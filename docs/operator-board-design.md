@@ -855,6 +855,8 @@ CHECK ((observation = 'unobserved') = (observation_reason IS NOT NULL))
 - 置き場所: 最後の `NEXT: human` 行の**上**に 1 行、間に空行を 1 つ。`NEXT:` は最終行のまま、`NEXT:` の直上の行は空のまま（`TIER-C:` / `STOP:` の読み手に影響しない）。§5.2A.5 の ci-route マーカーは `NEXT:` の後ろに置くが、本マーカーはこの 2 点のため前に置く。
 - 読み手は `parse_stop_marker`（同モジュール）。書きは厳密、読みは寛容（空白や改行の揺れを許し、壊れたマーカーは例外にせず無視する）。自由文のフィールドに `-->` が入っても payload の中で閉じないよう、書き手は `>` をエスケープする（ci-route マーカーと同じ）。
 - 壊れたマーカーを無視した場合、その通知は R-HUMAN に落ちる。これはマーカー導入前と同じ扱い。
+- **例外: `reason=operator_tier_c_conflict`（T-next-role-name-stands-down-to-human、msg-5428 D7 補足）**。author が `TIER-C: <type>` と `NEXT: operator` を同時に書いた stand-down は、R-RELAY-STOP に取らせず R-HUMAN（判断）に残し、「protocol 違反: Tier-C を operator に渡そうとした」と印を付ける。Tier-C と申告された作業を判断の列から落とさないため。
+- 同スレッドで、`NEXT:` 宛先解決に失敗した stand-down（`identity_unresolved` / `identity_role_ambiguous` / `identity_operator_no_task` / `operator_no_tier_c_check`）の通知にもマーカーが付くようになった。digest 側の分類（判断 / operator 作業 / 宛先誤り）は `src/spirrow_mindwire/conductor/parked_lane.py` が正本で、`scripts/parked_humans.py` が `lane` として出す。P1 はこの関数を使い、理由の文字列を直に書かないこと。
 
 ### 18.5 通知を投稿できなかった場合（S-3 後半、msg-5199 改訂）
 

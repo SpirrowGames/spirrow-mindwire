@@ -90,6 +90,18 @@ class StandDownReason(StrEnum):
     # The head's ``NEXT:`` names something that is neither a roster participant nor a sentinel,
     # for example the typo ``NEXT: Bohrr``.
     IDENTITY_UNRESOLVED = "identity_unresolved"
+    # The head's ``NEXT:`` is a role name (``implementer``), but the roster has zero or several
+    # identities holding that role, so it cannot be mapped to one (T-next-role-name-stands-down-
+    # to-human D3). Kept apart from IDENTITY_UNRESOLVED so a role-name miss is not read as a typo.
+    IDENTITY_ROLE_AMBIGUOUS = "identity_role_ambiguous"
+    # ``NEXT: operator`` refused (D6'''', msg-5428). The values equal those of
+    # :class:`.handoff.OperatorFault`, and a test pins that, so the parser's verdict and the
+    # event's reason are one vocabulary.
+    IDENTITY_OPERATOR_NO_TASK = "identity_operator_no_task"
+    OPERATOR_NO_TIER_C_CHECK = "operator_no_tier_c_check"
+    # The one stand-down that stays in the board's decision lane: the author declared a Tier-C and
+    # still tried ``NEXT: operator`` (msg-5428, D7 supplement).
+    OPERATOR_TIER_C_CONFLICT = "operator_tier_c_conflict"
     # The head names an identity whose embodiment has no adapter (ADR-2026-09-14-21 D-3, e.g.
     # Fermi = web_ai_chat).
     IDENTITY_NOT_SPAWNABLE = "identity_not_spawnable"

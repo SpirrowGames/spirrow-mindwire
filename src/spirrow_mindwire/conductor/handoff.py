@@ -141,6 +141,16 @@ _PARTICIPANT_NAME_RE = re.compile(_DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[
 # the same words, so they read them from here rather than re-spelling the literals.
 HUMAN_TOKEN = "human"
 NONE_TOKEN = "none"
+# ``NEXT: operator`` (T-next-role-name-stands-down-to-human D5 / D4'''): a human has to do work by
+# hand, and the author has checked that the work is none of the Tier-C types. It parks exactly like
+# ``human`` (``HandoffKind.HUMAN``) but carries :attr:`HumanAsk.OPERATOR_WORK`, so the board can
+# show it as operator work rather than as a decision. Not a :class:`~..value_objects.Role`: the
+# conductor never spawns an operator, and the role registry's role set is left unchanged (D5).
+OPERATOR_TOKEN = "operator"
+# D4'-a: the operator form's own keyword, held once. The protocol text, the parser and the
+# stand-down notice are all built from it (and from ``TIER_C_CHECK_KEYWORD`` / ``_NONE`` below),
+# so what the prompt teaches and what the parser accepts cannot drift apart.
+OPERATOR_TASK_KEYWORD = "OPERATOR-TASK"
 
 # The standing-autonomy ``DELEGATE`` marker that used to live here is gone. It authorised carve-out
 # ③ per *thread*, from the most recent human message, and non-stickily — so it had to be re-written
@@ -189,6 +199,35 @@ class HandoffKind(StrEnum):
     NONE = "none"  # NEXT: none — the thread is settled; the conductor stops
     PR_REVIEW = "pr_review"  # NEXT: pr-review <owner/repo#n> — fire the Tier B PR-gate (PR-2b-2)
     ABSENT = "absent"  # no parseable NEXT (missing / unknown participant) → human fallback (Obj3)
+
+
+class HumanAsk(StrEnum):
+    """What a ``HandoffKind.HUMAN`` asks the human for, when it is not a decision.
+
+    ``None`` on :attr:`Handoff.human_ask` is the default meaning of a human handoff (a Tier-C
+    decision). ``OPERATOR_WORK`` is a validated ``NEXT: operator``: work by hand that the author
+    has declared to be outside every Tier-C type (D5 / D4''').
+    """
+
+    OPERATOR_WORK = "operator_work"
+
+
+class OperatorFault(StrEnum):
+    """Why a ``NEXT: operator`` was refused (D6''''). Values are the stand-down reason strings.
+
+    Checked in this order, and the first that applies wins, so a contradictory message is always
+    reported as the contradiction rather than as a missing line:
+
+    1. ``TIER_C_CONFLICT`` — the message also declares a Tier-C (a ``TIER-C: <type>`` line
+       anywhere, :func:`declares_tier_c`).
+    2. ``NO_TASK`` — no ``OPERATOR-TASK: <work>`` line two lines above the final ``NEXT:``.
+    3. ``NO_TIER_C_CHECK`` — the line directly above the final ``NEXT:`` is not
+       ``TIER-C-CHECK: none`` (the same check as guard (i)'s G2, :func:`declares_no_tier_c`).
+    """
+
+    TIER_C_CONFLICT = "operator_tier_c_conflict"
+    NO_TASK = "identity_operator_no_task"
+    NO_TIER_C_CHECK = "operator_no_tier_c_check"
 
 
 class MismatchReason(StrEnum):
@@ -429,6 +468,17 @@ class Handoff:
     in this module — not a substitute for a single sum type (the naysayer reply to msg-4864
     accepted this trade-off over widening :class:`MismatchReason`).
 
+    ``via_role_alias`` is ``True`` when a ``ROLE`` handoff was reached through a role name rather
+    than an identity name (D1 / D3): ``NEXT: implementer`` with exactly one implementer on the
+    roster. ``role_alias_unresolved`` is ``True`` on an ``ABSENT`` whose token IS a role name but
+    whose role has zero or several holders on the roster (``IDENTITY_ROLE_AMBIGUOUS``), so it can
+    be told apart from a typo.
+
+    ``human_ask`` / ``operator_task`` are set on a valid ``NEXT: operator`` (kind ``HUMAN``,
+    :attr:`HumanAsk.OPERATOR_WORK`, and the text of the ``OPERATOR-TASK:`` line).
+    ``operator_fault`` is set, with kind ``ABSENT``, when a ``NEXT: operator`` failed the D6''''
+    checks; the conductor stands down on it.
+
     ``stop_line`` is the ``STOP:`` disposition (T-next-line-carries-who-not-why Slice 1): set to a
     :class:`StopLine` exactly when ``kind is HandoffKind.NONE`` — including ``StopStatus.ABSENT``
     when no such line was written — and ``None`` on every other kind (not measured there). Like
@@ -444,6 +494,11 @@ class Handoff:
     mismatch_body_token: str | None = None
     stop_line: StopLine | None = None
     author_requested_human: bool = False
+    via_role_alias: bool = False
+    role_alias_unresolved: bool = False
+    human_ask: HumanAsk | None = None
+    operator_task: str | None = None
+    operator_fault: OperatorFault | None = None
 
     def __post_init__(self) -> None:
         if not self.author_requested_human:
@@ -605,6 +660,50 @@ def declares_no_tier_c(body: str) -> bool:
     return match is not None and match.group("value").casefold() == TIER_C_CHECK_NONE
 
 
+_OPERATOR_TASK_RE = re.compile(
+    r"\A\s*" + re.escape(OPERATOR_TASK_KEYWORD) + r":\s*(?P<task>\S.*?)\s*\Z", re.IGNORECASE
+)
+
+
+def _operator_task_line(body: str) -> str | None:
+    """The work on ``OPERATOR-TASK: <work>`` two lines above the final ``NEXT:``, or ``None``.
+
+    The position is the template's (D4''' item 4): the task, then ``TIER-C-CHECK: none``, then
+    ``NEXT: operator``. A task line quoted anywhere else in the body does not count, for the same
+    reason the ``TIER-C:`` / ``STOP:`` readers look at one fixed line.
+    """
+    matches = list(_NEXT_LINE_RE.finditer(body))
+    if not matches:
+        return None
+    # The last element is the empty tail after the newline that ends the line above ``NEXT:``.
+    lines = body[: matches[-1].start()].split("\n")
+    if len(lines) < 3:
+        return None
+    match = _OPERATOR_TASK_RE.match(lines[-3])
+    return match.group("task") if match is not None else None
+
+
+def _check_operator(body: str, handoff: Handoff) -> Handoff:
+    """D6'''': accept a ``NEXT: operator`` only in its 3-line form; otherwise stand down.
+
+    The order is fixed (msg-5428): a Tier-C declaration anywhere in the message is checked first,
+    so a contradictory message is reported as the contradiction, never as a missing line. There is
+    no ``decided <msg-ref>`` form (msg-5425 / msg-5426): an agent cannot claim that a human already
+    approved Tier-C work. Tier-C work goes to ``NEXT: human``.
+    """
+    task = _operator_task_line(body)
+    fault: OperatorFault | None = None
+    if declares_tier_c(body):
+        fault = OperatorFault.TIER_C_CONFLICT
+    elif task is None:
+        fault = OperatorFault.NO_TASK
+    elif not declares_no_tier_c(body):
+        fault = OperatorFault.NO_TIER_C_CHECK
+    if fault is not None:
+        return Handoff(HandoffKind.ABSENT, token=handoff.token, operator_fault=fault)
+    return replace(handoff, operator_task=task)
+
+
 def _name_from_raw(raw: str) -> str | None:
     """The participant name at the head of a raw NEXT token, or ``None`` if there is not one."""
     match = _PARTICIPANT_NAME_RE.match(raw)
@@ -632,7 +731,9 @@ def resolve_handoff(
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
 
     Resolution order: the ``pr-review <ref>`` PR-gate sentinel (PR-2b-2) first, then the reserved
-    ``human`` / ``none`` sentinels, then the roster (case-insensitive on the identity name). A
+    ``human`` / ``none`` / ``operator`` sentinels, then the roster (case-insensitive on the
+    identity name), then a role name held by exactly one roster identity (D1). A ``NEXT:
+    operator`` is then checked against its 3-line form (:func:`_check_operator`). A
     missing ``NEXT:`` line, the empty token, or a non-participant name all resolve to
     :attr:`HandoffKind.ABSENT` — the conductor treats every ABSENT as "route to human" (Obj3 / D-4)
     so a malformed handoff flags a human rather than silently stranding the thread.
@@ -668,11 +769,23 @@ def resolve_handoff(
     tell them apart without duplicating this resolver.
     """
     body_handoff = _resolve_body(body, roster)
+    if body_handoff.human_ask is HumanAsk.OPERATOR_WORK:
+        # PR #402 gate (82ec032): a malformed body ``NEXT: operator`` stands down whatever the
+        # field says. head_skip reads only the body, so it LAUNCHes every malformed operator head
+        # on the promise that the conductor posts a notice that moves the head. If a diverging
+        # field turned this into a quiet TARGET_DIVERGENCE park instead, the head would never
+        # move and every tick would relaunch the same head. A well-formed body still reconciles
+        # against the field as before (head_skip SKIPs it, so a quiet park is safe there).
+        checked = _check_operator(body, body_handoff)
+        if checked.operator_fault is not None:
+            return checked
     field_value = next_participant.strip() if next_participant is not None else ""
     if not field_value:
         resolved = body_handoff
     else:
         resolved = _reconcile(_resolve_field(field_value, roster), body_handoff)
+    if resolved.human_ask is HumanAsk.OPERATOR_WORK:
+        resolved = _check_operator(body, resolved)
     if resolved.kind is HandoffKind.NONE:
         # STOP: disposition (Slice 1, measurement only). Attached AFTER reconciliation so a
         # field-driven NONE whose body also says `NEXT: none` keeps the body's STOP line instead
@@ -716,11 +829,11 @@ def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
         )
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
-    match = _roster_lookup(roster, token)
-    if match is None:
-        return Handoff(HandoffKind.ABSENT, token=token)
-    identity, role = match
-    return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+    if folded == OPERATOR_TOKEN:
+        # D5: parks like ``human``. Whether the message is a well-formed operator request is
+        # decided once, after reconciliation, by :func:`_check_operator` (D6'''', msg-5428).
+        return Handoff(HandoffKind.HUMAN, token=token, human_ask=HumanAsk.OPERATOR_WORK)
+    return _resolve_participant(roster, token)
 
 
 def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
@@ -772,11 +885,14 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.HUMAN, token=token, author_requested_human=True)
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
-    match = _roster_lookup(roster, token)
-    if match is None:
-        return Handoff(HandoffKind.ABSENT, token=token)
-    identity, role = match
-    return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+    if folded == OPERATOR_TOKEN:
+        # Same token, same meaning as the body route; the 3-line form is checked against the
+        # body after reconciliation. A field-only ``operator`` (body has no NEXT:) takes
+        # :func:`_reconcile` row 3 (body ABSENT -> field wins), keeps ``OPERATOR_WORK``, and so
+        # reaches :func:`_check_operator`, which stands it down with ``NO_TASK`` (no lines above
+        # any NEXT:). Pinned by test_field_only_operator_stands_down_with_the_missing_task_reason.
+        return Handoff(HandoffKind.HUMAN, token=token, human_ask=HumanAsk.OPERATOR_WORK)
+    return _resolve_participant(roster, token)
 
 
 def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
@@ -829,7 +945,11 @@ def _same_target(a: Handoff, b: Handoff) -> bool:
         return a.identity == b.identity
     if a.kind is HandoffKind.PR_REVIEW:
         return a.token == b.token
-    return True  # HUMAN / NONE — the kind IS the target
+    if a.kind is HandoffKind.HUMAN:
+        # ``human`` and ``operator`` both park on the human but ask for different things (D5);
+        # a field saying one and a body saying the other is a divergence, not agreement.
+        return a.human_ask == b.human_ask
+    return True  # NONE — the kind IS the target
 
 
 # --------------------------------------------------------------------------- #
@@ -884,6 +1004,17 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
 _TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
 
+# D4'-a: the one written example of the operator form. The protocol text quotes it, the stand-down
+# notices quote it, and a test feeds it through :func:`resolve_handoff` and requires
+# ``HumanAsk.OPERATOR_WORK`` — so the example the prompt teaches is, by construction, a form the
+# parser accepts. Built from the keyword constants, never re-spelled.
+OPERATOR_FORM_EXAMPLE = (
+    f"{OPERATOR_TASK_KEYWORD}: <the concrete work, one line>\n"
+    f"{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}\n"
+    f"NEXT: {OPERATOR_TOKEN}"
+)
+_OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -895,7 +1026,9 @@ with exactly one handoff line, and make it the FINAL line of your reply:
     NEXT: <name>
 
 `<name>` is either another participant's persona name (spelled exactly as it \
-appears as a message author in this thread) or one of two reserved words:
+appears as a message author in this thread — the persona name, not a role name: \
+write the name of the persona who holds the implementer role here, not \
+`implementer`) or one of three reserved words:
 
   - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision. Tier-C \
 is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything else is NOT \
@@ -906,6 +1039,17 @@ mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
+  - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
+of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
+comes first: if the work is, or could be, any of those types, hand it to \
+`{HUMAN_TOKEN}` as a Tier-C decision instead, never `NEXT: {OPERATOR_TOKEN}`. \
+Use exactly these three lines at the end of your reply:
+
+{_OPERATOR_FORM_INDENTED}
+
+A `NEXT: {OPERATOR_TOKEN}` without the `{OPERATOR_TASK_KEYWORD}:` line, without \
+`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` directly above it, or in a reply that \
+also declares a Tier-C type, is refused and the conductor stops.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
 out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
@@ -1010,6 +1154,42 @@ def build_handoff_protocol_block(role: Role) -> str:
     return f"{_HANDOFF_PROTOCOL_CORE}\n\n{_ROLE_HANDOFF_GUIDANCE[role]}\n"
 
 
+def _resolve_participant(roster: Mapping[str, Role], token: str) -> Handoff:
+    """Resolve a non-sentinel token: identity name first, then a role name (D1).
+
+    The identity match always wins, so a roster where an identity happens to be spelled like a
+    role keeps its current behaviour. Only when no identity matches is the token compared with the
+    :class:`Role` values; it resolves when exactly one identity holds that role in THIS roster at
+    THIS moment, so no fixed role→persona map exists anywhere (identity and role stay separate
+    axes; the roster decides). Zero or several holders is ``ABSENT`` with
+    ``role_alias_unresolved`` set (``IDENTITY_ROLE_AMBIGUOUS``), so it is not mistaken for a typo.
+    Everything downstream (guard (i), the self-handoff check, the spawnability check) reads
+    ``Handoff.identity`` and so sees the resolved identity (D2).
+    """
+    match = _roster_lookup(roster, token)
+    if match is not None:
+        identity, role = match
+        return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+    alias = _role_alias(token)
+    if alias is None:
+        return Handoff(HandoffKind.ABSENT, token=token)
+    holders = [identity for identity, role in roster.items() if role is alias]
+    if len(holders) != 1:
+        return Handoff(HandoffKind.ABSENT, token=token, role_alias_unresolved=True)
+    return Handoff(
+        HandoffKind.ROLE, identity=holders[0], role=alias, token=token, via_role_alias=True
+    )
+
+
+def _role_alias(token: str) -> Role | None:
+    """The :class:`Role` whose value is ``token`` (casefolded), or ``None``."""
+    folded = token.casefold()
+    for role in Role:
+        if role.value == folded:
+            return role
+    return None
+
+
 def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | None:
     """Case-insensitive identity→role lookup; returns the **canonical** (identity, role)."""
     direct = roster.get(name)
@@ -1025,6 +1205,9 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 __all__ = [
     "HUMAN_TOKEN",
     "NONE_TOKEN",
+    "OPERATOR_FORM_EXAMPLE",
+    "OPERATOR_TASK_KEYWORD",
+    "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
     "STOP_TRIGGER_ARMS",
     "TIER_C_CHECK_KEYWORD",
@@ -1032,7 +1215,9 @@ __all__ = [
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
+    "HumanAsk",
     "MismatchReason",
+    "OperatorFault",
     "StopLine",
     "StopStatus",
     "build_handoff_protocol_block",

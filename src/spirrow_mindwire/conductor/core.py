@@ -116,8 +116,11 @@ from .gate_records import (
 )
 from .handoff import (
     HUMAN_TOKEN,
+    OPERATOR_FORM_EXAMPLE,
+    OPERATOR_TOKEN,
     Handoff,
     HandoffKind,
+    OperatorFault,
     declares_no_tier_c,
     declares_tier_c,
     parse_next_token,
@@ -140,6 +143,7 @@ from .stand_down import (
     emit_stand_down,
     stand_down_event,
 )
+from .stop_marker import render_stop_marker
 from .tierc_gate import TierCGate, bounced_msg_id, is_bounce_notice, render_bounce_body
 
 if TYPE_CHECKING:
@@ -169,6 +173,56 @@ _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 #: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
+
+def _with_stop_marker(notice: str, event: Event) -> str:
+    """``notice`` with ``event``'s stop marker inserted above its final line (the ``NEXT:``).
+
+    The placement rule of :mod:`.stop_marker`: the marker on its own line, a blank line, then the
+    unchanged final ``NEXT: human`` — so the line directly above ``NEXT:`` stays empty and the
+    ``TIER-C:`` / ``STOP:`` readers see nothing there.
+    """
+    # Trailing newlines are dropped first so ``last`` is always the ``NEXT:`` line, never "".
+    head, sep, last = notice.rstrip("\n").rpartition("\n")
+    if not sep:
+        return notice
+    return f"{head}\n{render_stop_marker(event)}\n\n{last}"
+
+
+def _operator_fault_notice(fault: OperatorFault) -> str:
+    """The stand-down notice for a refused ``NEXT: operator`` (D6-prime and its msg-5428 revision).
+
+    Each one carries the correct form verbatim, so a session that never saw the updated protocol
+    can fix its handoff in one turn. The conflict notice teaches the Tier-C form instead: work the
+    author declared Tier-C is never operator work.
+    """
+    if fault is OperatorFault.TIER_C_CONFLICT:
+        cause = (
+            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は operator には"
+            "渡せません (protocol 違反: Tier-C を operator に渡そうとした)。"
+        )
+        fix = (
+            "次にやること: Tier-C の作業として、次の形で human に渡し直してください。\n\n"
+            f"    TIER-C: <type>\n    NEXT: {HUMAN_TOKEN}"
+        )
+    else:
+        if fault is OperatorFault.NO_TASK:
+            cause = "`OPERATOR-TASK:` 行がありません (`NEXT:` の 2 行上に必要です)。"
+        else:
+            cause = f"`NEXT: {OPERATOR_TOKEN}` の直上の行が `TIER-C-CHECK: none` ではありません。"
+        indented = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+        fix = (
+            "次にやること: 作業が Tier-C のどの型にも当たらないなら、次の 3 行で書き直して"
+            f"ください。当たる、または当たりうるなら `TIER-C: <type>` / `NEXT: {HUMAN_TOKEN}` "
+            f"で渡してください。\n\n{indented}"
+        )
+    return (
+        f"Conductor stand-down — `NEXT: {OPERATOR_TOKEN}` を受け付けませんでした\n\n"
+        f"理由 (`{fault.value}`): {cause}\n\n"
+        f"∴ 誰も spawn せず停止しました。{fix}\n\n"
+        f"head が動くまでループは再開しません。\n\n"
+        f"NEXT: {HUMAN_TOKEN}"
+    )
 
 
 class ConductorDispatcher(Protocol):
@@ -533,6 +587,17 @@ class Conductor:
             # two different targets" apart from "the writer put garbage in the field" without
             # re-deriving it from the raw tokens, and a programmatic consumer counts them apart
             # without duplicating :mod:`.handoff`'s resolver). Same escalation, different cause.
+            if handoff.via_role_alias:
+                # D3 (T-next-role-name-stands-down-to-human): a role name resolved to the one
+                # roster identity holding it. Logged so the frequency of role-name handoffs stays
+                # measurable after they stopped standing down.
+                logger.info(
+                    "conductor.handoff.role_alias msg=%s token=%r identity=%s role=%s",
+                    latest_msg_id,
+                    handoff.token,
+                    handoff.identity,
+                    handoff.role.value if handoff.role is not None else None,
+                )
             if handoff.mismatch_reason is not None:
                 logger.warning(
                     "conductor next_participant field/body mismatch: msg=%s reason=%s "
@@ -767,8 +832,13 @@ class Conductor:
                 # the pre-Layer-3 path. This branch is structurally unreachable when the field is
                 # set; the assertion pins it that way so a future refactor of the resolver cannot
                 # silently re-open msg-1438's 2-day silent stall (§3-1 row 3).
+                # The one exception is a refused ``NEXT: operator`` (``operator_fault``): it is a
+                # NO_HANDOFF that always posts its stand-down notice, so it cannot be msg-1438's
+                # silent stall even when a field is present (PR #402 gate, 82ec032).
                 assert not (
-                    stop_reason is StopReason.NO_HANDOFF and _next_participant(latest) is not None
+                    stop_reason is StopReason.NO_HANDOFF
+                    and _next_participant(latest) is not None
+                    and handoff.operator_fault is None
                 ), (
                     f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
                     f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"
@@ -785,6 +855,11 @@ class Conductor:
                 stand_down = self._identity_stand_down(handoff, stop_reason, spawn_blocked)
                 if stand_down is not None:
                     emit_stand_down(stand_down)
+                    if notice is not None:
+                        # D7: the board tells a routing stand-down from a decision by this marker
+                        # (``parked_lane``), not by the prose. Same placement as the other stop
+                        # notices: above the final ``NEXT: human``, one blank line between.
+                        notice = _with_stop_marker(notice, stand_down)
                 if notice is not None:
                     posted = await self._post_as_relay(notice)
                     if stand_down is not None and not _msg_id(posted):
@@ -1225,6 +1300,20 @@ class Conductor:
                 stop_reason=StopReason.SETTLED,
             )
 
+        if handoff.operator_fault is not None:
+            # D6'''' (msg-5428): a refused ``NEXT: operator`` stops at once and says why, with the
+            # correct form in the notice. It is NOT sent through the guard (ii) consult below: the
+            # consult would post first and bury the notice, and the fix is the author's to make in
+            # one turn (D6').
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.NO_HANDOFF,
+            )
+
         # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
         # to route still terminates at the human, but a non-naysayer's un-reviewed content must
         # get a naysayer consult first. An empty turn / the naysayer's own turn / the human's own
@@ -1333,6 +1422,23 @@ class Conductor:
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
             )
+        if reason is StopReason.NO_HANDOFF and handoff.operator_fault is not None:
+            return _operator_fault_notice(handoff.operator_fault)
+        if (
+            reason is StopReason.NO_HANDOFF
+            and handoff.kind is HandoffKind.ABSENT
+            and handoff.role_alias_unresolved
+        ):
+            return (
+                f"Conductor stand-down — role 名の宛先が 1 人に決まりません\n\n"
+                f"head の `NEXT:` は role 名 `{handoff.token}` を指していますが、この project の "
+                f"roster ではこの role を持つ identity が 1 人ではありません (0 人または複数)。"
+                f"\n\n∴ 誰も spawn せず、人間の介入が必要な停止として扱いました "
+                f"(`conductor.stand_down` reason=identity_role_ambiguous)。\n\n"
+                f"次にやること: `NEXT:` を identity 名 (persona 名) で書き直してください。"
+                f"head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
         if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
             # T44 (Einstein msg-4548 / Bohr msg-4569 異議 1): ``NEXT: Bohrr`` — the head names a
             # target, so a reader of the head believes someone was started. Without this line the
@@ -1371,6 +1477,29 @@ class Conductor:
                 project=project,
                 thread=thread,
                 detail=f"NEXT target {name!r} has embodiment {embodiment!r} (no adapter)",
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.operator_fault is not None:
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason(handoff.operator_fault.value),
+                project=project,
+                thread=thread,
+                detail=f"NEXT: {OPERATOR_TOKEN} refused ({handoff.operator_fault.value})",
+            )
+        if (
+            reason is StopReason.NO_HANDOFF
+            and handoff.kind is HandoffKind.ABSENT
+            and handoff.role_alias_unresolved
+        ):
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_ROLE_AMBIGUOUS,
+                project=project,
+                thread=thread,
+                detail=(
+                    f"NEXT target {handoff.token!r} is a role name held by zero or several "
+                    "roster identities"
+                ),
             )
         if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
             return stand_down_event(
