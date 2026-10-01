@@ -18,18 +18,35 @@
 - **取り下げないもの**: §1 の D1〜D8（Takahito 裁定）。後継スレッドは **D2 と衝突する状態ストアを新しく作らない**。
 - **凍結の理由**（msg-4898 §3.3）: P0-D0 → P0 → P1 → P2 と進めても、operator の手作業が減り始めるのは P2 からで、そこまで 3 repo・4 段かかる。下の後継は、それぞれ merge した時点で手作業を 1 種類ずつ減らす。
 
-### F.1 後継（msg-4900 §3 の最終形。いずれも mindwire 単体）
+### F.1 後継（msg-4900 §3 の最終形に msg-5148 / msg-5150 を反映。いずれも mindwire 単体）
 
 | # | 単位 | 新規か | 閉じる / 進める条件 |
 |---|---|---|---|
-| 1a | `T-pr-review-threads-outlive-their-prs` の Phase 1/2 | **既存スレッドを再開**（`src/spirrow_mindwire/pr_review_sweep/`） | PR-review 台帳（`T-pr-review-<repo>-<n>`、1 PR = 1 台帳）に限り、PR の merge / close で台帳を close |
-| 1b | `T-merged-pr-advances-thread` | 新規 | merge を検出したら、その PR を relay していた作業スレッドに「PR #N が merge された（sha）」を書き `NEXT: <proposer>` で渡す。**`NEXT: none` を書くのは PR 本文に `Closes-thread: <thread_id>` がある場合だけ**（1 スレッド = N PR のため。Einstein msg-4899 の BLOCKING） |
+| 1a | `T-pr-review-threads-outlive-their-prs` の Phase 1/2 | **既存スレッドを再開**（`src/spirrow_mindwire/pr_review_sweep/`） | PR-review 台帳（`T-pr-review-<repo>-<n>`、1 PR = 1 台帳）に限り、PR の merge / close で台帳を close。**作業スレッド（1 スレッド = N PR）とは閉じる条件が違う**: 台帳は merged でも closed でも無条件で close してよいが、作業スレッドは 1b の表に従い、閉じるのは `Closes-thread:` 付きの merge だけ（msg-5150 §2） |
+| 1b | `T-pr-event-advances-thread`（旧名 `T-merged-pr-advances-thread`、msg-5148 §2 で改名。未起票） | 新規 | PR のイベントで止まっている作業スレッドを前へ進める。**閉じるのは `Closes-thread:` 付きの merge だけ**。3 状態の動作は下の §F.1.1。§17.1 `RES-GATE-PENDING-NO-REFIRE` の後継（(ii)） |
 | 2 | `T-next-operator-is-silent` | 新規 | conductor が `NEXT: operator` を `no_handoff_to_human rounds=0` で無音で捨てる欠陥を直す（最小: ledger に「operator 待ち」を明示）。初回ターンは再現 → 設計 |
-| 3 | `T-sweep-auto-register-unregistered` | `T-sweep-intake-and-quarantine-stalls` と重なるなら合流 | `scripts/unregistered_threads.py` の出力を環境 probe 付きで sweep に自動登録。**probe 失敗は登録しない**。理由は毎 tick その場で導いて daily digest に載せる。**`parked` 状態は作らず、`state/quarantine.json` にも入れない**（msg-4900 §2） |
+| 3 | `T-sweep-intake-and-quarantine-stalls` の D-2 の続き（`T-sweep-auto-register-unregistered` は立てない） | **既存スレッドに合流**（msg-5148 §1。`unregistered_threads.py` の docstring が同スレッドの D-2 を担うと書いている） | `scripts/unregistered_threads.py` の出力を環境 probe 付きで sweep に自動登録。**probe 失敗は登録しない**。理由は毎 tick その場で導いて daily digest に載せる。**`parked` 状態は作らず、`state/quarantine.json` にも入れない**（msg-4900 §2）。digest にはもう 1 項目、**末尾が `NEXT: human` のまま N 時間以上動いていないスレッドを古い順に**載せる（スレッド末尾からその場で導く。永続化しない）。§17.1 `RES-A-GAP` の後継（msg-5148 §2） |
 
 - 偽駐機の差し戻しのうち判断が要る部分（J-ESCALATE 相当）は**今回は切らない**。1〜3 が入った後の手作業ログで残件数を測ってから決める（msg-4898 §3.2 末尾）。
 - 3 の advisory（Einstein msg-4901）: 恒久的に登録できないスレッドが digest に毎日出続けるノイズは、実際に出てから mute list を検討する。先に作らない。
 - §17 残余レジスタは生きている（§17 冒頭の v0.4 注記参照）。
+- 3 の digest の「`NEXT: human` で止まっている一覧」は本当に人を待っている一覧なので、毎日出続けるのが正しい。mute list はこちらにも作らない（msg-5148 §2）。
+
+#### F.1.1 1b（`T-pr-event-advances-thread`）の起点（msg-5150 §2、Einstein msg-5151 で BLOCKING 解消）
+
+起点となる PR の状態は 3 つ。いずれも gh から毎回その場で導き、状態は持たない。
+
+| PR の状態 | 動作 | `NEXT` |
+|---|---|---|
+| **merged** | (i) 作業スレッドに「PR #N が merge された（sha）」と 1 本書く | 本文に `Closes-thread: <thread_id>` があれば `none`。無ければ proposer |
+| **closed（merge されていない）** | 「PR #N が merge されずに close された（closed_at、最終 head sha）。本スレッドの作業はこの PR では landing していない」と 1 本書く | **`Closes-thread:` の有無に関係なく必ず proposer**。`NEXT: none` は書かない |
+| **open**、かつ直前の gate 結果が CI pending による COMMENT で、同じ head の CI が終端 | (ii) gate を 1 回だけ撃ち直す | gate relay が決める |
+
+- **closed-unmerged で宣言を無視する理由**: `Closes-thread:` は「この PR が landing したらスレッドの目的は果たされる」という条件付きの宣言で、merge されずに close されたならその条件は満たされていない。放棄・差し替え・スレッドごと中止のどれかは判断が要るので、機械は決める主体（proposer）に渡すだけにする。スレッドごとやめるなら proposer 自身が書く。失敗の向き: 誤って閉じる経路は無く、最悪でも proposer が閉じる 1 手が余分にかかるだけ。
+- **優先順位と排他**: (ii) の再発火は **PR が `open` のときだけ**。gate COMMENT の後に PR が close されていたら (ii) は撃たず、closed の行が優先される。死んだ PR に gate を撃つ経路は無い。
+- **一度だけ動くこと**: スレッドの末尾から導く。(ii) は「直前のメッセージが gate の CI-pending COMMENT であること」を条件にする。末尾がすでに merged / closed の行なら何もしない。
+- **既知の制約（Einstein msg-5151 ADVISORY）**: (ii) はスレッドの**直前の 1 本**しか見ない。CI が終わる前に誰かがスレッドに書き込むと（状況報告、失敗テストのメモなど）、gate の CI-pending COMMENT が末尾でなくなり、CI が終端しても再発火しない。影の DB を作らないための意図した trade-off であり、直さない。**運用: CI pending の gate COMMENT の後にスレッドへ書き込んだ人は、CI 終端後に gate を手で撃ち直す。** このときの escalate の境界は §17.3.1 に従う。
+- 1b が merge されるまでは §17.3.1 の暫定規律（30 分 / 2 sweep を超えたら、問いではなく事実と推奨の形で人に上げる）が今のまま有効。
 
 ---
 
@@ -606,6 +623,7 @@ profile  = "ephemeral-develop"
 - **msg-2730 pr-review naysayer（PR #236 gate round-1、v0.3.5 content review、REQUEST_CHANGES ci=success）**: BLOCKING 1 件（invariant、where=`docs/operator-board-design.md:565`）— 「#236 が更新後の #229 head に正しく rebase されているなら、#229 の review 修正ログ（round-1〜round-5）は base 側に既に存在し、この diff では変更のない context 行として現れなければならない。しかし実際は全て `+` で導入されている ∴ 実装者が #229 の更新履歴を base に持たせず stacked 側の本 PR に直接ペーストして二重管理している」＋「ファイル先頭で版番号を 0.3.5 へ上げながら追加ログ中で『版番号は v0.3.4 維持』と主張するのは事実と矛盾し読み手を欺瞞する」。**explicit endorse 3 件**（① §17.3.1 のエスカレーション境界と cap の分離＝operator lane の駐機予算 30 分と gate 内部の `CAP_NOCLOCK` 12h の流用禁止、② §17.3.2 の rebase 規律＝「畳むか同梱するか」の判断自体を禁じて D8 症状を構造的に閉じた点、③ 未 vendoring ADR ポインタの防御的扱い＝`ADR-2026-06-03-16` の body 取得後に矛盾したら silent edit せず設計ターンの trigger にする、OBL-DECLARE-UNREADABLE の正しい実践）。ADR pointers=2（ADR-06-03-16 / ADR-06-04-19、いずれも VERDICT に非寄与）。
 - **msg-2731 Bohr（PR #236 gate round-1 の裁定 = 棄却、本エントリは Heisenberg が記録・実測を再現）**: BLOCKING の事実的前提が 3 つとも測定で偽。**主張 A「#236 は #229 の更新後 head に rebase されていない」→ 偽**: `git merge-base <#236 head ce4c23e> origin/main` = `f56ee51` であり、これは PR #229 の最終 head（`git rev-parse refs/remotes/pr/229` = `f56ee51`、2026-09-08T07:17Z に `ce49f5a` として main へ merge 済）そのもの ∴ #236 は #229 最終 head の直系子孫で、これ以上 rebase された状態は定義上存在しない。**主張 B「#229 の review 修正ログが base 側に存在するはず」→ 偽（前提が成立しない）**: `PR #229 fix v0.3.4` の出現数は base `f56ee51` = **0**、head `ce4c23e` = **5**（`origin/main` `b0b1829` でも **0**）。#229 の 5 commit はすべて §17.2 本文の修正で、#229 は自分自身の round ログを §14 に一度も書いていない。§14 の review 履歴台帳を前へ運ぶことは後続版である #236 の成果物内容そのものであって、base から失われた context ではない。**主張 B'「二重管理している」→ 偽**: base 出現数が 0 である以上、当該行は世界に 1 箇所しか存在しない。**主張 C「v0.3.5 へ上げる diff の中で『版番号は v0.3.4 維持』と書くのは矛盾・欺瞞」→ 偽（主語の取り違え）**: 係争 5 行はいずれも §14 決定ログのエントリで、bold の主語が `PR #229 fix v0.3.4 round-N` と自分の対象を名指ししており、base の版ヘッダ実測が `版: **0.3.4**` である以上 #229 の fix commit についての真な言明である。一方 #236 が `0.3.5` へ上げるのは §17.1 4 行目（`RES-GATE-PENDING-NO-REFIRE`）＋ §17.3 を新規に足すからで、ヘッダの `v0.3.5 差分の正本:` 行がその根拠を明示している ∴ 別の PR についての 2 つの真な言明であって矛盾も欺瞞も無い。**∴ 係争 5 行は編集しない** — 記述は実測で真であり、偽の異議に合わせて正確な履歴記録を書き換えることは、記録の正確さを reviewer の誤読に譲り渡すことになる。付随: `where` の行番号は今回も不正確（head `ce4c23e` の 565 行目は msg-2664 Einstein のエントリで、係争 5 行は 569 / 571 / 573 / 575 / 577 行目。7 周中 5 周で不正確 ∴ 同定キーは逐語引用であって行番号ではない）。**advisory（blocking ではない）**: diff の中に書かれた自己言及的なプロセス主張（「本 PR は rebase 済み」等）は git を実行できない diff-only の reviewer には原理的に検証不能であり、本ラウンドの false objection の発生源である（§17.2 の `head_pushed_at` proxy 誤りや round-4 のサンプリング flaw と同族の「検証者が立っている場所から検証できない主張」の型）— ただし当該記述は真かつ §17.3.2 が要求する記録なので #236 の欠陥ではなく、修正は要求しない。**本 PR (#236) の版は v0.3.5 のまま（本エントリは fix commit）**。§17.3.2 の rebase 規律は #229 が merge 済で終端に達し stack の親が main に移ったため、本 fix で `origin/main`（`b0b1829`）へ rebase して force-push した（`docs/operator-board-design.md` の blob は `f56ee51` と `b0b1829` で同一の `bb922d94` ∴ 内容 no-op・衝突なし。以後の reviewer から「rebase されているか」という問い自体が消える）。手動発火した gate が design thread に `pr-gate-relay` を投げない件（本ラウンドの verdict が台帳スレッドにしか存在しなかった原因）は、§17.3.2 の「常に独立、常に rebase」に従い本 PR に同梱せず別 PR・別行として立てる。
 - **v0.4（2026-10-01、凍結）**: operator msg-4882（21 日停止からの駐機解除と棚卸し依頼）→ Bohr msg-4898（棚卸し: 実装済みは §5.2A のみ。(b) 凍結 + mindwire 単体の後継 3 本を推奨）→ Einstein msg-4899（凍結を endorse。BLOCKING: 無条件 close は複数 PR のスレッドを誤って閉じる。ADVISORY: `parked` を新しい状態にしない）→ Bohr msg-4900（両方受け入れ。PR-review 台帳と作業スレッドを分け、`Closes-thread:` 宣言時だけ `NEXT: none`。`parked` を廃止）→ Einstein msg-4901（BLOCKING 解消、ADVISORY 1 件: digest の毎日の重複ノイズ）→ 人 decide（凍結と後継 3 本を採用）。本版で §F を追加し、§12 / §15 / §16 / §17 に v0.4 注記を入れた。
+- **v0.4 追補（PR #391 追加 commit）**: Heisenberg msg-5147（§17 の 2 行は後継未割当として開示）→ Bohr msg-5148（3 は `T-sweep-intake-and-quarantine-stalls` に合流。`RES-GATE-PENDING-NO-REFIRE` → 1b の (ii) CI 終端再発火、1b を `T-pr-event-advances-thread` に改名。`RES-A-GAP` → 3 の digest の「`NEXT: human` で止まっている一覧」）→ Einstein msg-5149（BLOCKING: merge されずに close された PR を検出しない）→ Bohr msg-5150（closed-unmerged は宣言を無視して常に proposer。(ii) は open の PR に限る）→ Einstein msg-5151（BLOCKING 解消。ADVISORY: (ii) は末尾だけを見るので途中の書き込みで再発火しない → §F.1.1 に既知の制約として記載）→ 人 decide（実装に進める）。本追補で §F.1 / §F.1.1 / §17.1 の 2 行 / §17.3 冒頭を更新した。版番号は 0.4 のまま。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
@@ -674,8 +692,8 @@ board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言し�
 |---|---|---|---|---|
 | **RES-CI-CLOCK-FALLBACK** | `observed = ∅` 時の待ち時計が `head_committed_date` に落ちるため、古い commit を今 push した head で R3 `ROUTE_HUMAN` の false-early 早鳴りが起こる（naysayer round-3 advisory）| **既に出荷済**: R3 escalation 文字列の `clock=commit`。observability は追加コード不要 | `clock=commit` の escalation が 1 件でも出たら、その時点の `push_age` を確認。`push_age < CAP_NOCLOCK` なら誤発火 → **設計ターンへ昇格**（Bohr → Einstein → 実装） | **deferred**（§17.2 参照） |
 | **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行）→ **配線後は 1**（`conductor/core.py` の `Conductor._admit`）。production で配線が生きている観測物は 2 つ: ① `NEXT: pr-review` を踏むたび毎回出る `gate admission for <ref>: rule=<R> admission=<verdict>` の INFO ログ ② R4 のときだけ thread に残る `<!-- mindwire:ci-route v1 ... -->` マーカ（deferral は無記録ゆえ、赤 CI の routing だけが痕跡を残す） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | **closed**（配線 PR で discharge。`nomination_is_self` の読み替え 1 件を deviation として PR 本文で開示。既定 ON で、rollup を読めなければ配線前の挙動に縮退する） |
-| **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | ~~board 稼働で自動消滅~~ → **v0.4: board 凍結で期限の根拠が消えた。後継 id は未割当**（§F.1 の 1〜3 はどれも「人の停止の集約可視面」を名目にしていない）。割り当ては proposer が決める | **受容（期限喪失・後継未割当）** |
-| **RES-GATE-PENDING-NO-REFIRE** | PR-gate が pending CI で保留するとき `NEXT: human` で終端し、再発火経路が無い。時間が答える問いで人を止める（実例: msg-2600, 2026-09-08。本設計スレッド自身の中で発生した D7 症状） | gate の `COMMENT (ci=pending)` msg の直後の `NEXT:` が `human` であること | ~~無し。board の `gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火で自動消滅~~ → **v0.4: board 凍結で消滅経路が無くなった。後継 id は未割当**。msg-4898 §2 はこれを「偽駐機の差し戻し」に対応づけ、判断が要る部分（J-ESCALATE 相当）は 1〜3 着地後に測ってから切ると決めた（§F.1）。再発火の決定的な部分をどの後継に載せるかは proposer が決める | **受容（期限喪失・後継未割当）**。§17.3 の暫定規律は引き続き有効 |
+| **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | ~~board 稼働で自動消滅~~ → **v0.4: §F.1 の 3（`T-sweep-intake-and-quarantine-stalls` に合流）の digest 項目「末尾が `NEXT: human` のまま N 時間以上動いていないスレッドの一覧」を名指しした PR の merge で消滅**（msg-5148 §2） | **受容（期限付き・後継割当済）** |
+| **RES-GATE-PENDING-NO-REFIRE** | PR-gate が pending CI で保留するとき `NEXT: human` で終端し、再発火経路が無い。時間が答える問いで人を止める（実例: msg-2600, 2026-09-08。本設計スレッド自身の中で発生した D7 症状） | gate の `COMMENT (ci=pending)` msg の直後の `NEXT:` が `human` であること | ~~無し。board の `gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火で自動消滅~~ → **v0.4: §F.1 の 1b（`T-pr-event-advances-thread`）の (ii)（PR が open で CI 終端後に gate を 1 回だけ撃ち直す、§F.1.1）を名指しした PR の merge で消滅**（msg-5148 §2）。判断が要る部分（J-ESCALATE 相当）は 1〜3 着地後に測ってから切る（§F.1） | **受容（期限付き・後継割当済）**。§17.3 の暫定規律は 1b の merge まで有効 |
 
 ### 17.2 RES-CI-CLOCK-FALLBACK の中身 —「`head_pushed_at` に替えるだけ」ではない（Bohr msg-2595 §C）
 
@@ -733,6 +751,8 @@ conductor が head を初めて見た tick に `first_seen(head)` を書き（§
 ### 17.3 RES-GATE-PENDING-NO-REFIRE の運用規律（Bohr msg-2665 §A / §B、Einstein msg-2664 correctness + structure 受け入れ）
 
 board が稼働するまでの間、本行は「board 稼働で自動消滅」を状態にしているが、稼働までの期間中も駐機と escalate の境界は必要になる。以下は board 稼働までの暫定規律で、稼働と同時に破棄される（`gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火が構造的に代替する）。
+
+> **v0.4**: board は凍結した。本暫定規律は ~~board 稼働で破棄~~ → **§F.1 の 1b（`T-pr-event-advances-thread`）の merge で破棄**する（1b の (ii) が構造的に代替する。msg-5148 §3）。
 
 #### 17.3.1 escalate の境界（Einstein msg-2664 objection 1 correctness 受け入れ）
 
