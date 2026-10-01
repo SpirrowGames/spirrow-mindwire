@@ -58,8 +58,8 @@ def _checked() -> bool:
     return True
 
 
-def _cleared() -> bool:
-    return True
+def _no_veto() -> bool:
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +136,7 @@ def test_guard_i_truth_table(
             message_is_attested=lambda: attested,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is expected
     )
@@ -159,7 +159,7 @@ def test_carveout_1_human_authored_decide_honours() -> None:
             message_is_attested=lambda: False,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is GuardIVerdict.HONOR
     )
@@ -176,7 +176,7 @@ def test_carveout_3_attested_naysayer_under_run_honours() -> None:
             message_is_attested=lambda: True,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is GuardIVerdict.HONOR
     )
@@ -194,7 +194,7 @@ def test_carveout_3_unattested_naysayer_falls_through_to_redirect() -> None:
             message_is_attested=lambda: False,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -211,7 +211,7 @@ def test_carveout_3_naysayer_under_supervised_redirects() -> None:
             message_is_attested=lambda: True,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -229,7 +229,7 @@ def test_proposer_to_implementer_redirects_by_default() -> None:
             message_is_attested=lambda: True,
             segment_declares_tier_c=_no_decl,
             naysayer_declared_no_tier_c=_checked,
-            decider_clears=_cleared,
+            decider_vetoes=_no_veto,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -296,7 +296,7 @@ def test_attest_thunk_not_invoked_outside_carveout_3_branch(
         message_is_attested=thunk,
         segment_declares_tier_c=_no_decl,
         naysayer_declared_no_tier_c=_checked,
-        decider_clears=_cleared,
+        decider_vetoes=_no_veto,
     )
     assert thunk.calls == 0
 
@@ -312,7 +312,7 @@ def test_attest_thunk_invoked_exactly_once_in_carveout_3_branch() -> None:
         message_is_attested=thunk,
         segment_declares_tier_c=_no_decl,
         naysayer_declared_no_tier_c=_checked,
-        decider_clears=_cleared,
+        decider_vetoes=_no_veto,
     )
     assert thunk.calls == 1
     assert verdict is GuardIVerdict.HONOR
@@ -325,7 +325,7 @@ def test_attest_thunk_invoked_exactly_once_in_carveout_3_branch() -> None:
         message_is_attested=unattested,
         segment_declares_tier_c=_no_decl,
         naysayer_declared_no_tier_c=_checked,
-        decider_clears=_cleared,
+        decider_vetoes=_no_veto,
     )
     assert unattested.calls == 1
     assert verdict is GuardIVerdict.REDIRECT

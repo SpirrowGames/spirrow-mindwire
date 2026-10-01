@@ -83,7 +83,7 @@ from ..decider.hook import (
     ThreadMessage,
     is_tierc_entry,
     never_retry,
-    run_proceed_clearance,
+    run_proceed_veto,
     run_tierc_hook,
 )
 from ..exceptions import AdapterSpawnTimeoutError
@@ -443,11 +443,17 @@ class Conductor:
         # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
-        # D-4' G3: the Decider's proceed clearance for ONE head, keyed by that head's msg id
-        # (``_prefetch_proceed_clearance``). ``_route`` is synchronous and the Decider is not, so
-        # the answer is fetched before ``_route`` and read back through a thunk; a missing or
-        # stale entry reads as "not cleared" (fail-closed).
-        self._proceed_clearance: tuple[str, bool] | None = None
+        # D-4' G3 (veto form, msg-5219 / Bohr msg-5229 R3'): the Decider's veto answer for ONE
+        # head, keyed by that head's msg id (``_prefetch_proceed_veto``) as
+        # ``(head_id, vetoed, ask_score)``. ``_route`` is synchronous and the Decider is not, so
+        # the answer is fetched before ``_route`` and read back through a thunk. An entry exists
+        # only when the Decider was consulted (``backend=off`` included, recorded as not vetoed);
+        # a missing or stale entry means it was NOT consulted for this head — an internal fault —
+        # and reads as a veto (fail-closed, Einstein msg-5228 / msg-5230).
+        self._proceed_veto: tuple[str, bool, float | None] | None = None
+        # Why G3 closed carve-out ③ on the last ``_route`` (``None`` = G3 did not close it); read
+        # by the guard-(i) redirect notice so the human can tell a Jev veto from an internal fault.
+        self._g3_close_reason: str | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -688,11 +694,11 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
-            # D-4' G3: fetch the Decider's clearance for a naysayer proceed BEFORE the synchronous
+            # D-4' G3: fetch the Decider's veto answer for a naysayer proceed BEFORE the synchronous
             # ``_route`` consults it. Only called when every other carve-out ③ condition already
             # holds (``carve_out_iii_admissible``, the same rule ``_route`` applies), so a
             # proposer's handoff, a supervised project or an undeclared proceed costs no call.
-            await self._prefetch_proceed_clearance(handoff, messages, round_index)
+            await self._prefetch_proceed_veto(handoff, messages, round_index)
             route = self._route(handoff, messages)
             target_role = route.target_role
             target_identity = route.target_identity
@@ -1137,6 +1143,7 @@ class Conductor:
             # D-4' (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): G1 / G2 / G3 are
             # thunks for the same reason — the predicate owns when they are read.
             head_id = _msg_id(messages[-1])
+            self._g3_close_reason = None
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
@@ -1144,7 +1151,7 @@ class Conductor:
                 message_is_attested=lambda: self._attested(messages[-1]),
                 segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
                 naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
-                decider_clears=lambda: self._proceed_cleared_for(head_id),
+                decider_vetoes=lambda: self._proceed_vetoed_for(head_id),
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
@@ -1458,24 +1465,40 @@ class Conductor:
                 return True
         return False
 
-    def _proceed_cleared_for(self, head_msg_id: str) -> bool:
-        """G3 read-back: the prefetched Decider clearance for exactly this head, else ``False``."""
-        cached = self._proceed_clearance
-        return bool(head_msg_id) and cached is not None and cached == (head_msg_id, True)
+    def _proceed_vetoed_for(self, head_msg_id: str) -> bool:
+        """G3 read-back (veto form), three states (Bohr msg-5229 R3', Einstein msg-5230):
 
-    async def _prefetch_proceed_clearance(
+        * entry for exactly this head, ``vetoed=False`` → not vetoed (the Decider was consulted —
+          or is off — and did not say "ask the human"; G1 / G2 decide);
+        * entry for exactly this head, ``vetoed=True`` → vetoed (Jev judged it a human matter);
+        * no entry, an entry for another head, or an empty head id → vetoed, with an error log:
+          the conductor cannot show the Decider was consulted for this head, which is an internal
+          fault and must not be read as the Decider's "no veto".
+        """
+        cached = self._proceed_veto
+        if not head_msg_id or cached is None or cached[0] != head_msg_id:
+            logger.error("G3 prefetch missing for head=%s; carve-out ③ closed", head_msg_id)
+            self._g3_close_reason = "prefetch-missing"
+            return True
+        _, vetoed, ask_score = cached
+        if vetoed:
+            score = "?" if ask_score is None else f"{ask_score:.2f}"
+            self._g3_close_reason = f"veto:{score}"
+        return vetoed
+
+    async def _prefetch_proceed_veto(
         self, handoff: Handoff, messages: list[dict[str, Any]], round_index: int
     ) -> None:
-        """D-4' G3: ask the Decider whether this naysayer proceed may reach code without a human.
+        """D-4' G3 (veto form): ask the Decider whether this naysayer proceed must go to the human.
 
         Runs only for a ``ROLE`` handoff to the implementer whose author is not the human and for
         which :func:`~spirrow_mindwire.routing.carve_out_iii_admissible` — the very rule
-        ``_route``'s guard applies before its own ``decider_clears`` thunk — already holds. The
-        result is cached against the head's msg id; ``_route`` reads it back via
-        :meth:`_proceed_cleared_for`. With no Decider wired (``backend=off``) the cache records
-        "not cleared" and carve-out ③ stays closed (the accepted price of G3).
+        ``_route``'s guard applies before its own ``decider_vetoes`` thunk — already holds. Every
+        consult writes an entry against the head's msg id, whatever the answer (``backend=off``,
+        an error, grey-zone and ``LIKELY_NOT`` all write ``vetoed=False``); ``_route`` reads it
+        back via :meth:`_proceed_vetoed_for`, where a missing entry closes the door (R3').
         """
-        self._proceed_clearance = None
+        self._proceed_veto = None
         if not messages or handoff.kind is not HandoffKind.ROLE:
             return
         if handoff.role is not self._implementer_role:
@@ -1492,7 +1515,7 @@ class Conductor:
             naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
         ):
             return
-        cleared = await run_proceed_clearance(
+        vetoed, ask_score = await run_proceed_veto(
             self._decider,
             thread_id=self._thread_ref.thread_id,
             round_index=round_index,
@@ -1508,13 +1531,17 @@ class Conductor:
             ],
         )
         head_id = _msg_id(head)
-        if not cleared:
+        if vetoed:
             logger.info(
-                "conductor carve-out ③ not cleared by the Decider (G3): head=%s decider=%s",
+                "conductor carve-out ③ vetoed by the Decider (G3): head=%s ask_score=%s",
                 head_id,
-                "off" if self._decider is None else "on",
+                ask_score,
             )
-        self._proceed_clearance = (head_id, cleared) if head_id else None
+        if not head_id:
+            # No key to cache under; ``_proceed_vetoed_for`` will close (and log an error).
+            logger.warning("G3 prefetch has no head msg id; carve-out ③ will close")
+            return
+        self._proceed_veto = (head_id, vetoed, ask_score)
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
@@ -1849,7 +1876,11 @@ class Conductor:
         author_role = self._roster_role(author)
         target = self._guard_i_redirect_target(author, author_role, messages)
         return self._format_guard_i_redirect_body(
-            author=author, author_role=author_role, handoff=handoff, target=target
+            author=author,
+            author_role=author_role,
+            handoff=handoff,
+            target=target,
+            g3_close_reason=self._g3_close_reason,
         )
 
     def _guard_i_redirect_target(
@@ -1908,6 +1939,7 @@ class Conductor:
         author_role: Role | None,
         handoff: Handoff,
         target: str,
+        g3_close_reason: str | None = None,
     ) -> str:
         """Render the D-1 write-back body. See :meth:`_render_guard_i_redirect_notice` for shape.
 
@@ -1926,6 +1958,18 @@ class Conductor:
         # the thread when it has come to rest (if target is human). Both need to see the same
         # facts, so the body does not branch on target for the diagnostic prose.
         target_line = f"NEXT: {target}"
+        # Bohr msg-5227 R4 / msg-5229 R3': when G3 is what closed ③, say which kind of close it was
+        # so the human can tell a Jev veto from a conductor-internal fault.
+        if g3_close_reason is None:
+            g3_line = ""
+        elif g3_close_reason == "prefetch-missing":
+            g3_line = (
+                "今回 ③ を閉じたのは G3 です: G3 の事前取得が欠落しました (内部エラー。"
+                "Decider の判定ではありません)。\n\n"
+            )
+        else:
+            score = g3_close_reason.removeprefix("veto:")
+            g3_line = f"今回 ③ を閉じたのは G3 です: Jev が人に聞くべきと判定 (p={score})。\n\n"
         return (
             "Conductor stop — guard (i) redirect (design→implement Tier-C gate)\n\n"
             f"直近の post ({author}, role: {author_role_label}) の `NEXT:` は "
@@ -1941,8 +1985,9 @@ class Conductor:
             "author が naysayer でない、あるいは attest 済でない、あるいは control が "
             "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
             "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
-            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が proceed を "
-            "承認しなかった (Decider 無効時を含む)。\n\n"
+            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が「人に聞くべき」と "
+            "判定した (拒否権。Decider 無効・判定なし・エラーでは閉じない)。\n\n"
+            f"{g3_line}"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "

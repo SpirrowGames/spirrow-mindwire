@@ -89,13 +89,13 @@ def carve_out_iii_admissible(
     segment_declares_tier_c: Callable[[], bool],
     naysayer_declared_no_tier_c: Callable[[], bool],
 ) -> bool:
-    """Every carve-out ③ condition EXCEPT the Decider's clearance (G3).
+    """Every carve-out ③ condition EXCEPT the Decider's veto (G3).
 
     Split out so the conductor can ask "is the (network-bound) Decider worth
     calling for this turn?" through the same rule the predicate uses, instead of
     re-expressing the conjunction at the call site (the drift PR-review msg-2554
     flagged). :func:`guard_proposer_to_implementer` calls this and then the
-    ``decider_clears`` thunk — so the Decider is only consulted, by either
+    ``decider_vetoes`` thunk — so the Decider is only consulted, by either
     caller, when this returns ``True``.
 
     The conjunction, cheapest first (each thunk only fires if everything before
@@ -137,7 +137,7 @@ def guard_proposer_to_implementer(
     message_is_attested: Callable[[], bool],
     segment_declares_tier_c: Callable[[], bool],
     naysayer_declared_no_tier_c: Callable[[], bool],
-    decider_clears: Callable[[], bool],
+    decider_vetoes: Callable[[], bool],
 ) -> GuardIVerdict:
     """Decide whether a handoff to the implementer may proceed.
 
@@ -160,12 +160,15 @@ def guard_proposer_to_implementer(
     1. **carve-out ①**: ``author_is_human`` — honour immediately. A human-
        authored decide is the Tier-C gate itself. No thunk is invoked.
     2. **carve-out ③**: :func:`carve_out_iii_admissible` (naysayer ∧ RUN ∧
-       attested ∧ G1 ∧ G2) **and** ``decider_clears()`` (**G3**, Takahito
-       "B" decide: the Tier-C Decider evaluated this proceed turn and judged
-       it NOT a matter for the human). ``decider_clears`` must be ``False``
-       whenever the Decider is off (``backend=off``), undecided, or failed —
-       so with no Decider in production, ``run`` behaves as ``supervised``
-       for code handoffs (msg-4856 §3 G3: the accepted price of G3).
+       attested ∧ G1 ∧ G2) **and not** ``decider_vetoes()`` (**G3 as a veto**,
+       T-pr-2b-3-human-identity-delegate msg-5219 Takahito "a" decide, which
+       replaced the "B" decide's clearance form). ``decider_vetoes`` is ``True``
+       only when the Tier-C Decider judged, actionably, that the human must be
+       asked (tierc-v2 ``CONFIRMED``, ``should_ask_human >= tierc_v2_ask_min``)
+       — or when the caller cannot show that the Decider was consulted for this
+       head at all (an internal fault, Bohr msg-5229 R3'). A Decider that is off,
+       undecided, grey-zone or failed does not veto: G1 / G2 decide. G3 stays
+       monotone — it can only close the door, never open it.
     3. Otherwise — ``REDIRECT``. Guard (i) fires; the caller decides whether
        it is an explicit-human terminal or a redirect.
 
@@ -185,7 +188,7 @@ def guard_proposer_to_implementer(
             segment_declares_tier_c=segment_declares_tier_c,
             naysayer_declared_no_tier_c=naysayer_declared_no_tier_c,
         )
-        and decider_clears()
+        and not decider_vetoes()
     ):
         return GuardIVerdict.HONOR
     return GuardIVerdict.REDIRECT

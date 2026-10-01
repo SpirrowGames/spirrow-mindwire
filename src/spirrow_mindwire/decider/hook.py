@@ -73,7 +73,7 @@ from spirrow_mindwire.decider.state import (
     SimpleTurn,
     state_builder,
 )
-from spirrow_mindwire.decider.verdict import TierCVerdictKind
+from spirrow_mindwire.decider.verdict import TierCV2Verdict, TierCVerdictKind
 from spirrow_mindwire.tier_c_admission_gate import (
     AdmissionDecision,
     LogKind,
@@ -104,7 +104,7 @@ class Decider(Protocol):
     async def evaluate(self, state: DecisionState) -> DecisionResult | None: ...
 
     async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
-        """D-4' G3: evaluate a naysayer's proceed handoff; ``None`` = not called."""
+        """D-4' G3 (veto): evaluate a naysayer's proceed handoff; ``None`` = not called."""
         ...
 
 
@@ -522,50 +522,69 @@ async def run_tierc_hook(
     return dr
 
 
-def proceed_cleared(dr: DecisionResult | None) -> bool:
-    """G3's single reading of a proceed-clearance result: cleared iff the Decider was called,
-    produced an actionable verdict (``EVALUATED`` ∧ ``IN_GATE`` — msg-4184: acting code reads
-    ``actionable_verdict`` only) and that verdict is ``LIKELY_NOT`` ("not a matter for the
-    human"). ``CONFIRMED``, ``UNSURE``, a null / malformed / transport-error outcome and "not
-    called" are all *not cleared* — the fail-closed side (Bohr msg-4856 §3 G3)."""
+def proceed_vetoed(dr: DecisionResult | None) -> bool:
+    """G3's single reading of a proceed result, as a **veto** (T-pr-2b-3-human-identity-delegate
+    msg-5219 Takahito "a" decide, Bohr msg-5227 R2): vetoed iff the Decider was called, produced
+    an actionable verdict (``EVALUATED`` ∧ ``IN_GATE`` — msg-4184: acting code reads
+    ``actionable_verdict`` only), that verdict is a tierc-v2 one, and its kind is ``CONFIRMED``
+    ("ask the human": ``should_ask_human >= tierc_v2_ask_min``, pre-registered 0.60).
+
+    Everything else is *not vetoed* — G3 then stays out of the way and G1 / G2 decide:
+    ``None`` (not called / off), a null / malformed / transport-error outcome, a v1 verdict,
+    ``UNSURE`` (the grey zone) and ``LIKELY_NOT``."""
     if dr is None:
         return False
     av = dr.actionable_verdict
-    return av is not None and av.kind is TierCVerdictKind.LIKELY_NOT
+    return isinstance(av, TierCV2Verdict) and av.kind is TierCVerdictKind.CONFIRMED
 
 
-async def run_proceed_clearance(
+def veto_ask_score(dr: DecisionResult | None) -> float | None:
+    """The ``ask_score`` of an actionable v2 result, for the log line and the redirect notice;
+    else ``None``. Reads ``actionable_verdict`` like every acting path (msg-4184 §2-3); the raw
+    verdict still reaches the log through ``decision_result_to_dict``."""
+    if dr is None:
+        return None
+    av = dr.actionable_verdict
+    return av.ask_score if isinstance(av, TierCV2Verdict) else None
+
+
+async def run_proceed_veto(
     decider: Decider | None,
     *,
     thread_id: str,
     round_index: int,
     roster: Mapping[str, Role],
     messages: Sequence[ThreadMessage],
-) -> bool:
-    """D-4' G3 (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): may the naysayer's
-    proceed handoff at the head of ``messages`` go to the implementer without a human?
+) -> tuple[bool, float | None]:
+    """D-4' G3 as a veto (T-pr-2b-3-human-identity-delegate msg-5219 Takahito "a" decide, Bohr
+    msg-5227 R2 / msg-5229 R3', Einstein msg-5228 / msg-5230): did the Tier-C Decider judge that
+    the naysayer's proceed handoff at the head of ``messages`` must go to the human?
 
-    **This is a gate, not an observer** — unlike :func:`run_tierc_hook` (D20 shadow), its answer
-    feeds carve-out ③ in :func:`spirrow_mindwire.routing.guard_proposer_to_implementer`. It is
-    monotone in the safe direction: it can only keep the door to code *closed*; it never opens a
-    route the rule-based guard would have closed. Hence every failure mode answers ``False``:
+    Returns ``(vetoed, ask_score)``. **This is a gate, not an observer**, and it is monotone in the
+    safe direction: a veto can only *close* carve-out ③, never open a route the rule-based guard
+    (G1 / G2) would have closed. Only an actionable tierc-v2 ``CONFIRMED`` vetoes
+    (:func:`proceed_vetoed`). Every way of not getting such a verdict answers ``False`` — the
+    Decider being off (``decider is None``, ``backend=off``), declining to call (``None``),
+    raising, a v1 configuration, null / malformed, ``UNSURE``, ``LIKELY_NOT`` — so a Decider
+    outage does not block the loop; G1 / G2 decide (msg-5219: "off・判定を出さない・エラー・
+    grey-zone・LIKELY_NOT のときは G3 は閉じず").
 
-    * ``decider is None`` (``backend=off`` — the production state at msg-4746): ``False``, so
-      under ``run`` a code handoff still stops at the human until the Decider is enabled (the
-      accepted price of G3, msg-4856 §3).
-    * the Decider declines to call (``None``), errors, or returns anything but an actionable
-      ``LIKELY_NOT``: ``False`` (:func:`proceed_cleared`).
+    The distinction between "the Decider was consulted and did not veto" and "the Decider was
+    never consulted" is NOT made here: it is the conductor's cache (``_prefetch_proceed_veto``
+    writes an entry on every consult, including ``decider is None``; a missing entry closes the
+    door — Bohr msg-5229 R3').
 
     No admission gate runs (``gate_result=None``): the gate classifies ``NEXT: human`` labels and
     has nothing to say about a proceed turn.
 
     **Reader of the log line.** One ``decider_proceed_clearance`` ``logger.info`` record per call
-    that reached the Decider, read by the operator off the conductor's own log — a separate prefix
-    from ``decider_decision`` so the §6 escalation tally is not mixed with proceed turns. Nothing
-    is posted to a chatroom thread, so no chatroom fallback surface is involved.
+    that reached the Decider (prefix kept so the shadow log stays greppable across the change;
+    field ``vetoed`` plus ``ask_score``), read by the operator off the conductor's own log to
+    reconcile the redirects counted in msg-5219. Nothing is posted to a chatroom thread, so no
+    chatroom fallback surface is involved.
     """
     if decider is None or not messages:
-        return False
+        return False, None
     try:
         state = state_builder(
             turn_from_messages(
@@ -579,21 +598,25 @@ async def run_proceed_clearance(
         )
         dr = await decider.clear_proceed(state)
     except Exception:
-        logger.warning("decider proceed clearance failed; carve-out ③ stays closed", exc_info=True)
-        return False
-    cleared = proceed_cleared(dr)
+        logger.warning(
+            "decider proceed veto failed; G3 veto unavailable; G1/G2 decide", exc_info=True
+        )
+        return False, None
+    vetoed = proceed_vetoed(dr)
+    ask_score = veto_ask_score(dr)
     if dr is not None:
         record: dict[str, Any] = {
             "thread_id": thread_id,
             "round_index": round_index,
             "head_msg_id": messages[-1].msg_id,
-            "cleared": cleared,
+            "vetoed": vetoed,
+            "ask_score": ask_score,
             **decision_result_to_dict(dr),
         }
         logger.info(
             "decider_proceed_clearance %s", json.dumps(record, ensure_ascii=False, sort_keys=True)
         )
-    return cleared
+    return vetoed, ask_score
 
 
 __all__ = [
@@ -612,9 +635,10 @@ __all__ = [
     "is_tierc_entry",
     "log_decision",
     "never_retry",
-    "proceed_cleared",
+    "proceed_vetoed",
     "routed_from_route",
-    "run_proceed_clearance",
+    "run_proceed_veto",
     "run_tierc_hook",
     "turn_from_messages",
+    "veto_ask_score",
 ]

@@ -13,7 +13,8 @@ Three states (the vocabulary is conclair's; this module only consumes it):
   to the implementer (the old carve-out ③, now project-wide rather than per-thread) — subject to
   the D-4' guardrails in :func:`spirrow_mindwire.routing.carve_out_iii_admissible` (G1: no
   ``TIER-C:`` declared since the human last spoke; G2: ``TIER-C-CHECK: none`` on the proceed) and
-  G3 (the Tier-C Decider cleared the proceed; with the Decider off, ``run`` does not reach code).
+  G3 (a veto: the Tier-C Decider judged the proceed a human matter — tierc-v2 ``CONFIRMED``;
+  a Decider that is off, undecided or failing does not veto, msg-5219).
 
 **The latch is the decided expiry policy.** msg-925 §3-1 asked that delegation not be left open
 indefinitely; the design thread (T-pr-2b-3-human-identity-delegate, Bohr msg-4854 ⚠ / msg-4856 G4)
