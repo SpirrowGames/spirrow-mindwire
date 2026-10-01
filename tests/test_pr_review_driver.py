@@ -4218,7 +4218,7 @@ async def test_same_identity_422_fallback_still_works() -> None:
 @pytest.mark.anyio
 async def test_same_identity_422_fallback_401_raises_environment_terminal_not_quarantine() -> None:
     # msg-3218 fix: the same-identity 422 → COMMENT fallback was not routed
-    # through _classify_and_reraise. A 401 on the fallback POST would therefore
+    # through _classify_exception. A 401 on the fallback POST would therefore
     # bubble as a plain GitHubHTTPError → thread quarantine, i.e. the exact
     # false-quarantine mode this design exists to prevent. The fix wraps the
     # fallback POST in the same funnel, so an env-terminal on the fallback
@@ -4256,7 +4256,7 @@ async def test_same_identity_422_fallback_401_raises_environment_terminal_not_qu
     assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
     assert excinfo.value.status_code == 401
     # The origin tag distinguishes fallback-time failures from primary ones in
-    # the log record (see _classify_and_reraise's logger.warning call).
+    # the log record (see _classify_exception's logger.warning call).
     assert "submit-comment-fallback" in str(excinfo.value)
 
 
@@ -4265,7 +4265,7 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
     # Companion oracle: a TARGET-scoped terminal on the fallback (e.g. the PR
     # was deleted between the primary POST and the fallback POST) must also go
     # through the funnel and surface as TargetTerminalError, not a raw
-    # GitHubHTTPError. Preserves the invariant that _classify_and_reraise is
+    # GitHubHTTPError. Preserves the invariant that _classify_exception is
     # the SOLE producer of the typed variants for every write path.
     from spirrow_mindwire.github.client import TargetTerminalError
 
@@ -4909,6 +4909,25 @@ async def test_submit_retry_budget_exhausted_reraises_last_error() -> None:
 
 
 @pytest.mark.anyio
+async def test_submit_retry_final_attempt_with_retry_after_raises_last_error() -> None:
+    # PR-gate #392 @ 639dd9f objection: "if _submit_retry_delay returns a delay on the final
+    # attempt, the loop hits `continue`, falls out, and crashes with AssertionError". Every
+    # attempt here carries an honourable retry_after, so a delay IS available on the final
+    # attempt. The `attempt < _SUBMIT_MAX_ATTEMPTS` guard keeps the final attempt out of
+    # the retry branch: no third sleep/read, the LAST error is re-raised through the
+    # classifier, and the post-loop AssertionError is never reached.
+    events: list[str] = []
+    errors = [_http(429, retry_after=30) for _ in range(3)]
+    github = _RetryScriptGitHub(head="sha-ra-final", script=list(errors), events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is errors[2]
+    assert not isinstance(excinfo.value, AssertionError)
+    assert events == ["post", "sleep:30", "read", "post", "sleep:30", "read", "post"]
+
+
+@pytest.mark.anyio
 async def test_submit_retry_unknown_head_never_retries() -> None:
     # UNKNOWN stops the loop: with no head_sha the guard can only answer UNKNOWN, so the
     # driver does not retry at all -- decided before sleeping. One POST, no pinning.
@@ -4997,3 +5016,45 @@ async def test_submit_pins_commit_id_on_primary_and_fallback() -> None:
     await _retry_driver(github, events).review(_pr(), post_critique=post)
     assert github.commit_ids == ["sha-pin", "sha-pin"]
     assert events == ["post", "post"]
+
+
+# --- PR-gate #392: the classifier RETURNS, callers raise explicitly ----------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status_code", "probe", "expected_type"),
+    [(401, 401, "EnvironmentTerminalError"), (422, 200, "TargetTerminalError")],
+)
+async def test_classify_exception_returns_typed_error_chained_to_original(
+    status_code: int, probe: int, expected_type: str
+) -> None:
+    # The helper must hand the exception back instead of raising it, so every call
+    # site's ``raise`` is the real exit. The typed variant keeps the ``from exc`` link.
+    from spirrow_mindwire.github import client as client_mod
+
+    class _Probe(_FakeGitHub):
+        async def probe_identity(self) -> int:
+            return probe
+
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"),
+        github=_Probe(ci=CiStatus(CiState.SUCCESS, "sha-classify", [])),
+    )
+    original = GitHubHTTPError(f"POST /reviews returned {status_code}", status_code=status_code)
+    result = await driver._classify_exception(_pr(), original, origin="submit")
+    assert isinstance(result, getattr(client_mod, expected_type))
+    assert result is not original
+    assert result.__cause__ is original
+    assert result.__suppress_context__ is True
+
+
+@pytest.mark.anyio
+async def test_classify_exception_returns_raw_retryable_unchanged() -> None:
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"),
+        github=_FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-classify-raw", [])),
+    )
+    original = GitHubHTTPError("POST /reviews returned 503", status_code=503)
+    result = await driver._classify_exception(_pr(), original, origin="submit")
+    assert result is original

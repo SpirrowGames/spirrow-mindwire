@@ -57,6 +57,7 @@ from ..github.client import (
     CrossPrApproveCoverage,
     EnvironmentTerminalError,
     GitHubClient,
+    GitHubError,
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
@@ -186,6 +187,17 @@ _ALL_LANDED_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
 _SUBMIT_MAX_ATTEMPTS = 3
 _RETRY_AFTER_MAX_S = 60.0
 _SUBMIT_FALLBACK_BACKOFF_S: tuple[float, ...] = (2.0, 8.0)
+
+
+def _chained(err: GitHubError, *, cause: BaseException) -> GitHubError:
+    """Return ``err`` chained to ``cause`` exactly as ``raise err from cause`` would chain it.
+
+    Lets :meth:`NaysayerPrReviewDriver._classify_exception` hand back a typed exception for the
+    caller to ``raise`` explicitly, without losing the ``from exc`` link.
+    """
+    err.__cause__ = cause
+    err.__suppress_context__ = True
+    return err
 
 
 def _submit_retry_delay(exc: GitHubHTTPError, retry_index: int) -> float | None:
@@ -2680,7 +2692,7 @@ class NaysayerPrReviewDriver:
             lost-response POST did reach GitHub; return without a second POST (msg-3275
             invariant). NOT_LANDED → POST again. UNKNOWN → stop and re-raise the original
             error (fail closed; the replay pass owns it). A failing guard read goes through
-            :meth:`_classify_and_reraise`, so a dead token is still exit 2.
+            :meth:`_classify_exception`, so a dead token is still exit 2.
           - a receipt with no ``head_sha`` cannot be guarded (``landed`` would answer
             UNKNOWN), so it is never retried — decided before sleeping, not after.
           - budget exhausted → the last RETRYABLE error is re-raised unchanged, exactly as
@@ -2694,8 +2706,15 @@ class NaysayerPrReviewDriver:
           as before this change.
         """
         commit_id = receipt.head_sha or None
-        attempt = 1
-        while True:
+        # Bounded by construction: at most _SUBMIT_MAX_ATTEMPTS iterations. Every exit is a
+        # statement in this body — ``return`` on success, on guard LANDED, and after the
+        # same-identity 422 COMMENT fallback (called in-loop, just below), and
+        # ``raise await self._classify_exception(...)`` on everything else. The classifier only
+        # BUILDS the exception; the ``raise`` here is what ends the loop (PR-gate #366
+        # advisory + #392 objection: termination must not rest on a helper's side effect).
+        # The final attempt can never take the retry branch (``attempt <
+        # _SUBMIT_MAX_ATTEMPTS`` is false), so it always reaches that raise.
+        for attempt in range(1, _SUBMIT_MAX_ATTEMPTS + 1):
             try:
                 await self._github.submit_review(
                     pr, event=receipt.event, body=receipt.body, commit_id=commit_id
@@ -2741,25 +2760,26 @@ class NaysayerPrReviewDriver:
                             )
                             return
                         if state is LandedState.NOT_LANDED:
-                            attempt += 1
                             continue
                         # UNKNOWN: fail closed — re-raise the original error below.
-                await self._classify_and_reraise(pr, exc, origin="submit")
+                raise await self._classify_exception(pr, exc, origin="submit")  # noqa: B904 — chained by helper
+        raise AssertionError(  # pragma: no cover - the last attempt always returns or raises
+            "unreachable: _submit_review's final attempt returns or raises"
+        )
 
     async def _retry_guard(self, pr: PrRef, *, head_sha: str) -> LandedState:
         """Idempotency guard before a submit retry: has our review for ``head_sha`` landed?
 
         Uses the STRICT fetcher (a read failure raises rather than reading as "empty",
         which would authorise a double POST) and routes that failure through the same
-        :meth:`_classify_and_reraise` funnel as a submit failure, so a dead token found
+        :meth:`_classify_exception` funnel as a submit failure, so a dead token found
         by the guard is still :class:`EnvironmentTerminalError` (exit 2) and a transient
         read failure stops the retry loop with a raw :class:`GitHubHTTPError`.
         """
         try:
             reviews = await self._github.fetch_pr_reviews_strict(pr)
         except GitHubHTTPError as read_exc:
-            await self._classify_and_reraise(pr, read_exc, origin="submit-retry-guard")
-            raise  # unreachable — _classify_and_reraise always raises
+            raise await self._classify_exception(pr, read_exc, origin="submit-retry-guard")  # noqa: B904 — chained by helper
         return landed(
             reviews,
             head_sha=head_sha,
@@ -2785,27 +2805,41 @@ class NaysayerPrReviewDriver:
                 commit_id=receipt.head_sha or None,
             )
         except GitHubHTTPError as fallback_exc:
-            await self._classify_and_reraise(pr, fallback_exc, origin="submit-comment-fallback")
+            raise await self._classify_exception(  # noqa: B904 — chained by helper
+                pr, fallback_exc, origin="submit-comment-fallback"
+            )
 
-    async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
-        """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
+    async def _classify_exception(
+        self, pr: PrRef, exc: GitHubHTTPError, *, origin: str
+    ) -> GitHubError:
+        """Classify a :class:`GitHubHTTPError`, probe if terminal, RETURN the exception to raise.
+
+        This helper never raises the classified error itself; every caller writes
+        ``raise await self._classify_exception(...)`` so the control-flow exit is visible
+        at the call site (PR-gate #392 objection). A typed variant comes back with
+        ``__cause__`` already set to ``exc`` (the equivalent of ``raise ... from exc``); the
+        raw ``exc`` comes back unchanged, so re-raising it keeps its own traceback and its own
+        ``__cause__`` (e.g. the ``httpx`` transport error behind #186). That is why call
+        sites carry ``# noqa: B904``: a caller-side ``from exc`` would overwrite the raw
+        error's cause with itself; the chaining is decided here, once. (The
+        probe itself may still raise — that is a failure of the probe, not the verdict.)
 
         Central funnel used by both the primary submit and the same-identity 422 COMMENT
-        fallback (msg-3218 fix) so an environment-terminal outage during either leg raises
-        :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine) rather
+        fallback (msg-3218 fix) so an environment-terminal outage during either leg is raised
+        as :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine) rather
         than bubbling out as a plain ``GitHubHTTPError`` and quarantining the thread.
 
         Semantics:
 
-        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc``. Retries happen in the
+        * ``Retryability.RETRYABLE`` → return the raw ``exc``. Retries happen in the
           caller, behind the ``landed()`` guard (:meth:`_submit_review`, PR-B'); by the
           time a RETRYABLE error reaches this funnel the caller has decided to stop.
-        * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → raise
+        * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → return
           :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine).
-        * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → raise
+        * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → return
           :class:`TargetTerminalError` (a proper subclass of ``GitHubHTTPError``
           that carries positive-evidence "this is thread-scoped").
-        * ``Retryability.TERMINAL`` + ``Scope.UNKNOWN`` → re-raise the raw ``exc``
+        * ``Retryability.TERMINAL`` + ``Scope.UNKNOWN`` → return the raw ``exc``
           (fail-safe: DESIGN v3 §3 "未分類は必ず 1", and the ``Scope`` docstring's
           "callers MUST NOT collapse UNKNOWN into either concrete value" —
           keeping the raw type preserves the UNKNOWN-ness at the type level).
@@ -2828,14 +2862,17 @@ class NaysayerPrReviewDriver:
                 _submit_decision(scope),
             )
             if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
-                raise EnvironmentTerminalError(
-                    pr=pr,
-                    scope=scope,
-                    status_code=exc.status_code,
-                    message=f"environment-terminal on {pr.slug} ({origin}): {exc}",
-                ) from exc
+                return _chained(
+                    EnvironmentTerminalError(
+                        pr=pr,
+                        scope=scope,
+                        status_code=exc.status_code,
+                        message=f"environment-terminal on {pr.slug} ({origin}): {exc}",
+                    ),
+                    cause=exc,
+                )
             if scope is Scope.TARGET:
-                raise TargetTerminalError(exc) from exc
+                return _chained(TargetTerminalError(exc), cause=exc)
             # UNKNOWN falls through — do NOT collapse into TARGET.
         else:
             logger.warning(
@@ -2847,7 +2884,7 @@ class NaysayerPrReviewDriver:
                 Scope.UNKNOWN.value,
                 "raise",
             )
-        raise exc
+        return exc
 
     async def _emit_head_unchanged_skip(
         self,
@@ -2928,7 +2965,7 @@ class NaysayerPrReviewDriver:
 
         We use :meth:`~spirrow_mindwire.github.client.GitHubReviewClient.fetch_pr_reviews_strict`,
         not the fail-soft variant — a terminal read failure here (a dead PAT) is
-        routed through :meth:`_classify_and_reraise` (``origin="read"``) which is
+        routed through :meth:`_classify_exception` (``origin="read"``) which is
         the SAME funnel :meth:`_submit_review` uses. Env-scope failures raise
         :class:`EnvironmentTerminalError` and exit the turn without POSTing a
         garbage verdict; target/UNKNOWN failures re-raise and quarantine
@@ -3005,8 +3042,7 @@ class NaysayerPrReviewDriver:
         try:
             prior = await self._github.fetch_pr_reviews_strict(pr)
         except GitHubHTTPError as read_exc:
-            await self._classify_and_reraise(pr, read_exc, origin="read")
-            raise  # unreachable — _classify_and_reraise always raises
+            raise await self._classify_exception(pr, read_exc, origin="read")  # noqa: B904 — chained by helper
         head_landed = landed(
             prior,
             head_sha=ci.head_sha,
