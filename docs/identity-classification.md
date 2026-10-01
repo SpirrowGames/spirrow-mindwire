@@ -41,9 +41,11 @@ write half exists to register — `observed = ∅` is a certainty, so the inters
 `allowed_roles = ∅` for every one of them and the msg-1489 §4 biconditional then classified them as
 machinery. Registration could not bootstrap (msg-1585 §1).
 
-`legitimate = ∅` is the honest value for a **machine**; a subsequent `upsert_identity` MUST leave
-`allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485) and `independence_class = null`
-(msg-1487 §4; its constituent §2 / §3 endorsed by Einstein msg-1488).
+`legitimate = ∅` is the honest value for a **machine**; its `upsert_identity` MUST carry
+`allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485). The `independence_class` it
+carries is **not restated here**: see [§ Write half](#write-half--revised-by-msg-1704--msg-1706).
+(The earlier text said `independence_class = null`. The live API rejects that value, as
+msg-1703 §2 measured.)
 
 ## The four identity names this repo writes
 
@@ -76,7 +78,7 @@ The two questions Bohr's §5 posed:
 1. **participant** (the identity IS an LLM actor whose voice the post carries verbatim) →
    `legitimate = {role(s) the actor plays}`.
 2. **machine** (the identity IS harness code; no LLM speaks under this name) →
-   `legitimate = ∅` (`allowed_roles = []`, `independence_class = null`).
+   `legitimate = ∅` (`allowed_roles = []`; `independence_class`: see § Write half).
 
 ### `naysayer-pr-review` — **participant**, `legitimate = {naysayer}`
 
@@ -120,12 +122,10 @@ harness writes — which Bohr's msg-1484 §5 forbids explicitly: "**`naysayer-pr
 participant なら `[]` にしてはならない。それは Tier-B gate の verdict を「機械の発言」として
 記録することになり、§3 と逆向きの捏造になる。**"
 
-**Consequence for the write half**: `upsert_identity("naysayer-pr-review",
-allowed_roles=["naysayer"], independence_class=<the value the T15 gradient assigns to a Gemini
-tier participant>)`. The `independence_class` value MUST be non-null (the bidirectional invariant
-of msg-1487 §3 / msg-1489 §4 requires `allowed_roles ≠ ∅ ⟺ independence_class ≠ null`). This repo does not own
-the `independence_class` enum's SoT (ADR-2026-05-31-15); the write-half implementer must consult
-the T15 gradient by primary source before selecting a value.
+**Consequence for the write half**: `allowed_roles = ["naysayer"]`. The payload is built by
+`src/spirrow_mindwire/identity/registration.py::build_upsert_identity_args` from this entry. The participant's `independence_class` is declared once, on the
+entry in `spec/identity/legitimate_roles.yaml` (decided by msg-1704 §4 and endorsed by Einstein
+msg-1705 / msg-1707).
 
 ### `orchestrator` — **machine**, `legitimate = ∅`
 
@@ -141,9 +141,8 @@ never appears as an `author` on any `chatroom_post_message` call in `src/`. So n
 under this name and no post's role stamp is ever set for it — it is a thread-metadata label the
 harness stamps to identify who *opened* the ledger, not who authored anything.
 
-**Consequence for the write half**: `upsert_identity("orchestrator", allowed_roles=[],
-independence_class=null)`. Under the msg-1487 §3 / msg-1489 §4 bidirectional invariant, both
-sides are set to their absence values together.
+**Consequence for the write half**: `allowed_roles = []`, payload built by
+`src/spirrow_mindwire/identity/registration.py::build_upsert_identity_args` (see § Write half).
 
 The 258/258 null count from PR #153's commit message (`orchestrator: 258/258 null`) refers to
 `role` values on posts credited to this name — but grep shows no post site here. Those 258 posts
@@ -188,8 +187,9 @@ conductor's own framing wrapping the driver's outcome.
 `pr-gate-relay` is therefore **machinery** — a mechanical transport that carries an outcome, not
 an actor that produced one. `legitimate = ∅`.
 
-**Consequence for the write half**: `upsert_identity("pr-gate-relay", allowed_roles=[],
-independence_class=null)`. The 26/26 null count (PR #153 commit message) is honest and stays.
+**Consequence for the write half**: `allowed_roles = []`, payload built by
+`src/spirrow_mindwire/identity/registration.py::build_upsert_identity_args` (see § Write half). The 26/26 null count (PR #153 commit message) is honest and
+stays: a machine's post keeps `role = null` after the write half as well (msg-4902 §2).
 
 ### `conductor-relay` — **machine**, `legitimate = ∅`
 
@@ -216,8 +216,8 @@ entries above document (msg-2540 §1-4 explicitly pins that constraint: the load
 `kind=machine` with a non-empty `legitimate` list, and giving the relay a role to route around that
 would fabricate exactly the evidence the invariant exists to make meaningful).
 
-**Consequence for the write half**: `upsert_identity("conductor-relay", allowed_roles=[],
-independence_class=null)`. No live-corpus count yet — this identity is registered by T-human-
+**Consequence for the write half**: `allowed_roles = []`, payload built by
+`src/spirrow_mindwire/identity/registration.py::build_upsert_identity_args` (see § Write half). No live-corpus count yet — this identity is registered by T-human-
 terminal-overuse before its first post, so `residual` starts empty; the first `identity_findings`
 run after the landing will confirm that (or surface unexpected earlier writes, which would be a
 live-corpus finding not a spec change).
@@ -231,12 +231,42 @@ live-corpus finding not a spec change).
   (`legitimate \ observed` — the entitlement it has not exercised). Both come from
   `scripts/identity_findings.py`. A non-empty `residual` is a finding the write half must reason
   about before registering (msg-1493 §3); a non-empty `unused` is reported and gates nothing.
-- **`independence_class`'s exact value for `naysayer-pr-review`.** The T15 gradient (ADR-2026-05-31-15)
-  is the SoT for that enum and lives in a repo this implementer cannot read (per
-  `OBL-DECLARE-UNREADABLE`). Any value assigned here without reading T15 would be a guess.
-- **Whether Prismind's `upsert_identity` API exists as-described in Bohr's spec.** The design
-  references it by name and the write half depends on it, but no code in this repo calls it and
-  no schema in this repo defines it. That reachability question is a write-half prerequisite.
+- **`independence_class` values.** This file originally left them open. The write half now
+  settles them; see § Write half.
+- **Reachability of `upsert_identity`.** Since answered: magickit exposes `upsert_identity`
+  and `get_identity` on the MCP surface this repo already uses (live `tools/list`, measured
+  at the start of PR-B).
+
+## Write half — revised by msg-1704 / msg-1706
+
+This section supersedes every `independence_class = null` the read half wrote above. The live
+enum rejects null (msg-1703 §2). Einstein's msg-1707 endorsed the design:
+
+- **Payloads are not restated in this doc.** Every `upsert_identity` argument set is built by
+  `src/spirrow_mindwire/identity/registration.py::build_upsert_identity_args`, the only constructor of those arguments in this repo, from the entry in
+  `spec/identity/legitimate_roles.yaml`. The machine value is one named constant
+  (`MACHINE_INDEPENDENCE_CLASS` in `identity/classification.py`), added to Prismind by
+  ADR-2026-08-25-20. The participant value lives on its YAML entry. The reason for this
+  arrangement (msg-1706 §2) is that a doc that restates a payload can drift into prescribing a
+  value the API rejects. A doc that names the constructor cannot.
+- **Guard (both directions, all in mindwire; msg-1706 §1).**
+  `registration.py::check_identity_against_classification` requires:
+  `kind = machine` ⟹ `allowed_roles = []` **and** `independence_class = machine`;
+  `kind = participant` ⟹ `allowed_roles ≠ []` **and** `independence_class ≠ machine`.
+  The participant side is intentionally left open, not a closed set.
+  Prismind enforces none of this, because it does not own the role vocabulary
+  (ADR-2026-05-29-10). The guard runs on every outgoing payload, on the read-back after
+  registration, and on the live store in `scripts/identity_findings.py` (the `store` block,
+  which is the msg-1706 §4 tamper check).
+- **Registration** is `scripts/register_identities.py --apply`. Deployment of the `machine`
+  value is verified only by that run's live result. A `success=False` stops the run. No local
+  copy of Prismind's enum exists in this repo, whether as a tuple or an import (msg-1706 §2 / DoD 4).
+- **Forward effect (msg-1704 §5).** `naysayer-pr-review` is registered with
+  `independence_class = independent`. Today this changes no behaviour, because the naysayer
+  allowlist is config. Once the planned magickit reader that treats
+  `independence_class == "independent"` as naysayer lands, this identity is promoted to a
+  naysayer identity next to Einstein. Whoever lands that reader should decide with that effect
+  in view.
 
 ## Requirement-vs-artifact table
 
