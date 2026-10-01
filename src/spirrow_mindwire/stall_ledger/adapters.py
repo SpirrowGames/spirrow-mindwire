@@ -259,10 +259,23 @@ def _failed(
 
 # ─── GitHub ────────────────────────────────────────────────────────────────────────────
 
-#: ``mergeable_state`` values under which the merge is executable. Everything else --
-#: ``dirty``, ``blocked``, ``behind``, ``unstable``, ``draft``, ``unknown``, absent --
+#: ``mergeable_state`` values under which the merge is executable. Every other
+#: OBSERVED value -- ``dirty``, ``blocked``, ``behind``, ``unstable``, ``draft`` --
 #: reads as not executable, which is the loud side of ``needs_actor_pr``.
 _EXECUTABLE_MERGE_STATES = frozenset({"clean", "has_hooks"})
+
+#: ``mergeable_state`` values that mean GitHub has not computed the merge state yet
+#: (it is computed lazily; the first read often answers ``unknown``). ``None`` -- the
+#: field absent or JSON null -- is treated the same way. Bohr msg-5157 §3: such a PR is
+#: UNOBSERVABLE this tick -- neither ``dirty`` (a false external block) nor "not
+#: blocked" -- so it goes into ``unobservable`` and close rule (a) does not touch it.
+_UNCOMPUTED_MERGE_STATES = frozenset({"unknown"})
+
+
+def mergeable_state_is_observed(mergeable_state: str | None) -> bool:
+    """False for ``None`` / ``unknown``: the merge state has not been computed yet."""
+    return mergeable_state is not None and mergeable_state not in _UNCOMPUTED_MERGE_STATES
+
 
 #: Review states that count as a verdict on the head they were submitted against.
 _VERDICT_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED"})
@@ -274,21 +287,28 @@ class GitHubOpenPrAdapter:
     Per heartbeat: one paginated listing (``list_open_prs``, the request pinned by
     ``build_open_pr_query``), then per open PR three existing reads -- reviews
     (strict), the PR object (for ``mergeable_state``) and the check rollup (for the
-    head commit's clock and the CI rows). A PR whose per-PR reads fail is counted as
-    ``unrecognized`` and reported ``unobservable``: its record is neither opened nor
-    closed on a heartbeat that could not see it.
+    head commit's clock and the CI rows). A PR whose per-PR reads fail -- or whose
+    ``mergeable_state`` GitHub has not computed yet (``unknown`` / null, msg-5157 §3) --
+    is counted as ``unrecognized`` and reported ``unobservable``: its record is neither
+    opened nor closed on a heartbeat that could not see it.
 
     Mapping onto ``PrState`` / ``ClassifierInput`` (implementer's reading, see module
     docstring):
 
     * verdict = the newest review on the CURRENT head whose state is APPROVED,
-      CHANGES_REQUESTED or COMMENTED. A head that moved past every verdict has none,
-      so the review actor owes a call.
+      CHANGES_REQUESTED or COMMENTED. A head with no review at all, or one that moved
+      past every verdict, has none -- "no verdict", the loud side -- so the review
+      actor owes a call.
     * ``verdict_recorded_as_indefinite_input`` = that verdict is COMMENTED (the gate
       posts COMMENT for ``ci=pending`` / ``ci=unknown``, msg-2354 M-3/M-4).
     * ``merge_state_is_executable`` = ``mergeable_state`` in {clean, has_hooks}.
     * ``is_approve_awaiting_human_merge`` = APPROVED and executable.
     * ``is_externally_blocked`` = ``mergeable_state == "dirty"`` (M-3: needs a rebase).
+      ``blocked`` / ``behind`` / ``unstable`` are NOT external blocks: ``blocked`` is
+      the normal state of a PR carrying an RC, CI runs on ``behind``, and ``unstable``
+      is failing CI -- in each the PR's actor is still expected to move (msg-5157 §3).
+    * ``mergeable_state`` ``unknown`` / null -> the PR is unobservable this tick (see
+      above), never mapped to blocked or not-blocked.
     * ``ci_became_definitive`` = the rollup has rows and every row is completed.
     * motion: the head as ``head_push`` at the head commit's ``committedDate``, and every
       submitted review as ``review`` at ``submitted_at``. ``committedDate`` is used
@@ -296,6 +316,11 @@ class GitHubOpenPrAdapter:
       PR's ``updatedAt``, which any label or comment moves -- that would make motion look
       newer than it is (the quiet side). ``committedDate`` can only be earlier than the
       push (the loud side).
+
+      Known residual (accepted, Bohr msg-5157 §3): a commit authored locally long ago
+      and pushed later carries its old ``committedDate``, so that push reads as older
+      motion than it is and the stall can open EARLY (by up to the commit-to-push gap).
+      This errs to the loud side and is not corrected here.
     """
 
     def __init__(
@@ -364,6 +389,8 @@ class GitHubOpenPrAdapter:
         except (TimeoutError, GitHubError):
             return None
         if state.resolution != PrResolution.OPEN or rollup is None:
+            return None
+        if not mergeable_state_is_observed(state.mergeable_state):
             return None
         head_sha = state.head_sha or pr.head_sha
         return build_pr_observation(

@@ -108,11 +108,92 @@ def test_latest_verdict_on_head_wins() -> None:
     assert obs.needs_actor is False
 
 
+def test_pr_with_no_review_at_all_has_no_verdict_and_needs_actor() -> None:
+    """msg-5157 §3: no review on the head (here: none at all) = "no verdict", loud side."""
+    obs = _obs([], "clean")
+    assert obs.needs_actor is True
+    assert not obs.classifier_input.verdict_is_indefinite
+    assert [m.type for m in obs.motion] == ["head_push"]
+
+
+# msg-5157 §3: one row per observed mergeable_state. Only clean/has_hooks are executable
+# (so APPROVED is "awaiting human merge"); only dirty is an external block.
+@pytest.mark.parametrize(
+    ("mergeable", "executable", "externally_blocked"),
+    [
+        ("clean", True, False),
+        ("has_hooks", True, False),
+        ("dirty", False, True),
+        ("blocked", False, False),
+        ("behind", False, False),
+        ("unstable", False, False),
+    ],
+)
+def test_observed_mergeable_states_map(
+    mergeable: str, executable: bool, externally_blocked: bool
+) -> None:
+    obs = _obs([_rv("APPROVED")], mergeable)
+    assert obs.needs_actor is (not executable)
+    assert obs.classifier_input.is_externally_blocked is externally_blocked
+    gh = _FakeGitHub()
+    gh.mergeable = {1: mergeable, 2: mergeable}
+    result = asyncio.run(GitHubOpenPrAdapter(gh, "o", "r").fetch())  # type: ignore[arg-type]
+    assert result.unobservable == frozenset()
+    assert len(result.observations) == 2
+
+
+@pytest.mark.parametrize("mergeable", ["unknown", None])
+def test_uncomputed_mergeable_state_is_unobservable_and_closes_nothing(
+    tmp_path: Path, mergeable: str | None
+) -> None:
+    """msg-5157 §3 (hard requirement): ``unknown`` / null -> unobservable this tick.
+
+    PR #1 carries an APPROVE on its head, so if ``unknown`` / null leaked through as
+    executable it would read as not-needs_actor and close by rule (a); if it leaked as
+    ``dirty`` it would read as an external block. Neither may happen: the PR is
+    reported unobservable and its open record survives untouched.
+    """
+    gh = _FakeGitHub()
+    gh.mergeable = {1: "blocked", 2: "blocked"}
+    gh.reviews = {1: [_rv("APPROVED", sha="s1", rid="r1")]}
+    adapter = GitHubOpenPrAdapter(gh, "o", "r")  # type: ignore[arg-type]
+    state = tmp_path / "state"
+
+    def tick(now: datetime) -> Any:
+        return asyncio.run(
+            run_tick(
+                paths=TickPaths(state_dir=state),
+                adapters=[adapter],
+                now=lambda: now,
+                out=io.StringIO(),
+            )
+        )
+
+    tick(NOW)
+    store_path = state / "stall-ledger.json"
+    before = json.loads(store_path.read_text(encoding="utf-8"))["records"]
+    assert "pr:o/r#1" in before, "precondition: the record must be open"
+
+    gh.mergeable = {1: mergeable, 2: "blocked"}
+    result = asyncio.run(adapter.fetch())
+    assert result.unobservable == frozenset({"pr:o/r#1"})
+    assert [o.unit.key for o in result.observations] == ["pr:o/r#2"]
+    assert (result.report.recognized, result.report.unrecognized) == (1, 1)
+
+    out = tick(NOW + timedelta(hours=1))
+    assert [line for line in out.lines if line["kind"] == "close"] == []
+    after = json.loads(store_path.read_text(encoding="utf-8"))["records"]
+    assert after["pr:o/r#1"] == before["pr:o/r#1"]
+
+
 class _FakeGitHub:
     def __init__(self, *, listing_error: str | None = None, fail_pr: int | None = None) -> None:
         self.listing_error = listing_error
         self.fail_pr = fail_pr
         self.bodies: dict[str, str | None] = {}
+        # Per-PR ``mergeable_state``; a PR not named here reads "clean".
+        self.mergeable: dict[int, str | None] = {}
+        self.reviews: dict[int, list[ReviewInfo]] = {}
 
     async def list_open_prs(self, owner: str, repo: str) -> Any:
         from spirrow_mindwire.github.client import OpenPrListing
@@ -130,10 +211,15 @@ class _FakeGitHub:
 
         if pr.number == self.fail_pr:
             raise GitHubHTTPError("boom")
-        return []
+        return list(self.reviews.get(pr.number, []))
 
     async def fetch_pr_state(self, pr: PrRef) -> PrState:
-        return PrState(ref=pr, resolution=PrResolution.OPEN, head_sha=f"s{pr.number}")
+        return PrState(
+            ref=pr,
+            resolution=PrResolution.OPEN,
+            head_sha=f"s{pr.number}",
+            mergeable_state=self.mergeable.get(pr.number, "clean"),
+        )
 
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup:
         return CheckRollup(head_sha="s", head_committed_date=T0, head_pushed_at=T0, rows=())

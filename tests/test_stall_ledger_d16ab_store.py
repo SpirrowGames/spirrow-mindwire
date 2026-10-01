@@ -326,6 +326,19 @@ def test_clear_request_writes_only_a_request_file(tmp_path: Path) -> None:
     assert not list(req_dir.glob("*.tmp"))
 
 
+def test_clear_request_explicit_null_reads_as_empty_not_none_string(tmp_path: Path) -> None:
+    """#362 gate advisory / msg-5157 §4: ``null`` must not become the string "None"."""
+    req_dir = tmp_path / "r"
+    req_dir.mkdir()
+    (req_dir / "clear-20260930T000000Z-x.json").write_text(
+        json.dumps({"unit_key": "pr:o/r#1", "requested_by": None, "requested_at": None}),
+        encoding="utf-8",
+    )
+    [request], invalid = read_clear_requests(req_dir)
+    assert invalid == []
+    assert (request.requested_by, request.requested_at) == ("", "")
+
+
 def test_two_clear_requests_never_overwrite_each_other(tmp_path: Path) -> None:
     req_dir = tmp_path / "r"
     a = write_clear_request(req_dir, "k1", "a", NOW)
