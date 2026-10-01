@@ -164,14 +164,14 @@ def test_stop_tokens_return_skip(token: str) -> None:
         "nonesuch",  # substring of "none" but a different token
     ],
 )
-def test_only_the_two_stop_tokens_return_skip(token: str) -> None:
+def test_only_the_stop_tokens_return_skip(token: str) -> None:
     """Property-style: every non-STOP_TOKENS token stays out of the SKIP branch.
 
     This is the closed-set invariant that fixes the failure mode this module was written for:
     the head-skip cache cannot silently swallow a live thread by mistaking its handoff for a
-    stop. The set is fixed at ``{none, human}`` at import time (:data:`STOP_TOKENS`) and any
-    change requires updating this test — a code refactor cannot expand the skip surface by
-    accident.
+    stop. The set is fixed at ``{none, human, operator}`` at import time (:data:`STOP_TOKENS`)
+    and any change requires updating this test — a code refactor cannot expand the skip
+    surface by accident.
     """
     verdict = decide(
         now=_T0,
