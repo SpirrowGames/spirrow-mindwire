@@ -359,7 +359,8 @@ async def test_v2_bad_matched_rule_keeps_the_verdict(
     assert dr.outcome is DecisionOutcome.EVALUATED
     assert dr.verdict is not None and dr.verdict.kind is TierCVerdictKind.CONFIRMED
     assert dr.matched_rule is None and dr.matched_rule_error is not None
-    assert dr.matched_rule_source == "choice"
+    # msg-4629 §2: no value → no source; ``matched_rule_error`` carries the reason.
+    assert dr.matched_rule_source is None
     assert "matched_rule unusable" in caplog.text
 
 
@@ -369,6 +370,7 @@ async def test_v2_none_is_a_valid_matched_rule() -> None:
         _state(), client=FakeClient(_payload(choice="none")), policy="p", rules=RULES
     )
     assert dr.matched_rule == "none" and dr.matched_rule_error is None
+    assert dr.matched_rule_source == "choice"
 
 
 @pytest.mark.anyio
@@ -378,11 +380,13 @@ async def test_v2_null_provider_and_transport_error_keep_version_fields() -> Non
     )
     assert dr.outcome is DecisionOutcome.NO_VERDICT_NULL
     assert dr.matched_rule is None and dr.rules_sha256 == RULES.sha256
+    assert dr.matched_rule_source is None  # msg-4629 §2: no answer, no source
     te = await decide_once(
         _state(), client=FakeClient(exc=LexoraTimeoutError("t")), policy="p", rules=RULES
     )
     assert te.outcome is DecisionOutcome.TRANSPORT_ERROR
     assert te.questions_version == "tierc-v3" and te.rules_sha256 == RULES.sha256
+    assert te.matched_rule is None and te.matched_rule_source is None
 
 
 @pytest.mark.anyio

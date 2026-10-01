@@ -89,6 +89,7 @@ from .config import (
     load_settings,
     resolve_tier_c_decisions_log_path,
     resolve_tierc_rules_path,
+    resolve_tierc_rules_snapshot_dir,
 )
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
@@ -825,6 +826,8 @@ def build_conductor(
             # malformed file refuses startup through the ValueError below.
             questions=dec_cfg.tierc.questions,
             rules_path=resolve_tierc_rules_path(settings),
+            # msg-4631 / 4633 / 5130: the loaded bytes are saved by sha256; never refuses startup.
+            snapshot_dir=resolve_tierc_rules_snapshot_dir(settings),
             v2_thresholds=TierCV2Thresholds(
                 ask_min=dec_cfg.thresholds.tierc_v2_ask_min,
                 not_ask_max=dec_cfg.thresholds.tierc_v2_not_ask_max,

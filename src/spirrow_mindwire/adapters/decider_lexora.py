@@ -53,10 +53,12 @@ than silently pointing at the loopback default.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -187,7 +189,8 @@ async def decide_once(
         else {
             "questions_version": v2_version,
             "rules_sha256": rules.sha256,
-            "matched_rule_source": MATCHED_RULE_SOURCE_CHOICE,
+            # No answer was obtained on these paths, so ``matched_rule`` is ``None`` and so is its
+            # source (Bohr msg-4629 §2): ``"choice"`` is only ever paired with a value.
         }
     )
 
@@ -328,7 +331,9 @@ def _v2_result(
         questions_version=questions_version,
         latency_ms=latency_ms,
         matched_rule=matched_rule,
-        matched_rule_source=MATCHED_RULE_SOURCE_CHOICE,
+        # ``None`` with ``None`` (msg-4629 §2): a broken ``choice`` answer has no source either —
+        # ``matched_rule_error`` says why — so a reader never needs ``outcome`` to tell them apart.
+        matched_rule_source=MATCHED_RULE_SOURCE_CHOICE if matched_rule is not None else None,
         matched_rule_error=rule_error,
         rules_sha256=rules.sha256,
     )
@@ -438,6 +443,124 @@ class DeciderLexoraAdapter:
                 logger.warning("decider client close failed", exc_info=True)
 
 
+def _corrupt_evidence_path(dest: Path, now: datetime) -> Path:
+    """``<hash>.toml.corrupt-<UTC %Y%m%dT%H%M%SZ>`` (msg-5130 step 2); a ``-<n>`` suffix only if
+    a second corruption lands inside the same second, so earlier evidence is never overwritten."""
+    base = f"{dest.name}.corrupt-{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    candidate = dest.with_name(base)
+    n = 1
+    while candidate.exists():
+        candidate = dest.with_name(f"{base}-{n}")
+        n += 1
+    return candidate
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def snapshot_tierc_rules(
+    rules: TierCRules,
+    snapshot_dir: Path,
+    *,
+    now: Callable[[], datetime] = _utc_now,
+) -> bool:
+    """Save the bytes the live Decider hashed to ``<snapshot_dir>/<rules_sha256>.toml``.
+
+    Design: T-decider-tierc-v2-all-escalations, Bohr msg-4631 / 4633 / 5130 (Einstein msg-5131
+    approved). The canonical rules file lives outside git and is edited in place, so the text
+    behind a shadow row's ``rules_sha256`` is only recoverable if it is saved when the hash is
+    computed — here, at build time — from :attr:`TierCRules.raw` (never a re-read of the file).
+
+    * A same-named snapshot whose bytes hash to its name → nothing is written (idempotent).
+    * Absent → write ``<hash>.toml.tmp`` (fsync), ``os.replace`` it onto ``<hash>.toml``.
+    * Present but its bytes do not hash to its name (corrupt / tampered) → write the tmp file,
+      move the bad file aside to ``<hash>.toml.corrupt-<UTC>`` (evidence kept), ``os.replace``
+      the tmp file in, and log ERROR with the bad file's real sha256. If the move aside fails
+      the bad file is left untouched — evidence is never destroyed to make room.
+    * The tmp name is fixed per hash and is unlinked in ``finally`` unless the replace
+      completed, so repeated failing starts (disk full) never pile up files (msg-5130 Obj. 2).
+
+    **Never raises** (msg-4633 Objection 1 / D20): a snapshot is telemetry for the offline
+    report, and failing to write one must not stop the conductor. Every failure is one
+    ``logger.error`` line naming the reason, the hash and the path. Returns ``True`` iff
+    ``<hash>.toml`` holds ``raw`` afterwards.
+    """
+    sha = rules.sha256
+    dest = snapshot_dir / f"{sha}.toml"
+    tmp = snapshot_dir / f"{sha}.toml.tmp"
+    try:
+        if hashlib.sha256(rules.raw).hexdigest() != sha:
+            logger.error(
+                "decider tierc rules snapshot skipped: loaded bytes do not hash to "
+                "rules_sha256=%s (path=%s)",
+                sha,
+                dest,
+            )
+            return False
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        existing: bytes | None
+        try:
+            existing = dest.read_bytes()
+        except FileNotFoundError:
+            existing = None
+        existing_sha = hashlib.sha256(existing).hexdigest() if existing is not None else None
+        if existing_sha == sha:
+            return True
+        evidence: Path | None = None
+        replaced = False
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(rules.raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if existing is not None:
+                evidence = _corrupt_evidence_path(dest, now())
+                try:
+                    os.replace(dest, evidence)
+                except OSError as exc:
+                    logger.error(
+                        "decider tierc rules snapshot is corrupt and could not be moved aside "
+                        "(rules_sha256=%s actual_sha256=%s path=%s): %s — left untouched",
+                        sha,
+                        existing_sha,
+                        dest,
+                        exc,
+                    )
+                    return False
+            os.replace(tmp, dest)
+            replaced = True
+        finally:
+            if not replaced:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "decider tierc rules snapshot tmp file %s not removed: %s", tmp, exc
+                    )
+        if evidence is not None:
+            logger.error(
+                "decider tierc rules snapshot was corrupt (rules_sha256=%s actual_sha256=%s); "
+                "moved aside to %s and restored %s from the loaded bytes",
+                sha,
+                existing_sha,
+                evidence,
+                dest,
+            )
+        else:
+            logger.info("decider tierc rules snapshot saved: %s", dest)
+        return True
+    except Exception as exc:  # telemetry must never stop the conductor (D20, msg-4633)
+        logger.error(
+            "decider tierc rules snapshot failed (rules_sha256=%s path=%s): %s: %s",
+            sha,
+            dest,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
 def resolve_backend(config_backend: str) -> str:
     """``MINDWIRE_DECIDER_BACKEND`` when set (msg-4180 §4 / D4), else ``[decider].backend``."""
     env = os.environ.get(_BACKEND_ENV, "").strip()
@@ -453,6 +576,7 @@ def build_decider(
     questions: QuestionSet = "tierc-v2",
     rules_path: Path | None = None,
     v2_thresholds: TierCV2Thresholds | None = None,
+    snapshot_dir: Path | None = None,
 ) -> DeciderLexoraAdapter | None:
     """Composition-root factory. ``None`` = Decider off (no HTTP will ever be made).
 
@@ -466,6 +590,11 @@ def build_decider(
     :class:`~spirrow_mindwire.decider.questions.TierCRulesError` (a ``ValueError``) — the same
     refuse-to-start policy as a missing ``MINDWIRE_LEXORA_URL``. The packaged template is never
     read as a fallback (msg-4382: one canonical copy).
+
+    ``snapshot_dir`` given → the loaded bytes are saved to ``<snapshot_dir>/<rules_sha256>.toml``
+    right after the read (:func:`snapshot_tierc_rules`, msg-4631 / 4633 / 5130). That step never
+    raises: a snapshot failure is an ERROR log line and the Decider is built as usual. Only a
+    missing / malformed rules file — the evaluation's own input — refuses startup.
     """
     backend = resolve_backend(config_backend)
     if backend == "off" or tierc_mode == "off":
@@ -497,6 +626,8 @@ def build_decider(
             rules.sha256,
             len(rules.rules),
         )
+        if snapshot_dir is not None:
+            snapshot_tierc_rules(rules, snapshot_dir)
     return DeciderLexoraAdapter(
         tierc_mode=tierc_mode,
         client_factory=client_factory,
@@ -515,4 +646,5 @@ __all__ = [
     "build_decider",
     "decide_once",
     "resolve_backend",
+    "snapshot_tierc_rules",
 ]

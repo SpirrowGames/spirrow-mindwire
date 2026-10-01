@@ -526,12 +526,18 @@ class DeciderTierCConfig(_StrictModel):
     ``<data_dir>/config/tierc_rules.toml`` (mindwire.toml と同じディレクトリ —
     :func:`resolve_tierc_rules_path`)。初回配置は ``mindwire init-config tierc-rules``。
     起動時に 1 回だけ読む ∴ 文言を直したら conductor を再起動する (msg-4384)。
+
+    :attr:`rules_snapshot_dir` は読み込んだルールの退避先 (T-decider-tierc-v2-all-escalations
+    msg-4631 / 4633 / 5130)。未指定なら ``<data_dir>/decider/rules``
+    (:func:`resolve_tierc_rules_snapshot_dir`)。起動のたびに ``<rules_sha256>.toml`` が無ければ
+    保存される ∴ 文言を直して再起動しても、旧版の文言はここに残る。
     """
 
     mode: Literal["off", "shadow", "annotate", "bounce"] = "shadow"
     skip_naysayer_when_confirmed: bool = False
     questions: Literal["tierc-v1", "tierc-v2"] = "tierc-v2"
     rules_path: Path | None = None
+    rules_snapshot_dir: Path | None = None
 
 
 class DeciderConfig(_StrictModel):
@@ -679,6 +685,16 @@ def resolve_tierc_rules_path(settings: MindwireSettings) -> Path:
     return settings.paths.config_dir / TIERC_RULES_FILENAME
 
 
+def resolve_tierc_rules_snapshot_dir(settings: MindwireSettings) -> Path:
+    """``[decider.tierc].rules_snapshot_dir`` when set (``expanduser`` applied), else
+    ``<data_dir>/decider/rules`` — where the live Decider saves the rules bytes it loaded, keyed
+    by ``rules_sha256`` (msg-4631 / 4633 / 5130)."""
+    configured = settings.decider.tierc.rules_snapshot_dir
+    if configured is not None:
+        return configured.expanduser()
+    return settings.paths.data_dir / "decider" / "rules"
+
+
 def _default_config_path() -> Path:
     """Resolve the default ``mindwire.toml`` path.
 
@@ -762,4 +778,5 @@ __all__ = [
     "load_settings",
     "resolve_tier_c_decisions_log_path",
     "resolve_tierc_rules_path",
+    "resolve_tierc_rules_snapshot_dir",
 ]
