@@ -34,7 +34,7 @@ is decisive:
    inverted: "alert-not-open" means the failure is *actively persisting*,
    and applying the same rule would clear the state every tick, defeating
    the rate limiter. The result is not merely wrong; it is wrong in the
-   direction that reintroduces the 5-minute-spam vector this whole module
+   direction that reintroduces the per-tick-spam vector this whole module
    exists to close.
 3. **Key shape**: :attr:`FailureEpisode.thread_id` is part of the episode
    key; a failed thread creation produces no thread_id to key on.
@@ -164,7 +164,7 @@ Episode clear (D-2''' Rule 1 — positive observation only):
   silent stalls).
 
 The clear NEVER touches the floor record (D-2''' Rule 2). Flapping
-(failure → no-failure → failure) leaves the floor intact so a 5-minute
+(failure → no-failure → failure) leaves the floor intact so a tick-scale
 oscillation cannot restart the spam.
 
 Invariants this module MUST NOT violate (raise on any):
@@ -248,7 +248,7 @@ from .magickit.client import McpToolCaller, ThreadResolvedError
 # Named here (not scattered as a magic number) because msg-2295 D-2'' pinned
 # it as a testable claim: "1 project につき 24 時間に 1 回を超えて post を
 # 試みない". The test at ``test_floor_holds_across_failing_posts`` computes
-# 24h / 5min = 288 ticks from this value and asserts exactly one attempt.
+# 24h / <simulated tick interval> ticks from this value and asserts exactly one attempt.
 FAILURE_REPORT_FLOOR = timedelta(hours=24)
 
 
@@ -953,7 +953,7 @@ class CloseFailureVisibility:
         #    is a new episode, the episode record) BEFORE attempting the
         #    post. This is what makes the "≤ 1 attempt / 24h" claim
         #    actually enforceable — writing the floor only on post-success
-        #    would let a persistently failing post loop 288 times per 24h
+        #    would let a persistently failing post loop once per tick, all day
         #    (Einstein msg-2294 objection).
         state.floors[thread_id] = RateLimitFloor(
             project=project, thread_id=thread_id, last_attempt_at=now_iso
@@ -1209,7 +1209,7 @@ def _format_visibility_report(*, project: str, thread_id: str, exc: BaseExceptio
         "feedback):**\n\n"
         "- **The close attempt itself is NOT rate-limited.** The sweeper "
         "continues to call `close_alert` on THIS thread on every "
-        "5-minute tick. The moment the underlying cause is fixed "
+        "scheduled tick. The moment the underlying cause is fixed "
         "upstream, the next tick will close this thread and no further "
         "action is required — do NOT wait 24 hours.\n"
         "- **Only THIS report is rate-limited.** The visibility "

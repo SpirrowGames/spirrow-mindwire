@@ -486,7 +486,7 @@ class GitHubReviewClient(Protocol):
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
 
     async def submit_review(
-        self, pr: PrRef, *, event: ReviewEvent, body: str
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
     ) -> dict[str, Any]: ...
 
     async def probe_identity(self) -> int: ...
@@ -577,8 +577,18 @@ class GitHubClient:
         diff), which is exactly what fail-loud is meant to preclude. An
         unreachable / non-2xx response is loud, and that is the trade.
         """
-        # Step 1 — read metadata for base.ref and head.sha. Same JSON we already
-        # read on the CI path (see :meth:`_fetch_ci_status_rest`).
+        base_ref, head_sha = await self.fetch_pr_base_and_head(pr)
+        return await self.fetch_compare_diff(pr.owner, pr.repo, base_ref, head_sha)
+
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        """Step 1 of :meth:`fetch_pr_diff`: the PR's ``(base.ref, head.sha)``, fail-loud.
+
+        Split out (T-fix-now-vs-followup-is-mechanical, Bohr msg-5239 §1) so a caller that
+        already knows the head it means — ``mindwire pr-diff-size`` right after a push, when
+        this metadata's ``head.sha`` may still lag — can take ``base.ref`` from here and pass
+        its own head to :meth:`fetch_compare_diff`. The gate still reads both from here.
+        """
+        # Same JSON we already read on the CI path (see :meth:`_fetch_ci_status_rest`).
         meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
         try:
             resp = await self._client.get(meta_path)
@@ -597,15 +607,22 @@ class GitHubClient:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): malformed response: {exc}") from exc
         if not base_ref or not head_sha:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
+        return base_ref, head_sha
 
-        # Step 2 — three-dot compare. `base_ref` is URL-encoded because a
-        # feature-branch name may contain `/` (e.g. `feature/stacked`); leaving
-        # a raw slash in the path segment routes to a different endpoint and
-        # returns 404. Head is a hex SHA and needs no encoding, but the same
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
+        """Step 2 of :meth:`fetch_pr_diff`: the three-dot ``compare`` diff, fail-loud.
+
+        This is the exact artifact the PR gate measures (``len()`` of this text is the gate's
+        ``DiffView.original_chars``). A head SHA GitHub does not know (not yet pushed) is a
+        non-2xx here and raises :class:`GitHubHTTPError` — never an empty diff.
+        """
+        # `base_ref` is URL-encoded because a feature-branch name may contain `/` (e.g.
+        # `feature/stacked`); leaving a raw slash in the path segment routes to a different
+        # endpoint and returns 404. Head is a hex SHA and needs no encoding, but the same
         # `quote` call is harmless on it.
         base_seg = quote(base_ref, safe="")
         head_seg = quote(head_sha, safe="")
-        compare_path = f"/repos/{pr.owner}/{pr.repo}/compare/{base_seg}...{head_seg}"
+        compare_path = f"/repos/{owner}/{repo}/compare/{base_seg}...{head_seg}"
         try:
             resp = await self._client.get(
                 compare_path, headers={"Accept": "application/vnd.github.v3.diff"}
@@ -1483,8 +1500,19 @@ class GitHubClient:
             page += 1
         return out
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
+
+        ``commit_id`` (optional) is GitHub's own API parameter: when given, the review
+        is attached to that commit instead of to whatever the PR head is when the POST
+        arrives. It is sent only when not ``None``, so omitting it leaves the request
+        body byte-identical to before. This client attaches no meaning to it — the
+        caller that retries (``NaysayerPrReviewDriver._submit_review``) pins the POST
+        to the same commit its ``landed()`` guard checks, so a head that moves between
+        a lost-response POST and the retry cannot produce a second review
+        (T-gate-review-submit-failure-handling msg-4781 item 3).
 
         On non-2xx the raised :class:`GitHubHTTPError` carries the header-derived
         ``retry_after`` and ``rate_limited`` fields (D-1) so the caller's classifier
@@ -1495,11 +1523,17 @@ class GitHubClient:
         A caller that wants retries must add them behind an idempotency guard
         (T-gate-review-submit-failure-handling PR-B: retries and ``landed()``
         ship together, never separately, or a POST whose response leg drops
-        can double-post — msg-1981 §4.2, msg-3275/msg-3276).
+        can double-post — msg-1981 §4.2, msg-3275/msg-3276). The retry lives in
+        the naysayer driver, not here: this method has no ``head_sha`` to scope a
+        guard by, so a client-level retry would mistake an earlier head's review
+        for this one's (msg-4780).
         """
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
         try:
-            resp = await self._client.post(path, json={"event": event.value, "body": body})
+            payload: dict[str, Any] = {"event": event.value, "body": body}
+            if commit_id is not None:
+                payload["commit_id"] = commit_id
+            resp = await self._client.post(path, json=payload)
         except httpx.RequestError as exc:
             raise GitHubHTTPError(f"POST {path} (review): {exc}") from exc
         if resp.status_code >= 400:

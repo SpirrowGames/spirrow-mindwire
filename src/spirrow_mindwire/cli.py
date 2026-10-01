@@ -5,6 +5,10 @@ Bohr msg-4382 Objection 3): it places the Tier-C rules file (五ヶ条) at its c
 ``[decider.tierc].rules_path`` or ``<data_dir>/config/tierc_rules.toml``, by copying the template
 shipped in the package. An existing file is **never** overwritten — it is Takahito's edited copy.
 The status / debug commands are still deferred to a later phase.
+
+``mindwire pr-diff-size --repo o/r --pr N [--head SHA]`` (T-fix-now-vs-followup-is-mechanical)
+measures a PR's diff exactly as the naysayer gate does and prints ``decision=fix-now`` (exit 0)
+or ``decision=split`` (exit 3); see :mod:`spirrow_mindwire.naysayer.pr_diff_size`.
 """
 
 from __future__ import annotations
@@ -39,6 +43,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="mindwire.toml to resolve the destination from (default: the standard location)",
     )
+    size = sub.add_parser(
+        "pr-diff-size",
+        help="measure a PR's diff as the naysayer gate does; decide fix-now (exit 0) or split (3)",
+    )
+    size.add_argument("--repo", required=True, help="owner/repo")
+    size.add_argument("--pr", required=True, type=int, help="pull request number")
+    size.add_argument(
+        "--head",
+        default=None,
+        help="head commit SHA to measure (default: local `git rev-parse HEAD`; must be pushed)",
+    )
     return parser
 
 
@@ -52,4 +67,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         else:
             print(f"{dest} already exists; left unchanged", file=sys.stderr)
         return
+    if args.command == "pr-diff-size":
+        from .naysayer.pr_diff_size import run
+
+        raise SystemExit(run(args.repo, args.pr, args.head))
     raise SystemExit(2)  # unreachable: argparse rejects anything else

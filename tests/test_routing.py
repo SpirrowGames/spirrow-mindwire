@@ -47,6 +47,21 @@ import pytest
 
 from spirrow_mindwire.routing import GuardIVerdict, guard_proposer_to_implementer
 
+
+# The D-4' guardrails (G1/G2/G3) held on their OPEN side, so the pre-D-4' truth table below keeps
+# testing exactly what it tested before. The D-4' rows live in ``test_d4_guardrails.py``.
+def _no_decl() -> bool:
+    return False
+
+
+def _checked() -> bool:
+    return True
+
+
+def _cleared() -> bool:
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Truth table — every combination of the four observation booleans.
 # --------------------------------------------------------------------------- #
@@ -119,6 +134,9 @@ def test_guard_i_truth_table(
             author_is_naysayer=author_is_naysayer,
             control_state_is_run=run,
             message_is_attested=lambda: attested,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is expected
     )
@@ -139,6 +157,9 @@ def test_carveout_1_human_authored_decide_honours() -> None:
             author_is_naysayer=False,
             control_state_is_run=False,
             message_is_attested=lambda: False,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is GuardIVerdict.HONOR
     )
@@ -153,6 +174,9 @@ def test_carveout_3_attested_naysayer_under_run_honours() -> None:
             author_is_naysayer=True,
             control_state_is_run=True,
             message_is_attested=lambda: True,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is GuardIVerdict.HONOR
     )
@@ -168,6 +192,9 @@ def test_carveout_3_unattested_naysayer_falls_through_to_redirect() -> None:
             author_is_naysayer=True,
             control_state_is_run=True,
             message_is_attested=lambda: False,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -182,6 +209,9 @@ def test_carveout_3_naysayer_under_supervised_redirects() -> None:
             author_is_naysayer=True,
             control_state_is_run=False,
             message_is_attested=lambda: True,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -197,6 +227,9 @@ def test_proposer_to_implementer_redirects_by_default() -> None:
             author_is_naysayer=False,
             control_state_is_run=True,
             message_is_attested=lambda: True,
+            segment_declares_tier_c=_no_decl,
+            naysayer_declared_no_tier_c=_checked,
+            decider_clears=_cleared,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -261,6 +294,9 @@ def test_attest_thunk_not_invoked_outside_carveout_3_branch(
         author_is_naysayer=author_is_naysayer,
         control_state_is_run=run,
         message_is_attested=thunk,
+        segment_declares_tier_c=_no_decl,
+        naysayer_declared_no_tier_c=_checked,
+        decider_clears=_cleared,
     )
     assert thunk.calls == 0
 
@@ -274,6 +310,9 @@ def test_attest_thunk_invoked_exactly_once_in_carveout_3_branch() -> None:
         author_is_naysayer=True,
         control_state_is_run=True,
         message_is_attested=thunk,
+        segment_declares_tier_c=_no_decl,
+        naysayer_declared_no_tier_c=_checked,
+        decider_clears=_cleared,
     )
     assert thunk.calls == 1
     assert verdict is GuardIVerdict.HONOR
@@ -284,6 +323,9 @@ def test_attest_thunk_invoked_exactly_once_in_carveout_3_branch() -> None:
         author_is_naysayer=True,
         control_state_is_run=True,
         message_is_attested=unattested,
+        segment_declares_tier_c=_no_decl,
+        naysayer_declared_no_tier_c=_checked,
+        decider_clears=_cleared,
     )
     assert unattested.calls == 1
     assert verdict is GuardIVerdict.REDIRECT

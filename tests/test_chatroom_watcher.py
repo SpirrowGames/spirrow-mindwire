@@ -264,3 +264,110 @@ async def test_stop_halts_sessions() -> None:
     await watcher.stop()
     assert len(adapter.halted) == 1
     assert await watcher.poll_once() == 0  # handles cleared → nothing to poll
+
+
+# --------------------------------------------------------------------------- #
+# T-dispatched-turn-gets-one-message U-1 (msg-4871 §3): the watcher supplies the
+# thread too, cut causally at each trigger.
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingDispatcher:
+    """Duck-typed dispatcher: records the events the watcher builds, nothing else."""
+
+    def __init__(self) -> None:
+        self.events: list[ChatroomEvent] = []
+
+    async def spawn_instance(
+        self, thread_ref: ThreadRef, role: Role, instance_id: str
+    ) -> SessionHandle:
+        return SessionHandle(
+            session_id=new_ulid(),
+            instance_id=instance_id,
+            adapter_id="rec",
+            thread_ref=thread_ref,
+            role=role,
+            started_at=_TS,
+        )
+
+    async def dispatch(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+        self.events.append(event)
+
+
+def _rendered(event: ChatroomEvent) -> str:
+    from spirrow_mindwire.thread_context import build_turn_prompt
+
+    return build_turn_prompt(event, Role.PROPOSER, "Reply.")
+
+
+@pytest.mark.anyio
+async def test_watcher_prompt_carries_the_thread_opener() -> None:
+    """R-3(f): the watcher used to hand the turn the trigger and nothing else."""
+    mcp = _FakeMcp([_msg("msg-1", author="Bohr", content="THE-OPENER")])
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [*mcp.messages, _msg("msg-2", content="the new one")]
+    assert await w.poll_once() == 1
+    out = _rendered(disp.events[0])
+    assert "=== Thread so far" in out
+    assert "THE-OPENER" in out
+    assert out.index("THE-OPENER") < out.index("New message from human:")
+
+
+@pytest.mark.anyio
+async def test_a_batched_poll_does_not_show_a_turn_its_own_future() -> None:
+    """R-3(a): N and N+1 arrive in one poll; N's turn must not see N+1 (body OR count)."""
+    mcp = _FakeMcp(
+        [
+            _msg("msg-1", author="Bohr", content="THE-OPENER"),
+            _msg("msg-2", content="MIDDLE"),
+        ]
+    )
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [
+        *mcp.messages,
+        _msg("msg-3", content="BODY-OF-N"),
+        _msg("msg-4", content="BODY-OF-N-PLUS-1"),
+    ]
+    assert await w.poll_once() == 2
+    first, second = disp.events
+    assert first.payload.msg_id == "msg-3"
+    assert "BODY-OF-N-PLUS-1" not in _rendered(first)
+    assert first.thread_context is not None
+    assert first.thread_context.total_count == 3
+    assert second.payload.msg_id == "msg-4"
+    assert "BODY-OF-N" in _rendered(second)
+    assert second.thread_context is not None
+    assert second.thread_context.total_count == 4
+
+
+@pytest.mark.anyio
+async def test_a_trigger_missing_message_does_not_abort_the_rest_of_the_poll(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Human decision after #371 APPROVE: isolate ThreadContextTriggerMissing per message.
+
+    An empty-string ``msg_id`` passes the ``isinstance(str)`` filter but is dropped by
+    the context builder's parser, so its context build raises. Before the fix the
+    exception escaped ``_poll_watch`` and the valid message after it waited a whole
+    poll interval. Now that one message is skipped loudly (still at-most-once: it is
+    in ``_seen``) and the rest of the batch dispatches in the SAME poll.
+    """
+    mcp = _FakeMcp([_msg("msg-1", author="Bohr", content="THE-OPENER")])
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [*mcp.messages, _msg("", content="BAD"), _msg("msg-3", content="GOOD")]
+    with caplog.at_level("ERROR", logger="spirrow_mindwire.magickit.watcher"):
+        assert await w.poll_once() == 1
+    assert [e.payload.msg_id for e in disp.events] == ["msg-3"]
+    skips = [r for r in caplog.records if "ThreadContextTriggerMissing" in r.getMessage()]
+    assert skips
+    # An expected, recovered refusal: ERROR level, no traceback (#375 advisory).
+    assert all(r.levelname == "ERROR" and r.exc_info is None for r in skips)
+    # at-most-once: the bad message is not retried on the next poll.
+    assert await w.poll_once() == 0
+    assert len(disp.events) == 1

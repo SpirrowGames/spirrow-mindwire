@@ -645,3 +645,31 @@ obligations:
       magickit.client.ThreadResolvedError` to fire the disposition; an
       uncaught :class:`ThreadResolvedError` is the correct fail-loud
       default when a producer's author has not declared a surface.
+
+  - id: OBL-FIX-NOW-DEFAULT
+    role: implementer
+    # Net-new formulation (no origin). T-fix-now-vs-followup-is-mechanical: rules from
+    # Takahito's DECIDED msg-5233 (rules 1-5); procedure from Bohr msg-5234 §2/§5 as amended
+    # by msg-5236 (revert-commit format, force-push grounds) and msg-5241 (single remote
+    # measurement, `--local` dropped); Einstein msg-5242 endorsed the final form. The body
+    # names no threshold NUMBER on purpose: the helper reports the gate's own constant, so a
+    # change to `naysayer/pr_review.py::_MAX_DIFF_CHARS` keeps this text true (the WARN_RATIO
+    # reasoning, DECIDED rule 2).
+    body: |
+      FIX NOW BY DEFAULT; SPLIT ONLY ON THE MEASURED DIFF. Whether to fix a review finding in the current PR or in a follow-up PR is not a judgement call and never goes to the human (do not hand it off with `NEXT: human`). The rule:
+      (1) Default: fix the finding in the same PR, at the point you notice it.
+      (2) The only timing exception is size, measured, not estimated. Commit the fix and push it to the PR branch normally, then run `mindwire pr-diff-size --repo <owner/repo> --pr <n>` (it measures the pushed local HEAD by default, the same way the naysayer gate reads the diff, against the gate's warn threshold as the helper reports it). `decision=fix-now` (exit 0): done. `decision=split` (exit 3): on the PR branch, `git revert` the fix commit with the message `Revert "<original commit subject>" — moved to follow-up <tracking thread ID>`, and `git cherry-pick` the fix onto a follow-up branch. Any other exit is a failed measurement, not a decision: fix the cause (usually an unpushed commit) and measure again. Never force-push to undo the commit: history rewriting is Tier-C (the Tier-C rules' `rule_3` lists force push; ADR-2026-05-23-07 §2.3 forbids it from the loop).
+      (3) A follow-up needs a tracking destination created in the same turn — a new thread (and its sweep registration) or an addition to an existing thread — and you name its ID in your reply. A follow-up with no tracking destination is the same as not fixing it.
+      (4) Splitting for structural reasons is not restricted: a fix that spans another repository, or a PR that the naysayer declared unsplittable as an invariant. That is a structural constraint, not a timing choice.
+      (5) The exception in (2) covers only a separable advisory fix. A fix required by a blocking finding (REQUEST_CHANGES) cannot move to a follow-up, because the gate will not approve without it; if that fix pushes the diff over the threshold, split the PR itself structurally, as in (4). A design-time finding has no PR diff yet, so (2) does not arise: take it into the design, per (1).
+      If the fix itself adds, removes, or changes scope or goal, that is a different question: raise it on its own content, not as "now or later".
+
+  - id: OBL-FIX-NOW-REVIEW
+    role: naysayer
+    # Net-new formulation (no origin). T-fix-now-vs-followup-is-mechanical, Bohr msg-5234 §2
+    # (endorsed Einstein msg-5242). Delivery scope: design-time naysayer face ONLY, the same
+    # scope as every `role: naysayer` entry (see OBL-VERDICT-CONSTRAINT's note and
+    # spec/process/README.md §「`./obligations.yaml` の配送範囲は naysayer の片面 (design-time)
+    # だけである」); the PR-gate face is not wired to this manifest and is not meant to be.
+    body: |
+      FIX-NOW VS FOLLOW-UP, REVIEW SIDE: the default is that a finding is fixed in the current PR; a split is justified only by the measured gate diff exceeding the gate's warn threshold (`mindwire pr-diff-size`) or by a structural constraint. Do not accept "we will fix it in a follow-up" as a disposition unless it names a tracking destination (a thread ID, new or existing); a follow-up with nowhere to be tracked is a fix that will not happen. When you declare a PR unsplittable as an invariant, state the reason as a structural constraint, so it reads as one and not as a timing preference.

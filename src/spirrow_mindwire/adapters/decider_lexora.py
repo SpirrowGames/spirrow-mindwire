@@ -64,6 +64,7 @@ from ..decider.questions import (
     MATCHED_RULE_KEY,
     SHOULD_ASK_HUMAN_KEY,
     TIERC_QUESTIONS_VERSION,
+    TIERC_V2_PROCEED_QUESTIONS_VERSION,
     TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
@@ -79,7 +80,7 @@ from ..decider.verdict import (
     evaluate_tierc,
     evaluate_tierc_v2,
 )
-from ..decider.wire import POLICY_LIVE_TIERC, build_decide_request
+from ..decider.wire import POLICY_LIVE_PROCEED, POLICY_LIVE_TIERC, build_decide_request
 from ..lexora.client import LexoraClient, LexoraError
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ async def decide_once(
     thresholds: TierCThresholds | None = None,
     rules: TierCRules | None = None,
     v2_thresholds: TierCV2Thresholds | None = None,
+    proceed: bool = False,
 ) -> DecisionResult:
     """One ``/v1/decide`` round-trip → :class:`DecisionResult`, following msg-4188's order.
 
@@ -168,15 +170,22 @@ async def decide_once(
     ``state.gate_result is None`` (msg-4196 DECIDED 1). ``rules`` given is tierc-v2: every state
     is sent, gate result or not (msg-4380 Δ2); ``thresholds`` is then unused and
     ``v2_thresholds`` applies.
+
+    ``proceed=True`` (D-4' G3) sends the ``tierc-v2-proceed`` set — the v2 keys asked of a
+    naysayer's proceed handoff — and is classified exactly like tierc-v2. It requires ``rules``
+    (``ValueError`` before any HTTP otherwise).
     """
+    if proceed and rules is None:
+        raise ValueError("decide_once(proceed=True) requires the tierc-v2 rules")
     if rules is None and state.gate_result is None:
         raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
-    body = build_decide_request(state, policy=policy, rules=rules)
+    body = build_decide_request(state, policy=policy, rules=rules, proceed=proceed)
+    v2_version = TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_V2_QUESTIONS_VERSION
     version_fields: dict[str, Any] = (
         {"questions_version": TIERC_QUESTIONS_VERSION}
         if rules is None
         else {
-            "questions_version": TIERC_V2_QUESTIONS_VERSION,
+            "questions_version": v2_version,
             "rules_sha256": rules.sha256,
             "matched_rule_source": MATCHED_RULE_SOURCE_CHOICE,
         }
@@ -245,6 +254,7 @@ async def decide_once(
             policy=policy,
             latency_ms=latency_ms,
             no_verdict=_no_verdict,
+            questions_version=v2_version,
         )
 
     # 4. malformed answers.
@@ -287,6 +297,7 @@ def _v2_result(
     policy: str,
     latency_ms: int | None,
     no_verdict: Callable[[DecisionOutcome, str | None], DecisionResult],
+    questions_version: str = TIERC_V2_QUESTIONS_VERSION,
 ) -> DecisionResult:
     """tierc-v2 steps 4-5: ``should_ask_human`` alone decides MALFORMED and the verdict;
     ``matched_rule`` is validated on its own and never changes the outcome (msg-4380 Δ3)."""
@@ -314,7 +325,7 @@ def _v2_result(
         raw_answers=raw_answers,
         verdict=evaluate_tierc_v2(scores[SHOULD_ASK_HUMAN_KEY], thresholds),
         policy=policy,
-        questions_version=TIERC_V2_QUESTIONS_VERSION,
+        questions_version=questions_version,
         latency_ms=latency_ms,
         matched_rule=matched_rule,
         matched_rule_source=MATCHED_RULE_SOURCE_CHOICE,
@@ -392,6 +403,32 @@ class DeciderLexoraAdapter:
                 thresholds=self._thresholds,
                 rules=self._rules,
                 v2_thresholds=self._v2_thresholds,
+            )
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.warning("decider client close failed", exc_info=True)
+
+    async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
+        """D-4' G3: evaluate a naysayer's proceed handoff (``NEXT: <implementer>``).
+
+        ``None`` iff the Decider was not called: mode ``off``, or no tierc-v2 rules (v1 has no
+        proceed variant). The caller treats ``None`` — like every non-``LIKELY_NOT`` result — as
+        "not cleared", so carve-out ③ stays closed (fail-closed). Unlike :meth:`evaluate` this
+        does NOT require ``parsed_next == human``: the proceed turn is exactly the one that isn't.
+        """
+        if self._tierc_mode == "off" or self._rules is None:
+            return None
+        client = self._client_factory()
+        try:
+            return await decide_once(
+                state,
+                client=client,
+                policy=POLICY_LIVE_PROCEED,
+                rules=self._rules,
+                v2_thresholds=self._v2_thresholds,
+                proceed=True,
             )
         finally:
             try:

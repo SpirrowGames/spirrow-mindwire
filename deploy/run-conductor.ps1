@@ -68,4 +68,6 @@ if (-not $env:MINDWIRE_PATHS__DATA_DIR) {
 $repoRoot = Split-Path -Parent $PSScriptRoot   # deploy/.. == repo root
 Set-Location $repoRoot
 Write-Host "[adr18] starting Stage 3 conductor daemon (project + thread from mindwire.toml [conductor])"
-uv run mindwire-loop --mode conductor
+# Extra arguments are forwarded as-is. The sweep uses this to hand the conductor the T42 stall
+# watchdog input (--launches-same-head / --launch-head-msg-id); a bare hand-run passes none.
+uv run mindwire-loop --mode conductor @args

@@ -1504,3 +1504,269 @@ def test_signal_is_a_runtime_error_subclass() -> None:
     sig = SdkIsErrorSignal({"reason_source": "result", "message": "x"})
     assert isinstance(sig, RuntimeError)
     assert isinstance(sig, Exception)
+
+
+# --------------------------------------------------------------------------- #
+# S-9 (thread T-sdk-is-error-loses-the-reason msg-4807 §3 / msg-4809 §3-4)
+# --------------------------------------------------------------------------- #
+
+# Verbatim ``captured_fields`` of ``state/quarantine-history.json`` line 2062
+# (Bohr delivery, 10 s / 3 turns), the record msg-4807 §2 cites. The raw
+# ``permission_denials`` element was never recorded (it was summarised to
+# ``list(len=1)`` by pre-#283 code), so its shape below is an ASSUMPTION —
+# msg-4809 §3 says so too: dict with ``tool_name`` / ``tool_use_id`` /
+# ``tool_input``, unobserved.
+_LINE_2062_ERRORS = [
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+    "AxiosError: Request failed with status code 403\n"
+    "    at Ii (B:/~BUN/root/src/entrypoints/cli.js:115:1194)\n"
+    "    at <anonymous> (B:/~BUN/root/src/entrypoints/cli.js:120:12710)\n"
+    "    at emit (node:events:92:22)\n"
+    "    at endReadableNT (internal:streams/readable:865:50)\n"
+    "    at processTicksAndRejections (native:7:39)",
+]
+
+
+def _line_2062(**overrides: Any) -> _FakeResultMessage:
+    fields: dict[str, Any] = {
+        "session_id": "855fc345-73ca-4388-aa28-6060ad64a70d",
+        "duration_ms": 10149,
+        "num_turns": 3,
+        "subtype": "error_during_execution",
+        "stop_reason": None,
+        "errors": list(_LINE_2062_ERRORS),
+        "api_error_status": None,
+        "permission_denials": [
+            {
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_01",
+                "tool_input": {"command": "git push origin main"},
+            }
+        ],
+        "result": None,
+    }
+    fields.update(overrides)
+    return _FakeResultMessage(**fields)
+
+
+def test_s9_subtype_is_a_prefix_and_the_403_reaches_the_message() -> None:
+    """R-1: the line-2062 case used to pick ``field:subtype`` and bury the 403."""
+    detail = capture_is_error_detail(_line_2062())
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"].startswith("SDK is_error[error_during_execution]; errors=")
+    assert "403" in detail["message"]
+    # The classification is still captured as data.
+    assert detail["captured_fields"]["subtype"] == "error_during_execution"
+
+
+def test_s9_permission_denials_first_level_keys_are_visible() -> None:
+    """R-2 (msg-4809 §4, last bullet): the denial's first-level keys survive."""
+    detail = capture_is_error_detail(_line_2062())
+    denials = detail["captured_fields"]["permission_denials"]
+    assert isinstance(denials, list) and len(denials) == 1
+    for key in ("tool_name", "tool_use_id", "tool_input"):
+        assert f'"{key}"=' in denials[0]
+    # Depth 1: the nested ``tool_input`` dict is a type marker, not expanded.
+    assert '"tool_input"="dict(len=1)"' in denials[0]
+
+
+def test_s9_subtype_only_is_distinct_from_absent() -> None:
+    detail = capture_is_error_detail(
+        _line_2062(errors=None, permission_denials=[], api_error_status=None, result=None)
+    )
+    assert detail["reason_source"] == "subtype_only"
+    assert detail["message"].startswith("SDK is_error[error_during_execution]; ")
+    assert "absent_dump" not in detail
+
+
+def test_s9_no_subtype_and_no_reason_is_still_absent() -> None:
+    detail = capture_is_error_detail(_FakeResultMessage())
+    assert detail["reason_source"] == "absent"
+
+
+def test_s9_precedence_errors_before_api_status_before_denials() -> None:
+    d = capture_is_error_detail(_line_2062(errors=None, api_error_status=403))
+    assert d["reason_source"] == "field:api_error_status"
+    d = capture_is_error_detail(_line_2062(errors=None))
+    assert d["reason_source"] == "field:permission_denials"
+    d = capture_is_error_detail(_line_2062(errors=None, permission_denials=None, result={"c": 1}))
+    assert d["reason_source"] == "field:result"
+
+
+def test_s9_stop_reason_is_not_a_reason_candidate() -> None:
+    """msg-4807 §3's precedence list does not name ``stop_reason``."""
+    d = capture_is_error_detail(
+        _FakeResultMessage(subtype="error_during_execution", stop_reason="max_tokens")
+    )
+    assert d["reason_source"] == "subtype_only"
+    assert d["captured_fields"]["stop_reason"] == "max_tokens"
+
+
+def test_s9_line_5517_result_path_is_unchanged() -> None:
+    """msg-4807 §3-3: the ``result`` case keeps ``reason_source="result"``."""
+    text = "API Error: Stream idle timeout - partial response received"
+    detail = capture_is_error_detail(
+        _FakeResultMessage(
+            session_id="5655c9b3-b914-4f70-b2bb-46bdcaff867e",
+            duration_ms=1143863,
+            num_turns=73,
+            subtype="success",
+            stop_reason="stop_sequence",
+            permission_denials=[],
+            result=text,
+        )
+    )
+    assert detail["reason_source"] == "result"
+    assert detail["message"] == f"SDK is_error[success]; {text}"
+
+
+def test_s9_result_without_subtype_stays_verbatim() -> None:
+    detail = capture_is_error_detail(_FakeResultMessage(result="boom"))
+    assert detail["message"] == "boom"
+
+
+def test_s9_unserialisable_value_in_denial_dict_does_not_raise() -> None:
+    """msg-4809 §4: ``object()`` inside a denial element → ``repr_omitted``."""
+    detail = capture_is_error_detail(_line_2062(permission_denials=[{"x": object()}]))
+    assert detail["captured_fields"]["permission_denials"] == ['"x"="object(repr_omitted)"']
+
+
+def test_s9_self_referential_denial_dict_terminates() -> None:
+    d: dict[str, Any] = {"tool_name": "Bash"}
+    d["self"] = d
+    detail = capture_is_error_detail(_line_2062(permission_denials=[d]))
+    (elem,) = detail["captured_fields"]["permission_denials"]
+    assert '"self"="dict(len=2)"' in elem
+    assert '"tool_name"="Bash"' in elem
+
+
+def test_s9_hostile_len_is_contained_to_its_own_field() -> None:
+    class _BadLen:
+        __slots__ = ()
+
+        def __len__(self) -> int:
+            raise RuntimeError("hostile __len__")
+
+    detail = capture_is_error_detail(_line_2062(permission_denials=[{"x": _BadLen()}]))
+    fields = detail["captured_fields"]
+    assert fields["permission_denials"] == ['"x"="_BadLen(repr_omitted)"']
+    # Other fields and the reason are intact.
+    assert detail["reason_source"] == "field:errors"
+    assert fields["session_id"] == "855fc345-73ca-4388-aa28-6060ad64a70d"
+
+
+def test_s9_single_huge_scalar_dict_element_is_still_bounded() -> None:
+    """Einstein's advisory on the msg-4809 APPROVE: one element holding a massive scalar dict
+    must not bypass the structural bound."""
+    huge = {f"k{i:05d}": "v" * 50 for i in range(5000)}
+    detail = capture_is_error_detail(_line_2062(permission_denials=[huge]))
+    (elem,) = detail["captured_fields"]["permission_denials"]
+    assert len(elem) <= 600
+    assert len(json.dumps(detail, ensure_ascii=False)) < 10_000
+
+
+def test_s9_absent_with_only_stop_reason_does_not_claim_every_field_empty() -> None:
+    """PR #368 PR-gate objection 1: ``stop_reason`` is captured but not judged,
+    so ``absent`` must not read as "every captured field was empty"."""
+    detail = capture_is_error_detail(_FakeResultMessage(stop_reason="max_tokens"))
+    assert detail["reason_source"] == "absent"
+    assert detail["captured_fields"]["stop_reason"] == "max_tokens"
+    assert "known reason fields captured" not in detail["message"]
+    assert "errors, api_error_status, permission_denials, result" in detail["message"]
+    assert "no subtype" in detail["message"]
+
+
+def test_s9_unreadable_subtype_is_no_classification_not_a_prefix() -> None:
+    """PR #368 PR-gate objection 2: a subtype whose read raised must not leak
+    into the ``SDK is_error[...]`` prefix."""
+
+    class _HostileSubtype:
+        session_id = "s"
+        duration_ms = 1
+        num_turns = 1
+        stop_reason = None
+        errors: ClassVar[list[str]] = ["boom"]
+        api_error_status = None
+        permission_denials = None
+        result = None
+
+        @property
+        def subtype(self) -> str:
+            raise RuntimeError("hostile subtype")
+
+    detail = capture_is_error_detail(_HostileSubtype())
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"] == "SDK is_error; errors=['boom']"
+    assert "[" not in detail["message"].split(";")[0]
+    assert detail["captured_fields"]["subtype"] == {"capture_failed": True}
+
+
+def test_s9_raw_subtype_is_the_sentinel_object_not_the_summary_dict() -> None:
+    """PR #368 PR-gate round 3 read the RAW side as holding
+    ``{"capture_failed": True}``. It holds the sentinel object; the dict is
+    summary-only. Pin both halves so the two sides cannot be conflated."""
+    from spirrow_mindwire.adapters import _sdk_result as m
+
+    class _HostileSubtype:
+        session_id = "s"
+        duration_ms = 1
+        num_turns = 1
+        stop_reason = None
+        errors: ClassVar[list[str]] = ["boom"]
+        api_error_status = None
+        permission_denials = None
+        result = None
+
+        @property
+        def subtype(self) -> str:
+            raise RuntimeError("hostile subtype")
+
+    raw, summary = m._capture_known(_HostileSubtype())
+    assert raw["subtype"] is m._CAPTURE_ERROR_SENTINEL
+    assert summary["subtype"] == {"capture_failed": True}
+    assert m._classification_text(raw, summary) == ""
+    # Even if a summary-side failure marker ever reached the raw side, it
+    # must not become a prefix.
+    assert m._classification_text({"subtype": "x"}, {"subtype": {"capture_failed": True}}) == ""
+
+
+def test_s9_hostile_subtype_costs_the_prefix_not_the_reason() -> None:
+    """A ``subtype`` whose ``__bool__``/``__len__`` raise used to escape
+    ``_pick_reason`` and turn the whole detail into ``capture_failed``,
+    losing a readable ``errors`` reason."""
+
+    class _HostileStr(str):
+        def __len__(self) -> int:
+            raise RuntimeError("hostile len")
+
+        def __bool__(self) -> bool:
+            raise RuntimeError("hostile bool")
+
+    detail = capture_is_error_detail(
+        _FakeResultMessage(subtype=_HostileStr("error_during_execution"), errors=["boom"])
+    )
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"] == "SDK is_error; errors=['boom']"
+
+
+def test_capture_list_is_derived_from_reason_priority_and_classification() -> None:
+    """The capture list cannot drift from the reason list (#368 advisory, decision B).
+
+    A reason candidate missing from the capture list never reaches ``raw`` and
+    would silently never be evaluated. This pins that invariant (subset, not a
+    re-run of the derivation) and the unchanged ``captured_fields`` key order.
+    """
+    from spirrow_mindwire.adapters import _sdk_result as m
+
+    known = m._KNOWN_REASON_FIELDS
+    assert set(m._REASON_PRIORITY) <= set(known)
+    assert m._CLASSIFICATION_FIELD in known
+    assert known == (
+        "subtype",
+        "stop_reason",
+        "errors",
+        "api_error_status",
+        "permission_denials",
+        "result",
+    )
+    assert len(set(known)) == len(known)

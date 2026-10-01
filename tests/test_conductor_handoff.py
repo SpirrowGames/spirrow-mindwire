@@ -331,8 +331,10 @@ def test_proposer_block_teaches_tier_c_syntax_and_enum() -> None:
     assert "TIER-C:" in block
     for label in TIER_C_LABELS:
         assert f"`{label}`" in block, f"enum label {label!r} missing from proposer guidance"
-    assert "other:<one-line reason>" in block
-    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+    # U2 (T-tier-c-admission-gate msg-4768): `other:` is no longer taught as a label — msg-3630
+    # §2.2 makes it a non-ticket — and the unsure label is the sanctioned way to ask.
+    assert "other:<one-line reason>" not in block
+    assert "unsure:goal?" in block
 
 
 def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
@@ -352,8 +354,10 @@ def test_implementer_block_teaches_tier_c_syntax_and_enum() -> None:
     assert "TIER-C:" in block
     for label in TIER_C_LABELS:
         assert f"`{label}`" in block, f"enum label {label!r} missing from implementer guidance"
-    assert "other:<one-line reason>" in block
-    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+    # U2 (T-tier-c-admission-gate msg-4768): `other:` is no longer taught as a label — msg-3630
+    # §2.2 makes it a non-ticket — and the unsure label is the sanctioned way to ask.
+    assert "other:<one-line reason>" not in block
+    assert "unsure:goal?" in block
 
 
 def test_naysayer_block_does_not_carry_tier_c_guidance() -> None:
@@ -1276,3 +1280,104 @@ class TestRealTrafficCorpus:
         texts = [text for _, _, text in self._records()]
         assert any(t.startswith("**NEXT: Heisenberg**") for t in texts)
         assert any(t.startswith("→ **NEXT: human**") for t in texts)
+
+
+# ---- U2 (T-tier-c-admission-gate, Bohr msg-4768 / msg-4776) ---------------------------------- #
+
+
+def test_tier_c_labels_are_derived_from_the_admission_gate_enum() -> None:
+    # One source of truth: what the prompt teaches is exactly what the gate admits.
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+    assert frozenset(TIER_C_LABELS) == ADMIT_LABELS
+    assert len(TIER_C_LABELS) == len(ADMIT_LABELS)
+
+
+def test_handoff_core_drops_design_approval_example_and_lists_the_four_types() -> None:
+    # msg-3630 §2.7: "approving a design for implementation" taught internal design approval
+    # as Tier-C. It is gone; the four types and the not-Tier-C list are in its place.
+    for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
+        block = build_handoff_protocol_block(role)
+        assert "approving a design for implementation" not in block
+        for label in ("goal", "cost", "irreversible", "merge-protected"):
+            assert f"`{label}`" in block, (role, label)
+        assert "Tier-C — decide it yourself" in block
+        assert "whether and how to address review findings" in block
+    for stale in ("`scope`", "`billing`", "`release-cross-repo`"):
+        assert stale not in build_handoff_protocol_block(Role.PROPOSER)
+
+
+def test_fix_now_vs_follow_up_is_listed_as_not_tier_c_for_every_role() -> None:
+    # T-fix-now-vs-followup-is-mechanical (DECIDED msg-5233, design msg-5241 §1): the
+    # fix-now-or-follow-up question is decided by the gate's measured diff, never by the human.
+    # The block names the helper and the threshold by reference only — no hard-coded number, so
+    # a change to the gate's constants cannot make this prose lie.
+    from spirrow_mindwire.naysayer import pr_review
+
+    for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
+        block = build_handoff_protocol_block(role)
+        assert "whether to fix a finding in the current PR or a follow-up" in block, role
+        assert "`mindwire pr-diff-size`" in block, role
+        assert "gate's warn threshold" in block, role
+        assert f"{pr_review._DIFF_WARN_THRESHOLD:,}" not in block, role
+        assert str(pr_review._DIFF_WARN_THRESHOLD) not in block, role
+
+
+class TestLabelProseIsDerivedNotHardcoded:
+    """PR #365 review (invariant): the label prose and its count follow ADMIT_LABELS."""
+
+    def test_definitions_cover_exactly_the_admitted_set(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+        from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+        assert frozenset(handoff._TIER_C_LABEL_DEFINITIONS) == ADMIT_LABELS
+
+    def test_mismatched_definitions_fail_loudly(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+        from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+        extra = frozenset({*ADMIT_LABELS, "new-fifth-label"})
+        with pytest.raises(RuntimeError, match="new-fifth-label"):
+            handoff._check_label_definitions(handoff._TIER_C_LABEL_DEFINITIONS, extra)
+        missing = {k: v for k, v in handoff._TIER_C_LABEL_DEFINITIONS.items() if k != "cost"}
+        with pytest.raises(RuntimeError):
+            handoff._check_label_definitions(missing, ADMIT_LABELS)
+
+    def test_example_label_must_be_admitted(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        assert handoff._admitted_example("goal") == "goal"
+        with pytest.raises(RuntimeError, match="scope"):
+            handoff._admitted_example("scope")
+
+    def test_count_word_follows_len(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        expected = handoff._count_word(len(TIER_C_LABELS))
+        assert expected == handoff._TIER_C_COUNT_WORD
+        assert handoff._count_word(5) == "five"
+        assert handoff._count_word(12) == "12"
+        block = build_handoff_protocol_block(Role.IMPLEMENTER)
+        assert f"closed set of {handoff._TIER_C_COUNT_WORD}:" in block
+        assert f"the {handoff._TIER_C_COUNT_WORD} Tier-C types above" in block
+
+    def test_prose_is_rendered_from_the_definitions(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        block = build_handoff_protocol_block(Role.PROPOSER)
+        for label in TIER_C_LABELS:
+            assert f"`{label}` ({handoff._TIER_C_LABEL_DEFINITIONS[label]})" in block, label
+
+
+class TestLegacyLabelsStillMeasured:
+    """The parser keeps recording legacy / unsure labels — measurement, not admission."""
+
+    def test_legacy_and_unsure_labels_parse(self) -> None:
+        for label in ("scope", "billing", "release-cross-repo", "unsure:goal?"):
+            h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == label, label
+
+    def test_new_labels_parse(self) -> None:
+        for label in ("goal", "cost", "irreversible", "merge-protected"):
+            h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == label, label
