@@ -589,9 +589,12 @@ class NaysayerGatingConfig(_StrictModel):
     """
 
     skip_if_head_unchanged: bool = False
-    """Skip the (costly) Lexora review and reuse the prior verdict when the naysayer has already
-    reviewed THIS exact head SHA (its last verdict review's ``commit_id`` == the PR head) — catches
-    accidental / reflexive re-fires on an unchanged commit. Env:
+    """Skip the (costly) Lexora review when the naysayer has already reviewed THIS exact head SHA
+    (its last verdict review's ``commit_id`` == the PR head) — catches accidental / reflexive
+    re-fires on an unchanged commit. The skip only re-posts a prior APPROVE; a prior
+    REQUEST_CHANGES always gets a full re-review, because a re-posted RC carries no critique the
+    implementer could act on (T-infra-failure-posts-empty-rc, PR #367). The CI gate still runs
+    first, so a cached APPROVE never masks a current CI failure. Env:
     ``MINDWIRE_NAYSAYER_GATING__SKIP_IF_HEAD_UNCHANGED=true``."""
 
     max_review_rounds: int = Field(default=0, ge=0)
