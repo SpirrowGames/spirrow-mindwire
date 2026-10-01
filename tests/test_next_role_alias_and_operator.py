@@ -445,3 +445,81 @@ def test_head_skip_parks_a_valid_operator_head() -> None:
 def test_head_skip_launches_a_malformed_operator_head(body: str) -> None:
     # The conductor is what posts the stand-down notice; skipping here would park it silently.
     assert _decide(body) is not Decision.SKIP
+
+
+# --------------------------------------------------------------------------- #
+# PR #402 gate (82ec032) — head_skip LAUNCHes a head only if the conductor moves it
+# --------------------------------------------------------------------------- #
+
+_MALFORMED_OPERATOR_BODIES = [
+    "x\n\nNEXT: operator",
+    f"TIER-C: cost\n\n{OPERATOR_FORM_EXAMPLE}",
+    "OPERATOR-TASK: a\nTIER-C-CHECK: decided msg-1\nNEXT: operator",
+]
+
+
+@pytest.mark.parametrize("field", ["human", "Bohr", "operator", "none"])
+@pytest.mark.parametrize("body", _MALFORMED_OPERATOR_BODIES)
+def test_malformed_body_operator_stands_down_whatever_the_field_says(field: str, body: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER, next_participant=field)
+    assert handoff.kind is HandoffKind.ABSENT
+    assert handoff.operator_fault is not None
+    assert handoff.mismatch_reason is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["human", "Bohr", "operator"])
+@pytest.mark.parametrize("body", _MALFORMED_OPERATOR_BODIES)
+async def test_launched_malformed_operator_head_is_moved_by_a_notice(field: str, body: str) -> None:
+    # The loop the gate described: head_skip LAUNCHes this head (it reads only the body), so the
+    # conductor must post a notice or the same head is relaunched every tick.
+    assert _decide(body) is Decision.LAUNCH
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content=body, next_participant=field)
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.spawns == []
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+    (post,) = mcp.posts
+    marker = parse_stop_marker(str(post["content"]))
+    assert marker is not None
+    assert _decide(str(post["content"])) is Decision.SKIP
+
+
+@pytest.mark.anyio
+async def test_field_only_operator_posts_its_stand_down_without_tripping_section_6() -> None:
+    # Field ``operator`` with no body ``NEXT:`` is a NO_HANDOFF with the field set; the §6
+    # assertion must let it through because it always posts its notice.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="prose only", next_participant="operator")
+    outcome = await _conductor(mcp, _ScriptedDispatcher(mcp, {})).run()
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+    (post,) = mcp.posts
+    marker = parse_stop_marker(str(post["content"]))
+    assert marker is not None
+    assert marker["reason"] == StandDownReason.IDENTITY_OPERATOR_NO_TASK.value
+
+
+def test_field_operator_with_body_human_is_skipped_by_head_skip() -> None:
+    # The gate's literal scenario: head_skip reads the body token (``human``), not the field.
+    assert _decide("x\n\nNEXT: human") is Decision.SKIP
+
+
+def test_stop_marker_lands_above_next_even_with_a_trailing_newline() -> None:
+    from spirrow_mindwire.conductor.core import _with_stop_marker
+    from spirrow_mindwire.conductor.stand_down import UnresolvedItem, stand_down_event
+
+    event = stand_down_event(
+        unresolved=UnresolvedItem.IDENTITY,
+        reason=StandDownReason.IDENTITY_OPERATOR_NO_TASK,
+        project="p",
+        thread="t",
+        detail="d",
+    )
+    base = "cause\n\nNEXT: human"
+    for notice in (base, base + "\n", base + "\n\n"):
+        marked = _with_stop_marker(notice, event)
+        lines = marked.splitlines()
+        assert lines[-1] == "NEXT: human"
+        assert lines[-2] == ""
+        assert parse_stop_marker(marked) is not None

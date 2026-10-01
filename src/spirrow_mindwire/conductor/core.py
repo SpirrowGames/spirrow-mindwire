@@ -181,7 +181,8 @@ def _with_stop_marker(notice: str, event: Event) -> str:
     unchanged final ``NEXT: human`` — so the line directly above ``NEXT:`` stays empty and the
     ``TIER-C:`` / ``STOP:`` readers see nothing there.
     """
-    head, sep, last = notice.rpartition("\n")
+    # Trailing newlines are dropped first so ``last`` is always the ``NEXT:`` line, never "".
+    head, sep, last = notice.rstrip("\n").rpartition("\n")
     if not sep:
         return notice
     return f"{head}\n{render_stop_marker(event)}\n\n{last}"
@@ -816,8 +817,13 @@ class Conductor:
                 # the pre-Layer-3 path. This branch is structurally unreachable when the field is
                 # set; the assertion pins it that way so a future refactor of the resolver cannot
                 # silently re-open msg-1438's 2-day silent stall (§3-1 row 3).
+                # The one exception is a refused ``NEXT: operator`` (``operator_fault``): it is a
+                # NO_HANDOFF that always posts its stand-down notice, so it cannot be msg-1438's
+                # silent stall even when a field is present (PR #402 gate, 82ec032).
                 assert not (
-                    stop_reason is StopReason.NO_HANDOFF and _next_participant(latest) is not None
+                    stop_reason is StopReason.NO_HANDOFF
+                    and _next_participant(latest) is not None
+                    and handoff.operator_fault is None
                 ), (
                     f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
                     f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"

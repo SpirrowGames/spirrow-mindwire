@@ -769,6 +769,16 @@ def resolve_handoff(
     tell them apart without duplicating this resolver.
     """
     body_handoff = _resolve_body(body, roster)
+    if body_handoff.human_ask is HumanAsk.OPERATOR_WORK:
+        # PR #402 gate (82ec032): a malformed body ``NEXT: operator`` stands down whatever the
+        # field says. head_skip reads only the body, so it LAUNCHes every malformed operator head
+        # on the promise that the conductor posts a notice that moves the head. If a diverging
+        # field turned this into a quiet TARGET_DIVERGENCE park instead, the head would never
+        # move and every tick would relaunch the same head. A well-formed body still reconciles
+        # against the field as before (head_skip SKIPs it, so a quiet park is safe there).
+        checked = _check_operator(body, body_handoff)
+        if checked.operator_fault is not None:
+            return checked
     field_value = next_participant.strip() if next_participant is not None else ""
     if not field_value:
         resolved = body_handoff
