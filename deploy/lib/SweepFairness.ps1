@@ -192,7 +192,15 @@ function Get-OrderedSweepCandidates {
         $lane = Get-SweepLane -Verdict $v
         if ($lane -eq 'none') { $others += $c; continue }
         $wait = Get-LaunchWaitSince -EvaluatedState $EvaluatedState -Key $c.key
-        if ($null -eq $wait) { $wait = $Now.ToUniversalTime() }
+        # A missing value reads as $Now, and $Now goes through the same 'o' round trip that a stored
+        # value has been through (Set-LaunchWaitPending writes 'o', Get-LaunchWaitSince parses it).
+        # Every sort key therefore comes from one representation, and a fallback key compares
+        # equal to a value stored this tick. Equality does not depend on a native [datetime] and a
+        # parsed one agreeing to the tick (PR #406 gate advisory).
+        if ($null -eq $wait) {
+            $wait = [datetime]::Parse($Now.ToUniversalTime().ToString('o'), [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        }
         $item = [PSCustomObject]@{ Cand = $c; WaitTicks = $wait.Ticks; Index = $i }
         if ($lane -eq 'gate') { $gates += $item } else { $roles += $item }
     }

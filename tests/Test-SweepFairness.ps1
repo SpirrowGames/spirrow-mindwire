@@ -215,6 +215,18 @@ $stO = @{ 'p/T-c' = @{ launch_wait_since = $t0.AddHours(-1).ToString('o') }; 'p/
 $ord = (Get-OrderedSweepCandidates -Candidates $cO -Verdicts $vO -EvaluatedState $stO -Now $t0 | ForEach-Object { $_.key }) -join ','
 Check "order = skip, gate, then c (older), a, b (tie by sweep order)" ($ord -eq 'p/T-skip,p/T-d,p/T-c,p/T-a,p/T-b') "got=$ord"
 
+# PR #406 gate advisory: a value stored this tick (written as 'o', parsed back) and the $Now
+# fallback for a missing value must compare EQUAL, so the tie falls to sweep.json order. A $Now
+# with sub-tick-irrelevant but non-zero fractional ticks is used on purpose.
+$nowFrac = $t0.AddTicks(1234567)
+$cT = @('p/T-fallback', 'p/T-stored') | ForEach-Object { New-Cand $_ }
+$vT = @{ 'p/T-fallback' = (New-Verdict); 'p/T-stored' = (New-Verdict) }
+$stT2 = @{}
+Set-LaunchWaitPending -EvaluatedState $stT2 -Key 'p/T-stored' -Now $nowFrac
+$ordT = (Get-OrderedSweepCandidates -Candidates $cT -Verdicts $vT -EvaluatedState $stT2 -Now $nowFrac | ForEach-Object { $_.key }) -join ','
+Check "stored-this-tick and fallback keys tie, so sweep.json order decides" ($ordT -eq 'p/T-fallback,p/T-stored') "got=$ordT"
+Check "the stored value round-trips to the exact tick" ((Get-LaunchWaitSince $stT2 'p/T-stored').Ticks -eq $nowFrac.Ticks)
+
 # =============================================================================================
 Write-Host "budgets — slow decide (Gate < pre-loop < Launch) with one gate: gate exactly 1, then role 1"
 $cS = @((New-Cand 'p/T-role'), (New-Cand 'p/T-gate'))
