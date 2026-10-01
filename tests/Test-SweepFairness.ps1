@@ -409,6 +409,40 @@ $spawnIdx = $loop.Body.Extent.Text.IndexOf('& $inner')
 $clearIdx = $loop.Body.Extent.Text.IndexOf('Clear-LaunchWait')
 Check "admission is checked before commit-launch" (($admIdx -gt 0) -and ($admIdx -lt $commitIdx))
 Check "the wait clears after commit-launch and before the spawn" (($clearIdx -gt $commitIdx) -and ($clearIdx -lt $spawnIdx))
+# PR #406 gate round 2: Invoke-SimTick is a skeleton of the dispatch loop, so a control-flow guard
+# that exists only in the wrapper (for example `if ($didWork) { continue }` at the top of the body)
+# would be invisible to the simulation and could silently cut the lanes short. The pins below close
+# that gap on the REAL loop's AST:
+#   (a) $didWork is never READ inside the dispatch loop. It is only assigned there, and its single
+#       reader is the ALL-CANDIDATES-IDLE summary after the loop.
+#   (b) the loop's own `break` statements (nearest enclosing loop = the dispatch loop) are exactly
+#       the four exits the design names: time-budget, k-budget-hit, undeclared-verdict, and the
+#       role-lane post-run break. Adding one forces this test to be revisited.
+#   (c) the post-run break sits under an `if` that calls Get-PostRunAction, so whether a worked run
+#       ends the sweep is decided by the lib function the simulation exercises.
+function Get-NearestLoop {
+    param($Node)
+    $p = $Node.Parent
+    while ($null -ne $p -and -not ($p -is [System.Management.Automation.Language.LoopStatementAst] -or
+                                   $p -is [System.Management.Automation.Language.ForEachStatementAst])) { $p = $p.Parent }
+    return $p
+}
+$didWorkReads = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $n.VariablePath.UserPath -eq 'didWork' -and -not ($n.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Parent.Left -eq $n) }, $true))
+Check "(a) `$didWork is never read inside the dispatch loop" ($didWorkReads.Count -eq 0) "reads at line(s) $(($didWorkReads | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
+$ownBreaks = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.BreakStatementAst] }, $true) |
+    Where-Object { (Get-NearestLoop $_) -eq $loop })
+Check "(b) the dispatch loop has exactly 4 own break exits" ($ownBreaks.Count -eq 4) "found $($ownBreaks.Count) at line(s) $(($ownBreaks | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
+$postRunBreak = @($ownBreaks | Where-Object {
+    $p = $_.Parent; $found = $false
+    while ($null -ne $p -and $p -ne $loop) {
+        if ($p -is [System.Management.Automation.Language.IfStatementAst] -and
+            $p.Clauses[0].Item1.Extent.Text -match 'Get-PostRunAction') { $found = $true; break }
+        $p = $p.Parent
+    }
+    $found })
+Check "(c) the worked-run break is governed by Get-PostRunAction" ($postRunBreak.Count -eq 1)
 $orderAssign = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
     $n.Left.Extent.Text -eq '$candidates' -and $n.Right.Extent.Text -like 'Get-OrderedSweepCandidates*' }, $true))
 Check "the loop's `$candidates is the ordered list" ($orderAssign.Count -eq 1 -and $orderAssign[0].Extent.StartOffset -lt $loop.Extent.StartOffset)
