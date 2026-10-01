@@ -56,6 +56,7 @@ from spirrow_mindwire.stall_ledger.predicates import stalled
 from spirrow_mindwire.stall_ledger.store import (
     REQUESTS_DIRNAME,
     STORE_FILENAME,
+    InvalidRequest,
     LoadedStore,
     StoreStatus,
     load_store,
@@ -68,6 +69,9 @@ from spirrow_mindwire.stall_ledger.store import (
 #: Whole-tick deadline (msg-4701 §3). Provisional; D-16c fixes it with the heartbeat
 #: interval under the constraint ``T_TICK_MAX < T_LOCK_STALE``.
 DEFAULT_T_TICK_MAX = timedelta(minutes=10)
+
+#: Suffix an unusable clear request is renamed to, taking it out of ``clear-*.json``.
+INVALID_REQUEST_SUFFIX = ".invalid"
 
 FLAG_EPOCH_UNKNOWN = "epoch_unknown"
 FLAG_ORIGIN_UNKNOWN = "origin_unknown"
@@ -391,26 +395,35 @@ async def _locked_tick(
         log({"kind": "store_version_ahead", "detail": store.detail})
     elif store.status == StoreStatus.VERSION_UNRECOGNIZED:
         log({"kind": "store_version_unrecognized", "detail": store.detail})
+    # Every line that reports a change to the STORE is held in ``held`` and emitted only
+    # after ``save_store`` lands: a tick that aborts on its deadline applied nothing, and
+    # must not say it did (PR-gate #361 @ f303068, objection 1). That covers record
+    # quarantines, the clear-request outcomes, and everything ``evaluate`` reports
+    # (open / close / reclassify / unknown_motion_type). Lines about things that already
+    # happened on disk regardless of the write -- ``store_corrupt``'s move-aside, the
+    # store status -- go out immediately.
+    held: list[dict[str, Any]] = []
     for event in store.quarantine_events:
         if event.first:
-            log({"kind": "record_quarantined", "key": event.key, "reason": event.reason})
+            held.append({"kind": "record_quarantined", "key": event.key, "reason": event.reason})
 
     results = [await adapter.fetch() for adapter in adapters]
 
     # Clear requests are read after the fetch, immediately before evaluation
     # (msg-4699 §2-2), so a request dropped while this tick was waiting on the network
     # is applied by this tick rather than the next one.
-    # Their log lines are held until the store write lands: a tick that aborts on its
-    # deadline applied nothing, and must not say it did.
+    # Their log lines are held with the rest (see ``held`` above). An INVALID request is
+    # moved aside to ``<name>.invalid`` after the store write, so it is reported once and
+    # then leaves the ``clear-*.json`` glob instead of being re-read and re-logged on
+    # every tick forever (PR-gate #361 @ f303068, objection 2). It is renamed, not
+    # deleted: the operator's file stays on disk as evidence of what was wrong with it.
     applied_requests: list[Path] = []
-    clear_lines: list[dict[str, Any]] = []
+    invalid_requests: list[InvalidRequest] = []
     if store.writable:
-        requests, invalid = read_clear_requests(paths.requests)
-        for bad in invalid:
-            log({"kind": "clear_request_invalid", "path": str(bad.path), "detail": bad.detail})
+        requests, invalid_requests = read_clear_requests(paths.requests)
         for req in requests:
             cleared = store.clear_quarantined(req.unit_key)
-            clear_lines.append(
+            held.append(
                 {
                     "kind": "quarantine_cleared" if cleared else "clear_request_noop",
                     "key": req.unit_key,
@@ -422,7 +435,7 @@ async def _locked_tick(
 
     if store.writable:
         await evaluate(
-            store=store, results=results, now=tick_now, log=log, counters=outcome.counters
+            store=store, results=results, now=tick_now, log=held.append, counters=outcome.counters
         )
         if before_store_write is not None:
             before_store_write()
@@ -434,15 +447,38 @@ async def _locked_tick(
         assert store.envelope is not None
         save_store(paths.store, store.envelope)
         outcome.wrote_store = True
-        for line in clear_lines:
+        for line in held:
             log(line)
         for path in applied_requests:
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
+        for bad in invalid_requests:
+            log(
+                {
+                    "kind": "clear_request_invalid",
+                    "path": str(bad.path),
+                    "detail": bad.detail,
+                    "moved_to": _move_invalid_request_aside(bad.path),
+                }
+            )
         outcome.evaluated = True
         _heartbeat(log, results, tick_now, store, evaluated=True, aborted=None)
     else:
         _heartbeat(log, results, tick_now, store, evaluated=False, aborted=None)
+
+
+def _move_invalid_request_aside(path: Path) -> str | None:
+    """Rename an unusable request to ``<name>.invalid``; ``None`` if that failed.
+
+    A failed rename is reported (``moved_to: null``) and the file is retried next tick
+    -- loud, never silent, and never a delete.
+    """
+    target = path.with_name(path.name + INVALID_REQUEST_SUFFIX)
+    try:
+        os.replace(path, target)
+    except OSError:
+        return None
+    return str(target)
 
 
 def _heartbeat(
@@ -465,7 +501,9 @@ def _heartbeat(
         input_format_version=ADAPTER_FORMAT_VERSION,
         sources=tuple(r.report for r in results),
         previous_last_valid_ingest_at=None,
-        stalls=tuple(sorted(store.records)) if store.writable else (),
+        # Only a tick whose store write landed reports its stalls: an aborted tick's
+        # in-memory records were never persisted (same invariant as ``held``).
+        stalls=tuple(sorted(store.records)) if store.writable and evaluated else (),
     )
     line: dict[str, Any] = {
         "kind": "heartbeat",

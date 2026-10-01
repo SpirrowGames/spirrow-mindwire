@@ -549,3 +549,91 @@ def test_deadline_abort_writes_nothing_and_keeps_requests(tmp_path: Path) -> Non
     assert (state / "stall-ledger.json").read_bytes() == before
     assert len(list((state / "stall-ledger.requests").glob("clear-*.json"))) == 1
     assert not [c for c in out.lines if "clear" in c["kind"]]
+    # PR-gate #361 @ f303068 objection 1: nothing that reports a store change may be
+    # logged by a tick whose store write never happened.
+    assert [line["kind"] for line in out.lines] == ["heartbeat"]
+    assert hb["stalls"] == []
+
+
+def test_deadline_abort_says_nothing_then_the_next_tick_says_it_once(tmp_path: Path) -> None:
+    """Objection 1, positive side: the open the aborted tick computed is reported by
+    the tick that actually persists it -- exactly once, not twice."""
+    a = FakeAdapter(units={"o/r#1": (True, (), DAY1)})
+    ticks = iter([0.0, 10_000.0])
+    paths = TickPaths(state_dir=tmp_path / "state")
+    aborted = asyncio.run(
+        run_tick(
+            paths=paths,
+            adapters=[a],
+            now=lambda: DAY1 + timedelta(days=2),
+            monotonic=lambda: next(ticks),
+            t_tick_max=timedelta(minutes=10),
+            out=io.StringIO(),
+        )
+    )
+    assert aborted.aborted == "deadline"
+    assert _lines(aborted, "open") == []
+    landed = _tick(tmp_path, [a], DAY1 + timedelta(days=2, minutes=5))
+    assert [o["unit"] for o in _lines(landed, "open")] == ["pr:o/r#1"]
+
+
+def test_deadline_abort_does_not_report_a_record_quarantine(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "stall-ledger.json").write_text(
+        json.dumps({"schema_version": "1.0", "records": {"pr:o/r#1": {"unit": "bogus"}}}),
+        encoding="utf-8",
+    )
+    ticks = iter([0.0, 10_000.0])
+    out = asyncio.run(
+        run_tick(
+            paths=TickPaths(state_dir=state),
+            adapters=[FakeAdapter()],
+            now=lambda: DAY1,
+            monotonic=lambda: next(ticks),
+            t_tick_max=timedelta(minutes=10),
+            out=io.StringIO(),
+        )
+    )
+    assert out.aborted == "deadline"
+    assert _lines(out, "record_quarantined") == []
+    landed = _tick(tmp_path, [FakeAdapter()], DAY1)
+    assert len(_lines(landed, "record_quarantined")) == 1
+
+
+def test_invalid_clear_request_is_reported_once_and_moved_aside(tmp_path: Path) -> None:
+    """PR-gate #361 @ f303068 objection 2: an unparseable request must not be re-read
+    and re-logged on every tick forever. It is renamed (never deleted), once."""
+    req_dir = tmp_path / "state" / "stall-ledger.requests"
+    req_dir.mkdir(parents=True)
+    bad = req_dir / "clear-20260901T000000Z-bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    first = _tick(tmp_path, [FakeAdapter()], DAY1)
+    [line] = _lines(first, "clear_request_invalid")
+    assert line["path"] == str(bad)
+    assert line["moved_to"] == str(bad) + ".invalid"
+    assert not bad.exists()
+    assert (req_dir / (bad.name + ".invalid")).read_text(encoding="utf-8") == "{not json"
+    second = _tick(tmp_path, [FakeAdapter()], DAY1 + timedelta(minutes=5))
+    assert _lines(second, "clear_request_invalid") == []
+
+
+def test_invalid_clear_request_is_untouched_by_an_aborted_tick(tmp_path: Path) -> None:
+    req_dir = tmp_path / "state" / "stall-ledger.requests"
+    req_dir.mkdir(parents=True)
+    bad = req_dir / "clear-20260901T000000Z-bad.json"
+    bad.write_text("[]", encoding="utf-8")
+    ticks = iter([0.0, 10_000.0])
+    out = asyncio.run(
+        run_tick(
+            paths=TickPaths(state_dir=tmp_path / "state"),
+            adapters=[FakeAdapter()],
+            now=lambda: DAY1,
+            monotonic=lambda: next(ticks),
+            t_tick_max=timedelta(minutes=10),
+            out=io.StringIO(),
+        )
+    )
+    assert out.aborted == "deadline"
+    assert bad.exists()
+    assert _lines(out, "clear_request_invalid") == []

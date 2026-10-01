@@ -31,7 +31,10 @@ NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 
 # A child that takes the lock, reports, and holds it until ``go`` appears (or forever).
 # A child that runs one real tick against a quarantine.json source that is slow to read,
-# so concurrent children overlap. It waits for ``start`` so all children begin together.
+# so concurrent children overlap. It prints ``ready`` once its imports are done, then
+# waits for ``start``: the parent touches ``start`` only after EVERY child is ready, so a
+# child still importing under load cannot begin after another child's tick has already
+# ended (which made "exactly one evaluates" flake under the full gate).
 _TICKER = textwrap.dedent(
     """
     import asyncio, io, json, sys, time, pathlib
@@ -46,6 +49,7 @@ _TICKER = textwrap.dedent(
 
     state = pathlib.Path(sys.argv[1])
     start = pathlib.Path(sys.argv[2])
+    print("ready", flush=True)
     while not start.exists():
         time.sleep(0.01)
     paths = TickPaths(state_dir=state)
@@ -91,6 +95,12 @@ def _seed_state(tmp_path: Path) -> Path:
     return state
 
 
+def _start_together(procs: list[subprocess.Popen[str]], start: Path) -> None:
+    for p in procs:
+        assert _readline(p, timeout=60.0) == "ready"
+    start.touch()
+
+
 def _file_id(path: Path) -> tuple[int, int]:
     st = os.stat(path)
     return st.st_dev, st.st_ino
@@ -112,7 +122,7 @@ def test_two_concurrent_ticks_one_evaluates_one_skips(tmp_path: Path) -> None:
     )
     start = tmp_path / "start"
     procs = [_spawn(_TICKER, str(state), str(start), "1.5") for _ in range(2)]
-    start.touch()
+    _start_together(procs, start)
     results = [json.loads(_readline(p)) for p in procs]
     for p in procs:
         p.wait(timeout=30)
@@ -131,7 +141,7 @@ def test_three_ticks_over_a_dead_owner_payload_exactly_one_evaluates(tmp_path: P
     )
     start = tmp_path / "start"
     procs = [_spawn(_TICKER, str(state), str(start), "1.5") for _ in range(3)]
-    start.touch()
+    _start_together(procs, start)
     results = [json.loads(_readline(p)) for p in procs]
     for p in procs:
         p.wait(timeout=30)
