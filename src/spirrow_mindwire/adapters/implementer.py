@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -74,11 +75,13 @@ from claude_agent_sdk import (
 )
 
 from ..conductor.handoff import build_handoff_protocol_block
+from ..dispatcher.event_log import spawn_ready_event
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
     AdapterHealthError,
     AdapterSpawnError,
+    AdapterSpawnTimeoutError,
 )
 from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
@@ -99,6 +102,7 @@ from ..value_objects import (
 )
 from . import _sdk_job_hook
 from ._cli_selection import cli_selection_kwargs
+from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
     JobState,
@@ -110,6 +114,8 @@ from .claude_code_sdk import (
     SdkTurnTimeoutError,
     _default_client_factory,
     _drain_reply,
+    _emit_observational,
+    _note_cc_session_uuid,
     _SdkClient,
     _shutdown,
 )
@@ -118,7 +124,9 @@ from .claude_code_sdk import (
 # conductor-4h). Both are conservative — smaller than the Task Scheduler's 4 h
 # wall by a wide margin, larger than any healthy turn. Overridable via the
 # constructor + env vars for operational tuning.
-_DEFAULT_SPAWN_TIMEOUT_SECONDS = 60.0
+# The spawn budget is the shared connect budget: the proposer uses the same number (Bohr msg-5053
+# D-4), and defining this one from it is what keeps the two from drifting.
+_DEFAULT_SPAWN_TIMEOUT_SECONDS = DEFAULT_CONNECT_TIMEOUT_SECONDS
 _DEFAULT_TURN_TIMEOUT_SECONDS = 30 * 60.0  # 30 minutes — a long turn is fine,
 # a session that eats hours is what we exist to break.
 
@@ -292,12 +300,16 @@ class ImplementerSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the implementer adapter (§3.4)."""
 
 
-class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError):
+class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError, AdapterSpawnTimeoutError):
     """``spawn`` exceeded its init time budget (v12 B-4).
 
     Distinct subclass so the dispatcher / conductor can tell "the SDK never
     connected" from "the SDK connected but errored". Error code:
     ``adapter.spawn_timeout``.
+
+    Also an :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` (Bohr
+    msg-5053 D-2): that Port-level class is what the conductor catches to retry
+    the spawn once, so it never has to import this one.
     """
 
 
@@ -346,6 +358,9 @@ class _Session:
     # on close, so a double-cleanup does not attempt to close the same handle
     # twice (which on Windows can destroy a recycled handle).
     job_state: JobState | None = None
+    # T45 (loop side): the Claude Code session UUID from ``SystemMessage(init)``;
+    # distinct from the handle's mindwire ULID ``session_id`` (Bohr msg-4884 §2).
+    cc_session_uuid: str | None = None
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -630,6 +645,7 @@ class ImplementerSdkAdapter:
             client = self._client_factory(options)
             job_handle_for_ctx = session.job_state.handle if session.job_state is not None else None
             token = _JOB_HANDLE_CTX.set(job_handle_for_ctx)
+            connect_started = time.monotonic()
             try:
                 await asyncio.wait_for(
                     client.connect(),
@@ -665,6 +681,15 @@ class ImplementerSdkAdapter:
             )
             self._sessions[handle] = session
             session_registered = True
+            # T43 (Bohr msg-4888): connect() returned inside the spawn budget, so the
+            # handle is usable. That is the whole readiness signal — no second clock,
+            # no deferred delivery. It stands in for "listening" only while the session
+            # has no out-of-process MCP server; tests/test_role_tool_surface.py pins
+            # that. A session that connected and then never answers is the stall
+            # watchdog's case (conductor.stalled, T42), not this one's.
+            await _emit_observational(
+                ctx, spawn_ready_event(handle, after_s=time.monotonic() - connect_started)
+            )
             return handle
 
         except TimeoutError as exc:
@@ -678,7 +703,9 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkSpawnTimeoutError(
                 f"adapter.spawn_timeout: SDK spawn did not connect inside "
                 f"{self._spawn_timeout_seconds}s for role {role.value} on "
-                f"thread {thread_ref.thread_id}"
+                f"thread {thread_ref.thread_id}",
+                adapter_id=self.adapter_id,
+                timeout_s=self._spawn_timeout_seconds,
             ) from exc
         except ImplementerSdkSpawnError:
             # Already a spawn error — pass through so the caller sees our
@@ -743,11 +770,13 @@ class ImplementerSdkAdapter:
         # command cannot hold the drain open past our wall. A hit here
         # raises ``SdkTurnTimeoutError`` which we wrap as
         # ``adapter.turn_timeout``.
+        observed_uuid: list[str] = []
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body = await _drain_reply(
                 session.client,
                 turn_timeout_seconds=self._turn_timeout_seconds,
+                on_init=observed_uuid.append,
             )
             await session.ctx.on_reply(
                 ReplyDraft(
@@ -776,6 +805,10 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
+        finally:
+            # T45: recorded on success AND failure (a timed-out turn is the one whose
+            # transcript is wanted).
+            await _note_cc_session_uuid(session, handle, next(iter(observed_uuid), None))
 
         session.last_active_at = datetime.now(UTC)
         session.state = SessionState.IDLE

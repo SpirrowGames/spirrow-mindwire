@@ -78,13 +78,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
-from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
+from ..decider.hook import Decider, ThreadMessage, run_proceed_clearance, run_tierc_hook
+from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
-from ..routing import GuardIVerdict, guard_proposer_to_implementer
+from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..value_objects import (
@@ -105,8 +106,24 @@ from .gate_records import (
     render_ci_route_marker,
     verdict_heads,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
+from .handoff import (
+    HUMAN_TOKEN,
+    Handoff,
+    HandoffKind,
+    declares_no_tier_c,
+    declares_tier_c,
+    parse_next_token,
+    resolve_handoff,
+)
 from .roster import RoleResolutionError, derive_identity_by_role
+from .spawn_timeout import (
+    SPAWN_ATTEMPTS,
+    SpawnGaveUp,
+    emit_spawn_timeout,
+    render_spawn_timeout_notice,
+    spawn_timeout_event,
+)
+from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
 from .stand_down import (
     StandDownError,
     StandDownReason,
@@ -201,6 +218,12 @@ class StopReason(StrEnum):
     # ended on NO_PROGRESS. Measured on two threads that sat that way for days at one retry per
     # hour. Detecting it in ``_route`` means the spawn never happens and the stop names its cause.
     SELF_HANDOFF = "self_handoff_to_human"
+    # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
+    # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
+    # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
+    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
+    # nowhere if re-run).
+    STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -326,6 +349,8 @@ class Conductor:
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
         stop_slot: ConductorStopSlot | None = None,
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -381,12 +406,22 @@ class Conductor:
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
+        # T42 stall watchdog input, handed down by the sweep (``--launches-same-head`` /
+        # ``--launch-head-msg-id``). The defaults (0 / None) never stall, so a bare Conductor
+        # and every caller that predates T42 behave exactly as before.
+        self._launches_same_head = launches_same_head
+        self._launch_head_msg_id = launch_head_msg_id
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
         # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
+        # D-4' G3: the Decider's proceed clearance for ONE head, keyed by that head's msg id
+        # (``_prefetch_proceed_clearance``). ``_route`` is synchronous and the Decider is not, so
+        # the answer is fetched before ``_route`` and read back through a thunk; a missing or
+        # stale entry reads as "not cleared" (fail-closed).
+        self._proceed_clearance: tuple[str, bool] | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -551,11 +586,18 @@ class Conductor:
                             )
                         handle = sessions.get(implementer_identity)
                         if handle is None:
-                            handle = await self._dispatcher.spawn_instance(
-                                self._thread_ref,
-                                self._implementer_role,
-                                implementer_identity,
+                            spawned = await self._spawn(
+                                self._implementer_role, implementer_identity
                             )
+                            if isinstance(spawned, SpawnGaveUp):
+                                return self._stop(
+                                    round_index,
+                                    StopReason.HUMAN,
+                                    spawned.notice_msg_id,
+                                    forced,
+                                    forced_saveable,
+                                )
+                            handle = spawned
                             sessions[implementer_identity] = handle
                         # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
                         # this round's fetch, so it is not in ``messages``. The context builder
@@ -590,9 +632,16 @@ class Conductor:
                     return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
                 handle = sessions.get(implementer_identity)
                 if handle is None:
-                    handle = await self._dispatcher.spawn_instance(
-                        self._thread_ref, self._implementer_role, implementer_identity
-                    )
+                    spawned = await self._spawn(self._implementer_role, implementer_identity)
+                    if isinstance(spawned, SpawnGaveUp):
+                        return self._stop(
+                            round_index,
+                            StopReason.HUMAN,
+                            spawned.notice_msg_id,
+                            forced,
+                            forced_saveable,
+                        )
+                    handle = spawned
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
@@ -611,6 +660,11 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
+            # D-4' G3: fetch the Decider's clearance for a naysayer proceed BEFORE the synchronous
+            # ``_route`` consults it. Only called when every other carve-out ③ condition already
+            # holds (``carve_out_iii_admissible``, the same rule ``_route`` applies), so a
+            # proposer's handoff, a supervised project or an undeclared proceed costs no call.
+            await self._prefetch_proceed_clearance(handoff, messages, round_index)
             route = self._route(handoff, messages)
             target_role = route.target_role
             target_identity = route.target_identity
@@ -681,6 +735,56 @@ class Conductor:
                         posted = await self._post_as_conductor_relay(redirect_body)
                         latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
+            # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
+            # count describes the head this launch started on; a later round is on a head this
+            # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
+            # roster-resolved "AI-addressed" test (msg-4532 §1) — the PR-gate path (a CI wait on
+            # one head is legitimate) and every stop above never reach here.
+            if round_index == 0 and is_stalled(
+                launches_same_head=self._launches_same_head,
+                launch_head_msg_id=self._launch_head_msg_id,
+                head_msg_id=latest_msg_id,
+            ):
+                stall_event = stalled_event(
+                    project=self._thread_ref.project_id,
+                    thread=self._thread_ref.thread_id,
+                    head_msg_id=latest_msg_id,
+                    launches_same_head=self._launches_same_head,
+                    target=target_identity,
+                )
+                emit_stalled(stall_event)
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for work.
+                # Fallback when the thread is gone: disposition (3), fail loudly. ``_post_as_relay``
+                # turns a ThreadResolvedError into an empty ``msg_id``; that, or any post that
+                # returns no ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine
+                # and Discord alert, with the ``conductor.stalled`` line above in the log tail.
+                posted = await self._post_as_relay(render_stalled_notice(stall_event))
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "conductor.stalled notice did not land in thread %r — exiting non-zero",
+                        self._thread_ref.thread_id,
+                    )
+                    raise StalledError(stall_event)
+                return self._stop(
+                    round_index, StopReason.STALLED, posted_id, forced, forced_saveable
+                )
+            # The session first, the forced-consult count after: a spawn that gave up stops the
+            # run here, and a consult that never ran must not be reported as one that did.
+            handle = sessions.get(target_identity)
+            if handle is None:
+                spawned = await self._spawn(target_role, target_identity)
+                if isinstance(spawned, SpawnGaveUp):
+                    return self._stop(
+                        round_index,
+                        StopReason.HUMAN,
+                        spawned.notice_msg_id,
+                        forced,
+                        forced_saveable,
+                    )
+                handle = spawned
+                sessions[target_identity] = handle
             if is_forced:
                 forced += 1
                 # ``is_saveable`` comes from _route (the single source of truth for the forcing
@@ -688,13 +792,6 @@ class Conductor:
                 # always; read it with the lever off to size the potential saving.
                 if is_saveable:
                     forced_saveable += 1
-
-            handle = sessions.get(target_identity)
-            if handle is None:
-                handle = await self._dispatcher.spawn_instance(
-                    self._thread_ref, target_role, target_identity
-                )
-                sessions[target_identity] = handle
             await self._dispatch_recording(
                 handle,
                 latest,
@@ -772,7 +869,10 @@ class Conductor:
             target_role=target_role,
             spawn_blocked=spawn_blocked,
             naysayer_role=self._naysayer_role,
-            author_wrote_next_human=handoff.mismatch_reason is None,
+            # A positive fact set only where the author named the human (handoff.py), never
+            # derived from ``mismatch_reason is None``: that negation would count any future
+            # non-mismatch HUMAN escalation as an author request (msg-4861 / msg-4864 U1).
+            author_requested_human=handoff.author_requested_human,
             now=datetime.now(UTC),
         )
 
@@ -890,11 +990,18 @@ class Conductor:
             # form's scope exactly (``_attested`` is reached only for a non-human naysayer
             # under RUN), and a future carve-out that needs the attest bit for a different
             # role/state combination edits ``routing.py`` only.
+            #
+            # D-4' (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): G1 / G2 / G3 are
+            # thunks for the same reason — the predicate owns when they are read.
+            head_id = _msg_id(messages[-1])
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
                 control_state_is_run=self._control_state is ControlState.RUN,
                 message_is_attested=lambda: self._attested(messages[-1]),
+                segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+                naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
+                decider_clears=lambda: self._proceed_cleared_for(head_id),
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
@@ -1186,6 +1293,85 @@ class Conductor:
         self._control_state = state
         await self._control.report_observed(state)
         return state
+
+    def _segment_declares_tier_c(self, messages: list[dict[str, Any]]) -> bool:
+        """D-4' G1: has anyone declared a Tier-C since the human last spoke?
+
+        Scans newest → oldest and stops at the most recent message authored by the human
+        (:meth:`_is_human`, the carve-out ① test) — the ONLY reset boundary (Bohr msg-4858 §2,
+        after Einstein msg-4857's edge case: an implementer failure/return must not erase a
+        declaration). Implementer, proposer, naysayer and conductor-relay messages are all scanned
+        and none of them resets. With no human message in the thread, the whole thread is scanned.
+        Any ``TIER-C: <label>`` line (``other:`` included, :func:`.handoff.declares_tier_c`) makes
+        it ``True`` — and it stays ``True`` on every later turn until the human speaks (latch).
+
+        The human boundary is author-string trust, the same D-3 environment trust model as
+        :meth:`_is_human` (msg-598 Q2=yes, re-accepted for G1 in msg-4858 §2).
+        """
+        for msg in reversed(messages):
+            if self._is_human(_author(msg)):
+                return False
+            if declares_tier_c(_content(msg)):
+                return True
+        return False
+
+    def _proceed_cleared_for(self, head_msg_id: str) -> bool:
+        """G3 read-back: the prefetched Decider clearance for exactly this head, else ``False``."""
+        cached = self._proceed_clearance
+        return bool(head_msg_id) and cached is not None and cached == (head_msg_id, True)
+
+    async def _prefetch_proceed_clearance(
+        self, handoff: Handoff, messages: list[dict[str, Any]], round_index: int
+    ) -> None:
+        """D-4' G3: ask the Decider whether this naysayer proceed may reach code without a human.
+
+        Runs only for a ``ROLE`` handoff to the implementer whose author is not the human and for
+        which :func:`~spirrow_mindwire.routing.carve_out_iii_admissible` — the very rule
+        ``_route``'s guard applies before its own ``decider_clears`` thunk — already holds. The
+        result is cached against the head's msg id; ``_route`` reads it back via
+        :meth:`_proceed_cleared_for`. With no Decider wired (``backend=off``) the cache records
+        "not cleared" and carve-out ③ stays closed (the accepted price of G3).
+        """
+        self._proceed_clearance = None
+        if not messages or handoff.kind is not HandoffKind.ROLE:
+            return
+        if handoff.role is not self._implementer_role:
+            return
+        head = messages[-1]
+        author = _author(head)
+        if self._is_human(author):
+            return
+        if not carve_out_iii_admissible(
+            author_is_naysayer=self._roster_role(author) is self._naysayer_role,
+            control_state_is_run=self._control_state is ControlState.RUN,
+            message_is_attested=lambda: self._attested(head),
+            segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+            naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
+        ):
+            return
+        cleared = await run_proceed_clearance(
+            self._decider,
+            thread_id=self._thread_ref.thread_id,
+            round_index=round_index,
+            roster=self._roster,
+            messages=[
+                ThreadMessage(
+                    msg_id=_msg_id(m),
+                    author=_author(m),
+                    content=_content(m),
+                    parsed_next=parse_next_token(_content(m)),
+                )
+                for m in messages
+            ],
+        )
+        head_id = _msg_id(head)
+        if not cleared:
+            logger.info(
+                "conductor carve-out ③ not cleared by the Decider (G3): head=%s decider=%s",
+                head_id,
+                "off" if self._decider is None else "on",
+            )
+        self._proceed_clearance = (head_id, cleared) if head_id else None
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
@@ -1603,7 +1789,10 @@ class Conductor:
             "ではありません。\n"
             "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
             "author が naysayer でない、あるいは attest 済でない、あるいは control が "
-            "`run` ではありません。\n\n"
+            "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
+            "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
+            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が proceed を "
+            "承認しなかった (Decider 無効時を含む)。\n\n"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "
@@ -1773,6 +1962,62 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
         )
+
+    async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
+        """Spawn the session for ``identity``: the one spawn path (Bohr msg-5053 D-1..D-3).
+
+        Returns the handle, or :class:`~.spawn_timeout.SpawnGaveUp` when every attempt timed out
+        and the notice saying so landed in the thread; the caller then stops on
+        ``StopReason.HUMAN`` against that notice. See :mod:`.spawn_timeout` for the rule.
+
+        Only :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` is handled. Every
+        other exception leaves here exactly as the dispatcher raised it, first attempt, no retry
+        and no notice: a spawn that failed for a stated reason fails the same way again, and its
+        exit 1 → quarantine path is unchanged.
+        """
+        for attempt in range(1, SPAWN_ATTEMPTS + 1):
+            try:
+                return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
+            except AdapterSpawnTimeoutError as exc:
+                event = spawn_timeout_event(
+                    adapter_id=exc.adapter_id,
+                    instance_id=identity,
+                    role=role,
+                    attempt=attempt,
+                    timeout_s=exc.timeout_s,
+                )
+                emit_spawn_timeout(event)
+                if attempt < SPAWN_ATTEMPTS:
+                    continue
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for a turn
+                # that never ran. Fallback when the thread is gone: disposition (3), fail loudly.
+                # ``_post_as_conductor_relay`` turns a ThreadResolvedError into an empty
+                # ``msg_id``; that, a post with no ``msg_id``, or a post that raised re-raises
+                # the timeout itself → exit 1 → the wrapper's quarantine and Discord alert, with
+                # the ``spawn.timeout`` lines above in the log tail. The refusal is never posted
+                # into another thread.
+                try:
+                    posted = await self._post_as_conductor_relay(render_spawn_timeout_notice(event))
+                except Exception as post_exc:
+                    logger.warning(
+                        "spawn.timeout notice could not be posted in thread %r (%s: %s) — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                        type(post_exc).__name__,
+                        post_exc,
+                    )
+                    raise exc from None
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "spawn.timeout notice did not land in thread %r — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                    )
+                    raise
+                return SpawnGaveUp(notice_msg_id=posted_id)
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _dispatch_recording(
         self,

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
 
 from spirrow_mindwire.adapters.claude_code_sdk import (
     ClaudeCodeSdkAdapter,
@@ -24,10 +24,14 @@ from spirrow_mindwire.adapters.claude_code_sdk import (
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
+    EVENT_FIELD_CC_SESSION_UUID,
     EVENT_FIELD_ERROR,
     EVENT_FIELD_FAILED_EVENT_ID,
+    EVENT_FIELD_SESSION_ID,
     EVENT_KIND_DELIVERY_FAILED,
     EVENT_KIND_REPLY_SENT,
+    EVENT_KIND_SESSION_CC_UUID,
+    EVENT_KIND_SPAWN_READY,
 )
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.value_objects import (
@@ -41,10 +45,31 @@ from spirrow_mindwire.value_objects import (
 )
 
 _TS = datetime(2026, 5, 22, tzinfo=UTC)
+_CC_UUID = "11111111-2222-3333-4444-555555555555"
+
+#: The two kinds that say how a turn ended. Everything else in the log (``spawn.ready``,
+#: ``session.cc_session_uuid``, and whatever session fact is added next) describes the session,
+#: not the turn — so the turn-outcome assertions below filter on this set instead of pinning the
+#: whole log, and do not break when the log learns a new session fact (PR #376 review).
+_TURN_OUTCOME_KINDS = frozenset({EVENT_KIND_REPLY_SENT, EVENT_KIND_DELIVERY_FAILED})
+
+
+def _turn_outcomes(events: list[Event]) -> list[Event]:
+    return [e for e in events if e.kind in _TURN_OUTCOME_KINDS]
+
+
+def _of_kind(events: list[Event], kind: str) -> list[Event]:
+    return [e for e in events if e.kind == kind]
 
 
 def _ok_responses() -> list[Any]:
     return [
+        # A real Claude Code session opens every turn with this handshake; the fake sends it too
+        # so these tests run the same T45 path production does.
+        SystemMessage(
+            subtype="init",
+            data={"type": "system", "subtype": "init", "session_id": _CC_UUID},
+        ),
         AssistantMessage(content=[TextBlock(text="reply text")], model="m"),
         ResultMessage(
             subtype="success",
@@ -157,12 +182,21 @@ async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
     assert posted_body.startswith("reply text")
     assert posted_body.rstrip().splitlines()[-1].startswith("<!-- source:")
     assert gateway.posts[0]["idempotency_key"] == f"{handle.session_id}:1"
-    assert [e.kind for e in events] == [EVENT_KIND_REPLY_SENT]
-    assert events[0].fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # T26: author = instance_id
+    # The turn ended in exactly one reply.sent and nothing failed.
+    [sent] = _turn_outcomes(events)
+    assert sent.kind == EVENT_KIND_REPLY_SENT
+    assert sent.fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # T26: author = instance_id
     # anchor #6 (I3 v2.2 / T26): the chatroom author and the event-log author are
     # the same identity SOT — assert the equality directly so a future one-sided
     # drift is caught (not just two literals that could both change together).
-    assert gateway.posts[0]["author"] == events[0].fields[EVENT_FIELD_AUTHOR]
+    assert gateway.posts[0]["author"] == sent.fields[EVENT_FIELD_AUTHOR]
+    # T43: the spawn's connect logs spawn.ready once, before anything the turn logs.
+    [ready] = _of_kind(events, EVENT_KIND_SPAWN_READY)
+    assert events[0] is ready
+    # T45: the init handshake's Claude Code session UUID is logged once, tied to this spawn.
+    [linked] = _of_kind(events, EVENT_KIND_SESSION_CC_UUID)
+    assert linked.fields[EVENT_FIELD_CC_SESSION_UUID] == _CC_UUID
+    assert linked.fields[EVENT_FIELD_SESSION_ID] == handle.session_id
 
 
 @pytest.mark.anyio
@@ -175,8 +209,12 @@ async def test_delivery_failure_logs_failed_event(tmp_path: Path) -> None:
         await disp.dispatch(handle, _event())
 
     assert gateway.posts == []  # no reply posted on failure
-    assert [e.kind for e in events] == [EVENT_KIND_DELIVERY_FAILED]
-    failed = events[0]
+    # The turn ended in exactly one delivery.failed; the spawn itself had connected (T43).
+    [failed] = _turn_outcomes(events)
+    assert failed.kind == EVENT_KIND_DELIVERY_FAILED
+    assert len(_of_kind(events, EVENT_KIND_SPAWN_READY)) == 1
+    # query() failed before the SDK sent its init handshake, so there is no UUID to log (T45).
+    assert _of_kind(events, EVENT_KIND_SESSION_CC_UUID) == []
     assert failed.fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # I3 v2.2 / T26: author = instance_id
     assert failed.fields[EVENT_FIELD_FAILED_EVENT_ID] == "01JEVENT"  # the failed ChatroomEvent id
     assert failed.fields[EVENT_FIELD_ERROR]  # non-empty error string

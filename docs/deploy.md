@@ -113,7 +113,7 @@ role_cli_path = "C:/Users/<you>/.local/bin/claude.exe"
 ```
 
 A `role_cli_path` that is not a file, or is not executable, stops the daemon at startup with a named
-error rather than failing once per five-minute tick. It is resolved to an absolute path there too —
+error rather than failing once per tick. It is resolved to an absolute path there too —
 a relative one would be read against the daemon's working directory by that check and against the
 session's `cwd` by the SDK, which are not the same directory.
 
@@ -259,11 +259,14 @@ Task settings that matter (Windows):
 | Setting | Value | Why |
 |---|---|---|
 | Action | `pwsh -NoProfile -File <daemon-checkout>\deploy\run-conductor-scheduled.ps1` | the wrapper, not the raw launcher — and the **daemon** checkout, not a working one (above) |
-| Trigger | at logon **and** a repeating trigger, 5 min, indefinite | the head probe makes a short interval nearly free; see below |
+| Trigger | at logon **and** a repeating trigger, 1 min, indefinite | the head probe makes a short interval nearly free; see below |
 | `MultipleInstancesPolicy` | `IgnoreNew` | a tick that fires while the previous sweep is still working is dropped — this is the whole of the "already running?" handling, no lock file needed |
 | `ExecutionTimeLimit` | `PT4H` | a real design round can take a while; `PT2H` was cutting runs off |
-| `RestartCount` / `RestartInterval` | `3` / `PT10M` | transient MCP or inference failures retry instead of waiting for the next tick |
 | Run as | the user holding `MINDWIRE_NAYSAYER_GITHUB_TOKEN`, the webhook var, and the Claude subscription | the wrapper reads the webhook from the **User** env scope |
+
+There is deliberately **no `RestartCount` / `RestartInterval`**: the repeating trigger already runs
+the next tick sooner than any restart interval worth setting, so a failed tick is simply retried by
+the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
@@ -290,7 +293,7 @@ Three rules are load-bearing:
 - **A tick either updates the code or uses it, never both.** The wrapper was parsed from the old file
   at startup, while `run-conductor.ps1` would be read from disk *after* the pull — a sweep spanning
   two versions is not a thing worth debugging later. So a deploy tick launches nothing; the cost is
-  one 5-minute cycle of latency after a merge.
+  one tick of latency after a merge.
 - **Nothing but a pure fast-forward is ever performed.** A dirty tree or a diverged branch means
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
@@ -460,7 +463,7 @@ driving those from an unattended schedule would spend money on a timer, so it st
 with their verdicts recorded — but the exclusion rule here stays for future `T-pr-review-*`
 threads.)
 
-### Why the sweep is cheap enough to run every 5 minutes
+### Why the sweep is cheap enough to run on a short interval
 
 Launching the conductor is not uniformly cheap:
 
@@ -470,7 +473,7 @@ Launching the conductor is not uniformly cheap:
   nothing (`no_progress_to_human`), the tick has bought nothing and billed for it.
 
 So the wrapper does not launch blindly. **`scripts/thread_heads.py`** answers "did anything change?"
-from data: one `chatroom_my_unread` call returns every thread's `latest_msg_id` without fetching a
+from data: one `chatroom_list_threads` call returns every open thread's `last_msg_id` without fetching a
 single message body (~1 s for all threads at once). If a thread's head equals the `last_msg` the
 conductor reported last time, the conductor would resolve the same handoff and reach the same stop —
 so it is not launched at all.
@@ -479,7 +482,10 @@ so it is not launched at all.
 earlier iteration of this predicate keyed a skip cache on both: the thread's head message *and*
 the project's loop control state (`state/heads.json`, entry per thread). At an unchanged head, a
 naysayer→implementer handoff stops at the human gate under `hold` / `supervised` but dispatches
-the implementer under `run` (carve-out ③).
+the implementer under `run` (carve-out ③ — since the D-4' guardrails, only when the naysayer's
+proceed carries `TIER-C-CHECK: none` on the line above its `NEXT:`, no `TIER-C:` line has been
+posted since the human last spoke, and the Tier-C Decider clears the proceed; with the Decider off
+(`backend=off`) a `run` project stops at the human gate for code, like `supervised`).
 
 That head-equality predicate has been retired (T-sweep-intake-and-quarantine-stalls, Bohr
 msg-1428〜msg-1432). Measured 2026-08-11, it burned inferences on a `T-track-b-seam-octree-
@@ -524,29 +530,26 @@ An earlier design used a cooldown timer instead. It was dropped: a timer guesses
 might be worthwhile, the head id knows.
 
 **Everything unknown fails open.** A probe failure, a thread missing from the probe's result, or a
-thread with no recorded head all launch the conductor anyway. The probe's exclusion rule is not fully
-characterised — it reported 11 threads where `chatroom_list_threads` showed 33 active, omitting the
-`T-pr-review-*` family — so a gap must cost one cheap run rather than silently parking a live thread
-forever.
+thread with no recorded head all launch the conductor anyway: a gap must cost one cheap run rather
+than silently parking a live thread forever.
 
-> **2026-08-02 update (K-5 triage)**: the 33-active state above is historical. K-5 closed 22 threads
-> (the whole `T-pr-review-150`〜`167` review-record family plus the settled May–June threads),
-> leaving **11 active** — matching what the probe was returning at the time. Probe and
-> `chatroom_list_threads` should now agree, but the exclusion rule itself is *still* not
-> characterised, so the fail-open stance stays.
-
-> **The probe identity must never post and never mark read.** `chatroom_my_unread` is an inbox: it
-> lists threads with unread messages, so an identity whose read cursor has advanced under-reports
-> *silently*. Measured: `Heisenberg` returned 5 of 11 threads and omitted two live candidates, while
-> the dedicated `conductor-probe` identity returned all 11. Nothing in this repo calls
-> `chatroom_mark_read`; if anything ever does for that identity, the probe goes blind and the sweep
-> quietly degrades to "launch everything".
+> **2026-09-30 (T-unread-correlated-count-scale)**: the probe used to call `chatroom_my_unread` as a
+> dedicated never-reads identity (`conductor-probe`), so that every thread stayed unread and hence
+> listed. That inbox evaluates a per-thread unread count for every thread in conclair — a cursorless
+> identity is its worst case — and the probe only ever read the head id. At 100× today's data the
+> inbox call measured 657 ms against 15 ms for the listing on the same rows (conclair perf harness,
+> CI run 35128633398). The inbox's exclusion rule was also never fully characterised (it once reported
+> 11 threads where `chatroom_list_threads` showed 33 active). The probe now calls
+> `chatroom_list_threads` with every status except `resolved` — the inbox's `include_resolved=false`
+> set — and reads `last_msg_id`. Before the switch the two were compared live on all six projects:
+> identical thread sets, identical head ids (216/216). No identity is involved any more, so there is
+> no read cursor that can blind the probe.
 
 ### State and logs
 
 | Path | Contents |
 |---|---|
-| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a 5-minute cadence readable |
+| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a minute-scale cadence readable |
 | `<data_dir>/logs/clock-YYYY-MM-DD.log` | clock-sync log |
 | `<data_dir>/state/head_skip.json` | per-thread head-skip predicate record (nomination-target, launch attempts, cached observation) — the skip decision above. Single writer: `scripts/head_skip_decide.py`; atomic replace |
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |

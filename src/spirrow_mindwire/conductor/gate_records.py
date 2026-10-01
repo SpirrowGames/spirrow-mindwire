@@ -51,6 +51,7 @@ from enum import StrEnum
 from ..github.client import ReviewEvent
 from ..github.reviews import parse_verdict_footer
 from ..naysayer.pr_review import ObjectionParse, parse_objections
+from ..tier_c_admission_gate import require_admitted
 
 #: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
 #: admission posts) are written. Both readers below are restricted to messages authored under
@@ -188,6 +189,15 @@ class RelayRoute(StrEnum):
     HUMAN = "human"
 
 
+#: The label an APPROVE → human relay carries on the line above its ``NEXT: human``: every such
+#: hand-off is a merge request, i.e. the ``merge-protected`` Tier-C type (msg-4772 / msg-4774).
+#: Resolved through :func:`~spirrow_mindwire.tier_c_admission_gate.require_admitted`, so if the
+#: gate ever renames or drops the label this module fails at import instead of the relay quietly
+#: emitting a label the gate no longer admits (PR #365 PR-gate advisory, msg-4850). The line and
+#: the implementer instruction below are both built from this one value.
+MERGE_REQUEST_TIER_C_LABEL = require_admitted("merge-protected", where="gate_records")
+MERGE_REQUEST_TIER_C_LINE = f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}"
+
 #: Appended (above the ``NEXT:`` line) ONLY on the first-advisory → implementer route, so the
 #: implementer knows on the spot what to do with an advisory-only APPROVE without its global
 #: system prompt growing for a PR-gate edge case (Einstein msg-4775 #1, Bohr msg-4776 #1 — text
@@ -197,13 +207,9 @@ class RelayRoute(StrEnum):
 ADVISORY_SELF_TRIAGE_INSTRUCTION = (
     "Advisory のみの APPROVE。human に「直すか」を聞かずに、自分で裁くこと: 安く直せるなら同じ "
     "PR で直して push する (再ゲートになる)。見送る advisory は `DECIDED: <どれを> — <理由>` を "
-    "1 行ずつ書く。見送りだけで終える場合は、最後に `TIER-C: merge-protected` と `NEXT: human` "
-    "を書いて merge を依頼する。"
+    "1 行ずつ書く。見送りだけで終える場合は、最後に "
+    f"`{MERGE_REQUEST_TIER_C_LINE}` と `NEXT: human` を書いて merge を依頼する。"
 )
-
-#: The label an APPROVE → human relay carries on the line above its ``NEXT: human``: every such
-#: hand-off is a merge request, i.e. the ``merge-protected`` Tier-C type (msg-4772 / msg-4774).
-MERGE_REQUEST_TIER_C_LINE = "TIER-C: merge-protected"
 
 #: Objection-parse statuses that mean "no advisory to triage". ``MISSING`` is here on purpose:
 #: an unreadable block is not evidence of an advisory, and the safe direction is the human
@@ -282,6 +288,7 @@ def decide_relay_route(
 
 __all__ = [
     "ADVISORY_SELF_TRIAGE_INSTRUCTION",
+    "MERGE_REQUEST_TIER_C_LABEL",
     "MERGE_REQUEST_TIER_C_LINE",
     "RELAY_AUTHOR",
     "RelayRoute",

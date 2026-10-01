@@ -10,7 +10,17 @@ the thread at all — it is stored per **project** in conclair, set from the das
 Three states (the vocabulary is conclair's; this module only consumes it):
 
 - ``run`` — fully autonomous. The independent naysayer's proceed-handoff carries a design through
-  to the implementer (the old carve-out ③, now project-wide rather than per-thread).
+  to the implementer (the old carve-out ③, now project-wide rather than per-thread) — subject to
+  the D-4' guardrails in :func:`spirrow_mindwire.routing.carve_out_iii_admissible` (G1: no
+  ``TIER-C:`` declared since the human last spoke; G2: ``TIER-C-CHECK: none`` on the proceed) and
+  G3 (the Tier-C Decider cleared the proceed; with the Decider off, ``run`` does not reach code).
+
+**The latch is the decided expiry policy.** msg-925 §3-1 asked that delegation not be left open
+indefinitely; the design thread (T-pr-2b-3-human-identity-delegate, Bohr msg-4854 ⚠ / msg-4856 G4)
+put the latch to Takahito as option (i) against (ii) "revert ``run`` to ``supervised`` after N
+implementations or T days", and Takahito chose (i) — indefinite delegation authority, together
+with G1+G2+G3 — in his "B" decide on that thread. There is therefore no expiry field here or in
+magickit's ``desired_state``; the per-turn containment is the D-4' guardrails above, not a timer.
 - ``supervised`` — the design loop turns, but only a human Tier-C decide or a PR-gate
   REQUEST_CHANGES reaches code. **This is the pre-inversion behaviour** and the baseline this
   module falls back to when no control source is wired at all.

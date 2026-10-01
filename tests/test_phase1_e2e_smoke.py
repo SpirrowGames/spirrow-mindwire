@@ -58,6 +58,7 @@ assertion.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -66,11 +67,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
 
 from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from spirrow_mindwire.dispatcher.core import Dispatcher
-from spirrow_mindwire.dispatcher.event_log import EVENT_FIELD_AUTHOR, EVENT_KIND_REPLY_SENT
+from spirrow_mindwire.dispatcher.event_log import (
+    EVENT_FIELD_AUTHOR,
+    EVENT_FIELD_CC_SESSION_UUID,
+    EVENT_FIELD_SESSION_ID,
+    EVENT_KIND_DELIVERY_FAILED,
+    EVENT_KIND_REPLY_SENT,
+    EVENT_KIND_SESSION_CC_UUID,
+    EVENT_KIND_SPAWN_READY,
+)
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
@@ -241,6 +250,8 @@ class _ScriptedSdkClient:
     def __init__(self) -> None:
         self._reply = ""
         self.disconnected = False
+        # One Claude Code session UUID per client, as in production (one per SDK session).
+        self.cc_session_uuid = str(uuid.uuid4())
 
     async def connect(self) -> None: ...
 
@@ -248,6 +259,11 @@ class _ScriptedSdkClient:
         self._reply = _script_reply(prompt)
 
     async def receive_response(self) -> AsyncIterator[Any]:
+        # A real session opens every turn with the init handshake (T45 reads the UUID from it).
+        yield SystemMessage(
+            subtype="init",
+            data={"type": "system", "subtype": "init", "session_id": self.cc_session_uuid},
+        )
         yield AssistantMessage(content=[TextBlock(text=self._reply)], model="claude-code-stub")
         yield ResultMessage(
             subtype="success",
@@ -268,6 +284,30 @@ class _ScriptedSdkClient:
 
 def _sdk_factory(_options: Any) -> _ScriptedSdkClient:
     return _ScriptedSdkClient()
+
+
+def _assert_session_facts_are_consistent(events: list[Event]) -> None:
+    """The non-reply entries in the audit log: nothing failed, and the session facts line up.
+
+    Checked by meaning rather than by pinning the full set of kinds, so the log can learn a new
+    session fact without these tests changing (PR #376 review).
+    """
+    assert not [e for e in events if e.kind == EVENT_KIND_DELIVERY_FAILED]
+    # T43: one spawn.ready per SDK session that connected at spawn.
+    ready_sessions = [
+        e.fields[EVENT_FIELD_SESSION_ID] for e in events if e.kind == EVENT_KIND_SPAWN_READY
+    ]
+    assert ready_sessions
+    assert len(set(ready_sessions)) == len(ready_sessions)
+    # T45: each session's Claude Code UUID is logged once (it never changes here), only for a
+    # session that had become ready, and no two sessions share one.
+    linked = [e for e in events if e.kind == EVENT_KIND_SESSION_CC_UUID]
+    assert linked
+    linked_sessions = [e.fields[EVENT_FIELD_SESSION_ID] for e in linked]
+    assert len(set(linked_sessions)) == len(linked_sessions)
+    assert set(linked_sessions) <= set(ready_sessions)
+    uuids = [e.fields[EVENT_FIELD_CC_SESSION_UUID] for e in linked]
+    assert len(set(uuids)) == len(uuids)
 
 
 # --------------------------------------------------------------------------- #
@@ -493,9 +533,10 @@ async def test_e2e_single_thread_full_cycle(tmp_path: Path) -> None:
     )
 
     # Observational audit channel (I7 sink): one reply.sent per adapter reply, in
-    # order, no delivery.failed.
-    assert {e.kind for e in h.events} == {EVENT_KIND_REPLY_SENT}
-    assert [e.fields[EVENT_FIELD_AUTHOR] for e in h.events] == [
+    # order, no delivery.failed. The other entries are session facts (T43 / T45).
+    _assert_session_facts_are_consistent(h.events)
+    replies = [e for e in h.events if e.kind == EVENT_KIND_REPLY_SENT]
+    assert [e.fields[EVENT_FIELD_AUTHOR] for e in replies] == [
         "proposer-1",
         "naysayer-1",
         "proposer-1",
@@ -559,9 +600,11 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
     # Audit channel stays clean under concurrency: 8 replies (4 per stream), all
     # reply.sent, each attributed to its own stream's instances (no merge across
     # the concurrently-running streams).
-    assert {e.kind for e in h.events} == {EVENT_KIND_REPLY_SENT}
-    assert len(h.events) == 8
-    assert {e.fields[EVENT_FIELD_AUTHOR] for e in h.events} == {
+    # (The other entries are session facts, T43 / T45; they are not replies.)
+    _assert_session_facts_are_consistent(h.events)
+    replies = [e for e in h.events if e.kind == EVENT_KIND_REPLY_SENT]
+    assert len(replies) == 8
+    assert {e.fields[EVENT_FIELD_AUTHOR] for e in replies} == {
         "proposer-A",
         "naysayer-A",
         "implementer-A",

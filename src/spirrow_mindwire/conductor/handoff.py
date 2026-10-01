@@ -66,6 +66,7 @@ from ..tier_c_admission_gate import (
     LEGACY_LABEL_MAP,
     RELEASE_CROSS_REPO_LABEL,
     UNSURE_LABEL,
+    require_admitted,
 )
 from ..value_objects import Role
 
@@ -412,6 +413,22 @@ class Handoff:
     #184 and left as-is here (the scope of this change is the reason-code split, not the
     surrounding token invariants — see PR body §「非目標」).
 
+    ``author_requested_human`` is ``True`` iff the **author themself** named the human: the
+    body's final ``NEXT: human`` or a ``human`` ``next_participant`` field (including a field
+    ``human`` the body agrees with or is silent on). It is set in exactly those two resolver
+    branches and nowhere else. It exists so a consumer asking "did the author ask for the
+    human?" reads a positive fact instead of deriving it from ``mismatch_reason is None`` —
+    that negation was correct only while every other ``HUMAN`` producer was a mismatch, and
+    would silently turn every future non-mismatch escalation into an author request
+    (T-reconcile-field-mismatch-flag-overloaded msg-4861 / msg-4864 U1).
+
+    Because it is a second field describing the cause of a ``HUMAN`` handoff, the combination
+    is checked at construction (msg-4864 U1, "不正な組は構築時に落とす"): ``True`` requires
+    ``kind is HUMAN`` and ``mismatch_reason is None``, and :meth:`__post_init__` raises
+    :class:`ValueError` otherwise. The check is a local guardrail — every ``Handoff`` is built
+    in this module — not a substitute for a single sum type (the naysayer reply to msg-4864
+    accepted this trade-off over widening :class:`MismatchReason`).
+
     ``stop_line`` is the ``STOP:`` disposition (T-next-line-carries-who-not-why Slice 1): set to a
     :class:`StopLine` exactly when ``kind is HandoffKind.NONE`` — including ``StopStatus.ABSENT``
     when no such line was written — and ``None`` on every other kind (not measured there). Like
@@ -426,6 +443,20 @@ class Handoff:
     mismatch_reason: MismatchReason | None = None
     mismatch_body_token: str | None = None
     stop_line: StopLine | None = None
+    author_requested_human: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.author_requested_human:
+            return
+        if self.kind is not HandoffKind.HUMAN:
+            raise ValueError(
+                f"author_requested_human=True requires kind=HUMAN, got kind={self.kind.value}"
+            )
+        if self.mismatch_reason is not None:
+            raise ValueError(
+                "author_requested_human=True is incompatible with a conductor escalation "
+                f"(mismatch_reason={self.mismatch_reason.value})"
+            )
 
 
 def _last_next_raw(body: str) -> str | None:
@@ -534,6 +565,46 @@ def _tier_c_label_above_last_next(body: str) -> str | None:
     return lowered
 
 
+# ---- D-4' guardrails (T-pr-2b-3-human-identity-delegate, Bohr msg-4856 / msg-4858) ---- #
+# Unlike the calibration reader above, these two ARE routing inputs: carve-out ③
+# (:func:`spirrow_mindwire.routing.carve_out_iii_admissible`) reads them. The
+# measurement path (``Handoff.tier_c_label``) keeps its non-blocking contract; these
+# are separate functions so neither side's semantics can leak into the other.
+TIER_C_CHECK_KEYWORD = "TIER-C-CHECK"
+"""The naysayer's G2 self-declaration keyword (``TIER-C-CHECK: none``)."""
+TIER_C_CHECK_NONE = "none"
+"""The only value that opens carve-out ③ (G2). Anything else — including a Tier-C label — keeps
+it closed."""
+
+_TIER_C_CHECK_RE = re.compile(r"\A\s*TIER-C-CHECK:\s*(?P<value>\S.*?)\s*\Z", re.IGNORECASE)
+
+
+def declares_tier_c(body: str) -> bool:
+    """G1: does ANY line of ``body`` declare a Tier-C (``TIER-C: <label>``, ``other:`` included)?
+
+    Same line grammar as the calibration reader (:data:`_TIER_C_LABEL_RE`, anchored to the whole
+    line) but over every line, not only the one above ``NEXT:`` — a declaration anywhere in the
+    segment must latch the gate (msg-4858 §2). Prose that merely mentions ``TIER-C: scope``
+    mid-sentence does not match; a line-quoted declaration does, which closes the gate: the
+    fail-closed direction, undone by one human turn (msg-4858 §3).
+    """
+    return any(_TIER_C_LABEL_RE.match(line) for line in body.splitlines())
+
+
+def declares_no_tier_c(body: str) -> bool:
+    """G2: is the line directly above the final ``NEXT:`` exactly ``TIER-C-CHECK: none``?
+
+    Strict on purpose — this is the side that OPENS the gate, so it must not be satisfied by a
+    quote elsewhere in the body. Keyword case-insensitive, value ``none`` case-insensitive,
+    surrounding whitespace ignored; anything else (missing, other value, decorated) is ``False``.
+    """
+    prev_line = _line_above_last_next(body)
+    if prev_line is None:
+        return False
+    match = _TIER_C_CHECK_RE.match(prev_line)
+    return match is not None and match.group("value").casefold() == TIER_C_CHECK_NONE
+
+
 def _name_from_raw(raw: str) -> str | None:
     """The participant name at the head of a raw NEXT token, or ``None`` if there is not one."""
     match = _PARTICIPANT_NAME_RE.match(raw)
@@ -638,7 +709,10 @@ def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
         # simply stays None. This is intentionally parsed ONLY on the HUMAN terminal: the ROLE /
         # PR_REVIEW / NONE / ABSENT paths do not carry a Tier-C claim in v1.
         return Handoff(
-            HandoffKind.HUMAN, token=token, tier_c_label=_tier_c_label_above_last_next(body)
+            HandoffKind.HUMAN,
+            token=token,
+            tier_c_label=_tier_c_label_above_last_next(body),
+            author_requested_human=True,
         )
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
@@ -695,7 +769,7 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
         # No tier_c_label on the field route: the calibration tag is a body-only annotation
         # (msg-890 §3 reads it off the line above the NEXT:). A field-driven HUMAN records its
         # class through the mismatch event or through absence, not through a body scan.
-        return Handoff(HandoffKind.HUMAN, token=token)
+        return Handoff(HandoffKind.HUMAN, token=token, author_requested_human=True)
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
     match = _roster_lookup(roster, token)
@@ -809,9 +883,7 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
 
 def _admitted_example(label: str) -> str:
     """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
-    if label not in ADMIT_LABELS:
-        raise RuntimeError(f"handoff example label {label!r} is not in ADMIT_LABELS")
-    return label
+    return require_admitted(label, where="handoff example")
 
 
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
@@ -835,7 +907,9 @@ is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything e
 Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
 to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
 refactor extent, work order, splitting PRs or threads, approving an internal \
-mechanism's design, and "may I proceed?".
+mechanism's design, whether to fix a finding in the current PR or a follow-up \
+(fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
+gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
@@ -912,7 +986,14 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "autonomously the conductor builds it directly, otherwise it routes your go to the human "
         f"for the Tier-C decision; or hand to `{HUMAN_TOKEN}` to escalate a concern that needs the "
         "human now. You are advisory, not a veto — but your escalation pulls the human back in "
-        "however autonomously the loop is running."
+        "however autonomously the loop is running. When you hand to the implementer, put exactly "
+        f"`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your `NEXT:` "
+        "line, and only after checking that what you approve to build needs no human decision: "
+        "no increase in money spent, no addition / removal / change to a spec already decided for "
+        "the project, nothing irreversible or externally published, no task only the human can "
+        "do, and no proposer-naysayer conflict you could not settle. If any of those applies, "
+        "hand to the human instead. Without the check line the conductor "
+        "does not build autonomously — it routes your go to the human."
     ),
 }
 
@@ -951,6 +1032,8 @@ __all__ = [
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
     "STOP_TRIGGER_ARMS",
+    "TIER_C_CHECK_KEYWORD",
+    "TIER_C_CHECK_NONE",
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
@@ -958,6 +1041,8 @@ __all__ = [
     "StopLine",
     "StopStatus",
     "build_handoff_protocol_block",
+    "declares_no_tier_c",
+    "declares_tier_c",
     "parse_next_token",
     "resolve_handoff",
 ]

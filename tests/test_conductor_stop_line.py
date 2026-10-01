@@ -276,7 +276,7 @@ async def test_conductor_forwards_nothing_for_a_stop_line() -> None:
 )
 @pytest.mark.anyio
 async def test_stop_line_does_not_change_decider_entry_on_next_human(above: str | None) -> None:
-    """msg-4718 §1-3: ``author_wrote_next_human`` (``core.py`` → ``decider/hook.py``) is the same
+    """msg-4718 §1-3: ``author_requested_human`` (``core.py`` → ``decider/hook.py``) is the same
     with or without a STOP line; the proposer's ``NEXT: human`` enters the hook exactly once."""
     head = "revised\n\nNEXT: human" if above is None else f"revised\n\n{above}\nNEXT: human"
     baseline, bdisp, _ = await _run(None)

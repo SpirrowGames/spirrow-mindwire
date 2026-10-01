@@ -82,7 +82,7 @@ DEFAULT_MODEL: str | None = "haiku"
 
 The composer writes a short, formulaic envelope (a question, two or three options, a
 recommendation) from a bounded tail. Nothing in that needs a frontier model, and it fires on
-every parked thread at a 5-minute cadence, so it is the clearest case in §7's table of "定型生成。
+every parked thread on every sweep tick, so it is the clearest case in §7's table of "定型生成。
 frontier を通す理由がない".
 
 ``"haiku"`` is the CLI's own alias rather than a pinned id, deliberately: pinning

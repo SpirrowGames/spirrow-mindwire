@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..dispatcher.core import Dispatcher
-from ..thread_context import build_thread_context
+from ..thread_context import ThreadContextTriggerMissing, build_thread_context
 from ..value_objects import (
     ChatroomEvent,
     EventType,
@@ -181,7 +181,7 @@ class ChatroomWatcher:
         return count
 
     async def _poll_watch(self, watch: WatchSpec, handle: SessionHandle) -> int:
-        count = 0
+        dispatched_count = 0
         # numeric msg-id order = chronological = occurred_at order (msg-190 note 1).
         messages = await self._fetch_messages(watch)
         for msg in messages:
@@ -195,9 +195,26 @@ class ChatroomWatcher:
             # (e.g. ThreadContextTriggerMissing) skips this one message rather than
             # retrying it forever and wedging the watch (at-most-once, msg-4871 §1).
             self._seen.add(seen_key)
-            await self._dispatcher.dispatch(handle, self._to_event(watch.thread_ref, msg, messages))
-            count += 1
-        return count
+            # The failure is isolated to THIS message (human decision after the #371
+            # APPROVE advisory): letting it escape aborted the rest of the batch, so
+            # valid messages behind it waited a whole poll interval. Narrow on
+            # purpose — only the builder's fail-closed refusal is caught here; a
+            # dispatch failure still escapes to :meth:`run`'s logged swallow.
+            try:
+                event = self._to_event(watch.thread_ref, msg, messages)
+            except ThreadContextTriggerMissing as exc:
+                # ERROR, not ``exception``: this is an expected, cleanly-recovered input
+                # refusal, so the reason is logged without a traceback (#375 advisory).
+                logger.error(
+                    "ThreadContextTriggerMissing: skipping %s (not dispatched, not retried);"
+                    " continuing the poll batch: %s",
+                    seen_key,
+                    exc,
+                )
+                continue
+            await self._dispatcher.dispatch(handle, event)
+            dispatched_count += 1
+        return dispatched_count
 
     def _to_event(
         self, thread_ref: ThreadRef, msg: dict[str, Any], messages: list[Any]

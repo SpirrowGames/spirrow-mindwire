@@ -354,7 +354,8 @@ def test_progressed_launches_have_zero_delay() -> None:
 
     This is the explicit-fix side of removing ``MIN_GAP``: the progress path has no design-time
     floor. The bound on this path is the ENVIRONMENT (Windows scheduler IgnoreNew + 1-candidate-
-    per-run + 15-25 min measured session length -> 2-4 launches/hour/thread), not the predicate.
+    per-run + the wall-clock length of a session; measurements are in ``head_skip``'s module
+    docstring and ``BASE`` comment), not the predicate.
     Pinning this test is what forces a future change that reintroduces a delay on the progress
     path to be a deliberate, visible change — the human-approved invariant "a progressing thread
     never backs off" is right here.
