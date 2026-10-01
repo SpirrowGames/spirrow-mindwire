@@ -194,6 +194,8 @@ class _FakeGitHub:
         # Per-PR ``mergeable_state``; a PR not named here reads "clean".
         self.mergeable: dict[int, str | None] = {}
         self.reviews: dict[int, list[ReviewInfo]] = {}
+        # Listing rows the client could not parse (no trustworthy PR number).
+        self.unparsed_rows = 0
 
     async def list_open_prs(self, owner: str, repo: str) -> Any:
         from spirrow_mindwire.github.client import OpenPrListing
@@ -204,7 +206,9 @@ class _FakeGitHub:
             OpenPr(ref=PrRef(owner, repo, n), draft=False, head_sha=f"s{n}", created_at=T0)
             for n in (1, 2)
         )
-        return OpenPrListing(prs=prs, examined=2, unrecognized=0)
+        return OpenPrListing(
+            prs=prs, examined=2 + self.unparsed_rows, unrecognized=self.unparsed_rows
+        )
 
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
         from spirrow_mindwire.github.client import GitHubHTTPError
@@ -241,6 +245,16 @@ def test_github_adapter_accounting_and_unobservable() -> None:
     assert result.complete is True
     assert result.scope(Unit(UnitKind.PR, "o/r#9"))
     assert not result.scope(Unit(UnitKind.PR, "o/rr#9"))
+
+
+def test_github_adapter_unparsed_listing_row_suspends_rule_a() -> None:
+    """PR-gate #361 @ e426e69: a row with no trustworthy PR number could be any tracked
+    PR, so the listing is not complete and rule (a) closes nothing for this source."""
+    gh = _FakeGitHub()
+    gh.unparsed_rows = 1
+    result = asyncio.run(GitHubOpenPrAdapter(gh, "o", "r").fetch())  # type: ignore[arg-type]
+    assert result.complete is False
+    assert result.report.unrecognized == 1
 
 
 def test_github_adapter_listing_failure() -> None:
@@ -299,6 +313,9 @@ def test_chatroom_adapter_pages_and_accounts() -> None:
     result = asyncio.run(ChatroomThreadAdapter(mcp, "p").fetch())
     r = result.report
     assert (r.examined, r.recognized, r.unrecognized) == (3, 2, 1)
+    # ``{"thread_id": 3}`` has no usable id: it could be any tracked thread.
+    assert result.complete is False
+    assert result.unobservable == frozenset()
     needs = {o.unit.key: o.needs_actor for o in result.observations}
     assert needs == {"thread:p/T-a": True, "thread:p/T-b": False}
     assert result.observations[0].motion == (
@@ -341,6 +358,105 @@ def test_chatroom_fetch_failure() -> None:
     assert not result.complete
 
 
+def _tick_with(state: Path, adapter: Any, now: datetime) -> Any:
+    return asyncio.run(
+        run_tick(
+            paths=TickPaths(state_dir=state),
+            adapters=[adapter],
+            now=lambda: now,
+            out=io.StringIO(),
+        )
+    )
+
+
+def _records(state: Path) -> dict[str, Any]:
+    data = json.loads((state / "stall-ledger.json").read_text(encoding="utf-8"))
+    records: dict[str, Any] = data["records"]
+    return records
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param({"last_activity_at": "not-a-time"}, id="bad-timestamp"),
+        pytest.param({"last_activity_at": None}, id="null-timestamp"),
+        pytest.param({"status": 7}, id="bad-status"),
+    ],
+)
+def test_malformed_keyed_thread_row_is_unobservable_and_closes_nothing(
+    tmp_path: Path, broken: dict[str, Any]
+) -> None:
+    """PR-gate #361 @ e426e69: a listed thread whose row is malformed must not read as
+    "gone" -- it is unobservable, and its open record survives untouched."""
+    mcp = _FakeMcp([_thread("T-a"), _thread("T-b")])
+    adapter = ChatroomThreadAdapter(mcp, "p")
+    state = tmp_path / "state"
+    _tick_with(state, adapter, NOW)
+    before = _records(state)
+    assert "thread:p/T-a" in before, "precondition: the record must be open"
+
+    mcp.items = [{**_thread("T-a"), **broken}, _thread("T-b")]
+    result = asyncio.run(adapter.fetch())
+    assert result.unobservable == frozenset({"thread:p/T-a"})
+    assert result.complete is True
+    out = _tick_with(state, adapter, NOW + timedelta(hours=1))
+    assert [line for line in out.lines if line["kind"] == "close"] == []
+    assert _records(state)["thread:p/T-a"] == before["thread:p/T-a"]
+
+
+def test_unkeyed_thread_row_suspends_rule_a_for_the_source(tmp_path: Path) -> None:
+    """A row with no usable thread_id could be any tracked thread: no record of this
+    source is closed by rule (a) this tick, even one the listing no longer shows."""
+    mcp = _FakeMcp([_thread("T-a"), _thread("T-b")])
+    adapter = ChatroomThreadAdapter(mcp, "p")
+    state = tmp_path / "state"
+    _tick_with(state, adapter, NOW)
+    before = _records(state)
+    assert {"thread:p/T-a", "thread:p/T-b"} <= set(before)
+
+    mcp.items = [{**_thread("T-a"), "thread_id": None}, _thread("T-b")]
+    out = _tick_with(state, adapter, NOW + timedelta(hours=1))
+    assert [line for line in out.lines if line["kind"] == "close"] == []
+    assert _records(state)["thread:p/T-a"] == before["thread:p/T-a"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param({"first_failure_at": "garbage"}, id="bad-timestamp"),
+        pytest.param({}, id="missing-timestamp"),
+        pytest.param("not-an-object", id="not-an-object"),
+    ],
+)
+def test_malformed_quarantine_entry_is_unobservable_and_closes_nothing(
+    tmp_path: Path, value: Any
+) -> None:
+    """PR-gate #361 @ e426e69: an entry still present in quarantine.json with an
+    unreadable payload must not read as "cleared"."""
+    path = tmp_path / "quarantine.json"
+    good = {"first_failure_at": "2026-09-01T00:00:00Z"}
+    path.write_text(json.dumps({"p/T-a": good, "p/T-b": good}), encoding="utf-8")
+    adapter = QuarantineFileAdapter(path)
+    state = tmp_path / "state"
+    _tick_with(state, adapter, NOW)
+    before = _records(state)
+    assert "quarantine:p/T-a" in before, "precondition: the record must be open"
+
+    path.write_text(json.dumps({"p/T-a": value, "p/T-b": good}), encoding="utf-8")
+    result = asyncio.run(adapter.fetch())
+    assert result.unobservable == frozenset({"quarantine:p/T-a"})
+    out = _tick_with(state, adapter, NOW + timedelta(hours=1))
+    assert [line for line in out.lines if line["kind"] == "close"] == []
+    assert _records(state)["quarantine:p/T-a"] == before["quarantine:p/T-a"]
+
+    # Control: an entry that is really gone still closes by rule (a).
+    path.write_text(json.dumps({"p/T-b": good}), encoding="utf-8")
+    out = _tick_with(state, adapter, NOW + timedelta(hours=2))
+    closed = [c["record_id"] for c in out.lines if c["kind"] == "close"]
+    assert len(closed) == 1 and closed[0].startswith("quarantine:p/T-a@")
+    assert "quarantine:p/T-a" not in _records(state)
+
+
 # ── quarantine.json ───────────────────────────────────────────────────────────────────
 
 
@@ -363,6 +479,8 @@ def test_quarantine_adapter_states(tmp_path: Path) -> None:
     assert obs.unit == Unit(UnitKind.QUARANTINE, "p/T-a")
     assert obs.needs_actor and obs.n == timedelta(0) and obs.motion == ()
     assert obs.classifier_input.is_quarantined
+    assert ok.unobservable == frozenset({"quarantine:p/T-b"})
+    assert ok.complete is True
 
 
 # ── §7-6: one outage does not hide the others; sweep.json is never opened ─────────────

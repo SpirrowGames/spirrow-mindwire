@@ -209,6 +209,12 @@ class SourceResult:
     ``observations``" as ``needs_actor = false`` (close rule (a)). ``unobservable``
     names units the listing returned but whose per-unit reads failed: their records are
     left exactly as they are.
+
+    The same holds for a listed row whose payload is malformed (PR-gate #361 @ e426e69):
+    if its unit key can still be read, the key goes into ``unobservable``; if even the
+    key cannot be read, the row could be ANY tracked unit, so the adapter reports
+    ``complete = False`` and close rule (a) is suspended for that source this tick. A
+    malformed row never reads as "this unit is gone".
     """
 
     report: SourceReport
@@ -376,7 +382,9 @@ class GitHubOpenPrAdapter:
             report=report,
             observations=tuple(observations),
             unobservable=frozenset(unobservable),
-            complete=True,
+            # A listing row the client could not parse has no PR number we can trust, so
+            # it could be any tracked PR: rule (a) waits for a clean listing.
+            complete=listing.unrecognized == 0,
             scope=self.scope,
             checker=self,
         )
@@ -542,7 +550,21 @@ class ChatroomThreadAdapter:
         except Exception:
             return _failed(self.name, FetchOutcome.HTTP_ERROR, self.scope, self)
 
-        observations = [obs for obs in (self._thread_row(item) for item in items) if obs]
+        observations: list[UnitObservation] = []
+        unobservable: set[str] = set()
+        unkeyed = 0
+        for item in items:
+            obs = self._thread_row(item)
+            if obs is not None:
+                observations.append(obs)
+                continue
+            # Malformed row: never "absent" (close rule (a)). Keyed -> unobservable;
+            # unkeyed -> the whole listing is not complete (see SourceResult).
+            key = self._row_key(item)
+            if key is None:
+                unkeyed += 1
+            else:
+                unobservable.add(key)
         report = SourceReport(
             name=self.name,
             fetch_outcome=FetchOutcome.OK,
@@ -554,11 +576,20 @@ class ChatroomThreadAdapter:
         return SourceResult(
             report=report,
             observations=tuple(observations),
-            unobservable=frozenset(),
-            complete=True,
+            unobservable=frozenset(unobservable),
+            complete=unkeyed == 0,
             scope=self.scope,
             checker=self,
         )
+
+    def _row_key(self, item: object) -> str | None:
+        """The unit key of a listing row, or ``None`` if the row carries no usable id."""
+        if not isinstance(item, dict):
+            return None
+        thread_id = item.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return None
+        return Unit(UnitKind.THREAD, f"{self._project}/{thread_id}").key
 
     def _thread_row(self, item: object) -> UnitObservation | None:
         if not isinstance(item, dict):
@@ -618,7 +649,8 @@ class QuarantineFileAdapter:
 
     A missing file is ``file_missing`` and an unparseable one is ``parse_error`` -- both
     failures, per :class:`FetchOutcome`'s own definitions. An entry whose value is not an
-    object or has no parseable ``first_failure_at`` is ``unrecognized``. Quarantine units
+    object or has no parseable ``first_failure_at`` is ``unrecognized`` and reported
+    ``unobservable`` (its record is left as it is, never closed). Quarantine units
     have no motion events; ``first_failure_at`` is the baseline.
 
     Reads the file; never writes it (msg-4685 §8, msg-4697 §2-3).
@@ -644,9 +676,13 @@ class QuarantineFileAdapter:
         if not isinstance(data, dict):
             return _failed(self.name, FetchOutcome.PARSE_ERROR, self.scope, self)
         observations: list[UnitObservation] = []
+        unobservable: set[str] = set()
         for key, value in data.items():
             first = _parse_ts(value.get("first_failure_at")) if isinstance(value, dict) else None
             if first is None:
+                # The entry is present -- the predicate for this source -- but its payload
+                # is unreadable: unobservable, never "cleared" (close rule (a)).
+                unobservable.add(Unit(UnitKind.QUARANTINE, str(key)).key)
                 continue
             observations.append(
                 UnitObservation(
@@ -669,7 +705,7 @@ class QuarantineFileAdapter:
         return SourceResult(
             report=report,
             observations=tuple(observations),
-            unobservable=frozenset(),
+            unobservable=frozenset(unobservable),
             complete=True,
             scope=self.scope,
             checker=self,
