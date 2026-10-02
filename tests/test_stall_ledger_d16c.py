@@ -25,6 +25,7 @@ from spirrow_mindwire.stall_ledger.adapters import (
     Marked,
     MarkerCheck,
     MotionEvent,
+    QuarantineFileAdapter,
     SourceResult,
     UnitObservation,
     Unmarked,
@@ -407,6 +408,47 @@ def test_cli_runs_a_full_tick_and_passes_the_fetch_timeout(
     assert heartbeat[0]["budget_exhausted"] is False
     assert heartbeat[0]["deferred_fetches"] == 0
     assert heartbeat[0]["pending_markers"] == 0
+
+
+def test_cli_fetch_timeout_override_reaches_every_network_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR-gate on 96c41b4: the budget must not believe a fetch takes <= N seconds while
+    # the adapter can block longer. Pin that one `--fetch-timeout-seconds` value sizes
+    # the budget AND bounds every network call: each adapter's `_bounded` timeout and
+    # the GitHub HTTP client's own timeout.
+    from spirrow_mindwire.github import client as gh_client
+    from spirrow_mindwire.magickit import client as mk_client
+
+    cli = _load_cli()
+    seen: dict[str, Any] = {}
+
+    class FakeGitHub:
+        def __init__(self, *, timeout_seconds: float) -> None:
+            seen["github_timeout_seconds"] = timeout_seconds
+
+        async def aclose(self) -> None:
+            pass
+
+    class FakeMcp:
+        def __init__(self, url: Any) -> None:
+            pass
+
+    async def spy(**kwargs: Any) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(gh_client, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(mk_client, "StreamableHttpChatroomMcp", FakeMcp)
+    monkeypatch.setattr(cli, "run_tick", spy)
+    argv = ["--data-dir", str(tmp_path), "--fetch-timeout-seconds", "5"]
+    argv += ["--repo", "o/r", "--project", "p"]
+    assert cli.main(argv) == 0
+    want = timedelta(seconds=5)
+    assert seen["fetch_timeout"] == want
+    assert seen["github_timeout_seconds"] == 5.0
+    network = [a for a in seen["adapters"] if not isinstance(a, QuarantineFileAdapter)]
+    assert {type(a).__name__ for a in network} == {"GitHubOpenPrAdapter", "ChatroomThreadAdapter"}
+    assert all(a._timeout == want for a in network)
 
 
 # ── marker_flags' whole list reaches the record (PR-gate finding on 66fb508) ─────────
