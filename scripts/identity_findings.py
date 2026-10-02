@@ -463,17 +463,23 @@ def _cut_row(
 
 
 def _phase2_start(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Evaluate the Phase 2 start condition (msg-5678 §2 as revised by msg-5680 §2)."""
+    """Evaluate the Phase 2 start condition (msg-5678 §2 as revised by msg-5680 §2).
+
+    ``rows`` must hold a row for every critical-path identity. :func:`_identity_cut`
+    guarantees that (it iterates ``authors | _CRITICAL_PATH`` and emits an
+    ``undetermined`` row when a lookup fails), so a missing row is a caller bug,
+    not a measurement outcome: raise :class:`ValueError` rather than invent a state.
+    """
     by_name = {r["identity_name"]: r for r in rows}
+    missing = [name for name in _CRITICAL_PATH if name not in by_name]
+    if missing:
+        raise ValueError(f"no cut row for critical-path identities: {missing}")
     violated = sorted(r["identity_name"] for r in rows if r["state"] == "violated")
     undetermined = sorted(r["identity_name"] for r in rows if r["state"] == "undetermined")
     not_evidenced = [
-        {
-            "identity_name": name,
-            "state": by_name[name]["state"] if name in by_name else "not_measured",
-        }
+        {"identity_name": name, "state": by_name[name]["state"]}
         for name in _CRITICAL_PATH
-        if name not in by_name or by_name[name]["state"] != "evidenced"
+        if by_name[name]["state"] != "evidenced"
     ]
     cond1 = not violated and not undetermined
     cond2 = not not_evidenced

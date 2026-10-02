@@ -193,16 +193,23 @@ def test_phase2_start_condition_1_fails_on_undetermined() -> None:
 def test_phase2_start_condition_2_names_each_unevidenced_critical_identity() -> None:
     rows = [r for r in _ALL_CRITICAL_EVIDENCED if r["identity_name"] not in {"human", "Bohr"}]
     rows.append(_row("Bohr", "silent"))
+    rows.append(_row("human", "undetermined"))
     verdict = _MODULE._phase2_start(rows)
     assert verdict["condition_2_critical_path_evidenced"] == {
         "pass": False,
         "not_evidenced": [
             {"identity_name": "Bohr", "state": "silent"},
-            {"identity_name": "human", "state": "not_measured"},
+            {"identity_name": "human", "state": "undetermined"},
         ],
     }
-    assert verdict["condition_1_no_violated"]["pass"] is True
+    assert verdict["condition_1_no_violated"]["undetermined"] == ["human"]
     assert verdict["pass"] is False
+
+
+def test_phase2_start_raises_when_a_critical_path_row_is_missing() -> None:
+    rows = [r for r in _ALL_CRITICAL_EVIDENCED if r["identity_name"] != "human"]
+    with pytest.raises(ValueError, match="human"):
+        _MODULE._phase2_start(rows)
 
 
 def test_critical_path_is_the_list_fixed_in_msg_5680() -> None:
