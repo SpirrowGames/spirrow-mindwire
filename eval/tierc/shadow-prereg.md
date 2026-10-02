@@ -33,7 +33,7 @@ A row that fails any condition appears only as a count, per reason, in `export.j
 
 | Item | Value | Source |
 |---|---|---|
-| Questions version | `tierc-v3` | `decider/questions.py` `TIERC_ESCALATION_QUESTIONS_VERSION` — the version the live hook logs (2d-15). The config selector `[decider.tierc].questions = "tierc-v2"` names the question-set *kind* and is not this value. `tests/test_tierc_registered_version.py` fails the gate if the code, the exporter and this row drift apart |
+| Questions version | `tierc-v3` | `decider/questions.py` `TIERC_V2_QUESTIONS_VERSION` — the version the live hook logs (2d-15). The config selector `[decider.tierc].questions = "tierc-v2"` names the question-set *kind* and is not this value. `tests/test_tierc_registered_version.py` fails the gate if the code, the exporter and this row drift apart |
 | `ask_min` | **0.60** | `verdict.py:371` `DEFAULT_V2_ASK_MIN`. Fixed before the replay; cited here, not chosen here (2d-4) |
 | `not_ask_max` | **0.40** | `verdict.py:374` `DEFAULT_V2_NOT_ASK_MAX`, same |
 | `RUBRIC-v2.md` sha256 | `c99ce23c7bad069e0d419d9bd18d2764959f037b61f3f7907ac99fba3f65376c` | `eval/tierc/RUBRIC-v2.md` at this commit (2d-10) |

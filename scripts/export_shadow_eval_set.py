@@ -109,7 +109,7 @@ LOG_PREFIX = "decider_decision "
 ROUTED_STOP = "stop"
 REGISTERED_QUESTIONS_VERSION = "tierc-v3"
 """msg-5753 DECIDED 2d-15: the one questions version ``eval/tierc/shadow-prereg.md`` registers.
-Equal to ``decider.questions.TIERC_ESCALATION_QUESTIONS_VERSION`` and to the pre-registration's
+Equal to ``decider.questions.TIERC_V2_QUESTIONS_VERSION`` and to the pre-registration's
 §1 condition 3 — ``tests/test_tierc_registered_version.py`` fails the gate when they drift."""
 EVAL_SET_SHADOW = "shadow"
 ROSTER_SOURCE_LOGGED = "logged"

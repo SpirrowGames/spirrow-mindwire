@@ -40,9 +40,9 @@ from enum import StrEnum
 from typing import Final
 
 from spirrow_mindwire.decider.questions import (
-    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
     TierCQuestionKind,
 )
 
@@ -409,7 +409,7 @@ class TierCV2Verdict:
     ask_score: float
     scope: TierCScope = TierCScope.IN_GATE
     fired_reason: None = None
-    questions_version: str = TIERC_ESCALATION_QUESTIONS_VERSION
+    questions_version: str = TIERC_V2_QUESTIONS_VERSION
 
 
 def evaluate_tierc_v2(

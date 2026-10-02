@@ -5,7 +5,7 @@ T-decider-conductor-hook msg-5753 item 4: ``b224540`` raised the live question f
 production row would have been excluded and the export would have been silently empty. This
 test ties the three places together:
 
-* ``decider/questions.py`` ``TIERC_ESCALATION_QUESTIONS_VERSION`` — what the live hook logs;
+* ``decider/questions.py`` ``TIERC_V2_QUESTIONS_VERSION`` — what the live hook logs;
 * ``scripts/export_shadow_eval_set.py`` ``REGISTERED_QUESTIONS_VERSION`` — what is counted;
 * ``eval/tierc/shadow-prereg.md`` — the title, §1 condition 3 and the §2 row.
 
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from spirrow_mindwire.decider.questions import TIERC_ESCALATION_QUESTIONS_VERSION
+from spirrow_mindwire.decider.questions import TIERC_V2_QUESTIONS_VERSION
 
 ROOT = Path(__file__).resolve().parent.parent
 PREREG = ROOT / "eval" / "tierc" / "shadow-prereg.md"
@@ -56,7 +56,7 @@ def prereg_versions(text: str) -> dict[str, str]:
 def test_registered_version_matches_the_live_version() -> None:
     registered = _exporter().REGISTERED_QUESTIONS_VERSION
     prereg = prereg_versions(PREREG.read_text(encoding="utf-8"))
-    assert registered == TIERC_ESCALATION_QUESTIONS_VERSION, (
+    assert registered == TIERC_V2_QUESTIONS_VERSION, (
         "the live question frame's version changed: decide the shadow registration explicitly "
         "(eval/tierc/shadow-prereg.md, the exporter) before any data is counted"
     )

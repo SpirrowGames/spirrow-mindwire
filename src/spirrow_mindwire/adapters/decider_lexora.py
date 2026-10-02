@@ -65,9 +65,9 @@ from typing import Any, Literal, Protocol
 from ..decider.questions import (
     MATCHED_RULE_KEY,
     SHOULD_ASK_HUMAN_KEY,
-    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_VERSION,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
 )
@@ -182,9 +182,7 @@ async def decide_once(
     if rules is None and state.gate_result is None:
         raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
     body = build_decide_request(state, policy=policy, rules=rules, proceed=proceed)
-    v2_version = (
-        TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_ESCALATION_QUESTIONS_VERSION
-    )
+    v2_version = TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_V2_QUESTIONS_VERSION
     version_fields: dict[str, Any] = (
         {"questions_version": TIERC_QUESTIONS_VERSION}
         if rules is None
@@ -302,7 +300,7 @@ def _v2_result(
     policy: str,
     latency_ms: int | None,
     no_verdict: Callable[[DecisionOutcome, str | None], DecisionResult],
-    questions_version: str = TIERC_ESCALATION_QUESTIONS_VERSION,
+    questions_version: str = TIERC_V2_QUESTIONS_VERSION,
 ) -> DecisionResult:
     """tierc-v2 steps 4-5: ``should_ask_human`` alone decides MALFORMED and the verdict;
     ``matched_rule`` is validated on its own and never changes the outcome (msg-4380 Δ3)."""
