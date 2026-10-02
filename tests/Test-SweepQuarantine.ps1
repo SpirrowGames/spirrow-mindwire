@@ -41,7 +41,18 @@ if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leas
 
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'New-QuarantineRecord', 'Get-FailureClass',
+# Get-FailureClass runs the classifier through the bounded probe helper with a probe temp file
+# (T-parked-humans-probe-has-no-timeout msg-5611 §3), so the helper, the temp-file pair and the
+# settings they read are lifted too. Without them the CWD-independence check below would see
+# 'unknown' (Get-FailureClass swallows the missing command) and fail.
+$FailureClassProbeTimeoutSeconds = 120
+$ProbeKillGraceMs = 5000
+$ProbeInputFilePrefix = 'mindwire-probe-'
+$ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+
+foreach ($name in 'Get-BoundedProbeCommandLine', 'Invoke-BoundedUvProbe',
+                  'New-ProbeInputFile', 'Remove-ProbeInputFile',
+                  'New-QuarantineRecord', 'Get-FailureClass',
                   'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
