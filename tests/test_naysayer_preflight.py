@@ -196,6 +196,8 @@ async def test_attestation_reads_the_backend_from_the_accounting_row() -> None:
     assert record.expected == "gemini"
     assert record.tier == "naysayer"
     assert record.probe == "cost-row#6032"
+    # A preflight record evidences a separate probe request, not a turn.
+    assert record.scope == "probe"
     assert record.at == _NOW
     # The probe is non-streaming and goes to the configured tier: that is what
     # makes the gateway write a row at all (msg-953 §1.4 — streaming leaves no
