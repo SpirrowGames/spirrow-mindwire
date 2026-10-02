@@ -42,6 +42,11 @@ DEFAULT_DATA_DIR = Path.home() / "spirrow-mindwire-data"
 # ``ConductorConfig.max_rounds`` (here) and the ``Conductor`` ctor default
 # (``conductor.core`` imports this) so the two cannot drift (PR-2b-3 D-2).
 DEFAULT_CONDUCTOR_MAX_ROUNDS = 40
+# Wall-clock budgets for one conductor run (msg-5496 / msg-5498 W-5). Measured on the loop host's
+# sweep logs, 2026-08-02 .. 2026-10-02: 5,533 runs, p99 = 2,625 s. Soft = p99 x 1.5 (rounded),
+# hard = soft + 15 min. Both stay under Task Scheduler's ExecutionTimeLimit (PT4H).
+DEFAULT_CONDUCTOR_RUN_BUDGET_S = 3940.0
+DEFAULT_CONDUCTOR_RUN_HARD_BUDGET_S = 4840.0
 
 
 class _StrictModel(BaseModel):
@@ -419,6 +424,19 @@ class ConductorConfig(_StrictModel):
     :class:`~spirrow_mindwire.conductor.core.Conductor` ctor default (PR-2b-3 D-2); a turn that does
     not converge to ``NEXT: human`` / ``none`` within this many rounds stops at the round cap.
     """
+    run_budget_s: float = Field(default=DEFAULT_CONDUCTOR_RUN_BUDGET_S, gt=0)
+    """Soft wall-clock budget for one conductor run, in seconds (msg-5496 / msg-5498 W-1).
+
+    When it expires the conductor writes ``conductor.run_timeout``, cancels the run, posts a stop
+    notice ending ``NEXT: human`` and exits (0 if posted, 5 if not). See
+    :mod:`spirrow_mindwire.conductor.run_budget`."""
+    run_hard_budget_s: float = Field(default=DEFAULT_CONDUCTOR_RUN_HARD_BUDGET_S, gt=0)
+    """Hard wall-clock budget, in seconds, enforced OUTSIDE the process by
+    ``deploy/run-conductor.ps1`` (kill the process tree, exit 6; exit 7 if the kill is not
+    confirmed). Python only checks, at daemon startup, that it exceeds ``run_budget_s`` plus the
+    stop-notice post budget; the PowerShell side reads the same key (env
+    ``MINDWIRE_CONDUCTOR__RUN_HARD_BUDGET_S`` first, then this TOML key, then its copy of the
+    default, which a test pins to :data:`DEFAULT_CONDUCTOR_RUN_HARD_BUDGET_S`)."""
     identity_embodiment: dict[str, str] = Field(default_factory=dict)
     """Identities the conductor must NOT spawn, by稼働形態 (ADR-2026-09-14-21 D-2 / D-3).
 
