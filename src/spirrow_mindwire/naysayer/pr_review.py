@@ -286,9 +286,10 @@ def _body_without_footer(body: str) -> str:
 # unified-diff CONTEXT line is prefixed with exactly one space — the most common line kind in any
 # diff. So the one defence the comment named did not cover the one case that mattered.
 #
-# ``matches[-1]`` (below) does not rescue it: last-wins only helps while the injected copy comes
-# BEFORE the model's real verdict. A model that states its verdict and then quotes the offending
-# hunk — a normal thing for a reviewer to do — puts the injected APPROVE last.
+# The old last-wins selection (``matches[-1]``, retired 2026-10 — see "Cardinality" below) did
+# not rescue it: last-wins only helps while the injected copy comes BEFORE the model's real
+# verdict. A model that states its verdict and then quotes the offending hunk — a normal thing
+# for a reviewer to do — puts the injected APPROVE last.
 #
 # Why column zero and not "a little indentation": every leading-space allowance re-admits the
 # context line, because the context prefix IS one space. ``^[ \t]{0,3}`` would have changed
@@ -316,15 +317,34 @@ def _body_without_footer(body: str) -> str:
 # It makes VERBATIM diff text inert, because a hunk line keeps its +/-/space prefix and so cannot
 # begin at column 0. That is the whole of it. It is NOT immunity to injection. A model that
 # RE-TYPES an injected line without the prefix — most plausibly by quoting it inside a fenced
-# block — emits a genuine column-0 match, and ``matches[-1]`` (last-wins) only covers that while
-# the quote comes BEFORE the model's own verdict. A quote placed after it still wins; measured
-# 2026-08-16, not hypothesised. That residual is recorded rather than fixed here: closing it means
-# deciding what may legitimately surround a verdict line (fences, quoting rules), which is a
-# design question, not a regex tweak.
+# block — emits a genuine column-0 match. Under the old last-wins selection a quote placed AFTER
+# the model's own verdict won (measured 2026-08-16, not hypothesised). That residual is now closed
+# by the cardinality rule below, not by this anchor.
 #
-# While it stays open, the one mitigation that IS available is to deny the exploit its string: keep
-# column-0 ``VERDICT: APPROVE`` out of the sources this gate reads and out of the prompt it is
-# given. See the note above _PR_REVIEW_SYSTEM_PROMPT.
+# Denying the exploit its string stays in force as defence in depth: keep column-0
+# ``VERDICT: APPROVE`` out of the sources this gate reads and out of the prompt it is given. See
+# the note above _PR_REVIEW_SYSTEM_PROMPT. Under the cardinality rule an echo of it costs a red
+# gate rather than opening one, but a red gate on every review that discusses this file is still
+# a cost worth not paying.
+#
+# ---- Cardinality: two or more verdict lines are AMBIGUOUS, and ambiguous is red ----
+# (D-1, T-verdict-echo-after-real-verdict msg-1978; ADR-2026-06-03-16 checked in msg-5270: it
+# says nothing about parser cardinality or anchoring, so no ADR change is involved.)
+#
+# _scan_verdict_lines takes ``findall`` ONCE and decides on that one list: 0 matches ->
+# UNPARSEABLE (unchanged), 1 -> that verdict, 2 or more -> AMBIGUOUS, which decide_verdict maps
+# to REQUEST_CHANGES. There is no "pick the right one" step, because "the last one is the real
+# one" is the assumption that broke. Rejected variants, so nobody re-adds them as a "relaxation":
+#   * all-matches-agree -> accept: lets through a body whose real verdict is missing and that
+#     carries two quoted APPROVE lines, to remove false reds that were measured at 0.
+#   * ignore matches inside fences / quotes: one more layer that guesses intent from the shape
+#     of the text, which is the same way this anchor broke.
+# Measured before deciding (msg-1977): 673 ``spirrowgames-ops`` review bodies, 1 with two
+# column-0 verdict lines, and that one was a hand-relayed COMMENTED body that never went through
+# this parser. Applied retroactively the rule produces 0 false reds on the gate path.
+#
+# Count and verdict come from the SAME list on purpose: counting with a second regex would let a
+# later anchor change (e.g. PR #152's) apply to one side and not the other.
 #
 # ---- Bold verdicts fail closed, deliberately (ruling: T-verdict-regex-space-prefix-injection) ----
 #
@@ -352,18 +372,12 @@ def _body_without_footer(body: str) -> str:
 # is actually observed here — a review body whose bold verdict forced a REQUEST_CHANGES the author
 # did not intend.
 #
-# ---- Divergence back-reference (R-4a, rider-3 msg-2130 §1) -------------------------------------
-# This regex is used with a LAST-WINS anchor (see ``_parse_model_verdict``: ``matches[-1]``).
-# The objection-block parser next to it (:func:`parse_objections`) uses STRICT-SINGLE (D-1):
-# two column-zero markers derive MISSING rather than picking one. The two parsers therefore
-# disagree on how to react to a column-zero echo — deliberately.
-#
-# Whether the last-wins discipline here should follow the objection parser to strict-single is
-# an open question under ``T-verdict-echo-after-real-verdict`` (msg-1979); rider 3 (msg-2072 §5,
-# discharge in msg-2130 §1) chose the "explicit-justification" branch of R-4 rather than the
-# "unify" branch, so the divergence is named on BOTH sides — here and in ``parse_objections`` —
-# to keep a future reader from making it consistent by touching this line prematurely. This note
-# is DESCRIPTIVE: it records that a decision is pending, not which way it should go.
+# ---- Divergence back-reference (R-4a, rider-3 msg-2130 §1) — now CONVERGED --------------------
+# This regex used to be read last-wins (``matches[-1]``) while the objection-block parser next to
+# it (:func:`parse_objections`) is strict-single (D-1): two column-zero markers derive MISSING
+# rather than picking one. Whether the verdict side should follow was decided under
+# ``T-verdict-echo-after-real-verdict`` (msg-1978 D-1): it does. Both parsers now refuse to pick
+# among two-plus column-zero matches and fail closed instead (here: AMBIGUOUS -> REQUEST_CHANGES).
 # ------------------------------------------------------------------------------------------------
 _VERDICT_RE = re.compile(
     r"^VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
@@ -622,14 +636,40 @@ class ModelVerdict(Enum):
     APPROVE = "APPROVE"
     REQUEST_CHANGES = "REQUEST_CHANGES"
     UNPARSEABLE = "unparseable"
+    # Two or more column-zero verdict lines (msg-1978 D-1). Its own value, not folded into
+    # REQUEST_CHANGES, for the same honesty reason as UNPARSEABLE: the gate posts RC either
+    # way, but "the model objected" and "the body had n verdict lines, so none was taken" are
+    # different facts, and a fix loop that cannot tell them apart chases a design finding
+    # that does not exist. The value doubles as the reason code in the notice and the log.
+    AMBIGUOUS = "VERDICT_AMBIGUOUS"
+
+
+def _scan_verdict_lines(critique: str) -> tuple[ModelVerdict, int]:
+    """Return ``(verdict, n)`` where ``n`` is the count of column-zero verdict lines.
+
+    Count and verdict come from ONE ``findall`` list (msg-1978 §4): see the "Cardinality"
+    block above :data:`_VERDICT_RE`. ``n >= 2`` returns :attr:`ModelVerdict.AMBIGUOUS` without
+    looking at which tokens matched — two APPROVE lines are as ambiguous as an RC and an APPROVE.
+    """
+    matches = _VERDICT_RE.findall(critique)
+    n = len(matches)
+    if n == 0:
+        return ModelVerdict.UNPARSEABLE, 0
+    if n >= 2:
+        return ModelVerdict.AMBIGUOUS, n
+    token = re.sub(r"[ _-]", "_", matches[0].upper())
+    if token == "APPROVE":
+        return ModelVerdict.APPROVE, 1
+    # COMMENT / REQUEST_CHANGES / anything else the model wrote → same "objection" bucket.
+    return ModelVerdict.REQUEST_CHANGES, 1
 
 
 def _parse_model_verdict(critique: str) -> ModelVerdict:
-    """Extract the model's stated verdict; three-way (APPROVE / REQUEST_CHANGES / UNPARSEABLE).
+    """Extract the model's stated verdict (APPROVE / REQUEST_CHANGES / UNPARSEABLE / AMBIGUOUS).
 
-    The injection-safe parse (last standalone ``VERDICT:`` line at column zero — see the
-    :data:`_VERDICT_RE` block for the anchor rationale, and note that last-wins on its own
-    is no defence when a quote comes after the verdict) lives here as the ONE source. Every
+    The injection-safe parse (exactly ONE standalone ``VERDICT:`` line at column zero — see the
+    :data:`_VERDICT_RE` block for the anchor and cardinality rationale) lives in
+    :func:`_scan_verdict_lines` as the ONE source; this is its verdict-only projection. Every
     production caller consumes this through :class:`VerdictDecision` via :func:`decide_verdict`
     — no separate two-way projection exists anymore (round-5 PR-gate finding on PR #186
     msg-1890 removed the dead ``_parse_verdict`` wrapper along with its callers).
@@ -639,14 +679,7 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
     different facts that the gate notice header must report honestly (see the
     :class:`ModelVerdict` docstring for why the three-way distinction matters).
     """
-    matches = _VERDICT_RE.findall(critique)
-    if not matches:
-        return ModelVerdict.UNPARSEABLE
-    token = re.sub(r"[ _-]", "_", matches[-1].upper())
-    if token == "APPROVE":
-        return ModelVerdict.APPROVE
-    # COMMENT / REQUEST_CHANGES / anything else the model wrote → same "objection" bucket.
-    return ModelVerdict.REQUEST_CHANGES
+    return _scan_verdict_lines(critique)[0]
 
 
 # ─── Objection classes (T-naysayer-blocking-bar-undefined Stage 1) ───────────────────
@@ -668,11 +701,12 @@ _OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
 # Anchored at COLUMN ZERO. A unified-diff line carries a ``+``/``-``/space prefix, so a VERBATIM
 # quote of this file's own diff (which necessarily contains the sentinel literal) cannot satisfy
 # the anchor. The residual is real: a model that RE-TYPES the marker without the prefix produces
-# a genuine match. This is the exploit surface :data:`_VERDICT_RE`'s own last-wins discipline is
-# still exposed to (pending on ``T-verdict-echo-after-real-verdict``); this parser diverges by
-# design (see :func:`parse_objections` D-1 note). In Stage 1 the residual costs nothing (nothing
-# is posted from it); the rider-3 review (T-rider3-objection-parser-injection-surface) closes
-# the parser side of the reversal's pre-conditions.
+# a genuine match. :data:`_VERDICT_RE` was exposed to the same surface under its old last-wins
+# discipline; since ``T-verdict-echo-after-real-verdict`` D-1 both parsers are strict about
+# multiple column-zero matches (see :func:`parse_objections` D-1 note).
+# In Stage 1 the residual costs nothing (nothing is posted from it); the rider-3 review
+# (T-rider3-objection-parser-injection-surface) closes the parser side of the reversal's
+# pre-conditions.
 #
 # **RESPONSIBILITY SEPARATION (gamma-1, msg-2478 §4.2 / msg-2521 §2.1).** This regex POSITIONS
 # the marker; it does not judge payload adjacency. The pre-gamma form carried a ``\s*$`` tail
@@ -1159,9 +1193,10 @@ def parse_objections(critique: str) -> ObjectionReport:
     D-2-prime is premature until the reversal is on the table. R-4 (unify the two parsers' anchor
     strategy, or justify the divergence, before the reversal) is discharged by the D-1 note
     above and the divergence back-reference at :data:`_VERDICT_RE` (msg-2130 §1): the objection
-    parser is deliberately strict-single, ``_VERDICT_RE`` remains last-wins for the reasons on
-    ``T-verdict-echo-after-real-verdict``, and the divergence is named on BOTH sides rather
-    than left implicit. V-1 (verify the array-terminator method): confirmed by inspection —
+    parser is deliberately strict-single, and since ``T-verdict-echo-after-real-verdict`` D-1
+    (msg-1978) the verdict parser is too (two-plus column-zero ``VERDICT:`` lines → AMBIGUOUS →
+    REQUEST_CHANGES), so the divergence R-4 asked about is closed by unifying.
+    V-1 (verify the array-terminator method): confirmed by inspection —
     ``raw_decode`` stops at the end of the JSON value, so anything after ``]`` is structurally
     invisible to this parser (matching the note next to the ``raw_decode`` call below); no
     code change is needed.
@@ -1345,6 +1380,10 @@ class VerdictDecision:
     # commit whose bytes it inspected — a reader who wants to reproduce the demotion runs
     # ``git show <sha>:<path>`` against this value.
     verified_head_sha: str | None = None
+    # How many column-zero ``VERDICT:`` lines the critique carried, from the same ``findall``
+    # list the model verdict was taken from (msg-1978 §4). Read by the E-ambiguous note.
+    # 0 on short-circuit paths that build a decision without parsing a critique.
+    verdict_line_count: int = 0
 
     @property
     def diverged(self) -> bool:
@@ -1379,13 +1418,22 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
     to make the existing behaviour AUDIBLE, not to change it. See msg-1874 §9 "参照
     実装をテスト内に置く".
     """
-    mv = _parse_model_verdict(critique)
+    mv, verdict_line_count = _scan_verdict_lines(critique)
+    if mv is ModelVerdict.AMBIGUOUS:
+        # msg-1978 §2: VERDICT_AMBIGUOUS must be observable, not a silent red — §6 re-proposes
+        # structured verdicts if it reaches 3 per rolling 100 driver bodies. The notice carries
+        # it to the reader; this line is the grep-able corpus counter.
+        logger.warning(
+            "naysayer verdict %s count=%d: no verdict taken, gate fails closed",
+            ModelVerdict.AMBIGUOUS.value,
+            verdict_line_count,
+        )
     if view.truncated or finish_reason == "length":
         gv = ReviewEvent.REQUEST_CHANGES
     elif mv is ModelVerdict.APPROVE:
         gv = ReviewEvent.APPROVE
     else:
-        # UNPARSEABLE or REQUEST_CHANGES → gate stays closed (fail-safe collapse of the
+        # UNPARSEABLE, AMBIGUOUS or REQUEST_CHANGES → gate stays closed (fail-safe collapse of the
         # two non-APPROVE model verdicts to a single gate verdict). This is the ONE case
         # where UNPARSEABLE and RC still look the same to the gate; the distinction
         # survives on ``model_verdict`` for the notice, so the record does not lie about
@@ -1401,6 +1449,7 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
         finish_reason=finish_reason,
         objections=report,
         derived_verdict=derive_verdict(report),
+        verdict_line_count=verdict_line_count,
     )
 
 
@@ -1416,6 +1465,7 @@ _MARKER_B_LEN = "<!-- mindwire:note B-len -->"
 _MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
 _MARKER_C_DEMOTED = "<!-- mindwire:note C-demoted -->"
 _MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
+_MARKER_E_AMBIGUOUS = "<!-- mindwire:note E-ambiguous -->"
 
 
 # ─── verify_citations: single-line where + empty-line predicate ─────────────────────
@@ -1602,7 +1652,8 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     # there), the notice must say so.
     fire_c_demoted = bool(decision.demoted_objections)
     fire_d = decision.diverged
-    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_c_demoted or fire_d):
+    fire_e = decision.model_verdict is ModelVerdict.AMBIGUOUS
+    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_c_demoted or fire_d or fire_e):
         return ""
 
     lines: list[str] = [_GATE_NOTICE_SENTINEL]
@@ -1662,6 +1713,25 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             "but the gate posted `REQUEST_CHANGES` because the review below is partial "
             "(see the note(s) above); a review of a partial diff / partial output "
             "cannot open the gate."
+        )
+    if fire_e:
+        # msg-1978 D-1. The gate refused to pick among n verdict lines; say that the red is
+        # about FORM, not design, so the fix loop does not go looking for a finding. Every line
+        # here starts with ``> `` and names the token inline, never at column 0 — a note that
+        # emitted a column-zero verdict line would raise the count every time the posted body
+        # is parsed again (pinned by test 7 of the D-1 set).
+        lines.append(">")
+        lines.append(f"> {_MARKER_E_AMBIGUOUS}")
+        lines.append(
+            f"> **GATE-NOTE: {ModelVerdict.AMBIGUOUS.value} — this red is about form, not "
+            f"design.** The review below has {decision.verdict_line_count} verdict lines — "
+            f"lines that start at column 0 with `VERDICT:` and carry nothing but one verdict "
+            f"token (`APPROVE`, `REQUEST_CHANGES` or `COMMENT`); other `VERDICT:` lines are "
+            f"not counted. The gate takes a verdict only when there is exactly one such line, "
+            f"so it took none and posted `REQUEST_CHANGES`. This is not a finding about "
+            f"the change. When quoting a verdict-shaped line, indent it or keep a prefix in "
+            f"front of it (inside fences too), so that the review's own verdict is the only "
+            f"one at column 0."
         )
     if fire_c_demoted:
         # T-gate-blocks-on-miscounted-line-numbers (msg-3604 D-4 / msg-3606 D-3 revise).

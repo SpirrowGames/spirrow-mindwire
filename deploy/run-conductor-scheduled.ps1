@@ -702,6 +702,9 @@ $ParkedHumansProbeTimeoutSeconds = 120
 $ControlProbeTimeoutSeconds = 120
 $PredictedResourceProbeTimeoutSeconds = 120
 $GateBootstrapProbeTimeoutSeconds = 120
+# 1b (T-pr-event-advances-thread): one chatroom read per open thread of the project, plus a GitHub
+# read only for threads whose tail is a PR-gate relay. Longer than the single-call probes for that.
+$PrEventAdvanceProbeTimeoutSeconds = 300
 # Get-FailureClass -> spirrow_mindwire.stall_ledger (Bohr msg-5611 §3). The classifier itself runs in
 # milliseconds; the bound is the same as the other probes because uv -> python start-up alone took
 # ~75 s in msg-5322.
@@ -4166,6 +4169,46 @@ function Invoke-GateBootstrapTick {
     }
 }
 
+# --- 1b: PR events advance work threads ---------------------------------------------------------
+# For each distinct project in the sweep list, run `python -m spirrow_mindwire.pr_event_advance`
+# (docs/operator-board-design.md §F.1 row 1b / §F.1.1; chatroom T-pr-event-advances-thread). When a
+# work thread's tail is a PR-gate relay and the PR has since been merged or closed — or CI has ended
+# on the head a CI-pending hold named — it writes ONE message whose NEXT: moves the thread on.
+#
+# Runs after the project's HOLD check and BEFORE its head probe, so a held project gets no writes
+# and a thread it just wrote to has a moved head and is launched this tick. Fail-open on the SWEEP, for the same reason as Invoke-GateBootstrapTick: a broken 1b tick must
+# not stop the sweep that runs conductors. Every outcome other than a quiet no-op is logged.
+function Invoke-PrEventAdvanceTick {
+    param([string]$Project)
+
+    try {
+        $r = Invoke-BoundedUvProbe -Label "pr-event-advance-$Project" -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.pr_event_advance', '--project', $Project, '--sweep-config', $sweepConfigPath)
+        if (-not $r.ok) {
+            Write-Log "pr-event-advance [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
+        }
+        $json = Get-ProbeJsonLine -Result $r
+        if (-not $json) {
+            Write-Log "pr-event-advance [$Project]: no JSON on stdout (exit=$($r.code)) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($r.code -ne 0) {
+            Write-Log "pr-event-advance [$Project]: tick failed (exit=$($r.code)): $($obj.error)"
+            return $obj
+        }
+        if ($obj.posted -gt 0 -or @($obj.outcomes).Count -gt 0 -or $obj.roster_error) {
+            Write-Log "pr-event-advance [$Project]: $json"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "pr-event-advance [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
+        return $null
+    }
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -4298,6 +4341,10 @@ try {
             }
         }
         if (Test-HoldObserved -Control $c) { continue }
+        # 1b (T-pr-event-advances-thread): after the HOLD check, so a held project gets no 1b
+        # writes either, and BEFORE the head probe, so a thread it writes to shows a moved head
+        # in this same tick. Fail-open (see Invoke-PrEventAdvanceTick).
+        [void](Invoke-PrEventAdvanceTick -Project $proj)
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }

@@ -31,9 +31,11 @@ next to the green/red badge.
   it is also unavoidable without branch protection — the check side cannot
   close it.
 - Semantic drift where the id is preserved but the body is rewritten. That is
-  what canary two-double-prime (``tests/test_obligations.py``) is for: any
-  moved-from body whose length no longer matches ``origin.original_length``
-  reds the gate. This advisory check is scoped to id-level topology (add /
+  what the body pins checked by the loader and by ``tests/test_obligations.py``
+  are for: a moved-from body whose length no longer matches
+  ``origin.original_length`` (canary two-double-prime), or a net-new body whose
+  SHA-256 no longer matches ``body_sha256`` (canary net-new sha256), reds the
+  gate. This advisory check is scoped to id-level topology (add /
   remove / rename), because reasoning about "did the meaning change" from a
   diff would require this script to hold a shadow of the reviewed meaning —
   the very shadow-list dual-management the design deliberately rejected.

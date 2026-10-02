@@ -82,7 +82,7 @@ Cost invariants worth stating outright, because the spec depends on them:
   ``MultipleInstancesPolicy=IgnoreNew`` keeps the conductor to one live process, the conductor
   processes one candidate per run, and a session takes wall-clock time. Measured 2026-09-17 to
   2026-09-30 (method under ``BASE`` below): a session launched on the progress path ran a median
-  of 3.2 min (p90 23.4 min, n=424), and the most progress-path launches any one thread received
+  of 3.2 min (p90 23.4 min, n=425), and the most progress-path launches any one thread received
   inside 60 minutes was 6. This is a *load-bearing operational premise*, not a design guarantee.
 - **``eligible_at`` is a display value only**. It is emitted on every verdict (for report-mode
   audit and for the log) but never persisted to the record — the record only stores observations

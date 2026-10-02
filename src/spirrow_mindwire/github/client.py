@@ -201,6 +201,12 @@ class PrState:
     # ``unknown`` / ...), verbatim, for an OPEN PR. ``None`` when the payload lacked it.
     # Added for the stall ledger's ``needs_actor`` read (msg-4685 §3); S0 ignores it.
     mergeable_state: str | None = None
+    # T-pr-event-advances-thread (1b): the merge commit of a merged PR (GitHub's
+    # ``merge_commit_sha``) and the PR body, read off the same single GET so 1b can write
+    # "PR #N was merged (sha)" and look for a ``Closes-thread:`` declaration without a
+    # second call. ``None`` when the payload lacked them. S0 ignores both.
+    merge_commit_sha: str | None = None
+    body: str | None = None
 
     @property
     def slug(self) -> str:
@@ -1067,6 +1073,8 @@ class GitHubClient:
         state = str(payload.get("state") or "").lower()
         head = payload.get("head")
         head_sha = str(head.get("sha")) if isinstance(head, dict) and head.get("sha") else None
+        raw_body = payload.get("body")
+        body = raw_body if isinstance(raw_body, str) else None
         if state == "open":
             mergeable = payload.get("mergeable_state")
             return PrState(
@@ -1074,6 +1082,7 @@ class GitHubClient:
                 resolution=PrResolution.OPEN,
                 head_sha=head_sha,
                 mergeable_state=mergeable if isinstance(mergeable, str) else None,
+                body=body,
             )
         if state != "closed":
             # A third state would mean the API contract moved under us. Refusing to
@@ -1087,6 +1096,12 @@ class GitHubClient:
             closed_at=_parse_github_timestamp(payload.get("closed_at")),
             merged=bool(payload.get("merged")),
             head_sha=head_sha,
+            merge_commit_sha=(
+                str(payload["merge_commit_sha"])
+                if isinstance(payload.get("merge_commit_sha"), str)
+                else None
+            ),
+            body=body,
         )
 
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:

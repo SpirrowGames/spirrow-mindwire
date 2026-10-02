@@ -69,8 +69,17 @@ _SITES = _call_sites()
 
 def test_every_call_site_was_found() -> None:
     # msg-5414 §3 names eight call sites and msg-5611 §3 adds Get-FailureClass as the ninth; a
-    # parser miss must not silently shrink coverage.
-    assert len(_SITES) == 9, _SITES
+    # parser miss must not silently shrink coverage. T-pr-event-advances-thread (1b) adds the
+    # tenth: Invoke-PrEventAdvanceTick -> -m spirrow_mindwire.pr_event_advance.
+    assert len(_SITES) == 10, _SITES
+
+
+def test_pr_event_advance_call_site_resolves_to_the_1b_module() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"pr-event-advance-$Project"') == (
+        "-m spirrow_mindwire.pr_event_advance",
+        ["--project", "--sweep-config"],
+    )
 
 
 def test_failure_class_call_site_resolves_to_the_classifier_module() -> None:

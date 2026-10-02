@@ -25,7 +25,7 @@ them.
 
 `OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT` (in `./obligations.yaml`) は本節の再定式化であり、ループに毎 turn 注入される — つまり本節の規範性は obligations.yaml で運搬される。本 README は人向けの背景説明。
 
-**旧 §N.1.1 の rationale SOT** は ADR-2026-05-29-13 だが同 ADR は文書実体が未作成の可能性がある。そのため rationale を破棄せず、本 README に退避してある。
+**旧 §N.1.1 の rationale SOT** は ADR-2026-05-29-13（本文: `chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326`、`spec/adr_index.yaml` 参照）。本 README の rationale は、リポジトリ内で読める背景説明として残してある。
 
 ## 適用 trigger (旧 §N.1.2、5 件)
 
@@ -102,7 +102,7 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 
 理由: 上節 (旧 §N.3) の教訓 (「正しく実装され正しく宣言している fail-open でも不可視でありうる」) は obligation にも当てはまる。同じ意味の節が adapter 側に散らばると、単一の PR ではもう全体を審査できず、レビュー時に見えていたはずの規約が知らぬ間にドリフトする (2026-08-09、voxelworld PR #182 で ADR-2026-05-29-13 の read-back 義務が「read できない ADR に対して何をするか」の未定義分岐で沈黙。義務は書かれていたが、`OBL-READBACK-*` として名前がついておらず抽出できなかった)。
 
-manifest の書式・読込 API・不変条件 (verbatim 長さ保持 = canary ②″) は `src/spirrow_mindwire/obligations.py` の docstring と `./obligations.yaml` の冒頭コメントに定義がある。composition root (`loop_runner._build_dispatcher`) が startup で 1 度だけ読み込み、失敗時は `SystemExit` で fail-closed。canary は `tests/test_obligations.py` に 3 本 (① id 網羅 / ②′ 描画注入 / ②″ 長さ保持) + 本 README への pointer 存在 grep — いずれも skip 条件なし。
+manifest の書式・読込 API・不変条件 (moved entry の verbatim 長さ保持 = canary ②″、net-new entry の `body_sha256` 固定 = canary net-new sha256) は `src/spirrow_mindwire/obligations.py` の docstring と `./obligations.yaml` の冒頭コメントに定義がある。composition root (`loop_runner._build_dispatcher`) が startup で 1 度だけ読み込み、失敗時は `SystemExit` で fail-closed。canary は `tests/test_obligations.py` に 3 本 (① id 網羅 / ②′ 描画注入 / ②″ 長さ保持) + net-new sha256 固定 1 本 + 本 README への pointer 存在 grep — いずれも skip 条件なし。
 
 `moved_from` は Python literal (`path::LITERAL_NAME`) と doc section (`path::§HEADING`) の両方を受ける opaque string。**現時点で origin を持つのは Python literal 例の `OBL-VERDICT-CONSTRAINT` の 1 件のみ**。`OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT` は旧 `CLAUDE.md §N.1.3 / §N.1.4` の spirit を英文で再定式化したもの (Japanese の numbered list 構造は verbatim には prompt body へ落ちない) で、**verbatim 移設ではなく net-new formulation** ゆえ `origin` を持たない — canary 二重プライムの length 不変式は verbatim 移設の text にのみ適用される (前身が Japanese の要件リストで、英文 body の length と一致させても不変式の意味を持たない)。PR #135 Tier-B naysayer Finding 1 が過去の origin 記載の誤りを指摘し、当該 PR で訂正した。`OBL-DECLARE-UNREADABLE` は当初 Python literal 例だったが、T-adr-index-dangling-references で body から bare な ADR-2026-05-29-13 anchor を除去する書き換えが入り、byte-for-byte 一致が保てなくなったため `origin` を落とし net-new formulation に再分類した (bump ではなく drop を選んだ理由は当該 obligation の隣接コメント参照 = `original_length` の bump は `moved_from` の主張を残したまま invariant の意味を silently 再定義してしまう、PR #135 Finding 1 と同型の構造欠陥)。歴史的な source length 795 は provenance 記録として同コメントに保存されている。
 

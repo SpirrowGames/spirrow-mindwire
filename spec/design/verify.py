@@ -492,15 +492,34 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
     if repo_name != pin["repo"]:
         return PinResult("NO-PIN", "REPO_MISMATCH")
 
-    # 8 — reachability from origin/main (positive side never fetches; negative side
-    # tries fetch once, then re-judges)
-    def _is_ancestor() -> bool:
-        return _git_ok(repo_root, "merge-base", "--is-ancestor", commit, "origin/main")
+    # 8 — reachability from origin/main.
+    #
+    # This block implements the r3 reachability rule in the OBL-SPEC-PIN body
+    # (T-spec-pin-hardening-and-id-audit.md §4-1, mirrored in
+    # spec/process/obligations.yaml), NOT T-design-spec-delivery.md §3 step 8.
+    # That older step collapses every post-fetch failure into
+    # COMMIT_UNREACHABLE; it is superseded by the hardening spec and was left
+    # unedited under D-19 (thread T-spec-pin-shallow-clone-exit128).
+    #
+    #   * judge once; status 0 → accept, fetch nothing (also when origin/main
+    #     is missing, the judgement is simply non-zero and we fall through).
+    #   * otherwise fetch main exactly once; unavailable/failed →
+    #     FETCH_UNAVAILABLE.
+    #   * judge again; 0 → accept.  Any other status (1 = known but not an
+    #     ancestor, 128 = unknown commit) is only conclusive in a full clone:
+    #     `rev-parse --is-shallow-repository` must print exactly "false" for
+    #     COMMIT_UNREACHABLE.  "true", any other output (an old git echoing
+    #     the flag back) or a failure → FETCH_UNAVAILABLE, because a shallow
+    #     clone lacks the history to rule the commit out.
+    #   * never deepen / unshallow, never fetch twice.
+    def _is_ancestor_status() -> int | None:
+        try:
+            proc = _git(repo_root, "merge-base", "--is-ancestor", commit, "origin/main")
+        except (FileNotFoundError, OSError):
+            return None
+        return proc.returncode
 
-    have_origin_main = _git_ok(repo_root, "rev-parse", "--verify", "--quiet", "origin/main")
-    if have_origin_main and _is_ancestor():
-        pass  # proceed
-    else:
+    if _is_ancestor_status() != 0:
         if no_fetch:
             return PinResult("NO-PIN", "FETCH_UNAVAILABLE")
         fetch_ok = _git_ok(
@@ -511,8 +530,14 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
         )
         if not fetch_ok:
             return PinResult("NO-PIN", "FETCH_UNAVAILABLE")
-        if not _is_ancestor():
-            return PinResult("NO-PIN", "COMMIT_UNREACHABLE")
+        if _is_ancestor_status() != 0:
+            # _git_out strips stdout, so a trailing newline cannot turn a
+            # full clone's raw "false" plus newline into a FETCH_UNAVAILABLE
+            # verdict.
+            shallow = _git_out(repo_root, "rev-parse", "--is-shallow-repository")
+            if shallow == "false":
+                return PinResult("NO-PIN", "COMMIT_UNREACHABLE")
+            return PinResult("NO-PIN", "FETCH_UNAVAILABLE")
 
     # 9 — blob lookup by commit:path
     blob_at_commit = _git_out(repo_root, "rev-parse", f"{commit}:{pin['path']}")

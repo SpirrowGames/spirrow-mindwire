@@ -30,6 +30,7 @@ import io
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import ModuleType
@@ -949,3 +950,234 @@ def test_main_usage_error_returns_two(tmp_path: Path) -> None:
 # Silence lint for unused sys import: keep it available for future skip
 # conditions if verify.py grows platform-specific paths.
 _ = sys
+
+
+# ---------------------------------------------------------------------------
+# Step 8 reachability — r3 rule of the OBL-SPEC-PIN body (hardening §4-1),
+# thread T-spec-pin-shallow-clone-exit128 unit 2a, matrix T1-T6.
+#
+# All repos are local temporaries; the shallow clone goes through a
+# ``file://`` URL because ``--depth`` is ignored for a plain local path.
+# The one fetch the rule allows hits that local upstream — no network.
+# ---------------------------------------------------------------------------
+
+_PIN_SPEC_PATH = "spec/design/T-fixture.md"
+
+
+def _git_run(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return proc.stdout.strip()
+
+
+def _make_upstream(root: Path) -> dict[str, str]:
+    """Upstream with three commits on ``main`` and one commit on ``unmerged``.
+
+    Returns the shas: ``first`` (oldest main commit), ``tip`` (main tip),
+    ``unmerged`` (a commit never merged to main).
+    """
+
+    up = root / "upstream"
+    up.mkdir()
+    _git_run(up, "init", "-q", "-b", "main")
+    _git_run(up, "config", "user.email", "t@example.com")
+    _git_run(up, "config", "user.name", "test")
+    spec_file = up / _PIN_SPEC_PATH
+    spec_file.parent.mkdir(parents=True)
+    shas: dict[str, str] = {}
+    for i in range(3):
+        spec_file.write_text(f"spec v{i}\n", encoding="utf-8")
+        _git_run(up, "add", _PIN_SPEC_PATH)
+        _git_run(up, "commit", "-qm", f"main {i}")
+        if i == 0:
+            shas["first"] = _git_run(up, "rev-parse", "HEAD")
+    shas["tip"] = _git_run(up, "rev-parse", "HEAD")
+    _git_run(up, "checkout", "-q", "-b", "unmerged")
+    spec_file.write_text("unmerged\n", encoding="utf-8")
+    _git_run(up, "commit", "-qam", "unmerged")
+    shas["unmerged"] = _git_run(up, "rev-parse", "HEAD")
+    _git_run(up, "checkout", "-q", "main")
+    return shas
+
+
+def _clone(root: Path, *clone_args: str) -> Path:
+    dest = root / "clone"
+    upstream_url = (root / "upstream").resolve().as_uri()
+    subprocess.run(
+        ["git", "clone", "-q", *clone_args, upstream_url, str(dest)],
+        check=True,
+        capture_output=True,
+    )
+    _git_run(dest, "checkout", "-q", "-b", "feature/test")
+    return dest
+
+
+def _write_resolved_pin(clone: Path, commit: str, blob_sha: str = "0" * 40) -> None:
+    _write_pin(
+        clone,
+        {
+            "schema_version": 1,
+            "mode": "resolved",
+            "spec_id": "SPEC-FIXTURE",
+            "thread": "T-fixture",
+            "repo": "upstream",
+            "branch": "feature/test",
+            "path": _PIN_SPEC_PATH,
+            "blob_sha": blob_sha,
+            "commit": commit,
+            "pinned_at": "2026-10-02T00:00:00Z",
+            "pinned_by": "dispatcher",
+        },
+    )
+
+
+def _ancestor_status(clone: Path, commit: str) -> int:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, "origin/main"],
+        cwd=clone,
+        capture_output=True,
+    ).returncode
+
+
+def test_step8_t1_full_clone_unknown_unmerged_commit_is_commit_unreachable(
+    tmp_path: Path,
+) -> None:
+    """T1: full clone, unmerged commit absent from the object store (exit 128)."""
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path, "--single-branch", "--branch", "main")
+    assert _git_run(clone, "rev-parse", "--is-shallow-repository") == "false"
+    assert _ancestor_status(clone, shas["unmerged"]) == 128
+    _write_resolved_pin(clone, shas["unmerged"])
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", "COMMIT_UNREACHABLE")
+
+
+def test_step8_t2_full_clone_known_unmerged_commit_is_commit_unreachable(
+    tmp_path: Path,
+) -> None:
+    """T2: full clone that already has the unmerged commit (exit 1).
+
+    Keeps delivery-spec A-10 true.
+    """
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path)
+    assert _git_run(clone, "rev-parse", "--is-shallow-repository") == "false"
+    assert _ancestor_status(clone, shas["unmerged"]) == 1
+    _write_resolved_pin(clone, shas["unmerged"])
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", "COMMIT_UNREACHABLE")
+
+
+def test_step8_t3_shallow_clone_merged_commit_beyond_boundary_is_fetch_unavailable(
+    tmp_path: Path,
+) -> None:
+    """T3: --depth 1 clone, commit genuinely on main but beyond the boundary.
+
+    The pre-r3 code reported this as COMMIT_UNREACHABLE ("never merged"),
+    the opposite of the truth (msg-1600 defect 1).
+    """
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path, "--depth", "1", "--branch", "main")
+    assert _git_run(clone, "rev-parse", "--is-shallow-repository") == "true"
+    assert _ancestor_status(clone, shas["first"]) != 0
+    _write_resolved_pin(clone, shas["first"])
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", "FETCH_UNAVAILABLE")
+
+
+def test_step8_t4_shallow_clone_unmerged_commit_is_fetch_unavailable(
+    tmp_path: Path,
+) -> None:
+    """T4: --depth 1 clone, unmerged commit: undeterminable, not a verdict."""
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path, "--depth", "1", "--branch", "main")
+    assert _git_run(clone, "rev-parse", "--is-shallow-repository") == "true"
+    _write_resolved_pin(clone, shas["unmerged"])
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", "FETCH_UNAVAILABLE")
+
+
+def test_step8_t5_shallow_check_failure_is_fetch_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T5: full clone, but the shallow check itself fails (None).
+
+    Fail-safe FETCH_UNAVAILABLE, never COMMIT_UNREACHABLE.
+    """
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path)
+    _write_resolved_pin(clone, shas["unmerged"])
+    real_git_out: Callable[..., str | None] = VERIFY._git_out
+
+    def fake_git_out(repo_root: Path, *args: str) -> str | None:
+        if args == ("rev-parse", "--is-shallow-repository"):
+            return None
+        return real_git_out(repo_root, *args)
+
+    monkeypatch.setattr(VERIFY, "_git_out", fake_git_out)
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", "FETCH_UNAVAILABLE")
+
+
+@pytest.mark.parametrize(
+    ("shallow_stdout", "expected"),
+    [
+        ("false\n", "COMMIT_UNREACHABLE"),
+        ("false\r\n", "COMMIT_UNREACHABLE"),
+        ("true\n", "FETCH_UNAVAILABLE"),
+        ("--is-shallow-repository\n", "FETCH_UNAVAILABLE"),
+    ],
+)
+def test_step8_shallow_answer_is_compared_after_strip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shallow_stdout: str,
+    expected: str,
+) -> None:
+    """msg-5750 advisory: raw git stdout carries a trailing newline.
+
+    A full clone's ``false\\n`` must still give COMMIT_UNREACHABLE, while
+    ``true`` and an old git echoing the flag back give FETCH_UNAVAILABLE.
+    """
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path)
+    _write_resolved_pin(clone, shas["unmerged"])
+    real_git = VERIFY._git
+
+    def fake_git(repo_root: Path, *args: str, **kw: Any) -> Any:
+        if args == ("rev-parse", "--is-shallow-repository"):
+            return subprocess.CompletedProcess(["git", *args], 0, shallow_stdout, "")
+        return real_git(repo_root, *args, **kw)
+
+    monkeypatch.setattr(VERIFY, "_git", fake_git)
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert (result.state, result.reason) == ("NO-PIN", expected)
+
+
+def test_step8_t6_main_tip_is_accepted_without_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: the positive case never fetches, and the pin resolves."""
+
+    shas = _make_upstream(tmp_path)
+    clone = _clone(tmp_path)
+    blob = _git_run(clone, "rev-parse", f"{shas['tip']}:{_PIN_SPEC_PATH}")
+    _write_resolved_pin(clone, shas["tip"], blob_sha=blob)
+    calls: list[tuple[str, ...]] = []
+    real_git = VERIFY._git
+
+    def recording_git(repo_root: Path, *args: str, **kw: Any) -> Any:
+        calls.append(args)
+        return real_git(repo_root, *args, **kw)
+
+    monkeypatch.setattr(VERIFY, "_git", recording_git)
+    result = VERIFY._resolve_pin(clone, no_fetch=False)
+    assert result.state == "RESOLVED"
+    assert result.commit == shas["tip"]
+    assert not [c for c in calls if c and c[0] == "fetch"]
+    assert ("rev-parse", "--is-shallow-repository") not in calls
