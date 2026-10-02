@@ -162,7 +162,7 @@ Check 'exit 2 branch still precedes the generic non-zero branch' $true ($posEnv2
 # ===================================================================================================
 foreach ($name in 'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update-DirtyCloneParking',
                   'Get-DirtyCloneDigestLines', 'New-DailyDigest', 'Get-FingerprintHint',
-                  'Get-DerivedQuarantineState', 'Format-DurationDigest', 'ConvertTo-UtcInstant',
+                  'Get-DerivedQuarantineState', 'Format-DurationDigest', 'Get-ParkedRowTag', 'ConvertTo-UtcInstant',
                   'Get-QuarantineReproHint') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }

@@ -67,7 +67,7 @@ $needed = @(
     'New-DailyDigest',
     'Get-FingerprintHint',
     'Get-DerivedQuarantineState',
-    'Format-DurationDigest',
+    'Format-DurationDigest', 'Get-ParkedRowTag',
     'ConvertTo-UtcInstant',
     # T-decision-material-push (msg-1445 §W-2 / §W-3): the material-push wiring.
     'Get-EnvelopeField',
