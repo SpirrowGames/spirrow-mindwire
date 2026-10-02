@@ -695,7 +695,7 @@ $ProbeInputDirectory = [System.IO.Path]::GetTempPath()
 
 # The full command line Invoke-BoundedUvProbe starts, element 0 being the executable. Pure, so the
 # argv composition is testable without launching anything. UvOptions (uv's own flags) go right after
-# the first two Launcher elements — `uv run` — and before the interpreter, which is the only place
+# the first two Launcher elements — which must be `uv run` — and before the interpreter, which is the only place
 # uv reads them; with UvOptions empty the result is exactly Launcher + Arguments, as before.
 function Get-BoundedProbeCommandLine {
     param(
@@ -705,7 +705,13 @@ function Get-BoundedProbeCommandLine {
     )
     $line = [System.Collections.Generic.List[string]]::new()
     $opts = @($UvOptions | Where-Object { $null -ne $_ })
-    if ($opts.Count -gt 0 -and $Launcher.Count -lt 3) {
+    # Checked by shape, not only by length: the insertion point is index 2 because that is where
+    # `uv run` ends, so a launcher that is not literally `uv run <interpreter>` (e.g. a 3-element
+    # `pwsh -NoProfile -File`) is refused rather than given uv flags it would misread.
+    $isUvRun = $Launcher.Count -ge 3 -and
+        [System.IO.Path]::GetFileNameWithoutExtension([string]$Launcher[0]) -ieq 'uv' -and
+        [string]$Launcher[1] -ceq 'run'
+    if ($opts.Count -gt 0 -and -not $isUvRun) {
         throw "Get-BoundedProbeCommandLine: -UvOptions needs a launcher of the form 'uv run <interpreter>' (got: $($Launcher -join ' '))"
     }
     for ($i = 0; $i -lt $Launcher.Count; $i++) {

@@ -358,6 +358,13 @@ exit 0
     $threw = $false
     try { $null = Get-BoundedProbeCommandLine -Launcher @('pwsh', '-File') -UvOptions @('--quiet') -Arguments @('x') } catch { $threw = $true }
     CheckTrue 'UvOptions with a launcher too short to hold them is refused, not silently misplaced' $threw
+    foreach ($bad in @(@('pwsh', '-NoProfile', '-File'), @('uv', 'tool', 'python'), @('uvx', 'run', 'python'))) {
+        $threw = $false
+        try { $null = Get-BoundedProbeCommandLine -Launcher $bad -UvOptions @('--quiet') -Arguments @('x') } catch { $threw = $true }
+        CheckTrue "UvOptions with a non-'uv run' launcher ($($bad -join ' ')) is refused, not injected at index 2" $threw
+    }
+    Check 'a path-qualified uv.exe launcher is accepted' 'C:\bin\uv.exe|run|--quiet|python|x' `
+        ((Get-BoundedProbeCommandLine -Launcher @('C:\bin\uv.exe', 'run', 'python') -UvOptions @('--quiet') -Arguments @('x')) -join '|')
     $r = Invoke-BoundedUvProbe -Launcher @('pwsh', '-File') -UvOptions @('--quiet') -Arguments @('x') -TimeoutSeconds 5 -Label 'u1'
     Check 'the helper turns that refusal into an error result (ok = $false)' $false $r.ok
     CheckTrue 'error names the invalid command line' ($r.error -like 'invalid command line:*')
