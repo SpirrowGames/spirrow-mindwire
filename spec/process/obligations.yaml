@@ -112,9 +112,9 @@ obligations:
     # same structural failure PR #135 Tier B Finding 1 caught in a different guise.
     # Dropping `origin` outright classifies this entry as net-new formulation (the
     # runtime rule now lives here as its own SOT) and preserves 795 as the historical
-    # source-length record (documentary provenance, not integrity — the entry no
-    # longer has any drift check of its own; whether integrity should be reintroduced
-    # for every entry uniformly is a step 4 candidate deferred to a later PR).
+    # source-length record (documentary provenance, not integrity). Integrity is now
+    # the net-new kind's: the `body_sha256` pin below, checked at load time and by
+    # test_canary_net_new_bodies_match_pinned_sha256 (T-net-new-obligation-drift-detection).
     body_sha256: f4a85e7a6ea69a247c73429a147b8fa1c0fa85b219122fc0bf3c33dfe141ed33
     body: "DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that is all. ADR bodies live in a separate docs repository you cannot reach, and you do not have CLAUDE.md. When a task asks you to check your work against a document whose text you cannot see, do NOT reconstruct what it probably says — say plainly \"I cannot read <doc>'s text, so I have not verified against it\", then verify everything you CAN and report that. An incomplete report is always better than a confident wrong one: stating the limit is what lets a human close the gap, while a plausible invention closes the subject and is believed. This applies to ADR titles too — a title is a summary, and reasoning outward from a summary as if it were the document is the exact mistake this rule exists to prevent."
 

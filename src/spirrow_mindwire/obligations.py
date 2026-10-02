@@ -28,8 +28,7 @@ representing.
 
 Net-new hash pin: an entry *without* ``origin`` is a net-new formulation, so
 there is no source length to compare against. Such an entry is pinned by
-``body_sha256`` — the SHA-256 of the normalized body (``body.rstrip("
-")``),
+``body_sha256`` — the SHA-256 of the normalized body (``body.rstrip("\\n")``),
 UTF-8 encoded, as 64 lowercase hex digits. Whenever the key is present the
 loader checks its format and its value and raises :class:`ObligationsError` on
 either mismatch, so a silently edited net-new body halts the daemon exactly as
