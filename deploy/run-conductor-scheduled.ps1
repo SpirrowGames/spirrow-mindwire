@@ -62,9 +62,15 @@
 # > the default in deploy/lib/SweepFairness.ps1. 0 means "not passed". The scheduled task passes
 # neither, so the env var or the default applies; see docs/deploy.md "Launch fairness" for how
 # these relate to the task's trigger interval.
+#
+# $StaleHumanThresholdHours (T-sweep-intake-and-quarantine-stalls msg-5889 D-1; Operator Board §F.1
+# row 3 / RES-A-GAP): the N in the digest's "末尾 NEXT: human のまま N h 以上" section. Default 24,
+# the same 24h as 飢餓 and escalated, so "a day without motion" means one thing across the digest.
 param(
     [int]$LaunchBudgetSeconds = 0,
-    [int]$GateBudgetSeconds = 0
+    [int]$GateBudgetSeconds = 0,
+    [ValidateRange(1, 8760)]
+    [int]$StaleHumanThresholdHours = 24
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,6 +106,8 @@ $StarvedThreshold         = [TimeSpan]::FromHours(24)
 # $StarvedThreshold, because "not evaluated" and "evaluated but never launched" are different
 # failures. W-2c's last_evaluated_at refresh hid the second one (#392 / #361 / #359, 2026-10-02).
 $LaunchWaitStarvedThreshold = [TimeSpan]::FromHours(6)
+# Stale NEXT: human (msg-5889 D-1). From the script parameter above; see its comment.
+$StaleHumanThreshold = [TimeSpan]::FromHours($StaleHumanThresholdHours)
 
 # Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
 # surface in one section.
@@ -1961,7 +1969,10 @@ function New-DailyDigest {
         # is empty, so a caller that predates the metric gets an empty section.
         [array]$LaunchWaitStarved = @(),
         # The threshold the caller used to build $LaunchWaitStarved; only rendered in the header.
-        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6)
+        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6),
+        # T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3, RES-A-GAP):
+        # the N of the 停止中 section, built from the $HumanParked rows that carry last_msg_at.
+        [TimeSpan]$StaleHumanThreshold = [TimeSpan]::FromHours(24)
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2289,6 +2300,53 @@ function New-DailyDigest {
         $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
     }
 
+    # 停止中 rows — T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3,
+    # RES-A-GAP). Threads whose last message still ends in NEXT: human and has not moved for at
+    # least $StaleHumanThreshold, oldest first. A different list from 判断待ち above: that one is
+    # "everything parked on a human now, in candidate order"; this one is "parked AND old".
+    #
+    # The age is derived here, from $Now and the row's last_msg_at, every time the digest is
+    # rendered. It is never written anywhere (§F.1: "スレッド末尾からその場で導く。永続化しない"), and
+    # there is no mute list (§F.1: a thread that waits on a human every day belongs here every day).
+    #
+    # Only rows that CARRY a last_msg_at property are considered. Invoke-ParkedHumansProbe always
+    # sets it; a caller that builds $HumanParked without it predates this section.
+    #
+    # Fail direction (msg-5889 D-1, endorsed by Einstein msg-5891): a row whose last_msg_at is $null
+    # or does not parse is LISTED, as 経過不明, ahead of every dated row. Its age is unknown, so it
+    # cannot be shown to be under N, and dropping it would be the silent kind of failure this thread
+    # exists to remove. parked_humans.py has already put the cause in 取得失敗.
+    $staleHumanList = @()
+    foreach ($p in $HumanParked) {
+        if (-not ($p.PSObject.Properties.Name -contains 'last_msg_at')) { continue }
+        $at = $null
+        try { $at = ConvertTo-UtcInstant -Value $p.last_msg_at } catch { $at = $null }
+        $ageText = '経過不明（timestamp 読めず）'
+        $ageSeconds = [int64]::MaxValue
+        if ($null -ne $at) {
+            $age = $Now.ToUniversalTime() - $at
+            if ($age -lt $StaleHumanThreshold) { continue }
+            $ageText = Format-DurationDigest -Span $age
+            $ageSeconds = [int64]$age.TotalSeconds
+        }
+        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+        $tag = ''
+        if ($lane -eq 'operator_work') {
+            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            $tag = "   — [operator 作業] $task"
+        }
+        elseif ($lane -eq 'misroute') {
+            $tag = "   — [宛先誤り・再ルーティング待ち]"
+        }
+        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
+            $tag = "   — [protocol 違反: Tier-C を operator に渡そうとした]"
+        }
+        $staleHumanList += [PSCustomObject]@{ Line = "  $($p.key)   [$($p.head_msg_id)]   $ageText$tag"; AgeSeconds = $ageSeconds }
+    }
+    # Oldest first. Ties are broken by the row text so the order is identical across ticks for the
+    # same input.
+    $staleHumanList = @($staleHumanList | Sort-Object -Property @{ Expression = 'AgeSeconds'; Descending = $true }, @{ Expression = 'Line'; Descending = $false })
+
     # ---- the fixed text of every later section, named once and emitted from the same variable ---
     # These are the lines the renderer WILL emit whatever the budget does, so their cost is known
     # exactly. Emitting them from the same variables the ladder measures is what makes the reserve
@@ -2321,6 +2379,11 @@ function New-DailyDigest {
         $fetchErrHeadLines = @("  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）")
     }
 
+    # Emitted at 0 件 too, like 飢餓 below (msg-5889 D-1). The header deliberately does not START with
+    # "NEXT:": a line that does reads as a handoff to anything running the NEXT: grammar over text.
+    $staleHumanHeadLines = @("", "停止中（末尾 NEXT: human のまま $([int]$StaleHumanThreshold.TotalHours)h 以上、古い順）: $($staleHumanList.Count) 件")
+    if ($staleHumanList.Count -eq 0) { $staleHumanHeadLines += "  (該当なし)" }
+
     $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
     if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
 
@@ -2343,8 +2406,10 @@ function New-DailyDigest {
     $reserveAfterLaunchWait = _LinesCost $footerLines
     $reserveAfterStarved  = (_LinesCost $launchWaitHeadLines) +
                             (_SectionFloorCost -Entries $launchWaitList -Indent '  ') + $reserveAfterLaunchWait
-    $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
+    $reserveAfterStaleHuman = (_LinesCost $starvedHeadLines) +
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
+    $reserveAfterFetchErr = (_LinesCost $staleHumanHeadLines) +
+                            (_SectionFloorCost -Entries $staleHumanList -Indent '  ') + $reserveAfterStaleHuman
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
     $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
@@ -2425,6 +2490,15 @@ function New-DailyDigest {
         $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '    '
+    }
+
+    # 停止中 (msg-5889 D-1). Rows were built above; same floor discipline as every other section.
+    $lines += $staleHumanHeadLines
+    if ($staleHumanList.Count -gt 0) {
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $staleHumanList -MaxLen $Budget -Reserve $reserveAfterStaleHuman -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
     $lines += $starvedHeadLines
@@ -3751,6 +3825,11 @@ function Invoke-ParkedHumansProbe {
             lane               = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
             operator_task      = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
             protocol_violation = ($p.PSObject.Properties.Name -contains 'protocol_violation') -and [bool]$p.protocol_violation
+            # msg-5889 D-1: when the thread's last message was posted (ISO-8601 UTC), or $null when
+            # parked_humans.py could not read it (that case also carries an errors[] row). Always
+            # present on probe output, so New-DailyDigest's 停止中 section considers every row; the
+            # renderer turns it into an age fresh each tick and nothing persists it.
+            last_msg_at        = if ($p.PSObject.Properties.Name -contains 'last_msg_at') { $p.last_msg_at } else { $null }
         }
     }
     $errorsOut = @()
@@ -5074,7 +5153,8 @@ try {
                 -Budget $DigestBudget `
                 -HealthWarning $healthWarning `
                 -RetryState $retryState `
-                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold
+                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
+                -StaleHumanThreshold $StaleHumanThreshold
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
