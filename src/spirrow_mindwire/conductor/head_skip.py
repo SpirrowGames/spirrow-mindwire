@@ -175,6 +175,19 @@ def _is_parked_operator(head_body: str) -> bool:
     return resolve_handoff(head_body, {}).human_ask is HumanAsk.OPERATOR_WORK
 
 
+def stage1_skips(head_body: str) -> bool:
+    """Does Stage 1 of :func:`decide` SKIP this head body? The single owner of that boundary.
+
+    T-role-body-field-divergence-relaunch D1 (Bohr msg-5855/5859, approved by Einstein msg-5858):
+    the conductor needs the same answer to decide whether a stop it made from the structured
+    ``next_participant`` field is invisible to the sweep (the sweep reads only the body). Both
+    callers ask this one function, so the boundary cannot drift between them. It reads nothing but
+    the body — no record, no clock, no status — exactly like Stage 1 itself.
+    """
+    token = parse_head_token(head_body)
+    return token in STOP_TOKENS and (token != OPERATOR_TOKEN or _is_parked_operator(head_body))
+
+
 # Conductor stop reasons that TERMINATE a thread until its head moves (design §6.2).
 #
 # These are not stop *tokens* — the head still says ``NEXT: Bohr``, which is exactly the problem.
@@ -444,7 +457,7 @@ def decide(
     # so the closed-set invariant is visible: this is the ONLY place the head-skip cache can
     # return SKIP, and expanding it requires editing STOP_TOKENS. Any downstream code that
     # short-circuits SKIP on other conditions is a bug (see test #13).
-    if token in STOP_TOKENS and (token != OPERATOR_TOKEN or _is_parked_operator(head_body)):
+    if stage1_skips(head_body):
         return Verdict(
             decision=Decision.SKIP,
             reason="stop-token",
@@ -956,5 +969,6 @@ __all__ = [
     "parse_head_token",
     "record_from_json",
     "record_to_json",
+    "stage1_skips",
     "verdict_to_json",
 ]
