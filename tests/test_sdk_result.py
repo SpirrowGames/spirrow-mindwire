@@ -1770,3 +1770,114 @@ def test_capture_list_is_derived_from_reason_priority_and_classification() -> No
         "result",
     )
     assert len(set(known)) == len(known)
+
+
+# --------------------------------------------------------------------------- #
+# S-10 (thread msg-5380 / msg-5714): a reason field whose emptiness test raises
+# costs only its own judgement — never the readable reason behind it, never the
+# whole detail, and never a false "no field carried a reason".
+# --------------------------------------------------------------------------- #
+
+
+class _HostileLenList(list):  # type: ignore[type-arg]
+    """``errors`` value whose ``__len__`` / ``__bool__`` raise."""
+
+    def __len__(self) -> int:
+        raise RuntimeError("hostile __len__")
+
+    def __bool__(self) -> bool:
+        raise RuntimeError("hostile __bool__")
+
+
+class _HostileStr(str):
+    """``result`` value whose ``__len__`` / ``__bool__`` raise."""
+
+    __slots__ = ()
+
+    def __len__(self) -> int:
+        raise RuntimeError("hostile __len__")
+
+    def __bool__(self) -> bool:
+        raise RuntimeError("hostile __bool__")
+
+
+def test_s10_unjudgeable_errors_does_not_hide_readable_api_status() -> None:
+    """S-10-3 case 1: a broken ``errors`` is skipped; ``403`` behind it is the reason.
+    Fails under the "treat raise as non-empty" alternative."""
+    detail = capture_is_error_detail(
+        _line_2062(errors=_HostileLenList(["boom"]), api_error_status=403, permission_denials=[])
+    )
+    assert detail["reason_source"] == "field:api_error_status"
+    assert detail["message"] == "SDK is_error[error_during_execution]; api_error_status=403"
+    assert "<unjudgeable>" not in detail["message"]
+
+
+def test_s10_only_unjudgeable_errors_is_marked_not_absent_nor_capture_failed() -> None:
+    """S-10-3 case 2: with nothing readable, the broken field is picked with the
+    marker. Fails under the "treat raise as empty" alternative (→ subtype_only)."""
+    detail = capture_is_error_detail(
+        _line_2062(errors=_HostileLenList(["boom"]), permission_denials=[], result=None)
+    )
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"].startswith(
+        "SDK is_error[error_during_execution]; errors=<unjudgeable> "
+    )
+    assert "capture_error" not in detail
+    assert "absent_dump" not in detail
+    # The rest of the record is intact.
+    assert detail["captured_fields"]["session_id"] == "855fc345-73ca-4388-aa28-6060ad64a70d"
+
+
+def test_s10_only_unjudgeable_errors_without_subtype_is_not_absent() -> None:
+    detail = capture_is_error_detail(_FakeResultMessage(errors=_HostileLenList(["boom"])))
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"].startswith("SDK is_error; errors=<unjudgeable> ")
+    assert "absent_dump" not in detail
+
+
+def test_s10_hostile_str_result_leaves_step_1_safely() -> None:
+    """S-10-3 case 3: a str-subclass ``result`` whose truthiness raises skips the
+    fast path; a readable ``errors`` is the reason."""
+    detail = capture_is_error_detail(
+        _line_2062(result=_HostileStr("x"), errors=["boom"], permission_denials=[])
+    )
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"] == "SDK is_error[error_during_execution]; errors=['boom']"
+
+
+def test_s10_hostile_str_result_alone_is_marked_unjudgeable() -> None:
+    """``result`` is the loop's last candidate; with nothing else it is the
+    unjudgeable fallback, not a separate code path."""
+    detail = capture_is_error_detail(
+        _line_2062(result=_HostileStr("x"), errors=None, permission_denials=[])
+    )
+    assert detail["reason_source"] == "field:result"
+    assert "result=<unjudgeable> " in detail["message"]
+
+
+def test_s10_first_unjudgeable_field_wins_the_fallback() -> None:
+    detail = capture_is_error_detail(
+        _line_2062(
+            errors=_HostileLenList(["a"]),
+            permission_denials=_HostileLenList(["b"]),
+            result=None,
+        )
+    )
+    assert detail["reason_source"] == "field:errors"
+
+
+def test_s10_result_path_line_5517_is_unchanged() -> None:
+    """S-10-3 case 4: the ordinary ``result`` path keeps ``reason_source="result"``."""
+    test_s9_line_5517_result_path_is_unchanged()
+
+
+def test_s10_unjudgeable_message_still_matches_stall_ledger_signature() -> None:
+    """Out-of-scope check (msg-5380 §4): the prefix shape is unchanged, so the
+    stall-ledger's ``sdk-error-during-execution`` signature still matches."""
+    from spirrow_mindwire.stall_ledger.failure_class import classify_failure
+
+    detail = capture_is_error_detail(
+        _line_2062(errors=_HostileLenList(["boom"]), permission_denials=[], result=None)
+    )
+    line = f"ClaudeCodeSdkDeliveryError: {detail['message']}"
+    assert classify_failure(line) == "sdk-error-during-execution"
