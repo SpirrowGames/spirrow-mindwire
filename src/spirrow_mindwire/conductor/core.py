@@ -71,10 +71,12 @@ structurally out of the loop.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
@@ -96,6 +98,13 @@ from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import AdmissionVerdict
+from ..tier_c_decisions_log import (
+    DECISION_LOG_AUTHOR_ROLES,
+    append_log_entries,
+    decision_log_entries,
+    has_decision_entries,
+    scan_decision_lines,
+)
 from ..value_objects import (
     ChatroomEvent,
     Event,
@@ -421,6 +430,7 @@ class Conductor:
         launch_head_msg_id: str | None = None,
         tierc_gate: TierCGate | None = None,
         retry_of: RetryOf | None = None,
+        decisions_log_path: Path | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -479,6 +489,15 @@ class Conductor:
         # gate bounces goes back to its author (``_enforce_tierc_gate``) — the one sanctioned
         # exception to D20 monotonicity, bounded by RETRY / fail-open (see :mod:`.tierc_gate`).
         self._tierc_gate = tierc_gate
+        # §2.6 decision log extraction (T-tier-c-admission-gate U4a, msg-5655 / msg-5657). ``None``
+        # = no extraction (a bare Conductor, e.g. in unit tests). Independent of ``tierc_gate`` on
+        # purpose: the log records what the proposer / implementer chose, which is a different
+        # fact from the gate's admit / bounce decisions, so it runs with the gate off as well.
+        self._decisions_log_path = decisions_log_path
+        # Decision lines that were seen but not logged, by cause (``malformed`` /
+        # ``unattributed_author``). Counted, and each one logged at WARNING, so nothing is dropped
+        # silently (msg-5655 / msg-5657). Read through :attr:`decision_log_counts`.
+        self._decision_log_counts: Counter[str] = Counter()
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
@@ -564,6 +583,9 @@ class Conductor:
                 return self._stop(
                     round_index, StopReason.NO_PROGRESS, latest_msg_id, forced, forced_saveable
                 )
+            # §2.6 decision log (U4a): record the head's ``DECIDED:`` / ``DEFERRED:`` lines before
+            # anything routes on it. Observation only — never changes the routing below.
+            self._record_decision_lines(latest)
 
             handoff = resolve_handoff(
                 _content(latest),
@@ -1091,6 +1113,93 @@ class Conductor:
             )
             return None
         return posted
+
+    @property
+    def decision_log_counts(self) -> Mapping[str, int]:
+        """Decision lines seen this run but not logged, by cause (``malformed`` /
+        ``unattributed_author``). A read-only copy."""
+        return dict(self._decision_log_counts)
+
+    def _record_decision_lines(self, latest: dict[str, Any]) -> None:
+        """Append ``latest``'s ``DECIDED:`` / ``DEFERRED:`` lines to the decisions log (U4a).
+
+        Grammar and allowlist come from :mod:`..tier_c_decisions_log` (msg-5657), the same
+        definitions the U4b acceptance scan imports. The author's role is resolved through the
+        roster:
+
+        * an author with no roster role (``pr-gate-relay``, ``conductor-relay``, operator, the
+          human) is never parsed. If its message has line-start decision lines, it counts once under
+          ``unattributed_author``, so a decision line that could not be attributed stays visible;
+        * a role outside :data:`DECISION_LOG_AUTHOR_ROLES` (the naysayer, who quotes other authors)
+          is skipped without a count;
+        * malformed lines from an allowed role are counted under ``malformed`` and not written.
+
+        Idempotent per ``(thread, msg_id)``: a head seen again by a later run is not written twice.
+        A failure to read or write the log is logged at WARNING and does not stop the turn. The
+        audit log is an observer of routing, never a gate on it.
+        """
+        log_path = self._decisions_log_path
+        if log_path is None:
+            return
+        msg_id = _msg_id(latest)
+        author = _author(latest)
+        scan = scan_decision_lines(_content(latest))
+        if scan.empty:
+            return
+        role = self._roster_role(author)
+        if role is None:
+            self._decision_log_counts["unattributed_author"] += 1
+            logger.warning(
+                "decision log: msg=%s author=%r has no roster role; %d decision line(s) not logged "
+                "(unattributed_author)",
+                msg_id,
+                author,
+                len(scan.lines) + len(scan.malformed),
+            )
+            return
+        if role not in DECISION_LOG_AUTHOR_ROLES:
+            logger.info(
+                "decision log: msg=%s author=%s role=%s is not a decision-log author; skipped",
+                msg_id,
+                author,
+                role.value,
+            )
+            return
+        if scan.malformed:
+            self._decision_log_counts["malformed"] += len(scan.malformed)
+            for raw in scan.malformed:
+                logger.warning(
+                    "decision log: msg=%s author=%s malformed decision line skipped "
+                    "(needs '<what> — <reason>'): %r",
+                    msg_id,
+                    author,
+                    raw,
+                )
+        if not scan.lines:
+            return
+        thread = self._thread_ref.thread_id
+        try:
+            if has_decision_entries(log_path, thread=thread, msg_id=msg_id):
+                return
+            entries = decision_log_entries(
+                scan, author=author, author_role=role, now=datetime.now(UTC)
+            )
+            append_log_entries(log_path, entries, thread=thread, msg_id=msg_id)
+        except Exception:
+            logger.warning(
+                "decision log: writing %d entr(ies) for msg=%s failed",
+                len(scan.lines),
+                msg_id,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "decision log: msg=%s author=%s role=%s wrote %d entr(ies)",
+            msg_id,
+            author,
+            role.value,
+            len(entries),
+        )
 
     def _roster_entry(self, author: str) -> tuple[str, Role]:
         """``(roster identity, role)`` for a roster author, matched case-insensitively like

@@ -101,10 +101,13 @@ class LogKind(StrEnum):
     append-only file with a ``kind`` field is one physical source of
     truth).
 
-    * ``DECIDED`` — implementer chose to fix an advisory in the same PR
-      (source: workspace LLM via conductor extraction).
-    * ``DEFERRED`` — implementer chose to skip an advisory (source:
-      workspace LLM via conductor extraction).
+    * ``DECIDED`` — a proposer or implementer recorded a discretionary
+      decision, such as fixing an advisory in the same PR or choosing an
+      approach (source: workspace LLM via conductor extraction; the
+      ``author_role`` field tells them apart, msg-5657).
+    * ``DEFERRED`` — a proposer or implementer chose to skip something,
+      typically an advisory (source: workspace LLM via conductor
+      extraction).
     * ``BOUNCED`` — admission gate rejected a handoff (source: infra;
       this module's :func:`decide_admission`).
     * ``LABEL_MIGRATION`` — legacy label auto-rewritten to the new enum
