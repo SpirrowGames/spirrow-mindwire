@@ -131,20 +131,48 @@ def pr_facts_of(state: PrState) -> PrFacts | None:
     )
 
 
-async def list_open_threads(mcp: McpToolCaller, project: str, limit: int = 1000) -> list[str]:
-    """Every not-finished thread of ``project`` (one listing call, as ``thread_heads`` does)."""
-    payload: Any = await mcp.call_tool(
-        "chatroom_list_threads",
-        {"project": project, "status_filter": list(OPEN_STATUSES), "limit": limit},
-    )
-    items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        raise MagickitMcpError(f"chatroom_list_threads returned no item list: {payload!r}")
-    return [
-        item["thread_id"]
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
-    ]
+_THREAD_PAGE = 200
+
+
+async def list_open_threads(
+    mcp: McpToolCaller, project: str, page_size: int = _THREAD_PAGE
+) -> list[str]:
+    """Every not-finished thread of ``project``, paged so no listing cap truncates it.
+
+    Pages by ``offset`` (the stall ledger's pattern) until the listing reports it has
+    returned ``total`` rows, or — when no ``total`` is given — until a short page. A page
+    that adds no new thread id stops the walk, so a server that ignores ``offset`` cannot
+    loop it (PR #424 gate round 2 advisory: a single 1000-row call silently dropped the rest).
+    """
+    seen: dict[str, None] = {}
+    offset = 0
+    while True:
+        payload: Any = await mcp.call_tool(
+            "chatroom_list_threads",
+            {
+                "project": project,
+                "status_filter": list(OPEN_STATUSES),
+                "limit": page_size,
+                "offset": offset,
+            },
+        )
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise MagickitMcpError(f"chatroom_list_threads returned no item list: {payload!r}")
+        before = len(seen)
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("thread_id"), str):
+                seen.setdefault(item["thread_id"], None)
+        offset += len(items)
+        total = payload.get("total")
+        if not items or len(seen) == before:
+            break
+        if isinstance(total, int):
+            if offset >= total:
+                break
+        elif len(items) < page_size:
+            break
+    return list(seen)
 
 
 async def _read_tail(mcp: McpToolCaller, project: str, thread_id: str) -> dict[str, Any] | None:

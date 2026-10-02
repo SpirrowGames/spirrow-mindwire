@@ -52,6 +52,7 @@ from spirrow_mindwire.pr_event_advance import (
 from spirrow_mindwire.pr_event_advance.runner import (
     TOOLS_USED,
     advance_thread,
+    list_open_threads,
     pr_facts_of,
     run_tick,
 )
@@ -402,7 +403,10 @@ class _FakeChatroom:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append(name)
         if name == "chatroom_list_threads":
-            return {"items": [{"thread_id": t} for t in self.threads]}
+            ids = list(self.threads)
+            start = int(arguments.get("offset", 0))
+            page = ids[start : start + int(arguments["limit"])]
+            return {"items": [{"thread_id": t} for t in page], "total": len(ids)}
         tid = arguments["thread_id"]
         if name == "chatroom_get_thread":
             if tid in self.unreadable:
@@ -643,3 +647,42 @@ def test_r10_the_package_does_not_name_the_close_api() -> None:
                 names = {a.name for a in node.names}
                 assert not any("close_thread" in n or n == "close_alert" for n in names), names
                 assert "gate_bootstrap" not in (node.module or ""), path.name
+
+
+# --------------------------------------------------------------------------- G2: listing paging
+
+
+class _ListingOnly:
+    """``chatroom_list_threads`` only, with knobs for total / offset handling."""
+
+    def __init__(self, n: int, *, with_total: bool, honours_offset: bool = True) -> None:
+        self.ids = [f"T-{i}" for i in range(n)]
+        self.with_total = with_total
+        self.honours_offset = honours_offset
+        self.calls = 0
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        assert name == "chatroom_list_threads"
+        self.calls += 1
+        start = int(arguments["offset"]) if self.honours_offset else 0
+        page = self.ids[start : start + int(arguments["limit"])]
+        out: dict[str, Any] = {"items": [{"thread_id": t} for t in page]}
+        if self.with_total:
+            out["total"] = len(self.ids)
+        return out
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("with_total", [True, False])
+async def test_g2_listing_pages_past_any_single_call_cap(with_total: bool) -> None:
+    mcp = _ListingOnly(1205, with_total=with_total)
+    got = await list_open_threads(mcp, "p", page_size=200)
+    assert got == mcp.ids  # nothing beyond the first page is dropped, order kept
+
+
+@pytest.mark.anyio
+async def test_g2_listing_stops_when_server_ignores_offset() -> None:
+    mcp = _ListingOnly(450, with_total=True, honours_offset=False)
+    got = await list_open_threads(mcp, "p", page_size=200)
+    assert got == mcp.ids[:200]
+    assert mcp.calls == 2  # second page adds nothing new → stop, no loop
