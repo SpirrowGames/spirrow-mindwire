@@ -66,14 +66,14 @@ from spirrow_mindwire.stall_ledger.predicates import (
     needs_actor_quarantine,
     needs_actor_thread,
 )
+from spirrow_mindwire.stall_ledger.timing import FETCH_TIMEOUT
 
 #: The format version every adapter in this module parses. One string, compared by
 #: :meth:`SourceReport.is_failure` against the driver's expected version.
 ADAPTER_FORMAT_VERSION = "stall-ledger-adapter/1"
 
-#: Default per-fetch timeout (msg-4701 §3). Provisional: D-16c fixes the real value
-#: together with the heartbeat interval.
-DEFAULT_FETCH_TIMEOUT = timedelta(seconds=30)
+#: Default per-fetch timeout (msg-4701 §3). Set by D-16c in :mod:`.timing`.
+DEFAULT_FETCH_TIMEOUT = FETCH_TIMEOUT
 
 
 # ─── Motion events ─────────────────────────────────────────────────────────────────────

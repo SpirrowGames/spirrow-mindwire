@@ -641,6 +641,48 @@ shapes as `verdict='unreadable'` fail-closed, not as valid-with-no-holder, so th
 rather than granting — but repairing then requires following the same Recovery path. Follow §
 Migration boundary Recovery in either case.
 
+## Stall ledger tick (D-16c)
+
+The stall ledger (`src/spirrow_mindwire/stall_ledger/`, T-stalled-pr-has-no-detector) runs as its
+**own** Task Scheduler task, separate from the conductor sweep. Each run is one heartbeat: it
+evaluates open PRs, chatroom threads and `quarantine.json`, updates
+`<data_dir>/state/stall-ledger.json`, and appends JSON lines to
+`<data_dir>/logs/stall-ledger-YYYY-MM-DD.jsonl` (stderr goes to `…-YYYY-MM-DD.err.log`).
+It is **log-only**: it sends no Discord message and posts nothing anywhere. Alerts come with D-16d.
+
+Timing (`src/spirrow_mindwire/stall_ledger/timing.py`; a test fails if these stop holding):
+
+| Value | Setting | Why |
+|---|---|---|
+| `HEARTBEAT_INTERVAL` = 15 min | task `RepetitionInterval` | one tick per interval |
+| `T_TICK_MAX` = 10 min | `--t-tick-max-seconds` default | a tick past this saves nothing |
+| `T_LOCK_STALE` = 14 min | task `ExecutionTimeLimit` | the scheduler kills a hung tick, and the OS frees its lock, before the next tick fires |
+| `FETCH_TIMEOUT` = 30 s | `--fetch-timeout-seconds` default | per request |
+| `FETCH_MARGIN` = 2 min | — | body fetches stop starting so the tick can still save |
+
+Register it once, on the loop host, from the daemon checkout. This is an operator step: nothing in
+the loop registers it.
+
+```pwsh
+cd C:\Users\tomtar\spirrow-mindwire-daemon
+# check what will be registered
+pwsh -NoProfile -File deploy\Register-StallLedgerTask.ps1 -Checkout (Get-Location) `
+    -Repo SpirrowGames/spirrow-mindwire -Project spirrow-mindwire -DryRun
+# register
+pwsh -NoProfile -File deploy\Register-StallLedgerTask.ps1 -Checkout (Get-Location) `
+    -Repo SpirrowGames/spirrow-mindwire -Project spirrow-mindwire
+```
+
+Run it as the same user as the sweep task, so the tick sees the same GitHub token and data dir.
+`-Repo` / `-Project` repeat as comma lists. Check that it is working: after one interval, the
+newest line of the day's `stall-ledger-*.jsonl` is a `heartbeat`. In that line,
+`budget_exhausted: true` together with a `pending_markers` count that keeps growing means body
+fetches are falling behind (see `deferred_fetches`).
+
+To stop it, disable the `mindwire-stall-ledger` task. The store survives a stop; quarantined
+ledger records are listed and cleared with `scripts/stall_ledger_tick.py --list-quarantined` /
+`--clear-quarantined`.
+
 ## Quarantine and daily digest
 
 **Why it exists.** The prior wrapper broke the sweep on any non-zero exit. That fail-safe stopped a
