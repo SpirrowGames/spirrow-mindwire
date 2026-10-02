@@ -15,7 +15,8 @@ the index lock ``git status`` would otherwise grab to refresh the stat cache (de
 (Einstein msg-5774 #3). A clone is accepted only when all of these hold:
 
 * no git operation is part-way through (``MERGE_HEAD`` / ``rebase-merge`` / ``rebase-apply`` /
-  ``CHERRY_PICK_HEAD`` / ``REVERT_HEAD``) → else ``op_in_progress``;
+  ``CHERRY_PICK_HEAD`` / ``REVERT_HEAD`` / ``BISECT_START`` / ``BISECT_HEAD``)
+  → else ``op_in_progress``;
 * ``index.lock`` is absent, or goes away within :data:`LOCK_WAIT_S` (polled every
   :data:`LOCK_POLL_S`) → else ``clone_busy``;
 * ``git status --porcelain=v1 -z --untracked-files=normal`` prints nothing → else ``dirty_tree``
@@ -66,6 +67,11 @@ OP_IN_PROGRESS_MARKERS: tuple[str, ...] = (
     "rebase-apply",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    # ``git bisect start`` writes BISECT_START (BISECT_HEAD too under --no-checkout). A bisect
+    # left running by a human on the shared clone can sit on a clean tree at the default branch,
+    # so nothing else would catch it (PR #432 gate advisory).
+    "BISECT_START",
+    "BISECT_HEAD",
 )
 
 

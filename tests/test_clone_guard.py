@@ -143,6 +143,16 @@ def test_operation_in_progress_is_refused(repo: Path, marker: str) -> None:
     assert marker in ei.value.detail
 
 
+def test_real_bisect_on_clean_default_branch_is_refused(repo: Path) -> None:
+    # `git bisect start` with no revisions checks nothing out: HEAD stays on the default branch
+    # and the tree stays clean, so only the BISECT_START marker reveals the half-done operation.
+    _git(repo, "bisect", "start")
+    with pytest.raises(DirtyCloneError) as ei:
+        CloneGuard(repo).check()
+    assert ei.value.reason == DirtyCloneReason.OP_IN_PROGRESS
+    assert "BISECT_START" in ei.value.detail
+
+
 def test_detached_head_is_wrong_head(repo: Path) -> None:
     _git(repo, "switch", "-q", "--detach")
     assert _reason(repo) == DirtyCloneReason.WRONG_HEAD
