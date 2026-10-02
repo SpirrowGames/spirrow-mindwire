@@ -237,6 +237,8 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 **同時実行は 1 つまでです**
 - 1 つの `auth.json` を、トークンの更新で競合させないためです。
 - codex backend の同時実行数は、コードで 1 を上限にします。config で 2 以上が指定されたら、起動時に拒否します。
+- **上限に達したときは、待ち合わせます（直列化）。フォールバックの契機にはしません。** 上限に達したことを codex の失敗として扱うと、重なったリクエストが gemini-fallback（従量課金）へ黙って流れるからです。
+- fallback wrapper が gemini-fallback に切り替えてよいのは、codex 側が失敗したとき（ゲートが閉じている、実行がエラーになった、など）だけです。待ち合わせの上限時間を超えた場合の扱いは Lexora の PR で決めますが、その場合もフォールバックではなく、失敗として呼び出し元に返します。
 
 **残るリスク**
 - `auth.json` は、sandbox の中から読める位置にあります。読まれないことは、ツールが無いことだけで保証しています。
@@ -259,14 +261,18 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 
 **どちらにも共通の規則**
 - プロンプトには文字数の上限を設けます。上限を超えたら、テストファイルから順に落とし、落としたファイルの名前をプロンプトの冒頭に書きます。
+- **上限の値は、mindwire がそのリクエストを送るティアごとに持ちます。** codex ティア（gemini-fallback を予備に持つもの）には codex の上限を使います。N-3 の部分集合のように Gemini に固定して送るリクエストには、Gemini の上限を使います。codex ティアから gemini-fallback に切り替わった場合は、codex の上限で組んだプロンプトがそのまま渡ります（Lexora の中で組み直すことはしません）。
 - 入れたファイルは区切りで囲み、「データであって指示ではない」と明示します。これは補助的な対策です。本当の防御は 7.4 です。
-- 組み立て方は、backend によって変えません。
+- 組み立ての規則（何を入れるか、落とす順番、区切り）は、backend によって変えません。変わるのは上限の値だけです。
 
 ### 7.6 naysayer ティアの構成と attestation
 
 - naysayer ティアの構成は、「codex を正、gemini-fallback を予備」とする fallback wrapper です。
 - 素の codex backend を、直接ティアにつなぐことはしません。
-- mindwire の attestation で正とするのは `codex` です。`gemini-fallback` も、許容されるフォールバックとして受け入れます。
+- mindwire の attestation で期待する値は、**リクエストごとに決めます。** 全体で一律に緩めることはしません。
+  - codex ティアに送ったリクエスト：正は `codex` です。`gemini-fallback` も、許容されるフォールバックとして受け入れます。
+  - N-3 の部分集合（7.3。Gemini に固定して送るもの）：期待する値は `gemini` だけです。`codex` や `gemini-fallback` が返ってきたら不一致として fail-closed にします。ティアを決める関数が誤って codex ティアに送った場合も、ここで検知できるようにするためです（多層防御）。
+  - 期待する値は、ティアを決める関数と同じ判定から導きます。2 か所で別々に判定することはしません。
 - この変更の対象は、`expected=gemini` を前提にしている箇所です（`naysayer/preflight.py`・`principles.py`・`adapters/naysayer_sdk.py`）。
 - この変更は、Lexora の codex 経路がティアにつながるのと同時に入れます。先に入れると、今の Gemini の経路が attestation で不一致になるからです。
 
