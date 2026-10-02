@@ -83,6 +83,7 @@ $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } 
 $hardBudget = Get-ConductorHardBudgetSeconds -ConfigPath (Join-Path $dataDir "config/mindwire.toml")
 $run = Invoke-ConductorBounded -FilePath 'uv' `
     -Arguments (@('run', 'mindwire-loop', '--mode', 'conductor') + @($args)) `
-    -HardBudgetSeconds $hardBudget -WorkingDirectory $repoRoot
+    -HardBudgetSeconds $hardBudget -WorkingDirectory $repoRoot `
+    -TempDirectory (Join-Path $dataDir "tmp/conductor")
 foreach ($line in $run.lines) { Write-Output $line }
 exit $run.code

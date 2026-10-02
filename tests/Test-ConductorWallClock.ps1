@@ -4,6 +4,10 @@
 #
 #   B  — Get-ConductorHardBudgetSeconds: env first, then [conductor].run_hard_budget_s, then the
 #        default; a value that is not a positive number throws, and so does a duplicate key.
+#   P  — ps output parsing: header skipped; a one-column output is empty (cannot confirm); the
+#        ps call uses one keyword per -o, which BSD (macOS) ps accepts.
+#   S  — the output files' directory is private (0700 off Windows) and must be named by the
+#        caller; there is no system-temp default.
 #   N  — Invoke-ConductorBounded, normal exit: > 64 KB of output does not block the child (files,
 #        not pipes); every line comes back, stderr then stdout; the exit code passes through;
 #        an argument with a space arrives as one argument; the temp files are gone.
@@ -12,7 +16,8 @@
 #   U  — a kill that cannot be confirmed: exit 7 and the run_kill_unconfirmed line.
 #   W  — structure: run-conductor.ps1 no longer calls uv directly and exits with the bounded
 #        run's code; it reads the hard budget from config/mindwire.toml with a '/' path; the
-#        sweep's dispatch loop stops on exit 7 with a break.
+#        sweep's dispatch loop stops on exit 7 with a break; the output files go under the data
+#        dir.
 #
 # The Python soft budget and the literals shared between the languages are in
 # tests/test_run_budget.py.
@@ -74,6 +79,33 @@ try {
     $threw = $false
     try { Get-ConductorHardBudgetSeconds -ConfigPath $dup -EnvValue '' | Out-Null } catch { $threw = $true }
     Check 'B6 a duplicate [conductor] key throws, as tomllib does' $true $threw
+
+    # ---------------------------------------------------------------- P
+    # ps output parsing (PR #407 gate @ 42a6b24): the header is skipped, and a one-column output
+    # (BSD ps rejecting a keyword list) yields an empty table, never a partial one.
+    $parsed = ConvertFrom-PsPidPpidRows -Rows @('  PID  PPID', '    1     0', '  420     1', '', ' 421   420')
+    Check 'P1 header skipped, three rows parsed' 3 $parsed.Count
+    Check 'P2 ppid of 421 is 420' 420 $parsed[421]
+    Check 'P3 one-column output parses to an empty table' 0 (ConvertFrom-PsPidPpidRows -Rows @('  PID', '    1', '  420')).Count
+    $libAst = [System.Management.Automation.Language.Parser]::ParseFile($lib, [ref]$null, [ref]$null)
+    $psCalls = @($libAst.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'ps' }, $true))
+    Check 'P4 the lib calls ps once' 1 $psCalls.Count
+    if ($psCalls.Count -eq 1) {
+        Check 'P5 ps uses one keyword per -o (BSD-compatible)' $true $psCalls[0].Extent.Text.StartsWith('& ps -A -o pid -o ppid')
+    }
+
+    # ---------------------------------------------------------------- S
+    # The output files live in a private directory, never the shared temp dir (PR #407 gate,
+    # REQUEST_CHANGES @ 42a6b24).
+    $private = Join-Path $scratch 'private/conductor'
+    Initialize-ConductorPrivateDirectory -Path $private
+    Check 'S1 the private directory is created' $true (Test-Path -LiteralPath $private -PathType Container)
+    if (-not $IsWindows) {
+        Check 'S2 the private directory is 0700' 'UserRead, UserWrite, UserExecute' ([System.IO.File]::GetUnixFileMode($private)).ToString()
+    }
+    $tempParam = (Get-Command Invoke-ConductorBounded).Parameters['TempDirectory']
+    Check 'S3 -TempDirectory is mandatory (no system-temp default)' $true (@($tempParam.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory }).Count -ge 1)
 
     # ---------------------------------------------------------------- N
     $chatty = Write-ChildScript 'chatty.ps1' @'
@@ -151,6 +183,10 @@ Start-Sleep -Seconds 120
     if ($budgetCall.Count -eq 1) {
         $t = $budgetCall[0].Extent.Text
         Check 'W9 the hard-budget config path is config/mindwire.toml (no backslash)' $true ($t.Contains('"config/mindwire.toml"') -and -not $t.Contains('\'))
+    }
+    $bounded = @($cmds | Where-Object { $_.GetCommandName() -eq 'Invoke-ConductorBounded' })
+    if ($bounded.Count -eq 1) {
+        Check 'W10 the output files go under the data dir (tmp/conductor), not system temp' $true $bounded[0].Extent.Text.Contains('-TempDirectory (Join-Path $dataDir "tmp/conductor")')
     }
 
     $sweep = Join-Path $repoRoot 'deploy/run-conductor-scheduled.ps1'

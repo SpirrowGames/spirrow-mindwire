@@ -28,6 +28,8 @@
 #     `conductor.run_killed budget_s=<n> pid=<root>` and return exit 6. If any of them is still
 #     alive after the grace period, or the tree could not be listed, return exit 7 (fail-closed:
 #     an orphan may still be running, and the sweep stops the rest of its tick).
+#   * The two files are created in a caller-named directory that is made private to the current
+#     user (0700 on Linux/macOS), never in the shared system temp dir.
 #   * The temp files are removed in `finally`; a failure to remove them is a warning, never a
 #     change to the result.
 
@@ -81,6 +83,39 @@ function Get-ConductorHardBudgetSeconds {
     return $value
 }
 
+# Parse `ps -o pid -o ppid` output into @{ pid = ppid }. Lines whose first two fields are not both
+# integers (the header, blank lines) are skipped. A one-column output yields an empty table, which
+# the caller treats as "cannot confirm".
+function ConvertFrom-PsPidPpidRows {
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Rows)
+    $parentOf = @{}
+    foreach ($r in @($Rows)) {
+        $f = @("$r".Trim() -split '\s+')
+        if ($f.Count -lt 2) { continue }
+        $id = 0; $parent = 0
+        if ([int]::TryParse($f[0], [ref]$id) -and [int]::TryParse($f[1], [ref]$parent)) {
+            $parentOf[$id] = $parent
+        }
+    }
+    return $parentOf
+}
+
+# Create $Path if needed and make it private to the current user. The conductor's stdout/stderr
+# files hold the whole thread context, prompts and source, so they must not land where other users
+# can read them (PR #407 gate, REQUEST_CHANGES @ 42a6b24). On Linux/macOS the directory is set to
+# 0700, so the files in it are unreachable to other users whatever the umask. On Windows the
+# directory sits under the data dir and inherits its ACL. A failure to restrict it throws: the run
+# does not start with its output exposed.
+function Initialize-ConductorPrivateDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not $IsWindows) {
+        [System.IO.File]::SetUnixFileMode($Path, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
+    }
+}
+
 # Every process in the tree rooted at $RootId, as @{ id; start } (start = StartTime ticks, or $null
 # when the OS will not say). Returns $null when the process table cannot be read — the caller treats
 # that as "cannot confirm".
@@ -94,15 +129,18 @@ function Get-ProcessTreeSnapshot {
             }
         }
         else {
-            $rows = & ps -A -o 'pid=,ppid=' 2>$null
+            # `-o pid -o ppid` (one keyword per -o) is accepted by both procps (Linux) and BSD ps
+            # (macOS); BSD rejects the combined `pid=,ppid=` form. It prints a header line, which
+            # ConvertFrom-PsPidPpidRows skips.
+            $rows = & ps -A -o pid -o ppid 2>$null
             if ($LASTEXITCODE -ne 0 -or -not $rows) { return $null }
-            foreach ($r in $rows) {
-                $f = "$r".Trim() -split '\s+'
-                if ($f.Count -ge 2) { $parentOf[[int]$f[0]] = [int]$f[1] }
-            }
+            $parentOf = ConvertFrom-PsPidPpidRows -Rows $rows
         }
     }
     catch { return $null }
+    # No parent relation at all means the table was not really read (wrong ps syntax, one column):
+    # say "cannot confirm" rather than return a root-only tree that would miss every descendant.
+    if ($null -eq $parentOf -or $parentOf.Count -eq 0) { return $null }
 
     $ids = [System.Collections.Generic.List[int]]::new()
     $ids.Add($RootId)
@@ -181,9 +219,12 @@ function Invoke-ConductorBounded {
         [string[]]$Arguments = @(),
         [Parameter(Mandatory)][double]$HardBudgetSeconds,
         [string]$WorkingDirectory = (Get-Location).Path,
-        [string]$TempDirectory = [System.IO.Path]::GetTempPath(),
+        # No default: the system temp dir (/tmp on Linux) is shared, and these files carry the
+        # full run output. The caller names a directory under its data dir; it is made private here.
+        [Parameter(Mandatory)][string]$TempDirectory,
         [int]$KillGraceMs = $ConductorKillGraceMs
     )
+    Initialize-ConductorPrivateDirectory -Path $TempDirectory
     $stem = Join-Path $TempDirectory ('mindwire-conductor-' + [guid]::NewGuid().ToString('N'))
     $outFile = "$stem.out"
     $errFile = "$stem.err"
