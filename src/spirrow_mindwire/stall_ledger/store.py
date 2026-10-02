@@ -469,8 +469,10 @@ def read_clear_requests(requests_dir: Path) -> tuple[list[ClearRequest], list[In
             ClearRequest(
                 path=path,
                 unit_key=data["unit_key"],
-                requested_by=str(data.get("requested_by", "")),
-                requested_at=str(data.get("requested_at", "")),
+                # ``or ""``: an explicit JSON ``null`` reads as empty, never as the
+                # string "None" (#362 gate advisory, Bohr msg-5157 §4).
+                requested_by=str(data.get("requested_by") or ""),
+                requested_at=str(data.get("requested_at") or ""),
             )
         )
     return valid, invalid
