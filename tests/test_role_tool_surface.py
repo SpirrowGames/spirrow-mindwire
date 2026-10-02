@@ -15,7 +15,9 @@ stop a session from inheriting anything else from the host. So those three thing
 per role, from the production builders:
 
 (a) the ``tools=`` built-in set holds nothing from the out-of-band communication family;
-(b) ``mcp_servers`` holds only in-process SDK servers (``type: "sdk"``) — today, none at all;
+(b) ``mcp_servers`` holds only in-process SDK servers (``type: "sdk"``) — today, only the
+    implementer's ``mindwire-ledger`` server, whose tools are exactly ``ledger_get_task`` and
+    ``ledger_append_note`` (pinned below by equality, not by a list of excluded names);
 (c) the session carries :func:`session_isolation_kwargs` (``setting_sources=[]`` and
     ``strict_mcp_config=True``), so no host connector, plugin or ``.mcp.json`` can widen (a)/(b).
 
@@ -38,10 +40,12 @@ from typing import Any
 import pytest
 from claude_agent_sdk import create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig
+from mcp.types import ListToolsRequest
 
 from spirrow_mindwire.adapters._session_isolation import session_isolation_kwargs
 from spirrow_mindwire.claude_code.tools.mindwire_server import build_mindwire_mcp_server
-from spirrow_mindwire.loop_runner import build_implementer, build_naysayer, build_proposer
+from spirrow_mindwire.config import MindwireSettings, Stage3LoopConfig
+from spirrow_mindwire.loop_runner import _build_dispatcher, build_naysayer, build_proposer
 from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import SpawnContext
 from spirrow_mindwire.value_objects import ReplyDraft, Role, ThreadRef
@@ -107,11 +111,41 @@ def _proposer_options(tmp_path: Path) -> Any:
     return captured[0]
 
 
+class _InertMcp:
+    """The Magickit client handed to the composition root; never called by these tests."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:  # pragma: no cover
+        raise AssertionError(f"tool-surface tests must not call magickit ({name})")
+
+
+def _implementer_options(tmp_path: Path) -> Any:
+    """The implementer's options as production builds them: composition root, then spawn's path.
+
+    Built through :func:`_build_dispatcher` (not ``build_implementer`` directly) so the Magickit
+    client the root hands the implementer is part of what is pinned — that hand-off is what
+    attaches the ledger server.
+    """
+    settings = MindwireSettings(loop=Stage3LoopConfig(repo_dir=tmp_path))
+    _, registry, _ = _build_dispatcher(
+        settings, mcp=_InertMcp(), proposer=None, implementer=None, naysayer=None
+    )
+    adapter: Any = registry.qualified_for(Role.IMPLEMENTER)[0]
+    ctx = SpawnContext(
+        on_reply=_noop_reply,
+        on_event_log=_noop_log,
+        own_role=Role.IMPLEMENTER,
+        own_instance_id="implementer-1",
+    )
+    ref = ThreadRef(project_id="p", thread_id="t", chatroom_uri="chatroom://p/t")
+    ledger = adapter._ledger_for(ref, ctx)
+    return adapter._make_options(ledger_server=None if ledger is None else ledger[1])
+
+
 def _role_options(role: str, tmp_path: Path) -> Any:
     if role == "proposer":
         return _proposer_options(tmp_path)
     if role == "implementer":
-        return build_implementer(tmp_path, obligations=_OBLIGATIONS)._make_options()
+        return _implementer_options(tmp_path)
     if role == "naysayer":
         return build_naysayer(tmp_path, obligations=_OBLIGATIONS)._make_options()
     raise AssertionError(role)
@@ -169,14 +203,37 @@ def test_b_mcp_servers_are_in_process_sdk_only(role: str, tmp_path: Path) -> Non
     )
 
 
-def test_b_production_mcp_servers_are_empty_today(tmp_path: Path) -> None:
-    """Today's measured fact behind (b): no loop role attaches any MCP server at all.
+def _listed_tool_names(server_cfg: Any) -> set[str]:
+    """The tool names an in-process server answers ``tools/list`` with — what the session sees."""
+    handler = server_cfg["instance"].request_handlers[ListToolsRequest]
+    result = asyncio.run(handler(ListToolsRequest(method="tools/list")))
+    return {t.name for t in result.root.tools}
 
-    Pinned separately so that adding even an in-process server is a visible diff to this test,
-    not a silent pass of the ``type: "sdk"`` check above.
+
+def test_b_production_mcp_servers_are_exactly_the_ledger_today(tmp_path: Path) -> None:
+    """Today's measured fact behind (b): the implementer attaches one server, the others none.
+
+    Pinned separately so that adding any further server, even in-process, is a visible diff to
+    this test, not a silent pass of the ``type: "sdk"`` check above. The implementer's server is
+    pinned by the exact set of tools it lists (Bohr msg-5296 §5: enumerate what is allowed and
+    compare, rather than check that ``loop_control_*`` / ``delete_*`` are absent).
     """
-    for role in _ROLES:
-        assert dict(_role_options(role, tmp_path).mcp_servers or {}) == {}, role
+    assert dict(_role_options("proposer", tmp_path).mcp_servers or {}) == {}
+    assert dict(_role_options("naysayer", tmp_path).mcp_servers or {}) == {}
+    servers = dict(_role_options("implementer", tmp_path).mcp_servers or {})
+    assert set(servers) == {"mindwire-ledger"}
+    assert _listed_tool_names(servers["mindwire-ledger"]) == {
+        "ledger_get_task",
+        "ledger_append_note",
+    }
+
+
+def test_b_implementer_allowed_tools_name_only_the_two_ledger_tools(tmp_path: Path) -> None:
+    allowed = _role_options("implementer", tmp_path).allowed_tools
+    assert [t for t in allowed if t.startswith("mcp__")] == [
+        "mcp__mindwire-ledger__ledger_append_note",
+        "mcp__mindwire-ledger__ledger_get_task",
+    ]
 
 
 def test_b_watcher_mcp_server_is_an_sdk_server() -> None:

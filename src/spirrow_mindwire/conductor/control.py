@@ -55,8 +55,16 @@ logger = logging.getLogger(__name__)
 # decides what it should do.
 #
 # How far that actually goes, stated exactly so nobody over-trusts it: the daemon never calls
-# ``loop_control_set``, and the three role sessions cannot either — ``loop_runner`` wires no
-# ``mcp_servers`` into any adapter, so they have no MCP tools at all (verified 2026-08-04). It is
+# ``loop_control_set``, and the three role sessions cannot either as a tool call. The only MCP tools
+# any role session holds are the implementer's two ledger tools (``ledger_get_task`` /
+# ``ledger_append_note``, the in-process ``mindwire-ledger`` server — pinned to the thread's
+# project, append-only; proposer and naysayer hold none). No session holds ``loop_control_*``
+# (pinned by ``tests/test_role_tool_surface.py``; thread
+# T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down msg-5296 / msg-5300). Residual risk
+# of that ledger append, stated as it is: it does not detect collisions — a write by another
+# process or a person that lands between its read and its write is overwritten, and recovery from
+# an overlap relies on the event_log (``ledger.note_appended`` records the notes it read); a
+# person's UI write is not recoverable from there. It is
 # NOT a sandbox: the implementer session has shell tools and the magickit endpoint is unauthed on
 # the tailnet, so an implementer that decided to could POST to it directly. That residual is the
 # same environment trust model the rest of the loop rests on (see ``adapters/implementer.py`` on the
