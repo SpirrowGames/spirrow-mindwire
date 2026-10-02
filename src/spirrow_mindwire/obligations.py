@@ -25,10 +25,25 @@ the loop's actual instructions away from what was reviewed. The loader treats
 the invariant that matters is the length equality, and enshrining a specific
 format here would force a schema bump every time a new kind of source needed
 representing.
+
+Net-new hash pin: an entry *without* ``origin`` is a net-new formulation, so
+there is no source length to compare against. Such an entry is pinned by
+``body_sha256`` — the SHA-256 of the normalized body (``body.rstrip("
+")``),
+UTF-8 encoded, as 64 lowercase hex digits. Whenever the key is present the
+loader checks its format and its value and raises :class:`ObligationsError` on
+either mismatch, so a silently edited net-new body halts the daemon exactly as
+a paraphrased moved body does. The loader does *not* require the key (fixture
+manifests in the tests need not carry hash lines unrelated to what they
+test); ``test_canary_net_new_bodies_match_pinned_sha256`` requires it on every
+net-new entry of the real manifest. A PR that changes a net-new body updates
+``body_sha256`` in the same commit.
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +63,8 @@ _MANIFEST_ROLES: dict[str, Role] = {
     Role.IMPLEMENTER.value: Role.IMPLEMENTER,
     Role.NAYSAYER.value: Role.NAYSAYER,
 }
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 class ObligationsError(RuntimeError):
@@ -79,6 +96,7 @@ class Obligation:
     role: Role
     body: str
     origin: ObligationOrigin | None
+    body_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,8 +149,9 @@ def load_manifest(path: Path | None = None) -> ObligationsManifest:
     (naysayer round-3 finding on PR #135).
 
     The parse is strict: missing/duplicate ids, unknown roles, empty bodies,
-    and origin blocks whose recorded length disagrees with the actual body
-    length all raise :class:`ObligationsError`. That failure is caught at the
+    origin blocks whose recorded length disagrees with the actual body
+    length, and ``body_sha256`` pins that are malformed or disagree with the
+    body's actual hash all raise :class:`ObligationsError`. That failure is caught at the
     composition root and re-raised as ``SystemExit`` (loader ← composition root
     ← daemon startup) — see :mod:`spirrow_mindwire.loop_runner`.
     """
@@ -210,7 +229,51 @@ def _parse_entry(entry: Any, *, index: int, source: Path) -> Obligation:
         body=normalized_body,
         source=source,
     )
-    return Obligation(id=obligation_id, role=role_value, body=normalized_body, origin=origin)
+    body_sha256 = _parse_body_sha256(
+        entry.get("body_sha256"),
+        obligation_id=obligation_id,
+        body=normalized_body,
+        source=source,
+    )
+    return Obligation(
+        id=obligation_id,
+        role=role_value,
+        body=normalized_body,
+        origin=origin,
+        body_sha256=body_sha256,
+    )
+
+
+def _parse_body_sha256(
+    pinned: Any,
+    *,
+    obligation_id: str,
+    body: str,
+    source: Path,
+) -> str | None:
+    """Check a ``body_sha256`` pin against the normalized body — fail-closed.
+
+    Absent key → ``None`` (the requirement that every net-new entry of the real
+    manifest carries one is the canary's job, not the loader's).
+    """
+    if pinned is None:
+        return None
+    if not isinstance(pinned, str) or _SHA256_HEX.fullmatch(pinned) is None:
+        raise ObligationsError(
+            f"obligations manifest at {source}: obligation {obligation_id!r} 'body_sha256' "
+            f"must be 64 lowercase hex digits (got {pinned!r})"
+        )
+    actual = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if actual != pinned:
+        # The net-new counterpart of canary two-double-prime, enforced at load time for the
+        # same reason: a body that drifted from what was reviewed halts the daemon at the
+        # composition root rather than silently changing what the loop reads.
+        raise ObligationsError(
+            f"obligations manifest at {source}: obligation {obligation_id!r} body sha256 "
+            f"({actual}) does not match body_sha256 ({pinned}); either restore the "
+            "reviewed body text or update body_sha256 in the same commit"
+        )
+    return pinned
 
 
 def _parse_origin(
