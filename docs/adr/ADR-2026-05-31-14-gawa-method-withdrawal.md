@@ -245,7 +245,11 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - **待ち合わせの上限時間を超えたら、gemini-fallback に切り替えます。呼び出し元を失敗させることはしません。** PR-gate やレビューが、ほかのリクエストと重なっただけで落ちることは許しません。コストを抑えることよりも、レビューが確実に終わることを優先します。
   - この切り替えは黙って行いません。共通の notifier で知らせ、attestation にも `gemini-fallback` として残します。
   - 上限時間の値は Lexora の PR で決めます。ふつうの直列化ではまず超えない長さにします。
-  - **1 リクエストにかける時間の合計（待ち合わせ＋codex の実行、または待ち合わせ＋gemini-fallback の実行）は、mindwire が前提にしている backend の時間の上限（`lexora/client.py` の `LEXORA_BACKEND_TIMEOUT_SECONDS`）に収めます。** mindwire のクライアントは、その値に余裕を足した時間だけ待ちます（`naysayer/pr_review.py` の `_DEFAULT_TIMEOUT_SECONDS`）。そのため、Lexora が上限内に返す限り、クライアントが先に接続を切ることはありません。待ち合わせの上限時間は、この合計の予算から gemini-fallback の実行に必要な時間を引いた値以下にします。
+  - **1 リクエストにかける時間の合計（待ち合わせ＋codex の実行、または待ち合わせ＋gemini-fallback の実行）は、mindwire が前提にしている backend の時間の上限（`lexora/client.py` の `LEXORA_BACKEND_TIMEOUT_SECONDS`）に収めます。** mindwire のクライアントは、その値に余裕を足した時間だけ待ちます（`naysayer/pr_review.py` の `_DEFAULT_TIMEOUT_SECONDS`）。そのため、Lexora が上限内に返す限り、クライアントが先に接続を切ることはありません。予算の配分は次のとおりにします。
+    - codex の 1 回の実行と、gemini-fallback の 1 回の実行には、それぞれ Lexora のコードで上限時間を設けます。上限を超えた実行は打ち切ります。codex の実行を打ち切った場合は、codex 側の失敗として扱います。
+    - 最も長くかかるのは、待ち合わせの後に codex を上限まで実行し、それが失敗して gemini-fallback を上限まで実行する経路です。そのため、**待ち合わせの上限時間 ≦ 予算 − (codex の実行の上限時間 ＋ gemini-fallback の実行の上限時間)** とします。どの経路をたどっても、合計が予算に収まります。
+    - 待ち合わせの上限を超えて直接 gemini-fallback に切り替える経路は、待ち合わせの上限時間＋gemini-fallback の実行の上限時間なので、上の式を満たせば予算に収まります。
+    - この不等式は、Lexora の起動時に確かめます。満たさない値が設定されていたら、起動を拒否します。
   - それでもクライアント側で時間切れになった場合は、いまの PR-gate の扱い（`_degrade_on_timeout`：COMMENT で保留し、人に知らせる）に従います。黙って失敗することはありません。
 - そのほかに fallback wrapper が gemini-fallback に切り替えるのは、codex 側が失敗したとき（ゲートが閉じている、実行がエラーになった、レート制限やセッションの失効など）です。
 
