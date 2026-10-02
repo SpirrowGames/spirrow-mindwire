@@ -910,6 +910,9 @@ def build_conductor(
             retry_of=retry_of,
             # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
             tierc_gate=tierc_gate,
+            # §2.6 decision log extraction (T-tier-c-admission-gate U4a): always wired, in every
+            # [tierc_gate] mode — it records proposer / implementer choices, not gate decisions.
+            decisions_log_path=resolve_tier_c_decisions_log_path(settings),
             # Wall-clock budget (msg-5498 W-1): the phase the run_timeout event reports.
             run_phase=run_phase,
         )

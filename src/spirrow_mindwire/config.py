@@ -685,7 +685,8 @@ TIER_C_DECISIONS_LOG_FILENAME = "tier_c_decisions_log.jsonl"
 
 
 def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
-    """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store."""
+    """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store,
+    and the §2.6 decision log the conductor writes ``DECIDED:`` / ``DEFERRED:`` lines to (U4a)."""
     return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
 
 

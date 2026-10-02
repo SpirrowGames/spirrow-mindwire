@@ -17,14 +17,34 @@ Two writer classes exist by design (msg-3702 §3 書き出しマトリクス):
   parsing it. Any indirection here would be the "hybrid & dual-management"
   bug Einstein flagged in msg-3701.
 
-* **Workspace source** — the implementer role (LLM). It emits
-  ``DECIDED:`` / ``DEFERRED:`` grammar prefixes as free-text lines at the
-  tail of its handoff messages; the conductor's extraction step parses
-  those lines and calls :func:`append_log_entry` with the same
-  :class:`~spirrow_mindwire.tier_c_admission_gate.LogEntry` shape. The
-  allowlist for extraction is ``{implementer}`` only (msg-3702 §1) so no
-  infra author's message can leak through the LLM-oriented parser as
-  false-positive events.
+* **Workspace source** — the roles in :data:`DECISION_LOG_AUTHOR_ROLES`
+  (proposer and implementer, both LLM). They emit ``DECIDED:`` /
+  ``DEFERRED:`` grammar prefixes as free-text lines in their messages;
+  the conductor's extraction step reads them with
+  :func:`scan_decision_lines` and calls :func:`append_log_entries` with
+  the same :class:`~spirrow_mindwire.tier_c_admission_gate.LogEntry`
+  shape. The allowlist keeps out infra authors (``pr-gate-relay``, whose
+  instruction text quotes the grammar) and quoting authors (the
+  naysayer), so their messages cannot leak through the LLM-oriented
+  parser as false-positive events (msg-3702 §1). msg-5657 widened it to
+  the proposer, because design-time choices are §2.6 discretionary
+  decisions too.
+
+Decision-line grammar (msg-5657)
+--------------------------------
+
+A decision line is a line that **starts** with ``DECIDED:`` or
+``DEFERRED:`` (leading spaces / tabs allowed) and reads
+``<prefix> <what> — <reason>``. It is split at the first em dash ``—``,
+and both sides must be non-empty. A prefix in the middle of a sentence,
+inside backticks, behind a ``>`` quote marker, or inside a fenced code
+block does not make a decision line. A line that has the prefix but no
+non-empty ``what`` / ``reason`` around a ``—`` is *malformed*: it is
+never logged, and it is returned separately so the caller can count it
+instead of dropping it silently. :func:`scan_decision_lines` and
+:data:`DECISION_LOG_AUTHOR_ROLES` are the single definition that both
+the conductor and the §3 acceptance scan (U4b) use, so the log and a
+recount from message bodies cannot apply different rules.
 
 RETRY store
 -----------
@@ -45,21 +65,125 @@ Attribution
 
 Design: T-tier-c-admission-gate. JSONL single-file discipline from
 msg-3648 v1 §4 (Bohr); 6-kind enum from msg-3708 §2 (Bohr); allowlist
-restriction to ``{implementer}`` from msg-3702 §1 (Bohr accepting
-Einstein msg-3701 BLOCKING). The extraction callable belongs to the
-conductor, not this module; the callable's contract is that it emits
-:class:`~spirrow_mindwire.tier_c_admission_gate.LogEntry` values and
-calls :func:`append_log_entry` — no other coupling.
+restriction from msg-3702 §1 (Bohr accepting Einstein msg-3701
+BLOCKING), widened to ``{proposer, implementer}`` by msg-5657 (Bohr
+accepting Einstein msg-5656 BLOCKING). The extraction step (read a
+message, resolve its author's role, write the rows) belongs to the
+conductor. This module owns only the grammar, the allowlist and the row
+shape.
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .tier_c_admission_gate import LogEntry, LogKind, RetryLookup
+from .value_objects import Role
+
+DECISION_LOG_AUTHOR_ROLES: frozenset[Role] = frozenset({Role.PROPOSER, Role.IMPLEMENTER})
+"""The roles whose ``DECIDED:`` / ``DEFERRED:`` lines become audit-log entries (msg-5657).
+
+Defined once here and imported by every reader (the conductor's extraction step and the U4b
+acceptance scan), so the two cannot drift apart. The naysayer is excluded because it quotes other
+authors' decisions. Authors with no role at all (``pr-gate-relay``, ``conductor-relay``, operator,
+the human) are never parsed.
+"""
+
+_DECISION_LINE_RE: re.Pattern[str] = re.compile(r"^[ \t]*(?P<kind>DECIDED|DEFERRED):(?P<rest>.*)$")
+_FENCE_RE: re.Pattern[str] = re.compile(r"^[ \t]*(```|~~~)")
+_DECISION_SEPARATOR = "—"
+
+
+@dataclass(frozen=True)
+class DecisionLine:
+    """One well-formed ``DECIDED:`` / ``DEFERRED:`` line, split at its first em dash."""
+
+    kind: LogKind
+    what: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class DecisionLineScan:
+    """What :func:`scan_decision_lines` found in one message body.
+
+    ``lines`` holds the well-formed decision lines, in body order. ``malformed`` holds the raw lines
+    that had a line-start prefix but no ``<what> — <reason>`` split. Malformed lines are never
+    logged; the caller counts them so they are not dropped silently (msg-5655).
+    """
+
+    lines: tuple[DecisionLine, ...]
+    malformed: tuple[str, ...]
+
+    @property
+    def empty(self) -> bool:
+        return not self.lines and not self.malformed
+
+
+def scan_decision_lines(body: str) -> DecisionLineScan:
+    """Find the decision lines in ``body`` under the msg-5657 grammar (see the module docstring).
+
+    Pure: no I/O and no role check. The caller checks that the author's role is in
+    :data:`DECISION_LOG_AUTHOR_ROLES` before logging anything.
+    """
+    lines: list[DecisionLine] = []
+    malformed: list[str] = []
+    in_fence = False
+    for raw in body.splitlines():
+        if _FENCE_RE.match(raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _DECISION_LINE_RE.match(raw)
+        if match is None:
+            continue
+        what, sep, reason = match.group("rest").partition(_DECISION_SEPARATOR)
+        what, reason = what.strip(), reason.strip()
+        if not sep or not what or not reason:
+            malformed.append(raw.strip())
+            continue
+        lines.append(DecisionLine(kind=LogKind(match.group("kind")), what=what, reason=reason))
+    return DecisionLineScan(lines=tuple(lines), malformed=tuple(malformed))
+
+
+def decision_log_entries(
+    scan: DecisionLineScan,
+    *,
+    author: str,
+    author_role: Role,
+    now: datetime,
+) -> tuple[LogEntry, ...]:
+    """The ``DECIDED`` / ``DEFERRED`` :class:`LogEntry` rows for the well-formed lines in ``scan``.
+
+    Each row records ``author_role``, so the audit can tell design-time (proposer) decisions apart
+    from implementation-time (implementer) ones (msg-5657). Raises :class:`ValueError` for a role
+    outside :data:`DECISION_LOG_AUTHOR_ROLES`, so the allowlist is enforced when rows are built and
+    not only by the caller.
+    """
+    if author_role not in DECISION_LOG_AUTHOR_ROLES:
+        raise ValueError(f"role {author_role.value!r} may not write decision-log entries")
+    ts = now.isoformat()
+    return tuple(
+        LogEntry(
+            kind=line.kind,
+            payload={
+                "ts": ts,
+                "author": author,
+                "author_role": author_role.value,
+                "what": line.what,
+                "reason": line.reason,
+            },
+        )
+        for line in scan.lines
+    )
 
 
 def _entry_to_dict(
@@ -234,3 +358,62 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
         return bounced
 
     return _lookup
+
+
+DecisionKey = tuple[str, str, str, str]
+"""``(msg_id, kind, what, reason)``: what identifies one decision-log row within a thread."""
+
+
+def decision_key(msg_id: str, entry: LogEntry) -> DecisionKey:
+    """The :data:`DecisionKey` of a ``DECIDED`` / ``DEFERRED`` entry built for ``msg_id``."""
+    return (
+        msg_id,
+        entry.kind.value,
+        str(entry.payload.get("what", "")),
+        str(entry.payload.get("reason", "")),
+    )
+
+
+def logged_decision_keys(log_path: Path, *, thread: str) -> Counter[DecisionKey]:
+    """The ``DECIDED`` / ``DEFERRED`` rows already in the log for ``thread``, as a multiset of keys.
+
+    The conductor sees the same message on more than one run (every run re-reads the whole thread),
+    so extraction must be idempotent. It is idempotent per *entry*, not per message: a write that
+    failed after some of a message's rows reached the file leaves the rest missing, and a
+    per-message "any row present" check would then skip them forever (PR #418 gate, finding 2).
+    Comparing keys lets the caller write exactly the rows that are missing. A multiset, so that two
+    identical lines in one message are two rows. One full scan per call, for the same reason as
+    :func:`build_retry_lookup`.
+    """
+    kinds = {LogKind.DECIDED.value, LogKind.DEFERRED.value}
+    keys: Counter[DecisionKey] = Counter()
+    for row in _iter_rows(log_path):
+        if row.get("kind") not in kinds or row.get("thread") != thread:
+            continue
+        keys[
+            (
+                str(row.get("msg_id", "")),
+                str(row.get("kind")),
+                str(row.get("what", "")),
+                str(row.get("reason", "")),
+            )
+        ] += 1
+    return keys
+
+
+def missing_decision_entries(
+    entries: Iterable[LogEntry], *, msg_id: str, logged: Counter[DecisionKey]
+) -> tuple[LogEntry, ...]:
+    """The subset of ``entries`` (built for ``msg_id``) that ``logged`` does not already hold.
+
+    Order is kept. ``logged`` is consumed as the entries are matched, so it must be a copy the
+    caller can spend, or the caller must want the consumption (several messages share one scan).
+    """
+    missing: list[LogEntry] = []
+    for entry in entries:
+        key = decision_key(msg_id, entry)
+        if logged[key] > 0:
+            logged[key] -= 1
+            continue
+        missing.append(entry)
+    return tuple(missing)
