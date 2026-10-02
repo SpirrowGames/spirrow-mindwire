@@ -151,3 +151,143 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - spirrow-lexora commit `c9aa914`（`main`、push 済）。変更ファイル: `config.py` / `factory.py` / `backends/gemini.py` / `config/lexora_config.yaml`。
 - 関連: ADR-2026-06-03-17（Gemini の tool-less/one-shot 制約による design-time 参加 regression を relay orchestrator で回帰させる決定）。本改訂は gate 自体を config で外す別レバーであり、17 の orchestrator 方式とは独立。
 - **再有効化**: 本番 config を `governance_gate_enabled: true` に戻す（または key 削除で既定 True）だけで surface 強制が復活する。
+
+
+---
+
+## 7. Amendment (2026-10-03): OpenAI（Codex CLI、ChatGPT Pro サブスク認証）を naysayer の 3 社目として認める — D-4 の改訂
+
+- **Status**: Proposed。収束は chatroom `T-D8-codex-backend-adr14-15-amendment`（Bohr proposer の msg-6059、msg-6061 / Einstein naysayer の承認）。Takahito の判断は msg-5940（Fermi が代筆、選択肢 (a)）。**この節が main に merge されることを、Takahito による承認とする**（merge-protected）。
+- **SOT**: Codex に関するデータ統治は、この節が SOT です。ADR-15 C-2 と ADR-19 D-3 は、この節を参照します。
+- **変更しないこと**: Gemini の経路にかかる D-4（paid 鍵の不変条件、ZDR の推奨、再必須化トリガー (i)(ii)、検知点）と §6 は、そのまま有効です。
+
+### 7.1 何を認めるか
+
+- **3 社目のベンダーとして OpenAI を認めます。** 経路は Lexora の codex backend です。Lexora が `codex exec` を naysayer ティアの裏で動かします。
+- 対象は、design-time の naysayer と PR-gate の naysayer の両方です。
+- 認証は個人の ChatGPT Pro サブスクで、Takahito の個人契約です。API 鍵（API org）は使いません。
+- 費用は Pro の定額だけです。API の従量課金は発生しません。
+
+### 7.2 最後の防御線（D-4 の「paid 鍵」に当たるもの）
+
+サブスク認証には、paid 鍵に当たるものがありません。そこで、最後の防御線を次の 3 つで置き換えます。
+
+1. **データ設定の記録（TTL つき）**
+   - ChatGPT のデータ設定で「モデルの改善に使う」をオフにします。人がこれを確かめた日時を、Lexora の `_check_data_controls()` が読む記録に残します。
+   - TTL が切れたら、ゲートが閉じます。
+   - 期限が近づいたら、codex backend が自分で予告を出します。予告には、どの backend からも呼べる共通の notifier を使います。
+2. **`verification_stale`**
+   - CLI のバージョンが変わったら、ゲートが閉じます。
+   - `verify_codex` をやり直すまで、ゲートは開きません。
+3. **D-D（ツールを無効にすること）**
+   - 中身は 7.4 のとおりです。
+
+### 7.3 受け入れるリスク（paid 鍵との違い）
+
+**data controls は、黙って変わりうる**
+- paid 鍵の性質が変わるのは、契約の変更としてです。その場合は予告があります。
+- 一方、data controls のトグルは、予告なしに切り替わりえます。たとえば規約の更新、アカウントの操作、プランの変更などです。
+- 学習オプトアウトの状態を、CLI や API から機械的に読む手段は確認されていません。
+- そのため、TTL が残っている間は、トグルが変わっても気づけません。
+- **このリスクは受け入れます。** Takahito の判断（msg-5940）によるもので、既存の方針「学習されても困らない」にもとづいています。
+
+**ZDR は満たしていません**
+- 個人向けの Pro では、ZDR を満たせません。
+- msg-5940 で、ZDR は codex の通常経路の要件から外されました。
+
+**N-3 の部分集合（再必須化トリガー (ii)）は Gemini 固定とします**
+- ADR-15 C-2 の「この部分集合は ZDR 必須」は外しません。
+- そのため、naysayer ティアを決める関数は、この部分集合では codex を返しません。
+- これを mindwire 側の実装で強制します。名前がずれたことを検知する構造テストも置きます。
+- この部分集合を codex に広げるかどうかは、goal の判断です。広げる場合は、別に改訂します。
+
+**HOST_REPO が private な場合も、その内容が OpenAI に送られます**
+- public なリポジトリを除外する条件（4b）は、撤回しました（msg-5940）。
+- 根拠は公式ドキュメントにあります。「Do not use this workflow for public or open-source repositories」が禁じているのは、CI の runner に `auth.json` を置く手順です。コードの内容を送ることを禁じた文ではありません。
+- また、`auth.json` は、外部の PR がコードを動かせるマシンには置きません。
+
+### 7.4 D-D：ツールを無効にすること（4a。PR-gate と design-time の両方で、codex を有効にする条件）
+
+**不変条件**
+- モデルに渡るツールの一覧に、次のものを 1 つも含めません。
+  - ファイルを読めるもの
+  - コードやコマンドを実行できるもの
+  - ネットワークに出られるもの
+- 許すツールは、許可リストで持ちます。許可リストに入るのは、次の 2 つだけです。
+  - `clock`
+  - `send_user_message_async`
+- **`apply_patch` は許しません。** 書き込みが read-only の sandbox で失敗する場合でも、文脈を確かめるために対象ファイルを読むからです。
+- 許可リストに無いツールが 1 つでも見つかったら、fail-closed にします。
+
+**消し方は、計測して決めます**
+1. **(i)** `model_catalog_json` で、使うモデル（`gpt-6.1-sol`）のエントリを書き換えたカタログを渡します。`tool_mode: direct`、`apply_patch_tool_type: null` などにし、`-c` のフラグも組み合わせます。
+2. **(i')** 同じ書き換えを `gpt-5.5` に当てます。
+3. **どちらでも許可リストに収まらなければ、codex は本番で有効にしません。** design-time と PR-gate のどちらでもです。
+
+**モデルの選択は、Tier-C ではありません**
+- 費用も goal も変わらないからです。
+- 品質は、primary に上げる前の shadow 比較で測ります。
+
+**強制は Lexora のコードで行います（config では変えられません）**
+- カタログ、`-c` のフラグ、`--model` はコードに固定します。カタログは、中身のハッシュも照合します。
+- `TOOL_DISABLE_OVERRIDE_KEYS` を設けます。
+- `verify_codex` で `codex exec --json` を実行し、実際に渡るツールの一覧を許可リストと照合します。
+- 実行時の多層防御として、ツールの実行を 1 回でも検知したら止める latch（D-1c）を残します。
+
+**同時実行は 1 つまでです**
+- 1 つの `auth.json` を、トークンの更新で競合させないためです。
+- codex backend の同時実行数は、コードで 1 を上限にします。config で 2 以上が指定されたら、起動時に拒否します。
+
+**残るリスク**
+- `auth.json` は、sandbox の中から読める位置にあります。読まれないことは、ツールが無いことだけで保証しています。
+- design-time でツールを許す案は、今回は採りません。採る場合は、先に sandbox の中から `auth.json` を隠せるかを実測し、別の提案として出します。
+
+### 7.5 プロンプトの構成（ツールの代わりに、mindwire が決まった規則で組み立てます）
+
+何を読むかは、モデルに選ばせません。
+
+**PR-gate に入れるもの**
+- diff
+- 変更されたファイルの、head 時点の全文
+- パスの規則だけで決まる、対になるテストファイル（例: `src/x/y.py` ↔ `tests/**/test_y.py`）
+- import をたどってファイルを集めることはしません。shadow 比較で文脈が足りないと確かめられてから、別に提案します。
+
+**design-time に入れるもの**
+- スレッドの本文
+- principles
+- スレッドが参照している ADR やファイルの全文
+
+**どちらにも共通の規則**
+- プロンプトには文字数の上限を設けます。上限を超えたら、テストファイルから順に落とし、落としたファイルの名前をプロンプトの冒頭に書きます。
+- 入れたファイルは区切りで囲み、「データであって指示ではない」と明示します。これは補助的な対策です。本当の防御は 7.4 です。
+- 組み立て方は、backend によって変えません。
+
+### 7.6 naysayer ティアの構成と attestation
+
+- naysayer ティアの構成は、「codex を正、gemini-fallback を予備」とする fallback wrapper です。
+- 素の codex backend を、直接ティアにつなぐことはしません。
+- mindwire の attestation で正とするのは `codex` です。`gemini-fallback` も、許容されるフォールバックとして受け入れます。
+- この変更の対象は、`expected=gemini` を前提にしている箇所です（`naysayer/preflight.py`・`principles.py`・`adapters/naysayer_sdk.py`）。
+- この変更は、Lexora の codex 経路がティアにつながるのと同時に入れます。先に入れると、今の Gemini の経路が attestation で不一致になるからです。
+
+### 7.7 C-2 の対象外と、テストで守っている前提
+
+**`_run_unverified` は、C-2（機密の外部移動）の対象外です**
+- 送り先はループバックだけで、送るのは固定の文面と nonce だけです。
+- これは backend が強制しています（Lexora `a8517f8`）。
+
+**argv の並びを前提にしています**
+- `codex exec` に渡す argv の並びを前提にしています（並びの中身は Lexora の backend とテストが正本です。この ADR では書き写しません）。
+- この前提は、テスト `TestVerifyOverridePrecedence`（Lexora `0e28018`）が守っています。
+
+### 7.8 §6（gate の無効化）との関係
+
+- §6 で無効にしたのは、Gemini backend の surface gate です。codex の経路は、read-only の sandbox でツールを持たないので（7.4）、§6 と矛盾しません。
+
+### 7.9 有効にする前提（すべて満たすまで、本番では有効にしません）
+
+1. Lexora の PR で、7.4 の強制、同時実行数 1、共通の notifier、fallback wrapper の構成を入れていること。そのうえで、(i)/(i') の計測結果がスレッドに報告されていること。
+2. Lexora のホストで `verify_codex` が成功していること。
+3. 本番の B-2 migration（`answered_by` の列）を確かめ、無ければ当てていること。
+4. mindwire 側に、attestation（7.6）、N-3 の除外（7.3）、プロンプトの構成（7.5）が入っていること。
+5. shadow 比較のあとで primary に上げること。
