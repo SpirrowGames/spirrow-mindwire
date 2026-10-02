@@ -372,11 +372,12 @@ exit 0
     Check 'the helper turns that refusal into an error result (ok = $false)' $false $r.ok
     CheckTrue 'error names the invalid command line' ($r.error -like 'invalid command line:*')
 
-    Write-Host 'U2 — only Get-FailureClass passes -UvOptions; the eight msg-5414 call sites do not'
+    Write-Host 'U2 — only Get-FailureClass passes -UvOptions; the eight msg-5414 call sites and 1b do not'
     $helperCalls = @($ast.FindAll({
                 param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
                 $n.GetCommandName() -eq 'Invoke-BoundedUvProbe' }, $true))
-    Check 'nine helper call sites in the sweep script' 9 $helperCalls.Count
+    # +1 for Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b): no -UvOptions, like the eight.
+    Check 'ten helper call sites in the sweep script' 10 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
@@ -516,6 +517,45 @@ exit 0
     CheckTrue 'recent mindwire-probe-*.json kept' (Test-Path -LiteralPath $new)
     CheckTrue 'old file with another prefix kept' (Test-Path -LiteralPath $otherOld)
     CheckTrue 'old mindwire-probe-* with another extension kept' (Test-Path -LiteralPath $oldTxt)
+
+    # --- P: Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b) — fail-open on the sweep ---
+    Write-Host 'P — 1b tick: argv / bound / label, and every failure returns instead of throwing'
+    Import-SweepFunction 'Get-ProbeJsonLine'
+    Import-SweepFunction 'Invoke-PrEventAdvanceTick'
+    $PrEventAdvanceProbeTimeoutSeconds = 311
+    $sweepConfigPath = 'C:\cfg\sweep.json'
+    $script:peCalls = [System.Collections.Generic.List[object]]::new()
+    $script:peResult = $null
+    $script:peThrow = $false
+    function script:Invoke-BoundedUvProbe {
+        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
+        if ($script:peThrow) { throw 'boom' }
+        $script:peCalls.Add(@{ Arguments = $Arguments; TimeoutSeconds = $TimeoutSeconds; Label = $Label; UvOptions = $UvOptions })
+        return $script:peResult
+    }
+    $script:logLines.Clear()
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":1,"outcomes":[{"thread_id":"T-a"}],"noop_counts":{}}' }
+    $o = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'posted count parsed' 1 $o.posted
+    $c = $script:peCalls[0]
+    Check 'argv = -m spirrow_mindwire.pr_event_advance --project p --sweep-config <path>' '-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json' ($c.Arguments -join '|')
+    Check 'bound = $PrEventAdvanceProbeTimeoutSeconds' 311 $c.TimeoutSeconds
+    Check "label = 'pr-event-advance-p'" 'pr-event-advance-p' $c.Label
+    CheckTrue 'a post is logged' (@($script:logLines | Where-Object { $_ -like 'pr-event-advance `[p`]: {*' }).Count -eq 1)
+    $script:logLines.Clear()
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":0,"outcomes":[],"noop_counts":{"not-relay-tail":3}}' }
+    $null = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'a quiet all-noop tick logs nothing' 0 $script:logLines.Count
+    $script:peResult = @{ ok = $false; code = $null; stdout = ''; error = 'timeout' }
+    Check 'probe not ok -> $null' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peResult = @{ ok = $true; code = 1; stdout = '{"project":"p","error":"listing failed"}' }
+    $o = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'exit 1 -> the error object is returned' 'listing failed' $o.error
+    $script:peResult = @{ ok = $true; code = 0; stdout = 'not json' }
+    Check 'no JSON -> $null' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peThrow = $true
+    Check 'a throw inside -> $null, not an exception' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peThrow = $false
 
     Write-Host 'T3 — the sweep calls the startup cleanup before reading the sweep list'
     $text = Get-Content -LiteralPath $sweepScript -Raw

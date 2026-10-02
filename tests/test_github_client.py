@@ -2142,3 +2142,38 @@ async def test_fetch_file_at_transport_error_raises_github_http_error() -> None:
     async with _client(handler) as client:
         with pytest.raises(GitHubHTTPError):
             await client.fetch_file_at(_PR, path="x.py", ref="abc")
+
+
+# --- T-pr-event-advances-thread (1b): PrState carries merge_commit_sha and body -------------- #
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_state_reads_merge_commit_and_body_for_1b() -> None:
+    from spirrow_mindwire.github.client import PrResolution
+
+    def merged(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "state": "closed",
+                "merged": True,
+                "closed_at": "2026-10-02T08:00:00Z",
+                "merge_commit_sha": "abc123",
+                "head": {"sha": "def456"},
+                "body": "Fix.\r\n\r\nCloses-thread: T-x",
+            },
+        )
+
+    async with _client(merged) as gh:
+        state = await gh.fetch_pr_state(_PR)
+    assert state.resolution is PrResolution.CLOSED and state.merged
+    assert state.merge_commit_sha == "abc123"
+    assert state.body == "Fix.\r\n\r\nCloses-thread: T-x"
+
+    def open_null_body(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"state": "open", "head": {"sha": "d"}, "body": None})
+
+    async with _client(open_null_body) as gh:
+        state = await gh.fetch_pr_state(_PR)
+    assert state.resolution is PrResolution.OPEN
+    assert state.body is None and state.merge_commit_sha is None
