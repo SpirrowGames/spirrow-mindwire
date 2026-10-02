@@ -138,7 +138,12 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # (``[decider.tierc].questions = "tierc-v2"``) は set の *種類* を選ぶ名前で、この記録用 version
 # とは別物なので動かさない。proceed 用 (``tierc-v2-proceed``) は枠の文が不変なので動かさない。
 TIERC_V2_QUESTIONS_VERSION = "tierc-v3"
-"""v2 問いセットの set 単位 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。"""
+"""v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
+問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
+
+``eval/tierc/shadow-prereg.md`` の登録値と exporter の登録値は、この値と一致することを
+``tests/test_tierc_registered_version.py`` が検査する (DECIDED 2d-15) — 枠の文を変えて version を
+上げたら、その PR で gate が赤になり、事前登録の扱いを明示的に決めることになる。"""
 
 SHOULD_ASK_HUMAN_KEY = "should_ask_human"
 MATCHED_RULE_KEY = "matched_rule"

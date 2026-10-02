@@ -416,8 +416,11 @@ Check "the wait clears after commit-launch and before the spawn" (($clearIdx -gt
 #   (a) $didWork is never READ inside the dispatch loop. It is only assigned there, and its single
 #       reader is the ALL-CANDIDATES-IDLE summary after the loop.
 #   (b) the loop's own `break` statements (nearest enclosing loop = the dispatch loop) are exactly
-#       the four exits the design names: time-budget, k-budget-hit, undeclared-verdict, and the
-#       role-lane post-run break. Adding one forces this test to be revisited.
+#       the five exits the design names: time-budget, kill-unconfirmed (conductor exit 7, PR #407
+#       W-3), k-budget-hit, undeclared-verdict, and the role-lane post-run break. Adding one forces
+#       this test to be revisited.
+#   (b') the kill-unconfirmed break sits under an `if` on `$ConductorKillUnconfirmedExitCode`, so it
+#       fires only on exit 7 and cannot widen into a general failure break.
 #   (c) the post-run break sits under an `if` that calls Get-PostRunAction, so whether a worked run
 #       ends the sweep is decided by the lib function the simulation exercises.
 function Get-NearestLoop {
@@ -433,7 +436,16 @@ $didWorkReads = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Autom
 Check "(a) `$didWork is never read inside the dispatch loop" ($didWorkReads.Count -eq 0) "reads at line(s) $(($didWorkReads | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
 $ownBreaks = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.BreakStatementAst] }, $true) |
     Where-Object { (Get-NearestLoop $_) -eq $loop })
-Check "(b) the dispatch loop has exactly 4 own break exits" ($ownBreaks.Count -eq 4) "found $($ownBreaks.Count) at line(s) $(($ownBreaks | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
+Check "(b) the dispatch loop has exactly 5 own break exits" ($ownBreaks.Count -eq 5) "found $($ownBreaks.Count) at line(s) $(($ownBreaks | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
+$killBreak = @($ownBreaks | Where-Object {
+    $p = $_.Parent; $found = $false
+    while ($null -ne $p -and $p -ne $loop) {
+        if ($p -is [System.Management.Automation.Language.IfStatementAst] -and
+            $p.Clauses[0].Item1.Extent.Text -match '\$ConductorKillUnconfirmedExitCode') { $found = $true; break }
+        $p = $p.Parent
+    }
+    $found })
+Check "(b') the kill-unconfirmed break is governed by `$ConductorKillUnconfirmedExitCode" ($killBreak.Count -eq 1)
 $postRunBreak = @($ownBreaks | Where-Object {
     $p = $_.Parent; $found = $false
     while ($null -ne $p -and $p -ne $loop) {

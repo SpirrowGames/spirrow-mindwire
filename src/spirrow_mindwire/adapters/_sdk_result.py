@@ -139,6 +139,13 @@ _KNOWN_REASON_FIELDS: tuple[str, ...] = (
 # applies verbatim here.
 _SESSION_FACT_FIELDS: tuple[str, ...] = ("session_id", "duration_ms", "num_turns")
 
+# Fixed text put in front of the value of a reason field whose emptiness test
+# raised (``__bool__`` / ``__len__`` of a str / container subclass), when no
+# readable reason exists and that field is picked as a last resort (S-10,
+# thread msg-5714 §1). Not a new ``reason_source`` value and not a new field:
+# it only keeps an unjudged value from reading like a judged one.
+_UNJUDGEABLE_MARKER = "<unjudgeable>"
+
 # Hard cap on any single captured string value. Keeps the marker line, which is
 # emitted to stdout and lands in ``session_log_tail``, bounded.
 _FIELD_VALUE_MAX_LEN = 500
@@ -805,6 +812,14 @@ def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str
        ``field:<name>``, message formatted from the SUMMARY so bounds are
        enforced.
 
+       A field whose emptiness test raises is skipped, not treated as empty
+       and not taken as the reason; the first such field is remembered.
+       If no field yields a readable reason, that remembered field is
+       returned as ``field:<name>`` with the ``<unjudgeable>`` marker in
+       front of its value (S-10). One broken value costs only its own
+       judgement — never the whole detail (no ``capture_failed``) and never
+       a readable reason behind it.
+
     3. No reason field, but a subtype → ``subtype_only``.
 
     4. No reason field and no subtype → ``absent``. The message names the
@@ -824,16 +839,46 @@ def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str
     prefix = f"SDK is_error[{classification}]; " if classification else "SDK is_error; "
 
     result = raw.get("result")
-    if isinstance(result, str) and result:
+    result_text: str | None = None
+    try:
+        if isinstance(result, str) and result:
+            result_text = result
+    except Exception:
+        # A str subclass whose ``__bool__`` / ``__len__`` raises: step 1 is
+        # skipped, and the loop below meets ``result`` as its last candidate,
+        # where it is recorded as unjudgeable like any other field (S-10).
+        result_text = None
+    if result_text is not None:
         # No classification → the result string alone, as before S-9 (the
         # thread spec only defines the prefixed form for when a subtype exists).
-        return "result", (prefix + result) if classification else result
+        return "result", (prefix + result_text) if classification else result_text
 
+    # S-10 (thread msg-5714): one loop, plus the first field whose emptiness
+    # test RAISED. Such a field is neither empty (its value was read; it is
+    # not the capture-failure sentinel) nor a judged reason, so it is skipped
+    # here — a broken ``errors`` must not hide a readable
+    # ``api_error_status=403`` behind it — and used only when no readable
+    # reason exists, so "a value was there but could not be judged" is never
+    # written up as "no field carried a reason".
+    unjudgeable: str | None = None
     for name in _REASON_PRIORITY:
-        value = raw.get(name)
-        if _is_empty_reason_value(value):
+        try:
+            empty = _is_empty_reason_value(raw.get(name))
+        except Exception:
+            if unjudgeable is None:
+                unjudgeable = name
+            continue
+        if empty:
             continue
         return f"field:{name}", f"{prefix}{name}={summary.get(name)!r}"
+
+    if unjudgeable is not None:
+        # The marker sits in front of the (SUMMARY-derived, bounded) value so
+        # an unjudged value never looks like a judged reason in the record.
+        return (
+            f"field:{unjudgeable}",
+            f"{prefix}{unjudgeable}={_UNJUDGEABLE_MARKER} {summary.get(unjudgeable)!r}",
+        )
 
     if classification:
         return (

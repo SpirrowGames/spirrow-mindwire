@@ -80,6 +80,7 @@ def _record(probe: str) -> AttestationRecord:
         expected="gemini",
         route="host:8110",
         probe=probe,
+        scope="probe",
         at=datetime.now(UTC),
     )
 

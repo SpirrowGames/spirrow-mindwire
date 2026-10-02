@@ -62,9 +62,15 @@
 # > the default in deploy/lib/SweepFairness.ps1. 0 means "not passed". The scheduled task passes
 # neither, so the env var or the default applies; see docs/deploy.md "Launch fairness" for how
 # these relate to the task's trigger interval.
+#
+# $StaleHumanThresholdHours (T-sweep-intake-and-quarantine-stalls msg-5889 D-1; Operator Board §F.1
+# row 3 / RES-A-GAP): the N in the digest's "末尾 NEXT: human のまま N h 以上" section. Default 24,
+# the same 24h as 飢餓 and escalated, so "a day without motion" means one thing across the digest.
 param(
     [int]$LaunchBudgetSeconds = 0,
-    [int]$GateBudgetSeconds = 0
+    [int]$GateBudgetSeconds = 0,
+    [ValidateRange(1, 8760)]
+    [int]$StaleHumanThresholdHours = 24
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,6 +106,8 @@ $StarvedThreshold         = [TimeSpan]::FromHours(24)
 # $StarvedThreshold, because "not evaluated" and "evaluated but never launched" are different
 # failures. W-2c's last_evaluated_at refresh hid the second one (#392 / #361 / #359, 2026-10-02).
 $LaunchWaitStarvedThreshold = [TimeSpan]::FromHours(6)
+# Stale NEXT: human (msg-5889 D-1). From the script parameter above; see its comment.
+$StaleHumanThreshold = [TimeSpan]::FromHours($StaleHumanThresholdHours)
 
 # Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
 # surface in one section.
@@ -138,6 +146,11 @@ $DigestBudget = 1950
 # the phone-side reader has ("my 09:00 digest"). Time drift (24h clock walking off) is impossible
 # because the gate is "period ≠ last_sent_period AND local ≥ this time", not "elapsed ≥ 24h".
 $DailyDigestDeliveryTime = [TimeSpan]::FromHours(9)
+
+# Exit code of run-conductor.ps1 when the hard wall-clock budget killed the run but could not
+# confirm the tree is gone. Mirrors $ConductorKillUnconfirmedExitCode in deploy/lib/ConductorBudget.ps1
+# and RUN_KILL_UNCONFIRMED_EXIT_CODE in conductor/run_budget.py (a pytest pins all three).
+$ConductorKillUnconfirmedExitCode = 7
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -651,7 +664,9 @@ function Test-HoldForCandidate {
 #
 # THE CONTRACT (helper side — process control only):
 #   * The helper knows nothing about the target script's CLI. It takes argv, launches
-#     `uv run python <argv...>` from the repo root, and never writes to the child's stdin: stdin is
+#     `uv run [<UvOptions...>] python <argv...>` from the repo root (UvOptions is empty unless the
+#     caller passes uv's own flags, e.g. `--directory <root> --quiet` — Bohr msg-5611 §2), and
+#     never writes to the child's stdin: stdin is
 #     redirected and CLOSED immediately after start, so the child and every grandchild inherit an
 #     already-closed pipe instead of the console or this process's stdin.
 #   * Payloads never go through stdin or argv. The CALLER writes structured data to a temp file
@@ -680,12 +695,51 @@ $ParkedHumansProbeTimeoutSeconds = 120
 $ControlProbeTimeoutSeconds = 120
 $PredictedResourceProbeTimeoutSeconds = 120
 $GateBootstrapProbeTimeoutSeconds = 120
+# 1b (T-pr-event-advances-thread): one chatroom read per open thread of the project, plus a GitHub
+# read only for threads whose tail is a PR-gate relay. Longer than the single-call probes for that.
+$PrEventAdvanceProbeTimeoutSeconds = 300
+# Get-FailureClass -> spirrow_mindwire.stall_ledger (Bohr msg-5611 §3). The classifier itself runs in
+# milliseconds; the bound is the same as the other probes because uv -> python start-up alone took
+# ~75 s in msg-5322.
+$FailureClassProbeTimeoutSeconds = 120
 $ProbeKillGraceMs = 5000
 $ProbeInputFilePrefix = 'mindwire-probe-'
 $ProbeInputFileMaxAgeMinutes = 60
 # Where probe input files live. %TEMP% in production; tests point it at a private directory so a
 # leaked file is countable.
 $ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+
+# The full command line Invoke-BoundedUvProbe starts, element 0 being the executable. Pure, so the
+# argv composition is testable without launching anything. UvOptions (uv's own flags) go right after
+# the first two Launcher elements — which must be `uv run` — and before the interpreter, which is the only place
+# uv reads them; with UvOptions empty the result is exactly Launcher + Arguments, as before.
+function Get-BoundedProbeCommandLine {
+    param(
+        [Parameter(Mandatory)][string[]]$Launcher,
+        [string[]]$UvOptions = @(),
+        [string[]]$Arguments = @()
+    )
+    $line = [System.Collections.Generic.List[string]]::new()
+    $opts = @($UvOptions | Where-Object { $null -ne $_ })
+    # Checked by shape, not only by length: the insertion point is index 2 because that is where
+    # `uv run` ends, so a launcher that is not literally `uv run <interpreter>` (e.g. a 3-element
+    # `pwsh -NoProfile -File`) is refused rather than given uv flags it would misread.
+    # The basename is taken by splitting on BOTH separators: System.IO.Path on Linux does not treat
+    # `\` as a separator, so GetFileNameWithoutExtension('C:\bin\uv.exe') is not 'uv' there.
+    $exeLeaf = ([string]$Launcher[0] -split '[\\/]')[-1] -replace '\.[^.]*$', ''
+    $isUvRun = $Launcher.Count -ge 3 -and
+        $exeLeaf -ieq 'uv' -and
+        [string]$Launcher[1] -ceq 'run'
+    if ($opts.Count -gt 0 -and -not $isUvRun) {
+        throw "Get-BoundedProbeCommandLine: -UvOptions needs a launcher of the form 'uv run <interpreter>' (got: $($Launcher -join ' '))"
+    }
+    for ($i = 0; $i -lt $Launcher.Count; $i++) {
+        if ($i -eq 2) { foreach ($o in $opts) { $line.Add([string]$o) } }
+        $line.Add([string]$Launcher[$i])
+    }
+    foreach ($a in $Arguments) { $line.Add([string]$a) }
+    return , $line.ToArray()
+}
 
 function Invoke-BoundedUvProbe {
     param(
@@ -696,13 +750,26 @@ function Invoke-BoundedUvProbe {
         [string]$WorkingDirectory = $repoRoot,
         # The command prefix. Production always uses the default; tests substitute a fake probe
         # launcher (e.g. pwsh -File) so the bound and the tree kill run without uv.
-        [string[]]$Launcher = @('uv', 'run', 'python')
+        [string[]]$Launcher = @('uv', 'run', 'python'),
+        # uv's own options, inserted between `uv run` and `python` (see Get-BoundedProbeCommandLine).
+        # Empty by default: a caller that does not pass it gets exactly the argv it got before.
+        [string[]]$UvOptions = @()
     )
 
+    $result = @{
+        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
+        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
+    }
+    # A malformed launcher/option combination is an error RESULT like a failed start, never an
+    # exception: every caller's fail-open / fail-closed policy keys on the result, not on a throw.
+    try { $commandLine = Get-BoundedProbeCommandLine -Launcher $Launcher -UvOptions $UvOptions -Arguments $Arguments }
+    catch {
+        $result.error = "invalid command line: $($_.Exception.Message)"
+        return $result
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Launcher[0]
-    foreach ($a in @($Launcher | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
-    foreach ($a in $Arguments) { $psi.ArgumentList.Add([string]$a) }
+    $psi.FileName = $commandLine[0]
+    foreach ($a in @($commandLine | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -714,10 +781,6 @@ function Invoke-BoundedUvProbe {
     # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
 
-    $result = @{
-        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
-        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
-    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
     try {
@@ -795,9 +858,13 @@ function Get-ProbeJsonLine {
 
 # Write a probe payload to %TEMP%\mindwire-probe-<label>-<guid>.json (UTF-8, no BOM) and return
 # the path. The caller owns the file and MUST hand it to Remove-ProbeInputFile in `finally`.
+# The content is written verbatim: most probes hand JSON (`-Json`), while Get-FailureClass hands a
+# raw session-log tail and says so with the `-Text` alias (Einstein msg-5612 advisory 1). The name
+# keeps the .json extension either way, because Remove-StaleProbeInputFiles sweeps
+# `mindwire-probe-*.json` — a different extension would escape the startup backstop.
 function New-ProbeInputFile {
     param(
-        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][Alias('Text')][AllowEmptyString()][string]$Json,
         [Parameter(Mandatory)][string]$Label,
         [string]$Directory = $ProbeInputDirectory
     )
@@ -1405,7 +1472,8 @@ function Remove-RetryPendingNotLive {
 }
 
 # T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
-# the session log tail by invoking the Python classifier over stdin. The classifier's
+# the session log tail by invoking the Python classifier through the bounded probe helper
+# (``--input <tmp>``; T-parked-humans-probe-has-no-timeout msg-5611 §3). The classifier's
 # rules (which regex catches which error label) are the single SOT so a new signature
 # added there flows to both the persisted field and any digest side that groups on it.
 #
@@ -1482,30 +1550,44 @@ function Get-FailureClass {
 
     $blob = ($SessionLogTail -join "`n")
 
+    $tmp = $null
     try {
-        # ``uv run`` is the repo's convention for invoking a package in the managed venv;
-        # `.mindwire-gate` uses the same. Passing the tail via stdin (not argv) keeps the
-        # command line short and avoids any escaping surprise with quotes / backticks.
+        # Bounded (T-parked-humans-probe-has-no-timeout, Bohr msg-5611 §3). This used to be
+        # `$blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger` —
+        # a stdin feed with no upper bound, the exact shape that hung the parked-humans probe for
+        # 20+ minutes in msg-5322 and stopped every project's conductor. It sits on the sweep's
+        # failure branch, so a hang here would do the same. Now: the tail goes to a probe temp file
+        # (`--input`), the child's stdin is closed at start, and the whole tree is killed at
+        # $FailureClassProbeTimeoutSeconds.
         #
-        # ``--directory $RepoRoot`` pins the working directory of the uv invocation so
-        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD. This
-        # is preferred over ``Push-Location``: uv's own flag never leaks CWD state back
-        # into PowerShell if the child crashes mid-flight, so the sweep's outer scope
-        # cannot be corrupted by a failed classification (matches CON-1's record-then-
-        # execute discipline — if the remedy scope leaks, so does the observation of it).
-        $output = $blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $output) { return 'unknown' }
-        # The CLI prints ONE line — the label. Any surplus (stderr already suppressed
-        # above) is ignored; taking `[0]` guards against a stray blank line.
-        $label = if ($output -is [array]) { $output[0] } else { $output }
-        $label = "$label".Trim()
+        # ``--directory $RepoRoot`` (a uv option, hence -UvOptions) still pins where
+        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD — uv's own flag
+        # never leaks CWD state back into PowerShell (msg-2601 §1-2). -WorkingDirectory is pinned
+        # to the same root so the child's CWD does not depend on the top-level $repoRoot either.
+        $tmp = New-ProbeInputFile -Text $blob -Label 'failure-class'
+        $r = Invoke-BoundedUvProbe -Label 'failure-class' -TimeoutSeconds $FailureClassProbeTimeoutSeconds `
+            -WorkingDirectory $RepoRoot -UvOptions @('--directory', $RepoRoot, '--quiet') `
+            -Arguments @('-m', 'spirrow_mindwire.stall_ledger', '--input', $tmp)
+        # Timeout / start failure / unclosed streams / non-zero exit all collapse to 'unknown'.
+        # Deliberately NO digest notification on timeout (msg-5611 §3, endorsed msg-5612): this
+        # call is an attachment of a failure branch that is already reported loudly as a
+        # quarantine, so 'unknown' is a metadata loss, not a silent stop. The fact that it hung is
+        # still on record — the helper itself logs TIMEOUT / KILL-UNCONFIRMED / STREAMS-UNCLOSED.
+        if (-not $r.ok -or $r.code -ne 0) { return 'unknown' }
+        # stderr is not consulted (as with the old `2>$null`). The CLI prints ONE line — the label;
+        # take the first non-empty stdout line, and if stdout has no non-empty line at all, the
+        # answer is 'unknown' (msg-5612 advisory 2).
+        $label = @("$($r.stdout)" -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) |
+            Select-Object -First 1
         if (-not $label) { return 'unknown' }
         return $label
     } catch {
-        # Absolutely fatal failures (uv missing, venv broken, python crash) still fall
-        # through to the ledger-preserving ``unknown`` — this function is on the hot
-        # path of the sweep's failure branch and must never itself become a new failure.
+        # Absolutely fatal failures (temp dir unwritable, helper missing) still fall through to the
+        # ledger-preserving ``unknown`` — this function is on the hot path of the sweep's failure
+        # branch and must never itself become a new failure.
         return 'unknown'
+    } finally {
+        if ($tmp) { Remove-ProbeInputFile -Path $tmp }
     }
 }
 
@@ -1890,7 +1972,10 @@ function New-DailyDigest {
         # is empty, so a caller that predates the metric gets an empty section.
         [array]$LaunchWaitStarved = @(),
         # The threshold the caller used to build $LaunchWaitStarved; only rendered in the header.
-        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6)
+        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6),
+        # T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3, RES-A-GAP):
+        # the N of the 停止中 section, built from the $HumanParked rows that carry last_msg_at.
+        [TimeSpan]$StaleHumanThreshold = [TimeSpan]::FromHours(24)
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2218,6 +2303,53 @@ function New-DailyDigest {
         $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
     }
 
+    # 停止中 rows — T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3,
+    # RES-A-GAP). Threads whose last message still ends in NEXT: human and has not moved for at
+    # least $StaleHumanThreshold, oldest first. A different list from 判断待ち above: that one is
+    # "everything parked on a human now, in candidate order"; this one is "parked AND old".
+    #
+    # The age is derived here, from $Now and the row's last_msg_at, every time the digest is
+    # rendered. It is never written anywhere (§F.1: "スレッド末尾からその場で導く。永続化しない"), and
+    # there is no mute list (§F.1: a thread that waits on a human every day belongs here every day).
+    #
+    # Only rows that CARRY a last_msg_at property are considered. Invoke-ParkedHumansProbe always
+    # sets it; a caller that builds $HumanParked without it predates this section.
+    #
+    # Fail direction (msg-5889 D-1, endorsed by Einstein msg-5891): a row whose last_msg_at is $null
+    # or does not parse is LISTED, as 経過不明, ahead of every dated row. Its age is unknown, so it
+    # cannot be shown to be under N, and dropping it would be the silent kind of failure this thread
+    # exists to remove. parked_humans.py has already put the cause in 取得失敗.
+    $staleHumanList = @()
+    foreach ($p in $HumanParked) {
+        if (-not ($p.PSObject.Properties.Name -contains 'last_msg_at')) { continue }
+        $at = $null
+        try { $at = ConvertTo-UtcInstant -Value $p.last_msg_at } catch { $at = $null }
+        $ageText = '経過不明（timestamp 読めず）'
+        $ageSeconds = [int64]::MaxValue
+        if ($null -ne $at) {
+            $age = $Now.ToUniversalTime() - $at
+            if ($age -lt $StaleHumanThreshold) { continue }
+            $ageText = Format-DurationDigest -Span $age
+            $ageSeconds = [int64]$age.TotalSeconds
+        }
+        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+        $tag = ''
+        if ($lane -eq 'operator_work') {
+            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            $tag = "   — [operator 作業] $task"
+        }
+        elseif ($lane -eq 'misroute') {
+            $tag = "   — [宛先誤り・再ルーティング待ち]"
+        }
+        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
+            $tag = "   — [protocol 違反: Tier-C を operator に渡そうとした]"
+        }
+        $staleHumanList += [PSCustomObject]@{ Line = "  $($p.key)   [$($p.head_msg_id)]   $ageText$tag"; AgeSeconds = $ageSeconds }
+    }
+    # Oldest first. Ties are broken by the row text so the order is identical across ticks for the
+    # same input.
+    $staleHumanList = @($staleHumanList | Sort-Object -Property @{ Expression = 'AgeSeconds'; Descending = $true }, @{ Expression = 'Line'; Descending = $false })
+
     # ---- the fixed text of every later section, named once and emitted from the same variable ---
     # These are the lines the renderer WILL emit whatever the budget does, so their cost is known
     # exactly. Emitting them from the same variables the ladder measures is what makes the reserve
@@ -2250,6 +2382,11 @@ function New-DailyDigest {
         $fetchErrHeadLines = @("  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）")
     }
 
+    # Emitted at 0 件 too, like 飢餓 below (msg-5889 D-1). The header deliberately does not START with
+    # "NEXT:": a line that does reads as a handoff to anything running the NEXT: grammar over text.
+    $staleHumanHeadLines = @("", "停止中（末尾 NEXT: human のまま $([int]$StaleHumanThreshold.TotalHours)h 以上、古い順）: $($staleHumanList.Count) 件")
+    if ($staleHumanList.Count -eq 0) { $staleHumanHeadLines += "  (該当なし)" }
+
     $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
     if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
 
@@ -2272,8 +2409,10 @@ function New-DailyDigest {
     $reserveAfterLaunchWait = _LinesCost $footerLines
     $reserveAfterStarved  = (_LinesCost $launchWaitHeadLines) +
                             (_SectionFloorCost -Entries $launchWaitList -Indent '  ') + $reserveAfterLaunchWait
-    $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
+    $reserveAfterStaleHuman = (_LinesCost $starvedHeadLines) +
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
+    $reserveAfterFetchErr = (_LinesCost $staleHumanHeadLines) +
+                            (_SectionFloorCost -Entries $staleHumanList -Indent '  ') + $reserveAfterStaleHuman
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
     $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
@@ -2354,6 +2493,15 @@ function New-DailyDigest {
         $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '    '
+    }
+
+    # 停止中 (msg-5889 D-1). Rows were built above; same floor discipline as every other section.
+    $lines += $staleHumanHeadLines
+    if ($staleHumanList.Count -gt 0) {
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $staleHumanList -MaxLen $Budget -Reserve $reserveAfterStaleHuman -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
     $lines += $starvedHeadLines
@@ -3680,6 +3828,11 @@ function Invoke-ParkedHumansProbe {
             lane               = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
             operator_task      = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
             protocol_violation = ($p.PSObject.Properties.Name -contains 'protocol_violation') -and [bool]$p.protocol_violation
+            # msg-5889 D-1: when the thread's last message was posted (ISO-8601 UTC), or $null when
+            # parked_humans.py could not read it (that case also carries an errors[] row). Always
+            # present on probe output, so New-DailyDigest's 停止中 section considers every row; the
+            # renderer turns it into an age fresh each tick and nothing persists it.
+            last_msg_at        = if ($p.PSObject.Properties.Name -contains 'last_msg_at') { $p.last_msg_at } else { $null }
         }
     }
     $errorsOut = @()
@@ -3956,6 +4109,46 @@ function Invoke-GateBootstrapTick {
     }
 }
 
+# --- 1b: PR events advance work threads ---------------------------------------------------------
+# For each distinct project in the sweep list, run `python -m spirrow_mindwire.pr_event_advance`
+# (docs/operator-board-design.md §F.1 row 1b / §F.1.1; chatroom T-pr-event-advances-thread). When a
+# work thread's tail is a PR-gate relay and the PR has since been merged or closed — or CI has ended
+# on the head a CI-pending hold named — it writes ONE message whose NEXT: moves the thread on.
+#
+# Runs after the project's HOLD check and BEFORE its head probe, so a held project gets no writes
+# and a thread it just wrote to has a moved head and is launched this tick. Fail-open on the SWEEP, for the same reason as Invoke-GateBootstrapTick: a broken 1b tick must
+# not stop the sweep that runs conductors. Every outcome other than a quiet no-op is logged.
+function Invoke-PrEventAdvanceTick {
+    param([string]$Project)
+
+    try {
+        $r = Invoke-BoundedUvProbe -Label "pr-event-advance-$Project" -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.pr_event_advance', '--project', $Project, '--sweep-config', $sweepConfigPath)
+        if (-not $r.ok) {
+            Write-Log "pr-event-advance [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
+        }
+        $json = Get-ProbeJsonLine -Result $r
+        if (-not $json) {
+            Write-Log "pr-event-advance [$Project]: no JSON on stdout (exit=$($r.code)) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($r.code -ne 0) {
+            Write-Log "pr-event-advance [$Project]: tick failed (exit=$($r.code)): $($obj.error)"
+            return $obj
+        }
+        if ($obj.posted -gt 0 -or @($obj.outcomes).Count -gt 0 -or $obj.roster_error) {
+            Write-Log "pr-event-advance [$Project]: $json"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "pr-event-advance [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
+        return $null
+    }
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -4088,6 +4281,10 @@ try {
             }
         }
         if (Test-HoldObserved -Control $c) { continue }
+        # 1b (T-pr-event-advances-thread): after the HOLD check, so a held project gets no 1b
+        # writes either, and BEFORE the head probe, so a thread it writes to shows a moved head
+        # in this same tick. Fail-open (see Invoke-PrEventAdvanceTick).
+        [void](Invoke-PrEventAdvanceTick -Project $proj)
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
@@ -4728,6 +4925,24 @@ try {
                 -Message $notificationBody
         }
         if ($code -ne 0) {
+            # Exit 7 — the hard wall-clock budget killed the run but could not confirm the process
+            # tree is gone (deploy/lib/ConductorBudget.ps1; T-agmsg-transport-lessons-readiness-
+            # session-claim-board msg-5498 W-3). An orphan may still be running against this
+            # project, so launching anything else this tick could break the "one subprocess per
+            # project per tick" Concurrency profile without anyone seeing it. The failure itself has
+            # already gone down the ordinary retry/quarantine path above; this only stops the tick.
+            # Exits 5 and 6 get no branch: the log tail names them (design §18.5).
+            if ($code -eq $ConductorKillUnconfirmedExitCode) {
+                Write-Log "kill-unconfirmed $($cand.key): exit=$code — an orphaned conductor tree may still be running; stopping the rest of this tick's sweep"
+                Send-NotificationIfChanged -State $notifyState -Key "__conductor_kill_unconfirmed__/$($cand.key)" `
+                    -Signature "${nowIso}:${code}:${probeHead}" `
+                    -Message ("MindWire: **$($cand.key)** の conductor を時間上限で止めましたが、" +
+                              "プロセスツリーが終了したことを確認できませんでした (exit=$code)。" +
+                              "孤児プロセスが残っている可能性があるため、この tick の残りの sweep を止めました。" +
+                              "ループ host で mindwire-loop / claude のプロセスを確認してください。")
+                $breakReason = 'kill-unconfirmed'
+                break
+            }
             # K-budget short-circuit. Two failures in one sweep suggest a shared cause; keep
             # spending inferences past the second is the exact "keep bleeding" failure mode this
             # design refuses. The sweep breaks and fires a systemic-cause notification.
@@ -4985,7 +5200,8 @@ try {
                 -Budget $DigestBudget `
                 -HealthWarning $healthWarning `
                 -RetryState $retryState `
-                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold
+                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
+                -StaleHumanThreshold $StaleHumanThreshold
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest

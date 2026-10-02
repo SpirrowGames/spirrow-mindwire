@@ -434,12 +434,14 @@ Write-Host "F-1 — every non-empty row section keeps a floor of one row (msg-24
 # attaches to a quarantine row (it is part of the row above it, not a row of its own).
 function Get-DigestRowCounts {
     param([string]$Digest)
-    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; starved = 0; launchwait = 0 }
+    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; stalehuman = 0; starved = 0; launchwait = 0 }
     $sec = $null
     foreach ($l in ($Digest -split "`n")) {
         if ($l -match '^隔離中: ')       { $sec = 'quarantine'; continue }
         if ($l -match '^判断待ち: ')     { $sec = 'parked'; continue }
         if ($l -match '^\s+取得失敗: ')  { $sec = 'fetcherr'; continue }
+        # msg-5889 D-1: the 停止中 section sits between 取得失敗 and 飢餓.
+        if ($l -match '^停止中（')        { $sec = 'stalehuman'; continue }
         if ($l -match '^飢餓 ')           { $sec = 'starved'; continue }
         # T-sweep-starves-deep-candidates: the section after 飢餓. Its rows are not 飢餓 rows.
         if ($l -match '^起動待ち飢餓 ')   { $sec = 'launchwait'; continue }
@@ -833,6 +835,104 @@ CheckTrue "100-entry ParkedPollErrors spike still fits within budget" ($digest_e
 CheckTrue "count line still names the true total (100)" ($digest_errspike -match '取得失敗: 100 件') $digest_errspike.Substring(0, [Math]::Min(400, $digest_errspike.Length))
 CheckTrue "budget-forced truncation surfaces via `+N 件（省略）` under the fetch-error section" `
     ($digest_errspike -match '\+\d+ 件（省略）') $digest_errspike
+
+# =============================================================================================
+# 停止中 section — T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3,
+# RES-A-GAP): threads whose last message still ends in NEXT: human and has not moved for N hours,
+# oldest first, age derived from $Now every render, unreadable timestamps listed as 経過不明.
+# =============================================================================================
+Write-Host ""
+Write-Host "New-DailyDigest — 停止中 (末尾 NEXT: human のまま N h 以上) section (msg-5889 D-1)"
+
+$shNow = [datetime]::Parse('2026-10-02T00:00:00Z').ToUniversalTime()
+function New-ShRow {
+    param([string]$Tid, $At, [string]$Lane = 'decision', [string]$Task = '', [switch]$NoProperty)
+    $h = [ordered]@{ key = "p/$Tid"; project = 'p'; thread_id = $Tid; head_msg_id = "msg-$Tid";
+                     token = 'human'; lane = $Lane; operator_task = $Task; protocol_violation = $false }
+    if (-not $NoProperty) { $h['last_msg_at'] = $At }
+    return [PSCustomObject]$h
+}
+function Get-ShSection {
+    param([string]$Digest)
+    $out = @(); $in = $false
+    foreach ($l in ($Digest -split "`n")) {
+        if ($l -match '^停止中（') { $in = $true; $out += $l; continue }
+        if ($in -and ($l -eq '' -or $l -match '^飢餓 ')) { break }
+        if ($in) { $out += $l }
+    }
+    return ,$out
+}
+
+# 0 件: the header is still emitted, with (該当なし), and it names the threshold.
+$shEmpty = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked @()
+$sec0 = Get-ShSection $shEmpty
+Check "0 件 still emits the header with the default 24h threshold" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 0 件' $sec0[0]
+Check "0 件 says (該当なし)" '  (該当なし)' $sec0[1]
+CheckTrue "the header line does not start with 'NEXT:' (would read as a handoff)" `
+    (-not (($shEmpty -split "`n") | Where-Object { $_ -match '^\s*NEXT:' })) $shEmpty
+
+# Threshold, ordering, unknown age, legacy rows.
+$shParked = @(
+    (New-ShRow -Tid 'T-young'   -At '2026-10-01T14:00:00Z')                 # 10h  → not listed
+    (New-ShRow -Tid 'T-30h'     -At '2026-09-30T18:00:00Z')                 # 30h
+    (New-ShRow -Tid 'T-495h'    -At '2026-09-11T09:00:00Z')                 # 495h → oldest dated
+    (New-ShRow -Tid 'T-exact'   -At '2026-10-01T00:00:00Z')                 # exactly 24h → listed (≥)
+    (New-ShRow -Tid 'T-null'    -At $null)                                  # unknown → listed first
+    (New-ShRow -Tid 'T-garbage' -At 'not a time')                           # unknown → listed first
+    (New-ShRow -Tid 'T-legacy'  -At $null -NoProperty)                      # no property → not considered
+    (New-ShRow -Tid 'T-op'      -At '2026-09-29T00:00:00Z' -Lane 'operator_work' -Task 'clear quarantine')
+    (New-ShRow -Tid 'T-mis'     -At '2026-09-28T00:00:00Z' -Lane 'misroute')
+)
+$shDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked $shParked
+$sec = Get-ShSection $shDigest
+Check "header counts only rows at or past N (and unknown-age rows)" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 7 件' $sec[0]
+$rowKeys = @($sec | Select-Object -Skip 1 | ForEach-Object { ($_.Trim() -split '\s+')[0] })
+Check "rows are unknown-age first, then oldest first" `
+    'p/T-garbage,p/T-null,p/T-495h,p/T-mis,p/T-op,p/T-30h,p/T-exact' ($rowKeys -join ',')
+CheckTrue "a 10h-old park is not listed under a 24h threshold" (-not ($sec -match 'T-young')) ($sec -join "`n")
+CheckTrue "a row without a last_msg_at property is not considered" (-not ($sec -match 'T-legacy')) ($sec -join "`n")
+CheckTrue "unknown age is said out loud" (@($sec -match 'p/T-null .*経過不明').Count -eq 1) ($sec -join "`n")
+CheckTrue "dated rows carry the age derived from Now (495h → 20d 15h)" (@($sec -match 'p/T-495h .*20d 15h').Count -eq 1) ($sec -join "`n")
+CheckTrue "operator lane is tagged as in 判断待ち" (@($sec -match 'p/T-op .*\[operator 作業\] clear quarantine').Count -eq 1) ($sec -join "`n")
+CheckTrue "misroute lane is tagged as in 判断待ち" (@($sec -match 'p/T-mis .*\[宛先誤り').Count -eq 1) ($sec -join "`n")
+CheckTrue "判断待ち is unchanged by the new section (7 decisions + 1 operator + 1 misroute)" `
+    ($shDigest -match '判断待ち: 7 件（ほか operator 作業 1 件 / 宛先誤り 1 件）') $shDigest
+
+# The age is derived from $Now on every render (nothing is persisted): the same input rendered a
+# day earlier drops the rows that were not yet N hours old then.
+$shEarlier = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow.AddHours(-24) -LiveKeys @() -HumanParked $shParked
+Check "a render 24h earlier lists fewer rows (T-30h and T-exact were under 24h then)" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 5 件' (Get-ShSection $shEarlier)[0]
+
+# The threshold is a parameter, and the header names it.
+$sh72 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked $shParked -StaleHumanThreshold ([TimeSpan]::FromHours(72))
+Check "a 72h threshold is named in the header and filters accordingly" `
+    '停止中（末尾 NEXT: human のまま 72h 以上、古い順）: 5 件' (Get-ShSection $sh72)[0]
+
+# The section has a floor in the reserve ladder like every other row-emitting section: a large
+# 停止中 list plus a large 判断待ち list and a 飢餓 list must all fit, each with at least one row.
+$shMany = @()
+for ($i = 0; $i -lt 60; $i++) {
+    $shMany += New-ShRow -Tid ("T-stale-human-with-a-realistically-long-thread-name-{0:D3}" -f $i) -At $shNow.AddHours(-30 - $i).ToString('o')
+}
+$shStarvedState = @{}
+for ($i = 0; $i -lt 10; $i++) {
+    $shStarvedState["p/T-starved-$i"] = @{ last_evaluated_at = $shNow.AddDays(-3).ToString('o'); first_seen_at = $shNow.AddDays(-9).ToString('o') }
+}
+$shBudgeted = New-DailyDigest -QuarantineState @{} -EvaluatedState $shStarvedState -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @($shStarvedState.Keys) -HumanParked $shMany -Budget $script:DigestBudget
+CheckTrue "60 parked + 60 停止中 + 10 飢餓 fit the shipped budget" ($shBudgeted.Length -le $script:DigestBudget) $shBudgeted.Length
+$shRows = Get-DigestRowCounts -Digest $shBudgeted
+CheckTrue "判断待ち keeps its floor" ($shRows.parked -ge 1) ($shRows | Out-String)
+CheckTrue "停止中 keeps its floor" ($shRows.stalehuman -ge 1) ($shRows | Out-String)
+CheckTrue "飢餓 keeps its floor after 停止中" ($shRows.starved -ge 1) ($shRows | Out-String)
+CheckTrue "停止中 header keeps the true total (60) when rows are dropped" ($shBudgeted -match '停止中（[^）]*）: 60 件') $shBudgeted
 
 if ($script:failures -gt 0) {
     Write-Host ""

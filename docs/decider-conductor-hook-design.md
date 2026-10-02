@@ -187,7 +187,7 @@ min_confidence   = 0.60        # choice 系はこれ未満なら無視
 
 # Tier-C (§3.3.b Tier-C フック, §4.4 合成規則)
 genuine_min      = 0.60        # sum(genuine) >= genuine_min → CONFIRMED
-spurious_min     = 0.55        # max(spurious) >= spurious_min かつ genuine < genuine_max → LIKELY_NOT
+spurious_min     = 0.60        # max(spurious) >= spurious_min かつ genuine < genuine_max → LIKELY_NOT
 genuine_max      = 0.40        # LIKELY_NOT 判定に必要な genuine 上限（これ以上は CONFIRMED 側寄り ∴ LIKELY_NOT にしない）
 
 [decider.tierc]
@@ -452,7 +452,7 @@ implementer の push ごとに走る Gemini フルレビュー（PR 平均 2.4 �
 ## 10. Open questions / 実装時に決めること
 
 - Lexora `/v1/decide` の request / response schema（本設計は「4 種類の question type: noul / choice / free-form」までは決めたが、実際のワイヤ形式は lexora 側 `T-decide-endpoint` の spec に従う）
-- `[decider.thresholds]` の初期値は shadow データを 1〜2 週貯めてから較正する（現在は暫定値: Track B `handoff_valid_min = 0.30 / made_progress_min = 0.25 / min_confidence = 0.60`、Tier-C `genuine_min = 0.60 / spurious_min = 0.55 / genuine_max = 0.40`）。Tier-C 閾値は §6.2 A-post replay と live shadow の n が数十件に達した時点で McNemar / 符号検定と併せて較正する（§6.3）。
+- `[decider.thresholds]` の初期値は shadow データを 1〜2 週貯めてから較正する（現在は暫定値: Track B `handoff_valid_min = 0.30 / made_progress_min = 0.25 / min_confidence = 0.60`、Tier-C `genuine_min = 0.60 / spurious_min = 0.60 / genuine_max = 0.40`）。Tier-C 閾値は §6.2 A-post replay と live shadow の n が数十件に達した時点で McNemar / 符号検定と併せて較正する（§6.3）。
 - `DecisionState.recent_events` の N と `head_summary` の M（暫定 N=5, M=500 chars）
 
 ---

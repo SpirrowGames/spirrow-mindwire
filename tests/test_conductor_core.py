@@ -95,6 +95,7 @@ def _attested(body: str, *, backend: str = "gemini", expected: str = "gemini") -
             expected=expected,
             route="{{IP_SERVICES}}:8110",
             probe="cost-row#6032",
+            scope="turn",
             at=_TS,
         ),
     )
@@ -2660,3 +2661,72 @@ async def test_admission_reads_heads_only_off_relay_authored_messages() -> None:
     # R4, not R5: the quoted marker was ignored, so this still counts as the FIRST red.
     assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
     assert outcome.stop_reason is StopReason.NO_PROGRESS
+
+
+# --------------------------------------------------------------------------- #
+# T-pr-event-advances-thread R12: 1b's re-fire goes through R1-R7, and R6 lets it through.
+#
+# The tail before 1b writes is a CI-pending COMMENT relay carrying a ci-hold marker on _HEAD;
+# 1b (author ``pr-event-relay``, not the human) then writes ``NEXT: pr-review <ref>``. Because
+# the author is not the human, admission runs the R1-R7 table (no R0-OVERRIDE). Without R11 the
+# hold's heading would put _HEAD into verdict_heads and R6 would answer ALREADY_REVIEWED.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_hold_then_refire(mcp: _FakeChatroomMcp) -> None:
+    from spirrow_mindwire.conductor.gate_records import render_ci_hold_marker
+
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    mcp.seed(
+        author="pr-gate-relay",
+        content=(
+            f"{render_relay_heading('acme/widgets#7', _HEAD)}\n\n"
+            "VERDICT: comment (ci=pending)\n\nCI is still running\n\nNEXT: human\n\n"
+            f"{render_ci_hold_marker(head=_HEAD)}"
+        ),
+    )
+    mcp.seed(
+        author="pr-event-relay",
+        content=(
+            "PR event (1b, pr-event-relay) — acme/widgets#7\n\nCI ended\n\n"
+            "NEXT: pr-review acme/widgets#7"
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_invokes_the_gate_on_green() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == ["acme/widgets#7"]  # INVOKE, not R6 ALREADY_REVIEWED
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_routes_the_implementer_on_red() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]  # R4
+    assert ci_route_heads([mcp.posts[-1]["content"]]) == frozenset({_HEAD})
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_defers_when_ci_is_pending_again() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_PENDING))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert mcp.posts == []  # R2 DEFER writes nothing; the tail still says pr-review
+    assert outcome.stop_reason is StopReason.CI_WAIT

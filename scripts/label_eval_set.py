@@ -28,6 +28,15 @@ skipped). Without ``--resume`` the script refuses to touch a label file that alr
 so a continuation is always an explicit choice. Every run, bounded or not, appends one line to
 ``label_runs.jsonl`` with ``remaining`` (material rows still unlabelled).
 
+**Prompt and rubric files (T-decider-conductor-hook msg-4646 DECIDED 2d-10, msg-4652,
+msg-4654 DECIDED 2d-12).** ``--prompt-file`` / ``--rubric-file`` name the two files inside
+``--dir`` (defaults: the v1 ``label_prompt.md`` / ``RUBRIC.md``). Only a bare file name is
+accepted — no ``/`` or ``\\`` (so no ``..`` and no absolute path) — and it must exist directly in
+``--dir``. The same ``directory / name`` feeds the labelling system prompt, ``write_lock``'s
+system-prompt hash and the ``LOCKED_FILES`` hashes, so the manifest keys are those names and
+the manifest reproduces wherever the directory is copied. v2 files keep their v2 names; they
+are never renamed to the v1 names.
+
 **Reader.** Files only; nothing is posted to a chatroom thread.
 """
 
@@ -347,28 +356,64 @@ TRANSPORT_DECISION = (
     "the 2026-09-28 frontier-tier run returned 'claude-fable-5-1'."
 )
 
+DEFAULT_PROMPT_FILE = "label_prompt.md"
+DEFAULT_RUBRIC_FILE = "RUBRIC.md"
+
 LOCKED_FILES: tuple[str, ...] = (
-    "RUBRIC.md",
-    "label_prompt.md",
+    DEFAULT_RUBRIC_FILE,
+    DEFAULT_PROMPT_FILE,
     "materials.jsonl",
     "fixture.jsonl",
     "labels.naysayer-tier.jsonl",
     "labels.frontier-tier.jsonl",
 )
+"""The files hashed by the v1 defaults. :func:`locked_files` substitutes the prompt / rubric
+names actually used (msg-4652)."""
+
+
+def locked_files(prompt_file: str, rubric_file: str) -> tuple[str, ...]:
+    """``LOCKED_FILES`` with the rubric / prompt names in use (msg-4652 DECIDED 2d-10)."""
+    return (rubric_file, prompt_file, *LOCKED_FILES[2:])
+
+
+def input_file(directory: Path, name: str, what: str) -> Path:
+    """msg-4654 DECIDED 2d-12: a bare file name that exists directly in ``directory``.
+
+    ``:`` is refused with the separators: on Windows ``directory / "C:x"`` leaves ``directory``
+    (a drive-relative path), which is the absolute-path case in another spelling."""
+    if not name or any(c in name for c in ("/", "\\", ":")) or name in (".", ".."):
+        raise LabelStopError(f"{what} must be a file name inside --dir, not a path: {name!r}")
+    path = directory / name
+    if not path.is_file():
+        raise LabelStopError(f"{what} {name!r} is not a file in {directory}")
+    return path
+
+
+def read_system_prompt(directory: Path, prompt_file: str, rubric_file: str) -> str:
+    """The labelling system prompt from ``directory / prompt_file`` + ``directory / rubric_file``
+    — the one reader for labelling and lock alike."""
+    prompt = input_file(directory, prompt_file, "--prompt-file").read_text(encoding="utf-8")
+    rubric = input_file(directory, rubric_file, "--rubric-file").read_text(encoding="utf-8")
+    return system_prompt(prompt, rubric)
 
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def write_lock(directory: Path) -> dict[str, Any]:
+def write_lock(
+    directory: Path,
+    prompt_file: str = DEFAULT_PROMPT_FILE,
+    rubric_file: str = DEFAULT_RUBRIC_FILE,
+) -> dict[str, Any]:
     """Record the hashes that must exist before any evaluation row goes to Jev (msg-4224 /
-    msg-4231). Refuses unless both label files cover every material row."""
+    msg-4231). Refuses unless both label files cover every material row.
+
+    ``prompt_file`` / ``rubric_file`` are bare names in ``directory`` (msg-4654 DECIDED 2d-12);
+    the manifest's ``sha256`` keys are :func:`locked_files` of those names."""
     materials = read_jsonl(directory / "materials.jsonl")
     keys = {(m["thread_id"], m["round_index"]) for m in materials}
-    prompt = (directory / "label_prompt.md").read_text(encoding="utf-8")
-    rubric = (directory / "RUBRIC.md").read_text(encoding="utf-8")
-    prompt_sha = sha256_text(system_prompt(prompt, rubric))
+    prompt_sha = sha256_text(read_system_prompt(directory, prompt_file, rubric_file))
     coverage: dict[str, dict[str, Any]] = {}
     for who in LABELLERS:
         rows = read_jsonl(directory / f"labels.{who}.jsonl")
@@ -392,7 +437,9 @@ def write_lock(directory: Path) -> dict[str, Any]:
     runs = read_jsonl(directory / "label_runs.jsonl")
     manifest = {
         "locked_at": datetime.now(UTC).isoformat(),
-        "sha256": {name: file_sha256(directory / name) for name in LOCKED_FILES},
+        "sha256": {
+            name: file_sha256(directory / name) for name in locked_files(prompt_file, rubric_file)
+        },
         "system_prompt_sha256": prompt_sha,
         "labellers": {who: {"tier": tier, **coverage[who]} for who, tier in LABELLERS.items()},
         "transport": TRANSPORT_DECISION,
@@ -409,6 +456,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--labeller", choices=sorted(LABELLERS), default=None)
     parser.add_argument("--lock", action="store_true", help="write the hash lock (manifest.json)")
     parser.add_argument("--dir", type=Path, default=Path("eval/tierc"))
+    parser.add_argument(
+        "--prompt-file",
+        default=DEFAULT_PROMPT_FILE,
+        help="label prompt: a file name inside --dir (msg-4654)",
+    )
+    parser.add_argument(
+        "--rubric-file",
+        default=DEFAULT_RUBRIC_FILE,
+        help="rubric: a file name inside --dir (msg-4654)",
+    )
     parser.add_argument("--endpoint", default="http://100.79.84.62:8110")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument(
@@ -423,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.lock:
         try:
-            manifest = write_lock(args.dir)
+            manifest = write_lock(args.dir, args.prompt_file, args.rubric_file)
         except LabelStopError as e:
             print(f"label_eval_set: STOP — {e}", file=sys.stderr)
             return 1
@@ -432,9 +489,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.labeller is None:
         parser.error("--labeller or --lock is required")
 
-    prompt = (args.dir / "label_prompt.md").read_text(encoding="utf-8")
-    rubric = (args.dir / "RUBRIC.md").read_text(encoding="utf-8")
-    system = system_prompt(prompt, rubric)
+    try:
+        system = read_system_prompt(args.dir, args.prompt_file, args.rubric_file)
+    except LabelStopError as e:
+        print(f"label_eval_set: STOP — {e}", file=sys.stderr)
+        return 1
     materials = read_jsonl(args.dir / "materials.jsonl")
     label_path = args.dir / f"labels.{args.labeller}.jsonl"
     if read_jsonl(label_path) and not args.resume:

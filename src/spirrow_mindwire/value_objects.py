@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 # --------------------------------------------------------------------------- #
 # §2.6 Enums
@@ -274,6 +274,9 @@ class ReplyDraft:
 # Preflight attestation (P-1b — msg-953 §2, Tier-C msg-954 §3)
 # --------------------------------------------------------------------------- #
 
+AttestationScope: TypeAlias = Literal["turn", "probe"]
+"""What an :class:`AttestationRecord`'s rows are rows of — see its ``scope`` field."""
+
 
 @dataclass(frozen=True)
 class AttestationRecord:
@@ -319,8 +322,16 @@ class AttestationRecord:
         The authority (``host:port``) the preflight was sent to — same
         normalisation as the ``source:`` line's ``route`` field.
     probe
-        An identifier for the accounting row that was read back (e.g.
+        An identifier for the accounting row(s) that were read back (e.g.
         ``cost-row#5992``), so a human can re-open the same evidence.
+    scope
+        **What those rows are rows of** (T-per-turn-backend-attestation).
+        ``"turn"``: the rows the naysayer turn itself caused, joined to it by a
+        per-turn trace id — the record speaks for the verdict it is stamped on.
+        ``"probe"``: the rows of a separate two-token preflight request made
+        before the turn — the record speaks for the route at that instant, not
+        for the tokens of the turn. Every post stamped before this field existed
+        is ``"probe"`` in fact, and the parser reads the six-field form that way.
     at
         When the observation was made. Timezone-aware; rendered in UTC.
     """
@@ -330,6 +341,7 @@ class AttestationRecord:
     expected: str
     route: str
     probe: str
+    scope: AttestationScope
     at: datetime
 
 
@@ -401,6 +413,7 @@ class Event:
 
 __all__ = [
     "AttestationRecord",
+    "AttestationScope",
     "Capability",
     "ChatroomEvent",
     "ErrorInfo",

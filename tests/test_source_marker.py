@@ -58,7 +58,7 @@ from spirrow_mindwire.source_marker import (
     render_attestation_marker,
     render_source_marker,
 )
-from spirrow_mindwire.value_objects import AttestationRecord
+from spirrow_mindwire.value_objects import AttestationRecord, AttestationScope
 
 
 def _options(
@@ -96,6 +96,7 @@ def _attestation(
     expected: str = "gemini",
     route: str = "{{IP_SERVICES}}:8110",
     probe: str = "cost-row#5992",
+    scope: AttestationScope = "turn",
     at: datetime | None = None,
 ) -> AttestationRecord:
     return AttestationRecord(
@@ -104,6 +105,7 @@ def _attestation(
         expected=expected,
         route=route,
         probe=probe,
+        scope=scope,
         at=at if at is not None else datetime(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
     )
 
@@ -501,7 +503,8 @@ def test_attestation_marker_has_its_own_prefix() -> None:
     assert not marker.startswith(SOURCE_MARKER_PREFIX)
     assert marker == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+        "· at=2026-08-13T00:23:48Z -->"
     )
 
 
@@ -660,6 +663,45 @@ def test_parse_round_trips_a_rendered_marker() -> None:
     assert parse_attestation_marker(render_attestation_marker(record)) == record
 
 
+@pytest.mark.parametrize("scope", ["turn", "probe"])
+def test_parse_round_trips_both_scopes(scope: AttestationScope) -> None:
+    record = _attestation(scope=scope)
+    assert parse_attestation_marker(render_attestation_marker(record)) == record
+
+
+def test_parse_reads_a_pre_scope_six_field_stamp_as_probe_scope() -> None:
+    """★ T-per-turn-backend-attestation §3: the legacy form still parses — as ``probe``.
+
+    Every naysayer post before ``scope`` existed carries this six-field line, and
+    every one of them was stamped from a separate preflight probe. Reading them
+    as ``probe`` states what they evidenced; it neither drops them (which would
+    un-attest the whole history for the gate) nor upgrades them to ``turn``. The
+    literal is a real stamp: Einstein's msg-5389 on this thread.
+    """
+    legacy = (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        "· route=100.79.84.62:8110 · probe=cost-row#14813 · at=2026-10-01T06:25:48Z -->"
+    )
+    record = parse_attestation_marker(legacy)
+    assert record is not None
+    assert record.scope == "probe"
+    assert record.probe == "cost-row#14813"
+
+
+@pytest.mark.parametrize("bad", ["Turn", "session", "turn+probe", "spawn"])
+def test_parse_rejects_a_seven_field_stamp_with_an_unknown_scope(bad: str) -> None:
+    line = (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        f"· route=h:8110 · probe=cost-row#1 · scope={bad} · at=2026-10-01T06:25:48Z -->"
+    )
+    assert parse_attestation_marker(line) is None
+
+
+def test_the_rendered_stamp_always_names_its_scope() -> None:
+    assert " · scope=turn · " in render_attestation_marker(_attestation(scope="turn"))
+    assert " · scope=probe · " in render_attestation_marker(_attestation(scope="probe"))
+
+
 def test_parse_reads_the_stamp_off_a_stamped_body() -> None:
     """The production shape: a body with both marker lines appended below it."""
     opts = _options(env={"ANTHROPIC_BASE_URL": "http://{{IP_SERVICES}}:8110"}, model="naysayer")
@@ -683,7 +725,8 @@ def test_parse_ignores_a_quoted_marker_that_is_not_the_stamp() -> None:
     quoting_body = (
         "The format under discussion is\n\n"
         "    <!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->\n\n"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+        "· at=2026-08-13T00:23:48Z -->\n\n"
         "and I think the field order is wrong.\n\nNEXT: Heisenberg"
     )
     assert parse_attestation_marker(quoting_body) is None
@@ -728,12 +771,14 @@ def test_parse_ignores_a_source_marker() -> None:
         ),
         (
             "<!-- attest: tier=naysayer · backend=gemini · expected= "
-            "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->",
+            "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+            "· at=2026-08-13T00:23:48Z -->",
             "an empty field value",
         ),
         (
             "<!-- attest: tier=naysayer · gemini · expected=gemini "
-            "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->",
+            "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+            "· at=2026-08-13T00:23:48Z -->",
             "a bare value with no key",
         ),
         (

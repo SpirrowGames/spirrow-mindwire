@@ -70,6 +70,7 @@ structurally out of the loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import Counter
 from collections.abc import Mapping
@@ -122,23 +123,29 @@ from .gate_records import (
     RelayRoute,
     ci_route_heads,
     normalize_sha,
+    render_admission_heading,
     render_ci_route_marker,
     verdict_heads,
 )
 from .handoff import (
     HUMAN_TOKEN,
+    NONE_TOKEN,
     OPERATOR_FORM_EXAMPLE,
     OPERATOR_TOKEN,
     Handoff,
     HandoffKind,
+    MismatchReason,
     OperatorFault,
     declares_no_tier_c,
     declares_tier_c,
     parse_next_token,
     resolve_handoff,
 )
+from .head_skip import stage1_skips
+from .human_identity import is_human_identity
 from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
+from .run_budget import RunPhase, enter_phase
 from .spawn_timeout import (
     SPAWN_ATTEMPTS,
     SpawnGaveUp,
@@ -433,6 +440,7 @@ class Conductor:
         tierc_gate: TierCGate | None = None,
         retry_of: RetryOf | None = None,
         decisions_log_path: Path | None = None,
+        run_phase: RunPhase | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -521,6 +529,9 @@ class Conductor:
         # the sweep (``--retry-of``). ``None`` (the default) = not a retry; no prompt changes.
         # Read only by ``_dispatch_recording``, through :func:`.retry_notice.retry_notice_for`.
         self._retry_of = retry_of
+        # Wall-clock budget (msg-5498 W-1): where the run is, for the ``phase`` field of
+        # ``conductor.run_timeout``. ``None`` = nobody reads it (tests, library callers).
+        self._run_phase = run_phase
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -574,6 +585,8 @@ class Conductor:
         forced = 0
         forced_saveable = 0
         for round_index in range(self._max_rounds):
+            if self._run_phase is not None:
+                self._run_phase.rounds_started = round_index + 1
             # Control first: a `hold` then costs one MCP read and no thread fetch, and reading it
             # per round rather than per run is what bounds an operator's HOLD to one round of
             # latency. Unreadable ⇒ `hold` (control.FAILSAFE_CONTROL_STATE) — never fail open.
@@ -918,6 +931,10 @@ class Conductor:
                     if redirect_body is not None:
                         posted = await self._post_as_conductor_relay(redirect_body)
                         latest_msg_id = _msg_id(posted) or latest_msg_id
+                    else:
+                        latest_msg_id = await self._post_field_stop_notice(
+                            handoff, latest, stop_reason, latest_msg_id
+                        )
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
             # count describes the head this launch started on; a later round is on a head this
@@ -1614,6 +1631,127 @@ class Conductor:
             )
         return None
 
+    async def _post_field_stop_notice(
+        self,
+        handoff: Handoff,
+        latest: dict[str, Any],
+        stop_reason: StopReason,
+        latest_msg_id: str,
+    ) -> str:
+        """Move a head the conductor stopped on its FIELD but head_skip launched on its BODY.
+
+        T-role-body-field-divergence-relaunch (Bohr msg-5855 / msg-5857 / msg-5859, design approved
+        by Einstein msg-5858). head_skip reads only the body's ``NEXT:``; the conductor routes by
+        the structured ``next_participant`` field first. When the field stops the run (``HUMAN``
+        or ``SETTLED``) and the body is not a token head_skip SKIPs, nothing used to be posted: the
+        head kept saying e.g. ``NEXT: Bohr``, and every tick relaunched it into the same quiet
+        park. Invariant pinned here: **a head head_skip LAUNCHes always gets a notice that moves
+        it.**
+
+        D2 — called only when neither :meth:`_terminal_notice` nor the guard-(i) redirect posted,
+        and fires only when all three hold:
+
+        - ``stop_reason`` is ``HUMAN`` or ``SETTLED`` (every field-driven stop is one of the two);
+        - the field is set (:func:`_next_participant` reads the FIELD, never the body), so the
+          field-less NO_HANDOFF case stays out of scope by construction;
+        - :func:`.head_skip.stage1_skips` says head_skip does NOT skip the body — the predicate
+          head_skip itself uses, so the boundary cannot drift between the two (D1).
+
+        D3 — two notice kinds:
+
+        - **N1** (``mismatch_reason`` set): a routing stand-down. A ``conductor.stand_down`` event
+          (``unresolved=identity``, reason = the mismatch reason) is emitted, its stop marker sits
+          above the final ``NEXT: human``, and a notice that does not land raises
+          :class:`StandDownError` (exit 3), like every other stand-down.
+        - **N2** (field ``human`` / ``none`` won over a body that named nothing routable): the
+          conductor copies the field's decision onto the head. No marker; the board reads it as a
+          decision / settle (D7). A notice that does not land is logged at ERROR and the run stops
+          as before (exit 0) — the handling the self-handoff / spawn-blocked notices get.
+
+        Returns the ``last_msg_id`` for the stop: the posted notice's id, else ``latest_msg_id``.
+
+        Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE):
+
+        - Intended reader: the human who owns the target thread (N1: realign the field and the
+          body and repost; N2: the decision the field already stated), and head_skip on the next
+          tick, which reads the final ``NEXT:`` and SKIPs.
+        - Fallback when the thread is gone: disposition **(3) fail loudly**. ``_post_as_relay``
+          turns a :class:`ThreadResolvedError` into an empty ``msg_id``. N1 then raises
+          :class:`StandDownError` (non-zero exit → wrapper quarantine + Discord); N2 logs at ERROR
+          into the run log the wrapper keeps. Nothing is posted into any other thread.
+        """
+        field = _next_participant(latest)
+        body = _content(latest)
+        if (
+            stop_reason not in (StopReason.HUMAN, StopReason.SETTLED)
+            or field is None
+            or stage1_skips(body)
+        ):
+            return latest_msg_id
+        body_target = parse_next_token(body)
+        body_label = f"`NEXT: {body_target}`" if body_target else "`NEXT:` 行なし"
+        if handoff.mismatch_reason is not None:
+            reason = (
+                StandDownReason.FIELD_BODY_DIVERGENCE
+                if handoff.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
+                else StandDownReason.FIELD_UNRESOLVABLE
+            )
+            stand_down = stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=reason,
+                project=self._thread_ref.project_id,
+                thread=self._thread_ref.thread_id,
+                detail=(
+                    f"next_participant field {field!r} vs body NEXT target {body_target!r} "
+                    f"({handoff.mismatch_reason.value})"
+                ),
+            )
+            emit_stand_down(stand_down)
+            cause = (
+                "field と本文が別の宛先を指しています"
+                if reason is StandDownReason.FIELD_BODY_DIVERGENCE
+                else "field の値が参加者にも sentinel にも解決できません"
+            )
+            notice = _with_stop_marker(
+                "Conductor stand-down — `next_participant` field と本文の `NEXT:` が"
+                "食い違っています\n\n"
+                f"- field の値: `{field}`\n"
+                f"- 本文の宛先: {body_label}\n"
+                f"- 理由: `{reason.value}` ({cause})\n\n"
+                "Conductor は field を優先して止まりましたが、sweep は本文だけを読むため、"
+                "このままでは同じ head を起動し続けます。∴ 誰も spawn せず、"
+                "人間の介入が必要な停止として扱いました。\n\n"
+                "次にやること: field と本文の `NEXT:` を同じ宛先に揃えて投稿し直してください。"
+                "head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}",
+                stand_down,
+            )
+            posted = await self._post_as_relay(notice)
+            posted_id = _msg_id(posted)
+            if not posted_id:
+                raise StandDownError(stand_down)
+            return posted_id
+        terminal = NONE_TOKEN if stop_reason is StopReason.SETTLED else HUMAN_TOKEN
+        notice = (
+            "Conductor stop — `next_participant` field の判断を head に書き写します\n\n"
+            f"この投稿の field は `{field}` で、本文は {body_label} です。Conductor は field に"
+            "従って止まりましたが、sweep は本文だけを読むため、このままでは同じ head を"
+            "起動し続けます。field の判断をそのまま最終行に書き写します。\n\n"
+            f"NEXT: {terminal}"
+        )
+        posted = await self._post_as_relay(notice)
+        posted_id = _msg_id(posted)
+        if not posted_id:
+            logger.error(
+                "conductor field-stop notice did not land in thread %r (field=%r, body=%r); "
+                "stopping without moving the head",
+                self._thread_ref.thread_id,
+                field,
+                body_target,
+            )
+            return latest_msg_id
+        return posted_id
+
     def _identity_stand_down(
         self, handoff: Handoff, reason: StopReason, spawn_blocked: bool
     ) -> Event | None:
@@ -1839,8 +1977,9 @@ class Conductor:
         ``author`` string, so this carve-out is best-effort loop-level noise-reduction, NOT the
         authoritative Tier-C guard — that is the human's manual ``main`` merge (mirrors the
         implementer allow-list's environment-containment stance). Stronger author authentication
-        (ADR-11 normalization) is a deferred hardening."""
-        return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
+        (ADR-11 normalization) is a deferred hardening. The rule itself lives in
+        :func:`~.human_identity.is_human_identity`, shared with the shadow exporter (2d-14)."""
+        return is_human_identity(author, self._human_identity)
 
     def _attested(self, msg: dict[str, Any]) -> bool:
         """Does ``msg`` carry a well-formed harness attestation stamp (P-3, Tier-C msg-970)?
@@ -1948,14 +2087,15 @@ class Conductor:
         # for a *different* class of bug (a well-formed but oddly-shaped
         # response); the envelope path used to hide inside it and no longer
         # does.
-        result = await self._mcp.call_tool(
-            "chatroom_get_thread",
-            {
-                "project": self._thread_ref.project_id,
-                "thread_id": self._thread_ref.thread_id,
-                "mode": "full",
-            },
-        )
+        with enter_phase(self._run_phase, "thread.read"):
+            result = await self._mcp.call_tool(
+                "chatroom_get_thread",
+                {
+                    "project": self._thread_ref.project_id,
+                    "thread_id": self._thread_ref.thread_id,
+                    "mode": "full",
+                },
+            )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
@@ -1972,12 +2112,13 @@ class Conductor:
         not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
-            project=self._thread_ref.project_id,
-            pr_ref=pr_ref,
-            design_thread=self._thread_ref.thread_id,
-            implementer=self._implementer_identity,
-        )
+        with enter_phase(self._run_phase, "pr_gate.review"):
+            _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
+                project=self._thread_ref.project_id,
+                pr_ref=pr_ref,
+                design_thread=self._thread_ref.thread_id,
+                implementer=self._implementer_identity,
+            )
         # The route the relay writer decided (U3'). A relay dict without one — a caller that
         # predates U3', or a malformed return — fails to the human, the safe direction.
         route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
@@ -2377,7 +2518,7 @@ class Conductor:
         a 6 h / 12 h cap to elapse and R5 needs a second red on an unchanged head.
         """
         body = (
-            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"{render_admission_heading(pr_ref)}\n\n"
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"{decision.reason}\n\n"
             f"The gate was NOT fired. This is a machine observation of CI, not a review.\n\n"
@@ -2403,7 +2544,7 @@ class Conductor:
         )
         checks_line = ", ".join(failing) if failing else "<no named failing check>"
         body = (
-            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"{render_admission_heading(pr_ref)}\n\n"
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"CI is red on {rollup.head_sha[:12]}: {checks_line}\n\n"
             f"{decision.reason}\n\n"
@@ -2467,7 +2608,8 @@ class Conductor:
         """
         for attempt in range(1, SPAWN_ATTEMPTS + 1):
             try:
-                return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
+                with enter_phase(self._run_phase, f"{role.value}.spawn"):
+                    return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
             except AdapterSpawnTimeoutError as exc:
                 event = spawn_timeout_event(
                     adapter_id=exc.adapter_id,
@@ -2542,9 +2684,15 @@ class Conductor:
                 "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
             )
         try:
-            await self._dispatcher.dispatch(
-                handle, self._to_event(msg, messages, retry_notice=notice)
-            )
+            with enter_phase(self._run_phase, f"{role.value}.dispatch"):
+                await self._dispatcher.dispatch(
+                    handle, self._to_event(msg, messages, retry_notice=notice)
+                )
+        except asyncio.CancelledError:
+            # A cancellation is the wall-clock budget taking the run back (msg-5498 W-1), not an
+            # adapter failure. Recording a snapshot here would make ``loop_runner.main`` print an
+            # ``adapter_error`` stop line and exit 1 over the run_timeout's own exit code.
+            raise
         except BaseException as exc:
             if self._stop_slot is not None:
                 self._stop_slot.snapshot = ConductorStopSnapshot(

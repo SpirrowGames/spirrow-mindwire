@@ -1,0 +1,872 @@
+"""T-decider-conductor-hook step 2d — ``scripts/export_shadow_eval_set.py``.
+
+Spec: Bohr msg-4634 DECIDED 2d-2 (no Jev column in the labellers' files — checked column by
+column; out-of-scope rows excluded), msg-4636 DECIDED 2d-3 (tests 19 / 21: no state rebuild, rows
+without the point-in-time columns excluded), msg-4639 DECIDED 2d-4 / 2d-6
+(one registered version only, ``tierc-v3`` since 2d-15; ``following`` = 3, constants from
+``build_tierc_eval_fixture``), msg-4641 DECIDED 2d-7 (tests 20, 22a-22d: terminated / quiet
+threads, the 72-hour boundary, determinism) and msg-4643 DECIDED 2d-8
+(tests 22e-22g: the ``--as-of`` cut comes first). Test 18 lives in ``test_decider_step2.py``.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+import json
+import logging
+import sys
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from spirrow_mindwire.adapters.decider_lexora import DeciderLexoraAdapter
+from spirrow_mindwire.conductor.tierc_gate import TIERC_BOUNCE_HEADER
+from spirrow_mindwire.decider.hook import ThreadMessage, run_tierc_hook
+from spirrow_mindwire.decider.questions import load_tierc_rules, tierc_rules_template_path
+from spirrow_mindwire.value_objects import Role
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "export_shadow_eval_set.py"
+
+
+def _load(name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(f"{name}_module", ROOT / "scripts" / f"{name}.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[f"{name}_module"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ex = _load("export_shadow_eval_set")
+report = _load("tierc_eval_report")
+builder = _load("build_tierc_eval_fixture")
+
+SHA = "a" * 64
+ROSTER = {"Bohr": "proposer", "Einstein": "naysayer", "Heisenberg": "implementer"}
+T0 = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
+AS_OF = T0 + timedelta(days=10)
+
+
+def _at(minutes: float) -> str:
+    return (T0 + timedelta(minutes=minutes)).isoformat()
+
+
+def _msg(i: int, author: str = "Bohr", body: str | None = None, at: str | None = None) -> Any:
+    return ex.Message(
+        msg_id=f"msg-{i}",
+        author=author,
+        content=body if body is not None else f"body {i}\n\nNEXT: Einstein",
+        timestamp=at if at is not None else _at(i),
+    )
+
+
+def _thread(n: int) -> list[Any]:
+    return [_msg(i, "Einstein" if i % 2 else "Bohr") for i in range(n)]
+
+
+def _row(
+    *,
+    thread_id: str = "T-a",
+    round_index: int = 1,
+    latest: str | None = "msg-6",
+    routed: str = "stop",
+    sha: str | None = SHA,
+    version: str = "tierc-v3",
+    logged_at: str | None = None,
+    wire: bool = True,
+) -> dict[str, Any]:
+    r: dict[str, Any] = {
+        "thread_id": thread_id,
+        "round_index": round_index,
+        "stop": "human" if routed != "forced_naysayer" else None,
+        "routed": routed,
+        "gate_kind": None,
+        "gate_is_grey_zone": False,
+        "outcome": "evaluated",
+        "decision_id": f"d-{thread_id}-{latest}",
+        "provider": "jev",
+        "raw_answers": {"should_ask_human": {"noul": 0.3}},
+        "verdict": {"kind": "UNSURE", "scope": "in_gate", "ask_score": 0.3, "fired_reason": None},
+        "policy": "live",
+        "questions_version": version,
+        "latency_ms": 5,
+        "error": None,
+        "matched_rule": "none",
+        "matched_rule_source": "choice",
+        "matched_rule_error": None,
+        "rules_sha256": sha,
+    }
+    if wire:
+        r["latest_msg_id"] = latest
+        r["roster"] = dict(ROSTER)
+        r["logged_at"] = logged_at if logged_at is not None else _at(6.5)
+        r["state_wire"] = json.dumps(
+            {"thread_id": thread_id, "round_index": round_index, "gate_result": None},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return r
+
+
+def _build(rows: list[dict[str, Any]], threads: Mapping[str, Any], as_of: datetime = AS_OF) -> Any:
+    return ex.build_outputs(rows, SHA, threads, as_of, human_identity="human")
+
+
+def _bytes(out: Any) -> str:
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+def _keys_deep(obj: Any) -> set[str]:
+    if isinstance(obj, Mapping):
+        out = set(obj)
+        for v in obj.values():
+            out |= _keys_deep(v)
+        return out
+    if isinstance(obj, list):
+        out = set()
+        for v in obj:
+            out |= _keys_deep(v)
+        return out
+    return set()
+
+
+# --------------------------------------------------------------------------- test 19 / 2d-6
+
+
+def test_exporter_never_imports_the_state_builder() -> None:
+    """Test 19 (msg-4636): no ``state_builder`` / ``turn_from_messages`` and no direct import
+    from ``spirrow_mindwire.decider`` — the state comes from the log, never rebuilt."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+    assert "state_builder" not in imported
+    assert "turn_from_messages" not in imported
+    assert not [m for m in imported if m.startswith("spirrow_mindwire.decider")]
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert "state_builder" not in names and "turn_from_messages" not in names
+
+
+def test_material_constants_come_from_the_replay_builder() -> None:
+    """msg-4639 DECIDED 2d-6: one definition, imported — not a copy."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    from_builder = {
+        a.name
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ImportFrom) and n.module == "build_tierc_eval_fixture"
+        for a in n.names
+    }
+    assert from_builder == {
+        "MATERIAL_BODY_MAX",
+        "MATERIAL_FOLLOWING_N",
+        "MATERIAL_HEAD_M",
+        "MATERIAL_PRIOR_N",
+    }
+    assert ex.MATERIAL_FOLLOWING_N == builder.MATERIAL_FOLLOWING_N == 3
+
+
+# --------------------------------------------------------------------------- test 20 / 22a-c
+
+
+def test_output_is_fixed_once_three_following_exist() -> None:
+    """Test 20 (msg-4641): messages after i+3 change nothing."""
+    before = _build([_row()], {"T-a": ("p", _thread(10))})
+    after = _build([_row()], {"T-a": ("p", _thread(15))})
+    assert _bytes(before) == _bytes(after)
+    (m,) = before[0]
+    assert m["msg_id"] == "msg-6" and m["following_n"] == 3
+    assert [f["msg_id"] for f in m["following"]] == ["msg-7", "msg-8", "msg-9"]
+    assert [p["msg_id"] for p in m["prior"]] == [f"msg-{i}" for i in range(1, 6)]
+
+
+def test_terminated_thread_row_is_counted_with_one_following() -> None:
+    """22a: the thread ended with ``NEXT: none`` after 1 message → counted, ``following_n=1``."""
+    thread = [*_thread(7), _msg(7, "human", "decided.\n\nNEXT: none")]
+    materials, fixture, _, summary = _build(
+        [_row()], {"T-a": ("p", thread)}, T0 + timedelta(hours=1)
+    )
+    assert summary["counted"] == 1 and summary["held"] == 0
+    assert materials[0]["following_n"] == 1 == fixture[0]["following_n"]
+    assert summary["following_n_lt_3"] == 1
+
+
+def test_quiet_thread_row_is_counted_with_no_following() -> None:
+    """22b: last message ≥ 72 h before ``--as-of`` → counted with ``following_n=0``."""
+    materials, _, _, summary = _build([_row()], {"T-a": ("p", _thread(7))}, AS_OF)
+    assert summary["counted"] == 1
+    assert materials[0]["following"] == [] and materials[0]["following_n"] == 0
+
+
+def test_seventy_two_hour_boundary() -> None:
+    """22c: exactly 72 h after the last message counts; one second less is held."""
+    last = T0 + timedelta(minutes=6)
+    threads = {"T-a": ("p", _thread(7))}
+    at = _build([_row()], threads, last + timedelta(hours=72))[3]
+    before = _build([_row()], threads, last + timedelta(hours=72) - timedelta(seconds=1))[3]
+    assert (at["counted"], at["held"]) == (1, 0)
+    assert (before["counted"], before["held"]) == (0, 1)
+
+
+def test_held_row_is_counted_by_number_only_then_exported_once_ready() -> None:
+    """msg-4641: an active thread with < 3 following is held; once 3 more messages exist (by a
+    later ``--as-of``) the row is exported."""
+    as_of = T0 + timedelta(hours=1)
+    short = _build([_row()], {"T-a": ("p", _thread(8))}, as_of)
+    assert short[0] == [] and short[1] == [] and short[2] == []
+    assert short[3]["held"] == 1 and short[3]["by_bucket"] == {ex.HELD: 1}
+    ready = _build([_row()], {"T-a": ("p", _thread(10))}, as_of)
+    assert ready[3]["counted"] == 1 and ready[0][0]["following_n"] == 3
+
+
+# --------------------------------------------------------------------------- 22d-g (--as-of)
+
+
+def test_data_after_as_of_changes_no_byte() -> None:
+    """22d + 22e (msg-4643): a thread quiet for 72 h at ``--as-of`` then resumes, and new log
+    rows arrive — materials / fixture / replay and the held count are byte-identical."""
+    as_of = T0 + timedelta(hours=80)
+    rows = [_row(), _row(thread_id="T-b", latest="msg-1", logged_at=_at(1.5))]
+    t_b = [*_thread(3), _msg(3, at=(as_of - timedelta(hours=1)).isoformat())]
+    threads = {"T-a": ("p", _thread(7)), "T-b": ("q", t_b)}
+    first = _build(rows, threads, as_of)
+    later = [
+        _msg(100 + k, "human", at=(as_of + timedelta(minutes=k + 1)).isoformat()) for k in range(4)
+    ]
+    grown_threads = {"T-a": ("p", [*_thread(7), *later]), "T-b": ("q", [*t_b, *later])}
+    late_row = _row(latest="msg-100", logged_at=(as_of + timedelta(minutes=2)).isoformat())
+    second = _build([*rows, late_row], grown_threads, as_of)
+    assert _bytes(first) == _bytes(second)
+    # T-a was quiet 80 h → counted with 0 following; T-b has 2 following and moved 1 h ago → held.
+    assert first[3]["counted"] == 1 and first[3]["held"] == 1
+
+
+def test_rows_logged_after_as_of_are_in_no_bucket() -> None:
+    """22f: a row with ``logged_at > as_of`` is neither counted nor held nor bucketed."""
+    as_of = T0 + timedelta(hours=100)
+    late = _row(logged_at=(as_of + timedelta(seconds=1)).isoformat())
+    out = _build([late], {"T-a": ("p", _thread(7))}, as_of)
+    assert out[0] == [] and out[3]["by_bucket"] == {} and out[3]["rows_up_to_as_of"] == 0
+    on_time = _row(logged_at=as_of.isoformat())
+    assert _build([on_time], {"T-a": ("p", _thread(7))}, as_of)[3]["counted"] == 1
+
+
+def test_message_at_exactly_as_of_is_kept() -> None:
+    """22g: ``timestamp == as_of`` stays."""
+    as_of = T0 + timedelta(minutes=9)
+    materials, *_ = _build([_row()], {"T-a": ("p", _thread(10))}, as_of)
+    assert [f["msg_id"] for f in materials[0]["following"]] == ["msg-7", "msg-8", "msg-9"]
+    cut = _build([_row()], {"T-a": ("p", _thread(10))}, as_of - timedelta(seconds=1))
+    assert cut[3]["held"] == 1
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        ("2026-10-05T00:00:00", "no timezone"),
+        ("2026-10-05", "no timezone"),
+        ("yesterday", "not ISO 8601"),
+        ("2026-10-12T00:00:01+00:00", "in the future"),
+    ],
+)
+def test_as_of_must_be_aware_and_not_future(raw: str, match: str) -> None:
+    """22g: naive or future ``--as-of`` is an error."""
+    with pytest.raises(ex.ExportError, match=match):
+        ex.parse_as_of(raw, datetime(2026, 10, 12, tzinfo=UTC))
+    assert ex.parse_as_of("2026-10-12T09:00:00+09:00", datetime(2026, 10, 12, tzinfo=UTC))
+
+
+def test_main_refuses_bad_as_of(tmp_path: Path) -> None:
+    log = tmp_path / "c.log"
+    log.write_text("", encoding="utf-8")
+    base = ["--log", str(log), "--rules-sha256", SHA, "--project", "p"]
+    base += ["--out-dir", str(tmp_path / "lab"), "--replay-out", str(tmp_path / "r.jsonl")]
+    now = datetime(2026, 10, 12, tzinfo=UTC)
+    assert ex.main([*base, "--as-of", "2026-10-11T00:00:00"], now=now) == 2
+    assert ex.main([*base, "--as-of", "2026-10-13T00:00:00+00:00"], now=now) == 2
+    assert not (tmp_path / "lab").exists()
+
+
+# --------------------------------------------------------------------------- test 21 / scope
+
+
+def test_rows_without_point_in_time_columns_are_not_counted() -> None:
+    """Test 21 (msg-4636): a row written before the columns existed is counted by bucket only."""
+    rows = [_row(wire=False), _row(thread_id="T-b", latest="msg-3")]
+    materials, fixture, replay, summary = _build(rows, {"T-b": ("p", _thread(7))})
+    assert [m["thread_id"] for m in materials] == ["T-b"]
+    assert len(fixture) == len(replay) == 1
+    assert summary["by_bucket"] == {ex.COUNTED: 1, ex.NO_POINT_IN_TIME: 1}
+
+
+@pytest.mark.parametrize(
+    ("row", "bucket"),
+    [
+        (_row(wire=False), "no_point_in_time_columns"),
+        (_row(latest=None), "no_point_in_time_columns"),
+        ({**_row(), "logged_at": None}, "no_point_in_time_columns"),
+        (_row(routed="forced_naysayer"), "routed:forced_naysayer"),
+        (_row(routed="spawn_blocked"), "routed:spawn_blocked"),
+        (_row(version="tierc-v1"), "questions_version_not_registered"),
+        (_row(version="tierc-v2"), "questions_version_not_registered"),
+        (_row(sha="b" * 64), "rules_sha256_mismatch"),
+        (_row(sha=None), "rules_sha256_mismatch"),
+        (_row(), "candidate"),
+    ],
+)
+def test_classify(row: dict[str, Any], bucket: str) -> None:
+    """2d-1 / 2d-3 / 2d-4: the scope, and the separate forced / spawn table."""
+    assert ex.classify(row, SHA) == bucket
+
+
+def test_out_of_scope_rows_need_no_thread_fetch() -> None:
+    rows = [_row(routed="forced_naysayer"), _row(routed="spawn_blocked"), _row(sha="c" * 64)]
+    materials, _, _, summary = _build(rows, {})
+    assert materials == []
+    assert summary["counted"] == 0 and summary["rows_up_to_as_of"] == 3
+
+
+def test_duplicate_latest_msg_id_stops_the_export() -> None:
+    with pytest.raises(ex.ExportError, match="msg-6"):
+        _build([_row(), _row(round_index=4)], {"T-a": ("p", _thread(10))})
+
+
+def test_unfetched_thread_or_missing_message_stops_the_export() -> None:
+    with pytest.raises(ex.ExportError, match="not fetched"):
+        _build([_row()], {})
+    with pytest.raises(ex.ExportError, match="not in the fetched thread"):
+        _build([_row()], {"T-a": ("p", _thread(3))})
+
+
+# --------------------------------------------------------------------------- double blind
+
+
+def test_labeller_files_carry_no_jev_column() -> None:
+    """msg-4634 DECIDED 2d-2 negative test: column by column, at every depth."""
+    materials, fixture, replay, _ = _build([_row()], {"T-a": ("p", _thread(10))})
+    for col in sorted(ex.JEV_COLUMNS):
+        for m in materials:
+            assert col not in _keys_deep(m), col
+        for f in fixture:
+            assert col not in _keys_deep(f), col
+    assert {"state", "decision"} <= set(replay[0])
+    assert replay[0]["decision"]["raw_answers"] == {"should_ask_human": {"noul": 0.3}}
+
+
+def test_jev_columns_cover_every_decision_result_key() -> None:
+    from spirrow_mindwire.decider.result import (
+        DecisionOutcome,
+        DecisionResult,
+        decision_result_to_dict,
+    )
+
+    dr = DecisionResult(
+        outcome=DecisionOutcome.TRANSPORT_ERROR,
+        decision_id=None,
+        provider=None,
+        raw_answers=None,
+        verdict=None,
+        policy="p",
+        questions_version="v",
+        latency_ms=None,
+        error="x",
+    )
+    assert set(decision_result_to_dict(dr)) <= ex.JEV_COLUMNS
+    assert set(ex._DECISION_KEYS) == set(decision_result_to_dict(dr))
+
+
+def test_replay_out_inside_out_dir_is_refused(tmp_path: Path) -> None:
+    log = tmp_path / "c.log"
+    log.write_text("", encoding="utf-8")
+    rc = ex.main(
+        [
+            "--log",
+            str(log),
+            "--rules-sha256",
+            SHA,
+            "--project",
+            "p",
+            "--as-of",
+            "2026-10-01T00:00:00+00:00",
+            "--out-dir",
+            str(tmp_path / "lab"),
+            "--replay-out",
+            str(tmp_path / "lab" / "replay.jsonl"),
+        ]
+    )
+    assert rc == 2
+    assert not (tmp_path / "lab").exists()
+
+
+# --------------------------------------------------------------------------- report formats
+
+
+def test_outputs_join_in_tierc_eval_report() -> None:
+    """``--replay`` / ``--fixture`` shapes, keyed the same, ``msg_id`` = ``latest_msg_id``."""
+    rows = [_row(), _row(thread_id="T-b", round_index=1, latest="msg-2", logged_at=_at(2.5))]
+    materials, fixture, replay, _ = _build(
+        rows, {"T-a": ("p", _thread(12)), "T-b": ("q", _thread(6))}
+    )
+    joined = report.join(replay, fixture)
+    assert [(r.key, r.msg_id, r.author, r.project) for r in joined] == [
+        (("T-a", 6), "msg-6", "Bohr", "p"),
+        (("T-b", 2), "msg-2", "Bohr", "q"),
+    ]
+    assert all(r.live_entry and r.roster_source == "logged" for r in joined)
+    assert all(r.questions_version == "tierc-v3" and r.ask_score == 0.3 for r in joined)
+    assert [r.following_n for r in joined] == [3, 3]
+    assert {(m["thread_id"], m["round_index"]) for m in materials} == {r.key for r in joined}
+    assert [f["conductor_round_index"] for f in fixture] == [1, 1]
+
+
+def test_parse_log_lines_reads_only_decider_rows() -> None:
+    rec = _row()
+    lines = [
+        "INFO:spirrow_mindwire.conductor:something else",
+        f"INFO:spirrow_mindwire.decider.hook:decider_decision {json.dumps(rec)}",
+    ]
+    assert ex.parse_log_lines(lines) == [rec]
+    with pytest.raises(ex.ExportError):
+        ex.parse_log_lines(["decider_decision {not json"])
+
+
+# --------------------------------------------------------------------------- end to end
+
+
+class _Client:
+    def __init__(self) -> None:
+        self.bodies: list[dict[str, Any]] = []
+
+    async def decide(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.bodies.append(body)
+        return {
+            "answers": {
+                "should_ask_human": {"noul": 0.2},
+                "matched_rule": {"choice": "none", "probabilities": {"none": 1.0}},
+            },
+            "provider": "jev",
+            "decision_id": "d-e2e",
+            "latency_ms": 3,
+        }
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.anyio
+async def test_hook_log_line_exports_the_state_jev_was_sent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real hook row → exporter: the Jev-side ``state`` equals what the adapter sent, the
+    row's ``logged_at`` is the hook's ``now`` and the material is keyed at the logged head."""
+    rules = load_tierc_rules(tierc_rules_template_path())
+    c = _Client()
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c, rules=rules)
+    roster = {"Bohr": Role.PROPOSER, "Einstein": Role.NAYSAYER}
+    thread = [
+        ThreadMessage("msg-0", "Bohr", "plan\n\nNEXT: Einstein", "Einstein"),
+        ThreadMessage("msg-1", "Einstein", "critique\n\nNEXT: Bohr", "Bohr"),
+        ThreadMessage("msg-2", "Bohr", "need a call\n\nNEXT: human", "human"),
+    ]
+    decided = T0 + timedelta(minutes=3)
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        await run_tierc_hook(
+            adapter,
+            thread_id="T-e2e",
+            round_index=0,
+            roster=roster,
+            messages=thread,
+            stop="human",
+            is_forced=False,
+            target_role=None,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
+            author_requested_human=True,
+            now=decided,
+        )
+    rows = ex.parse_log_lines(r.getMessage() for r in caplog.records)
+    (row,) = rows
+    assert row["logged_at"] == decided.isoformat()
+    msgs = [ex.Message(m.msg_id, m.author, m.content, _at(k)) for k, m in enumerate(thread)]
+    msgs.append(ex.Message("msg-3", "human", "ok\n\nNEXT: none", _at(4)))
+    materials, fixture, replay, summary = ex.build_outputs(
+        rows,
+        str(row["rules_sha256"]),
+        {"T-e2e": ("p", msgs)},
+        T0 + timedelta(hours=1),
+        human_identity="human",
+    )
+    assert summary["counted"] == 1
+    assert replay[0]["state"] == json.loads(c.bodies[0]["state"])
+    assert replay[0]["decision"]["decision_id"] == "d-e2e"
+    assert materials[0]["msg_id"] == "msg-2" and materials[0]["round_index"] == 2
+    assert materials[0]["following_n"] == 1
+    assert fixture[0]["roster"] == {"Bohr": "proposer", "Einstein": "naysayer"}
+
+
+# --------------------------------------------------------------------------- 2d-10 / 2d-12
+
+
+labeller = _load("label_eval_set")
+EVAL = ROOT / "eval" / "tierc"
+
+
+def _labelled_dir(tmp_path: Path, prompt: str, rubric: str) -> Path:
+    """A lockable directory labelled under ``prompt`` + ``rubric`` (names inside it)."""
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / prompt).write_text("prompt text\n", encoding="utf-8")
+    (d / rubric).write_text("rubric text\n", encoding="utf-8")
+    (d / "fixture.jsonl").write_text("", encoding="utf-8")
+    mats = [{"thread_id": "T", "round_index": i} for i in range(2)]
+    (d / "materials.jsonl").write_text("".join(json.dumps(m) + "\n" for m in mats), "utf-8")
+    sha = labeller.sha256_text(labeller.system_prompt("prompt text\n", "rubric text\n"))
+    for who in labeller.LABELLERS:
+        rows = [{**m, "backend": "b", "model": "m", "prompt_sha256": sha} for m in mats]
+        (d / f"labels.{who}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+        )
+    return d
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "./RUBRIC-v2.md",
+        "sub/RUBRIC-v2.md",
+        "../RUBRIC-v2.md",
+        "ABSOLUTE",
+        "sub\\RUBRIC-v2.md",
+        "C:RUBRIC-v2.md",
+        "",
+        "..",
+    ],
+)
+def test_rubric_file_must_be_a_bare_name(tmp_path: Path, name: str) -> None:
+    """24a (msg-4654 DECIDED 2d-12): any path spelling is refused — labelling and lock alike."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    if name == "ABSOLUTE":
+        name = str((d / "RUBRIC-v2.md").resolve())
+    with pytest.raises(labeller.LabelStopError, match="not a path"):
+        labeller.write_lock(d, "label_prompt-v2.md", name)
+    args = ["--dir", str(d), "--prompt-file", "label_prompt-v2.md", "--rubric-file", name]
+    assert labeller.main([*args, "--labeller", "naysayer-tier", "--resume"]) == 1
+    assert labeller.main([*args, "--lock"]) == 1
+    assert not (d / "manifest.json").exists()
+
+
+def test_rubric_file_must_exist_in_dir(tmp_path: Path) -> None:
+    """24b: a name not present directly in ``--dir`` is refused."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    with pytest.raises(labeller.LabelStopError, match="is not a file"):
+        labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v9.md")
+
+
+def test_manifest_keys_are_the_names_used(tmp_path: Path) -> None:
+    """24c + msg-4652: the ``sha256`` keys are the given names, the values the files that built
+    the system prompt; no v1 rubric / prompt key remains."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    m = labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    assert "RUBRIC.md" not in m["sha256"] and "label_prompt.md" not in m["sha256"]
+    assert set(m["sha256"]) == set(labeller.locked_files("label_prompt-v2.md", "RUBRIC-v2.md"))
+    assert m["sha256"]["RUBRIC-v2.md"] == labeller.file_sha256(d / "RUBRIC-v2.md")
+    assert m["sha256"]["label_prompt-v2.md"] == labeller.file_sha256(d / "label_prompt-v2.md")
+    assert m["system_prompt_sha256"] == labeller.sha256_text(
+        labeller.read_system_prompt(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    )
+
+
+def test_manifest_reproduces_when_the_dir_is_copied(tmp_path: Path) -> None:
+    """24d: copy ``--dir`` elsewhere; every sha256 is the same."""
+    import shutil
+
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    first = labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    moved = shutil.copytree(d, tmp_path / "elsewhere" / "d")
+    second = labeller.write_lock(moved, "label_prompt-v2.md", "RUBRIC-v2.md")
+    for k in ("sha256", "system_prompt_sha256"):
+        assert first[k] == second[k]
+
+
+def test_defaults_keep_the_v1_lock() -> None:
+    """msg-4646 / msg-4652: with the defaults, the committed v1 manifest's system-prompt and file
+    hashes are what the code computes today."""
+    assert labeller.locked_files("label_prompt.md", "RUBRIC.md") == labeller.LOCKED_FILES
+    committed = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    system = labeller.read_system_prompt(EVAL, "label_prompt.md", "RUBRIC.md")
+    assert labeller.sha256_text(system) == committed["system_prompt_sha256"]
+    for name in ("RUBRIC.md", "label_prompt.md"):
+        assert labeller.file_sha256(EVAL / name) == committed["sha256"][name]
+
+
+# --------------------------------------------------------------------------- 2d-9 / 2d-13 / 23g
+
+
+def test_export_places_the_v2_rubric_and_prompt(tmp_path: Path) -> None:
+    """25a: both files beside the export, byte-equal to ``eval/tierc``, sha256 in export.json."""
+    materials, fixture, replay, summary = _build([_row()], {"T-a": ("p", _thread(10))})
+    export = ex.write_outputs(
+        tmp_path / "lab", tmp_path / "r.jsonl", materials, fixture, replay, summary
+    )
+    for key, name in (("rubric", "RUBRIC-v2.md"), ("label_prompt", "label_prompt-v2.md")):
+        placed = tmp_path / "lab" / name
+        assert placed.read_bytes() == (EVAL / name).read_bytes()
+        assert export[key] == {"name": name, "sha256": labeller.file_sha256(EVAL / name)}
+    on_disk = json.loads((tmp_path / "lab" / "export.json").read_text(encoding="utf-8"))
+    assert on_disk == export
+    assert on_disk["as_of"] == AS_OF.isoformat()
+    for key, path in (
+        ("materials", tmp_path / "lab" / "materials.jsonl"),
+        ("fixture", tmp_path / "lab" / "fixture.jsonl"),
+        ("replay", tmp_path / "r.jsonl"),
+    ):
+        assert on_disk["files"][key]["sha256"] == labeller.file_sha256(path)
+
+
+def test_export_refuses_a_different_rubric_already_there(tmp_path: Path) -> None:
+    """25b: a same-named file with other bytes stops the export before anything is written."""
+    out = tmp_path / "lab"
+    out.mkdir()
+    (out / "RUBRIC-v2.md").write_text("not the registered rubric\n", encoding="utf-8")
+    materials, fixture, replay, summary = _build([_row()], {"T-a": ("p", _thread(10))})
+    with pytest.raises(ex.ExportError, match=r"RUBRIC-v2.md"):
+        ex.write_outputs(out, tmp_path / "r.jsonl", materials, fixture, replay, summary)
+    assert sorted(p.name for p in out.iterdir()) == ["RUBRIC-v2.md"]
+    assert not (tmp_path / "r.jsonl").exists()
+    # identical bytes are fine
+    (out / "RUBRIC-v2.md").write_bytes((EVAL / "RUBRIC-v2.md").read_bytes())
+    ex.write_outputs(out, tmp_path / "r.jsonl", materials, fixture, replay, summary)
+
+
+class _EchoLabeller:
+    async def chat_completion(self, *, model: str, messages: list[Any], max_tokens: int) -> Any:
+        from spirrow_mindwire.lexora.client import ChatCompletion
+
+        items = json.loads(messages[1].content.split("\n\n", 1)[1])
+        lines = [
+            json.dumps(
+                {
+                    "thread_id": i["thread_id"],
+                    "round_index": i["round_index"],
+                    "label": "spurious",
+                    "category": "IMPL",
+                    "rationale": "x",
+                }
+            )
+            for i in items
+        ]
+        return ChatCompletion(
+            content="```jsonl\n" + "\n".join(lines) + "\n```",
+            reasoning_content=None,
+            finish_reason="stop",
+            model="m-" + model,
+            usage={"prompt_tokens": 1},
+        )
+
+    async def stats_costs_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return []
+
+
+def test_export_label_lock_report_end_to_end(tmp_path: Path) -> None:
+    """23g + 25c (msg-4652 / msg-4656): export → label (both labellers, fake endpoint) → lock →
+    report. Labelling leaves fixture / materials untouched, the lock's hashes equal the export's,
+    and the report accepts the run."""
+    import asyncio
+
+    out, replay_path = tmp_path / "lab", tmp_path / "jev" / "replay.jsonl"
+    rows = [_row(), _row(thread_id="T-b", latest="msg-2", logged_at=_at(2.5))]
+    materials, fixture, replay, summary = _build(
+        rows, {"T-a": ("p", _thread(12)), "T-b": ("q", _thread(6))}
+    )
+    export = ex.write_outputs(out, replay_path, materials, fixture, replay, summary)
+    system = labeller.read_system_prompt(out, "label_prompt-v2.md", "RUBRIC-v2.md")
+
+    async def _nosleep(_: float) -> None:
+        return None
+
+    for who in labeller.LABELLERS:
+        asyncio.run(
+            labeller.label_all(
+                client=_EchoLabeller(),
+                labeller=who,
+                materials=labeller.read_jsonl(out / "materials.jsonl"),
+                system=system,
+                out_dir=out,
+                sleep=_nosleep,
+            )
+        )
+    manifest = labeller.write_lock(out, "label_prompt-v2.md", "RUBRIC-v2.md")
+    for key, name in (("materials", "materials.jsonl"), ("fixture", "fixture.jsonl")):
+        assert labeller.file_sha256(out / name) == export["files"][key]["sha256"]
+        assert manifest["sha256"][name] == export["files"][key]["sha256"]
+    assert manifest["sha256"]["RUBRIC-v2.md"] == export["rubric"]["sha256"]
+    assert manifest["sha256"]["label_prompt-v2.md"] == export["label_prompt"]["sha256"]
+    rc = report.main(
+        [
+            "--replay",
+            str(replay_path),
+            "--fixture",
+            str(out / "fixture.jsonl"),
+            "--labels",
+            f"naysayer-tier={out / 'labels.naysayer-tier.jsonl'}",
+            "--labels",
+            f"frontier-tier={out / 'labels.frontier-tier.jsonl'}",
+            "--export-manifest",
+            str(out / "export.json"),
+            "--out",
+            str(tmp_path / "report.md"),
+        ]
+    )
+    assert rc == 0
+    assert "## Export lock" in (tmp_path / "report.md").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- 2d-14 bounce chains
+# msg-5578 / msg-5580 / msg-5582 DECIDED 2d-14: a bounce chain counts once — its first post.
+
+RETRY_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _notice(i: int, bounced: str, author: str = "conductor-relay") -> Any:
+    body = (
+        f"{TIERC_BOUNCE_HEADER}\n\nbounced: `{bounced}`\n\n"
+        f"bounce notice text\n\nRETRY: {RETRY_UUID}\n\nNEXT: Bohr"
+    )
+    return _msg(i, author, body)
+
+
+def _esc(i: int, author: str = "Bohr", body: str = "need a call\n\nNEXT: human") -> Any:
+    return _msg(i, author, body)
+
+
+def _chain_thread(*middle: Any) -> list[Any]:
+    """msg-0..2 filler, msg-3 = Bohr's bounced escalation, msg-4 = its notice, then ``middle``
+    (numbered from 5), then 3 filler messages so every row has its following window."""
+    t = [_msg(0), _msg(1, "Einstein"), _msg(2), _esc(3), _notice(4, "msg-3")]
+    t += list(middle)
+    n = len(t)
+    t += [_msg(n + k, "Einstein") for k in range(3)]
+    return t
+
+
+def _gate_row(latest: str, gate_kind: str | None, logged_at: str) -> dict[str, Any]:
+    r = _row(latest=latest, logged_at=logged_at)
+    r["gate_kind"] = gate_kind
+    return r
+
+
+def _chain_build(
+    thread: list[Any], rows: list[dict[str, Any]], human_identity: str = "human"
+) -> dict[str, Any]:
+    _, _, _, summary = ex.build_outputs(
+        rows, SHA, {"T-a": ("p", thread)}, AS_OF, human_identity=human_identity
+    )
+    return dict(summary)
+
+
+def test_2d14_a_retry_row_is_not_counted() -> None:
+    """(a) bounced row then its ``RETRY:`` row: only the bounced row counts; retry_admit = 1."""
+    thread = _chain_thread(_esc(5, body=f"RETRY: {RETRY_UUID}\n\nNEXT: human"))
+    rows = [
+        _gate_row("msg-3", "BOUNCED", _at(3.5)),
+        _gate_row("msg-5", "RETRY_ADMIT", _at(5.5)),
+    ]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 1
+    assert s["by_bucket"]["retry_admit"] == 1
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_b_resubmission_after_bounce_is_not_counted() -> None:
+    """(b) bounced row then a labelled re-submission (no ``RETRY:``): only the bounced row
+    counts; post_bounce = 1. Mutation: drop reason 3 and this fails."""
+    thread = _chain_thread(_esc(5, body="TIER-C: goal\nNEXT: human"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+
+
+@pytest.mark.parametrize("human", ["Takahito", "takahito", "TAKAHITO"])
+def test_2d14_c_human_post_ends_the_chain(human: str) -> None:
+    """(c) bounced row, a post by the configured human identity (any case), then a separate
+    escalation by the same author: both count. Mutation: literal ``"human"`` and this fails."""
+    thread = _chain_thread(_msg(5, human, "decided: X\n\nNEXT: Bohr"), _esc(6))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="Takahito")
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+    assert s["human_identity"] == "Takahito"
+
+
+def test_2d14_d_notice_for_another_author_does_not_exclude() -> None:
+    """(d) a bounce notice naming another author's message leaves this author's row counted."""
+    thread = _chain_thread(_esc(5, author="Heisenberg"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_e_quoted_notice_does_not_start_a_chain() -> None:
+    """(e) a role quoting a bounce notice starts no chain — only ``conductor-relay`` posts do."""
+    thread = [_msg(0), _msg(1, "Einstein"), _msg(2), _esc(3), _notice(4, "msg-3", "Einstein")]
+    thread += [_esc(5)] + [_msg(6 + k, "Einstein") for k in range(3)]
+    rows = [_gate_row("msg-3", "ADMIT", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_f_rows_before_398_follow_the_current_rules() -> None:
+    """(f) ``gate_kind`` null (or missing) and no bounce notice: judged as before."""
+    rows = [_row(), _row(latest="msg-8", logged_at=_at(8.5))]
+    del rows[1]["gate_kind"]
+    s = _chain_build(_thread(12), rows)
+    assert s["counted"] == 2
+    assert set(s["by_bucket"]) == {"counted"}
+
+
+def test_2d14_g_operator_post_does_not_end_the_chain() -> None:
+    """(g) bounced row, an ``operator`` post (merge-report wording included), then a
+    re-submission: only the bounced row counts; post_bounce = 1. Mutation: let ``operator``
+    end a chain and this fails."""
+    op = _msg(
+        5, "operator", "Takahito が merge した。直前の NEXT: human は消化済み。\n\nNEXT: Bohr"
+    )
+    thread = _chain_thread(op, _esc(6, body="TIER-C: goal\nNEXT: human"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="Takahito")
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+
+
+def test_2d14_h_empty_human_identity_never_ends_a_chain() -> None:
+    """(h) with ``human_identity`` empty, the thread of (c) gives post_bounce = 1."""
+    thread = _chain_thread(_msg(5, "Takahito", "decided: X\n\nNEXT: Bohr"), _esc(6))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="")
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+    assert s["human_identity"] == ""
+
+
+def test_2d14_exporter_uses_the_conductor_rule() -> None:
+    """One definition of "human" (msg-5582): the exporter imports ``is_human_identity`` and the
+    bounce-notice parsers from the conductor instead of restating them."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.setdefault(node.module or "", set()).update(a.name for a in node.names)
+    assert "is_human_identity" in imported["spirrow_mindwire.conductor.human_identity"]
+    gate_names = imported["spirrow_mindwire.conductor.tierc_gate"]
+    assert {"is_bounce_notice", "bounced_msg_id"} <= gate_names

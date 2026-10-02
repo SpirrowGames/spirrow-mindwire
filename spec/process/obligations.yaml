@@ -28,7 +28,28 @@
 #
 # Entries without `origin.moved_from` are net-new loop-readable formulations
 # (nothing was deleted from source to create them); the length invariant does
-# not apply to them and they evolve through the normal proposal flow.
+# not apply to them. They are pinned instead by `body_sha256`: the SHA-256 of
+# the body as the loader normalizes it (trailing newlines stripped, i.e.
+# `body.rstrip("\n")`), UTF-8 encoded, as 64 lowercase hex digits. They still
+# evolve through the normal proposal flow, but a PR that changes a net-new body
+# must update its `body_sha256` in the same commit, so the change is visible
+# in PR review instead of drifting the loop's instructions unseen.
+#
+# The two kinds of entry, side by side (both checked at load time AND in the
+# tests — a mismatch makes the daemon refuse to start, not just the gate red):
+#   - moved entry   (`origin.moved_from` present): pinned by length,
+#                   `len(body) == origin.original_length` (canary two-double-prime).
+#   - net-new entry (no `origin`): pinned by hash,
+#                   `sha256(body) == body_sha256`; the loader checks the value
+#                   and format whenever the key is present, and
+#                   test_canary_net_new_bodies_match_pinned_sha256 requires the
+#                   key on every net-new entry of this manifest.
+# Basis: ADR-2026-05-29-13 (body:
+# chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326),
+# whose read-back obligations are carried by this file; the drift lesson these
+# pins close is written up in spec/process/README.md (旧 §N.3 / §N.4: 「レビュー時に
+# 見えていたはずの規約が知らぬ間にドリフトする」). Decided on thread
+# T-net-new-obligation-drift-detection (design msg-5731).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # CONDITIONAL OBLIGATION BODIES CARRY THE COMPLIANCE AXIS, NOT THE OBSERVABILITY AXIS
@@ -91,9 +112,10 @@ obligations:
     # same structural failure PR #135 Tier B Finding 1 caught in a different guise.
     # Dropping `origin` outright classifies this entry as net-new formulation (the
     # runtime rule now lives here as its own SOT) and preserves 795 as the historical
-    # source-length record (documentary provenance, not integrity — the entry no
-    # longer has any drift check of its own; whether integrity should be reintroduced
-    # for every entry uniformly is a step 4 candidate deferred to a later PR).
+    # source-length record (documentary provenance, not integrity). Integrity is now
+    # the net-new kind's: the `body_sha256` pin below, checked at load time and by
+    # test_canary_net_new_bodies_match_pinned_sha256 (T-net-new-obligation-drift-detection).
+    body_sha256: f4a85e7a6ea69a247c73429a147b8fa1c0fa85b219122fc0bf3c33dfe141ed33
     body: "DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that is all. ADR bodies live in a separate docs repository you cannot reach, and you do not have CLAUDE.md. When a task asks you to check your work against a document whose text you cannot see, do NOT reconstruct what it probably says — say plainly \"I cannot read <doc>'s text, so I have not verified against it\", then verify everything you CAN and report that. An incomplete report is always better than a confident wrong one: stating the limit is what lets a human close the gap, while a plausible invention closes the subject and is believed. This applies to ADR titles too — a title is a summary, and reasoning outward from a summary as if it were the document is the exact mistake this rule exists to prevent."
 
   - id: OBL-VERDICT-CONSTRAINT
@@ -177,6 +199,7 @@ obligations:
     # broken by the rewrite. Delivery scope is UNCHANGED — design-time
     # naysayer face only; the T-obligations-not-reaching-pr-gate rationale
     # above still applies verbatim.
+    body_sha256: b53dedf22b2999e8c1bd45352721367384c26aab392bfc28326b329bf95c968d
     body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. What authorizes a merge is never a design-thread sentence; it is a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — plus, for a merge whose target is a protected branch (`main`), the human's own decision. Where the project's own merge policy sanctions self-merge into a non-protected integration branch, that PR-gate artifact together with the project sanction is the whole authorization and a human GO is not required — but a design-thread sentence is still not what authorized it. If the work looks ready to land, say that it is ready for the PR gate. If its target is a protected branch, also hand to the human; otherwise the absence of a human GO is not a reason to escalate — the project's own merge policy governs that merge. Whatever the target branch, do not write a sentence that a reader could mistake for the authorization itself."
 
   - id: OBL-READBACK-ENTRY
@@ -197,6 +220,7 @@ obligations:
     # outside this repo and is unreadable from the loop host, so the anchor was
     # rewritten to point at the readable README section instead (spec/process/
     # README.md §「提案の核」). Same fix pattern in OBL-READBACK-EXIT below.
+    body_sha256: ea7bfcbcf69736f8fe25007f48a8d184e5607e1bd8dec5e1a2ae7c43f9964fe0
     body: "READ-BACK AT ENTRY (rationale in spec/process/README.md §「提案の核 — spec read-back」): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
 
   - id: OBL-READBACK-EXIT
@@ -209,6 +233,7 @@ obligations:
     # T-adr-index-dangling-references: same rewrite as ENTRY — the body opener
     # used to name "ADR-2026-05-29-13 §N.1.4"; the readable-text anchor lives at
     # spec/process/README.md §「提案の核 — spec read-back」.
+    body_sha256: 086d5fa51dcd59c195476bc7b2316eaba63730d1a12d406db0455bf0d6db58d6
     body: "READ-BACK AT EXIT (rationale in spec/process/README.md §「提案の核 — spec read-back」): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
 
   - id: OBL-PRCHECK-READ
@@ -219,6 +244,7 @@ obligations:
     # them is worthless unless someone actually reads the PR's check runs before
     # handing to a human — that "actually reads" is what this obligation binds.
     # See spec/process/README.md §「PR check の未読み放置を塞ぐ (OBL-PRCHECK-READ)」.
+    body_sha256: 2be95fa95983d4d3b0226d9b9dc53fbd1da9d96b65d3b7419c9f59e9480d6867
     body: "READ THE PR CHECK RUNS BEFORE HANDING TO HUMAN: on a turn that carries a PR, before you emit `NEXT: human`, read that PR's check runs (`gh pr checks <n>` or the JSON `gh pr view <n> --json statusCheckRollup`). If a check is red, fix it. You may escalate to the human with a red check ONLY if one of these two holds and you state which in the reply: (a) the same check is red on the PR **base revision** (this failure is not from your PR — verify by checking out the base locally and re-running the same script; do NOT rely on `gh run list --commit <base_sha>` alone, since a newly added check has no run on base and the query returns empty rather than a verdict); or (b) fixing the failure requires an operation you cannot perform under Tier C (repo settings / branch protection / secrets / anything the allow-list denies). Neither condition being true, do not emit `NEXT: human` while a red PR check stands. The normative treatment of red CI on PR gates is ADR-2026-06-03-16; this obligation carries only the read-and-triage duty, not the gate policy."
 
   - id: OBL-ADR-CITATION-WEIGHT
@@ -236,6 +262,7 @@ obligations:
     # the naysayer index — but a thread can hand the loop a bare number over the
     # wire that the reverse check never sees, and THIS obligation is what binds
     # the loop's response to that arrival.
+    body_sha256: e5836118aefe8f80d2b4b58a1fe154100792180cbac7a113d516404b1d7c61e4
     body: "BARE ADR NUMBERS ARE NOT NORMATIVE CITATIONS: when a task, thread, or spec asks you to comply with an ADR by number, treat the number as an identifier — not as a normative source you have read. The ADR bodies live in a separate docs repository you cannot reach, and the id + title map you have is a summary of the ADR, not its text. If the citation is meant to bind your work, the binding text must accompany the citation (a verbatim clause quoted into the thread, or a pointer to a file in this repository whose text you can read). If it does not, do not reconstruct what the ADR probably says: satisfy OBL-DECLARE-UNREADABLE, name the id you were given, ask for the relevant clause to be quoted, and continue on what you CAN verify."
 
   - id: OBL-MERGE-MECHANISM
@@ -250,6 +277,7 @@ obligations:
     # because a denied session posts nothing, the thread head never moved: five hours
     # of the sweep starved behind one thread. The constraint was real, correct, and
     # unreadable by the only party bound by it.
+    body_sha256: 248fc14b536db44b8493cb7f7ca3b5867ef7c95c05af0a6f9623e3c4531ebeae
     body: "HOW TO MERGE (and how not to): `gh pr merge` is classified as a merge-to-main REGARDLESS of the pull request's base branch, so it is always denied and the denial HALTS your session — you will post nothing and the turn is lost. Never invoke it. Where a self-merge is sanctioned for your repository (a `feature/*` branch into `develop`), perform it locally instead: check out the target branch, `git merge <your feature branch>`, then push. Merges into `main` are never yours to make under any mechanism; open the PR, report, and hand to the human — that hand-off IS the merge step for `main`, not a fallback from a failed attempt."
 
   - id: OBL-NO-POLLUTING-PR-HEADER
@@ -262,6 +290,7 @@ obligations:
     # test_gate_notice_absent_when_all_quiet in tests/test_pr_review_driver.py — a caller
     # that stamps an unconditional header on the naysayer critique reds that test, and the
     # test is the executable expression of this obligation.
+    body_sha256: 704ecd139e9707f281cc284d409dcc81dbdd9ae05ac59e13883ac5876ff3fbcb
     body: "NO POLLUTING THE PR-GATE HEADER: do not add unconditional or high-frequency headers/banners above the naysayer PR-review critique; the gate-notice sentinel exists to be RARE and NOTICED. Enforced by test_gate_notice_absent_when_all_quiet in tests/test_pr_review_driver.py."
 
   - id: OBL-SPEC-PIN
@@ -283,6 +312,7 @@ obligations:
     # `tests/test_obligations.py` reads §4-1 from the landed
     # `spec/design/T-spec-pin-hardening-and-id-audit.md` and asserts byte-exact
     # match against `body:` below (Bohr msg-3991 objection 2: no hardcoded copy).
+    body_sha256: b99d0ac6c4e1f8fbb3cef4e79c739e881e5187e115541ff1e101d1a919c3edba
     body: |
       Before you do anything else on a turn, look for `.mindwire/pin` at the
       repository root and resolve it exactly as the spec delivery manifest
@@ -406,6 +436,7 @@ obligations:
     # `tests/test_obligations.py` reads §4-2 from the landed
     # `spec/design/T-spec-pin-hardening-and-id-audit.md` and asserts byte-exact
     # match against `body:` below (Bohr msg-3991 objection 2).
+    body_sha256: fe0d87fb5778582fccd7ad5856ba5dd3777dac8ab46261be6adbd0eb7d1c1ec7
     body: |
       Open every reply in which you performed, or attempted, implementation
       work with a receipt naming what you actually read this turn, on one
@@ -548,6 +579,7 @@ obligations:
     # msg-2392 §2). Moving the antecedent back into a comment, dragging
     # Einstein's framing clause back in, or dropping the landing site each red
     # the gate.
+    body_sha256: dd15b6a044f67ec9061723bbc214ce421f2405bbcd035e767c0c56f5d325971f
     body: |
       【実装先 — proposer 補足（Einstein の逐語ではない）】この carve-out のコードは magickit リポジトリのサーバ側 `chatroom_close_thread` 実装に入る。mindwire リポジトリの側に実装先は無く、履行は magickit に PR を立てることである。
       【以下 Einstein msg-1968 逐語】もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。
@@ -574,6 +606,7 @@ obligations:
     # the obligation body is delivered into the implementer prompt like
     # every other entry here; canary two-prime asserts that delivery on
     # every gate run.
+    body_sha256: 2c93a7ee67cc695a630ab052549fd267f50a970eefd3814dc4480fe1d7b46d2f
     body: |
       MONOTONIC INCIDENT FIXTURES FOR THE STALL DETECTOR: when operator lane observes a stall that the stall_ledger did not identify at the time (`tests/test_stall_ledger_incident_backtest.py`), or a false-positive it did identify, ADD a JSON fixture under `tests/data/stall_ledger_incidents/` for that incident before the thread that observed it closes. The fixture MUST record its provenance (source, captured_at, captured_by) and its expected verdict (stall / not-stall / not-representable); a not-representable fixture MUST carry a reason. The set is monotonic — do not retire seed fixtures, only supersede them. The rule the corpus enforces is that a parser change that silently loses coverage of a previously-caught incident reds the backtest, not the digest weeks later.
 
@@ -583,6 +616,7 @@ obligations:
     # §4-3. Silent expansion and silent omission share one failure mode: the
     # reviewer's picture of what happened is wrong. This obligation binds the
     # implementer to close scope explicitly, per item id, before finishing.
+    body_sha256: 9dc8e624d0bf30806bed307bfca0977bd2111e67b87c95f3ac6175e08724b5e9
     body: |
       On any turn performed under a resolved specification, the specification's
       `items` are the whole of your mandate for the turn. Do not change files
@@ -635,6 +669,7 @@ obligations:
     # and dropping it sent the reader to a site to read a declaration that does
     # not exist and should not. It is named because it is the site this thread
     # started from and is the first place a reader will look.
+    body_sha256: 148d33458a27887f5f838709112ce008e54e456f24aa49dc22c743eb47669c24
     body: |
       CHATROOM PRODUCER: DECLARE READER AND FALLBACK SURFACE. When you write
       code that posts into a chatroom thread, answer two questions in the
@@ -665,6 +700,7 @@ obligations:
     # names no threshold NUMBER on purpose: the helper reports the gate's own constant, so a
     # change to `naysayer/pr_review.py::_MAX_DIFF_CHARS` keeps this text true (the WARN_RATIO
     # reasoning, DECIDED rule 2).
+    body_sha256: a24ef495a452f76aa37002eadf35fd6fa01b97b11b0ca6915ec81597937b740a
     body: |
       FIX NOW BY DEFAULT; SPLIT ONLY ON THE MEASURED DIFF. Whether to fix a review finding in the current PR or in a follow-up PR is not a judgement call and never goes to the human (do not hand it off with `NEXT: human`). The rule:
       (1) Default: fix the finding in the same PR, at the point you notice it.
@@ -681,5 +717,6 @@ obligations:
     # scope as every `role: naysayer` entry (see OBL-VERDICT-CONSTRAINT's note and
     # spec/process/README.md §「`./obligations.yaml` の配送範囲は naysayer の片面 (design-time)
     # だけである」); the PR-gate face is not wired to this manifest and is not meant to be.
+    body_sha256: 5541de9fd73445dd080e598b5f65e9f82a00502dee4e4dec9eb24d350d846ace
     body: |
       FIX-NOW VS FOLLOW-UP, REVIEW SIDE: the default is that a finding is fixed in the current PR; a split is justified only by the measured gate diff exceeding the gate's warn threshold (`mindwire pr-diff-size`) or by a structural constraint. Do not accept "we will fix it in a follow-up" as a disposition unless it names a tracking destination (a thread ID, new or existing); a follow-up with nowhere to be tracked is a fix that will not happen. When you declare a PR unsplittable as an invariant, state the reason as a structural constraint, so it reads as one and not as a timing preference.
