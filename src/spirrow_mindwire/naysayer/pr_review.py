@@ -1724,9 +1724,11 @@ def render_gate_notice(decision: VerdictDecision) -> str:
         lines.append(f"> {_MARKER_E_AMBIGUOUS}")
         lines.append(
             f"> **GATE-NOTE: {ModelVerdict.AMBIGUOUS.value} — this red is about form, not "
-            f"design.** The review below has {decision.verdict_line_count} lines that start at "
-            f"column 0 with `VERDICT:`; the gate takes a verdict only when there is exactly "
-            f"one, so it took none and posted `REQUEST_CHANGES`. This is not a finding about "
+            f"design.** The review below has {decision.verdict_line_count} verdict lines — "
+            f"lines that start at column 0 with `VERDICT:` and carry nothing but one verdict "
+            f"token (`APPROVE`, `REQUEST_CHANGES` or `COMMENT`); other `VERDICT:` lines are "
+            f"not counted. The gate takes a verdict only when there is exactly one such line, "
+            f"so it took none and posted `REQUEST_CHANGES`. This is not a finding about "
             f"the change. When quoting a verdict-shaped line, indent it or keep a prefix in "
             f"front of it (inside fences too), so that the review's own verdict is the only "
             f"one at column 0."

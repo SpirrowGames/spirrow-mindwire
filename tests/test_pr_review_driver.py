@@ -1637,7 +1637,7 @@ def test_d1_4_real_rc_then_quoted_approve_is_ambiguous_and_red() -> None:
     assert _MARKER_E_AMBIGUOUS in notice
     assert "VERDICT_AMBIGUOUS" in notice
     assert "about form, not design" in notice
-    assert "has 2 lines" in notice
+    assert "has 2 verdict lines" in notice
 
 
 def test_d1_5_two_agreeing_approves_are_still_ambiguous() -> None:
