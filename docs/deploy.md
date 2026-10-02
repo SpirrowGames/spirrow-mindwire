@@ -451,8 +451,8 @@ Two things follow from it being config:
 > `T-pr-gate-adr-index-scope` sat stranded after being opened. State keys are `project/thread_id` for
 > the same reason: thread ids are only unique within a project.
 
-The wrapper walks the list head-first and **advances past any candidate the conductor reports no work
-for**, so one settled thread cannot park the whole loop. Only a clean `rounds=0` advances: a non-zero
+The wrapper **advances past any candidate the conductor reports no work for**, so one settled thread
+cannot park the whole loop. List order is only the tie-break for launches: see *Launch fairness* below. Only a clean `rounds=0` advances: a non-zero
 exit or an unparseable run **stops** the sweep, so a genuine breakage is never laundered into
 "everything is idle".
 
@@ -462,6 +462,70 @@ driving those from an unattended schedule would spend money on a timer, so it st
 (The entire `T-pr-review-150`〜`167` family was closed by the 2026-08-02 K-5 triage — all PRs merged
 with their verdicts recorded — but the exclusion rule here stays for future `T-pr-review-*`
 threads.)
+
+### Launch fairness — dispatch order, gate lane, budgets (T-sweep-starves-deep-candidates)
+
+The sweep used to walk `sweep.json` head-first and stop at the first thread that did work. While
+the top of the list kept working, nothing below it ever ran (2026-10-02: every tick was "worked 1 /
+not-reached 96〜100", and #392 / #361 / #359 waited 21〜31h). The old starvation metric did not see
+it: W-2c counts a LAUNCH verdict as an evaluation even when the sweep never reaches the candidate.
+The code is in `deploy/lib/SweepFairness.ps1`, and the tests are in `tests/Test-SweepFairness.ps1`.
+
+- **Order.** `evaluated.json` carries `launch_wait_since` per thread. It is set when the verdict is
+  LAUNCH and the thread was not launched, and it is never overwritten. It is cleared when the thread
+  is actually launched (after commit-launch) or when the verdict is SKIP. It is kept through DEFER,
+  held, and quarantined. LAUNCH candidates run in order of `launch_wait_since`, oldest first, so a
+  thread that just ran goes to the back. `sweep.json` order only breaks ties. Reordering the file
+  no longer moves a thread ahead of one that has waited longer.
+- **Gate lane.** A LAUNCH whose `NEXT:` is `pr-review` runs first. Up to **3 launches** per tick,
+  and a gate that did work does not stop the sweep. After the gate lane, role turns run as before:
+  the first one that did work ends the sweep. Gate failures count toward the same K-budget, and
+  reaching K stops both lanes.
+- **Budgets — two clocks, checked before every launch.**
+
+  | Admission of | Condition |
+  |---|---|
+  | the first gate candidate | `tickElapsed < LaunchBudgetSeconds` (it uses up this exception whether or not it launches) |
+  | each later gate | the above **and** `loopElapsed < GateBudgetSeconds` **and** fewer than 3 gates launched |
+  | a role turn | `tickElapsed < LaunchBudgetSeconds` |
+
+  `tickElapsed` counts from the start of the tick (sync, probes, and decide included).
+  `loopElapsed` counts from the start of the launch loop (decide excluded). Once the launch budget
+  is spent, the sweep stops with `time-budget`. Everything not launched keeps its
+  `launch_wait_since`, so it comes first next tick. The budget limits when a launch may **start**,
+  not how long it runs, so a tick can still run past it. When that happens the log says
+  `WARN tick exceeded launch budget`.
+
+**Setting the budgets.** The order of precedence is the script argument (`-LaunchBudgetSeconds` /
+`-GateBudgetSeconds`), then the environment variable (`MINDWIRE_SWEEP_LAUNCH_BUDGET_SEC` /
+`MINDWIRE_SWEEP_GATE_BUDGET_SEC`), then the default (**120 / 60**). `GateBudgetSeconds` must be
+less than `LaunchBudgetSeconds`. A tick with any other configuration aborts with a configuration
+error, and so does a tick with a value that is not a positive integer.
+
+| Task setting | Value today | Budget it interacts with |
+|---|---|---|
+| repeating trigger | **1 min** | none directly. Under `IgnoreNew`, the first trigger after a tick ends starts the next one, so a shorter launch budget means the next tick (and its gate lane) comes sooner |
+| `MultipleInstancesPolicy` | `IgnoreNew` | ticks cannot overlap, whatever the budget. The budget bounds how long one tick holds the loop |
+| `LaunchBudgetSeconds` / `GateBudgetSeconds` | 120 / 60 (defaults) | **if you change the trigger or the policy, revisit these here** |
+
+The design that chose 120 / 60 (msg-5588) assumed a 5-minute interval and set the budget to keep
+ticks from overlapping. Measured on the host on 2026-10-02, the trigger is PT1M with `IgnoreNew`,
+so overlap is already impossible. The pre-loop phase (sync, probes, decide) took about 22s. Tune
+against the per-tick line:
+
+```text
+tick elapsed=…s decide=…s loop=…s budget=gate 60/launch 120s (gate launched n/3 of m candidate(s)[, gate lane closed: gate-cap|gate-budget])
+```
+
+**Two starvation metrics, both in the log and in the digest.**
+- `飢餓` / `starved threads`: not *evaluated* for 24h. Unchanged.
+- `起動待ち飢餓` / `launch-wait starved threads`: LAUNCH for **6h or more** without a launch. This
+  is the failure the old metric could not see. W-2c's `last_evaluated_at` refresh does not reset it.
+
+Other WARN lines: `decide overhead exceeds launch budget` (or `pre-loop overhead …`) means nothing
+can launch this tick, so fix the budget or the slow phase. `gate admission invariant violated`
+means a role turn was admitted while gate candidates existed and none of them had been attempted.
+That should be impossible, and seeing it means the admission code has a bug.
 
 ### Why the sweep is cheap enough to run on a short interval
 

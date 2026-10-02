@@ -132,12 +132,11 @@ from .handoff import (
 #
 #   Measured 2026-09-17 to 2026-09-30 from the wrapper's ``conductor-YYYY-MM-DD.log`` files on
 #   the conductor host: all projects, wall clock from a candidate's ``head_skip LAUNCH`` line to its
-#   ``-> exit=`` line, 1294 sessions.
+#   ``-> exit=`` line (groups overlap).
 #     - Sessions followed by a no-progress relaunch, the ones BASE acts on (n=796): median under
 #       1 min, p90 6.0 min, 96% shorter than 15 min.
-#     - Sessions that posted at least one round (n=504): p25 2.2 min, median 5.7 min, p75 13.4
-#       min, p90 25.2 min, max 64.9 min; 80% shorter than 15 min.
-#     - All sessions: 8% ran 15 min or longer.
+#     - Sessions that posted at least one round (n=505): p25 2.2 min, median 5.7 min, p75 13.4
+#       min, p90 25.1 min, max 64.9 min; 80% shorter than 15 min.
 #   15 min is near the 80th percentile of a session that did work, so it is not a session-length
 #   floor. It stands as a policy call on the no-progress relaunch rate, not as a value derived
 #   from session length.

@@ -266,6 +266,7 @@ class Row:
     server_verdict: str | None
     outcome: str | None
     latency_ms: int | None
+    rules_sha256: str | None = None
 
 
 def gate_bucket(g: Mapping[str, Any] | None) -> str:
@@ -305,6 +306,7 @@ def join(replay: Sequence[Mapping[str, Any]], fixture: Sequence[Mapping[str, Any
                 server_verdict=str(sv["kind"]) if isinstance(sv, Mapping) else None,
                 outcome=str(d["outcome"]) if d.get("outcome") else None,
                 latency_ms=int(d["latency_ms"]) if d.get("latency_ms") is not None else None,
+                rules_sha256=_rules_sha256_of(rec, d),
             )
         )
     return rows
@@ -461,11 +463,15 @@ def render(
     population: Sequence[Mapping[str, Any]] = (),
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
+    rules_snapshots: RulesSnapshotReport | None = None,
 ) -> str:
     """With ``corrections``, ``all_rows`` / ``labellers`` must already be filtered
-    (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4)."""
+    (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4).
+    The same holds for ``rules_snapshots`` (:func:`archive_rules_snapshots`)."""
     truth = consensus(labellers)
     lines: list[str] = ["# Tier-C replay evaluation — Jev", ""]
+    if rules_snapshots is not None:
+        lines += [*render_rules_snapshots(rules_snapshots), ""]
     if corrections is None:
         lines += ["- corrections: **none applied** — every fixture row is counted.", ""]
     else:
@@ -623,6 +629,87 @@ def render(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# rules snapshots (T-decider-tierc-v2-all-escalations, Bohr msg-4631 / 4633 / 5130)
+# ---------------------------------------------------------------------------
+
+RULES_ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "eval" / "tierc" / "rules"
+"""Default ``--rules-archive-dir``: ``eval/tierc/rules/`` (the replay snapshot dir, msg-4382)."""
+
+
+@dataclass(frozen=True)
+class RulesSnapshotReport:
+    """Result of :func:`archive_rules_snapshots`: the rows that stay, and why the rest left."""
+
+    kept: list[Row]
+    archived: dict[str, Path]
+    excluded: dict[str, Counter[str]]
+    """reason (``missing`` / ``mismatch``) → rows excluded per ``rules_sha256``."""
+
+
+def _rules_sha256_of(rec: Mapping[str, Any], decision: Mapping[str, Any]) -> str | None:
+    """A record's ``rules_sha256`` — on the decision (live / ``--endpoint``) or the record."""
+    for src in (decision, rec):
+        v = src.get("rules_sha256")
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def archive_rules_snapshots(
+    rows: Sequence[Row], snapshot_dir: Path, archive_dir: Path
+) -> RulesSnapshotReport:
+    """Copy each row's live snapshot ``<snapshot_dir>/<sha>.toml`` to ``<archive_dir>/<sha>.toml``.
+
+    Only copying — the snapshot was written by the live Decider when it computed the hash
+    (msg-4631); this step never reads the canonical rules file. The bytes are re-hashed on the
+    way (msg-4633): a missing snapshot excludes its rows as ``missing``, bytes that do not hash
+    to the name exclude them as ``mismatch``. Nothing aborts; the counts go in the report.
+    Rows with no ``rules_sha256`` (tierc-v1) are kept untouched. ``*.tmp`` / ``*.corrupt-*``
+    files are never read (only ``<sha>.toml`` is opened).
+    """
+    status: dict[str, str] = {}
+    archived: dict[str, Path] = {}
+    for sha in sorted({r.rules_sha256 for r in rows if r.rules_sha256 is not None}):
+        try:
+            data = (snapshot_dir / f"{sha}.toml").read_bytes()
+        except OSError:
+            status[sha] = "missing"
+            continue
+        if hashlib.sha256(data).hexdigest() != sha:
+            status[sha] = "mismatch"
+            continue
+        dest = archive_dir / f"{sha}.toml"
+        if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest() != sha:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        status[sha] = "ok"
+        archived[sha] = dest
+    kept: list[Row] = []
+    excluded: dict[str, Counter[str]] = {"missing": Counter(), "mismatch": Counter()}
+    for r in rows:
+        st = "ok" if r.rules_sha256 is None else status[r.rules_sha256]
+        if st == "ok":
+            kept.append(r)
+        else:
+            assert r.rules_sha256 is not None
+            excluded[st][r.rules_sha256] += 1
+    return RulesSnapshotReport(kept=kept, archived=archived, excluded=excluded)
+
+
+def render_rules_snapshots(rep: RulesSnapshotReport) -> list[str]:
+    out = [
+        "- rules snapshots (msg-4631 / 4633): "
+        f"archived {len(rep.archived)} hash(es); excluded rows: "
+        f"missing={sum(rep.excluded['missing'].values())}, "
+        f"mismatch={sum(rep.excluded['mismatch'].values())}"
+    ]
+    for reason in ("missing", "mismatch"):
+        for sha, n in sorted(rep.excluded[reason].items()):
+            out.append(f"  - {reason}: `{sha}` — {n} row(s)")
+    return out
+
+
 def apply_corrections(
     rows: Sequence[Row], labellers: Mapping[str, Mapping[Key, Label]], corr: Corrections
 ) -> tuple[list[Row], dict[str, dict[Key, Label]]]:
@@ -641,6 +728,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--corrections", type=Path, default=None, help="corrections JSON (optional; msg-4302)"
+    )
+    parser.add_argument(
+        "--rules-snapshot-dir",
+        type=Path,
+        default=None,
+        help="live snapshot dir (<data_dir>/decider/rules): archive each row's rules_sha256 "
+        "snapshot and exclude rows whose snapshot is missing / mismatched (msg-4631 / 4633)",
+    )
+    parser.add_argument(
+        "--rules-archive-dir",
+        type=Path,
+        default=RULES_ARCHIVE_DIR,
+        help="where verified snapshots are copied (default eval/tierc/rules)",
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -675,7 +775,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    text = render(rows, labellers, th, population, corr, replayed)
+    snap: RulesSnapshotReport | None = None
+    if args.rules_snapshot_dir is not None:
+        snap = archive_rules_snapshots(rows, args.rules_snapshot_dir, args.rules_archive_dir)
+        kept_keys = {r.key for r in snap.kept}
+        rows = snap.kept
+        labellers = {
+            n: {k: v for k, v in m.items() if k in kept_keys} for n, m in labellers.items()
+        }
+    text = render(rows, labellers, th, population, corr, replayed, snap)
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8", newline="\n")
     else:

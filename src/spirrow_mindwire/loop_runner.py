@@ -100,6 +100,7 @@ from .config import (
     load_settings,
     resolve_tier_c_decisions_log_path,
     resolve_tierc_rules_path,
+    resolve_tierc_rules_snapshot_dir,
 )
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
@@ -385,6 +386,7 @@ def build_implementer(
     obligations: ObligationsManifest,
     model: str | None = None,
     cli_path: Path | None = None,
+    ledger_mcp: McpToolCaller | None = None,
 ) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
@@ -408,6 +410,11 @@ def build_implementer(
     the same two config keys — the two roles that route to Anthropic move
     together, so a host cannot end up designing on one model and implementing on
     another without saying so.
+
+    ``ledger_mcp`` is the Magickit client the ``mindwire-ledger`` tools forward through (thread
+    ``T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down`` Bohr msg-5296 / msg-5300).
+    :func:`_build_dispatcher` passes the loop's own client, so every implementer session gets the
+    two ledger tools and nothing else from Magickit. Proposer and naysayer get none.
     """
     from .adapters import _sdk_job_hook
 
@@ -417,6 +424,7 @@ def build_implementer(
         obligations=obligations,
         model=model,
         cli_path=cli_path,
+        ledger_mcp=ledger_mcp,
     )
 
 
@@ -612,6 +620,7 @@ def _build_dispatcher(
                 obligations=obligations,
                 model=cfg.role_model,
                 cli_path=role_cli_path,
+                ledger_mcp=mcp,
             )
         if naysayer is None:
             # No model / cli_path here, by design: the naysayer's independence is
@@ -837,6 +846,8 @@ def build_conductor(
             # malformed file refuses startup through the ValueError below.
             questions=dec_cfg.tierc.questions,
             rules_path=resolve_tierc_rules_path(settings),
+            # msg-4631 / 4633 / 5130: the loaded bytes are saved by sha256; never refuses startup.
+            snapshot_dir=resolve_tierc_rules_snapshot_dir(settings),
             v2_thresholds=TierCV2Thresholds(
                 ask_min=dec_cfg.thresholds.tierc_v2_ask_min,
                 not_ask_max=dec_cfg.thresholds.tierc_v2_not_ask_max,

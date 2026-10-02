@@ -1,4 +1,5 @@
-"""Composition-root preflight — P0/P1/P2 (T-drop-branch-prediction-from-allowlist §3).
+"""Composition-root preflight — P0/P3/P2/P1 (T-drop-branch-prediction-from-allowlist §3;
+P3 from T-secret-guard-unarmed-in-every-implementer-clone msg-5342 §4).
 
 Called by :func:`spirrow_mindwire.loop_runner.run_loop` /
 :func:`spirrow_mindwire.loop_runner.run_conductor` before the daemon spawns any
@@ -29,7 +30,7 @@ right now**, not a per-turn wire-level enforcement:
   checkout is pointed at right now are protected", not "any repo a push might
   reach is protected".
 
-Three checks, in one order so the earliest failure is the loudest:
+Four checks, in one order so the earliest failure is the loudest:
 
 * **P0** — the implementer's ``repo_dir`` is not the daemon's own checkout.
   Two different clones. The safety story ("a chained ``git checkout main &&
@@ -40,6 +41,31 @@ Three checks, in one order so the earliest failure is the loudest:
   subdirectory of ``daemon_root`` with no ``.git`` of its own would satisfy
   (a) — the paths differ — while ``git -C repo_dir <cmd>`` still walks
   upward and finds the daemon's ``.git``. (b) closes that bypass.
+
+* **P3** — ``repo_dir`` is armed with the secret guard: ``core.hooksPath``
+  (the effective value, as git itself reads it) is set and non-empty, and
+  the directory it names (a relative value is resolved against the repo's
+  toplevel, where git runs hooks) contains a regular FILE named
+  ``pre-commit``. The directory existing is not enough: the shared
+  ``githooks/`` directory also carries git-lfs's ``post-*`` / ``pre-push``
+  hooks, so "a hooks dir is configured" proves nothing about the pre-commit
+  guard. Windows has no meaningful exec bit, so only "is a file" is checked.
+  T-secret-guard-unarmed-in-every-implementer-clone (msg-2864 / msg-5342
+  §4): ``core.hooksPath`` is per-clone and is not carried by ``git clone``,
+  so every autonomous ``*-impl`` clone ran unarmed while the operator's own
+  clone was armed. The sweep wrapper writes the candidate's ``repo_dir``
+  into ``[loop].repo_dir`` before each daemon start, so this check runs per
+  dispatch against exactly the clone that will be committed in, and a new
+  clone added to the sweep is caught on its first dispatch instead of
+  silently joining the unarmed set. Remediation: run the guard's
+  ``install_githooks.sh`` naming that clone.
+
+  What P3 does NOT do (msg-5342 §4, kept out deliberately): it does not run
+  the hook (``git hook run``) and does not read any commit's rc, so the
+  production commit path gets no diagnostic side channel. It also checks the
+  hook by NAME only: any regular file called ``pre-commit`` passes whatever
+  it contains, and ``core.hooksPath`` is not compared against an expected
+  directory (that would need a new config item). Accepted residual weakness.
 
 * **P2** — every remote URL in ``repo_dir``'s ``.git/config`` at start is
   under ``https://github.com/SpirrowGames/``. Tier-C decide 2026-08-19
@@ -71,7 +97,9 @@ Three checks, in one order so the earliest failure is the loudest:
   it — and if a ruleset the loop can bypass provides an entirely different
   rule, halting on it is over-deny theatre.
 
-The three run in this order because P2 gates P1's *scope*: P1 asks GitHub
+P3 runs right after P0 and before the network-touching P1 (msg-5342 §4): it
+is one local ``git config`` read plus one ``stat``. P2 and P1 run in this
+order because P2 gates P1's *scope*: P1 asks GitHub
 about specific repos, and asking about a repo P2 has already rejected only
 adds a way for a bad-owner probe to fail slower. P0 comes first because it's
 the cheapest and the one whose failure means "your daemon configuration is
@@ -142,7 +170,7 @@ source_type), which is a Tier-C operation outside this file's scope. The
 the operator can distinguish an org-source vs repo-source failure without
 re-tracing the code.
 
-Test-injection: every I/O boundary (``git remote``, ``gh api``) is a
+Test-injection: every I/O boundary (``git remote``, ``git config``, ``gh api``) is a
 :class:`Callable` parameter with a subprocess-based default. Tests pass fakes;
 the daemon uses the defaults.
 """
@@ -189,6 +217,12 @@ ApiCaller = Callable[[str], Any]
 RemoteReader = Callable[[Path], list[tuple[str, str]]]
 """``git -C repo remote -v`` → ``[(remote_name, url), ...]``. Injectable for tests."""
 
+HooksPathReader = Callable[[Path], str | None]
+"""``git -C repo config --get --path core.hooksPath`` → the effective value, or
+``None`` when it is unset. Any other failure raises (P3 turns that into a
+fail-closed :class:`PreflightError`). Injectable for tests, same shape as
+:data:`RemoteReader`."""
+
 GitToplevel = Callable[[Path], Path | None]
 """``git -C path rev-parse --show-toplevel`` → resolved toplevel Path, or None
 if the path is not inside any git working tree / git is unavailable / the path
@@ -206,8 +240,9 @@ def preflight_gate(
     api_caller: ApiCaller | None = None,
     remote_reader: RemoteReader | None = None,
     git_toplevel: GitToplevel | None = None,
+    hooks_path_reader: HooksPathReader | None = None,
 ) -> None:
-    """Enforce P0/P1/P2. Raise :class:`PreflightError` on any failure.
+    """Enforce P0/P3/P2/P1. Raise :class:`PreflightError` on any failure.
 
     ``daemon_root`` defaults to :func:`Path.cwd`. The composition root invokes
     this once per daemon start; there is no per-turn re-check and no cache —
@@ -245,8 +280,10 @@ def preflight_gate(
     api = api_caller or _default_api_caller
     remotes_of = remote_reader or _default_remote_reader
     toplevel_of = git_toplevel or _default_git_toplevel
+    hooks_path_of = hooks_path_reader or _default_hooks_path_reader
 
     _p0_daemon_checkout_separated(repo_dir, daemon_root, toplevel_of)
+    _p3_secret_guard_armed(repo_dir, hooks_path_of, toplevel_of)
     remotes = _p2_remote_urls_under_spirrowgames(repo_dir, remotes_of)
     _p1_default_branch_protected(remotes, api)
     logger.info(
@@ -308,6 +345,61 @@ def _p0_daemon_checkout_separated(
             f"Point [loop].repo_dir at a directory that has its own `.git` "
             f"(the current production shape: C:/workspace/sandbox/<project>-impl "
             f"is a distinct git clone, not a subdirectory of the daemon's tree)."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# P3 — the secret guard (pre-commit) is armed in repo_dir
+# --------------------------------------------------------------------------- #
+
+_P3_REQUIRED_HOOK = "pre-commit"
+
+_P3_REMEDY = (
+    "Arm this clone by running the secret guard's install_githooks.sh against it, "
+    "naming the clone explicitly (not --all), so core.hooksPath points at the existing "
+    "guard hooks directory; do not create a new hooks directory "
+    "(T-secret-guard-unarmed-in-every-implementer-clone msg-2864 §6 R-1)."
+)
+
+
+def _p3_secret_guard_armed(
+    repo_dir: Path, hooks_path_reader: HooksPathReader, git_toplevel: GitToplevel
+) -> None:
+    try:
+        raw = hooks_path_reader(repo_dir)
+    except Exception as exc:
+        raise PreflightError(
+            f"preflight P3 failed: could not read core.hooksPath for {repo_dir}: {exc}. "
+            f"An unreadable arming state is treated as unarmed (fail-closed). {_P3_REMEDY}"
+        ) from exc
+    value = (raw or "").strip()
+    if not value:
+        raise PreflightError(
+            f"preflight P3 failed: {repo_dir} has no core.hooksPath set, so the "
+            f"{_P3_REQUIRED_HOOK} secret guard is not armed and a commit of a real infra "
+            f"value in this clone would go through unchecked. {_P3_REMEDY}"
+        )
+    hooks_dir = Path(value)
+    if not hooks_dir.is_absolute():
+        # git runs hooks from the working tree's toplevel, so a relative
+        # core.hooksPath is relative to that, not to whatever repo_dir names.
+        top = git_toplevel(repo_dir)
+        if top is None:
+            raise PreflightError(
+                f"preflight P3 failed: core.hooksPath for {repo_dir} is relative "
+                f"({value!r}) and the repo's toplevel could not be resolved to anchor it. "
+                f"Fail-closed. {_P3_REMEDY}"
+            )
+        hooks_dir = top / hooks_dir
+    hook = hooks_dir / _P3_REQUIRED_HOOK
+    # Asserted by name, not by directory existence: the shared hooks dir also
+    # holds git-lfs's pre-push / post-* hooks (msg-5342 §3(a)).
+    if not hook.is_file():
+        raise PreflightError(
+            f"preflight P3 failed: core.hooksPath for {repo_dir} is {value!r} but {hook} "
+            f"is not a regular file, so the {_P3_REQUIRED_HOOK} secret guard is not armed "
+            f"(a hooks directory holding only other hooks, or a directory named "
+            f"{_P3_REQUIRED_HOOK}, does not count). {_P3_REMEDY}"
         )
 
 
@@ -666,6 +758,29 @@ def _default_remote_reader(repo_dir: Path) -> list[tuple[str, str]]:
     return entries
 
 
+def _default_hooks_path_reader(repo_dir: Path) -> str | None:
+    """Return the effective ``core.hooksPath`` for ``repo_dir``, or ``None`` if unset.
+
+    Effective, not ``--local``: git honours a global/system value too, and the
+    question P3 asks is "will a commit here run the guard". ``--path`` applies
+    git's own ``~`` expansion. ``git config --get`` exits 1 with empty output
+    for an unset key; that is the only non-zero exit read as "unset". Any
+    other failure raises, so P3 fails closed.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "config", "--get", "--path", "core.hooksPath"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 1 and not proc.stdout.strip():
+        return None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, proc.args, output=proc.stdout, stderr=proc.stderr
+        )
+    return proc.stdout.strip()
+
+
 def _default_api_caller(endpoint: str) -> Any:
     """Call ``gh api <endpoint>`` and return the parsed JSON body.
 
@@ -713,6 +828,7 @@ def _default_git_toplevel(path: Path) -> Path | None:
 __all__ = [
     "ApiCaller",
     "GitToplevel",
+    "HooksPathReader",
     "PreflightError",
     "RemoteReader",
     "preflight_gate",

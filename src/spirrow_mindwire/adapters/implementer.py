@@ -74,6 +74,11 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
 )
 
+from ..claude_code.tools.ledger_server import (
+    LEDGER_ALLOWED_TOOLS,
+    LEDGER_SERVER_NAME,
+    build_ledger_mcp_server,
+)
 from ..conductor.handoff import build_handoff_protocol_block
 from ..dispatcher.event_log import spawn_ready_event
 from ..exceptions import (
@@ -83,6 +88,8 @@ from ..exceptions import (
     AdapterSpawnError,
     AdapterSpawnTimeoutError,
 )
+from ..magickit.client import McpToolCaller
+from ..magickit.ledger_notes import PROCESS_TASK_LOCKS, LedgerHead, LedgerNotes, TaskLocks
 from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
@@ -361,6 +368,9 @@ class _Session:
     # T45 (loop side): the Claude Code session UUID from ``SystemMessage(init)``;
     # distinct from the handle's mindwire ULID ``session_id`` (Bohr msg-4884 §2).
     cc_session_uuid: str | None = None
+    # The message this session is answering, for the ledger tools' provenance header. ``None``
+    # when the adapter was built without a ledger (``ledger_mcp=None``).
+    ledger_head: LedgerHead | None = None
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -467,8 +477,16 @@ class ImplementerSdkAdapter:
         turn_timeout_seconds: float | None = None,
         sdk_executable_path: str | None = None,
         job_module: Any = None,
+        ledger_mcp: McpToolCaller | None = None,
+        ledger_locks: TaskLocks | None = None,
     ) -> None:
         self._cwd = Path(cwd)
+        # Ledger notes (thread T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down, Bohr
+        # msg-5296 / msg-5300): when a Magickit client is given, each session gets the in-process
+        # ``mindwire-ledger`` server — two tools, pinned to the thread's project, append-only — and
+        # never the raw Magickit server. ``None`` attaches nothing.
+        self._ledger_mcp = ledger_mcp
+        self._ledger_locks = ledger_locks if ledger_locks is not None else PROCESS_TASK_LOCKS
         # Inference MUST be routed via Lexora (env spec §4): require an explicit
         # base URL; never fall back to the SDK default (api.anthropic.com).
         self._inference_base_url = (
@@ -539,7 +557,36 @@ class ImplementerSdkAdapter:
         # is the real ``_sdk_job_hook`` module.
         self._job_module = job_module if job_module is not None else _sdk_job_hook
 
-    def _make_options(self) -> ClaudeAgentOptions:
+    def _ledger_for(
+        self, thread_ref: ThreadRef, ctx: SpawnContext
+    ) -> tuple[LedgerHead, Any] | None:
+        """Build this session's ledger server, pinned to ``thread_ref.project_id``.
+
+        ``None`` when the adapter has no Magickit client. The returned head is updated by
+        :meth:`deliver_event` so the provenance header names the message being answered.
+        """
+        if self._ledger_mcp is None:
+            return None
+        head = LedgerHead()
+        notes = LedgerNotes(
+            mcp=self._ledger_mcp,
+            project_id=thread_ref.project_id,
+            thread_id=thread_ref.thread_id,
+            on_event=ctx.on_event_log,
+            head=head,
+            locks=self._ledger_locks,
+        )
+        return head, build_ledger_mcp_server(notes)
+
+    def _make_options(self, *, ledger_server: Any = None) -> ClaudeAgentOptions:
+        mcp_servers = dict(self._mcp_servers)
+        allowed_tools = list(self._allowed_tools)
+        if ledger_server is not None:
+            mcp_servers[LEDGER_SERVER_NAME] = ledger_server
+            # Listed for symmetry with the other roles' wiring. The bound is not here: this
+            # session runs ``bypassPermissions`` with no ``can_use_tool`` (see the module
+            # docstring), so what limits it is that the server exposes only these two tools.
+            allowed_tools.extend(LEDGER_ALLOWED_TOOLS)
         env = {
             "ANTHROPIC_BASE_URL": self._inference_base_url,
             # Force UTF-8 in the CLI subprocess and any Python the agent spawns
@@ -559,8 +606,8 @@ class ImplementerSdkAdapter:
             # built-ins (SDK 0.1.77 → ``--tools ""``), so this list is what the
             # session can call — and, with no per-call guard, the only limit on it.
             "tools": list(_IMPLEMENTER_BUILTIN_TOOLS),
-            "allowed_tools": self._allowed_tools,
-            "mcp_servers": self._mcp_servers,
+            "allowed_tools": allowed_tools,
+            "mcp_servers": mcp_servers,
             # Isolation (T37 #4) — this role had it first; the definition now lives
             # in ``_session_isolation`` so all three roles cannot drift apart.
             **session_isolation_kwargs(),
@@ -610,7 +657,8 @@ class ImplementerSdkAdapter:
                 "MINDWIRE_IMPLEMENTER_BASE_URL): the implementer must route inference "
                 "via Lexora, never api.anthropic.com directly (ADR-07 §2.4 / env spec §4)"
             )
-        options = self._make_options()
+        ledger = self._ledger_for(thread_ref, ctx)
+        options = self._make_options(ledger_server=None if ledger is None else ledger[1])
 
         now = datetime.now(UTC)
         session = _Session(
@@ -621,6 +669,7 @@ class ImplementerSdkAdapter:
             state=SessionState.IDLE,
             last_active_at=now,
             options=options,
+            ledger_head=None if ledger is None else ledger[0],
         )
         session_registered = False
         client: _SdkClient | None = None
@@ -763,6 +812,8 @@ class ImplementerSdkAdapter:
             # instance self-filter (Gap-2 (b), I3 v2.2): drop our own echoed post
             # (author == our instance_id, e.g. "implementer-1"), not the bare role.
             return
+        if session.ledger_head is not None:
+            session.ledger_head.msg_id = payload.msg_id
 
         session.state = SessionState.PROCESSING
         # B-1 bounded turn drain (v12) — hand ``_drain_reply`` the turn

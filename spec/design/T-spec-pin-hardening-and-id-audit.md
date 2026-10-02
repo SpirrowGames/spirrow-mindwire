@@ -223,16 +223,26 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
     one, do not abbreviate one, and do not translate one. Do not raise,
     do not retry with a guess, and do not repair the pin.
 
-    Reachability has one network rule. If the pinned commit is already
-    an ancestor of your local `origin/main`, accept it and fetch
-    nothing. Only if it is not — or if you have no `origin/main` ref at
-    all — run `git fetch origin +refs/heads/main:refs/remotes/origin/main`
-    exactly once and judge again. If that fetch fails or is unavailable
-    to you, the verdict is NO-PIN/FETCH_UNAVAILABLE: you could not
-    determine the answer. If the fetch succeeds and the commit is still
-    not reachable, the verdict is NO-PIN/COMMIT_UNREACHABLE: the pin
-    names a commit that is not on `main`, which usually means the
-    specification was never merged. Report whichever code you got; they
+    Reachability has one network rule. Judge it with
+    `git merge-base --is-ancestor <commit> origin/main` and read the exit
+    status: 0 means the pinned commit is on `main`. If the first judgement
+    gives 0, accept the pin and fetch nothing. On any other status —
+    including when you have no `origin/main` ref at all — run
+    `git fetch origin +refs/heads/main:refs/remotes/origin/main` exactly
+    once and judge again. If that fetch fails or is unavailable to you,
+    the verdict is NO-PIN/FETCH_UNAVAILABLE: you could not determine the
+    answer. If the fetch succeeds and the second judgement gives 0, accept
+    the pin. If it gives any other status, run
+    `git rev-parse --is-shallow-repository` before deciding. If it prints
+    `false`, the verdict is NO-PIN/COMMIT_UNREACHABLE: a full clone that
+    has just fetched `main` holds every commit on `main`, so a pinned
+    commit it does not know (exit 128) or knows but cannot reach (exit 1)
+    is not on `main`, which usually means the specification was never
+    merged. If it prints `true`, prints anything else, or fails, the
+    verdict is NO-PIN/FETCH_UNAVAILABLE: a shallow clone lacks the history
+    needed to rule the commit out, so a negative judgement there means you
+    could not determine the answer. Do not deepen or unshallow the clone,
+    and do not fetch a second time. Report whichever code you got; they
     have different causes and different fixes, and collapsing them costs
     the reader the diagnosis.
 

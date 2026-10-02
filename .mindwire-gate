@@ -22,6 +22,7 @@ pwsh -NoProfile -File tests/Test-DecisionComposerWiring.ps1
 pwsh -NoProfile -File tests/Test-StopReasonPhrase.ps1
 pwsh -NoProfile -File tests/Test-SweepSequentiality.ps1
 pwsh -NoProfile -File tests/Test-WrapperInitTrap.ps1
+pwsh -NoProfile -File tests/Test-SweepFairness.ps1
 pwsh -NoProfile -File tests/Test-BoundedProbe.ps1
 pwsh -NoProfile -File tests/Test-ConductorWallClock.ps1
 uv run pytest
