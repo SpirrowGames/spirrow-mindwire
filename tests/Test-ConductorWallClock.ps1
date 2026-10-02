@@ -102,7 +102,10 @@ try {
     Initialize-ConductorPrivateDirectory -Path $private
     Check 'S1 the private directory is created' $true (Test-Path -LiteralPath $private -PathType Container)
     if (-not $IsWindows) {
-        Check 'S2 the private directory is 0700' 'UserRead, UserWrite, UserExecute' ([System.IO.File]::GetUnixFileMode($private)).ToString()
+        # Compare the numeric mode (0o700 = 448), not the enum's string form: [UnixFileMode]
+        # renders combined flags in bit order ("UserExecute, UserWrite, UserRead"), so a string
+        # compare against the order the flags were written in never matches.
+        Check 'S2 the private directory is 0700' 448 ([int][System.IO.File]::GetUnixFileMode($private))
     }
     $tempParam = (Get-Command Invoke-ConductorBounded).Parameters['TempDirectory']
     Check 'S3 -TempDirectory is mandatory (no system-temp default)' $true (@($tempParam.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory }).Count -ge 1)
