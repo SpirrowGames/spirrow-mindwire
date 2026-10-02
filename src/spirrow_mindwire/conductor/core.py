@@ -498,6 +498,12 @@ class Conductor:
         # ``unattributed_author``). Counted, and each one logged at WARNING, so nothing is dropped
         # silently (msg-5655 / msg-5657). Read through :attr:`decision_log_counts`.
         self._decision_log_counts: Counter[str] = Counter()
+        # Heads whose decision lines this instance has already handled. A long-lived Conductor
+        # re-reads the same stopped head on every tick; without this the ``malformed`` /
+        # ``unattributed_author`` counts and their WARNINGs would repeat once per tick (PR #418
+        # gate advisory). The JSONL's ``has_decision_entries`` check stays as the cross-process
+        # guard for written entries; this set only silences repeats within one process.
+        self._decision_heads_seen: set[str] = set()
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
@@ -1134,7 +1140,9 @@ class Conductor:
           is skipped without a count;
         * malformed lines from an allowed role are counted under ``malformed`` and not written.
 
-        Idempotent per ``(thread, msg_id)``: a head seen again by a later run is not written twice.
+        Idempotent per ``(thread, msg_id)``: a head seen again by a later run is not written twice,
+        and a head this instance already handled is not re-scanned, so its counts and WARNINGs are
+        emitted once per process rather than once per tick (a failed write is retried).
         A failure to read or write the log is logged at WARNING and does not stop the turn. The
         audit log is an observer of routing, never a gate on it.
         """
@@ -1142,6 +1150,9 @@ class Conductor:
         if log_path is None:
             return
         msg_id = _msg_id(latest)
+        if msg_id in self._decision_heads_seen:
+            return
+        self._decision_heads_seen.add(msg_id)
         author = _author(latest)
         scan = scan_decision_lines(_content(latest))
         if scan.empty:
@@ -1186,6 +1197,8 @@ class Conductor:
             )
             append_log_entries(log_path, entries, thread=thread, msg_id=msg_id)
         except Exception:
+            # Forget the head so a later tick retries the write instead of losing the entries.
+            self._decision_heads_seen.discard(msg_id)
             logger.warning(
                 "decision log: writing %d entr(ies) for msg=%s failed",
                 len(scan.lines),

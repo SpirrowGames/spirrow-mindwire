@@ -253,6 +253,34 @@ async def test_same_head_seen_twice_is_logged_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_repeated_ticks_on_one_instance_count_and_warn_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR #418 gate advisory: a long-lived Conductor re-reading the same stopped head must not
+    re-count or re-warn its malformed / unattributed lines on every tick."""
+    log_path = _log(tmp_path)
+    head = "done\n\nDECIDED: kept the helper —\n\nTIER-C: merge-protected\nNEXT: human"
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.conductor.core"):
+        conductor, _ = await _run(log_path, head=head, head_author="Heisenberg")
+        await conductor.run()
+        await conductor.run()
+    assert conductor.decision_log_counts == {"malformed": 1}
+    assert sum("malformed" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.anyio
+async def test_failed_write_is_retried_on_the_next_tick(tmp_path: Path) -> None:
+    blocker = tmp_path / "state"
+    blocker.write_text("a file where the state directory should be", encoding="utf-8")
+    log_path = blocker / "log.jsonl"
+    conductor, _ = await _run(log_path, head=IMPLEMENTER_HEAD, head_author="Heisenberg")
+    blocker.unlink()
+    blocker.mkdir()
+    await conductor.run()
+    assert [r["kind"] for r in _rows(log_path)] == ["DECIDED", "DEFERRED"]
+
+
+@pytest.mark.anyio
 async def test_no_log_path_writes_nothing(tmp_path: Path) -> None:
     conductor, _ = await _run(None, head=IMPLEMENTER_HEAD, head_author="Heisenberg")
     assert list(tmp_path.iterdir()) == []
