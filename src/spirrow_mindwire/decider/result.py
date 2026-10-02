@@ -63,7 +63,8 @@ class DecisionResult:
       was obtained at all. Display / log only — never part of the verdict.
     * ``matched_rule_source`` — how ``matched_rule`` was obtained: ``"choice"`` (a ``choice``
       question; the only path built — Lexora accepts ``choice``, so msg-4382's noul-argmax
-      fallback is not needed).
+      fallback is not needed). ``None`` whenever ``matched_rule`` is ``None`` (msg-4629 §2), so
+      ``"choice"`` always comes with a value.
     * ``rules_sha256`` — sha256 of the rules file the questions were built from.
     """
 

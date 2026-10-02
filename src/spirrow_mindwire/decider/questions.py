@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -210,11 +210,16 @@ class TierCRule:
 @dataclass(frozen=True)
 class TierCRules:
     """読み込んだルールファイル。
-    ``sha256`` はファイルのバイト列の hex digest (``rules_sha256``)。"""
+    ``sha256`` はファイルのバイト列の hex digest (``rules_sha256``)。
+
+    ``raw`` は ``sha256`` を計算した**そのバイト列** (T-decider-tierc-v2-all-escalations
+    Bohr msg-4631)。live 側のスナップショット (``build_decider``) はファイルを読み直さずに
+    これを書く — 読み直すと、その間の編集で hash と中身が食い違うため。"""
 
     rules: tuple[TierCRule, ...]
     sha256: str
     source: str
+    raw: bytes = field(default=b"", repr=False)
 
     @property
     def matched_rule_options(self) -> tuple[str, ...]:
@@ -257,7 +262,9 @@ def parse_tierc_rules(data: bytes, *, source: str) -> TierCRules:
         if note is not None and (not isinstance(note, str) or not note.strip()):
             raise TierCRulesError(f"{source}: rule {rid} note must be a non-empty string")
         rules.append(TierCRule(id=rid, text=text.strip(), note=note.strip() if note else None))
-    return TierCRules(rules=tuple(rules), sha256=hashlib.sha256(data).hexdigest(), source=source)
+    return TierCRules(
+        rules=tuple(rules), sha256=hashlib.sha256(data).hexdigest(), source=source, raw=data
+    )
 
 
 def load_tierc_rules(path: Path) -> TierCRules:

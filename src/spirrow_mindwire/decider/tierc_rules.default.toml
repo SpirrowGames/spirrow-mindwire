@@ -4,6 +4,8 @@
 # (mindwire.toml と同じディレクトリ、[decider.tierc].rules_path で上書き可)。
 # 正本の初回配置: `mindwire init-config tierc-rules` (既存ファイルは上書きしない)。
 # 文言を直したら conductor を再起動してください (起動時に 1 回だけ読みます)。
+# 再起動のたびに、読み込んだ版が <data_dir>/decider/rules/<sha256>.toml に自動で保存されます
+# ([decider.tierc].rules_snapshot_dir で上書き可)。旧版の文言はそこに残るので、評価で辿れます。
 #
 # 形式: [[rule]] を並べる。id は rule_<番号> (一意)、text は必須、note は任意 (text の下に添えて渡す)。
 # 問いの枠の文 (「このハンドオフは人間に問うべきか」など) はコード側 (decider/questions.py) にあり、
