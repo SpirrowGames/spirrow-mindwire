@@ -1,0 +1,175 @@
+{
+  "rule": "ADR-2026-05-29-11: strip, [\\s_-]+ -> '-', casefold",
+  "normalize": [
+    [
+      "Bohr",
+      "bohr"
+    ],
+    [
+      "bohr",
+      "bohr"
+    ],
+    [
+      "BOHR",
+      "bohr"
+    ],
+    [
+      " Bohr ",
+      "bohr"
+    ],
+    [
+      "Bohr\t",
+      "bohr"
+    ],
+    [
+      "pr-gate-relay",
+      "pr-gate-relay"
+    ],
+    [
+      "pr_gate_relay",
+      "pr-gate-relay"
+    ],
+    [
+      "PR Gate Relay",
+      "pr-gate-relay"
+    ],
+    [
+      "pr--gate__relay",
+      "pr-gate-relay"
+    ],
+    [
+      "pr - gate",
+      "pr-gate"
+    ],
+    [
+      "Heisenberg",
+      "heisenberg"
+    ],
+    [
+      "human",
+      "human"
+    ],
+    [
+      "Human",
+      "human"
+    ],
+    [
+      "  human  ",
+      "human"
+    ],
+    [
+      "queue-empty",
+      "queue-empty"
+    ],
+    [
+      "queue_empty",
+      "queue-empty"
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "   ",
+      ""
+    ],
+    [
+      "-",
+      "-"
+    ],
+    [
+      "_lead",
+      "-lead"
+    ],
+    [
+      "trail_",
+      "trail-"
+    ],
+    [
+      "Straße",
+      "strasse"
+    ],
+    [
+      "STRASSE",
+      "strasse"
+    ],
+    [
+      "a　b",
+      "a-b"
+    ],
+    [
+      "claude-code",
+      "claude-code"
+    ],
+    [
+      "claude.ai",
+      "claude.ai"
+    ],
+    [
+      "Einstein",
+      "einstein"
+    ]
+  ],
+  "collisions": [
+    {
+      "input": [
+        "Bohr",
+        "bohr",
+        "Bohr"
+      ],
+      "expected": {
+        "bohr": [
+          "Bohr",
+          "bohr"
+        ]
+      }
+    },
+    {
+      "input": [
+        "pr-gate-relay",
+        "PR_Gate_Relay",
+        "pr gate relay"
+      ],
+      "expected": {
+        "pr-gate-relay": [
+          "pr-gate-relay",
+          "PR_Gate_Relay",
+          "pr gate relay"
+        ]
+      }
+    },
+    {
+      "input": [
+        "Heisenberg",
+        "Einstein"
+      ],
+      "expected": {}
+    },
+    {
+      "input": [
+        "Straße",
+        "STRASSE",
+        "strasse"
+      ],
+      "expected": {
+        "strasse": [
+          "Straße",
+          "STRASSE",
+          "strasse"
+        ]
+      }
+    },
+    {
+      "input": [
+        "",
+        "   "
+      ],
+      "expected": {
+        "": [
+          "",
+          "   "
+        ]
+      }
+    }
+  ]
+}
