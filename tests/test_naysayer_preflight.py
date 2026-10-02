@@ -441,6 +441,31 @@ async def test_a_gateway_that_ignores_the_filter_is_reported_with_the_row_shape(
 
 
 @pytest.mark.anyio
+async def test_an_unfiltered_gateway_on_a_populated_ledger_says_filter_not_full() -> None:
+    """★ PR-gate msg-5852: the realistic pre-``trace_id`` gateway returns a FULL read.
+
+    A production ledger holds thousands of rows, so a gateway that ignores
+    ``?trace_id=`` hands back exactly ``limit`` of them, none ours. The
+    diagnostic must be "did not apply the filter" (the deploy-ordering check the
+    live smoke test relies on), not the generic "came back full" — the 1-row
+    ledger in the test above could not tell the two orders apart.
+    """
+    populated = [_light_row(1 + i) for i in range(TRACE_READ_LIMIT + 50)]
+    gateway = _FakeGateway(
+        ledger=populated,
+        append_on_call=[[_light_row(9_000 + i)] for i in range(3)],
+        honours_trace_filter=False,
+    )
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest(gateway)
+    message = str(excinfo.value)
+    assert all(read["limit"] == TRACE_READ_LIMIT for read in gateway.stats_reads)
+    assert f"{TRACE_READ_LIMIT} accounting row(s) came back for a trace-filtered read" in message
+    assert "the gateway did not apply the filter" in message
+    assert "came back full" not in message
+
+
+@pytest.mark.anyio
 async def test_the_two_empty_selection_failures_do_not_share_a_message() -> None:
     """One failure operationally, two facts about the world — same type, different text."""
     nothing_written = _FakeGateway(append_on_call=[[], [], []])
@@ -712,6 +737,24 @@ async def test_a_full_turn_read_fails_at_once_and_a_mismatch_in_it_wins() -> Non
     poisoned = [*full[:-1], _turn_row(20_000, backend="anthropic")]
     with pytest.raises(PreflightError, match="did not resolve"):
         await _attest_turn(_Ledger([poisoned]), _Sleeps())
+
+
+@pytest.mark.anyio
+async def test_a_full_unfiltered_turn_read_says_filter_not_full_and_is_not_re_read() -> None:
+    """★ PR-gate msg-5852 at turn scope: diagnostic unshadowed, fail-fast kept.
+
+    ``limit`` foreign rows (an unfiltering gateway on a populated ledger) report
+    "did not apply the filter"; :func:`attest_turn` still sees a full read and
+    raises after ONE read — re-reading a full unfiltered set returns the same set.
+    """
+    unfiltered = [_light_row(10_000 + i) for i in range(TRACE_READ_LIMIT)]
+    ledger, sleeps = _Ledger([unfiltered]), _Sleeps()
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest_turn(ledger, sleeps)
+    message = str(excinfo.value)
+    assert "the gateway did not apply the filter" in message
+    assert "came back full" not in message
+    assert len(ledger.asked) == 1
 
 
 @pytest.mark.anyio

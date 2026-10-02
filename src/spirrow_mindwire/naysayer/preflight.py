@@ -263,10 +263,15 @@ def _judge(
        ``expected`` is a verdict (:class:`_BackendMismatchError`), and it wins
        over every "could not determine" state below: a mismatching row in hand
        is never set aside because the read *also* looked incomplete.
-    3. A **full read** (``len(rows) >= limit``) may have been cut off and may be
+    3. **No selected row** cannot pass: a 2xx response is not evidence of
+       routing. This is checked BEFORE the full-read check (PR-gate msg-5852):
+       a gateway that ignores ``?trace_id=`` returns the newest ``limit`` rows of
+       a populated ledger — a full read with none of ours — and the operator
+       must see "did not apply the filter", the deploy-ordering diagnostic, not
+       a generic truncation message. The caller still sees ``len(rows) >=
+       limit`` and does not re-read (:func:`attest_turn`).
+    4. A **full read** (``len(rows) >= limit``) may have been cut off and may be
        hiding a mismatching sibling, so it cannot pass.
-    4. **No selected row** cannot pass: a 2xx response is not evidence of
-       routing.
     5. Otherwise every selected row said ``expected``. One matching row never
        licenses ignoring a non-matching sibling, which is why (2) checks all.
 
@@ -281,12 +286,6 @@ def _judge(
             f"{what} did not resolve to the expected backend: rows for trace "
             f"{trace_id} report {sorted(backends)!r}, expected {expected!r}"
         )
-    if len(rows) >= limit:
-        raise PreflightError(
-            f"{what}: the trace-filtered read for {trace_id} came back full "
-            f"({len(rows)} row(s) at limit {limit}), so rows may have been cut off; "
-            f"a set that may be incomplete cannot attest the route"
-        )
     if not selected:
         if not rows:
             raise PreflightError(
@@ -299,6 +298,12 @@ def _judge(
             f"{what}: {len(rows)} accounting row(s) came back for a trace-filtered "
             f"read but none carries {TRACE_ROW_COLUMN} {trace_id!r}; the gateway did "
             f"not apply the filter, so the route is unproven. {_observed_shape(rows)}"
+        )
+    if len(rows) >= limit:
+        raise PreflightError(
+            f"{what}: the trace-filtered read for {trace_id} came back full "
+            f"({len(rows)} row(s) at limit {limit}), so rows may have been cut off; "
+            f"a set that may be incomplete cannot attest the route"
         )
     return "cost-row#" + "+".join(str(_row_id(row)) for row in selected)
 
