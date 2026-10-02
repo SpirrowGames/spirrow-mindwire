@@ -77,6 +77,12 @@ from .adapters.decider_lexora import build_decider
 from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
+from .clone_guard import (
+    DIRTY_CLONE_EXIT_CODE,
+    DIRTY_CLONE_PAYLOAD_PREFIX,
+    CloneGuard,
+    DirtyCloneError,
+)
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import (
     CONDUCTOR_RELAY_AUTHOR,
@@ -652,11 +658,18 @@ def _build_dispatcher(
         # unset (PR-review #335 round-2: the two must not be conflated).
         repo = Path(cfg.repo_dir)
         pin_writer = SpecPinWriter(pin_target_dir=repo, spec_source_root=repo)
+    # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-1): refuse to dispatch
+    # any role onto ``loop.repo_dir`` while it is dirty, mid-operation, or off its default branch.
+    # Same condition as the pin writer: no repo_dir = adapters were injected by a test.
+    clone_guard: CloneGuard | None = None
+    if cfg.repo_dir is not None:
+        clone_guard = CloneGuard(Path(cfg.repo_dir))
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,
         event_sink=_log_event_sink,
         spec_pin_writer=pin_writer,
+        clone_guard=clone_guard,
     )
     return mcp, registry, dispatcher
 
@@ -1208,6 +1221,14 @@ def _emit_environment_terminal_payload(exc: EnvironmentTerminalError) -> None:
     sys.stdout.flush()
 
 
+def _emit_dirty_clone_payload(exc: DirtyCloneError) -> None:
+    """Print the one ``MINDWIRE_DIRTY_CLONE_PAYLOAD <json>`` row the sweep wrapper parses."""
+    import json
+
+    sys.stdout.write(f"{DIRTY_CLONE_PAYLOAD_PREFIX}{json.dumps(exc.payload())}\n")
+    sys.stdout.flush()
+
+
 def main() -> None:
     """Entry point for the ``mindwire-loop`` console script.
 
@@ -1308,6 +1329,22 @@ def main() -> None:
             env_exc.status_code,
         )
         sys.exit(2)
+    except DirtyCloneError as dirty_exc:
+        # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
+        # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
+        # reach the exit-1 path below (whose stop line the wrapper turns into retry → quarantine).
+        # A dedicated exit code — not 2, which the wrapper reads as a GitHub credential fault even
+        # when the payload row is unreadable (Einstein msg-5776 #2). The payload row only enriches
+        # the notification; the wrapper's do-not-quarantine decision rides on the exit code.
+        _emit_dirty_clone_payload(dirty_exc)
+        logger.warning(
+            "dirty-clone exit=%d: repo_dir=%s reason=%s head=%s",
+            DIRTY_CLONE_EXIT_CODE,
+            dirty_exc.repo_dir,
+            dirty_exc.reason.value,
+            dirty_exc.head,
+        )
+        sys.exit(DIRTY_CLONE_EXIT_CODE)
     except BaseException as exc:
         # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
         # second copy). Sequenced carefully because Python's default

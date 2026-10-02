@@ -152,6 +152,13 @@ $DailyDigestDeliveryTime = [TimeSpan]::FromHours(9)
 # and RUN_KILL_UNCONFIRMED_EXIT_CODE in conductor/run_budget.py (a pytest pins all three).
 $ConductorKillUnconfirmedExitCode = 7
 
+# Exit code of mindwire-loop when the pre-dispatch clone guard refused to start a role because
+# [loop].repo_dir is dirty, mid-operation, or off its default branch
+# (T-timed-out-implementer-turn-leaves-dirty-shared-clone, design v4 D-2). Mirrors
+# DIRTY_CLONE_EXIT_CODE in src/spirrow_mindwire/clone_guard.py (a pytest pins the two). Not 5: 5/6/7
+# are the wall-clock budget's codes above.
+$DirtyCloneExitCode = 8
+
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
@@ -2765,6 +2772,59 @@ function Send-NotificationIfChanged {
     $State[$Key] = $Signature
 }
 
+# --- dirty shared clone (T-timed-out-implementer-turn-leaves-dirty-shared-clone, design v4 D-2) ---
+# The daemon exits $DirtyCloneExitCode when its pre-dispatch guard refused to run any role on the
+# candidate's repo_dir. The clone is shared by every candidate with that repo_dir, so the rest of
+# them would be refused the same way this tick; candidates on OTHER repos are unaffected and keep
+# going (Einstein msg-5778 #1). Nobody is quarantined or put on retry-pending: the fault is the
+# clone's, not a thread's, and the next tick's guard re-judges it. Only a human cleans the clone.
+
+# Case-insensitive, separator-normalised identity for a repo_dir (Windows paths).
+function ConvertTo-DirtyCloneRepoKey {
+    param([string]$RepoDir)
+    $full = [System.IO.Path]::GetFullPath($RepoDir)
+    return $full.TrimEnd([char[]]@([char]'\', [char]'/')).ToLowerInvariant()
+}
+
+function Test-DirtyCloneSkip {
+    param([string]$RepoDir, [hashtable]$DirtyRepoDirs)
+    if ($null -eq $DirtyRepoDirs -or $DirtyRepoDirs.Count -eq 0) { return $false }
+    return $DirtyRepoDirs.ContainsKey((ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir))
+}
+
+# Build the notification for one exit-$DirtyCloneExitCode run. The KEY is per repo and derived from
+# the wrapper's own $cand.repo_dir, so it never depends on the payload; the payload only shapes the
+# signature and the body. An unreadable payload still notifies (signature 'dirty-clone:parse-failed')
+# and never borrows a GitHub key (Einstein msg-5776 #2).
+function Get-DirtyCloneNotice {
+    param([string]$RepoDir, [string]$CandidateKey, $Output, [int]$ExitCode)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    $payload = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_DIRTY_CLONE_PAYLOAD\s+(.*)$') {
+            try { $payload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
+            break
+        }
+    }
+    $sig = 'dirty-clone:parse-failed'
+    $detailLine = '(payload parse failed)'
+    if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'reason') {
+        $head = if ($payload.head) { "$($payload.head)" } else { '-' }
+        $sig = "dirty-clone:$($payload.reason):$head"
+        $detailLine = "reason=$($payload.reason) head=$head"
+        if ($payload.detail) { $detailLine += " ($($payload.detail))" }
+        $porcelain = @($payload.porcelain | Where-Object { $_ })
+        if ($porcelain.Count -gt 0) {
+            $detailLine += "`n" + (($porcelain | Select-Object -First 10 | ForEach-Object { "  $_" }) -join "`n")
+        }
+    }
+    $body = ("MindWire: 共有 clone が汚れているため起動を拒否しました — **$CandidateKey** exit=$ExitCode。" +
+             "スレッドは無傷（quarantine 書かず）。この tick の同じ clone の候補は skip しました。`n" +
+             "clone: $RepoDir`n$detailLine`n" +
+             "clone を確認し、要る WIP は退避してからデフォルトブランチの clean な状態に戻してください（自動では片付けません）。")
+    return @{ key = "__dirty_clone__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey }
+}
+
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
 # Turns the current bare "the loop is waiting on Takahito" ping into a self-contained question by
 # invoking `mindwire-compose-decision` on every NEW human-terminal stop, then caching the result in
@@ -4523,6 +4583,9 @@ try {
     $sweepSignature = @()
     $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
     $breakReason = $null       # human-readable reason for a mid-sweep break, or $null if it ran to end
+    # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
+    # $DirtyCloneExitCode). Per tick only: the next tick's guard re-judges the clone.
+    $dirtyRepoDirs = @{}
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
     # `*_to_human` fallback are all "the loop parked on a human", and round_cap / empty_thread are
@@ -4593,6 +4656,14 @@ try {
             $quarantineSkipped++
             $dispositions[$cand.key] = 'quarantined-skipped'
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — [$stateLabel]$ageStr, not launching (Clear-Quarantine to release)"
+            continue
+        }
+
+        # Dirty shared clone (design v4 D-2): an earlier candidate this tick was refused on this
+        # same repo_dir. Launching would only be refused again. Not quarantined, not retry-pending.
+        if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $dirtyRepoDirs) {
+            $dispositions[$cand.key] = 'dirty-clone-skip'
+            Write-Log "dirty-clone-skip $($cand.key): repo_dir=$($cand.repo_dir) was refused as dirty earlier this tick, not launching"
             continue
         }
 
@@ -4838,6 +4909,20 @@ try {
             continue
         }
 
+        # EXIT CODE $DirtyCloneExitCode — dirty shared clone (T-timed-out-implementer-turn-leaves-
+        # dirty-shared-clone, design v4 D-2). The daemon's pre-dispatch guard refused to start a
+        # role on this repo_dir. MUST stay above the generic non-zero branch below: falling into it
+        # would retry and then quarantine a thread that did nothing wrong.
+        if ($code -eq $DirtyCloneExitCode) {
+            $dispositions[$cand.key] = 'dirty-clone'
+            $notice = Get-DirtyCloneNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code
+            $dirtyRepoDirs[$notice.repo_key] = $true
+            Send-NotificationIfChanged -State $notifyState -Key $notice.key `
+                -Signature $notice.signature -Message $notice.message
+            Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; other candidates on this repo_dir are skipped this tick, other repos CONTINUE"
+            continue
+        }
+
         # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
         # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
         # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
@@ -4846,7 +4931,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2 above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
