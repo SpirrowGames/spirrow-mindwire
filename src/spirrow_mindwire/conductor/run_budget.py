@@ -300,7 +300,16 @@ async def run_with_budget(
 
     The line is written by a timer callback at the deadline, which then moves the
     ``asyncio.timeout`` deadline to "now". The cancellation therefore arrives after the line, and
-    the body's ``finally`` blocks (adapter teardown) run after it too. If the body happens to
+    the body's ``finally`` blocks (adapter teardown) run after it too.
+
+    Teardown runs to completion, awaits included. asyncio's cancellation is edge-triggered: the
+    expired scope calls ``task.cancel()`` once, the single ``CancelledError`` lands on the await
+    that was pending at the deadline, and later awaits in ``finally`` (``await cond.aclose()``)
+    are not cancelled again. The scope being in its expired state does not re-cancel them
+    (``test_async_teardown_runs_to_completion_after_the_deadline``). The soft budget therefore
+    does not bound teardown: a teardown that never returns is left to the hard budget
+    (``test_teardown_that_hangs_cannot_keep_the_line_out``), by which time the line is already
+    in the log. If the body happens to
     return in the same loop iteration the timer fired, the line has been written but the result
     stands: the run finished, exits 0, and the log tail of an exit-0 run is not classified.
     """

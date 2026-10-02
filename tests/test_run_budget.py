@@ -140,6 +140,40 @@ async def test_line_is_written_before_the_body_tears_down(caplog: pytest.LogCapt
 
 
 @pytest.mark.anyio
+async def test_async_teardown_runs_to_completion_after_the_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # PR-gate on f045ba8: does the expired scope cancel every ``await`` in the body's ``finally``
+    # (``await cond.aclose()`` in ``loop_runner._run_conductor_once``), aborting teardown on its
+    # first await? No: asyncio's cancellation is edge-triggered. ``asyncio.timeout`` calls
+    # ``task.cancel()`` once at the deadline; that one CancelledError lands on the await that was
+    # pending, and later awaits in ``finally`` run normally. This test does what the real
+    # teardown does, several awaits that suspend, and checks that every one of them completes.
+    caplog.set_level(logging.INFO)
+    order: list[str] = []
+
+    async def _aclose() -> None:
+        for i in range(3):
+            await asyncio.sleep(0.01)  # really suspends, unlike sleep(0)
+            order.append(f"aclose.{i}")
+        order.append("aclose.done")
+
+    async def _body() -> None:
+        try:
+            await asyncio.sleep(30)
+        finally:
+            order.append("teardown")
+            await _aclose()
+
+    result, event = await run_with_budget(
+        _body, budget_s=0.05, run_phase=RunPhase(), project="p", thread="t"
+    )
+    assert result is None and event is not None
+    assert order == ["teardown", "aclose.0", "aclose.1", "aclose.2", "aclose.done"]
+    assert len(_timeout_lines(caplog)) == 1
+
+
+@pytest.mark.anyio
 async def test_teardown_that_hangs_cannot_keep_the_line_out(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
