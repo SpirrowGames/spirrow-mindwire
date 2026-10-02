@@ -95,6 +95,7 @@ def _attested(body: str, *, backend: str = "gemini", expected: str = "gemini") -
             expected=expected,
             route="{{IP_SERVICES}}:8110",
             probe="cost-row#6032",
+            scope="turn",
             at=_TS,
         ),
     )

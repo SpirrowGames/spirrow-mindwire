@@ -491,6 +491,7 @@ async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record()
         expected="gemini",
         route="{{IP_SERVICES}}:8110",
         probe="cost-row#5992",
+        scope="turn",
         at=datetime(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
     )
     adapter = _AttestingAdapter(options=options, record=record, reply_body="agent said this")
@@ -507,7 +508,8 @@ async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record()
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+        "· at=2026-08-13T00:23:48Z -->"
     )
 
 
@@ -594,6 +596,7 @@ async def test_dispatcher_stamps_attestation_when_adapter_has_no_options_getter(
         expected="gemini",
         route="{{IP_SERVICES}}:8110",
         probe="cost-row#5992",
+        scope="turn",
         at=_dt(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
     )
     adapter = _AttestationOnlyAdapter(record=record, reply_body="agent said this")
@@ -606,7 +609,8 @@ async def test_dispatcher_stamps_attestation_when_adapter_has_no_options_getter(
     assert lines[0] == "agent said this"
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · scope=turn "
+        "· at=2026-08-13T00:23:48Z -->"
     )
     # And no invented configuration line: this adapter has no options at all,
     # so a ``source:`` line here would be fiction, not a tautology (D1).
