@@ -407,3 +407,34 @@ def test_cli_runs_a_full_tick_and_passes_the_fetch_timeout(
     assert heartbeat[0]["budget_exhausted"] is False
     assert heartbeat[0]["deferred_fetches"] == 0
     assert heartbeat[0]["pending_markers"] == 0
+
+
+# ── marker_flags' whole list reaches the record (PR-gate finding on 66fb508) ─────────
+
+
+def _flags_with_extra(result: MarkerCheck) -> tuple[list[str], str | None]:
+    return ["origin_unknown", "extra_flag"], "test"
+
+
+def test_every_marker_flag_reaches_the_record_at_open_and_at_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_judge_e`` must carry everything ``marker_flags`` returns, not only
+    ``origin_unknown`` -- on the open path and on the A5 settle path alike."""
+    from spirrow_mindwire.stall_ledger import driver
+
+    monkeypatch.setattr(driver, "marker_flags", _flags_with_extra)
+    # Open path: an untrusted open whose fetch fits the budget.
+    clock = FakeClock()
+    src = Source(clock=clock, units={"o/r#1": (_review("o/r#1"), True)})
+    out = _tick(tmp_path / "open", src, clock, NOW)
+    rec = _records(tmp_path / "open")["pr:o/r#1"]
+    assert rec["flags"] == ["epoch_unknown", "origin_unknown", "extra_flag"]
+    assert _lines(out, "open")[0]["flags"] == rec["flags"]
+    # Settle path: a record opened with its fetch owed, settled on the next tick.
+    state, src, clock = _one_owed(tmp_path)
+    out = _tick(state, src, clock, NOW + timedelta(minutes=15))
+    rec = _records(state)["pr:o/r#1"]
+    assert rec["flags"] == ["epoch_unknown", "origin_unknown", "extra_flag"]
+    assert rec["evidence"]["marker_reason"] == "test"
+    assert _lines(out, "marker_resolved")[0]["flags"] == rec["flags"]

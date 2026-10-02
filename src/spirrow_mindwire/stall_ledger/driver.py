@@ -199,9 +199,14 @@ class FetchBudget:
 
 @dataclass(frozen=True)
 class _EVerdict:
-    """What E says about a unit's origin. ``pending``: the fetch is owed (A2')."""
+    """What E says about a unit's origin. ``pending``: the fetch is owed (A2').
 
-    origin_unknown: bool
+    ``flags`` is every flag the E table assigns, carried whole -- for a body fetch that
+    is exactly the list :func:`marker_flags` returned, so a flag it adds later reaches
+    the record instead of being dropped here.
+    """
+
+    flags: tuple[str, ...]
     reason: str | None
     pending: bool = False
 
@@ -216,15 +221,15 @@ async def _judge_e(
 ) -> _EVerdict:
     """The E table (msg-4685 §4-2), with the D-16c budget in front of the body fetch."""
     if e is None or e.type == MotionType.HEAD_PUSH:
-        return _EVerdict(False, None)
+        return _EVerdict((), None)
     if e.type in (MotionType.REVIEW, MotionType.CHATROOM_MSG):
         if not budget.try_start():
-            return _EVerdict(True, MARKER_REASON_BUDGET, pending=True)
+            return _EVerdict((FLAG_ORIGIN_UNKNOWN,), MARKER_REASON_BUDGET, pending=True)
         counters.body_fetches += 1
         extra, reason = marker_flags(await result.checker.check_marker(obs.unit, e))
-        return _EVerdict(FLAG_ORIGIN_UNKNOWN in extra, reason)
+        return _EVerdict(tuple(extra), reason)
     log({"kind": "unknown_motion_type", "unit": obs.unit.key, "type": e.type})
-    return _EVerdict(True, None)
+    return _EVerdict((FLAG_ORIGIN_UNKNOWN,), None)
 
 
 async def evaluate(
@@ -319,14 +324,15 @@ async def _settle_owed(
     motion_at_open = datetime.fromisoformat(motion_at_open_raw)
     e = select_e(obs, [])
     if e is None or e.at != motion_at_open:
-        verdict = _EVerdict(True, MARKER_REASON_E_NOT_FOUND)
+        verdict = _EVerdict((FLAG_ORIGIN_UNKNOWN,), MARKER_REASON_E_NOT_FOUND)
     else:
         verdict = await _judge_e(result, obs, e, budget, log, counters)
         if verdict.pending:
             return
+    # The owed record carries the budget verdict's provisional flags; the settled verdict
+    # replaces them. Every other flag (epoch_unknown) is kept.
     flags = [f for f in record.flags if f != FLAG_ORIGIN_UNKNOWN]
-    if verdict.origin_unknown:
-        flags.append(FLAG_ORIGIN_UNKNOWN)
+    flags.extend(f for f in verdict.flags if f not in flags)
     store.settle_marker(record.unit.key, flags, verdict.reason)
     counters.markers_resolved += 1
     line: dict[str, Any] = {
@@ -353,12 +359,11 @@ async def _open(
 ) -> None:
     flags: list[str] = []
     evidence: dict[str, Any] = {}
-    verdict = _EVerdict(False, None)
+    verdict = _EVerdict((), None)
     if untrusted:
         flags.append(FLAG_EPOCH_UNKNOWN)
         verdict = await _judge_e(result, obs, select_e(obs, []), budget, log, counters)
-        if verdict.origin_unknown:
-            flags.append(FLAG_ORIGIN_UNKNOWN)
+        flags.extend(f for f in verdict.flags if f not in flags)
         if verdict.reason is not None:
             evidence["marker_reason"] = verdict.reason
         if verdict.pending:

@@ -5,7 +5,7 @@
 # the daemon checkout (docs/deploy.md → "Stall ledger tick"). Nothing in the loop calls this.
 #
 # The two durations below must equal HEARTBEAT_INTERVAL and T_LOCK_STALE in
-# src/spirrow_mindwire/stall_ledger/timing.py. tests/test_stall_ledger_d16c_timing.py reads them
+# src/spirrow_mindwire/stall_ledger/timing.py. tests/test_stall_ledger_d16c.py reads them
 # from this file and fails the build if they drift, or if the order
 # T_TICK_MAX < T_LOCK_STALE < HEARTBEAT_INTERVAL stops holding.
 #

@@ -4,7 +4,7 @@ Spec: T-stalled-pr-has-no-detector msg-5744 §3 (C1, C2, C4) and msg-5746 §2 (A
 the advisory in msg-5747 (the fetch window must fit at least one fetch).
 
 These replace the provisional D-16ab values. The inequalities below are pinned by
-``tests/test_stall_ledger_d16c_timing.py``, so a later change to one value that breaks
+``tests/test_stall_ledger_d16c.py``, so a later change to one value that breaks
 another fails the build instead of the schedule.
 
 * ``HEARTBEAT_INTERVAL`` (H) -- how often Task Scheduler fires the tick
