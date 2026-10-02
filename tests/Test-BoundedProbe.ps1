@@ -365,6 +365,9 @@ exit 0
     }
     Check 'a path-qualified uv.exe launcher is accepted' 'C:\bin\uv.exe|run|--quiet|python|x' `
         ((Get-BoundedProbeCommandLine -Launcher @('C:\bin\uv.exe', 'run', 'python') -UvOptions @('--quiet') -Arguments @('x')) -join '|')
+    # Both separators, on every OS: CI runs on Linux, where System.IO.Path does not split on `\`.
+    Check 'a POSIX path-qualified uv launcher is accepted' '/usr/local/bin/uv|run|--quiet|python|x' `
+        ((Get-BoundedProbeCommandLine -Launcher @('/usr/local/bin/uv', 'run', 'python') -UvOptions @('--quiet') -Arguments @('x')) -join '|')
     $r = Invoke-BoundedUvProbe -Launcher @('pwsh', '-File') -UvOptions @('--quiet') -Arguments @('x') -TimeoutSeconds 5 -Label 'u1'
     Check 'the helper turns that refusal into an error result (ok = $false)' $false $r.ok
     CheckTrue 'error names the invalid command line' ($r.error -like 'invalid command line:*')

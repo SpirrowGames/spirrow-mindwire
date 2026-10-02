@@ -708,8 +708,11 @@ function Get-BoundedProbeCommandLine {
     # Checked by shape, not only by length: the insertion point is index 2 because that is where
     # `uv run` ends, so a launcher that is not literally `uv run <interpreter>` (e.g. a 3-element
     # `pwsh -NoProfile -File`) is refused rather than given uv flags it would misread.
+    # The basename is taken by splitting on BOTH separators: System.IO.Path on Linux does not treat
+    # `\` as a separator, so GetFileNameWithoutExtension('C:\bin\uv.exe') is not 'uv' there.
+    $exeLeaf = ([string]$Launcher[0] -split '[\\/]')[-1] -replace '\.[^.]*$', ''
     $isUvRun = $Launcher.Count -ge 3 -and
-        [System.IO.Path]::GetFileNameWithoutExtension([string]$Launcher[0]) -ieq 'uv' -and
+        $exeLeaf -ieq 'uv' -and
         [string]$Launcher[1] -ceq 'run'
     if ($opts.Count -gt 0 -and -not $isUvRun) {
         throw "Get-BoundedProbeCommandLine: -UvOptions needs a launcher of the form 'uv run <interpreter>' (got: $($Launcher -join ' '))"
