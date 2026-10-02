@@ -203,8 +203,10 @@ def test_should_ask_human_question_shape() -> None:
 def test_matched_rule_is_a_choice_over_rule_ids_and_none() -> None:
     mr = tierc_v2_questions(RULES)[MATCHED_RULE_KEY]
     assert mr["type"] == "choice"
-    assert [o["name"] for o in mr["criteria"]] == list(RULES.matched_rule_options)
-    assert [o["description"] for o in mr["criteria"][:5]] == list(FIVE_ARTICLES)
+    # TypeSafe's choice criteria is a {option: description} map; Jev answers an array with a 422
+    assert isinstance(mr["criteria"], dict)
+    assert list(mr["criteria"]) == list(RULES.matched_rule_options)
+    assert list(mr["criteria"].values())[:5] == list(FIVE_ARTICLES)
     # the rule texts ride on the options, not repeated in the instructions
     assert not any(text in mr["instructions"] for text in FIVE_ARTICLES)
 
@@ -216,7 +218,10 @@ def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
     rules = load_tierc_rules(f)
     q = tierc_v2_questions(rules)
     assert "- rule_1: ほげ" in q[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert [o["name"] for o in q[MATCHED_RULE_KEY]["criteria"]] == ["rule_1", "none"]
+    assert q[MATCHED_RULE_KEY]["criteria"] == {
+        "rule_1": "ほげ",
+        "none": "五ヶ条のどれにも当たらない",
+    }
 
 
 def test_v2_request_body() -> None:
