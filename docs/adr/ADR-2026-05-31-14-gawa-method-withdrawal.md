@@ -318,4 +318,5 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 2. Lexora のホストで `verify_codex` が成功していること。
 3. 本番の B-2 migration（`answered_by` の列）を確かめ、無ければ当てていること。
 4. mindwire 側に、attestation（7.6）、N-3 の除外（7.3）、プロンプトの構成（7.5）が入っていること。
+   - あわせて、naysayer の principles の SOT（`spec/NAYSAYER_PRINCIPLES.md`）の frontmatter `independent_model`（いまは `gemini-3.1-pro-preview`）を、codex を正・gemini-fallback を予備とする構成に合わせて更新していること。そのままだと、codex に渡す preamble が「Gemini である」と誤って述べることになります。
 5. shadow 比較のあとで primary に上げること。
