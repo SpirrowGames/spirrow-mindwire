@@ -271,7 +271,9 @@ class _FakeGitHub:
     async def find_cross_pr_head_bound_approves(self, pr: Any, *, reviewer_login: str) -> Any:
         raise AssertionError("not called")
 
-    async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
+    async def submit_review(
+        self, pr: Any, *, event: Any, body: str, commit_id: str | None = None
+    ) -> Any:
         raise AssertionError("not called")
 
     async def probe_identity(self) -> int:
@@ -736,7 +738,7 @@ def test_build_conductor_requires_repo_dir_when_building_adapters() -> None:
 
 @pytest.mark.anyio
 async def test_run_conductor_drives_round_trip_and_closes_sessions(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # End-to-end over a fake chatroom: a proposer NEXT:Einstein → the naysayer replies NEXT:human →
     # the conductor stops at HUMAN; run_conductor then aclose()s, halting the spawned session.
@@ -752,13 +754,16 @@ async def test_run_conductor_drives_round_trip_and_closes_sessions(
     # run_conductor calls build_conductor(settings) with no injection; patch it to inject our fakes.
     real_build = loop_runner.build_conductor
 
+    # ``mcp`` arrives in ``kw``: run_conductor hands build_conductor the same client its T44
+    # launch resolution read the thread through.
     def _build(settings: MindwireSettings, **kw: Any) -> Stage3Conductor:
         return real_build(
-            settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer, **kw
+            settings, proposer=proposer, implementer=implementer, naysayer=naysayer, **kw
         )
 
     monkeypatch.setattr(loop_runner, "build_conductor", _build)
-    outcome = await run_conductor(_conductor_settings())
+    monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
+    outcome = await run_conductor(_conductor_settings(tmp_path), mcp=mcp)
 
     assert outcome.stop_reason is StopReason.HUMAN
     assert outcome.forced_naysayer_turns == 0  # NEXT named Einstein explicitly
@@ -774,7 +779,7 @@ async def test_run_conductor_drives_round_trip_and_closes_sessions(
     ids=["operator hold", "control plane unreachable"],
 )
 async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
-    monkeypatch: pytest.MonkeyPatch, control_state: str | None, expect_reads: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, control_state: str | None, expect_reads: bool
 ) -> None:
     # Both ways a project ends up stopped, proven through the wiring rather than the Conductor
     # alone: an operator HOLD, and a control plane that cannot be read at all (``None`` makes the
@@ -793,7 +798,6 @@ async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
     def _build(settings: MindwireSettings, **kw: Any) -> Stage3Conductor:
         return real_build(
             settings,
-            mcp=mcp,
             proposer=_StubAdapter("fake-proposer", _proposer_caps()),
             implementer=_StubAdapter("fake-implementer", _exec_caps()),
             naysayer=naysayer,
@@ -801,7 +805,8 @@ async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
         )
 
     monkeypatch.setattr(loop_runner, "build_conductor", _build)
-    outcome = await run_conductor(_conductor_settings())
+    monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
+    outcome = await run_conductor(_conductor_settings(tmp_path), mcp=mcp)
 
     assert outcome.stop_reason is StopReason.HOLD
     assert outcome.rounds == 0
@@ -811,7 +816,7 @@ async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
 
 @pytest.mark.anyio
 async def test_run_conductor_closes_sessions_even_when_run_raises(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The aclose() teardown runs in finally even if the drive loop raises (no session leak).
     closed = False
@@ -825,8 +830,9 @@ async def test_run_conductor_closes_sessions_even_when_run_raises(
             closed = True
 
     monkeypatch.setattr(loop_runner, "build_conductor", lambda _s, **_kw: _BoomConductor())
+    monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
     with pytest.raises(RuntimeError, match="drive boom"):
-        await run_conductor(_conductor_settings())
+        await run_conductor(_conductor_settings(tmp_path), mcp=_FakeMcp(_FakeChatroom()))
     assert closed
 
 

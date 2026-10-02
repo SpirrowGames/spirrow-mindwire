@@ -38,6 +38,7 @@ import yaml
 from .normalize import IdentityCollisionError, find_collisions, normalize_identity_key
 
 __all__ = [
+    "MACHINE_INDEPENDENCE_CLASS",
     "ClassificationEntry",
     "ClassificationError",
     "LegitimateRolesFile",
@@ -67,6 +68,13 @@ class ClassificationEntry:
         the classification.
       primary_source: pointer into the repo (``"path::symbol"``).
       reason: prose justification.
+      independence_class: the participant's ``independence_class`` as the
+        classification declares it, or ``None``. Only a participant may carry
+        one; a machine's value is derived from ``kind`` by
+        :func:`~.registration.build_upsert_identity_args` and is never written
+        in the YAML (one place for the machine value, msg-1706 §2). A
+        participant that omits it loads (the read half does not need it) but
+        cannot be registered — the constructor refuses.
     """
 
     name: str
@@ -75,6 +83,7 @@ class ClassificationEntry:
     legitimate: frozenset[str]
     primary_source: str
     reason: str
+    independence_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,16 @@ class LegitimateRolesFile:
 
 
 _VALID_KINDS = frozenset({"participant", "machine"})
+
+#: The ``independence_class`` a ``kind: machine`` identity is registered with
+#: (ADR-2026-08-25-20; T-role-null-must-become-impossible msg-1704 §2 / msg-1706).
+#: This is the ONE place the value string lives in this repo: the registration
+#: constructor, the guard, and this loader all read this name, and the doc points
+#: at the constructor instead of restating the payload (msg-1706 §2). It is
+#: deliberately NOT paired with a local copy of Prismind's full enum — the only
+#: verification that the deployed service accepts it is the live ``upsert_identity``
+#: result (msg-1706 §2 / DoD 2), not a tuple or import pinned here.
+MACHINE_INDEPENDENCE_CLASS = "machine"
 
 
 def load_legitimate_roles(path: Path) -> LegitimateRolesFile:
@@ -219,6 +238,23 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         )
     if not isinstance(reason, str) or not reason.strip():
         raise ClassificationError(f"{path}: identities[{index}].reason must be a non-empty string")
+    independence_class = raw.get("independence_class")
+    if independence_class is not None:
+        if kind == "machine":
+            raise ClassificationError(
+                f"{path}: identities[{index}] kind=machine must not declare independence_class "
+                f"(a machine's value is derived from kind by the registration constructor; "
+                f"msg-1706 §2)"
+            )
+        if not isinstance(independence_class, str) or not independence_class.strip():
+            raise ClassificationError(
+                f"{path}: identities[{index}].independence_class must be a non-empty string"
+            )
+        if independence_class == MACHINE_INDEPENDENCE_CLASS:
+            raise ClassificationError(
+                f"{path}: identities[{index}] kind=participant must not declare "
+                f"independence_class='machine' (msg-1706 §1 guard table)"
+            )
 
     return ClassificationEntry(
         name=name,
@@ -227,6 +263,7 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         legitimate=frozenset(legitimate),
         primary_source=primary_source,
         reason=reason,
+        independence_class=independence_class,
     )
 
 

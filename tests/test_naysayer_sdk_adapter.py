@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,10 +19,12 @@ from typing import Any
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
+from spirrow_mindwire.adapters._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
 from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
     NaysayerSdkDeliveryError,
     NaysayerSdkHaltError,
+    NaysayerSdkShutdownError,
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
@@ -990,8 +993,14 @@ async def test_shutdown_failure_after_successful_turn_is_propagated(
     # Contract match with the main ``except`` blocks:
     assert "subprocess may have leaked" in str(excinfo.value)
     # The exception carries the same code as session.error so the conductor's ``error_code=`` can
-    # name it (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440).
-    assert getattr(excinfo.value, "code", None) == "adapter.shutdown_failed"
+    # name it (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440). ``code`` is
+    # declared on the base ``AdapterDeliveryError`` (msg-4910), so this is a typed read.
+    assert excinfo.value.code == "adapter.shutdown_failed"
+    # The code lives on the class (one place); session.error reads the same attribute,
+    # and the subclass still satisfies every ``except NaysayerSdkDeliveryError`` site.
+    assert type(excinfo.value) is NaysayerSdkShutdownError
+    assert isinstance(excinfo.value, NaysayerSdkDeliveryError)
+    assert NaysayerSdkShutdownError.code == "adapter.shutdown_failed"
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert "disconnect failed" in str(excinfo.value.__cause__)
     hs = await adapter.health(handle)
@@ -1595,3 +1604,56 @@ async def test_halt_during_a_succeeding_preflight_spawns_no_subprocess(
     assert adapter._sessions[handle].client is None
     assert factory.calls == []
     assert captured == []
+
+
+# --------------------------------------------------------------------------- #
+# the per-turn connect is bounded (Einstein msg-5054 advisory, T43 follow-up)
+# --------------------------------------------------------------------------- #
+
+
+class _HangingConnectClient(_ShutdownRecordingClient):
+    """SDK client whose ``connect`` never returns."""
+
+    async def connect(self) -> None:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.anyio
+async def test_a_per_turn_connect_that_hangs_fails_the_turn_inside_the_budget(
+    tmp_path: Path,
+) -> None:
+    """The naysayer connects per turn, so a hung connect is not a spawn timeout and
+    is not retried by the conductor. It must still end: the turn fails with the
+    budget named, the session is FAILED, the abandoned client is shut down, and
+    nothing is posted."""
+    client = _HangingConnectClient([_assistant("never yielded"), _result()])
+
+    def factory(options: Any) -> _HangingConnectClient:
+        return client
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+        connect_timeout_seconds=0.05,
+    )
+    captured: list[ReplyDraft] = []
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+
+    with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
+        await asyncio.wait_for(adapter.deliver_event(handle, _event()), timeout=5.0)
+
+    assert "SDK connect did not finish inside 0.05s" in str(excinfo.value)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None and hs.error.code == "adapter.delivery_failed"
+    assert client.queries == []  # never reached the model
+    assert client.disconnected == 1  # the abandoned client was torn down
+    assert captured == []
+
+
+def test_the_naysayer_connect_budget_is_the_shared_one() -> None:
+    default = inspect.signature(NaysayerSdkAdapter.__init__).parameters["connect_timeout_seconds"]
+    assert default.default is DEFAULT_CONNECT_TIMEOUT_SECONDS

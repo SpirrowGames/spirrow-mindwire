@@ -69,6 +69,9 @@ class _FakeMcp:
             if int(params.get("offset") or 0) > 0:
                 return {"items": [], "total": 1}
             return {"items": [{"thread_id": "T-a"}], "total": 1}
+        if name == "get_identity":
+            # Store check (msg-1706 §4) — these tests are about the corpus side.
+            return {"status": "not_found", "identity_name": params["identity_name"]}
         assert name == "chatroom_get_thread"
         return {
             "messages": [
@@ -198,6 +201,9 @@ class _CutoffCheckMcp:
             if int(params.get("offset") or 0) > 0:
                 return {"items": [], "total": 1}
             return {"items": [{"thread_id": "T-a"}], "total": 1}
+        if name == "get_identity":
+            # Store check (msg-1706 §4) — these tests are about the corpus side.
+            return {"status": "not_found", "identity_name": params["identity_name"]}
         assert name == "chatroom_get_thread"
         return {
             "messages": [
@@ -339,3 +345,17 @@ def test_parse_cutoff_rejects_none_and_empty_string() -> None:
     for bad in (None, "", 0, 20260817):
         with pytest.raises(ValueError):
             _MODULE._parse_cutoff(bad)
+
+
+def test_in_scope_reads_the_live_timestamp_field() -> None:
+    """The live ``chatroom_get_thread`` payload carries ``timestamp``, not ``created_at``.
+
+    Measured on msg-1179 at the start of PR-B (T-role-null-must-become-impossible). With a
+    ``created_at``-only lookup, every live message fell to the fail-open branch and the
+    cutoff was silently never applied, so a "since 08-25" run counted the whole history.
+    """
+    cutoff = _MODULE._parse_cutoff(_SINCE_ISO)
+    assert _MODULE._in_scope({"timestamp": "2026-08-10T00:00:00Z"}, cutoff, None) is False
+    assert _MODULE._in_scope({"timestamp": "2026-08-20T00:00:00Z"}, cutoff, None) is True
+    # Neither field present: still fail-open (unchanged policy).
+    assert _MODULE._in_scope({}, cutoff, None) is True

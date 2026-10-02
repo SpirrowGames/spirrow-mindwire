@@ -113,7 +113,7 @@ role_cli_path = "C:/Users/<you>/.local/bin/claude.exe"
 ```
 
 A `role_cli_path` that is not a file, or is not executable, stops the daemon at startup with a named
-error rather than failing once per five-minute tick. It is resolved to an absolute path there too —
+error rather than failing once per tick. It is resolved to an absolute path there too —
 a relative one would be read against the daemon's working directory by that check and against the
 session's `cwd` by the SDK, which are not the same directory.
 
@@ -259,11 +259,14 @@ Task settings that matter (Windows):
 | Setting | Value | Why |
 |---|---|---|
 | Action | `pwsh -NoProfile -File <daemon-checkout>\deploy\run-conductor-scheduled.ps1` | the wrapper, not the raw launcher — and the **daemon** checkout, not a working one (above) |
-| Trigger | at logon **and** a repeating trigger, 5 min, indefinite | the head probe makes a short interval nearly free; see below |
+| Trigger | at logon **and** a repeating trigger, 1 min, indefinite | the head probe makes a short interval nearly free; see below |
 | `MultipleInstancesPolicy` | `IgnoreNew` | a tick that fires while the previous sweep is still working is dropped — this is the whole of the "already running?" handling, no lock file needed |
 | `ExecutionTimeLimit` | `PT4H` | a real design round can take a while; `PT2H` was cutting runs off |
-| `RestartCount` / `RestartInterval` | `3` / `PT10M` | transient MCP or inference failures retry instead of waiting for the next tick |
 | Run as | the user holding `MINDWIRE_NAYSAYER_GITHUB_TOKEN`, the webhook var, and the Claude subscription | the wrapper reads the webhook from the **User** env scope |
+
+There is deliberately **no `RestartCount` / `RestartInterval`**: the repeating trigger already runs
+the next tick sooner than any restart interval worth setting, so a failed tick is simply retried by
+the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
@@ -290,7 +293,7 @@ Three rules are load-bearing:
 - **A tick either updates the code or uses it, never both.** The wrapper was parsed from the old file
   at startup, while `run-conductor.ps1` would be read from disk *after* the pull — a sweep spanning
   two versions is not a thing worth debugging later. So a deploy tick launches nothing; the cost is
-  one 5-minute cycle of latency after a merge.
+  one tick of latency after a merge.
 - **Nothing but a pure fast-forward is ever performed.** A dirty tree or a diverged branch means
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
@@ -448,8 +451,8 @@ Two things follow from it being config:
 > `T-pr-gate-adr-index-scope` sat stranded after being opened. State keys are `project/thread_id` for
 > the same reason: thread ids are only unique within a project.
 
-The wrapper walks the list head-first and **advances past any candidate the conductor reports no work
-for**, so one settled thread cannot park the whole loop. Only a clean `rounds=0` advances: a non-zero
+The wrapper **advances past any candidate the conductor reports no work for**, so one settled thread
+cannot park the whole loop. List order is only the tie-break for launches: see *Launch fairness* below. Only a clean `rounds=0` advances: a non-zero
 exit or an unparseable run **stops** the sweep, so a genuine breakage is never laundered into
 "everything is idle".
 
@@ -460,7 +463,71 @@ driving those from an unattended schedule would spend money on a timer, so it st
 with their verdicts recorded — but the exclusion rule here stays for future `T-pr-review-*`
 threads.)
 
-### Why the sweep is cheap enough to run every 5 minutes
+### Launch fairness — dispatch order, gate lane, budgets (T-sweep-starves-deep-candidates)
+
+The sweep used to walk `sweep.json` head-first and stop at the first thread that did work. While
+the top of the list kept working, nothing below it ever ran (2026-10-02: every tick was "worked 1 /
+not-reached 96〜100", and #392 / #361 / #359 waited 21〜31h). The old starvation metric did not see
+it: W-2c counts a LAUNCH verdict as an evaluation even when the sweep never reaches the candidate.
+The code is in `deploy/lib/SweepFairness.ps1`, and the tests are in `tests/Test-SweepFairness.ps1`.
+
+- **Order.** `evaluated.json` carries `launch_wait_since` per thread. It is set when the verdict is
+  LAUNCH and the thread was not launched, and it is never overwritten. It is cleared when the thread
+  is actually launched (after commit-launch) or when the verdict is SKIP. It is kept through DEFER,
+  held, and quarantined. LAUNCH candidates run in order of `launch_wait_since`, oldest first, so a
+  thread that just ran goes to the back. `sweep.json` order only breaks ties. Reordering the file
+  no longer moves a thread ahead of one that has waited longer.
+- **Gate lane.** A LAUNCH whose `NEXT:` is `pr-review` runs first. Up to **3 launches** per tick,
+  and a gate that did work does not stop the sweep. After the gate lane, role turns run as before:
+  the first one that did work ends the sweep. Gate failures count toward the same K-budget, and
+  reaching K stops both lanes.
+- **Budgets — two clocks, checked before every launch.**
+
+  | Admission of | Condition |
+  |---|---|
+  | the first gate candidate | `tickElapsed < LaunchBudgetSeconds` (it uses up this exception whether or not it launches) |
+  | each later gate | the above **and** `loopElapsed < GateBudgetSeconds` **and** fewer than 3 gates launched |
+  | a role turn | `tickElapsed < LaunchBudgetSeconds` |
+
+  `tickElapsed` counts from the start of the tick (sync, probes, and decide included).
+  `loopElapsed` counts from the start of the launch loop (decide excluded). Once the launch budget
+  is spent, the sweep stops with `time-budget`. Everything not launched keeps its
+  `launch_wait_since`, so it comes first next tick. The budget limits when a launch may **start**,
+  not how long it runs, so a tick can still run past it. When that happens the log says
+  `WARN tick exceeded launch budget`.
+
+**Setting the budgets.** The order of precedence is the script argument (`-LaunchBudgetSeconds` /
+`-GateBudgetSeconds`), then the environment variable (`MINDWIRE_SWEEP_LAUNCH_BUDGET_SEC` /
+`MINDWIRE_SWEEP_GATE_BUDGET_SEC`), then the default (**120 / 60**). `GateBudgetSeconds` must be
+less than `LaunchBudgetSeconds`. A tick with any other configuration aborts with a configuration
+error, and so does a tick with a value that is not a positive integer.
+
+| Task setting | Value today | Budget it interacts with |
+|---|---|---|
+| repeating trigger | **1 min** | none directly. Under `IgnoreNew`, the first trigger after a tick ends starts the next one, so a shorter launch budget means the next tick (and its gate lane) comes sooner |
+| `MultipleInstancesPolicy` | `IgnoreNew` | ticks cannot overlap, whatever the budget. The budget bounds how long one tick holds the loop |
+| `LaunchBudgetSeconds` / `GateBudgetSeconds` | 120 / 60 (defaults) | **if you change the trigger or the policy, revisit these here** |
+
+The design that chose 120 / 60 (msg-5588) assumed a 5-minute interval and set the budget to keep
+ticks from overlapping. Measured on the host on 2026-10-02, the trigger is PT1M with `IgnoreNew`,
+so overlap is already impossible. The pre-loop phase (sync, probes, decide) took about 22s. Tune
+against the per-tick line:
+
+```text
+tick elapsed=…s decide=…s loop=…s budget=gate 60/launch 120s (gate launched n/3 of m candidate(s)[, gate lane closed: gate-cap|gate-budget])
+```
+
+**Two starvation metrics, both in the log and in the digest.**
+- `飢餓` / `starved threads`: not *evaluated* for 24h. Unchanged.
+- `起動待ち飢餓` / `launch-wait starved threads`: LAUNCH for **6h or more** without a launch. This
+  is the failure the old metric could not see. W-2c's `last_evaluated_at` refresh does not reset it.
+
+Other WARN lines: `decide overhead exceeds launch budget` (or `pre-loop overhead …`) means nothing
+can launch this tick, so fix the budget or the slow phase. `gate admission invariant violated`
+means a role turn was admitted while gate candidates existed and none of them had been attempted.
+That should be impossible, and seeing it means the admission code has a bug.
+
+### Why the sweep is cheap enough to run on a short interval
 
 Launching the conductor is not uniformly cheap:
 
@@ -470,7 +537,7 @@ Launching the conductor is not uniformly cheap:
   nothing (`no_progress_to_human`), the tick has bought nothing and billed for it.
 
 So the wrapper does not launch blindly. **`scripts/thread_heads.py`** answers "did anything change?"
-from data: one `chatroom_my_unread` call returns every thread's `latest_msg_id` without fetching a
+from data: one `chatroom_list_threads` call returns every open thread's `last_msg_id` without fetching a
 single message body (~1 s for all threads at once). If a thread's head equals the `last_msg` the
 conductor reported last time, the conductor would resolve the same handoff and reach the same stop —
 so it is not launched at all.
@@ -479,7 +546,10 @@ so it is not launched at all.
 earlier iteration of this predicate keyed a skip cache on both: the thread's head message *and*
 the project's loop control state (`state/heads.json`, entry per thread). At an unchanged head, a
 naysayer→implementer handoff stops at the human gate under `hold` / `supervised` but dispatches
-the implementer under `run` (carve-out ③).
+the implementer under `run` (carve-out ③ — since the D-4' guardrails, only when the naysayer's
+proceed carries `TIER-C-CHECK: none` on the line above its `NEXT:`, no `TIER-C:` line has been
+posted since the human last spoke, and the Tier-C Decider has not vetoed the proceed — G3 is a
+veto, so with the Decider off (`backend=off`), undecided or failing, G1 and G2 alone decide).
 
 That head-equality predicate has been retired (T-sweep-intake-and-quarantine-stalls, Bohr
 msg-1428〜msg-1432). Measured 2026-08-11, it burned inferences on a `T-track-b-seam-octree-
@@ -524,40 +594,40 @@ An earlier design used a cooldown timer instead. It was dropped: a timer guesses
 might be worthwhile, the head id knows.
 
 **Everything unknown fails open.** A probe failure, a thread missing from the probe's result, or a
-thread with no recorded head all launch the conductor anyway. The probe's exclusion rule is not fully
-characterised — it reported 11 threads where `chatroom_list_threads` showed 33 active, omitting the
-`T-pr-review-*` family — so a gap must cost one cheap run rather than silently parking a live thread
-forever.
+thread with no recorded head all launch the conductor anyway: a gap must cost one cheap run rather
+than silently parking a live thread forever.
 
-> **2026-08-02 update (K-5 triage)**: the 33-active state above is historical. K-5 closed 22 threads
-> (the whole `T-pr-review-150`〜`167` review-record family plus the settled May–June threads),
-> leaving **11 active** — matching what the probe was returning at the time. Probe and
-> `chatroom_list_threads` should now agree, but the exclusion rule itself is *still* not
-> characterised, so the fail-open stance stays.
-
-> **The probe identity must never post and never mark read.** `chatroom_my_unread` is an inbox: it
-> lists threads with unread messages, so an identity whose read cursor has advanced under-reports
-> *silently*. Measured: `Heisenberg` returned 5 of 11 threads and omitted two live candidates, while
-> the dedicated `conductor-probe` identity returned all 11. Nothing in this repo calls
-> `chatroom_mark_read`; if anything ever does for that identity, the probe goes blind and the sweep
-> quietly degrades to "launch everything".
+> **2026-09-30 (T-unread-correlated-count-scale)**: the probe used to call `chatroom_my_unread` as a
+> dedicated never-reads identity (`conductor-probe`), so that every thread stayed unread and hence
+> listed. That inbox evaluates a per-thread unread count for every thread in conclair — a cursorless
+> identity is its worst case — and the probe only ever read the head id. At 100× today's data the
+> inbox call measured 657 ms against 15 ms for the listing on the same rows (conclair perf harness,
+> CI run 35128633398). The inbox's exclusion rule was also never fully characterised (it once reported
+> 11 threads where `chatroom_list_threads` showed 33 active). The probe now calls
+> `chatroom_list_threads` with every status except `resolved` — the inbox's `include_resolved=false`
+> set — and reads `last_msg_id`. Before the switch the two were compared live on all six projects:
+> identical thread sets, identical head ids (216/216). No identity is involved any more, so there is
+> no read cursor that can blind the probe.
 
 ### State and logs
 
 | Path | Contents |
 |---|---|
-| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a 5-minute cadence readable |
+| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a minute-scale cadence readable |
 | `<data_dir>/logs/clock-YYYY-MM-DD.log` | clock-sync log |
 | `<data_dir>/state/head_skip.json` | per-thread head-skip predicate record (nomination-target, launch attempts, cached observation) — the skip decision above. Single writer: `scripts/head_skip_decide.py`; atomic replace |
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |
 | `<data_dir>/state/quarantine.json` | quarantined threads — one entry per `project/thread_id`; see *Quarantine and daily digest* |
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
+| `<data_dir>/state/retry-pending.json` | `{ pending, events }` — threads whose first failure is waiting for its one automatic retry, plus the retry events the next digest counts; see *Retry once before quarantine*. Single writer: the sweep |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
 | `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **Only shape `{...}` (JSON object) is treated as a valid migration marker** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds any non-object root (root array, root scalar, JSON parse error, blank/whitespace, `[]`), the P4-3 v4.1 policy fails closed: `verdict='unreadable'`, T-5 flush skipped, corrupt file preserved in place as forensic evidence. `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete or truncate without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
 backoff); `notified.json` at most one duplicate alert.
+Deleting `retry-pending.json` forgets every pending first failure, so each of those threads gets
+one more retry than it would have; it never quarantines anything by itself.
 Deleting `quarantine.json` **un-quarantines every thread silently** — do not do it as a shortcut for
 `Clear-Quarantine`; the history file exists precisely so cleared-with-reason and cleared-without-
 context are not confusable later. Deleting `evaluated.json` resets the starvation clock (harmless,
@@ -585,14 +655,52 @@ mechanism that keeps the NEXT unknown breakage from dying the same silent way.
    fires,
 2. does **not** stop the sweep — the next candidate is tried, so downstream work still progresses.
 
+Since 2026-10-01 (1) applies only to a failure that happens **twice in a row**. The first failure is
+retried once automatically; see *Retry once before quarantine* below.
+
 The old sweep-break fail-safe is retained but re-aimed: only a **failure to write the declaration**
 (and a "conductor stopped: … rounds=…" line that never arrived) breaks the sweep. If we cannot
 even record what went wrong, we still cannot quietly move on.
 
-**K-budget (2 per sweep).** Two quarantines in one tick suggest a shared cause; a third would spend
+**K-budget (2 per sweep).** Two failures in one tick suggest a shared cause; a third would spend
 another inference on that same cause before stopping. At K=2 the sweep breaks and a "systemic
 cause suspected" notification fires. Remaining candidates count as `not-reached` on the starvation
-metric — the honesty rule below.
+metric — the honesty rule below. K counts **failures**: a first failure (now retried, not
+quarantined) counts the same as a failed retry. A K hit does **not** promote pending retries to
+quarantine; once a systemic wave clears, the next tick's retries recover them.
+
+**Retry once before quarantine** (T-retry-once-before-quarantine; decided msg-5424, design msg-5434
+/ msg-5441 / msg-5449). On 2026-10-01, 8 of 9 quarantined threads had failed exactly once on a
+transient SDK error and waited up to a day for a manual clear. The rule now:
+
+| Event | What the sweep does | Log prefix |
+|---|---|---|
+| exit ∉ {0, 2}, nothing pending | write `retry-pending.json`; **no** quarantine, **no** Discord alert | `retry-scheduled` |
+| a pending thread gets a LAUNCH verdict | launch it — this is its one retry; `--retry-of <error_code>@<first_failure_at>` is added only when the head is the one the first failure saw | `retry-launch` |
+| a pending thread is no longer on the sweep list | discard the pending record (not quarantined; the same prune `evaluated.json` gets) | `retry-dropped` |
+| the retry exits 0 | clear the pending record | `retry-recovered` |
+| the retry exits 2 | leave the pending record as is (environment fault, not the thread's) | — |
+| the retry fails again | quarantine with `consecutive_failures=2`, the first failure's `first_failure_at` (the 24h escalation counts from it) and `first_attempt`; alert "再試行でも失敗したため隔離" | `retry-failed→quarantined` |
+
+- **When.** Never inside the same sweep. A pending thread is not excluded from the head-skip decide
+  batch; it is retried on the next LAUNCH verdict, so head_skip's backoff and T42's
+  `launches_same_head` (STALLED at 3) count and bound the retry like any other launch. DEFER /
+  SKIP carry the pending record over.
+- **Count reset.** Only an exit 0 clears it, not a head change. A thread that posts and then fails
+  in SDK teardown on every run moves its head each time, and would never be quarantined otherwise.
+- **Same-head re-fire.** The conductor attaches a fixed "check the working tree / branch / existing
+  PR before acting; do not repeat a push, PR or comment" notice to the retry's first prompt. It does
+  this only for roles in `RETRY_NOTICE_ROLES` (`src/spirrow_mindwire/conductor/retry_notice.py`;
+  today, the implementer only). Every other role's prompt is unchanged.
+  The sweep passes `--retry-of` only when the head being launched equals the head recorded at the
+  first failure; on a moved head the notice would claim a failed attempt at a message nobody has
+  attempted yet, so it is left out (the launch still counts as the retry).
+- **Digest.** The summary line carries `再試行 N / 回復 M / 再試行後隔離 Q` since the last full
+  digest. A `再試行待ち [retry-pending]` section lists pending threads, and those pending ≥24h are
+  marked `24h+` and listed first. A pending record is never timed out into quarantine: a long
+  exit-2 outage is the environment's fault and already has its own alert.
+- **Q3 scope.** spec/msg-814 Q3 ("解除は人手のみ") now applies to quarantined threads only. The
+  automatic retry of a first failure is the one exception, and `Clear-Quarantine` is unchanged.
 
 **Escalation ladder.** A quarantine record's derived state is a function of its age, not any
 scheduling flag (it stays skipped either way):
@@ -603,7 +711,8 @@ scheduling flag (it stays skipped either way):
 | 24h–7d | `escalated` | broken out at the top of the digest; state-transition alert fires once |
 | ≥7d | `stale` | "fix it or fold the thread"; state-transition alert fires once |
 
-Only a human clear (`Clear-Quarantine`) ever transitions a thread out. There is deliberately no
+Only a human clear (`Clear-Quarantine`) ever transitions a quarantined thread out (Q3 — the
+one-retry rule above acts before quarantine, never after). There is deliberately no
 auto-clear on a `(head, control)` change — see *Fingerprint hint* below.
 
 **Fingerprint hint.** Each quarantine record stores the `(head, control)` pair observed at the

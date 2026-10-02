@@ -110,6 +110,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from spirrow_mindwire.chatroom.status import FINISHED_STATUSES, is_terminal_status
 from spirrow_mindwire.github.client import PrResolution, PrState
 
 #: Provisional until the measurement says otherwise (msg-2164 R-21). Five minutes is
@@ -133,9 +134,11 @@ _LIVENESS_STATUSES = frozenset({"active", "awaiting_reply"})
 #: status this deployment has never seen is out of scope rather than swept.
 INTAKE_STATUSES = frozenset({"parked", "active", "awaiting_reply"})
 
-#: The statuses that mean the thread is already finished. Listed only so an exclusion can
-#: say *why* it happened -- an unrecognised status is excluded too, for a different reason.
-FINISHED_STATUSES = frozenset({"resolved", "superseded"})
+# The statuses that mean the thread is already finished (:data:`FINISHED_STATUSES`) are
+# defined once in :mod:`spirrow_mindwire.chatroom.status` and re-exported here, because the
+# sweep's head-skip admission reads the same set (T-sweep-admission-ignores-thread-status).
+# Here it is used only so an exclusion can say *why* it happened -- an unrecognised status
+# is excluded too, for a different reason.
 
 #: Exclusion reasons. Two, not one: see the module docstring.
 OUT_OF_SCOPE_FINISHED = "out-of-scope-finished"
@@ -213,7 +216,7 @@ def intake_exclusion_reason(status: str) -> str | None:
     """
     if status in INTAKE_STATUSES:
         return None
-    return OUT_OF_SCOPE_FINISHED if status in FINISHED_STATUSES else OUT_OF_SCOPE_UNRECOGNISED
+    return OUT_OF_SCOPE_FINISHED if is_terminal_status(status) else OUT_OF_SCOPE_UNRECOGNISED
 
 
 def split_intake(

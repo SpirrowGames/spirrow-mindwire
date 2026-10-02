@@ -76,9 +76,10 @@ Fermi = "web_ai_chat"
 # a PR averaged ~2.4 naysayer reviews (max 13) because each implementer fix push re-fired a full
 # Gemini review. Leave unset/false to keep the prior behavior (a full review on every fire).
 [naysayer_gating]
-# Skip the (costly) Gemini review and reuse the prior verdict when the naysayer has already reviewed
-# THIS exact head SHA (its last verdict review's commit_id == the PR head) — catches accidental /
-# reflexive re-fires on an unchanged commit.
+# Skip the (costly) Gemini review when the naysayer has already reviewed THIS exact head SHA (its
+# last verdict review's commit_id == the PR head) — catches accidental / reflexive re-fires on an
+# unchanged commit. Only a prior APPROVE is re-posted; a prior REQUEST_CHANGES always re-reviews
+# (a re-posted RC has no critique for the implementer to act on). CI is still checked first.
 skip_if_head_unchanged = false
 # Cap on naysayer reviews per PR before escalating to the human (0 = disabled). At the cap the gate
 # short-circuits to a COMMENT (which routes the conductor to the human Tier-C, not back into the

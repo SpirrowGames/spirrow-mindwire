@@ -74,16 +74,22 @@ from pathlib import Path
 from .adapters._sdk_result import emit_sdk_error_marker, find_sdk_error_signal
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.decider_lexora import build_decider
+from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
+from .conductor.retry_notice import RetryOf, parse_retry_of
+from .conductor.stand_down import post_stand_down_notice, resolve_launch
+from .conductor.tierc_gate import TierCGate
 from .config import (
     MindwireSettings,
     NaysayerGatingConfig,
     Stage3LoopConfig,
     load_settings,
+    resolve_tier_c_decisions_log_path,
     resolve_tierc_rules_path,
+    resolve_tierc_rules_snapshot_dir,
 )
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
@@ -369,6 +375,7 @@ def build_implementer(
     obligations: ObligationsManifest,
     model: str | None = None,
     cli_path: Path | None = None,
+    ledger_mcp: McpToolCaller | None = None,
 ) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
@@ -392,6 +399,11 @@ def build_implementer(
     the same two config keys — the two roles that route to Anthropic move
     together, so a host cannot end up designing on one model and implementing on
     another without saying so.
+
+    ``ledger_mcp`` is the Magickit client the ``mindwire-ledger`` tools forward through (thread
+    ``T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down`` Bohr msg-5296 / msg-5300).
+    :func:`_build_dispatcher` passes the loop's own client, so every implementer session gets the
+    two ledger tools and nothing else from Magickit. Proposer and naysayer get none.
     """
     from .adapters import _sdk_job_hook
 
@@ -401,6 +413,7 @@ def build_implementer(
         obligations=obligations,
         model=model,
         cli_path=cli_path,
+        ledger_mcp=ledger_mcp,
     )
 
 
@@ -424,7 +437,7 @@ def _resolve_role_cli_path_or_exit(configured: Path | None) -> Path | None:
 
     Unset is the normal case and returns ``None`` (the SDK uses its vendored
     CLI). Set-but-wrong is checked here, at daemon startup, rather than left to
-    the first spawn: the sweep runs the daemon every five minutes, so a typo'd
+    the first spawn: the sweep runs the daemon on every tick, so a typo'd
     path would otherwise surface as a per-tick spawn failure — the shape an
     operator reads as "the loop is broken" rather than "one setting is wrong".
 
@@ -596,6 +609,7 @@ def _build_dispatcher(
                 obligations=obligations,
                 model=cfg.role_model,
                 cli_path=role_cli_path,
+                ledger_mcp=mcp,
             )
         if naysayer is None:
             # No model / cli_path here, by design: the naysayer's independence is
@@ -757,6 +771,9 @@ def build_conductor(
     naysayer: RoleAdapter | None = None,
     pr_review_driver: NaysayerPrReviewDriver | None = None,
     stop_slot: ConductorStopSlot | None = None,
+    launches_same_head: int = 0,
+    launch_head_msg_id: str | None = None,
+    retry_of: RetryOf | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -817,6 +834,8 @@ def build_conductor(
             # malformed file refuses startup through the ValueError below.
             questions=dec_cfg.tierc.questions,
             rules_path=resolve_tierc_rules_path(settings),
+            # msg-4631 / 4633 / 5130: the loaded bytes are saved by sha256; never refuses startup.
+            snapshot_dir=resolve_tierc_rules_snapshot_dir(settings),
             v2_thresholds=TierCV2Thresholds(
                 ask_min=dec_cfg.thresholds.tierc_v2_ask_min,
                 not_ask_max=dec_cfg.thresholds.tierc_v2_not_ask_max,
@@ -824,6 +843,22 @@ def build_conductor(
         )
     except ValueError as exc:
         raise SystemExit(f"decider misconfigured ([decider] in mindwire.toml): {exc}") from exc
+    # One INFO line each, on every start, whatever the value (DECIDED 2e-1b, the msg-4748
+    # recurrence fix): the Decider sat at backend=off for days with nothing in the log to say so.
+    # ``built`` is whether a Decider object exists — the only fact the hook acts on.
+    logger.info(
+        "decider: backend=%s tierc=%s questions=%s built=%s",
+        resolve_decider_backend(dec_cfg.backend),
+        dec_cfg.tierc.mode,
+        dec_cfg.tierc.questions,
+        "yes" if decider is not None else "no",
+    )
+    tierc_gate: TierCGate | None = None
+    if settings.tierc_gate.mode == "enforce":
+        tierc_gate = TierCGate(log_path=resolve_tier_c_decisions_log_path(settings))
+        logger.info("tierc_gate: enforce (log=%s)", tierc_gate.log_path)
+    else:
+        logger.info("tierc_gate: off")
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -855,6 +890,14 @@ def build_conductor(
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
             # line when a dispatch raised. ``None`` = no reader (tests, library callers).
             stop_slot=stop_slot,
+            # T42 stall watchdog input from the sweep (see :mod:`.conductor.stall`).
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
+            # T-retry-once-before-quarantine D-4: the failed launch this run re-fires (``None`` =
+            # not a retry). See :mod:`.conductor.retry_notice`.
+            retry_of=retry_of,
+            # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
+            tierc_gate=tierc_gate,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -877,7 +920,13 @@ def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
 
 
 async def run_conductor(
-    settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+    settings: MindwireSettings,
+    *,
+    stop_slot: ConductorStopSlot | None = None,
+    mcp: McpToolCaller | None = None,
+    launches_same_head: int = 0,
+    launch_head_msg_id: str | None = None,
+    retry_of: RetryOf | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -891,9 +940,63 @@ async def run_conductor(
     no-progress human fallback / the round cap). This entry therefore drives one design thread to
     its stop and exits — re-arming after the human responds is an operator / follow-up concern. The
     spawned adapter sessions are closed in ``finally`` so SDK subprocesses don't leak on shutdown.
+
+    T44 fail-closed resolution (T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down,
+    Bohr msg-4569): before the preflight and before any adapter is built, project → thread →
+    repo_dir are resolved by :func:`~spirrow_mindwire.conductor.stand_down.resolve_launch`. An
+    unresolved project / thread raises :class:`~spirrow_mindwire.conductor.stand_down.
+    StandDownError` (exit 3 → wrapper quarantine). An unresolved repo_dir in a resolved thread is
+    posted there ending ``NEXT: human`` and the run returns a HUMAN stop (exit 0). Nothing is
+    spawned on either path. ``mcp`` is injectable for tests; the same client is handed to
+    :func:`build_conductor` so resolution and the run read the chatroom through one transport.
+
+    T42 stall watchdog: ``launches_same_head`` / ``launch_head_msg_id`` are the sweep's count of
+    consecutive launches on one head and that head (``--launches-same-head`` /
+    ``--launch-head-msg-id``). They are handed to the Conductor unchanged; the defaults never stall.
+
+    T-retry-once-before-quarantine D-4: ``retry_of`` is the parsed ``--retry-of`` value, the failed
+    launch this run re-fires. Handed to the Conductor unchanged; ``None`` changes no prompt.
     """
+    if mcp is None:
+        mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
+    project = settings.loop.project
+    thread_id = settings.conductor.task_thread_id
+    resolution = await resolve_launch(
+        mcp=mcp,
+        project=project,
+        thread_id=thread_id,
+        repo_dir=settings.loop.repo_dir,
+    )
+    if resolution.stand_down is not None:
+        posted = await post_stand_down_notice(
+            mcp, project=project, thread_id=thread_id, event=resolution.stand_down
+        )
+        # Same ``conductor stopped:`` line shape as ``Conductor._stop`` so the wrapper's
+        # ``Get-ConductorVerdict`` parses it with no change. HUMAN (not a new reason) for the same
+        # reason the spawn-unavailable stop uses it: the operator's notification set is keyed on
+        # the reason string, and this IS a stop that waits on a person.
+        outcome = ConductorOutcome(
+            rounds=0,
+            stop_reason=StopReason.HUMAN,
+            last_msg_id=posted,
+            forced_naysayer_turns=0,
+        )
+        logger.info(
+            "conductor stopped: reason=%s rounds=0 forced_naysayer=0 "
+            "forced_naysayer_saveable=0 last_msg=%s",
+            outcome.stop_reason.value,
+            posted,
+        )
+        return outcome
     _preflight(settings.loop)
-    cond = build_conductor(settings, stop_slot=stop_slot)
+    cond = build_conductor(
+        settings,
+        mcp=mcp,
+        stop_slot=stop_slot,
+        launches_same_head=launches_same_head,
+        launch_head_msg_id=launch_head_msg_id,
+        retry_of=retry_of,
+    )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
@@ -1036,6 +1139,33 @@ def main() -> None:
             "conductor: NEXT-driven single-thread design conductor (msg-523)"
         ),
     )
+    # T42 stall watchdog (conductor mode only). Written by the sweep from the head_skip record it
+    # committed just before this launch; see :mod:`spirrow_mindwire.conductor.stall`. Absent =
+    # 0 / None, which never stalls, so a hand-run ``mindwire-loop --mode conductor`` is unchanged.
+    parser.add_argument(
+        "--launches-same-head",
+        type=int,
+        default=0,
+        help=(
+            "conductor: consecutive launches the sweep has committed on the current head, "
+            "counting this one (T42 stall watchdog)"
+        ),
+    )
+    parser.add_argument(
+        "--launch-head-msg-id",
+        default=None,
+        help="conductor: the head msg id --launches-same-head was counted on (T42)",
+    )
+    # T-retry-once-before-quarantine D-4. Written by the sweep only on the one automatic re-launch
+    # after a first failure. Absent = not a retry, so a hand-run conductor is unchanged.
+    parser.add_argument(
+        "--retry-of",
+        default=None,
+        help=(
+            "conductor: <error_code>@<first_failure_at> of the failed launch this run re-fires; "
+            "roles in RETRY_NOTICE_ROLES get a check-before-acting notice on round 0"
+        ),
+    )
     args = parser.parse_args()
     settings = load_settings()
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
@@ -1043,7 +1173,15 @@ def main() -> None:
     stop_slot = ConductorStopSlot()
     try:
         if args.mode == "conductor":
-            asyncio.run(run_conductor(settings, stop_slot=stop_slot))
+            asyncio.run(
+                run_conductor(
+                    settings,
+                    stop_slot=stop_slot,
+                    launches_same_head=args.launches_same_head,
+                    launch_head_msg_id=args.launch_head_msg_id or None,
+                    retry_of=parse_retry_of(args.retry_of),
+                )
+            )
         else:
             asyncio.run(run_loop(settings))
     except KeyboardInterrupt:

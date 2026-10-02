@@ -13,6 +13,7 @@ uv run mypy src tests
 pwsh -NoProfile -File tests/Test-SweepHeadCache.ps1
 pwsh -NoProfile -File tests/Test-SweepHoldGate.ps1
 pwsh -NoProfile -File tests/Test-SweepQuarantine.ps1
+pwsh -NoProfile -File tests/Test-SweepRetry.ps1
 pwsh -NoProfile -File tests/Test-SweepDigest.ps1
 pwsh -NoProfile -File tests/Test-ClearQuarantine.ps1
 pwsh -NoProfile -File tests/Test-Lease.ps1
@@ -21,4 +22,6 @@ pwsh -NoProfile -File tests/Test-DecisionComposerWiring.ps1
 pwsh -NoProfile -File tests/Test-StopReasonPhrase.ps1
 pwsh -NoProfile -File tests/Test-SweepSequentiality.ps1
 pwsh -NoProfile -File tests/Test-WrapperInitTrap.ps1
+pwsh -NoProfile -File tests/Test-SweepFairness.ps1
+pwsh -NoProfile -File tests/Test-BoundedProbe.ps1
 uv run pytest

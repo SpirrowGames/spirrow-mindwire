@@ -78,17 +78,27 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
-from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
+from ..decider.hook import (
+    Decider,
+    ThreadMessage,
+    is_tierc_entry,
+    never_retry,
+    run_proceed_veto,
+    run_tierc_hook,
+)
+from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
-from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
+from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
-from ..routing import GuardIVerdict, guard_proposer_to_implementer
+from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
+from ..tier_c_admission_gate import AdmissionVerdict
 from ..value_objects import (
     ChatroomEvent,
+    Event,
     EventType,
     NewMessagePayload,
     Role,
@@ -98,13 +108,44 @@ from ..value_objects import (
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
 from .gate_records import (
     RELAY_AUTHOR,
+    RelayRoute,
     ci_route_heads,
     normalize_sha,
     render_ci_route_marker,
     verdict_heads,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
+from .handoff import (
+    HUMAN_TOKEN,
+    OPERATOR_FORM_EXAMPLE,
+    OPERATOR_TOKEN,
+    Handoff,
+    HandoffKind,
+    OperatorFault,
+    declares_no_tier_c,
+    declares_tier_c,
+    parse_next_token,
+    resolve_handoff,
+)
+from .human_identity import is_human_identity
+from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
+from .spawn_timeout import (
+    SPAWN_ATTEMPTS,
+    SpawnGaveUp,
+    emit_spawn_timeout,
+    render_spawn_timeout_notice,
+    spawn_timeout_event,
+)
+from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
+from .stand_down import (
+    StandDownError,
+    StandDownReason,
+    UnresolvedItem,
+    emit_stand_down,
+    stand_down_event,
+)
+from .stop_marker import render_stop_marker
+from .tierc_gate import TierCGate, bounced_msg_id, is_bounce_notice, render_bounce_body
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -133,6 +174,56 @@ _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 #: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
+
+def _with_stop_marker(notice: str, event: Event) -> str:
+    """``notice`` with ``event``'s stop marker inserted above its final line (the ``NEXT:``).
+
+    The placement rule of :mod:`.stop_marker`: the marker on its own line, a blank line, then the
+    unchanged final ``NEXT: human`` — so the line directly above ``NEXT:`` stays empty and the
+    ``TIER-C:`` / ``STOP:`` readers see nothing there.
+    """
+    # Trailing newlines are dropped first so ``last`` is always the ``NEXT:`` line, never "".
+    head, sep, last = notice.rstrip("\n").rpartition("\n")
+    if not sep:
+        return notice
+    return f"{head}\n{render_stop_marker(event)}\n\n{last}"
+
+
+def _operator_fault_notice(fault: OperatorFault) -> str:
+    """The stand-down notice for a refused ``NEXT: operator`` (D6-prime and its msg-5428 revision).
+
+    Each one carries the correct form verbatim, so a session that never saw the updated protocol
+    can fix its handoff in one turn. The conflict notice teaches the Tier-C form instead: work the
+    author declared Tier-C is never operator work.
+    """
+    if fault is OperatorFault.TIER_C_CONFLICT:
+        cause = (
+            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は operator には"
+            "渡せません (protocol 違反: Tier-C を operator に渡そうとした)。"
+        )
+        fix = (
+            "次にやること: Tier-C の作業として、次の形で human に渡し直してください。\n\n"
+            f"    TIER-C: <type>\n    NEXT: {HUMAN_TOKEN}"
+        )
+    else:
+        if fault is OperatorFault.NO_TASK:
+            cause = "`OPERATOR-TASK:` 行がありません (`NEXT:` の 2 行上に必要です)。"
+        else:
+            cause = f"`NEXT: {OPERATOR_TOKEN}` の直上の行が `TIER-C-CHECK: none` ではありません。"
+        indented = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+        fix = (
+            "次にやること: 作業が Tier-C のどの型にも当たらないなら、次の 3 行で書き直して"
+            f"ください。当たる、または当たりうるなら `TIER-C: <type>` / `NEXT: {HUMAN_TOKEN}` "
+            f"で渡してください。\n\n{indented}"
+        )
+    return (
+        f"Conductor stand-down — `NEXT: {OPERATOR_TOKEN}` を受け付けませんでした\n\n"
+        f"理由 (`{fault.value}`): {cause}\n\n"
+        f"∴ 誰も spawn せず停止しました。{fix}\n\n"
+        f"head が動くまでループは再開しません。\n\n"
+        f"NEXT: {HUMAN_TOKEN}"
+    )
 
 
 class ConductorDispatcher(Protocol):
@@ -192,6 +283,12 @@ class StopReason(StrEnum):
     # ended on NO_PROGRESS. Measured on two threads that sat that way for days at one retry per
     # hour. Detecting it in ``_route`` means the spawn never happens and the stop names its cause.
     SELF_HANDOFF = "self_handoff_to_human"
+    # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
+    # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
+    # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
+    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
+    # nowhere if re-run).
+    STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -262,6 +359,10 @@ def adapter_error_code(exc: BaseException) -> str:
     space would be truncated, and a non-string ``.code`` (an HTTP status, ``SystemExit``'s int) is
     not an adapter error code. A ``.code`` property that itself raises falls back to the class
     name (msg-4440).
+
+    The attribute is declared on :class:`~spirrow_mindwire.exceptions.AdapterDeliveryError`
+    (``code: str | None = None``), so an adapter's delivery failure has it by contract. The read
+    below stays dynamic because a dispatch can raise anything, not only a delivery error.
     """
     try:
         code = getattr(exc, "code", None)
@@ -317,6 +418,10 @@ class Conductor:
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
         stop_slot: ConductorStopSlot | None = None,
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
+        tierc_gate: TierCGate | None = None,
+        retry_of: RetryOf | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -369,15 +474,41 @@ class Conductor:
         # or sent it to a forced naysayer consult — and never changes the routing decision
         # ``_route`` already made (D20 monotonicity).
         self._decider = decider
+        # Tier-C admission gate, enforced (T-decider-conductor-hook DECIDED 2e-1b). ``None`` =
+        # ``[tierc_gate] mode = "off"``: the gate stays compute-only inside the Decider hook and the
+        # conductor behaves byte-for-byte as before. When set, a role-authored ``NEXT: human`` the
+        # gate bounces goes back to its author (``_enforce_tierc_gate``) — the one sanctioned
+        # exception to D20 monotonicity, bounded by RETRY / fail-open (see :mod:`.tierc_gate`).
+        self._tierc_gate = tierc_gate
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
+        # T42 stall watchdog input, handed down by the sweep (``--launches-same-head`` /
+        # ``--launch-head-msg-id``). The defaults (0 / None) never stall, so a bare Conductor
+        # and every caller that predates T42 behave exactly as before.
+        self._launches_same_head = launches_same_head
+        self._launch_head_msg_id = launch_head_msg_id
+        # T-retry-once-before-quarantine D-4: the failed launch this run re-fires, handed down by
+        # the sweep (``--retry-of``). ``None`` (the default) = not a retry; no prompt changes.
+        # Read only by ``_dispatch_recording``, through :func:`.retry_notice.retry_notice_for`.
+        self._retry_of = retry_of
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
         # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
+        # D-4' G3 (veto form, msg-5219 / Bohr msg-5229 R3'): the Decider's veto answer for ONE
+        # head, keyed by that head's msg id (``_prefetch_proceed_veto``) as
+        # ``(head_id, vetoed, ask_score)``. ``_route`` is synchronous and the Decider is not, so
+        # the answer is fetched before ``_route`` and read back through a thunk. An entry exists
+        # only when the Decider was consulted (``backend=off`` included, recorded as not vetoed);
+        # a missing or stale entry means it was NOT consulted for this head — an internal fault —
+        # and reads as a veto (fail-closed, Einstein msg-5228 / msg-5230).
+        self._proceed_veto: tuple[str, bool, float | None] | None = None
+        # Why G3 closed carve-out ③ on the last ``_route`` (``None`` = G3 did not close it); read
+        # by the guard-(i) redirect notice so the human can tell a Jev veto from an internal fault.
+        self._g3_close_reason: str | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -457,6 +588,17 @@ class Conductor:
             # two different targets" apart from "the writer put garbage in the field" without
             # re-deriving it from the raw tokens, and a programmatic consumer counts them apart
             # without duplicating :mod:`.handoff`'s resolver). Same escalation, different cause.
+            if handoff.via_role_alias:
+                # D3 (T-next-role-name-stands-down-to-human): a role name resolved to the one
+                # roster identity holding it. Logged so the frequency of role-name handoffs stays
+                # measurable after they stopped standing down.
+                logger.info(
+                    "conductor.handoff.role_alias msg=%s token=%r identity=%s role=%s",
+                    latest_msg_id,
+                    handoff.token,
+                    handoff.identity,
+                    handoff.role.value if handoff.role is not None else None,
+                )
             if handoff.mismatch_reason is not None:
                 logger.warning(
                     "conductor next_participant field/body mismatch: msg=%s reason=%s "
@@ -542,16 +684,28 @@ class Conductor:
                             )
                         handle = sessions.get(implementer_identity)
                         if handle is None:
-                            handle = await self._dispatcher.spawn_instance(
-                                self._thread_ref,
-                                self._implementer_role,
-                                implementer_identity,
+                            spawned = await self._spawn(
+                                self._implementer_role, implementer_identity
                             )
+                            if isinstance(spawned, SpawnGaveUp):
+                                return self._stop(
+                                    round_index,
+                                    StopReason.HUMAN,
+                                    spawned.notice_msg_id,
+                                    forced,
+                                    forced_saveable,
+                                )
+                            handle = spawned
                             sessions[implementer_identity] = handle
+                        # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
+                        # this round's fetch, so it is not in ``messages``. The context builder
+                        # requires the trigger to be present; append it NON-destructively so
+                        # nothing else this round reads sees a changed list.
                         await self._dispatch_recording(
                             handle,
                             route_msg,
-                            messages,
+                            [*messages, route_msg],
+                            role=self._implementer_role,
                             rounds=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -559,31 +713,44 @@ class Conductor:
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
-                verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
+                relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
-                # A missing relay id (post result with no msg_id) breaks no-progress tracking on
-                # the continue path, so fail-safe to the human instead of re-processing the relay
-                # next round (Tier B msg-572 #2). APPROVE / COMMENT also stop at the human.
+                # U3' (T-tier-c-admission-gate msg-4776): WHERE to go is decided once, by the relay
+                # writer (``gate_records.decide_relay_route``), and read here off the relay — this
+                # branch no longer re-derives it from the verdict. What stays here are the two
+                # execution fail-safes, which are not policy: a missing relay id (post result with
+                # no msg_id) breaks no-progress tracking on the continue path (Tier B msg-572 #2),
+                # and no implementer persona means nobody to dispatch. Both stop at the human.
                 if (
                     not relay_msg_id
-                    or verdict is not ReviewEvent.REQUEST_CHANGES
+                    or relay_route is not RelayRoute.IMPLEMENTER
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
                     return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
                 handle = sessions.get(implementer_identity)
                 if handle is None:
-                    handle = await self._dispatcher.spawn_instance(
-                        self._thread_ref, self._implementer_role, implementer_identity
-                    )
+                    spawned = await self._spawn(self._implementer_role, implementer_identity)
+                    if isinstance(spawned, SpawnGaveUp):
+                        return self._stop(
+                            round_index,
+                            StopReason.HUMAN,
+                            spawned.notice_msg_id,
+                            forced,
+                            forced_saveable,
+                        )
+                    handle = spawned
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
+                # R-1b: ``relay_msg`` post-dates this round's fetch; hand the builder
+                # ``[*messages, relay_msg]`` (a new list — ``messages`` stays as fetched).
                 await self._dispatch_recording(
                     handle,
                     relay_msg,
-                    messages,
+                    [*messages, relay_msg],
+                    role=self._implementer_role,
                     rounds=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
@@ -593,6 +760,11 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
+            # D-4' G3: fetch the Decider's veto answer for a naysayer proceed BEFORE the synchronous
+            # ``_route`` consults it. Only called when every other carve-out ③ condition already
+            # holds (``carve_out_iii_admissible``, the same rule ``_route`` applies), so a
+            # proposer's handoff, a supervised project or an undeclared proceed costs no call.
+            await self._prefetch_proceed_veto(handoff, messages, round_index)
             route = self._route(handoff, messages)
             target_role = route.target_role
             target_identity = route.target_identity
@@ -611,6 +783,46 @@ class Conductor:
                 target_role=target_role,
                 spawn_blocked=spawn_blocked,
             )
+            # Tier-C admission gate, enforced (DECIDED 2e-1b). Only a turn ``_route`` stopped at the
+            # human is a candidate: a forced naysayer consult has not reached the human yet, and a
+            # spawn-blocked dead end is not somebody asking. A bounce posts the notice and
+            # dispatches the author directly on it (as the PR-gate relay dispatches the
+            # implementer) — routing the notice's ``NEXT: <author>`` through ``_route`` would send
+            # an implementer author into guard (i).
+            if (
+                target_role is None
+                and stop_reason is StopReason.HUMAN
+                and not spawn_blocked
+                and self._tierc_gate is not None
+            ):
+                bounce_msg = await self._enforce_tierc_gate(handoff, latest)
+                if bounce_msg is not None:
+                    author_identity, author_role = self._roster_entry(_author(latest))
+                    handle = sessions.get(author_identity)
+                    if handle is None:
+                        spawned = await self._spawn(author_role, author_identity)
+                        if isinstance(spawned, SpawnGaveUp):
+                            return self._stop(
+                                round_index,
+                                StopReason.HUMAN,
+                                spawned.notice_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
+                        handle = spawned
+                        sessions[author_identity] = handle
+                    await self._dispatch_recording(
+                        handle,
+                        bounce_msg,
+                        [*messages, bounce_msg],
+                        role=author_role,
+                        rounds=round_index,
+                        forced=forced,
+                        forced_saveable=forced_saveable,
+                    )
+                    # A silent author leaves the notice as the next latest → NO_PROGRESS.
+                    processed_msg_id = _msg_id(bounce_msg)
+                    continue
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -621,8 +833,13 @@ class Conductor:
                 # the pre-Layer-3 path. This branch is structurally unreachable when the field is
                 # set; the assertion pins it that way so a future refactor of the resolver cannot
                 # silently re-open msg-1438's 2-day silent stall (§3-1 row 3).
+                # The one exception is a refused ``NEXT: operator`` (``operator_fault``): it is a
+                # NO_HANDOFF that always posts its stand-down notice, so it cannot be msg-1438's
+                # silent stall even when a field is present (PR #402 gate, 82ec032).
                 assert not (
-                    stop_reason is StopReason.NO_HANDOFF and _next_participant(latest) is not None
+                    stop_reason is StopReason.NO_HANDOFF
+                    and _next_participant(latest) is not None
+                    and handoff.operator_fault is None
                 ), (
                     f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
                     f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"
@@ -632,8 +849,25 @@ class Conductor:
                 # treatment the R3/R5 admission escalation gets — so the sweep records the stop
                 # against the message a human will actually open.
                 notice = self._terminal_notice(handoff, _author(latest), stop_reason)
+                # T44 (Bohr msg-4569 異議 1): an identity that did not resolve is a stand-down, and
+                # the thread HAS resolved, so the report goes to this thread — never elsewhere. The
+                # decision is the one ``_route`` already made (``spawn_blocked`` / NO_HANDOFF on a
+                # named-but-unknown target); this only names it on the event log.
+                stand_down = self._identity_stand_down(handoff, stop_reason, spawn_blocked)
+                if stand_down is not None:
+                    emit_stand_down(stand_down)
+                    if notice is not None:
+                        # D7: the board tells a routing stand-down from a decision by this marker
+                        # (``parked_lane``), not by the prose. Same placement as the other stop
+                        # notices: above the final ``NEXT: human``, one blank line between.
+                        notice = _with_stop_marker(notice, stand_down)
                 if notice is not None:
                     posted = await self._post_as_relay(notice)
+                    if stand_down is not None and not _msg_id(posted):
+                        # "chatroom で言えたら exit 0、言えなかったら非 0" (msg-4569): the notice
+                        # did not land (resolved thread / no msg_id), so this stop is silent in the
+                        # chatroom and must exit non-zero → wrapper quarantine + Discord.
+                        raise StandDownError(stand_down)
                     latest_msg_id = _msg_id(posted) or latest_msg_id
                 else:
                     # T-human-terminal-overuse D-1 (Bohr msg-2540 approved by Einstein msg-2539).
@@ -651,6 +885,56 @@ class Conductor:
                         posted = await self._post_as_conductor_relay(redirect_body)
                         latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
+            # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
+            # count describes the head this launch started on; a later round is on a head this
+            # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
+            # roster-resolved "AI-addressed" test (msg-4532 §1) — the PR-gate path (a CI wait on
+            # one head is legitimate) and every stop above never reach here.
+            if round_index == 0 and is_stalled(
+                launches_same_head=self._launches_same_head,
+                launch_head_msg_id=self._launch_head_msg_id,
+                head_msg_id=latest_msg_id,
+            ):
+                stall_event = stalled_event(
+                    project=self._thread_ref.project_id,
+                    thread=self._thread_ref.thread_id,
+                    head_msg_id=latest_msg_id,
+                    launches_same_head=self._launches_same_head,
+                    target=target_identity,
+                )
+                emit_stalled(stall_event)
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for work.
+                # Fallback when the thread is gone: disposition (3), fail loudly. ``_post_as_relay``
+                # turns a ThreadResolvedError into an empty ``msg_id``; that, or any post that
+                # returns no ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine
+                # and Discord alert, with the ``conductor.stalled`` line above in the log tail.
+                posted = await self._post_as_relay(render_stalled_notice(stall_event))
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "conductor.stalled notice did not land in thread %r — exiting non-zero",
+                        self._thread_ref.thread_id,
+                    )
+                    raise StalledError(stall_event)
+                return self._stop(
+                    round_index, StopReason.STALLED, posted_id, forced, forced_saveable
+                )
+            # The session first, the forced-consult count after: a spawn that gave up stops the
+            # run here, and a consult that never ran must not be reported as one that did.
+            handle = sessions.get(target_identity)
+            if handle is None:
+                spawned = await self._spawn(target_role, target_identity)
+                if isinstance(spawned, SpawnGaveUp):
+                    return self._stop(
+                        round_index,
+                        StopReason.HUMAN,
+                        spawned.notice_msg_id,
+                        forced,
+                        forced_saveable,
+                    )
+                handle = spawned
+                sessions[target_identity] = handle
             if is_forced:
                 forced += 1
                 # ``is_saveable`` comes from _route (the single source of truth for the forcing
@@ -658,17 +942,11 @@ class Conductor:
                 # always; read it with the lever off to size the potential saving.
                 if is_saveable:
                     forced_saveable += 1
-
-            handle = sessions.get(target_identity)
-            if handle is None:
-                handle = await self._dispatcher.spawn_instance(
-                    self._thread_ref, target_role, target_identity
-                )
-                sessions[target_identity] = handle
             await self._dispatch_recording(
                 handle,
                 latest,
                 messages,
+                role=target_role,
                 rounds=round_index,
                 forced=forced,
                 forced_saveable=forced_saveable,
@@ -742,9 +1020,86 @@ class Conductor:
             target_role=target_role,
             spawn_blocked=spawn_blocked,
             naysayer_role=self._naysayer_role,
-            author_wrote_next_human=handoff.mismatch_reason is None,
+            # A positive fact set only where the author named the human (handoff.py), never
+            # derived from ``mismatch_reason is None``: that negation would count any future
+            # non-mismatch HUMAN escalation as an author request (msg-4861 / msg-4864 U1).
+            author_requested_human=handoff.author_requested_human,
             now=datetime.now(UTC),
+            # Under enforce the compute-only gate reads the live RETRY store, so the Decider sees
+            # the verdict the enforced gate acts on (msg-5143); off keeps ``never_retry``.
+            retry_lookup=(
+                self._tierc_gate.retry_lookup if self._tierc_gate is not None else never_retry
+            ),
         )
+
+    async def _enforce_tierc_gate(
+        self, handoff: Handoff, latest: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Run the enforced admission gate on a head ``_route`` stopped at the human (2e-1b).
+
+        Returns the posted bounce notice when the head was bounced back to its author, else
+        ``None`` — and ``None`` means "stop at the human exactly as with the gate off". Entered only
+        for an author-written ``NEXT: human`` (a field/body mismatch is a conductor safety valve,
+        not a request) by a proposer / implementer / naysayer — the Decider hook's entry rule
+        (:func:`~..decider.hook.is_tierc_entry`), so ``pr-gate-relay``, ``conductor-relay``,
+        operator and the human are never gated (msg-5141 condition 3).
+
+        Fail-open (msg-5141 condition 2): an exception from the gate or the log write, a failure
+        to render the notice, or a notice that did not land (resolved thread / no ``msg_id``) all
+        return ``None``. The gate's rows are written before the notice is posted
+        (:meth:`.tierc_gate.TierCGate.admit`).
+        """
+        gate = self._tierc_gate
+        if gate is None:
+            return None
+        if handoff.kind is not HandoffKind.HUMAN or not handoff.author_requested_human:
+            return None
+        author = _author(latest)
+        if not is_tierc_entry(author_requested_human=True, author_role=self._roster_role(author)):
+            return None
+        try:
+            decision = gate.admit(
+                body=_content(latest),
+                author=author,
+                thread=self._thread_ref.thread_id,
+                msg_id=_msg_id(latest),
+                now=datetime.now(UTC),
+            )
+            logger.info(
+                "tierc_gate decision: msg=%s author=%s verdict=%s rule=%s",
+                _msg_id(latest),
+                author,
+                decision.verdict.value,
+                decision.rule,
+            )
+            if decision.verdict is not AdmissionVerdict.BOUNCE:
+                return None
+            body = render_bounce_body(
+                author=author, decision=decision, bounced_msg_id=_msg_id(latest)
+            )
+        except Exception:
+            logger.warning(
+                "tierc_gate failed on msg=%s; stopping at the human (fail-open)",
+                _msg_id(latest),
+                exc_info=True,
+            )
+            return None
+        posted = await self._post_as_conductor_relay(body)
+        if not _msg_id(posted):
+            logger.warning(
+                "tierc_gate bounce notice for msg=%s did not land; stopping at the human",
+                _msg_id(latest),
+            )
+            return None
+        return posted
+
+    def _roster_entry(self, author: str) -> tuple[str, Role]:
+        """``(roster identity, role)`` for a roster author, matched case-insensitively like
+        :meth:`_roster_role`. Only called for an author :func:`is_tierc_entry` admitted."""
+        for identity, role in self._roster.items():
+            if identity.casefold() == author.casefold():
+                return identity, role
+        raise KeyError(author)
 
     def _route(self, handoff: Handoff, messages: list[dict[str, Any]]) -> RouteDecision:
         """Decide who to dispatch (``role is None`` = stop with the returned ``StopReason``).
@@ -860,11 +1215,19 @@ class Conductor:
             # form's scope exactly (``_attested`` is reached only for a non-human naysayer
             # under RUN), and a future carve-out that needs the attest bit for a different
             # role/state combination edits ``routing.py`` only.
+            #
+            # D-4' (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): G1 / G2 / G3 are
+            # thunks for the same reason — the predicate owns when they are read.
+            head_id = _msg_id(messages[-1])
+            self._g3_close_reason = None
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
                 control_state_is_run=self._control_state is ControlState.RUN,
                 message_is_attested=lambda: self._attested(messages[-1]),
+                segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+                naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
+                decider_vetoes=lambda: self._proceed_vetoed_for(head_id),
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
@@ -908,6 +1271,27 @@ class Conductor:
             )
 
         if handoff.kind is HandoffKind.NONE:
+            # T-next-line-carries-who-not-why Slice 1 (Bohr msg-4718 §1-2): record the STOP:
+            # line above the author's `NEXT: none` — present / absent / malformed, plus the typed
+            # disposition. MEASUREMENT ONLY, same discipline as the TIER-C tag above: nothing is
+            # rejected, nothing is forwarded to magickit, and the route below is identical for
+            # every value. `stop_line=absent` is the pre-cutover `unclassified` denominator.
+            stop = handoff.stop_line
+            # resolve_handoff sets stop_line on every NONE handoff (handoff.py, resolve_handoff).
+            assert stop is not None
+            logger.info(
+                "conductor none terminal: author=%s author_role=%s stop_line=%s "
+                "stop_disposition=%s stop_trigger=%s stop_wake=%s stop_raw=%r",
+                _author(messages[-1]),
+                author_role.value if author_role is not None else None,
+                stop.status.presence,
+                stop.status.value,
+                f"{stop.trigger_arm}:{stop.trigger_operand}"
+                if stop.trigger_arm is not None
+                else None,
+                stop.wake,
+                stop.raw,
+            )
             return RouteDecision(
                 target_role=None,
                 target_identity="",
@@ -915,6 +1299,20 @@ class Conductor:
                 is_saveable=False,
                 spawn_blocked=False,
                 stop_reason=StopReason.SETTLED,
+            )
+
+        if handoff.operator_fault is not None:
+            # D6'''' (msg-5428): a refused ``NEXT: operator`` stops at once and says why, with the
+            # correct form in the notice. It is NOT sent through the guard (ii) consult below: the
+            # consult would post first and bury the notice, and the fix is the author's to make in
+            # one turn (D6').
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.NO_HANDOFF,
             )
 
         # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
@@ -1025,6 +1423,93 @@ class Conductor:
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
             )
+        if reason is StopReason.NO_HANDOFF and handoff.operator_fault is not None:
+            return _operator_fault_notice(handoff.operator_fault)
+        if (
+            reason is StopReason.NO_HANDOFF
+            and handoff.kind is HandoffKind.ABSENT
+            and handoff.role_alias_unresolved
+        ):
+            return (
+                f"Conductor stand-down — role 名の宛先が 1 人に決まりません\n\n"
+                f"head の `NEXT:` は role 名 `{handoff.token}` を指していますが、この project の "
+                f"roster ではこの role を持つ identity が 1 人ではありません (0 人または複数)。"
+                f"\n\n∴ 誰も spawn せず、人間の介入が必要な停止として扱いました "
+                f"(`conductor.stand_down` reason=identity_role_ambiguous)。\n\n"
+                f"次にやること: `NEXT:` を identity 名 (persona 名) で書き直してください。"
+                f"head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            # T44 (Einstein msg-4548 / Bohr msg-4569 異議 1): ``NEXT: Bohrr`` — the head names a
+            # target, so a reader of the head believes someone was started. Without this line the
+            # thread just stops; that is the silent stop T44 exists to remove.
+            return (
+                f"Conductor stand-down — `NEXT:` の宛先が解決できません\n\n"
+                f"head の `NEXT:` は `{handoff.token}` を指していますが、これは roster の参加者"
+                f"でも `human` / `none` / `pr-review` でもありません (typo の可能性があります)。"
+                f"\n\n∴ 誰も spawn せず、人間の介入が必要な停止として扱いました "
+                f"(`conductor.stand_down` unresolved=identity)。\n\n"
+                f"次にやること: 正しい参加者名で `NEXT:` を書き直すか、`NEXT: human` で"
+                f"明示的に預けてください。head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        return None
+
+    def _identity_stand_down(
+        self, handoff: Handoff, reason: StopReason, spawn_blocked: bool
+    ) -> Event | None:
+        """The ``conductor.stand_down`` event for a stop caused by an unresolved identity.
+
+        Reads the decision ``_route`` already made rather than re-deriving it (no parallel
+        identity check, msg-4569): ``spawn_blocked`` is the router's own flag, and the unknown
+        target is the NO_HANDOFF stop on a head whose ``NEXT:`` named *something* (``token`` set)
+        that is neither a roster participant nor a sentinel. A head with no ``NEXT:`` at all is
+        not an identity failure — nothing was named — and stays out of this vocabulary.
+        """
+        project = self._thread_ref.project_id
+        thread = self._thread_ref.thread_id
+        if spawn_blocked:
+            blocked = self._spawn_blocked(handoff)
+            name, embodiment = blocked if blocked is not None else (handoff.token or "", "?")
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_NOT_SPAWNABLE,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {name!r} has embodiment {embodiment!r} (no adapter)",
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.operator_fault is not None:
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason(handoff.operator_fault.value),
+                project=project,
+                thread=thread,
+                detail=f"NEXT: {OPERATOR_TOKEN} refused ({handoff.operator_fault.value})",
+            )
+        if (
+            reason is StopReason.NO_HANDOFF
+            and handoff.kind is HandoffKind.ABSENT
+            and handoff.role_alias_unresolved
+        ):
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_ROLE_AMBIGUOUS,
+                project=project,
+                thread=thread,
+                detail=(
+                    f"NEXT target {handoff.token!r} is a role name held by zero or several "
+                    "roster identities"
+                ),
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_UNRESOLVED,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {handoff.token!r} is not a roster participant or a sentinel",
+            )
         return None
 
     def _human_terminal(
@@ -1089,6 +1574,105 @@ class Conductor:
         await self._control.report_observed(state)
         return state
 
+    def _segment_declares_tier_c(self, messages: list[dict[str, Any]]) -> bool:
+        """D-4' G1: has anyone declared a Tier-C since the human last spoke?
+
+        Scans newest → oldest and stops at the most recent message authored by the human
+        (:meth:`_is_human`, the carve-out ① test) — the ONLY reset boundary (Bohr msg-4858 §2,
+        after Einstein msg-4857's edge case: an implementer failure/return must not erase a
+        declaration). Implementer, proposer, naysayer and conductor-relay messages are all scanned
+        and none of them resets. With no human message in the thread, the whole thread is scanned.
+        Any ``TIER-C: <label>`` line (``other:`` included, :func:`.handoff.declares_tier_c`) makes
+        it ``True`` — and it stays ``True`` on every later turn until the human speaks (latch).
+
+        The human boundary is author-string trust, the same D-3 environment trust model as
+        :meth:`_is_human` (msg-598 Q2=yes, re-accepted for G1 in msg-4858 §2).
+        """
+        for msg in reversed(messages):
+            if self._is_human(_author(msg)):
+                return False
+            if declares_tier_c(_content(msg)):
+                return True
+        return False
+
+    def _proceed_vetoed_for(self, head_msg_id: str) -> bool:
+        """G3 read-back (veto form), three states (Bohr msg-5229 R3', Einstein msg-5230):
+
+        * entry for exactly this head, ``vetoed=False`` → not vetoed (the Decider was consulted —
+          or is off — and did not say "ask the human"; G1 / G2 decide);
+        * entry for exactly this head, ``vetoed=True`` → vetoed (Jev judged it a human matter);
+        * no entry, an entry for another head, or an empty head id → vetoed, with an error log:
+          the conductor cannot show the Decider was consulted for this head, which is an internal
+          fault and must not be read as the Decider's "no veto".
+        """
+        cached = self._proceed_veto
+        if not head_msg_id or cached is None or cached[0] != head_msg_id:
+            logger.error("G3 prefetch missing for head=%s; carve-out ③ closed", head_msg_id)
+            self._g3_close_reason = "prefetch-missing"
+            return True
+        _, vetoed, ask_score = cached
+        if vetoed:
+            score = "?" if ask_score is None else f"{ask_score:.2f}"
+            self._g3_close_reason = f"veto:{score}"
+        return vetoed
+
+    async def _prefetch_proceed_veto(
+        self, handoff: Handoff, messages: list[dict[str, Any]], round_index: int
+    ) -> None:
+        """D-4' G3 (veto form): ask the Decider whether this naysayer proceed must go to the human.
+
+        Runs only for a ``ROLE`` handoff to the implementer whose author is not the human and for
+        which :func:`~spirrow_mindwire.routing.carve_out_iii_admissible` — the very rule
+        ``_route``'s guard applies before its own ``decider_vetoes`` thunk — already holds. Every
+        consult writes an entry against the head's msg id, whatever the answer (``backend=off``,
+        an error, grey-zone and ``LIKELY_NOT`` all write ``vetoed=False``); ``_route`` reads it
+        back via :meth:`_proceed_vetoed_for`, where a missing entry closes the door (R3').
+        """
+        self._proceed_veto = None
+        if not messages or handoff.kind is not HandoffKind.ROLE:
+            return
+        if handoff.role is not self._implementer_role:
+            return
+        head = messages[-1]
+        author = _author(head)
+        if self._is_human(author):
+            return
+        if not carve_out_iii_admissible(
+            author_is_naysayer=self._roster_role(author) is self._naysayer_role,
+            control_state_is_run=self._control_state is ControlState.RUN,
+            message_is_attested=lambda: self._attested(head),
+            segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+            naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
+        ):
+            return
+        vetoed, ask_score = await run_proceed_veto(
+            self._decider,
+            thread_id=self._thread_ref.thread_id,
+            round_index=round_index,
+            roster=self._roster,
+            messages=[
+                ThreadMessage(
+                    msg_id=_msg_id(m),
+                    author=_author(m),
+                    content=_content(m),
+                    parsed_next=parse_next_token(_content(m)),
+                )
+                for m in messages
+            ],
+        )
+        head_id = _msg_id(head)
+        if vetoed:
+            logger.info(
+                "conductor carve-out ③ vetoed by the Decider (G3): head=%s ask_score=%s",
+                head_id,
+                ask_score,
+            )
+        if not head_id:
+            # No key to cache under; ``_proceed_vetoed_for`` will close (and log an error).
+            logger.warning("G3 prefetch has no head msg id; carve-out ③ will close")
+            return
+        self._proceed_veto = (head_id, vetoed, ask_score)
+
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
         fail-safe default that makes every design→implement handoff hard-reject).
@@ -1097,8 +1681,9 @@ class Conductor:
         ``author`` string, so this carve-out is best-effort loop-level noise-reduction, NOT the
         authoritative Tier-C guard — that is the human's manual ``main`` merge (mirrors the
         implementer allow-list's environment-containment stance). Stronger author authentication
-        (ADR-11 normalization) is a deferred hardening."""
-        return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
+        (ADR-11 normalization) is a deferred hardening. The rule itself lives in
+        :func:`~.human_identity.is_human_identity`, shared with the shadow exporter (2d-14)."""
+        return is_human_identity(author, self._human_identity)
 
     def _attested(self, msg: dict[str, Any]) -> bool:
         """Does ``msg`` carry a well-formed harness attestation stamp (P-3, Tier-C msg-970)?
@@ -1168,6 +1753,7 @@ class Conductor:
         the two cannot ping-pong.)
         """
         segment = messages[:-1]  # exclude the latest msg (the one now handing to human)
+        bounced = _bounced_msg_ids(messages)
         boundary = 0
         for i, msg in enumerate(segment):
             # Layer 3: a past message that ended a segment with ``next_participant: human`` (with
@@ -1178,7 +1764,11 @@ class Conductor:
             past = resolve_handoff(
                 _content(msg), self._roster, next_participant=_next_participant(msg)
             )
-            if past.kind is HandoffKind.HUMAN:
+            # 2e-1b: a ``NEXT: human`` the admission gate bounced never reached the human, so it
+            # does not end the segment — else the author's RETRY / relabelled reply would force a
+            # second consult of a design the naysayer already reviewed. Matched by the msg_id
+            # the notice names, not by adjacency: another post can land in between (#398 advisory).
+            if past.kind is HandoffKind.HUMAN and _msg_id(msg) not in bounced:
                 boundary = i + 1
         return any(
             self._roster_role(_author(msg)) is self._naysayer_role and self._attested(msg)
@@ -1212,7 +1802,7 @@ class Conductor:
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
-    async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, dict[str, Any]]:
+    async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
         """Fire the Tier B naysayer review on ``pr_ref`` and take back its verdict (PR-2b-2).
 
         Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub
@@ -1220,17 +1810,23 @@ class Conductor:
         verdict (with the critique body, so the implementer has its fix context) into the design
         thread named here. The relay used to live in this class, which made the destination a
         property of the *caller*: a hand-run driver held no design thread and silently relayed
-        nothing. Returns the verdict and the relay **message**, so the implementer is dispatched
-        on that relay event and sees the critique, not its own trigger (Tier B msg-567 #1).
+        nothing. Returns the relay route (U3', decided once by the relay writer) and the relay
+        **message**, so the implementer is dispatched on that relay event and sees the critique,
+        not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, outcome, relay_msg = await self._orchestrator.fire_pr_review(
+        _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
             project=self._thread_ref.project_id,
             pr_ref=pr_ref,
             design_thread=self._thread_ref.thread_id,
             implementer=self._implementer_identity,
         )
-        return outcome.verdict, relay_msg
+        # The route the relay writer decided (U3'). A relay dict without one — a caller that
+        # predates U3', or a malformed return — fails to the human, the safe direction.
+        route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
+        if not isinstance(route, RelayRoute):
+            route = RelayRoute.HUMAN
+        return route, relay_msg
 
     async def _post_as_relay(self, body: str) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.
@@ -1411,7 +2007,11 @@ class Conductor:
         author_role = self._roster_role(author)
         target = self._guard_i_redirect_target(author, author_role, messages)
         return self._format_guard_i_redirect_body(
-            author=author, author_role=author_role, handoff=handoff, target=target
+            author=author,
+            author_role=author_role,
+            handoff=handoff,
+            target=target,
+            g3_close_reason=self._g3_close_reason,
         )
 
     def _guard_i_redirect_target(
@@ -1456,7 +2056,9 @@ class Conductor:
         for msg in reversed(messages[:-1]):
             msg_author = _author(msg)
             if msg_author == CONDUCTOR_RELAY_AUTHOR:
-                return True
+                # A Tier-C bounce notice (2e-1b) is a different write-back, not a D-1 redirect: it
+                # ends the episode like any other non-author post rather than counting toward D-1c.
+                return not is_bounce_notice(_content(msg))
             if msg_author != current_author:
                 return False
         return False
@@ -1468,6 +2070,7 @@ class Conductor:
         author_role: Role | None,
         handoff: Handoff,
         target: str,
+        g3_close_reason: str | None = None,
     ) -> str:
         """Render the D-1 write-back body. See :meth:`_render_guard_i_redirect_notice` for shape.
 
@@ -1486,6 +2089,18 @@ class Conductor:
         # the thread when it has come to rest (if target is human). Both need to see the same
         # facts, so the body does not branch on target for the diagnostic prose.
         target_line = f"NEXT: {target}"
+        # Bohr msg-5227 R4 / msg-5229 R3': when G3 is what closed ③, say which kind of close it was
+        # so the human can tell a Jev veto from a conductor-internal fault.
+        if g3_close_reason is None:
+            g3_line = ""
+        elif g3_close_reason == "prefetch-missing":
+            g3_line = (
+                "今回 ③ を閉じたのは G3 です: G3 の事前取得が欠落しました (内部エラー。"
+                "Decider の判定ではありません)。\n\n"
+            )
+        else:
+            score = g3_close_reason.removeprefix("veto:")
+            g3_line = f"今回 ③ を閉じたのは G3 です: Jev が人に聞くべきと判定 (p={score})。\n\n"
         return (
             "Conductor stop — guard (i) redirect (design→implement Tier-C gate)\n\n"
             f"直近の post ({author}, role: {author_role_label}) の `NEXT:` は "
@@ -1499,7 +2114,11 @@ class Conductor:
             "ではありません。\n"
             "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
             "author が naysayer でない、あるいは attest 済でない、あるいは control が "
-            "`run` ではありません。\n\n"
+            "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
+            "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
+            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が「人に聞くべき」と "
+            "判定した (拒否権。Decider 無効・判定なし・エラーでは閉じない)。\n\n"
+            f"{g3_line}"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "
@@ -1638,7 +2257,13 @@ class Conductor:
         )
         return await self._post_as_relay(body)
 
-    def _to_event(self, msg: dict[str, Any], messages: list[dict[str, Any]]) -> ChatroomEvent:
+    def _to_event(
+        self,
+        msg: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        retry_notice: str | None = None,
+    ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
         ``messages`` is this round's freshly-fetched thread. The conductor has always
@@ -1668,7 +2293,64 @@ class Conductor:
                 parent_msg_id=msg.get("reply_to") or None,
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
+            retry_notice=retry_notice,
         )
+
+    async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
+        """Spawn the session for ``identity``: the one spawn path (Bohr msg-5053 D-1..D-3).
+
+        Returns the handle, or :class:`~.spawn_timeout.SpawnGaveUp` when every attempt timed out
+        and the notice saying so landed in the thread; the caller then stops on
+        ``StopReason.HUMAN`` against that notice. See :mod:`.spawn_timeout` for the rule.
+
+        Only :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` is handled. Every
+        other exception leaves here exactly as the dispatcher raised it, first attempt, no retry
+        and no notice: a spawn that failed for a stated reason fails the same way again, and its
+        exit 1 → quarantine path is unchanged.
+        """
+        for attempt in range(1, SPAWN_ATTEMPTS + 1):
+            try:
+                return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
+            except AdapterSpawnTimeoutError as exc:
+                event = spawn_timeout_event(
+                    adapter_id=exc.adapter_id,
+                    instance_id=identity,
+                    role=role,
+                    attempt=attempt,
+                    timeout_s=exc.timeout_s,
+                )
+                emit_spawn_timeout(event)
+                if attempt < SPAWN_ATTEMPTS:
+                    continue
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for a turn
+                # that never ran. Fallback when the thread is gone: disposition (3), fail loudly.
+                # ``_post_as_conductor_relay`` turns a ThreadResolvedError into an empty
+                # ``msg_id``; that, a post with no ``msg_id``, or a post that raised re-raises
+                # the timeout itself → exit 1 → the wrapper's quarantine and Discord alert, with
+                # the ``spawn.timeout`` lines above in the log tail. The refusal is never posted
+                # into another thread.
+                try:
+                    posted = await self._post_as_conductor_relay(render_spawn_timeout_notice(event))
+                except Exception as post_exc:
+                    logger.warning(
+                        "spawn.timeout notice could not be posted in thread %r (%s: %s) — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                        type(post_exc).__name__,
+                        post_exc,
+                    )
+                    raise exc from None
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "spawn.timeout notice did not land in thread %r — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                    )
+                    raise
+                return SpawnGaveUp(notice_msg_id=posted_id)
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _dispatch_recording(
         self,
@@ -1676,6 +2358,7 @@ class Conductor:
         msg: dict[str, Any],
         messages: list[dict[str, Any]],
         *,
+        role: Role,
         rounds: int,
         forced: int,
         forced_saveable: int,
@@ -1687,9 +2370,24 @@ class Conductor:
         type and chain are untouched (``loop_runner.main`` routes ``KeyboardInterrupt`` /
         ``EnvironmentTerminalError`` by type), and nothing is logged here: the single
         ``conductor stopped:`` line for this case is printed by ``loop_runner.main``.
+
+        ``role`` is the role ``handle`` was spawned for (the dispatcher contract makes it the
+        adapter's ``own_role``). It decides, with ``rounds``, whether this dispatch carries the
+        T-retry-once-before-quarantine notice: see :func:`.retry_notice.retry_notice_for`.
         """
+        notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
+        if self._retry_of is not None and rounds == 0:
+            logger.info(
+                "retry-of %s@%s: dispatching role=%s, notice=%s",
+                self._retry_of.error_code,
+                self._retry_of.first_failure_at,
+                role.value,
+                "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
+            )
         try:
-            await self._dispatcher.dispatch(handle, self._to_event(msg, messages))
+            await self._dispatcher.dispatch(
+                handle, self._to_event(msg, messages, retry_notice=notice)
+            )
         except BaseException as exc:
             if self._stop_slot is not None:
                 self._stop_slot.snapshot = ConductorStopSnapshot(
@@ -1725,6 +2423,22 @@ class Conductor:
             forced_naysayer_turns=forced,
             forced_naysayer_turns_saveable=forced_saveable,
         )
+
+
+def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
+    """msg_ids the admission gate bounced (2e-1b), read from the ``conductor-relay`` notices.
+
+    Only ``conductor-relay`` posts count, so a role quoting a notice cannot mark a message as
+    bounced. Empty ids are dropped.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if _author(msg) != CONDUCTOR_RELAY_AUTHOR:
+            continue
+        bounced = bounced_msg_id(_content(msg))
+        if bounced:
+            ids.add(bounced)
+    return frozenset(ids)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

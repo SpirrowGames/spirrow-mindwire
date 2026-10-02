@@ -27,9 +27,23 @@ msg-1721) requires:
     ``result`` was empty **but** another captured known field carried a value
     (e.g. ``field:errors`` when the SDK put a per-turn error list there).
 
+``"subtype_only"``
+    No reason field carried anything, but ``subtype`` did. ``subtype`` is the
+    SDK's *classification* of the failure (``error_during_execution`` …), not a
+    reason, so it is never picked as one (S-9 R-1, thread msg-4807 §3): it is
+    rendered as a ``SDK is_error[<subtype>]`` prefix on every message instead.
+    A value distinct from ``absent`` so "classified, but no reason" and "nothing
+    at all" stay two values.
+
 ``"absent"``
-    Every known field was empty/None. The reason is genuinely missing on this
-    ``ResultMessage``. In this branch — and ONLY here — a defensive reflection
+    No reason field (``_REASON_PRIORITY``: ``errors`` / ``api_error_status`` /
+    ``permission_denials`` / ``result``) and no ``subtype`` carried a value.
+    This is NOT "every captured field was empty": ``stop_reason`` and the
+    session facts are captured but are not reason candidates (S-9 R-1, thread
+    msg-4807 §3), so they may be populated here — they are in
+    ``captured_fields`` and in the dump, and the message says which fields
+    were judged. The reason is missing on this ``ResultMessage``.
+    In this branch — and ONLY here — a defensive reflection
     dump of the object is attached so the next iteration can widen the
     hand-picked list from evidence (§1-2 in msg-1721: the reflection is confined
     to the ``absent`` branch precisely because that is the one branch where
@@ -74,17 +88,46 @@ import json
 import sys
 from typing import Any, TextIO
 
-# Known fields on ``claude_agent_sdk.ResultMessage`` (SDK observed 2026-08-26,
-# S-0). ``result`` is enumerated so the general capture pass records it in
-# ``captured_fields`` alongside the others; the reason-source selection logic
-# below treats it as the highest-priority reason field independently.
-_KNOWN_REASON_FIELDS: tuple[str, ...] = (
-    "subtype",
-    "stop_reason",
+# The failure's classification. Rendered as a message prefix, never picked as
+# the reason (S-9 R-1, thread msg-4807 §3). 36 days of quarantine history showed
+# ``field:subtype`` as the majority ``reason_source`` with the value always
+# ``error_during_execution`` — a de-facto constant sitting in the one-line
+# ``message`` while the real reason (e.g. an HTTP 403 in ``errors``) was only
+# reachable by reading ``captured_fields``.
+_CLASSIFICATION_FIELD = "subtype"
+
+# Reason precedence after the str-``result`` fast path, verbatim from thread
+# msg-4807 §3 R-1: ``result`` (str) → ``errors`` → ``api_error_status`` →
+# ``permission_denials`` → non-str ``result``. ``subtype`` and ``stop_reason``
+# are captured but are not reason candidates.
+_REASON_PRIORITY: tuple[str, ...] = (
     "errors",
     "api_error_status",
     "permission_denials",
     "result",
+)
+
+# Fields captured for the reader but neither the classification nor a reason
+# candidate. ``stop_reason`` was never observed as ``field:stop_reason`` in the
+# quarantine history (0 of 77) and msg-4807 §3 does not list it.
+_CAPTURE_ONLY_FIELDS: tuple[str, ...] = ("stop_reason",)
+
+# Known fields on ``claude_agent_sdk.ResultMessage`` (SDK observed 2026-08-26,
+# S-0): the CAPTURE list (what lands in ``captured_fields``).
+#
+# It is DERIVED from the three tuples above rather than spelled out, so a
+# field added to ``_REASON_PRIORITY`` cannot be forgotten here — a reason
+# candidate that is never captured never reaches ``raw`` and would silently
+# never be evaluated (PR-gate advisory on #368 @ 97d3bea, human decision B on
+# thread T-sdk-is-error-loses-the-reason). The resulting order is the one the
+# hand-written tuple had (subtype, stop_reason, errors, api_error_status,
+# permission_denials, result), so ``captured_fields`` key order is unchanged.
+# ``result`` is in here via ``_REASON_PRIORITY``; the str-``result`` fast path
+# in ``_pick_reason`` treats it as the highest-priority reason independently.
+_KNOWN_REASON_FIELDS: tuple[str, ...] = (
+    _CLASSIFICATION_FIELD,
+    *_CAPTURE_ONLY_FIELDS,
+    *_REASON_PRIORITY,
 )
 
 # Session facts to always capture on failure so the quarantine marker carries
@@ -708,21 +751,65 @@ def _is_empty_reason_value(value: Any) -> bool:
     return isinstance(value, (list, tuple, set, frozenset, dict)) and not value
 
 
+def _classification_text(raw: dict[str, Any], summary: dict[str, Any]) -> str:
+    """Return the ``subtype`` as a bounded string, or ``""`` when there is none.
+
+    Three states are "no classification", each checked explicitly here rather
+    than left implicit in a helper (PR #368 PR-gate rounds 2-3 read the
+    implicit version as leaking; it did not, but the invariant should be
+    legible at the call site):
+
+    * the RAW value is the capture-failure sentinel object (the read raised).
+      Note the RAW dict holds the sentinel *object*; the ``{"capture_failed":
+      True}`` dict exists only on the SUMMARY side.
+    * the RAW value is empty per :func:`_is_empty_reason_value`.
+    * the SUMMARY is one of the failure markers (``capture_failed`` /
+      ``summarize_failed`` dicts) — never rendered as a prefix.
+
+    The whole body is fail-safe: the classification is an annotation on the
+    message, so a hostile ``subtype`` (``__bool__`` / ``__len__`` raising)
+    must cost the prefix, not the reason. Before this guard such a value
+    escaped :func:`_pick_reason` and collapsed the entire detail into
+    ``capture_failed``, discarding a readable ``errors=[…]``.
+
+    The text comes from the SUMMARY so it is length-bounded. ``[`` / ``]``
+    are not escaped: the prefix is for a human reader and the stall-ledger's
+    single-line regex, and the SDK's subtype values are plain identifiers.
+    """
+    try:
+        raw_value = raw.get(_CLASSIFICATION_FIELD)
+        if raw_value is _CAPTURE_ERROR_SENTINEL or _is_empty_reason_value(raw_value):
+            return ""
+        value = summary.get(_CLASSIFICATION_FIELD)
+        if isinstance(value, dict):
+            return ""
+        return value if isinstance(value, str) else str(value)
+    except Exception:
+        return ""
+
+
 def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str]:
     """Compute ``(reason_source, message)`` from RAW values, formatted from summary.
 
     Precedence:
 
+    0. ``subtype`` is never a reason. When non-empty it becomes the
+       ``SDK is_error[<subtype>]; `` prefix of every message below (S-9 R-1).
+
     1. ``result`` as a non-empty string → ``reason_source="result"`` and the
-       verbatim string as the message. This is the ordinary happy path — the
-       SDK put its reason text on this field.
+       verbatim string as the message (prefixed when a subtype exists). This
+       is the ordinary happy path — the SDK put its reason text on this field.
 
-    2. Any known field (including ``result``) whose RAW value is not empty
-       (per :func:`_is_empty_reason_value`) → ``field:<name>``, message
-       formatted from the SUMMARY so bounds are enforced.
+    2. The first field in ``_REASON_PRIORITY`` (including ``result``) whose
+       RAW value is not empty (per :func:`_is_empty_reason_value`) →
+       ``field:<name>``, message formatted from the SUMMARY so bounds are
+       enforced.
 
-    3. Everything empty → ``absent`` with the sentence explaining that N
-       fields were captured and none carried a reason.
+    3. No reason field, but a subtype → ``subtype_only``.
+
+    4. No reason field and no subtype → ``absent``. The message names the
+       fields that were judged; ``stop_reason`` / session facts are not among
+       them and may be populated (see ``captured_fields``).
 
     Note the deliberate difference between step 1 and step 2: step 1 fires ONLY
     for non-empty strings on ``result`` (the common case), but if ``result``
@@ -733,21 +820,32 @@ def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str
     reason vanished into the very shadow this whole thread exists to remove.
     (PR #181 round 4 naysayer review.)
     """
+    classification = _classification_text(raw, summary)
+    prefix = f"SDK is_error[{classification}]; " if classification else "SDK is_error; "
+
     result = raw.get("result")
     if isinstance(result, str) and result:
-        return "result", result
+        # No classification → the result string alone, as before S-9 (the
+        # thread spec only defines the prefixed form for when a subtype exists).
+        return "result", (prefix + result) if classification else result
 
-    for name in _KNOWN_REASON_FIELDS:
+    for name in _REASON_PRIORITY:
         value = raw.get(name)
         if _is_empty_reason_value(value):
             continue
-        return f"field:{name}", f"SDK is_error; {name}={summary.get(name)!r}"
+        return f"field:{name}", f"{prefix}{name}={summary.get(name)!r}"
+
+    if classification:
+        return (
+            "subtype_only",
+            f"{prefix}no reason field carried a reason ({', '.join(_REASON_PRIORITY)} all empty)",
+        )
 
     return (
         "absent",
         (
-            f"SDK reported is_error; {len(_KNOWN_REASON_FIELDS)} known reason "
-            "fields captured, none carried a reason"
+            f"SDK reported is_error; no subtype, and of the {len(_REASON_PRIORITY)} "
+            f"reason fields ({', '.join(_REASON_PRIORITY)}) none carried a reason"
         ),
     )
 
@@ -850,7 +948,8 @@ def capture_is_error_detail(final: Any) -> dict[str, Any]:
     Return shape (all keys always present except ``absent_dump`` /
     ``capture_error``):
 
-    * ``reason_source``: ``"result"`` | ``"field:<name>"`` | ``"absent"`` | ``"capture_failed"``
+    * ``reason_source``: ``"result"`` | ``"field:<name>"`` | ``"subtype_only"`` |
+      ``"absent"`` | ``"capture_failed"``
     * ``message``: human-readable text (also the exception's ``str()``)
     * ``captured_fields``: dict of the known-field slice (session facts +
       reason candidates), each value already length-bounded

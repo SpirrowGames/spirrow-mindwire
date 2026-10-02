@@ -87,6 +87,17 @@ def _as_message(raw: Any) -> ThreadContextMessage | None:
     )
 
 
+class ThreadContextTriggerMissing(ValueError):  # noqa: N818 — name fixed by msg-4871 §3 R-1
+    """The trigger is not in ``messages``, so the causal cut cannot be placed.
+
+    Raised instead of guessing (T-dispatched-turn msg-4871 §1, Einstein msg-4870).
+    Both silent alternatives are wrong: rendering every message treats the trigger
+    as newer than all of them and leaks any later message into the turn as
+    established fact; returning an empty context silently reverts the turn to the
+    one-message delivery this module exists to remove.
+    """
+
+
 def build_thread_context(
     messages: list[dict[str, Any]],
     *,
@@ -98,16 +109,30 @@ def build_thread_context(
     ``trigger_msg_id``.
 
     ``messages`` is the raw chatroom payload in ``msg_id`` order (what
-    ``chatroom_get_thread`` returns). The trigger is excluded from both the opener
-    and the recent window — it is rendered separately, in its own frame, and a
-    message that appears twice invites the reader to treat it as two turns.
+    ``chatroom_get_thread`` returns).
 
-    ``total_count`` counts every message in the thread including the trigger, so a
-    reader can tell how much of the thread the view represents.
+    **Contract (R-1, msg-4871 §3).** The trigger MUST be in ``messages``; if it is
+    not, :class:`ThreadContextTriggerMissing` is raised. Only ``messages[:index]``
+    — strictly before the trigger — is eligible for the view: a turn answering
+    msg N must never see N+1 as existing fact (a watcher poll can deliver both at
+    once). The trigger itself is excluded too — it is rendered in its own
+    ``New message from X`` frame, and a message that appears twice reads as two
+    turns. A caller whose trigger was posted after its fetch (the conductor's
+    relay and CI-route) appends it first, non-destructively.
+
+    ``total_count`` (R-1a) is the length of the thread **at trigger time**,
+    trigger included (``index + 1``). Counting later messages would leak the
+    future through the elision notice even with their bodies cut.
     """
     parsed = [m for m in (_as_message(r) for r in messages) if m is not None]
-    total = len(parsed)
-    others = [m for m in parsed if m.msg_id != trigger_msg_id]
+    index = next((i for i, m in enumerate(parsed) if m.msg_id == trigger_msg_id), None)
+    if index is None:
+        raise ThreadContextTriggerMissing(
+            f"trigger {trigger_msg_id!r} is not among the {len(parsed)} messages supplied; "
+            f"refusing to guess where it falls in the thread"
+        )
+    total = index + 1
+    others = parsed[:index]
     if not others:
         return ThreadContext(opener=None, recent=(), omitted_count=0, total_count=total)
 
@@ -187,6 +212,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     if history:
         blocks.append(history)
     blocks.append(f"New message from {payload.author}:\n\n{payload.body}")
+    # T-retry-once-before-quarantine D-4: its own block, after the trigger and before the
+    # closing, so it is never mistaken for part of the author's message. Absent → no block.
+    if event.retry_notice:
+        blocks.append(event.retry_notice)
     blocks.append(closing)
     return "\n\n".join(blocks)
 
@@ -194,6 +223,7 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
 __all__ = [
     "DEFAULT_THREAD_CONTEXT_BUDGET_CHARS",
     "DEFAULT_THREAD_CONTEXT_MAX_MESSAGES",
+    "ThreadContextTriggerMissing",
     "build_thread_context",
     "build_turn_prompt",
     "render_thread_context",

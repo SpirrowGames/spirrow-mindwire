@@ -16,13 +16,23 @@ handed and re-raises the exception UNCHANGED; ``loop_runner.main`` is the single
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
 from test_conductor_core import _ROSTER, _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 
 from spirrow_mindwire import loop_runner
-from spirrow_mindwire.adapters.implementer import ImplementerSdkTurnTimeoutError
+from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkDeliveryError
+from spirrow_mindwire.adapters.implementer import (
+    ImplementerSdkDeliveryError,
+    ImplementerSdkTurnTimeoutError,
+)
+from spirrow_mindwire.adapters.naysayer_lexora import NaysayerLexoraDeliveryError
+from spirrow_mindwire.adapters.naysayer_sdk import (
+    NaysayerSdkDeliveryError,
+    NaysayerSdkShutdownError,
+)
 from spirrow_mindwire.conductor.core import (
     Conductor,
     ConductorStopSlot,
@@ -30,7 +40,9 @@ from spirrow_mindwire.conductor.core import (
     StopReason,
     adapter_error_code,
 )
-from spirrow_mindwire.config import MindwireSettings
+from spirrow_mindwire.conductor.retry_notice import RetryOf
+from spirrow_mindwire.config import ConductorConfig, MindwireSettings, Stage3LoopConfig
+from spirrow_mindwire.exceptions import AdapterDeliveryError
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +197,51 @@ def test_adapter_raise_sites_carry_code() -> None:
     # The naysayer shutdown site is pinned end-to-end in test_naysayer_sdk_adapter.py.
 
 
+def test_delivery_error_base_declares_code_as_none() -> None:
+    # The contract lives on the base class (human msg-4910), and its default is None rather than
+    # a generic string (Einstein msg-5001).
+    # The declaration itself is not re-checked here: ``mypy src tests`` in the gate rejects the
+    # typed reads below if ``code`` is undeclared anywhere in the MRO, and at runtime they raise
+    # AttributeError. No ``vars()``/type-hint introspection, so moving the declaration to an
+    # intermediate base or mixin stays green (PR-gate advisories on #389).
+    assert AdapterDeliveryError.code is None
+    assert AdapterDeliveryError("x").code is None
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        AdapterDeliveryError,
+        ClaudeCodeSdkDeliveryError,
+        ImplementerSdkDeliveryError,
+        NaysayerLexoraDeliveryError,
+        NaysayerSdkDeliveryError,
+    ],
+)
+def test_delivery_error_without_a_code_keeps_its_class_name(
+    cls: type[AdapterDeliveryError],
+) -> None:
+    # The None default must not cost the stop line the adapter's identity: a delivery error that
+    # names no code is still reported by its concrete class (msg-5001).
+    exc = cls("x")
+    assert exc.code is None
+    assert adapter_error_code(exc) == cls.__name__
+
+
+@pytest.mark.parametrize(
+    ("cls", "expected"),
+    [
+        (ImplementerSdkTurnTimeoutError, "adapter.turn_timeout"),
+        (NaysayerSdkShutdownError, "adapter.shutdown_failed"),
+    ],
+)
+def test_delivery_error_subclass_override_wins(
+    cls: type[AdapterDeliveryError], expected: str
+) -> None:
+    assert cls.code == expected
+    assert adapter_error_code(cls("x")) == expected
+
+
 # --------------------------------------------------------------------------- #
 # loop_runner side (D-2')
 # --------------------------------------------------------------------------- #
@@ -200,7 +257,14 @@ _SNAPSHOT = ConductorStopSnapshot(
 
 def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
     async def _fake_run_conductor(
-        _settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+        _settings: MindwireSettings,
+        *,
+        stop_slot: ConductorStopSlot | None = None,
+        # T42: main() now also forwards the sweep's stall-watchdog input (defaults never stall).
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
+        # T-retry-once-before-quarantine D-4: and the sweep's --retry-of (None = not a retry).
+        retry_of: RetryOf | None = None,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)
@@ -320,8 +384,25 @@ async def test_environment_terminal_through_a_real_conductor_is_not_wrapped() ->
     assert slot.snapshot is not None
 
 
+class _ReadableThreadMcp:
+    """Answers only the T44 launch-resolution read: the thread exists."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        assert name == "chatroom_get_thread", name
+        return {"messages": []}
+
+
+def _resolvable_settings(tmp_path: Path) -> MindwireSettings:
+    # T44: run_conductor resolves project / thread / repo_dir before building anything, so the
+    # settings must name a thread and an existing repo_dir to reach build_conductor at all.
+    return MindwireSettings(
+        loop=Stage3LoopConfig(repo_dir=tmp_path),
+        conductor=ConductorConfig(task_thread_id="T-slot"),
+    )
+
+
 def test_run_conductor_threads_the_slot_into_the_conductor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from spirrow_mindwire.conductor.core import ConductorOutcome
 
@@ -349,5 +430,9 @@ def test_run_conductor_threads_the_slot_into_the_conductor(
     monkeypatch.setattr(loop_runner, "build_conductor", _fake_build)
     monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
     slot = ConductorStopSlot()
-    asyncio.run(loop_runner.run_conductor(MindwireSettings(), stop_slot=slot))
+    asyncio.run(
+        loop_runner.run_conductor(
+            _resolvable_settings(tmp_path), stop_slot=slot, mcp=_ReadableThreadMcp()
+        )
+    )
     assert seen == [slot]

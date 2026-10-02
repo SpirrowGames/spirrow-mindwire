@@ -160,7 +160,9 @@ class _FakeGitHub:
         # still ticks its coverage lookup without side effects here.
         return []
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
 

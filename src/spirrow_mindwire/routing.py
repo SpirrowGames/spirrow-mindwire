@@ -16,6 +16,9 @@ it to the human terminal, unless one of the following carve-outs applies:
   triggering message carries the harness's preflight attest (P-3b, Tier-C
   msg-954 §2 / msg-970). Un-attested, the branch is not taken and the turn
   falls through to the human terminal (the pre-existing safe path).
+  **D-4' guardrails** (T-pr-2b-3-human-identity-delegate, Bohr msg-4856 /
+  msg-4858, naysayer-endorsed msg-4857 / msg-4859, Takahito "B" decide) narrow
+  carve-out ③ further — see :func:`carve_out_iii_admissible`.
 
 Why this predicate is a module of its own — T-operator-board msg-2544 §C-3.
 The operator-board's ``R-NEXT-HEIS-GUARD`` transition must consult THE SAME
@@ -78,74 +81,114 @@ class GuardIVerdict(StrEnum):
     REDIRECT = "redirect"
 
 
+def carve_out_iii_admissible(
+    *,
+    author_is_naysayer: bool,
+    control_state_is_run: bool,
+    message_is_attested: Callable[[], bool],
+    segment_declares_tier_c: Callable[[], bool],
+    naysayer_declared_no_tier_c: Callable[[], bool],
+) -> bool:
+    """Every carve-out ③ condition EXCEPT the Decider's veto (G3).
+
+    Split out so the conductor can ask "is the (network-bound) Decider worth
+    calling for this turn?" through the same rule the predicate uses, instead of
+    re-expressing the conjunction at the call site (the drift PR-review msg-2554
+    flagged). :func:`guard_proposer_to_implementer` calls this and then the
+    ``decider_vetoes`` thunk — so the Decider is only consulted, by either
+    caller, when this returns ``True``.
+
+    The conjunction, cheapest first (each thunk only fires if everything before
+    it held):
+
+    * ``author_is_naysayer`` ∧ ``control_state_is_run`` — pre-D-4' ③.
+    * ``message_is_attested()`` — P-3b preflight stamp (pre-D-4' ③).
+    * **G1** ``not segment_declares_tier_c()`` — no ``TIER-C: <label>`` line
+      (any label, ``other:`` included) in any message since the most recent
+      human-authored message (msg-4858 §2: the human is the ONLY reset
+      boundary; implementer / proposer / naysayer turns and conductor-relay
+      write-backs never reset it). Once raised it latches until the human
+      speaks. Fail-closed: a quoted declaration closes the door, a human turn
+      reopens it.
+    * **G2** ``naysayer_declared_no_tier_c()`` — the naysayer's proceed turn
+      carries ``TIER-C-CHECK: none`` on the line directly above its final
+      ``NEXT:`` line (msg-4856 §3 G2). Absent / any other value ⇒ closed.
+
+    Trust model (msg-4857, D-3 msg-598 Q2=yes): the declaration line, the
+    attest stamp and the human boundary are all chatroom text and forgeable by
+    anyone who can post. These gates remove the ordinary ways to reach code
+    *without having judged* — they are noise reduction, not authentication; the
+    authoritative Tier-C guard remains the human's manual ``main`` merge.
+    """
+    return (
+        author_is_naysayer
+        and control_state_is_run
+        and message_is_attested()
+        and not segment_declares_tier_c()
+        and naysayer_declared_no_tier_c()
+    )
+
+
 def guard_proposer_to_implementer(
     *,
     author_is_human: bool,
     author_is_naysayer: bool,
     control_state_is_run: bool,
     message_is_attested: Callable[[], bool],
+    segment_declares_tier_c: Callable[[], bool],
+    naysayer_declared_no_tier_c: Callable[[], bool],
+    decider_vetoes: Callable[[], bool],
 ) -> GuardIVerdict:
     """Decide whether a handoff to the implementer may proceed.
 
     This is the single source of truth for guard (i) — every caller that
     asks "may this handoff to the implementer proceed?" must consult this
     function rather than re-express the rule (T-operator-board msg-2544
-    §C-3). Semantics are preserved verbatim from the previous inline
-    ``_route`` decision in :mod:`spirrow_mindwire.conductor.core`.
+    §C-3).
 
-    Parameters are named booleans (plus one bool-returning callable) on
-    purpose: lifting the *observations* to the caller keeps the predicate
-    free of identity, role-registry, and message-shape dependencies, so the
-    two call sites (the conductor and the future operator-board tick)
-    share the rule without also sharing a common object graph.
-
-    ``message_is_attested`` is a nullary callable rather than a bool
-    (PR-review msg-2554 BLOCKING). This is what keeps the "which carve-outs
-    consult the attest bit" question owned by this function alone: the
-    caller no longer has to reproduce the (naysayer ∧ RUN) short-circuit
-    just to avoid a needless attestation read on unrelated handoffs. If a
-    later carve-out needs the attest bit for a different combination of
-    role and control state, the change lands here — the caller keeps
-    passing the same thunk.
+    Parameters are named booleans plus bool-returning nullary callables:
+    lifting the *observations* to the caller keeps the predicate free of
+    identity, role-registry, message-shape and network dependencies. Every
+    observation that costs something (a body parse, a thread scan, a Decider
+    round-trip) is a thunk so the predicate — and only the predicate — decides
+    when it must be consulted (PR-review msg-2554 BLOCKING). None of the D-4'
+    parameters has a default: a caller that forgets one fails at the call, it
+    does not silently get the open side.
 
     Carve-out precedence:
 
     1. **carve-out ①**: ``author_is_human`` — honour immediately. A human-
-       authored decide is the Tier-C gate itself; no other check may
-       withdraw the authorisation the human just gave. The thunk is NOT
-       invoked in this branch.
-    2. **carve-out ③**: ``author_is_naysayer AND control_state_is_run AND
-       message_is_attested()`` — honour. The independent naysayer's own
-       proceed under RUN is the only autonomous door to code; un-attested,
-       the branch is not taken. The thunk is invoked only after both cheap
-       bits are true, so Python's boolean short-circuit preserves the
-       observation scope that the pre-extraction inline form had.
-    3. Otherwise — ``REDIRECT``. Guard (i) fires. The conductor's inline
-       version returned ``_human_terminal(..., explicit_human=False)``; the
-       distinction between "an explicit ``NEXT: human``" and "a guard-(i)
-       redirect" (which drives the ``forced_naysayer_turns_saveable``
-       metric and the ``force_naysayer_only_on_explicit_human`` lever) is
-       the caller's responsibility, not this predicate's.
+       authored decide is the Tier-C gate itself. No thunk is invoked.
+    2. **carve-out ③**: :func:`carve_out_iii_admissible` (naysayer ∧ RUN ∧
+       attested ∧ G1 ∧ G2) **and not** ``decider_vetoes()`` (**G3 as a veto**,
+       T-pr-2b-3-human-identity-delegate msg-5219 Takahito "a" decide, which
+       replaced the "B" decide's clearance form). ``decider_vetoes`` is ``True``
+       only when the Tier-C Decider judged, actionably, that the human must be
+       asked (tierc-v2 ``CONFIRMED``, ``should_ask_human >= tierc_v2_ask_min``)
+       — or when the caller cannot show that the Decider was consulted for this
+       head at all (an internal fault, Bohr msg-5229 R3'). A Decider that is off,
+       undecided, grey-zone or failed does not veto: G1 / G2 decide. G3 stays
+       monotone — it can only close the door, never open it.
+    3. Otherwise — ``REDIRECT``. Guard (i) fires; the caller decides whether
+       it is an explicit-human terminal or a redirect.
 
-    Carve-out ② (the PR-gate verdict relay, PR-2b-2) is not represented in
-    the parameter list because it is decided BEFORE this predicate is
-    consulted: the conductor routes on the deterministic ``fire_pr_review``
-    verdict, never on any parsed ``NEXT:`` line for a pr-review sentinel
-    (comment in ``core.py`` above ``HandoffKind.PR_REVIEW``). Modelling it
-    here would duplicate the marker-gated trust decision that must live
-    with the PR-gate.
+    Carve-out ② (the PR-gate verdict relay, PR-2b-2) is not represented here
+    because it is decided BEFORE this predicate is consulted, on the
+    deterministic ``fire_pr_review`` verdict.
     """
     # carve-out ①: human-authored Tier-C decide (Tier-C msg-553 / msg-557).
-    # The attestation thunk is deliberately NOT invoked on this branch.
     if author_is_human:
         return GuardIVerdict.HONOR
-    # carve-out ③: independent naysayer's own proceed under RUN + attest
-    # (P-3b, Tier-C msg-954 §2 / msg-970). Python's ``and`` short-circuits
-    # so the thunk is invoked only when the cheap bits have already put us
-    # in the naysayer-under-RUN branch — reproducing the observation scope
-    # the pre-extraction inline form had, WITHOUT requiring the caller to
-    # re-express (naysayer ∧ RUN) itself. That re-expression was the drift
-    # the naysayer flagged in PR-review msg-2554.
-    if author_is_naysayer and control_state_is_run and message_is_attested():
+    # carve-out ③ + D-4' G1/G2, then G3 last (the only network-bound thunk).
+    if (
+        carve_out_iii_admissible(
+            author_is_naysayer=author_is_naysayer,
+            control_state_is_run=control_state_is_run,
+            message_is_attested=message_is_attested,
+            segment_declares_tier_c=segment_declares_tier_c,
+            naysayer_declared_no_tier_c=naysayer_declared_no_tier_c,
+        )
+        and not decider_vetoes()
+    ):
         return GuardIVerdict.HONOR
     return GuardIVerdict.REDIRECT

@@ -25,8 +25,8 @@ from ``UNKNOWN``. The failure mode being guarded is D-7 (env-terminal reads):
 a fail-soft read that returned ``[]`` because of a 401 would authorise a re-POST
 that duplicates a landed verdict. The FETCHER is what closes that gap: the
 replay path uses ``fetch_pr_reviews_strict``, which raises on any read failure
-and is caught + classified by ``_classify_and_reraise`` before :func:`landed`
-runs. This predicate therefore only carries a ``head_sha=None`` UNKNOWN axis;
+and is caught + classified by ``NaysayerPrReviewDriver._classify_exception``
+before :func:`landed` runs. This predicate therefore only carries a ``head_sha=None`` UNKNOWN axis;
 its ``reviews`` argument is always a concrete list at the call site.
 """
 

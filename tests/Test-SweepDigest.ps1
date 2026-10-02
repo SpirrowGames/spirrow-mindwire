@@ -434,13 +434,15 @@ Write-Host "F-1 — every non-empty row section keeps a floor of one row (msg-24
 # attaches to a quarantine row (it is part of the row above it, not a row of its own).
 function Get-DigestRowCounts {
     param([string]$Digest)
-    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; starved = 0 }
+    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; starved = 0; launchwait = 0 }
     $sec = $null
     foreach ($l in ($Digest -split "`n")) {
         if ($l -match '^隔離中: ')       { $sec = 'quarantine'; continue }
         if ($l -match '^判断待ち: ')     { $sec = 'parked'; continue }
         if ($l -match '^\s+取得失敗: ')  { $sec = 'fetcherr'; continue }
         if ($l -match '^飢餓 ')           { $sec = 'starved'; continue }
+        # T-sweep-starves-deep-candidates: the section after 飢餓. Its rows are not 飢餓 rows.
+        if ($l -match '^起動待ち飢餓 ')   { $sec = 'launchwait'; continue }
         if ($l -match '^\(0 件でも')      { $sec = $null; continue }
         if ($null -eq $sec -or $l -eq '') { continue }
         if ($l -match '^\s+\+\d+ 件（省略') { continue }

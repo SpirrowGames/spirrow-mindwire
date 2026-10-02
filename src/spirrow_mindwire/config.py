@@ -353,7 +353,7 @@ class Stage3LoopConfig(_StrictModel):
 
     watches: tuple[LoopWatchConfig, ...] = ()
 
-    @field_validator("role_model", "role_cli_path", mode="before")
+    @field_validator("role_model", "role_cli_path", "repo_dir", mode="before")
     @classmethod
     def _blank_means_unset(cls, v: object) -> object:
         """Treat an empty / whitespace-only value as "not configured".
@@ -363,6 +363,11 @@ class Stage3LoopConfig(_StrictModel):
         ``role_model`` would send ``--model ""`` and ``role_cli_path`` would
         coerce to ``Path(".")`` — a directory offered to the SDK as an
         executable — which are two confusing failures for one obvious intent.
+
+        ``repo_dir`` joined for the same ``Path(".")`` trap (T42 PR, PR #357 gate advisory):
+        ``repo_dir = ""`` would become the current directory, pass T44's ``is_dir()`` check
+        and point the implementer at wherever the daemon happened to start. Read as unset, it
+        takes T44's ``repo_dir_unset`` stand-down instead.
         """
         if isinstance(v, str) and not v.strip():
             return None
@@ -521,12 +526,18 @@ class DeciderTierCConfig(_StrictModel):
     ``<data_dir>/config/tierc_rules.toml`` (mindwire.toml と同じディレクトリ —
     :func:`resolve_tierc_rules_path`)。初回配置は ``mindwire init-config tierc-rules``。
     起動時に 1 回だけ読む ∴ 文言を直したら conductor を再起動する (msg-4384)。
+
+    :attr:`rules_snapshot_dir` は読み込んだルールの退避先 (T-decider-tierc-v2-all-escalations
+    msg-4631 / 4633 / 5130)。未指定なら ``<data_dir>/decider/rules``
+    (:func:`resolve_tierc_rules_snapshot_dir`)。起動のたびに ``<rules_sha256>.toml`` が無ければ
+    保存される ∴ 文言を直して再起動しても、旧版の文言はここに残る。
     """
 
     mode: Literal["off", "shadow", "annotate", "bounce"] = "shadow"
     skip_naysayer_when_confirmed: bool = False
     questions: Literal["tierc-v1", "tierc-v2"] = "tierc-v2"
     rules_path: Path | None = None
+    rules_snapshot_dir: Path | None = None
 
 
 class DeciderConfig(_StrictModel):
@@ -558,6 +569,23 @@ class DeciderConfig(_StrictModel):
     tierc: DeciderTierCConfig = Field(default_factory=DeciderTierCConfig)
 
 
+class TierCGateConfig(_StrictModel):
+    """``[tierc_gate]`` — the Tier-C admission gate's acting mode (T-decider-conductor-hook 2e-1b).
+
+    * ``off`` (default) — the gate runs compute-only inside the Decider hook, as before: nothing
+      is written, nothing is bounced.
+    * ``enforce`` — a role-authored ``NEXT: human`` that ``_route`` stopped at the human and that
+      the gate bounces goes back to its author (one ``RETRY: <uuid>`` always reaches the human; a
+      gate failure reaches the human). State lives in
+      ``<data_dir>/state/tier_c_decisions_log.jsonl`` (:func:`resolve_tier_c_decisions_log_path`).
+      See :mod:`spirrow_mindwire.conductor.tierc_gate`.
+
+    Independent of ``[decider]``: the gate is deterministic and needs no Lexora backend.
+    """
+
+    mode: Literal["off", "enforce"] = "off"
+
+
 class NaysayerGatingConfig(_StrictModel):
     """PR-review debounce knobs (cost lever) for the Tier B naysayer gate.
 
@@ -567,9 +595,12 @@ class NaysayerGatingConfig(_StrictModel):
     """
 
     skip_if_head_unchanged: bool = False
-    """Skip the (costly) Lexora review and reuse the prior verdict when the naysayer has already
-    reviewed THIS exact head SHA (its last verdict review's ``commit_id`` == the PR head) — catches
-    accidental / reflexive re-fires on an unchanged commit. Env:
+    """Skip the (costly) Lexora review when the naysayer has already reviewed THIS exact head SHA
+    (its last verdict review's ``commit_id`` == the PR head) — catches accidental / reflexive
+    re-fires on an unchanged commit. The skip only re-posts a prior APPROVE; a prior
+    REQUEST_CHANGES always gets a full re-review, because a re-posted RC carries no critique the
+    implementer could act on (T-infra-failure-posts-empty-rc, PR #367). The CI gate still runs
+    first, so a cached APPROVE never masks a current CI failure. Env:
     ``MINDWIRE_NAYSAYER_GATING__SKIP_IF_HEAD_UNCHANGED=true``."""
 
     max_review_rounds: int = Field(default=0, ge=0)
@@ -617,6 +648,7 @@ class MindwireSettings(BaseSettings):
     conductor: ConductorConfig = Field(default_factory=ConductorConfig)
     naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
+    tierc_gate: TierCGateConfig = Field(default_factory=TierCGateConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -628,6 +660,15 @@ class MindwireSettings(BaseSettings):
                 "Migrate the config or pin a compatible MindWire version."
             )
         return v
+
+
+TIER_C_DECISIONS_LOG_FILENAME = "tier_c_decisions_log.jsonl"
+"""The admission gate's single append-only log under ``<data_dir>/state/`` (2e-1b, msg-5141)."""
+
+
+def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store."""
+    return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
 
 
 TIERC_RULES_FILENAME = "tierc_rules.toml"
@@ -642,6 +683,16 @@ def resolve_tierc_rules_path(settings: MindwireSettings) -> Path:
     if configured is not None:
         return configured.expanduser()
     return settings.paths.config_dir / TIERC_RULES_FILENAME
+
+
+def resolve_tierc_rules_snapshot_dir(settings: MindwireSettings) -> Path:
+    """``[decider.tierc].rules_snapshot_dir`` when set (``expanduser`` applied), else
+    ``<data_dir>/decider/rules`` — where the live Decider saves the rules bytes it loaded, keyed
+    by ``rules_sha256`` (msg-4631 / 4633 / 5130)."""
+    configured = settings.decider.tierc.rules_snapshot_dir
+    if configured is not None:
+        return configured.expanduser()
+    return settings.paths.data_dir / "decider" / "rules"
 
 
 def _default_config_path() -> Path:
@@ -707,6 +758,7 @@ __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
     "TIERC_RULES_FILENAME",
+    "TIER_C_DECISIONS_LOG_FILENAME",
     "ClaudeCodeConfig",
     "ConductorConfig",
     "DeciderConfig",
@@ -721,7 +773,10 @@ __all__ = [
     "PathsConfig",
     "PhanthandConfig",
     "Stage3LoopConfig",
+    "TierCGateConfig",
     "WatcherConfig",
     "load_settings",
+    "resolve_tier_c_decisions_log_path",
     "resolve_tierc_rules_path",
+    "resolve_tierc_rules_snapshot_dir",
 ]

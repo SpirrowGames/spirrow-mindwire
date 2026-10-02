@@ -2,9 +2,10 @@
 
 Spec: Bohr msg-4634 DECIDED 2d-2 (no Jev column in the labellers' files — checked column by
 column; out-of-scope rows excluded), msg-4636 DECIDED 2d-3 (tests 19 / 21: no state rebuild, rows
-without the point-in-time columns excluded), msg-4639 DECIDED 2d-4 / 2d-6 (``tierc-v2`` only;
-``following`` = 3, constants from ``build_tierc_eval_fixture``), msg-4641 DECIDED 2d-7 (tests 20,
-22a-22d: terminated / quiet threads, the 72-hour boundary, determinism) and msg-4643 DECIDED 2d-8
+without the point-in-time columns excluded), msg-4639 DECIDED 2d-4 / 2d-6
+(one registered version only, ``tierc-v3`` since 2d-15; ``following`` = 3, constants from
+``build_tierc_eval_fixture``), msg-4641 DECIDED 2d-7 (tests 20, 22a-22d: terminated / quiet
+threads, the 72-hour boundary, determinism) and msg-4643 DECIDED 2d-8
 (tests 22e-22g: the ``--as-of`` cut comes first). Test 18 lives in ``test_decider_step2.py``.
 """
 
@@ -23,6 +24,7 @@ from typing import Any
 import pytest
 
 from spirrow_mindwire.adapters.decider_lexora import DeciderLexoraAdapter
+from spirrow_mindwire.conductor.tierc_gate import TIERC_BOUNCE_HEADER
 from spirrow_mindwire.decider.hook import ThreadMessage, run_tierc_hook
 from spirrow_mindwire.decider.questions import load_tierc_rules, tierc_rules_template_path
 from spirrow_mindwire.value_objects import Role
@@ -74,7 +76,7 @@ def _row(
     latest: str | None = "msg-6",
     routed: str = "stop",
     sha: str | None = SHA,
-    version: str = "tierc-v2",
+    version: str = "tierc-v3",
     logged_at: str | None = None,
     wire: bool = True,
 ) -> dict[str, Any]:
@@ -112,7 +114,7 @@ def _row(
 
 
 def _build(rows: list[dict[str, Any]], threads: Mapping[str, Any], as_of: datetime = AS_OF) -> Any:
-    return ex.build_outputs(rows, SHA, threads, as_of)
+    return ex.build_outputs(rows, SHA, threads, as_of, human_identity="human")
 
 
 def _bytes(out: Any) -> str:
@@ -313,7 +315,8 @@ def test_rows_without_point_in_time_columns_are_not_counted() -> None:
         ({**_row(), "logged_at": None}, "no_point_in_time_columns"),
         (_row(routed="forced_naysayer"), "routed:forced_naysayer"),
         (_row(routed="spawn_blocked"), "routed:spawn_blocked"),
-        (_row(version="tierc-v1"), "questions_version_not_tierc_v2"),
+        (_row(version="tierc-v1"), "questions_version_not_registered"),
+        (_row(version="tierc-v2"), "questions_version_not_registered"),
         (_row(sha="b" * 64), "rules_sha256_mismatch"),
         (_row(sha=None), "rules_sha256_mismatch"),
         (_row(), "candidate"),
@@ -418,7 +421,7 @@ def test_outputs_join_in_tierc_eval_report() -> None:
         (("T-b", 2), "msg-2", "Bohr", "q"),
     ]
     assert all(r.live_entry and r.roster_source == "logged" for r in joined)
-    assert all(r.questions_version == "tierc-v2" and r.ask_score == 0.3 for r in joined)
+    assert all(r.questions_version == "tierc-v3" and r.ask_score == 0.3 for r in joined)
     assert [r.following_n for r in joined] == [3, 3]
     assert {(m["thread_id"], m["round_index"]) for m in materials} == {r.key for r in joined}
     assert [f["conductor_round_index"] for f in fixture] == [1, 1]
@@ -486,7 +489,7 @@ async def test_hook_log_line_exports_the_state_jev_was_sent(
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
             now=decided,
         )
     rows = ex.parse_log_lines(r.getMessage() for r in caplog.records)
@@ -495,7 +498,11 @@ async def test_hook_log_line_exports_the_state_jev_was_sent(
     msgs = [ex.Message(m.msg_id, m.author, m.content, _at(k)) for k, m in enumerate(thread)]
     msgs.append(ex.Message("msg-3", "human", "ok\n\nNEXT: none", _at(4)))
     materials, fixture, replay, summary = ex.build_outputs(
-        rows, str(row["rules_sha256"]), {"T-e2e": ("p", msgs)}, T0 + timedelta(hours=1)
+        rows,
+        str(row["rules_sha256"]),
+        {"T-e2e": ("p", msgs)},
+        T0 + timedelta(hours=1),
+        human_identity="human",
     )
     assert summary["counted"] == 1
     assert replay[0]["state"] == json.loads(c.bodies[0]["state"])
@@ -720,3 +727,146 @@ def test_export_label_lock_report_end_to_end(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert "## Export lock" in (tmp_path / "report.md").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- 2d-14 bounce chains
+# msg-5578 / msg-5580 / msg-5582 DECIDED 2d-14: a bounce chain counts once — its first post.
+
+RETRY_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _notice(i: int, bounced: str, author: str = "conductor-relay") -> Any:
+    body = (
+        f"{TIERC_BOUNCE_HEADER}\n\nbounced: `{bounced}`\n\n"
+        f"bounce notice text\n\nRETRY: {RETRY_UUID}\n\nNEXT: Bohr"
+    )
+    return _msg(i, author, body)
+
+
+def _esc(i: int, author: str = "Bohr", body: str = "need a call\n\nNEXT: human") -> Any:
+    return _msg(i, author, body)
+
+
+def _chain_thread(*middle: Any) -> list[Any]:
+    """msg-0..2 filler, msg-3 = Bohr's bounced escalation, msg-4 = its notice, then ``middle``
+    (numbered from 5), then 3 filler messages so every row has its following window."""
+    t = [_msg(0), _msg(1, "Einstein"), _msg(2), _esc(3), _notice(4, "msg-3")]
+    t += list(middle)
+    n = len(t)
+    t += [_msg(n + k, "Einstein") for k in range(3)]
+    return t
+
+
+def _gate_row(latest: str, gate_kind: str | None, logged_at: str) -> dict[str, Any]:
+    r = _row(latest=latest, logged_at=logged_at)
+    r["gate_kind"] = gate_kind
+    return r
+
+
+def _chain_build(
+    thread: list[Any], rows: list[dict[str, Any]], human_identity: str = "human"
+) -> dict[str, Any]:
+    _, _, _, summary = ex.build_outputs(
+        rows, SHA, {"T-a": ("p", thread)}, AS_OF, human_identity=human_identity
+    )
+    return dict(summary)
+
+
+def test_2d14_a_retry_row_is_not_counted() -> None:
+    """(a) bounced row then its ``RETRY:`` row: only the bounced row counts; retry_admit = 1."""
+    thread = _chain_thread(_esc(5, body=f"RETRY: {RETRY_UUID}\n\nNEXT: human"))
+    rows = [
+        _gate_row("msg-3", "BOUNCED", _at(3.5)),
+        _gate_row("msg-5", "RETRY_ADMIT", _at(5.5)),
+    ]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 1
+    assert s["by_bucket"]["retry_admit"] == 1
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_b_resubmission_after_bounce_is_not_counted() -> None:
+    """(b) bounced row then a labelled re-submission (no ``RETRY:``): only the bounced row
+    counts; post_bounce = 1. Mutation: drop reason 3 and this fails."""
+    thread = _chain_thread(_esc(5, body="TIER-C: goal\nNEXT: human"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+
+
+@pytest.mark.parametrize("human", ["Takahito", "takahito", "TAKAHITO"])
+def test_2d14_c_human_post_ends_the_chain(human: str) -> None:
+    """(c) bounced row, a post by the configured human identity (any case), then a separate
+    escalation by the same author: both count. Mutation: literal ``"human"`` and this fails."""
+    thread = _chain_thread(_msg(5, human, "decided: X\n\nNEXT: Bohr"), _esc(6))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="Takahito")
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+    assert s["human_identity"] == "Takahito"
+
+
+def test_2d14_d_notice_for_another_author_does_not_exclude() -> None:
+    """(d) a bounce notice naming another author's message leaves this author's row counted."""
+    thread = _chain_thread(_esc(5, author="Heisenberg"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_e_quoted_notice_does_not_start_a_chain() -> None:
+    """(e) a role quoting a bounce notice starts no chain — only ``conductor-relay`` posts do."""
+    thread = [_msg(0), _msg(1, "Einstein"), _msg(2), _esc(3), _notice(4, "msg-3", "Einstein")]
+    thread += [_esc(5)] + [_msg(6 + k, "Einstein") for k in range(3)]
+    rows = [_gate_row("msg-3", "ADMIT", _at(3.5)), _gate_row("msg-5", "ADMIT", _at(5.5))]
+    s = _chain_build(thread, rows)
+    assert s["counted"] == 2
+    assert "post_bounce" not in s["by_bucket"]
+
+
+def test_2d14_f_rows_before_398_follow_the_current_rules() -> None:
+    """(f) ``gate_kind`` null (or missing) and no bounce notice: judged as before."""
+    rows = [_row(), _row(latest="msg-8", logged_at=_at(8.5))]
+    del rows[1]["gate_kind"]
+    s = _chain_build(_thread(12), rows)
+    assert s["counted"] == 2
+    assert set(s["by_bucket"]) == {"counted"}
+
+
+def test_2d14_g_operator_post_does_not_end_the_chain() -> None:
+    """(g) bounced row, an ``operator`` post (merge-report wording included), then a
+    re-submission: only the bounced row counts; post_bounce = 1. Mutation: let ``operator``
+    end a chain and this fails."""
+    op = _msg(
+        5, "operator", "Takahito が merge した。直前の NEXT: human は消化済み。\n\nNEXT: Bohr"
+    )
+    thread = _chain_thread(op, _esc(6, body="TIER-C: goal\nNEXT: human"))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="Takahito")
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+
+
+def test_2d14_h_empty_human_identity_never_ends_a_chain() -> None:
+    """(h) with ``human_identity`` empty, the thread of (c) gives post_bounce = 1."""
+    thread = _chain_thread(_msg(5, "Takahito", "decided: X\n\nNEXT: Bohr"), _esc(6))
+    rows = [_gate_row("msg-3", "BOUNCED", _at(3.5)), _gate_row("msg-6", "ADMIT", _at(6.5))]
+    s = _chain_build(thread, rows, human_identity="")
+    assert s["counted"] == 1
+    assert s["by_bucket"]["post_bounce"] == 1
+    assert s["human_identity"] == ""
+
+
+def test_2d14_exporter_uses_the_conductor_rule() -> None:
+    """One definition of "human" (msg-5582): the exporter imports ``is_human_identity`` and the
+    bounce-notice parsers from the conductor instead of restating them."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.setdefault(node.module or "", set()).update(a.name for a in node.names)
+    assert "is_human_identity" in imported["spirrow_mindwire.conductor.human_identity"]
+    gate_names = imported["spirrow_mindwire.conductor.tierc_gate"]
+    assert {"is_bounce_notice", "bounced_msg_id"} <= gate_names

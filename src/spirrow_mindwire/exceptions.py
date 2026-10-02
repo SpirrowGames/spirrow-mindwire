@@ -48,6 +48,25 @@ class AdapterSpawnError(AdapterError):
     """
 
 
+class AdapterSpawnTimeoutError(AdapterSpawnError):
+    """``spawn`` did not finish inside the adapter's own init time budget.
+
+    The one spawn failure the conductor retries (T43, Bohr msg-5053 D-2): a connect that ran
+    out of time says nothing about whether the next one will, whereas every other spawn failure
+    (no base URL, ``adapter.job_assign_missed``, a refused preflight) fails the same way twice.
+    It lives at the Port level so the conductor can tell the two apart without importing an
+    adapter's concrete class.
+
+    ``adapter_id`` and ``timeout_s`` are required, not optional: they are two of the fields of
+    the ``spawn.timeout`` event, and only the adapter that raised knows them.
+    """
+
+    def __init__(self, message: str, *, adapter_id: str, timeout_s: float) -> None:
+        super().__init__(message)
+        self.adapter_id = adapter_id
+        self.timeout_s = timeout_s
+
+
 class AdapterHaltError(AdapterError):
     """Raised by ``RoleAdapter.halt`` on a genuine halt failure (§3.4).
 
@@ -68,7 +87,16 @@ class AdapterDeliveryError(AdapterError):
     """Raised by ``RoleAdapter.deliver_event`` on failure (ADR-06 §3.4).
 
     Typical: session closed / payload validation failure.
+
+    ``code`` is the declared contract for the ``adapter.*`` catalog code a delivery failure
+    carries on the exception itself (human msg-4910, Einstein msg-5001). A subclass that stands
+    for exactly one failure overrides it at class level (``adapter.turn_timeout``,
+    ``adapter.shutdown_failed``). The base value is ``None``, deliberately not a generic string:
+    the conductor's ``error_code=`` falls back to the concrete class name when there is no code,
+    and a default such as ``adapter.delivery_failed`` would erase which adapter failed.
     """
+
+    code: str | None = None
 
 
 __all__ = [
@@ -77,4 +105,5 @@ __all__ = [
     "AdapterHaltError",
     "AdapterHealthError",
     "AdapterSpawnError",
+    "AdapterSpawnTimeoutError",
 ]

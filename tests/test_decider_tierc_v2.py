@@ -40,7 +40,8 @@ from spirrow_mindwire.decider.hook import (
 from spirrow_mindwire.decider.questions import (
     MATCHED_RULE_KEY,
     SHOULD_ASK_HUMAN_KEY,
-    TIERC_V2_QUESTIONS_VERSION,
+    TIERC_ESCALATION_QUESTIONS_VERSION,
+    TIERC_V2_PROCEED_QUESTIONS_VERSION,
     TierCRules,
     TierCRulesError,
     load_tierc_rules,
@@ -220,10 +221,33 @@ def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
 
 def test_v2_request_body() -> None:
     body = build_decide_request(_state(), policy=POLICY_LIVE_TIERC, rules=RULES)
-    assert body["questions_version"] == TIERC_V2_QUESTIONS_VERSION == "tierc-v2"
+    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v3"
     assert body["questions"] == tierc_v2_questions(RULES)
     v1 = build_decide_request(_state(), policy=POLICY_LIVE_TIERC)
     assert v1["questions_version"] == "tierc-v1"
+
+
+def test_fix_now_vs_follow_up_exclusion_is_in_the_should_ask_frame_only() -> None:
+    """T-fix-now-vs-followup-is-mechanical (msg-5234 §3, msg-5241): the exclusion lives in the
+    frame sentence (code), not in the rules file; the proceed frame is untouched; keys and
+    criteria are unchanged, so old records read the same way."""
+    exclusion = (
+        "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
+        "順序・タイミングだけを問うハンドオフは、"
+        "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
+    )
+    q = tierc_v2_questions(RULES)
+    instructions = q[SHOULD_ASK_HUMAN_KEY]["instructions"]
+    assert instructions.endswith(exclusion)
+    assert exclusion not in TEMPLATE.read_text(encoding="utf-8")
+    proceed = tierc_v2_questions(RULES, proceed=True)
+    assert "follow-up" not in proceed[SHOULD_ASK_HUMAN_KEY]["instructions"]
+    assert set(q) == {SHOULD_ASK_HUMAN_KEY, MATCHED_RULE_KEY}
+    assert q[SHOULD_ASK_HUMAN_KEY]["criteria"] == {
+        "true": "五ヶ条のいずれかに当たる",
+        "false": "五ヶ条のどれにも当たらない",
+    }
+    assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v2-proceed"
 
 
 def test_dispute_rounds_on_wire_only_when_computed() -> None:
@@ -255,7 +279,7 @@ def test_evaluate_tierc_v2_boundaries(p: float, kind: TierCVerdictKind) -> None:
     v = evaluate_tierc_v2(p)
     assert v.kind is kind and v.ask_score == p
     assert v.scope is TierCScope.IN_GATE and v.fired_reason is None
-    assert v.questions_version == "tierc-v2"
+    assert v.questions_version == "tierc-v3"
 
 
 def test_v2_threshold_defaults_are_the_preregistered_values() -> None:
@@ -301,7 +325,7 @@ async def test_v2_every_gate_result_is_sent_and_in_gate(gate: AdmissionGateResul
     assert dr.matched_rule_source == MATCHED_RULE_SOURCE_CHOICE == "choice"
     assert dr.matched_rule_error is None
     assert dr.rules_sha256 == RULES.sha256
-    assert dr.questions_version == "tierc-v2"
+    assert dr.questions_version == "tierc-v3"
 
 
 @pytest.mark.anyio
@@ -318,7 +342,7 @@ async def test_v2_bad_should_ask_human_is_malformed(payload: dict[str, Any]) -> 
     dr = await decide_once(_state(), client=FakeClient(payload), policy="p", rules=RULES)
     assert dr.outcome is DecisionOutcome.NO_VERDICT_MALFORMED
     assert dr.verdict is None and dr.error is not None
-    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v2"
+    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v3"
 
 
 @pytest.mark.anyio
@@ -335,7 +359,8 @@ async def test_v2_bad_matched_rule_keeps_the_verdict(
     assert dr.outcome is DecisionOutcome.EVALUATED
     assert dr.verdict is not None and dr.verdict.kind is TierCVerdictKind.CONFIRMED
     assert dr.matched_rule is None and dr.matched_rule_error is not None
-    assert dr.matched_rule_source == "choice"
+    # msg-4629 §2: no value → no source; ``matched_rule_error`` carries the reason.
+    assert dr.matched_rule_source is None
     assert "matched_rule unusable" in caplog.text
 
 
@@ -345,6 +370,7 @@ async def test_v2_none_is_a_valid_matched_rule() -> None:
         _state(), client=FakeClient(_payload(choice="none")), policy="p", rules=RULES
     )
     assert dr.matched_rule == "none" and dr.matched_rule_error is None
+    assert dr.matched_rule_source == "choice"
 
 
 @pytest.mark.anyio
@@ -354,11 +380,13 @@ async def test_v2_null_provider_and_transport_error_keep_version_fields() -> Non
     )
     assert dr.outcome is DecisionOutcome.NO_VERDICT_NULL
     assert dr.matched_rule is None and dr.rules_sha256 == RULES.sha256
+    assert dr.matched_rule_source is None  # msg-4629 §2: no answer, no source
     te = await decide_once(
         _state(), client=FakeClient(exc=LexoraTimeoutError("t")), policy="p", rules=RULES
     )
     assert te.outcome is DecisionOutcome.TRANSPORT_ERROR
-    assert te.questions_version == "tierc-v2" and te.rules_sha256 == RULES.sha256
+    assert te.questions_version == "tierc-v3" and te.rules_sha256 == RULES.sha256
+    assert te.matched_rule is None and te.matched_rule_source is None
 
 
 @pytest.mark.anyio
@@ -562,13 +590,13 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is not None and dr.outcome is DecisionOutcome.EVALUATED
     (line,) = _decider_lines(caplog)
     assert line["matched_rule"] == "rule_2" and line["matched_rule_source"] == "choice"
     assert line["rules_sha256"] == RULES.sha256
-    assert line["questions_version"] == "tierc-v2"
+    assert line["questions_version"] == "tierc-v3"
     assert line["verdict"]["scope"] == "in_gate"
     assert line["gate_kind"] is None and line["gate_is_grey_zone"] is False  # labelled ADMIT
     sent_state = json.loads(c.bodies[0]["state"])
@@ -600,7 +628,7 @@ async def test_hook_v2_gate_exception_is_still_sent(
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is not None and len(c.bodies) == 1
     assert json.loads(c.bodies[0]["state"])["gate_result"] is None
@@ -628,7 +656,7 @@ async def test_hook_v2_off_roster_relay_not_entered(caplog: pytest.LogCaptureFix
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is None and c.bodies == [] and _decider_lines(caplog) == []
 
@@ -686,7 +714,7 @@ def test_replay_v2_dry_run_keeps_gateless_rows_in_gate(tmp_path: Path) -> None:
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(recs) == 2  # the gate_result-less row is not skipped under v2
     assert {r["scope"] for r in recs} == {"in_gate"}
-    assert {r["questions_version"] for r in recs} == {"tierc-v2"}
+    assert {r["questions_version"] for r in recs} == {"tierc-v3"}
     assert {r["rules_sha256"] for r in recs} == {RULES.sha256}
     assert recs[0]["state"]["dispute_rounds"] == 2
     assert "dispute_rounds" not in recs[1]["state"]
@@ -732,7 +760,7 @@ def test_replay_v2_endpoint_snapshots_rules_and_records_sha(
         ]
     )  # fmt: skip
     assert rc == 0
-    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v2"}
+    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v3"}
     assert (snap / f"{RULES.sha256}.toml").read_bytes() == TEMPLATE.read_bytes()
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     for r in recs:

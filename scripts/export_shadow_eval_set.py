@@ -3,9 +3,10 @@
 Spec (Bohr, each approved by Einstein): msg-4634 DECIDED 2d-2 (export → lock → label → measure;
 Jev's output in a separate file the labellers never read), msg-4636 DECIDED 2d-3 (read the
 point-in-time input the hook logged instead of rebuilding it; ``--replay`` / ``--fixture``
-shapes), msg-4639 DECIDED 2d-4 / 2d-6 (count ``tierc-v2`` rows only; ``following`` = the 3
-messages after, as in the replay), msg-4641 DECIDED 2d-7 (a row with fewer than 3 is counted when
-its thread ended with ``NEXT: none`` or has been quiet for 72 h at ``--as-of``, otherwise held)
+shapes), msg-4639 DECIDED 2d-4 / 2d-6 (count one registered questions version only —
+``tierc-v3`` since msg-5753 DECIDED 2d-15; ``following`` = the 3 messages after, as in the
+replay), msg-4641 DECIDED 2d-7 (a row with fewer than 3 is counted when its thread ended with
+``NEXT: none`` or has been quiet for 72 h at ``--as-of``, otherwise held)
 and msg-4643 DECIDED 2d-8 (everything after ``--as-of`` is dropped first).
 
 **Step 0 — the ``--as-of`` cut (2d-8).** Straight after reading, before any other logic, every
@@ -30,9 +31,23 @@ row), ``--rules-sha256 HEX`` (the value registered in ``eval/tierc/shadow-prereg
 **Scope.** :func:`classify` puts each surviving row in one bucket: no point-in-time columns
 (``state_wire`` / ``latest_msg_id`` / ``logged_at``), ``routed:<value>`` for a row ``_route`` did
 not stop (the separate forced / spawn-blocked table, 2d-1), a questions version other than
-``tierc-v2`` (2d-4), a different ``rules_sha256``, else a candidate. A candidate is ``counted``
-when its thread has 3 messages after it, or fewer and the thread is terminated / quiet (2d-7);
-otherwise ``held`` — counted by number only, exported on a later ``--as-of``.
+the registered :data:`REGISTERED_QUESTIONS_VERSION` (2d-4 / 2d-15), a different
+``rules_sha256``, ``retry_admit`` (2d-14 reason 2), else a candidate. A candidate whose head
+continues a bounce chain is ``post_bounce`` (2d-14 reason 3, :func:`continues_bounce_chain`). Any
+other candidate is ``counted`` when its thread has 3
+messages after it, or fewer and the thread is terminated / quiet (2d-7); otherwise ``held`` —
+counted by number only, exported on a later ``--as-of``.
+
+**Bounce chains (msg-5578 / 5580 / 5582 DECIDED 2d-14).** One bounced escalation counts once: its
+first post. A row whose ``gate_kind`` is ``RETRY_ADMIT`` (the author's ``RETRY:`` reply) is
+``retry_admit``. A row is ``post_bounce`` when, in its thread before its ``latest_msg_id``, a
+``conductor-relay`` post that is a bounce notice (``tierc_gate.is_bounce_notice``) names
+(``tierc_gate.bounced_msg_id``) a message by the same author, and no post by the human identity
+sits between that notice and the row. The human identity is ``--human-identity`` (default: the
+config's ``[conductor] human_identity``), tested by the conductor's own
+``is_human_identity`` — empty matches nobody, so no chain is ever broken. Posts by ``operator``,
+relays and every role never break a chain. A row the gate bounced (``BOUNCED``) is otherwise
+counted as usual, and a row with no ``gate_kind`` (before #398) meets no bounce notice.
 
 **Outputs.**
 
@@ -86,10 +101,16 @@ from build_tierc_eval_fixture import (  # the sibling script, as tierc_fulltext_
 )
 
 from spirrow_mindwire.conductor.handoff import parse_next_token
+from spirrow_mindwire.conductor.human_identity import is_human_identity
+from spirrow_mindwire.conductor.tierc_gate import bounced_msg_id, is_bounce_notice
+from spirrow_mindwire.config import load_settings
 
 LOG_PREFIX = "decider_decision "
 ROUTED_STOP = "stop"
-QUESTIONS_V2 = "tierc-v2"
+REGISTERED_QUESTIONS_VERSION = "tierc-v3"
+"""msg-5753 DECIDED 2d-15: the one questions version ``eval/tierc/shadow-prereg.md`` registers.
+Equal to ``decider.questions.TIERC_ESCALATION_QUESTIONS_VERSION`` and to the pre-registration's
+§1 condition 3 — ``tests/test_tierc_registered_version.py`` fails the gate when they drift."""
 EVAL_SET_SHADOW = "shadow"
 ROSTER_SOURCE_LOGGED = "logged"
 QUIET_AFTER = timedelta(hours=72)
@@ -111,8 +132,14 @@ EXPORT_NAME = "export.json"
 COUNTED = "counted"
 HELD = "held_following"
 NO_POINT_IN_TIME = "no_point_in_time_columns"
-NOT_V2 = "questions_version_not_tierc_v2"
+NOT_REGISTERED = "questions_version_not_registered"
 RULES_SHA_MISMATCH = "rules_sha256_mismatch"
+RETRY_ADMIT = "retry_admit"
+POST_BOUNCE = "post_bounce"
+GATE_KIND_RETRY_ADMIT = "RETRY_ADMIT"
+BOUNCE_NOTICE_AUTHOR = "conductor-relay"
+"""Only the conductor's own write-back can start a bounce chain; a role quoting a notice cannot
+(2d-14 test (e); same rule as the conductor's ``_bounced_msg_ids``)."""
 CANDIDATE = "candidate"
 """:func:`classify` returns ``candidate`` / ``routed:<value>`` / one of the reasons above;
 ``counted`` vs ``held`` is decided later, against the thread (:func:`following_ready`)."""
@@ -224,10 +251,12 @@ def classify(row: Mapping[str, Any], rules_sha256: str) -> str:
         return NO_POINT_IN_TIME
     if row.get("routed") != ROUTED_STOP:
         return f"routed:{row.get('routed')}"
-    if row.get("questions_version") != QUESTIONS_V2:
-        return NOT_V2
+    if row.get("questions_version") != REGISTERED_QUESTIONS_VERSION:
+        return NOT_REGISTERED
     if row.get("rules_sha256") != rules_sha256:
         return RULES_SHA_MISMATCH
+    if row.get("gate_kind") == GATE_KIND_RETRY_ADMIT:
+        return RETRY_ADMIT
     return CANDIDATE
 
 
@@ -259,6 +288,27 @@ def position(thread: Sequence[Message], latest_msg_id: str) -> int:
         if m.msg_id == latest_msg_id:
             return i
     raise ExportError(f"{latest_msg_id} is not in the fetched thread up to --as-of")
+
+
+def continues_bounce_chain(thread: Sequence[Message], i: int, human_identity: str) -> bool:
+    """2d-14 reason 3: does ``thread[i]`` continue a bounce chain of its author?
+
+    True iff some message before ``i`` is a ``conductor-relay`` bounce notice naming a message by
+    ``thread[i].author``, and no post by the human identity (:func:`is_human_identity`) sits
+    between that notice and ``i``. ``thread`` is already cut at ``--as-of``."""
+    author = thread[i].author
+    authors = {m.msg_id: m.author for m in thread[:i]}
+    for j in range(i - 1, -1, -1):
+        m = thread[j]
+        if is_human_identity(m.author, human_identity):
+            # Every notice before this human post is closed by it.
+            return False
+        if m.author != BOUNCE_NOTICE_AUTHOR or not is_bounce_notice(m.content):
+            continue
+        named = bounced_msg_id(m.content)
+        if named is not None and authors.get(named) == author:
+            return True
+    return False
 
 
 def following_ready(thread: Sequence[Message], i: int, as_of: datetime) -> bool:
@@ -358,6 +408,8 @@ def build_outputs(
     rules_sha256: str,
     threads: Mapping[str, tuple[str, Sequence[Message]]],
     as_of: datetime,
+    *,
+    human_identity: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Pure: log rows + fetched threads → (materials, fixture, replay, export summary).
 
@@ -377,6 +429,9 @@ def build_outputs(
             raise ExportError(f"thread {tid} was not fetched")
         project, msgs = cut[tid]
         i = position(msgs, str(r["latest_msg_id"]))
+        if continues_bounce_chain(msgs, i, human_identity):
+            counts[POST_BOUNCE] += 1
+            continue
         if not following_ready(msgs, i, as_of):
             counts[HELD] += 1
             continue
@@ -388,6 +443,8 @@ def build_outputs(
     summary = {
         "as_of": as_of.isoformat(),
         "rules_sha256": rules_sha256,
+        "questions_version": REGISTERED_QUESTIONS_VERSION,
+        "human_identity": human_identity,
         # Only what survives the cut: a count of rows after ``as_of`` would change as the log
         # grows, and 22d asks for the same bytes on the same ``as_of``.
         "rows_up_to_as_of": len(kept),
@@ -503,6 +560,12 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
     parser.add_argument("--as-of", required=True, help="timezone-aware ISO 8601 (msg-4643)")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--replay-out", type=Path, required=True)
+    parser.add_argument(
+        "--human-identity",
+        default=None,
+        help="the author whose post ends a bounce chain (2d-14); default: the config's "
+        "[conductor] human_identity. An empty value matches nobody",
+    )
     args = parser.parse_args(argv)
 
     out_dir: Path = args.out_dir.resolve()
@@ -519,6 +582,11 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
     except ExportError as exc:
         print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
         return 2
+    human_identity: str = (
+        args.human_identity
+        if args.human_identity is not None
+        else load_settings().conductor.human_identity
+    )
     rows: list[dict[str, Any]] = []
     for path in args.log:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -530,7 +598,9 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
         )
         for tid, errs in sorted(errors.items()):
             print(f"export_shadow_eval_set: {tid} not fetched: {errs}", file=sys.stderr)
-        materials, fixture, replay, summary = build_outputs(rows, args.rules_sha256, threads, as_of)
+        materials, fixture, replay, summary = build_outputs(
+            rows, args.rules_sha256, threads, as_of, human_identity=human_identity
+        )
     except ExportError as exc:
         print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
         return 1

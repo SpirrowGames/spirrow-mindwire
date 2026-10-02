@@ -31,7 +31,8 @@ asks what Jev *would* say. The server's own ``decision.verdict.kind`` is shown b
 "Human reached" = CONFIRMED or UNSURE (D2 monotonicity: UNSURE goes to the human).
 
 **Two question versions (T-decider-conductor-hook msg-4639 DECIDED 2d-5).** A record whose
-``questions_version`` is ``tierc-v2`` is recomputed from ``raw_answers["should_ask_human"]`` with
+``questions_version`` is in :data:`V2_STRUCTURE_VERSIONS` (``tierc-v2`` / ``tierc-v3``, msg-5753
+DECIDED 2d-15 item 3) is recomputed from ``raw_answers["should_ask_human"]`` with
 ``evaluate_tierc_v2`` (``TierCV2Thresholds``); every other record takes the v1 path above,
 unchanged. v1 and v2 rows get separate sections — headline, sweep and AUC per version. An
 input with no v2 row renders exactly as before (the committed ``eval/tierc/report.md`` is
@@ -142,12 +143,13 @@ def record_version(rec: Mapping[str, Any]) -> str:
 
 
 def run_version(replay: Sequence[Mapping[str, Any]]) -> str:
-    """``"v2"`` when every record is ``tierc-v2``, ``"v1"`` when none is; a mix is an
-    :class:`InputError` (msg-4650: one evaluation is v1 only or v2 only)."""
-    v2 = sum(1 for r in replay if record_version(r) == V2)
+    """``"v2"`` when every record has the v2 structure (:data:`V2_STRUCTURE_VERSIONS`), ``"v1"``
+    when none does; a mix is an :class:`InputError` (msg-4650: one evaluation is v1 only or v2
+    only)."""
+    v2 = sum(1 for r in replay if record_version(r) in V2_STRUCTURE_VERSIONS)
     if v2 and v2 != len(replay):
         raise InputError(
-            f"--replay mixes {v2} tierc-v2 record(s) with {len(replay) - v2} other(s); "
+            f"--replay mixes {v2} tierc-v2/v3 record(s) with {len(replay) - v2} other(s); "
             "one evaluation run is v1 only or v2 only"
         )
     return "v2" if v2 else "v1"
@@ -365,6 +367,7 @@ class Row:
     questions_version: str = ""
     ask_score: float | None = None
     following_n: int | None = None
+    rules_sha256: str | None = None
 
 
 def gate_bucket(g: Mapping[str, Any] | None) -> str:
@@ -409,6 +412,7 @@ def join(replay: Sequence[Mapping[str, Any]], fixture: Sequence[Mapping[str, Any
                 ),
                 ask_score=ask_score_of(rec),
                 following_n=int(f["following_n"]) if f.get("following_n") is not None else None,
+                rules_sha256=_rules_sha256_of(rec, d),
             )
         )
     return rows
@@ -570,13 +574,20 @@ def render(
     replayed_before_corrections: int | None = None,
     th_v2: TierCV2Thresholds | None = None,
     export: ExportLock | None = None,
+    rules_snapshots: RulesSnapshotReport | None = None,
 ) -> str:
     """One version per run (msg-4639 DECIDED 2d-5, msg-4650). No v2 row → the v1 report,
     unchanged; all v2 → the v2 section; a mix is an :class:`InputError`."""
-    v2 = [r for r in all_rows if r.questions_version == V2]
+    v2 = [r for r in all_rows if r.questions_version in V2_STRUCTURE_VERSIONS]
     if not v2:
         return _render_v1(
-            all_rows, labellers, th, population, corrections, replayed_before_corrections
+            all_rows,
+            labellers,
+            th,
+            population,
+            corrections,
+            replayed_before_corrections,
+            rules_snapshots,
         )
     if len(v2) != len(all_rows):
         raise InputError("rows mix tierc-v2 with other versions; one run is v1 only or v2 only")
@@ -587,6 +598,7 @@ def render(
         corrections,
         replayed_before_corrections,
         export,
+        rules_snapshots,
     )
 
 
@@ -597,12 +609,16 @@ def _render_v1(
     population: Sequence[Mapping[str, Any]] = (),
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
+    rules_snapshots: RulesSnapshotReport | None = None,
 ) -> str:
     """The v1 report (unchanged by 2d-5). With ``corrections``, ``all_rows`` / ``labellers``
     must already be filtered
-    (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4)."""
+    (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4).
+    The same holds for ``rules_snapshots`` (:func:`archive_rules_snapshots`)."""
     truth = consensus(labellers)
     lines: list[str] = ["# Tier-C replay evaluation — Jev", ""]
+    if rules_snapshots is not None:
+        lines += [*render_rules_snapshots(rules_snapshots), ""]
     if corrections is None:
         lines += ["- corrections: **none applied** — every fixture row is counted.", ""]
     else:
@@ -764,7 +780,11 @@ def _render_v1(
 # tierc-v2 (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7 / advisory)
 # ---------------------------------------------------------------------------
 
-V2 = "tierc-v2"
+V2_STRUCTURE_VERSIONS: frozenset[str] = frozenset({"tierc-v2", "tierc-v3"})
+"""msg-5753 DECIDED 2d-15 item 3: every version of the single-``should_ask_human`` structure goes
+to the v2 report. v3 only added one sentence to the question frame (main ``b224540``). The report
+describes rows and counts nothing, so it may hold both; which version is *counted* is the
+exporter's registered version, not this set. Each row's version is shown."""
 
 SWEEP_V2: tuple[tuple[float, float], ...] = ((0.50, 0.33), (0.60, 0.40), (0.70, 0.47), (0.80, 0.53))
 """msg-4641: the v2 sweep as a constant table of ``(ask_min, not_ask_max)`` — no arithmetic, so
@@ -844,11 +864,14 @@ def render_v2(
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
     export: ExportLock | None = None,
+    rules_snapshots: RulesSnapshotReport | None = None,
 ) -> str:
     """The tierc-v2 section (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7, msg-4650)."""
     truth = consensus(labellers)
     n = len(rows)
     lines: list[str] = ["# Tier-C evaluation — Jev, tierc-v2", ""]
+    if rules_snapshots is not None:
+        lines += [*render_rules_snapshots(rules_snapshots), ""]
     if export is None:
         lines += ["- export lock: **none** (not verified — library call, not the CLI)", ""]
     else:
@@ -879,6 +902,7 @@ def render_v2(
         f"- NO_VERDICT rows: {len(no_verdict)}",
         f"- MALFORMED (outcome `{MALFORMED_OUTCOME}`): {_pct(malformed, n)}",
         f"- outcome: {dict(Counter(r.outcome or 'not_called' for r in rows))}",
+        f"- questions_version: {dict(sorted(Counter(r.questions_version for r in rows).items()))}",
     ]
     if no_verdict:
         lines += [
@@ -889,7 +913,8 @@ def render_v2(
             "",
         ]
         lines += [
-            f"- {r.msg_id} `{r.key[0]}` r{r.key[1]} — outcome={r.outcome}" for r in no_verdict
+            f"- {r.msg_id} `{r.key[0]}` r{r.key[1]} [{r.questions_version}] — outcome={r.outcome}"
+            for r in no_verdict
         ]
         return "\n".join(lines)
     lines += ["- **valid**: every row has a v2 verdict.", ""]
@@ -916,7 +941,7 @@ def render_v2(
 
     lines += ["## Misses — genuine judged LIKELY_NOT", ""]
     miss = [
-        f"- **{r.msg_id}** `{r.key[0]}` r{r.key[1]} ({truth[r.key]}) — "
+        f"- **{r.msg_id}** `{r.key[0]}` r{r.key[1]} [{r.questions_version}] ({truth[r.key]}) — "
         f"should_ask_human={r.ask_score:.2f}\n  - body head: {r.body_head}"
         for r in rows
         if r.ask_score is not None
@@ -949,6 +974,87 @@ def render_v2(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# rules snapshots (T-decider-tierc-v2-all-escalations, Bohr msg-4631 / 4633 / 5130)
+# ---------------------------------------------------------------------------
+
+RULES_ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "eval" / "tierc" / "rules"
+"""Default ``--rules-archive-dir``: ``eval/tierc/rules/`` (the replay snapshot dir, msg-4382)."""
+
+
+@dataclass(frozen=True)
+class RulesSnapshotReport:
+    """Result of :func:`archive_rules_snapshots`: the rows that stay, and why the rest left."""
+
+    kept: list[Row]
+    archived: dict[str, Path]
+    excluded: dict[str, Counter[str]]
+    """reason (``missing`` / ``mismatch``) → rows excluded per ``rules_sha256``."""
+
+
+def _rules_sha256_of(rec: Mapping[str, Any], decision: Mapping[str, Any]) -> str | None:
+    """A record's ``rules_sha256`` — on the decision (live / ``--endpoint``) or the record."""
+    for src in (decision, rec):
+        v = src.get("rules_sha256")
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def archive_rules_snapshots(
+    rows: Sequence[Row], snapshot_dir: Path, archive_dir: Path
+) -> RulesSnapshotReport:
+    """Copy each row's live snapshot ``<snapshot_dir>/<sha>.toml`` to ``<archive_dir>/<sha>.toml``.
+
+    Only copying — the snapshot was written by the live Decider when it computed the hash
+    (msg-4631); this step never reads the canonical rules file. The bytes are re-hashed on the
+    way (msg-4633): a missing snapshot excludes its rows as ``missing``, bytes that do not hash
+    to the name exclude them as ``mismatch``. Nothing aborts; the counts go in the report.
+    Rows with no ``rules_sha256`` (tierc-v1) are kept untouched. ``*.tmp`` / ``*.corrupt-*``
+    files are never read (only ``<sha>.toml`` is opened).
+    """
+    status: dict[str, str] = {}
+    archived: dict[str, Path] = {}
+    for sha in sorted({r.rules_sha256 for r in rows if r.rules_sha256 is not None}):
+        try:
+            data = (snapshot_dir / f"{sha}.toml").read_bytes()
+        except OSError:
+            status[sha] = "missing"
+            continue
+        if hashlib.sha256(data).hexdigest() != sha:
+            status[sha] = "mismatch"
+            continue
+        dest = archive_dir / f"{sha}.toml"
+        if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest() != sha:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        status[sha] = "ok"
+        archived[sha] = dest
+    kept: list[Row] = []
+    excluded: dict[str, Counter[str]] = {"missing": Counter(), "mismatch": Counter()}
+    for r in rows:
+        st = "ok" if r.rules_sha256 is None else status[r.rules_sha256]
+        if st == "ok":
+            kept.append(r)
+        else:
+            assert r.rules_sha256 is not None
+            excluded[st][r.rules_sha256] += 1
+    return RulesSnapshotReport(kept=kept, archived=archived, excluded=excluded)
+
+
+def render_rules_snapshots(rep: RulesSnapshotReport) -> list[str]:
+    out = [
+        "- rules snapshots (msg-4631 / 4633): "
+        f"archived {len(rep.archived)} hash(es); excluded rows: "
+        f"missing={sum(rep.excluded['missing'].values())}, "
+        f"mismatch={sum(rep.excluded['mismatch'].values())}"
+    ]
+    for reason in ("missing", "mismatch"):
+        for sha, n in sorted(rep.excluded[reason].items()):
+            out.append(f"  - {reason}: `{sha}` — {n} row(s)")
+    return out
+
+
 def apply_corrections(
     rows: Sequence[Row], labellers: Mapping[str, Mapping[Key, Label]], corr: Corrections
 ) -> tuple[list[Row], dict[str, dict[Key, Label]]]:
@@ -973,6 +1079,19 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="the exporter's export.json; required for a tierc-v2 run (msg-4648 / msg-4650)",
+    )
+    parser.add_argument(
+        "--rules-snapshot-dir",
+        type=Path,
+        default=None,
+        help="live snapshot dir (<data_dir>/decider/rules): archive each row's rules_sha256 "
+        "snapshot and exclude rows whose snapshot is missing / mismatched (msg-4631 / 4633)",
+    )
+    parser.add_argument(
+        "--rules-archive-dir",
+        type=Path,
+        default=RULES_ARCHIVE_DIR,
+        help="where verified snapshots are copied (default eval/tierc/rules)",
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -1023,8 +1142,24 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    snap: RulesSnapshotReport | None = None
+    if args.rules_snapshot_dir is not None:
+        snap = archive_rules_snapshots(rows, args.rules_snapshot_dir, args.rules_archive_dir)
+        kept_keys = {r.key for r in snap.kept}
+        rows = snap.kept
+        labellers = {
+            n: {k: v for k, v in m.items() if k in kept_keys} for n, m in labellers.items()
+        }
     text = render(
-        rows, labellers, th, population, corr, replayed, th_v2=TierCV2Thresholds(), export=export
+        rows,
+        labellers,
+        th,
+        population,
+        corr,
+        replayed,
+        th_v2=TierCV2Thresholds(),
+        export=export,
+        rules_snapshots=snap,
     )
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8", newline="\n")

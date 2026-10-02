@@ -10,7 +10,18 @@ the thread at all — it is stored per **project** in conclair, set from the das
 Three states (the vocabulary is conclair's; this module only consumes it):
 
 - ``run`` — fully autonomous. The independent naysayer's proceed-handoff carries a design through
-  to the implementer (the old carve-out ③, now project-wide rather than per-thread).
+  to the implementer (the old carve-out ③, now project-wide rather than per-thread) — subject to
+  the D-4' guardrails in :func:`spirrow_mindwire.routing.carve_out_iii_admissible` (G1: no
+  ``TIER-C:`` declared since the human last spoke; G2: ``TIER-C-CHECK: none`` on the proceed) and
+  G3 (a veto: the Tier-C Decider judged the proceed a human matter — tierc-v2 ``CONFIRMED``;
+  a Decider that is off, undecided or failing does not veto, msg-5219).
+
+**The latch is the decided expiry policy.** msg-925 §3-1 asked that delegation not be left open
+indefinitely; the design thread (T-pr-2b-3-human-identity-delegate, Bohr msg-4854 ⚠ / msg-4856 G4)
+put the latch to Takahito as option (i) against (ii) "revert ``run`` to ``supervised`` after N
+implementations or T days", and Takahito chose (i) — indefinite delegation authority, together
+with G1+G2+G3 — in his "B" decide on that thread. There is therefore no expiry field here or in
+magickit's ``desired_state``; the per-turn containment is the D-4' guardrails above, not a timer.
 - ``supervised`` — the design loop turns, but only a human Tier-C decide or a PR-gate
   REQUEST_CHANGES reaches code. **This is the pre-inversion behaviour** and the baseline this
   module falls back to when no control source is wired at all.
@@ -44,8 +55,16 @@ logger = logging.getLogger(__name__)
 # decides what it should do.
 #
 # How far that actually goes, stated exactly so nobody over-trusts it: the daemon never calls
-# ``loop_control_set``, and the three role sessions cannot either — ``loop_runner`` wires no
-# ``mcp_servers`` into any adapter, so they have no MCP tools at all (verified 2026-08-04). It is
+# ``loop_control_set``, and the three role sessions cannot either as a tool call. The only MCP tools
+# any role session holds are the implementer's two ledger tools (``ledger_get_task`` /
+# ``ledger_append_note``, the in-process ``mindwire-ledger`` server — pinned to the thread's
+# project, append-only; proposer and naysayer hold none). No session holds ``loop_control_*``
+# (pinned by ``tests/test_role_tool_surface.py``; thread
+# T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down msg-5296 / msg-5300). Residual risk
+# of that ledger append, stated as it is: it does not detect collisions — a write by another
+# process or a person that lands between its read and its write is overwritten, and recovery from
+# an overlap relies on the event_log (``ledger.note_appended`` records the notes it read); a
+# person's UI write is not recoverable from there. It is
 # NOT a sandbox: the implementer session has shell tools and the magickit endpoint is unauthed on
 # the tailnet, so an implementer that decided to could POST to it directly. That residual is the
 # same environment trust model the rest of the loop rests on (see ``adapters/implementer.py`` on the

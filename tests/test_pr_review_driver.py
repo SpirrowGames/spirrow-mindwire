@@ -174,7 +174,9 @@ class _FakeGitHub:
             raise self._coverage_exc
         return list(self._coverage)
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         # Model the same-identity 422: the verdict event fails, but a COMMENT review (the
         # fallback) succeeds. submit_exc=None → always succeeds.
         if self._submit_exc is not None and event is not ReviewEvent.COMMENT:
@@ -201,6 +203,10 @@ class _FakeGitHub:
 
     async def aclose(self) -> None:
         return None
+
+
+async def _no_sleep(seconds: float) -> None:
+    return None
 
 
 def _pr() -> PrRef:
@@ -245,9 +251,35 @@ async def test_request_changes_flow() -> None:
 
 @pytest.mark.anyio
 async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> None:
-    # The naysayer already reviewed THIS head (its last verdict review's commit_id == ci.head_sha)
-    # → skip the Lexora/Gemini call and reuse the prior verdict; no new GitHub review submitted.
+    # The naysayer already APPROVED this head (its last verdict review's commit_id == ci.head_sha)
+    # → skip the Lexora/Gemini call and reuse the prior APPROVE; no new GitHub review submitted.
+    # (T-infra-failure-posts-empty-rc msg-4802 test 2. This test was RC-based before C-1; an RC
+    # prior now runs a full review — see test_skip_if_head_unchanged_never_reposts_request_changes.)
     lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls == []  # no Gemini call
+    assert github.submitted == []  # the existing review stands; no duplicate
+    assert outcome.skipped_head_unchanged is True
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert len(posted) == 1  # a short note is still posted to the thread
+
+
+@pytest.mark.anyio
+async def test_skip_if_head_unchanged_never_reposts_request_changes() -> None:
+    # T-infra-failure-posts-empty-rc msg-4802 C-1 / test 1 (msg-2136 F-7): a prior
+    # CHANGES_REQUESTED on the unchanged head must NOT be re-posted by the skip — that re-post
+    # carried no critique, yet an RC routes the conductor to the implementer. The full review
+    # runs instead, and the RC that goes out carries the model's own critique.
+    lexora = _FakeLexora(content="line 3 is still wrong\n\nVERDICT: REQUEST_CHANGES")
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
         reviews=[
@@ -258,11 +290,58 @@ async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> N
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert lexora.calls == []  # no Gemini call
-    assert github.submitted == []  # the existing review stands; no duplicate
-    assert outcome.skipped_head_unchanged is True
+    assert lexora.calls != []  # full review ran (2-pass, so >= 1 call)
+    assert outcome.skipped_head_unchanged is False
+    assert all("Skipping a re-review" not in body for body in posted)
     assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
-    assert len(posted) == 1  # a short note is still posted to the thread
+    assert "line 3 is still wrong" in posted[0]
+
+
+@pytest.mark.anyio
+async def test_skip_approve_cache_does_not_mask_current_ci_failure() -> None:
+    # msg-4802 test 3 (Einstein msg-2137): the CI gate runs BEFORE the head-unchanged skip, so a
+    # cached APPROVE for this head can never be re-posted over a CI that has since gone red.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.FAILURE, "headsha", ["build"]),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.ci_gated is True
+    assert outcome.skipped_head_unchanged is False
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.REQUEST_CHANGES]
+    assert lexora.calls == []
+
+
+@pytest.mark.anyio
+async def test_skip_rc_prior_falls_through_to_round_cap() -> None:
+    # msg-4802 test 4: an RC prior on the unchanged head is no longer skipped, so with the round
+    # cap enabled and reached, the cap applies — COMMENT, stop at the human, no Gemini call. This
+    # is the bound on the extra re-review cost that C-1 accepts.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, max_review_rounds=1
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.skipped_head_unchanged is False
+    assert outcome.rounds_capped is True
+    assert outcome.verdict is ReviewEvent.COMMENT
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.COMMENT]
+    assert lexora.calls == []
 
 
 @pytest.mark.anyio
@@ -362,6 +441,30 @@ async def test_round_cap_counts_only_verdict_reviews() -> None:
 async def test_shadow_mode_measures_skip_without_acting() -> None:
     # shadow=True: the head-unchanged skip is computed + recorded (would_skip_head_unchanged) but
     # NOT acted on — the full Gemini review still runs (no behaviour / coverage change).
+    # The prior is APPROVED: since msg-4802 C-1/C-2 only an APPROVE prior is skip-eligible, in
+    # shadow mode too (see test_shadow_mode_does_not_count_rc_prior_as_would_skip).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, shadow=True
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls != []  # full review ran (NOT skipped) — 2-pass, so >= 1 call
+    assert outcome.would_skip_head_unchanged is True
+    assert outcome.skipped_head_unchanged is False
+
+
+@pytest.mark.anyio
+async def test_shadow_mode_does_not_count_rc_prior_as_would_skip() -> None:
+    # msg-4802 C-2: shadow mode goes through _skip_unchanged_response, so an RC prior on the
+    # unchanged head is not a would-skip either (would_skip counts before/after C-1 differ).
     lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
@@ -375,9 +478,8 @@ async def test_shadow_mode_measures_skip_without_acting() -> None:
     )
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert lexora.calls != []  # full review ran (NOT skipped) — 2-pass, so >= 1 call
-    assert outcome.would_skip_head_unchanged is True
-    assert outcome.skipped_head_unchanged is False
+    assert lexora.calls != []
+    assert outcome.would_skip_head_unchanged is False
 
 
 @pytest.mark.anyio
@@ -412,7 +514,8 @@ async def test_shadow_skip_takes_precedence_over_cap() -> None:
         reviews=[
             # 2 verdict reviews (>= cap 2); the latest is against the current head (→ skip too).
             ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "old", "2026-06-10T00:00:01Z"),
-            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:02Z"),
+            # APPROVED: only an APPROVE prior is skip-eligible (msg-4802 C-1).
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:02Z"),
         ],
     )
     _posted, post = _capture()
@@ -814,7 +917,8 @@ async def test_head_unchanged_skip_does_not_claim_current_principles_version() -
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
         reviews=[
-            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+            # APPROVED: only an APPROVE prior is skip-eligible (msg-4802 C-1).
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
         ],
     )
     _posted, post = _capture()
@@ -2135,7 +2239,7 @@ async def test_target_terminal_422_with_live_probe_reraises_not_environment_term
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError(
                 "POST /reviews returned 422: unprocessable entity", status_code=422
@@ -2170,7 +2274,7 @@ async def test_unknown_scope_reraises_not_environment_terminal() -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 401", status_code=401)
 
@@ -2416,7 +2520,7 @@ async def test_replay_strict_read_env_terminal_raises_environment_terminal_error
             raise GitHubHTTPError("GET /reviews returned 401", status_code=401)
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise AssertionError("submit_review must not be called after strict read raises")
 
@@ -2514,7 +2618,7 @@ async def test_submit_403_with_unreachable_probe_reraises_plain_error_and_no_mar
             return []  # NOT_LANDED — replay is eligible
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 403", status_code=403)
 
@@ -2569,7 +2673,7 @@ async def test_submit_422_with_live_probe_writes_target_terminal_marker() -> Non
             return []  # NOT_LANDED
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             # 422 that is NOT the same-identity "own pull request" case (that has
             # its own COMMENT fallback). This is e.g. a deleted-PR / merged-branch
@@ -3925,7 +4029,7 @@ async def test_environment_terminal_raises_environment_terminal_error() -> None:
             self.probe_calls = 0
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 401: Bad credentials", status_code=401)
 
@@ -3955,7 +4059,7 @@ async def test_environment_terminal_permission_403_with_live_probe() -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-perm", []))
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 403", status_code=403)
 
@@ -3989,7 +4093,7 @@ async def test_target_terminal_422_with_live_probe_raises_target_terminal_error(
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError(
                 "POST /reviews returned 422: unprocessable entity", status_code=422
@@ -4025,7 +4129,7 @@ async def test_unknown_scope_reraises_not_environment_terminal_not_target_termin
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 401", status_code=401)
 
@@ -4048,10 +4152,10 @@ async def test_unknown_scope_reraises_not_environment_terminal_not_target_termin
 
 @pytest.mark.anyio
 async def test_retryable_error_reraises_raw() -> None:
-    # A 5xx on submit → RETRYABLE. PR-A ships classification without retries;
-    # PR-B will add retries behind a landed() idempotency guard (msg-3276).
-    # For now the driver must re-raise the raw exception without invoking the
-    # probe (RETRYABLE never touches scope_from_probe by definition).
+    # A 5xx on submit → RETRYABLE. PR-B' retries it in-run behind the landed()
+    # guard; once the budget is spent the driver must re-raise the raw exception
+    # without invoking the probe (RETRYABLE never touches scope_from_probe by
+    # definition). The sleep is injected so the 2 s / 8 s backoff costs nothing.
     from spirrow_mindwire.github.client import (
         EnvironmentTerminalError,
         TargetTerminalError,
@@ -4063,7 +4167,7 @@ async def test_retryable_error_reraises_raw() -> None:
             self.probe_calls = 0
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             raise GitHubHTTPError("POST /reviews returned 503", status_code=503)
 
@@ -4074,7 +4178,7 @@ async def test_retryable_error_reraises_raw() -> None:
     github = _RetryableGitHub()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(
-        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github, sleep=_no_sleep
     )
     with pytest.raises(GitHubHTTPError) as excinfo:
         await driver.review(_pr(), post_critique=post)
@@ -4114,7 +4218,7 @@ async def test_same_identity_422_fallback_still_works() -> None:
 @pytest.mark.anyio
 async def test_same_identity_422_fallback_401_raises_environment_terminal_not_quarantine() -> None:
     # msg-3218 fix: the same-identity 422 → COMMENT fallback was not routed
-    # through _classify_and_reraise. A 401 on the fallback POST would therefore
+    # through _classify_exception. A 401 on the fallback POST would therefore
     # bubble as a plain GitHubHTTPError → thread quarantine, i.e. the exact
     # false-quarantine mode this design exists to prevent. The fix wraps the
     # fallback POST in the same funnel, so an env-terminal on the fallback
@@ -4127,7 +4231,7 @@ async def test_same_identity_422_fallback_401_raises_environment_terminal_not_qu
             self._calls = 0
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             self._calls += 1
             if self._calls == 1:
@@ -4152,7 +4256,7 @@ async def test_same_identity_422_fallback_401_raises_environment_terminal_not_qu
     assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
     assert excinfo.value.status_code == 401
     # The origin tag distinguishes fallback-time failures from primary ones in
-    # the log record (see _classify_and_reraise's logger.warning call).
+    # the log record (see _classify_exception's logger.warning call).
     assert "submit-comment-fallback" in str(excinfo.value)
 
 
@@ -4161,7 +4265,7 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
     # Companion oracle: a TARGET-scoped terminal on the fallback (e.g. the PR
     # was deleted between the primary POST and the fallback POST) must also go
     # through the funnel and surface as TargetTerminalError, not a raw
-    # GitHubHTTPError. Preserves the invariant that _classify_and_reraise is
+    # GitHubHTTPError. Preserves the invariant that _classify_exception is
     # the SOLE producer of the typed variants for every write path.
     from spirrow_mindwire.github.client import TargetTerminalError
 
@@ -4171,7 +4275,7 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
             self._calls = 0
 
         async def submit_review(
-            self, pr: PrRef, *, event: ReviewEvent, body: str
+            self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
         ) -> dict[str, Any]:
             self._calls += 1
             if self._calls == 1:
@@ -4598,3 +4702,359 @@ async def test_gate_notice_absent_when_no_demotion_fires() -> None:
     await driver.review(_pr(), post_critique=post)
     body = posted[0]
     assert _MARKER_C_DEMOTED not in body
+
+
+# ---------- T-gate-review-submit-failure-handling PR-B': in-run submit retry ----------
+#
+# Design: msg-4781 (loop in the driver, landed() guard, commit_id pinning) + msg-4783
+# (retry_after honoured exactly; > _RETRY_AFTER_MAX_S aborts). The fake below records one
+# ordered event log ("post" / "sleep:<s>" / "read" / "probe") so every test asserts the
+# exact order delay -> possible abort -> sleep -> guard -> POST, not just the counts.
+
+_REVIEW_LOGIN = "spirrowgames-ops"
+
+
+class _RetryScriptGitHub(_FakeGitHub):
+    """Fake whose submit_review follows a script of outcomes, one per POST.
+
+    Script steps: ``"ok"`` (accepted, response delivered), ``"lost"`` (GitHub accepted the
+    review but the response leg dropped -- a transport error with no status), or an
+    exception to raise without recording anything. A recorded review is attached to the
+    POST's ``commit_id`` when given, else to ``current_head`` (what GitHub does), and
+    ``move_head_to`` moves ``current_head`` after the first POST.
+    """
+
+    def __init__(
+        self,
+        *,
+        head: str | None,
+        script: list[Any],
+        events: list[str],
+        prior: list[ReviewInfo] | None = None,
+        read_exc: Exception | None = None,
+        probe: int = 200,
+        move_head_to: str | None = None,
+    ) -> None:
+        super().__init__(ci=CiStatus(CiState.SUCCESS, head, []), reviews=prior)
+        self.current_head = head
+        self._script = list(script)
+        self._read_exc = read_exc
+        self._probe = probe
+        self._move_head_to = move_head_to
+        self.events = events
+        self.commit_ids: list[str | None] = []
+
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
+        self.events.append("post")
+        self.commit_ids.append(commit_id)
+        step = self._script.pop(0)
+        attached_to = commit_id if commit_id is not None else self.current_head
+        if self._move_head_to is not None:
+            self.current_head = self._move_head_to
+        if isinstance(step, BaseException):
+            raise step
+        self._reviews.append(
+            ReviewInfo(
+                login=_REVIEW_LOGIN,
+                state="APPROVED",
+                commit_id=attached_to,
+                submitted_at=None,
+            )
+        )
+        self.submitted.append((pr, event, body))
+        if step == "lost":
+            raise GitHubHTTPError("POST /reviews (review): ")
+        return {"id": len(self._reviews), "state": event.value}
+
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        self.events.append("read")
+        if self._read_exc is not None:
+            raise self._read_exc
+        return list(self._reviews)
+
+    async def probe_identity(self) -> int:
+        self.events.append("probe")
+        return self._probe
+
+
+def _retry_driver(github: _RetryScriptGitHub, events: list[str]) -> NaysayerPrReviewDriver:
+    async def sleep(seconds: float) -> None:
+        events.append(f"sleep:{seconds:g}")
+
+    return NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"),
+        github=github,
+        review_login=_REVIEW_LOGIN,
+        sleep=sleep,
+    )
+
+
+def _http(status: int | None, *, retry_after: float | None = None) -> GitHubHTTPError:
+    return GitHubHTTPError(
+        f"POST /reviews returned {status}",
+        status_code=status,
+        retry_after=retry_after,
+        rate_limited=retry_after is not None,
+    )
+
+
+@pytest.mark.anyio
+async def test_submit_retry_lost_response_does_not_double_post() -> None:
+    # msg-3275 invariant: the POST reached GitHub, only the response was lost. The guard
+    # finds the review on receipt.head_sha -> exactly ONE POST is recorded.
+    events: list[str] = []
+    github = _RetryScriptGitHub(head="sha-lost", script=["lost", "ok"], events=events)
+    _posted, post = _capture()
+    outcome = await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert events == ["post", "sleep:2", "read"]
+    assert len(github.submitted) == 1
+
+
+@pytest.mark.anyio
+async def test_submit_retry_head_moved_after_lost_response_does_not_double_post() -> None:
+    # msg-4781 item 3: the head moves between the lost-response POST and the retry. The
+    # POST carries commit_id=receipt.head_sha, so the review is attached to the SAME
+    # commit the guard checks -> LANDED -> no second POST on the new head.
+    events: list[str] = []
+    github = _RetryScriptGitHub(
+        head="sha-before", script=["lost", "ok"], move_head_to="sha-after", events=events
+    )
+    _posted, post = _capture()
+    await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert github.commit_ids == ["sha-before"]
+    assert events == ["post", "sleep:2", "read"]
+    assert len(github.submitted) == 1
+
+
+@pytest.mark.anyio
+async def test_submit_retry_earlier_head_review_is_not_landed() -> None:
+    # Einstein's msg-4780 counterexample as a test: our review on an EARLIER head must not
+    # read as "this head already landed", or the new verdict would be silently dropped.
+    events: list[str] = []
+    prior = [ReviewInfo(_REVIEW_LOGIN, "APPROVED", "sha-old", None)]
+    github = _RetryScriptGitHub(
+        head="sha-new", script=[_http(502), "ok"], prior=prior, events=events
+    )
+    _posted, post = _capture()
+    await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert events == ["post", "sleep:2", "read", "post"]
+    assert github.commit_ids == ["sha-new", "sha-new"]
+    assert len(github.submitted) == 1
+
+
+@pytest.mark.anyio
+async def test_submit_retry_honours_retry_after_exactly() -> None:
+    # msg-4783 row 1: retry_after=30 -> sleep exactly 30 s, THEN the guard, THEN the POST.
+    events: list[str] = []
+    github = _RetryScriptGitHub(
+        head="sha-ra30", script=[_http(429, retry_after=30), "ok"], events=events
+    )
+    _posted, post = _capture()
+    await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert events == ["post", "sleep:30", "read", "post"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_long_retry_after_aborts_without_truncating() -> None:
+    # msg-4782 / msg-4783 row 2: retry_after=3600 is never clamped. No sleep, no guard
+    # read, exactly one POST, and the ORIGINAL exception re-raised with its retry_after.
+    events: list[str] = []
+    original = _http(403, retry_after=3600)
+    github = _RetryScriptGitHub(head="sha-ra3600", script=[original], events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is original
+    assert excinfo.value.retry_after == 3600
+    assert events == ["post"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_after_boundary() -> None:
+    # retry_after == _RETRY_AFTER_MAX_S sleeps and retries; one second more aborts.
+    from spirrow_mindwire.naysayer.pr_review import _RETRY_AFTER_MAX_S
+
+    events: list[str] = []
+    at_cap = _http(429, retry_after=_RETRY_AFTER_MAX_S)
+    github = _RetryScriptGitHub(head="sha-cap", script=[at_cap, "ok"], events=events)
+    _posted, post = _capture()
+    await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert events == ["post", f"sleep:{_RETRY_AFTER_MAX_S:g}", "read", "post"]
+
+    events2: list[str] = []
+    over = _http(429, retry_after=_RETRY_AFTER_MAX_S + 1)
+    github2 = _RetryScriptGitHub(head="sha-cap1", script=[over], events=events2)
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github2, events2).review(_pr(), post_critique=post)
+    assert excinfo.value is over
+    assert events2 == ["post"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_budget_exhausted_reraises_last_error() -> None:
+    # msg-4783 row 3: no retry_after on a 5xx -> our own 2 s then 8 s. After the third
+    # failure the LAST error is re-raised unchanged (the exit-1 path, as before), and the
+    # scope probe is never spent on a RETRYABLE error.
+    events: list[str] = []
+    errors = [_http(500), _http(502), _http(503)]
+    github = _RetryScriptGitHub(head="sha-5xx", script=list(errors), events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is errors[2]
+    assert events == ["post", "sleep:2", "read", "post", "sleep:8", "read", "post"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_final_attempt_with_retry_after_raises_last_error() -> None:
+    # PR-gate #392 @ 639dd9f objection: "if _submit_retry_delay returns a delay on the final
+    # attempt, the loop hits `continue`, falls out, and crashes with AssertionError". Every
+    # attempt here carries an honourable retry_after, so a delay IS available on the final
+    # attempt. The `attempt < _SUBMIT_MAX_ATTEMPTS` guard keeps the final attempt out of
+    # the retry branch: no third sleep/read, the LAST error is re-raised through the
+    # classifier, and the post-loop AssertionError is never reached.
+    events: list[str] = []
+    errors = [_http(429, retry_after=30) for _ in range(3)]
+    github = _RetryScriptGitHub(head="sha-ra-final", script=list(errors), events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is errors[2]
+    assert not isinstance(excinfo.value, AssertionError)
+    assert events == ["post", "sleep:30", "read", "post", "sleep:30", "read", "post"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_unknown_head_never_retries() -> None:
+    # UNKNOWN stops the loop: with no head_sha the guard can only answer UNKNOWN, so the
+    # driver does not retry at all -- decided before sleeping. One POST, no pinning.
+    events: list[str] = []
+    original = _http(503)
+    github = _RetryScriptGitHub(head=None, script=[original], events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is original
+    assert events == ["post"]
+    assert github.commit_ids == [None]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_guard_read_401_is_environment_terminal() -> None:
+    # A dead token discovered by the guard read goes through the same funnel -> exit 2,
+    # never a second POST.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    events: list[str] = []
+    github = _RetryScriptGitHub(
+        head="sha-g401",
+        script=[_http(503)],
+        read_exc=_http(401),
+        probe=401,
+        events=events,
+    )
+    _posted, post = _capture()
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert "submit-retry-guard" in str(excinfo.value)
+    assert events == ["post", "sleep:2", "read", "probe"]
+
+
+@pytest.mark.anyio
+async def test_submit_retry_guard_read_transient_stops_loop() -> None:
+    # A transient guard-read failure stops retrying (fail closed): no second POST.
+    events: list[str] = []
+    read_exc = _http(502)
+    github = _RetryScriptGitHub(
+        head="sha-g502", script=[_http(503)], read_exc=read_exc, events=events
+    )
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is read_exc
+    assert events == ["post", "sleep:2", "read"]
+
+
+@pytest.mark.anyio
+async def test_submit_terminal_first_attempt_no_retry_no_guard() -> None:
+    # TERMINAL on the first POST -> straight to classify + probe; no sleep, no guard read.
+    from spirrow_mindwire.github.client import TargetTerminalError
+
+    events: list[str] = []
+    github = _RetryScriptGitHub(
+        head="sha-t422",
+        script=[GitHubHTTPError("POST /reviews returned 422: PR is closed", status_code=422)],
+        events=events,
+    )
+    _posted, post = _capture()
+    with pytest.raises(TargetTerminalError):
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert events == ["post", "probe"]
+
+
+@pytest.mark.anyio
+async def test_submit_pins_commit_id_on_primary_and_fallback() -> None:
+    # Every POST carries commit_id=receipt.head_sha, the same-identity COMMENT fallback
+    # included, so a replay's landed() check sees the COMMENT on the right commit.
+    events: list[str] = []
+    github = _RetryScriptGitHub(
+        head="sha-pin",
+        script=[
+            GitHubHTTPError(
+                "POST /reviews returned 422: cannot approve your own pull request",
+                status_code=422,
+            ),
+            "ok",
+        ],
+        events=events,
+    )
+    _posted, post = _capture()
+    await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert github.commit_ids == ["sha-pin", "sha-pin"]
+    assert events == ["post", "post"]
+
+
+# --- PR-gate #392: the classifier RETURNS, callers raise explicitly ----------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status_code", "probe", "expected_type"),
+    [(401, 401, "EnvironmentTerminalError"), (422, 200, "TargetTerminalError")],
+)
+async def test_classify_exception_returns_typed_error_chained_to_original(
+    status_code: int, probe: int, expected_type: str
+) -> None:
+    # The helper must hand the exception back instead of raising it, so every call
+    # site's ``raise`` is the real exit. The typed variant keeps the ``from exc`` link.
+    from spirrow_mindwire.github import client as client_mod
+
+    class _Probe(_FakeGitHub):
+        async def probe_identity(self) -> int:
+            return probe
+
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"),
+        github=_Probe(ci=CiStatus(CiState.SUCCESS, "sha-classify", [])),
+    )
+    original = GitHubHTTPError(f"POST /reviews returned {status_code}", status_code=status_code)
+    result = await driver._classify_exception(_pr(), original, origin="submit")
+    assert isinstance(result, getattr(client_mod, expected_type))
+    assert result is not original
+    assert result.__cause__ is original
+    assert result.__suppress_context__ is True
+
+
+@pytest.mark.anyio
+async def test_classify_exception_returns_raw_retryable_unchanged() -> None:
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"),
+        github=_FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-classify-raw", [])),
+    )
+    original = GitHubHTTPError("POST /reviews returned 503", status_code=503)
+    result = await driver._classify_exception(_pr(), original, origin="submit")
+    assert result is original

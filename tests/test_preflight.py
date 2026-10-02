@@ -86,7 +86,23 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire import preflight as preflight_mod
 from spirrow_mindwire.preflight import PreflightError, preflight_gate
+
+
+@pytest.fixture(autouse=True)
+def _armed_secret_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: Any) -> None:
+    """Every test here is about P0/P1/P2, so P3 (secret guard armed) must pass.
+
+    The tmp ``repo_dir`` these tests use is not a git repo, so the default
+    ``core.hooksPath`` reader would fail P3 before P2/P1 are reached. Point it at
+    an armed hooks dir instead; P3's own behaviour is pinned in
+    ``tests/test_preflight_p3_hooks_armed.py`` against real git repos.
+    """
+    hooks = tmp_path_factory.mktemp("armed-hooks")
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setattr(preflight_mod, "_default_hooks_path_reader", lambda _r: str(hooks))
+
 
 # --------------------------------------------------------------------------- #
 # helpers

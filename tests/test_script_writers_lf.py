@@ -13,7 +13,8 @@ Two checks (Bohr msg-4426 §1; the static one kept by the human's decision after
    the test rejects is *not deciding*. Reads, binary writes and ``sys.stdout`` are not checked.
    A mode that cannot be read statically counts as a write (fail loud, not silent). Where the
    receiver of ``x.open(...)`` is misread (an AST cannot see types), a ``# newline-exempt:
-   <reason>`` comment on the call is the escape hatch (see ``_open_mode_pos``).
+   <reason>`` comment on the call is the escape hatch (see ``_open_mode_pos``). The check looks
+   at each call expression on its own: it resolves no names, so it has no scoping rules.
 2. **Behaviour.** The two writers of ``build_tierc_eval_fixture.py`` that were unpinned
    (corrections JSON, ``harvest.json``) produce files with no ``\\r`` byte.
 """
@@ -60,6 +61,9 @@ _MODULE_OPENS = frozenset({"gzip", "bz2", "lzma", "io", "codecs"})
 # Receivers whose ``open`` never yields a text stream (fd / archive handle).
 _NEVER_TEXT = frozenset({"os", "tarfile"})
 
+# Constructors whose result has ``Path.open(mode, ...)``.
+_PATH_CTORS = frozenset({"Path", "PosixPath", "WindowsPath"})
+
 EXEMPT_MARK = "# newline-exempt:"
 """Escape hatch for a call the heuristic misreads (e.g. ``zf.open("a.txt", "w")`` on a
 ``ZipFile``, which is binary and takes no ``newline=``). Put it on a line of the call, followed
@@ -72,14 +76,50 @@ def _is_mode_literal(node: ast.expr) -> bool:
     return all(m is not None and m and len(m) <= 4 and set(m) <= _MODE_CHARS for m in leaves)
 
 
+def _says_mode(node: ast.expr) -> bool:
+    """The argument reads as a mode on its face: it is named ``mode`` / ``*_mode``
+    (``mode``, ``file_mode``, ``args.mode``), or is a ternary with such a branch or a
+    mode-literal branch (``m if c else "w"``). Names are not resolved."""
+    if isinstance(node, ast.IfExp):
+        return _says_mode(node.body) or _says_mode(node.orelse)
+    if isinstance(node, ast.Constant):
+        return _is_mode_literal(node)
+    ident = getattr(node, "id", None) or getattr(node, "attr", None)
+    return isinstance(ident, str) and (ident.lower() == "mode" or ident.lower().endswith("_mode"))
+
+
+def _looks_like_path(node: ast.expr) -> bool:
+    """The receiver is a ``pathlib`` path on its face: ``Path(...)``, ``pathlib.Path(...)``, a
+    classmethod on the class (``Path.cwd()``, ``pathlib.Path.home()``) or ``a / b``. Names are not
+    resolved."""
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Div)
+    if isinstance(node, ast.Call):
+        ctor = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if ctor in _PATH_CTORS:
+            return True
+        # PR-gate #359 @ ff8af95: ``Path.cwd()`` names ``cwd``, not ``Path``; look at its owner.
+        if isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            return (getattr(owner, "id", None) or getattr(owner, "attr", None)) in _PATH_CTORS
+    return False
+
+
 def _open_mode_pos(func: ast.expr, args: list[ast.expr]) -> int | None:
     """Positional index of the mode for an ``open`` call, or ``None`` if it is not a file open.
 
     Builtin ``open`` and ``<module>.open`` take ``(file, mode)``; ``Path.open`` takes
     ``(mode, ...)``. For any other ``x.open(...)`` the receiver's type is not visible to an AST,
-    so the first argument decides: a mode-shaped literal means ``Path.open``; a non-mode literal
-    (``zf.open("a.txt", ...)``) or two or more positionals mean ``(file, mode)``. A lone
-    non-literal (``p.open(m)``) stays ``Path``-style, which flags it — ambiguous is loud.
+    so the call shape decides: a mode-shaped literal first means ``Path.open``; a non-mode
+    literal (``zf.open("a.txt", ...)``) or two or more positionals mean ``(file, mode)``.
+
+    A lone non-literal (``x.open(v)``) is ``(file,)`` with the default mode ``"r"`` -- a read,
+    not flagged (PR-gate advisory on #356 @ 417b3be: ``zf.open(file_var)``) -- unless the call
+    itself says otherwise: ``v`` reads as a mode (``_says_mode``) or ``x`` is a path expression
+    (``_looks_like_path``). Only the call expression is looked at. Nothing is followed to an
+    assignment, a parameter or an annotation, so there is no scoping to get wrong; the cost is
+    that ``m = "w"; p.open(m)`` and ``def f(p: Path, m): p.open(m)`` are NOT flagged. Name the
+    argument ``mode``, or pass ``newline=``, and the check sees it.
     """
     if isinstance(func, ast.Name):
         return 1 if func.id == "open" else None
@@ -94,7 +134,7 @@ def _open_mode_pos(func: ast.expr, args: list[ast.expr]) -> int | None:
         return 0
     if isinstance(args[0], ast.Constant) or len(args) >= 2:
         return 1
-    return 0
+    return 0 if _says_mode(args[0]) or _looks_like_path(func.value) else 1
 
 
 def _exempt(node: ast.Call, lines: list[str]) -> bool:
@@ -163,7 +203,57 @@ def test_every_script_text_writer_declares_newline() -> None:
         ('p.open("w")', True),
         ('p.open("a" if resume else "w", encoding="utf-8")', True),
         ('p.open("r" if x else "rb")', False),
-        ("p.open(m)", True),
+        # PR-gate advisory #356 @ 417b3be: a lone non-literal argument to an unknown receiver is
+        # a file name (a read), not a mode ...
+        ("p.open(m)", False),
+        ("zf.open(file_var)", False),
+        ("zf.open(member.filename)", False),
+        ("zf.open(model_path)", False),  # "mode" inside a longer word is not a mode name
+        ("def f(name):\n    return zf.open(name)", False),
+        # ... unless the call itself says otherwise: the argument reads as a mode ...
+        ("p.open(mode)", True),
+        ("p.open(args.mode)", True),
+        ("p.open(file_mode)", True),
+        ("p.open(MODE)", True),
+        ('p.open(m if x else "w")', True),
+        ('p.open(m if x else "r")', True),  # "r" marks a mode; ``m`` is unknown, so may write
+        ("p.open(mode if x else other)", True),
+        ('p.open(mode, newline="\\n")', False),
+        ("zf.open(name if x else other)", False),
+        ('zf.open(name if x else "export.txt")', False),
+        # ... or the receiver is a path expression
+        ("Path(x).open(m)", True),
+        ("pathlib.Path(x).open(m)", True),
+        ("Path.cwd().open(m)", True),  # PR-gate #359 @ ff8af95: classmethod constructors
+        ("Path.home().open(m)", True),
+        ("pathlib.Path.cwd().open(m)", True),
+        ("zf.cwd().open(m)", False),
+        ("(root / 'a.txt').open(m)", True),
+        ("(root // n).open(m)", False),
+        ("make(x).open(m)", False),
+        # Names are NOT resolved (human decision C on #359): pinned so the boundary is a
+        # decision, not an accident. The mode position is unknown, so these are not flagged.
+        ('m = "w"\np.open(m)', False),
+        ("def f(p: Path, m):\n    p.open(m)", False),
+        ("q = root / 'a.txt'\nq.open(m)", False),
+        # In a known mode position an unreadable mode is still a write, whatever it is bound to.
+        ('m = "r"\nopen(f, m)', True),
+        ("for m in modes:\n    open(f, m)", True),
+        ("def f(p, mode):\n    p.open(mode)", True),
+        # The shapes from PR-gate #359 @ b7e4f9f / operator msg-4791 / Einstein msg-4796 broke
+        # the name resolution that existed at b7e4f9f. That resolution is gone (decision C): the
+        # statements before the call are not read at all. These rows are flagged ONLY because the
+        # argument is named ``mode`` (``_says_mode``); they pin that no preceding statement can
+        # change the verdict on the call, not any tracking of reads vs writes.
+        ('mode = "w"\nd[mode] = 1\np.open(mode)', True),
+        ('mode = "w"\nmode.attr = 1\np.open(mode)', True),
+        ('mode = "w"\nmatch v:\n    case mode.X:\n        pass\np.open(mode)', True),
+        ('mode = "w"\nmatch v:\n    case mode(x=a):\n        pass\np.open(mode)', True),
+        ('d[(mode := "w")] = 2\np.open(mode)', True),
+        # The same shapes with an unnamed variable are NOT flagged: the binding is not followed
+        # (PR-gate #359 @ 4e9f593 pinned this boundary).
+        ('m = "w"\nd[m] = 1\np.open(m)', False),
+        ('d[(m := "w")] = 2\np.open(m)', False),
         ('p.open("r+")', True),
         # PR-gate #356 bb73652: module / archive opens take (file, mode), not (mode, ...).
         ('gzip.open(path, "rb")', False),

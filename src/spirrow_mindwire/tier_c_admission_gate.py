@@ -183,6 +183,23 @@ class BounceReason(StrEnum):
 ADMIT_LABELS: frozenset[str] = frozenset({"goal", "cost", "irreversible", "merge-protected"})
 
 
+def require_admitted(label: str, *, where: str) -> str:
+    """Return ``label`` unchanged, raising if the gate does not admit it.
+
+    For code outside this module that must emit a specific Tier-C label (a worked prompt
+    example, the relay's merge-request line). Called at import time, it turns "the gate
+    renamed or dropped a label that some producer still emits" from a silent drift into an
+    import failure (PR #365 PR-gate advisory, msg-4850). ``where`` names the caller, so the
+    error says which producer went stale.
+    """
+    if label not in ADMIT_LABELS:
+        raise RuntimeError(
+            f"{where}: Tier-C label {label!r} is not in "
+            f"tier_c_admission_gate.ADMIT_LABELS {sorted(ADMIT_LABELS)}"
+        )
+    return label
+
+
 #: The legacy labels the gate auto-rewrites to the new enum on the way
 #: through (msg-3646 D1, msg-3710 §1 legacy_auto). ``scope`` becomes
 #: ``goal``; ``billing`` becomes ``cost``. Every rewrite emits a

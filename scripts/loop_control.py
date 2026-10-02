@@ -2,8 +2,8 @@
 
 The conductor reads this state itself, every round, and stops on ``hold``. So why read it here too?
 Because the sweep's job is to decide whether a launch is worth paying for. Without this probe a held
-project still costs a process start, a venv resolve and an MCP round trip per tick, ~288 times a
-day, to be told something one cheap read already knew.
+project still costs a process start, a venv resolve and an MCP round trip per tick, every tick of
+the day, to be told something one cheap read already knew.
 
 **This probe is an optimisation, not the enforcement.** That distinction is what lets it fail open
 like the head probe: if it cannot read the state, the sweep launches anyway and the conductor's own

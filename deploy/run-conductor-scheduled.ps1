@@ -18,13 +18,13 @@
 # state every round and fails closed on it — which is why this probe fails open. See
 # Invoke-ControlProbe.
 #
-# Why (1)+(2) exist — this is what makes a 5-minute cadence affordable. A thread whose last message
+# Why (1)+(2) exist — this is what makes a short sweep interval affordable. A thread whose last message
 # is `NEXT: none` / `NEXT: human` is finished or waiting on Takahito, so the conductor exits at once
 # with `rounds=0`; that costs an MCP read and no inference, which is cheap but pointless. The
 # expensive case is a thread whose `NEXT:` names a role: the conductor DISPATCHES that role, the role
 # posts nothing, and the tick has burned an inference for no progress (measured 2026-08-02 on
-# T-track-b-seam-octree-retirement). Polling that every 5 minutes would be 288 wasted dispatches a
-# day. The head probe answers "did anything change?" from data — one `chatroom_my_unread` call, no
+# T-track-b-seam-octree-retirement). Polling that on every tick would be one wasted dispatch per tick —
+# (24h / tick interval) a day. The head probe answers "did anything change?" from data — one `chatroom_list_threads` call, no
 # message bodies, no inference, ~1 s for every thread at once — so unchanged threads are never
 # launched at all. This replaces an earlier cooldown-timer design: a timer guesses, the head id knows.
 #
@@ -44,6 +44,8 @@
 # Fix: SIGNAL and SCHEDULING are separated. A non-zero exit now
 #   (a) is DECLARED — the candidate is quarantined (record written + Discord notification), and
 #   (b) does NOT stop the sweep — the next candidate is tried, so downstream work still progresses.
+# (2026-10-01, T-retry-once-before-quarantine, decided msg-5424: a FIRST failure is retried once
+# on a later tick before (a) applies — see the retry-pending block below the quarantine block.)
 # The old sweep-break fail-safe is retained but re-aimed: only a FAILURE TO WRITE THE DECLARATION
 # breaks the sweep. That reason still holds — if we cannot even record what went wrong, we must not
 # quietly move on. See the quarantine block below (Test-QuarantineDerivedState / New-DailyDigest
@@ -54,6 +56,16 @@
 # a Tier-C denial) is already closed by PR #136 (OBL-MERGE-MECHANISM). This wrapper's job is to make
 # sure the NEXT unknown failure does not die in the same silent way — i.e., that "the sweep died"
 # announces itself, whatever the reason.
+
+# Launch budgets (T-sweep-starves-deep-candidates, Bohr msg-5588 / msg-5590). Precedence: this
+# argument > environment variable (MINDWIRE_SWEEP_LAUNCH_BUDGET_SEC / MINDWIRE_SWEEP_GATE_BUDGET_SEC)
+# > the default in deploy/lib/SweepFairness.ps1. 0 means "not passed". The scheduled task passes
+# neither, so the env var or the default applies; see docs/deploy.md "Launch fairness" for how
+# these relate to the task's trigger interval.
+param(
+    [int]$LaunchBudgetSeconds = 0,
+    [int]$GateBudgetSeconds = 0
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -68,7 +80,7 @@ $ErrorActionPreference = "Stop"
 #     quarantines are observed — that is a candidate-order problem, not a K problem.
 #
 #   $QuarantineEscalatedAfter      = 24h
-#     sweep cadence is 5min; 24h = 288 unattended ticks. Matches "the human reads the digest once a
+#     24h = (24h / tick interval) unattended ticks, whatever the sweep interval is. Matches "the human reads the digest once a
 #     day" — below that "escalated overnight" becomes routine and the tier loses meaning.
 #
 #   $QuarantineStaleAfter          = 7d
@@ -83,6 +95,11 @@ $QuarantineFailureBudget  = 2
 $QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $StarvedThreshold         = [TimeSpan]::FromHours(24)
+# Launch-wait starvation (T-sweep-starves-deep-candidates, msg-5586 §5): a live candidate whose
+# decide verdict has been LAUNCH for this long without being launched. Separate from
+# $StarvedThreshold, because "not evaluated" and "evaluated but never launched" are different
+# failures. W-2c's last_evaluated_at refresh hid the second one (#392 / #361 / #359, 2026-10-02).
+$LaunchWaitStarvedThreshold = [TimeSpan]::FromHours(6)
 
 # Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
 # surface in one section.
@@ -139,6 +156,10 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
+# T-retry-once-before-quarantine D-3: threads whose first failure is waiting for its one automatic
+# retry. Written only by this sweep (single writer), so it needs no merge-on-write. Deliberately
+# NOT folded into quarantine.json — see the retry-pending block below the quarantine block.
+$retryPendingStatePath = Join-Path $dataDir "state\retry-pending.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
@@ -164,6 +185,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
 # the testability seam, not a refactor.
 . (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+# Launch fairness (T-sweep-starves-deep-candidates): dispatch order, launch_wait_since, gate lane,
+# and the two-clock admission rule. Pure helpers; the dispatch loop below is a skeleton around them.
+. (Join-Path $PSScriptRoot 'lib/SweepFairness.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -200,8 +224,8 @@ if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path 
 # Self-contained: the trap references only `$logPath` (defined above), `$env:*` (process env),
 # and .NET/PS builtins. It does not call `Write-Log` / `Format-LogLine` / `Send-Notification`
 # (all defined below), and it does not touch state files (`$dataDir\state\*.json`). No dedup or
-# marker file: at a 5-min cadence, a rebooting-daemon-that-cannot-start deserves a ping every
-# 5 min (Einstein msg-3581 Obj-2), not a debounce that could suppress a live outage.
+# marker file: a rebooting-daemon-that-cannot-start deserves a ping every tick (Einstein
+# msg-3581 Obj-2), not a debounce that could suppress a live outage.
 #
 # Webhook lookup uses `$env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK` (process env, which Windows merges
 # from Machine ∪ User at process start), not `[Environment]::GetEnvironmentVariable(..., 'User')`
@@ -242,9 +266,9 @@ trap {
 }
 
 # --- logging ------------------------------------------------------------------------------------
-# At a 5-minute cadence the common tick is "nothing moved", and writing a dozen lines for that would
-# put ~3k lines of noise a day between the entries that matter. So detail is buffered and only
-# committed once the tick proves it did something; an idle tick collapses to a single line.
+# At a short sweep interval the common tick is "nothing moved", and writing a dozen lines for that
+# would bury the entries that matter under thousands of lines of noise a day. So detail is buffered
+# and only committed once the tick proves it did something; an idle tick collapses to a single line.
 $script:pendingLines = New-Object System.Collections.Generic.List[string]
 $script:logCommitted = $false
 
@@ -439,12 +463,19 @@ function Update-EvaluatedTimestamp {
     # way out so downstream readers always receive the same shape regardless of whether the value
     # came from disk or from an in-memory write earlier this tick.
     $firstSeen = $null
+    $launchWait = $null
     if ($State.ContainsKey($Key) -and $null -ne $State[$Key]) {
         $priorInstant = ConvertTo-UtcInstant $State[$Key].first_seen_at
         if ($priorInstant) { $firstSeen = $priorInstant.ToString("o") }
+        # launch_wait_since (T-sweep-starves-deep-candidates) is carried through unchanged. An
+        # evaluation is NOT a launch, and resetting the wait clock here is the exact masking that
+        # hid #392 / #361 / #359 from the old starvation metric.
+        $priorWait = ConvertTo-UtcInstant $State[$Key].launch_wait_since
+        if ($priorWait) { $launchWait = $priorWait.ToString("o") }
     }
     $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
     if ($firstSeen) { $row.first_seen_at = $firstSeen }
+    if ($launchWait) { $row.launch_wait_since = $launchWait }
     $State[$Key] = $row
 }
 
@@ -610,6 +641,212 @@ function Test-HoldForCandidate {
     return (Test-HoldObserved -Control $ownerControl)
 }
 
+# --- bounded probe launcher (T-parked-humans-probe-has-no-timeout, Bohr msg-5414 §1–§2) ----------
+#
+# WHY: every post-processing probe used to be `& uv run python <script>` (some fed via `$payload |`)
+# with NO upper bound on the wait. On 2026-10-01 the parked-humans probe sat at 0 CPU / 0 TCP for
+# 20+ minutes, the wrapper never returned, the scheduled task refused every later start
+# (0x800710E0), and every project's conductor stopped for ~77 minutes — silently. One probe that
+# can wait forever is a silent stop of the whole loop.
+#
+# THE CONTRACT (helper side — process control only):
+#   * The helper knows nothing about the target script's CLI. It takes argv, launches
+#     `uv run python <argv...>` from the repo root, and never writes to the child's stdin: stdin is
+#     redirected and CLOSED immediately after start, so the child and every grandchild inherit an
+#     already-closed pipe instead of the console or this process's stdin.
+#   * Payloads never go through stdin or argv. The CALLER writes structured data to a temp file
+#     (New-ProbeInputFile), passes the path with the target script's own file flag, and removes the
+#     file in `finally` (Remove-ProbeInputFile). argv only ever carries short scalars.
+#   * stdout / stderr are read with ReadToEndAsync so a full pipe cannot deadlock the child.
+#   * On timeout: Kill($true) — the whole tree (uv -> venv trampoline -> python) — then
+#     WaitForExit($KillGraceMs). NEVER the parameterless WaitForExit(): it also waits for the
+#     redirected streams to close, and a surviving grandchild holding the pipe would hang us again.
+#     The stream tasks are abandoned on this path for the same reason.
+#   * Every wait in here is bounded. On the normal path the stream tasks are awaited for at most
+#     $KillGraceMs after the root exited; a grandchild that outlived its parent and keeps the pipe
+#     open is killed and reported, not waited on.
+#
+# Returns @{ ok; timedOut; killConfirmed; code; stdout; stderr; elapsedSec; pid; error }.
+#   ok        $true when the process ran to completion within the bound (any exit code)
+#   timedOut  $true when the bound fired and the tree was killed
+#   error     $null, or a diagnostic for a failed start / unclosed streams / timeout
+# Each caller keeps its own fail-open / fail-closed policy for a non-ok result.
+#
+# Reusable as is by T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down (msg-5323 §3):
+# this is the inner net (bounded per probe); that thread's watchdog is the outer net.
+$HeadSkipProbeTimeoutSeconds = 120
+$HeadProbeTimeoutSeconds = 120
+$ParkedHumansProbeTimeoutSeconds = 120
+$ControlProbeTimeoutSeconds = 120
+$PredictedResourceProbeTimeoutSeconds = 120
+$GateBootstrapProbeTimeoutSeconds = 120
+$ProbeKillGraceMs = 5000
+$ProbeInputFilePrefix = 'mindwire-probe-'
+$ProbeInputFileMaxAgeMinutes = 60
+# Where probe input files live. %TEMP% in production; tests point it at a private directory so a
+# leaked file is countable.
+$ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+
+function Invoke-BoundedUvProbe {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][string]$Label,
+        [int]$KillGraceMs = $ProbeKillGraceMs,
+        [string]$WorkingDirectory = $repoRoot,
+        # The command prefix. Production always uses the default; tests substitute a fake probe
+        # launcher (e.g. pwsh -File) so the bound and the tree kill run without uv.
+        [string[]]$Launcher = @('uv', 'run', 'python')
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Launcher[0]
+    foreach ($a in @($Launcher | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
+    foreach ($a in $Arguments) { $psi.ArgumentList.Add([string]$a) }
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    # The streams are decoded as UTF-8 above; have python encode them that way too instead of the
+    # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
+    $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+
+    $result = @{
+        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
+        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    }
+    catch {
+        $result.error = "cannot start $($Launcher[0]): $($_.Exception.Message)"
+        return $result
+    }
+    try {
+        $result.pid = $proc.Id
+        # Closed before anything else runs: nothing in the tree can block on reading stdin.
+        try { $proc.StandardInput.Close() } catch { }
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit([int]([TimeSpan]::FromSeconds($TimeoutSeconds).TotalMilliseconds))) {
+            $result.timedOut = $true
+            try { $proc.Kill($true) } catch { }
+            # Bounded on purpose — see the header. The streams are NOT awaited on this path.
+            $result.killConfirmed = [bool]$proc.WaitForExit($KillGraceMs)
+            $sw.Stop()
+            $result.elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+            if (-not $result.killConfirmed) {
+                Write-Log "KILL-UNCONFIRMED pid=$($result.pid) label=$Label (root still alive ${KillGraceMs}ms after Kill(entireProcessTree))"
+            }
+            Write-Log "TIMEOUT label=$Label elapsed=$($result.elapsedSec)s pid=$($result.pid) (bound ${TimeoutSeconds}s, process tree killed)"
+            $result.error = "timed out after ${TimeoutSeconds}s (process tree killed)"
+            return $result
+        }
+
+        $result.code = $proc.ExitCode
+        $streamsDone = $false
+        try { $streamsDone = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), $KillGraceMs) }
+        catch { $streamsDone = $false }
+        $sw.Stop()
+        $result.elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if (-not $streamsDone) {
+            # The root exited but something it spawned still holds the pipe. Kill what is left of
+            # the tree and report — never wait on it.
+            try { $proc.Kill($true) } catch { }
+            Write-Log "STREAMS-UNCLOSED label=$Label pid=$($result.pid) exit=$($result.code) (output pipe still open ${KillGraceMs}ms after exit)"
+            $result.error = "process exited $($result.code) but its output streams did not close within ${KillGraceMs}ms"
+            return $result
+        }
+        $result.stdout = $stdoutTask.Result
+        $result.stderr = $stderrTask.Result
+        $result.ok = $true
+        return $result
+    }
+    finally {
+        if ($proc) {
+            try { if (-not $proc.HasExited) { $proc.Kill($true) } } catch { }
+            $proc.Dispose()
+        }
+    }
+}
+
+# Output lines of a bounded probe, stdout first then stderr — the same material the old `2>&1`
+# capture held, used for log / diagnostic tails. JSON is parsed from stdout only.
+function Get-ProbeOutputLines {
+    param([hashtable]$Result)
+    $lines = @()
+    foreach ($s in @($Result.stdout, $Result.stderr)) {
+        if ($s) { $lines += @($s -split "`r?`n" | Where-Object { $_ -ne '' }) }
+    }
+    return , $lines
+}
+
+function Get-ProbeJsonLine {
+    param([hashtable]$Result)
+    if (-not $Result.stdout) { return $null }
+    return ($Result.stdout -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+}
+
+# Write a probe payload to %TEMP%\mindwire-probe-<label>-<guid>.json (UTF-8, no BOM) and return
+# the path. The caller owns the file and MUST hand it to Remove-ProbeInputFile in `finally`.
+function New-ProbeInputFile {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Directory = $ProbeInputDirectory
+    )
+    $safe = ($Label -replace '[^A-Za-z0-9-]', '-')
+    $name = '{0}{1}-{2}.json' -f $ProbeInputFilePrefix, $safe, [guid]::NewGuid().ToString('N')
+    $path = Join-Path $Directory $name
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $Json, $utf8NoBom)
+    return $path
+}
+
+# Remove a probe input file: up to $Attempts tries $DelayMs apart (a just-killed child may still
+# hold the handle for a moment). A final failure is LOGGED — never thrown, never silenced. The
+# stale-file sweep at the next wrapper start is the backstop.
+function Remove-ProbeInputFile {
+    param([string]$Path, [int]$Attempts = 3, [int]$DelayMs = 200)
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    $lastError = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($i -lt $Attempts) { Start-Sleep -Milliseconds $DelayMs }
+        }
+    }
+    Write-Log "WARN probe temp file not removed: $Path ($lastError)"
+}
+
+# Startup backstop: delete probe input files older than $MaxAgeMinutes. Every such file finishes
+# its job in seconds, so an hour-old one is certainly debris. One that cannot be deleted (still
+# locked) is left for the next run; the failure is logged, not thrown.
+function Remove-StaleProbeInputFiles {
+    param(
+        [string]$Directory = $ProbeInputDirectory,
+        [int]$MaxAgeMinutes = $ProbeInputFileMaxAgeMinutes
+    )
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$MaxAgeMinutes)
+    $stale = @(Get-ChildItem -LiteralPath $Directory -Filter "$ProbeInputFilePrefix*.json" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff })
+    foreach ($f in $stale) {
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
+        catch { Write-Log "WARN stale probe temp file not removed: $($f.FullName) ($($_.Exception.Message)) — next run retries" }
+    }
+}
+
 # --- head-skip nomination predicate wiring (T-sweep-intake-and-quarantine-stalls) ---------------
 #
 # The skip rule now lives inside scripts/head_skip_decide.py (module: head_skip.py). The wrapper's
@@ -671,30 +908,34 @@ function Invoke-HeadSkipDecide {
     }
     $payload = ConvertTo-Json -InputObject @($items) -Depth 4 -Compress
 
+    # Same invocation path as every other probe (Invoke-BoundedUvProbe): `uv run python` from the
+    # repo root so the module import resolves against this checkout. Reusing the same interpreter
+    # path is deliberate (msg-1430 §W-3 tail): there is never a version where `decide` and
+    # `commit-launch` disagree on runtime. The batch goes through a temp file (`--candidates`),
+    # never stdin (T-parked-humans-probe-has-no-timeout). A timeout is a SYSTEMIC failure here
+    # like any other: ok=$false, and the caller fails closed (W-3 layer 2).
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            # Same invocation pattern as Invoke-HeadProbe / Invoke-ParkedHumansProbe: run under
-            # `uv run python` from the repo root so the module import resolves against this
-            # checkout. Reusing the same interpreter path is deliberate (msg-1430 §W-3 tail): if
-            # a future refactor needs a different python it needs to touch one place, not two,
-            # so there is never a version where `decide` and `commit-launch` disagree on runtime.
-            $raw = $payload | & uv run python $decideScript `
-                --project $Project --state-file $StateFilePath --mode $Mode 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payload -Label 'head-skip-decide'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-decide' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--project', $Project, '--state-file', $StateFilePath, '--mode', $Mode, '--candidates', $tmp)
     }
     catch {
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
 
+    if (-not $r.ok) {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide exited ${code}: $tail" }
     }
 
-    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    $json = Get-ProbeJsonLine -Result $r
     if (-not $json) {
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide produced no JSON on stdout" }
     }
@@ -716,8 +957,12 @@ function Invoke-HeadSkipDecide {
     return @{ ok = $true; verdicts = $verdictMap; error = $null }
 }
 
-# Invoke `head_skip_decide.py --mode commit-launch --payload <payload>` for one thread. Returns:
-#   @{ ok = $true / $false; error = $null / diagnostic }
+# Invoke `head_skip_decide.py --mode commit-launch --payload-file <tmp>` for one thread. Returns:
+#   @{ ok = $true / $false; error = $null / diagnostic; launches_same_head = <int>; head_msg_id = <string> }
+# `launches_same_head` / `head_msg_id` are read back from the record the CLI just committed and are
+# the T42 stall watchdog's input to the conductor (src/spirrow_mindwire/conductor/stall.py). An
+# unreadable record gives 0 / '' — which never stalls — rather than failing the commit: the commit
+# itself succeeded, and the watchdog is a fallback, not a reason to abort the tick.
 # Called BEFORE spawning the conductor session for the chosen candidate — that is the
 # "session-start-before write" contract that survives a forced kill (head_skip.py docstring).
 function Invoke-HeadSkipCommitLaunch {
@@ -735,26 +980,55 @@ function Invoke-HeadSkipCommitLaunch {
     }
     $payloadJson = ConvertTo-Json -InputObject $Payload -Depth 6 -Compress
 
+    # `--payload-file`, never inline `--payload`: a JSON string in argv passes through three
+    # quoting layers (pwsh -> uv -> venv trampoline -> python) that are not guaranteed to agree
+    # (T-parked-humans-probe-has-no-timeout, Bohr msg-5410). Fail-closed on timeout, as on any
+    # other systemic failure.
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $decideScript `
-                --state-file $StateFilePath --mode commit-launch --payload $payloadJson 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payloadJson -Label 'head-skip-commit-launch'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-commit-launch' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--state-file', $StateFilePath, '--mode', 'commit-launch', '--payload-file', $tmp)
     }
     catch {
         return @{ ok = $false; error = "head_skip commit-launch invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+    if (-not $r.ok) {
+        return @{ ok = $false; error = "head_skip commit-launch invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; error = "head_skip commit-launch exited ${code}: $tail" }
     }
-    return @{ ok = $true; error = $null }
+    $launchesSameHead = 0
+    $launchHeadMsgId = ''
+    $readWarning = $null
+    $jsonLine = @($raw | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*\{' }) | Select-Object -Last 1
+    if ($jsonLine) {
+        try {
+            $rec = ($jsonLine | ConvertFrom-Json).record
+            if ($null -ne $rec) {
+                if ($null -ne $rec.launches_same_head) { $launchesSameHead = [int]$rec.launches_same_head }
+                if ($null -ne $rec.head_msg_id_at_launch) { $launchHeadMsgId = [string]$rec.head_msg_id_at_launch }
+            }
+        }
+        catch { $launchesSameHead = 0; $launchHeadMsgId = ''; $readWarning = "record JSON unparseable: $($_.Exception.Message)" }
+    }
+    # A committed LAUNCH always carries launches_same_head >= 1 (head_skip.commit_launch). Reading 0
+    # back therefore means the record keys drifted from this reader (renamed in record_to_json) or
+    # the JSON line is missing — which would disable the T42 watchdog without an error. Fail OPEN
+    # (the launch still proceeds, count 0 = no watchdog) but LOUD: the caller logs this warning.
+    # The key names are pinned against record_to_json by tests/test_conductor_stall.py.
+    if ($null -eq $readWarning -and $launchesSameHead -lt 1) {
+        $readWarning = 'launches_same_head missing or < 1 in the committed record (key drift?)'
+    }
+    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning }
 }
 
-# Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
+# Invoke `head_skip_decide.py --mode commit-terminal --payload-file <tmp>` for one thread.
 # Returns: @{ ok = $true / $false; error = $null / diagnostic }
 #
 # Called AFTER the conductor session returns — the mirror of commit-launch, and deliberately the
@@ -791,18 +1065,23 @@ function Invoke-HeadSkipCommitTerminal {
     }
     $payloadJson = ConvertTo-Json -InputObject $payload -Depth 4 -Compress
 
+    # `--payload-file`, never inline `--payload` (see Invoke-HeadSkipCommitLaunch). Fail-open on
+    # timeout like any other failure here: ok=$false, the caller logs it.
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $decideScript `
-                --state-file $StateFilePath --mode commit-terminal --payload $payloadJson 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payloadJson -Label 'head-skip-commit-terminal'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-commit-terminal' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--state-file', $StateFilePath, '--mode', 'commit-terminal', '--payload-file', $tmp)
     }
     catch {
         return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+    if (-not $r.ok) {
+        return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; error = "head_skip commit-terminal exited ${code}: $tail" }
@@ -823,7 +1102,8 @@ function Get-HeadSkipMode {
 }
 
 # --- quarantine ---------------------------------------------------------------------------------
-# A quarantined thread has failed at least once and will not be launched again by this wrapper until
+# A quarantined thread has failed TWICE IN A ROW (its first failure was retried once — see the
+# retry-pending block below) and will not be launched again by this wrapper until
 # a human clears it (deploy/Clear-Quarantine.ps1). Records live in <data_dir>/state/quarantine.json,
 # one entry per `project/thread_id`. The head-skip state file $headSkipStatePath is separate —
 # different owner (the CLI), different concern (nomination-predicate observation), different life
@@ -838,15 +1118,22 @@ function Get-HeadSkipMode {
 #
 # WHAT THIS FILE STORES — the minimum needed to (a) explain what broke last time and (b) let a
 # human decide whether to clear. It does NOT store anything used to AUTO-CLEAR: there is no auto
-# clear path (Q3, spec/msg-814). Fields:
+# clear path (Q3, spec/msg-814). Q3 was narrowed on 2026-10-01 (T-retry-once-before-quarantine,
+# msg-5424 rule 2) to exempt only "a first failure is retried once automatically"; once a thread
+# is quarantined, release is still a human's explicit Clear-Quarantine and nothing else. Fields:
 #   state                  quarantined | escalated | stale (derived from first_failure_at)
-#   first_failure_at       ISO 8601, UTC — set once
-#   last_failure_at        ISO 8601, UTC — refreshed if the same fingerprint fails again
-#   consecutive_failures   how many times the quarantine has been re-hit (usually 1: quarantined
-#                          threads are SKIPPED, so a re-hit needs a manual re-run or a probe change)
+#   first_failure_at       ISO 8601, UTC — the FIRST of the failures that led here (carried over
+#                          from the retry-pending record, so the 24h escalation counts from it)
+#   last_failure_at        ISO 8601, UTC — the failure that triggered the quarantine
+#   consecutive_failures   how many non-zero exits in a row led to this quarantine: 2 on the
+#                          retry path (first failure + failed retry). Records written before
+#                          2026-10-01 carry 1 (they were quarantined on the first failure)
+#   first_attempt          { exit_code; error_code; stop_reason; failure_fingerprint } of the first
+#                          failure; absent on a record written before the retry path existed
 #   exit_code              the conductor's exit code at the failure
 #   stop_reason            the parsed `reason=...`, or $null if the run died before that line
-#   failure_fingerprint    { head; control } observed at the failure — see the fingerprint rule
+#   failure_fingerprint    { head; control } observed at the LATEST failure — see the fingerprint
+#                          rule (the first failure's is in first_attempt)
 #   session_log_path       path to today's sweep log, so the tail can be found in context
 #   session_log_tail       last $SessionLogTailLines of the conductor's stdout+stderr for this run
 #
@@ -884,14 +1171,21 @@ function New-QuarantineRecord {
         # Optional so all existing callers (the tests lift this function's AST directly
         # and call it with the old signature) keep working with an ``unknown`` default;
         # the sweep passes the resolved value explicitly.
-        [string]$FailureClass = 'unknown'
+        [string]$FailureClass = 'unknown',
+        # T-retry-once-before-quarantine D-3. All three optional, so the old call shape still
+        # produces the old record. The sweep's retry path passes them: last_failure_at = this
+        # (second) failure, consecutive_failures = 2, first_attempt = the retry-pending record's
+        # summary of the first failure. An empty -LastFailureAt means "same as first".
+        [string]$LastFailureAt = '',
+        [int]$ConsecutiveFailures = 1,
+        $FirstAttempt = $null
     )
 
-    return @{
+    $rec = @{
         state                = 'quarantined'
         first_failure_at     = $FirstFailureAt
-        last_failure_at      = $FirstFailureAt
-        consecutive_failures = 1
+        last_failure_at      = if ($LastFailureAt) { $LastFailureAt } else { $FirstFailureAt }
+        consecutive_failures = $ConsecutiveFailures
         exit_code            = $ExitCode
         stop_reason          = $StopReason
         failure_fingerprint  = @{ head = $FailureHead; control = $FailureControl }
@@ -899,6 +1193,215 @@ function New-QuarantineRecord {
         session_log_path     = $SessionLogPath
         session_log_tail     = $SessionLogTail
     }
+    if ($null -ne $FirstAttempt) { $rec['first_attempt'] = $FirstAttempt }
+    return $rec
+}
+
+# --- retry-pending (T-retry-once-before-quarantine) ---------------------------------------------
+# DECIDED by Takahito, msg-5424: a failed launch is retried ONCE automatically; only a failed retry
+# is quarantined. Design: Bohr msg-5434 (v1) + msg-5441 (v2) + msg-5449 (D-4 addendum), approved by
+# Einstein msg-5452. Why: on 2026-10-01, 8 of 9 quarantined threads had consecutive_failures=1
+# (adapter.turn_timeout / adapter.shutdown_failed / ClaudeCodeSdkDeliveryError / bare exit 1), and
+# each sat until an operator cleared it — up to a day for one transient SDK failure.
+#
+# D-1 WHEN: on a LATER TICK, through the ordinary decide -> commit-launch -> spawn path, never inside
+#   the same sweep. A transient cause tends to repeat if hit again at once; a turn_timeout retry
+#   would double the wait for every later candidate; and the ordinary path is what makes the retry
+#   count in head_skip's backoff and in T42's launches_same_head. So a pending thread is NOT
+#   excluded from decide (a quarantined one is). It is retried only when decide says LAUNCH; a
+#   DEFER / SKIP carries the pending record over unchanged.
+# D-2 WHAT COUNTS: every exit other than 0 and 2, exactly the set that used to quarantine. "Unknown
+#   failure -> quarantine" becomes "unknown failure -> one retry -> quarantine". No error_code is
+#   exempt. Exit 2 (environment, not the thread's fault) neither consumes nor clears a pending
+#   retry; a pending record held up by a long exit-2 outage is not timed out into quarantine
+#   (msg-5441: that would charge the environment's fault to the thread) — the digest marks it 24h+.
+# D-3 STATE: this file, not quarantine.json. Every quarantine.json reader (the ContainsKey skip,
+#   the digest, derived states, Clear-Quarantine, merge-on-write) treats every key as quarantined,
+#   so a pending record there would be mis-read by all of them. The failure count resets ONLY on
+#   an exit 0, never on a head change: a thread that posts and then fails in SDK teardown every
+#   time moves its head on every run, and would never be quarantined if a head change reset it.
+# D-4 SAME-HEAD SAFETY: the retry launch carries --retry-of; the conductor turns it into a notice
+#   for roles in RETRY_NOTICE_ROLES only (src/spirrow_mindwire/conductor/retry_notice.py). The
+#   upper bound is the existing machinery: T42 (threshold 3) and head_skip's backoff.
+# D-5 K=2: a first failure and a failed retry both count as "a failure this sweep". At K the sweep
+#   stops as before, but pending records are NOT promoted to quarantine — once a systemic outage
+#   clears, the next tick's retries recover them.
+# D-6 RECORD: the log prefixes `retry-scheduled` / `retry-recovered` / `retry-failed→quarantined`
+#   (fixed, grep-stable), and events[] for the digest's summary counts, pruned when a digest is
+#   delivered.
+#
+# File shape: { "pending": { "<project/thread>": <New-RetryPendingRecord> },
+#               "events":  [ { at; key; kind } ] }   kind: one of $RetryEventKinds
+
+$RetryEventKinds = @('retry-scheduled', 'retry-recovered', 'retry-failed-quarantined')
+
+# events[] is pruned when a FULL digest lands (the counts have then been seen). A host with no
+# webhook never prunes, so the list is also capped, newest kept. The cap only bounds the file; it
+# is far above any day's real count (one event per failure / recovery).
+$RetryEventsCap = 500
+
+function Add-RetryEvent {
+    param([hashtable]$RetryState, [string]$At, [string]$Key, [string]$Kind)
+    $all = @($RetryState.events) + @(@{ at = $At; key = $Key; kind = $Kind })
+    if ($all.Count -gt $script:RetryEventsCap) {
+        $all = @($all[($all.Count - $script:RetryEventsCap)..($all.Count - 1)])
+    }
+    $RetryState.events = $all
+}
+
+# Normalise whatever Get-JsonState returned into @{ pending = [hashtable]; events = [array] }.
+# Nested JSON objects come back as PSCustomObject; the pending map is converted to a hashtable so
+# ContainsKey / Remove work. The records themselves stay as they are (dot access works on both).
+function ConvertTo-RetryPendingState {
+    param([hashtable]$Raw)
+    $pending = @{}
+    $events = @()
+    if ($null -ne $Raw) {
+        $p = $Raw['pending']
+        if ($p -is [hashtable]) {
+            foreach ($k in @($p.Keys)) { $pending[$k] = $p[$k] }
+        }
+        elseif ($null -ne $p) {
+            foreach ($prop in $p.PSObject.Properties) { $pending[$prop.Name] = $prop.Value }
+        }
+        if ($null -ne $Raw['events']) { $events = @($Raw['events']) }
+    }
+    return @{ pending = $pending; events = $events }
+}
+
+function New-RetryPendingRecord {
+    param(
+        [string]$FirstFailureAt,
+        [int]$ExitCode,
+        [string]$StopReason,
+        [string]$ErrorCode,
+        [string]$FailureClass = 'unknown',
+        [string]$FailureHead,
+        [string]$FailureControl,
+        [string]$SessionLogPath
+    )
+    return @{
+        first_failure_at    = $FirstFailureAt
+        exit_code           = $ExitCode
+        stop_reason         = $StopReason
+        error_code          = $ErrorCode
+        failure_class       = $FailureClass
+        failure_fingerprint = @{ head = $FailureHead; control = $FailureControl }
+        session_log_path    = $SessionLogPath
+    }
+}
+
+# A first_failure_at that went through ConvertFrom-Json is a [DateTime]; one written this tick is a
+# string. Both must render as the same ISO 8601 UTC text, so neither the --retry-of value nor the
+# quarantine record's carried-over first_failure_at depends on which tick the record was born on.
+function ConvertTo-RetryIso {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '' }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime().ToString('o') }
+    return "$Value"
+}
+
+# The `--retry-of` value the sweep hands the conductor: "<error_code>@<first_failure_at>". A first
+# failure with no error_code (a bare exit 1) is named by its exit code, so the notice never says
+# "failed with nothing". Parsed on the Python side by conductor.retry_notice.parse_retry_of.
+function Get-RetryOfArgument {
+    param($Record)
+    $code = if ($Record.error_code) { "$($Record.error_code)" } else { "exit-$($Record.exit_code)" }
+    $at = ConvertTo-RetryIso $Record.first_failure_at
+    return "$code@$at"
+}
+
+# Apply one exit other than 0 / 2 to the retry state. Returns the action the caller must take:
+#   @{ action = 'retry-scheduled'; first = $null }       first failure: pending written, NO
+#                                                        quarantine, NO Discord alert (the log line
+#                                                        and the digest are the record)
+#   @{ action = 'quarantine'; first = <pending record> } the retry failed too: pending removed, and
+#                                                        the caller quarantines with `first` carried
+# The caller builds the quarantine record itself (it already holds every input
+# New-QuarantineRecord needs). Keeping this function to the state transition is what lets the
+# transition be tested in isolation.
+function Register-CandidateFailure {
+    param(
+        [hashtable]$RetryState,
+        [string]$Key,
+        [hashtable]$Record,
+        [datetime]$Now
+    )
+    $pending = $RetryState.pending
+    $at = $Now.ToUniversalTime().ToString('o')
+    if ($pending.ContainsKey($Key)) {
+        $first = $pending[$Key]
+        [void]$pending.Remove($Key)
+        Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-failed-quarantined'
+        return @{ action = 'quarantine'; first = $first }
+    }
+    $pending[$Key] = $Record
+    Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-scheduled'
+    return @{ action = 'retry-scheduled'; first = $null }
+}
+
+# Apply one exit 0. Returns $true when it cleared a pending retry (the caller logs retry-recovered).
+# Exit 0 is the ONLY thing that resets the count (D-3); a head change does not.
+function Register-CandidateSuccess {
+    param(
+        [hashtable]$RetryState,
+        [string]$Key,
+        [datetime]$Now
+    )
+    if (-not $RetryState.pending.ContainsKey($Key)) { return $false }
+    [void]$RetryState.pending.Remove($Key)
+    $at = $Now.ToUniversalTime().ToString('o')
+    Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-recovered'
+    return $true
+}
+
+# The `first_attempt` block a retry-path quarantine record carries (D-3 / D-5).
+function Get-RetryFirstAttempt {
+    param($Pending)
+    return @{
+        exit_code           = $Pending.exit_code
+        error_code          = $Pending.error_code
+        stop_reason         = $Pending.stop_reason
+        failure_fingerprint = $Pending.failure_fingerprint
+    }
+}
+
+# Does the --retry-of notice tell the truth on THIS launch? The notice says "the previous launch on
+# this same message failed" (conductor.retry_notice). That is only true when the head being launched
+# now is the head the first failure was observed on. D-3 deliberately keeps a pending retry across a
+# head move (a turn that posts and then fails in SDK teardown moves the head every run), so a
+# pending thread can be relaunched on a NEW head — and there the notice would claim a failed attempt
+# at a message nobody has attempted yet (PR #403 gate, objection 2). Strict: both heads must be
+# known and equal. An unknown head on either side cannot confirm "same message", so no notice.
+# The launch is still the thread's one retry either way (the count is head-independent, D-3); only
+# the notice is gated.
+function Test-RetryNoticeHeadMatches {
+    param($Record, [string]$ProbeHead)
+    if ($null -eq $Record -or [string]::IsNullOrWhiteSpace($ProbeHead)) { return $false }
+    $fp = $Record.failure_fingerprint
+    $failedHead = if ($null -eq $fp) { $null } elseif ($fp -is [hashtable]) { $fp['head'] } else { $fp.head }
+    if ([string]::IsNullOrWhiteSpace("$failedHead")) { return $false }
+    return ("$failedHead" -eq $ProbeHead)
+}
+
+# Drop pending retries for threads that are no longer on the sweep list (PR #403 gate, objection 1).
+# Only the candidate loop clears a pending record (exit 0) or promotes it (second failure); a thread
+# taken off sweep.json never reaches that loop again, so without this its record would sit in
+# retry-pending.json forever and render in every digest with no supported way to clear it
+# (Clear-Quarantine deliberately does not touch retry-pending). Same rule, same reason, as the
+# evaluated.json prune on $liveKeys. Losing the record is the safe direction: a thread put back on
+# the list and failing again starts from a first failure (one more retry), it is never quarantined
+# on a stale count. Returns the removed keys so the caller can log each one.
+function Remove-RetryPendingNotLive {
+    param([hashtable]$RetryState, [string[]]$LiveKeys = @())
+    $removed = @()
+    foreach ($k in @($RetryState.pending.Keys)) {
+        if ($LiveKeys -notcontains $k) {
+            [void]$RetryState.pending.Remove($k)
+            $removed += $k
+        }
+    }
+    return $removed
 }
 
 # T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
@@ -1124,19 +1627,19 @@ function Format-DurationDigest {
 # Cadence-advancing outcomes:
 #   * sent(ok)              — the full digest landed.
 #   * degraded(ok)          — the fixed-length fallback landed after a full 400.
-#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying every 5 minutes
+#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying on every tick
 #                             accomplishes nothing and would log-spam the daemon.
 #   * failed(deterministic-permanent) — the webhook is gone (401/403/404). PR-gate review
 #                             (2026-08-30): my Get-NotificationFailureClass docstring literally
 #                             said "Do NOT send a second POST" for this class, but the earlier
-#                             predicate ignored $class and refused to advance, spamming 404s every
-#                             5 minutes for the rest of the day. Advance the period so the
+#                             predicate ignored $class and refused to advance, spamming 404s on
+#                             every tick for the rest of the day. Advance the period so the
 #                             next-tick check sees "already sent" and stops.
 #   * failed(deterministic-payload) — only reached when the FULL digest 400s AND the degraded
 #                             fallback ALSO 400s. Retrying the same tick will fail the same way;
 #                             advance to prevent spam. (This branch is defensive — the degraded
 #                             message is fixed and small; if it 400s, something more fundamental
-#                             is broken and 5-minute spam does not help.)
+#                             is broken and per-tick spam does not help.)
 #
 # Held (returns $false):
 #   * failed(transient)     — network / 5xx / 429 / unknown. The next tick has a real chance to
@@ -1160,7 +1663,7 @@ function Test-DigestDelivered {
     }
     if ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded') { return $true }
     # A non-retryable failure class still advances cadence — the whole point of "non-retryable" is
-    # that a 2nd POST this tick, or a 3rd POST 5 minutes later, is guaranteed to fail the same way.
+    # that a 2nd POST this tick, or a 3rd POST one tick later, is guaranteed to fail the same way.
     # Held would mean spam. Advanced means "we tried once, we know it won't work, don't try again
     # until tomorrow"; ⚠ still lights up because Test-DigestFullSuccess is separate.
     if ($status -eq 'failed' -and ($class -eq 'deterministic-permanent' -or $class -eq 'deterministic-payload')) {
@@ -1206,7 +1709,7 @@ function Resolve-DigestSendResult {
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
 # is per-PERIOD, not per-interval. A period id is a wall-clock local date string; the predicate
-# "period P ≠ period Q" is jitter-immune because a 5-minute tick offset does not cross a date
+# "period P ≠ period Q" is jitter-immune because a tick-sized offset (minutes) does not cross a date
 # boundary. This is the whole point of the shift from `last_sent_at` (a timestamp) to
 # `last_sent_period` (a discrete id) — the jitter tolerance that Einstein msg-2104 proposed as a
 # fudge constant becomes structurally unnecessary.
@@ -1312,8 +1815,8 @@ function New-DegradedDigestMessage {
 # alert. Bucketed on the UTC date, NOT on the tick timestamp, because the failure this de-noise
 # addresses is not "same tick, twice" (impossible — the sweep breaks at K) but "adjacent ticks,
 # same underlying wave": during a real systemic outage, tick T fills its K=2 budget and stops; tick
-# T+5min skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
-# every one of the next 288 ticks does the same. A per-tick timestamp defeats the dedup and turns
+# T+1 skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
+# every remaining tick of the day does the same. A per-tick timestamp defeats the dedup and turns
 # the day into a Discord flood; a per-day bucket fires ONCE per day of an ongoing wave, then falls
 # silent. If the wave clears and returns days later, the day bucket has moved and the alert re-arms.
 # (Tier B naysayer, PR #138 round 2.)
@@ -1376,7 +1879,18 @@ function New-DailyDigest {
         # notify-health.json. Prepended above the header when set — non-null iff the last full
         # success is ≥ 2 periods old. Never affects the dedup signature: msg-2101 D-7 forbids
         # letting rendering-side ephemera reach any suppression predicate.
-        [string]$HealthWarning = $null
+        [string]$HealthWarning = $null,
+        # T-retry-once-before-quarantine D-6: the sweep's retry state
+        # (ConvertTo-RetryPendingState shape: @{ pending; events }). Default empty, so a caller
+        # that predates the retry path renders the same sections it always did.
+        [hashtable]$RetryState = @{ pending = @{}; events = @() },
+        # T-sweep-starves-deep-candidates (msg-5586 §5): launch-wait starvation, the output of
+        # Get-LaunchWaitStarved (deploy/lib/SweepFairness.ps1): objects { key; age }, oldest first.
+        # Computed by the caller so the log line and this section read the same list. The default
+        # is empty, so a caller that predates the metric gets an empty section.
+        [array]$LaunchWaitStarved = @(),
+        # The threshold the caller used to build $LaunchWaitStarved; only rendered in the header.
+        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6)
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -1443,6 +1957,42 @@ function New-DailyDigest {
         }
     }
 
+    # Retry-pending rows (T-retry-once-before-quarantine D-6 + msg-5441's addition). One row per
+    # thread whose first failure is waiting for its one retry, with its age since that failure.
+    # An entry at or past $QuarantineEscalatedAfter is marked `24h+` and sorts first. The threshold
+    # is deliberately the SAME value as the quarantine escalation (the same reason the header gives
+    # for $StarvedThreshold): two different "24h" lines would be a distinction nobody can explain.
+    # Display only — no state, no scheduling effect, no time-out into quarantine (msg-5441).
+    $retryList = @()
+    $retryPending = if ($RetryState -and $RetryState.pending) { $RetryState.pending } else { @{} }
+    foreach ($key in $retryPending.Keys) {
+        $prec = $retryPending[$key]
+        $pAt = ConvertTo-UtcInstant $prec.first_failure_at
+        $pSpan = if ($pAt) { $Now - $pAt } else { [TimeSpan]::Zero }
+        $overdue = ($pSpan -ge $script:QuarantineEscalatedAfter)
+        $pCode = if ($prec.error_code) { "$($prec.error_code)" } else { "exit=$($prec.exit_code)" }
+        $mark = if ($overdue) { "24h+ " } else { "" }
+        $retryList += [PSCustomObject]@{
+            Line       = "  $mark$key   $(Format-DurationDigest -Span $pSpan)   ($pCode)"
+            AgeSeconds = [int64]$pSpan.TotalSeconds
+            Overdue    = [int]$overdue
+        }
+    }
+    $retryList = @($retryList | Sort-Object -Property @{ Expression = 'Overdue'; Descending = $true },
+                                                       @{ Expression = 'AgeSeconds'; Descending = $true })
+    # Summary counts since the last full digest (events[] is pruned on a full delivery). Counted
+    # inline rather than via a helper so this renderer stays liftable on its own by the tests.
+    $retryCounts = @{ scheduled = 0; recovered = 0; quarantined = 0 }
+    foreach ($ev in @($(if ($RetryState) { $RetryState.events } else { @() }))) {
+        if ($null -eq $ev) { continue }
+        $evKind = if ($ev -is [hashtable]) { $ev['kind'] } else { $ev.kind }
+        switch ("$evKind") {
+            'retry-scheduled'          { $retryCounts.scheduled++ }
+            'retry-recovered'          { $retryCounts.recovered++ }
+            'retry-failed-quarantined' { $retryCounts.quarantined++ }
+        }
+    }
+
     # Starvation. Pivoted on $LiveKeys, NOT $EvaluatedState.Keys — the same reason the header of
     # this function spells out. A live key that is absent from $EvaluatedState (never launched) is
     # a legitimate starvation candidate; a state key that is not live (folded from the sweep list)
@@ -1475,13 +2025,19 @@ function New-DailyDigest {
     $escalatedList   = @($escalatedList   | Sort-Object -Property AgeSeconds -Descending)
     $quarantinedList = @($quarantinedList | Sort-Object -Property AgeSeconds -Descending)
     $starvedList     = @($starvedList     | Sort-Object -Property AgeSeconds -Descending)
+    # 起動待ち飢餓 rows. Already oldest-first (Get-LaunchWaitStarved sorts them).
+    $launchWaitList = @()
+    foreach ($lw in $LaunchWaitStarved) {
+        $launchWaitList += [PSCustomObject]@{ Line = "  $($lw.key)   $(Format-DurationDigest -Span $lw.age)"; AgeSeconds = [int64]$lw.age.TotalSeconds }
+    }
 
     # Build the compact summary line first (msg-2099 D-1: "1 行目で行動が決まる — 件数と最古の
     # 待ち日数"). Emitted even when both sections are 0 so the format is stable across empty and
     # non-empty days.
     $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
     $oldestQuarantineDays = if ($oldestQuarantineAge) { [int]($oldestQuarantineAge.TotalDays) } else { 0 }
-    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d"
+    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 起動待ち $($launchWaitList.Count) / 最古 ${oldestQuarantineDays}d" +
+               " / 再試行 $($retryCounts.scheduled) / 回復 $($retryCounts.recovered) / 再試行後隔離 $($retryCounts.quarantined)"
 
     $lines = @()
     # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
@@ -1638,6 +2194,19 @@ function New-DailyDigest {
             }
         }
         $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
+        # D7 (T-next-role-name-stands-down-to-human): a park that is not a decision says so on its
+        # row, so it is not read as one. The lane comes from scripts/parked_humans.py.
+        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+        if ($lane -eq 'operator_work') {
+            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            $suffix = "   — [operator 作業] $task"
+        }
+        elseif ($lane -eq 'misroute') {
+            $suffix = "   — [宛先誤り・再ルーティング待ち]"
+        }
+        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
+            $suffix = "   — [protocol 違反: Tier-C を operator に渡そうとした]$suffix"
+        }
         $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
     }
 
@@ -1656,8 +2225,22 @@ function New-DailyDigest {
     $staleHeadLine = "  [stale] — 直すか、スレッドを畳むか決めよ"
     $escHeadLine   = "  [escalated] — 24h 以上経過"
     $quarHeadLine  = "  [quarantined]"
+    # Emitted only when something is pending; the summary line carries the 0 every day.
+    $retryHeadLines = @()
+    if ($retryList.Count -gt 0) {
+        $retryHeadLines = @("", "再試行待ち [retry-pending]: $($retryList.Count) 件（1 回目の失敗後、次の tick 以降で 1 回だけ再試行）")
+    }
 
-    $parkedHeadLines = @("", "判断待ち: $($HumanParked.Count) 件")
+    # D7: the header counts decisions only; operator work and misroutes are named next to it.
+    $laneOf = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
+    $operatorCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'operator_work' }).Count
+    $misrouteCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'misroute' }).Count
+    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount
+    $parkedHeader = "判断待ち: $decisionCount 件"
+    if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
+        $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"
+    }
+    $parkedHeadLines = @("", $parkedHeader)
     if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
 
     # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
@@ -1670,6 +2253,12 @@ function New-DailyDigest {
     $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
     if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
 
+    # 起動待ち飢餓 (T-sweep-starves-deep-candidates §5): evaluated every tick but not launched.
+    # Emitted at 0 件 too, like 飢餓 above. It is a separate section because it is a separate
+    # failure: these candidates DO get evaluated, which is why 飢餓 could not show them.
+    $launchWaitHeadLines = @("", "起動待ち飢餓 (LAUNCH 判定のまま $([int]$LaunchWaitThreshold.TotalHours)h 以上起動されていない): $($launchWaitList.Count) 件")
+    if ($launchWaitList.Count -eq 0) { $launchWaitHeadLines += "  (該当なし)" }
+
     $footerLines = @(
         ""
         "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
@@ -1680,13 +2269,17 @@ function New-DailyDigest {
     # Read bottom-up. Each value is the exact number of characters the renderer will still emit
     # after the named section, with every later row-emitting section reduced to its floor. Passed
     # as -Reserve so a section physically cannot consume a later section's floor.
-    $reserveAfterStarved  = _LinesCost $footerLines
+    $reserveAfterLaunchWait = _LinesCost $footerLines
+    $reserveAfterStarved  = (_LinesCost $launchWaitHeadLines) +
+                            (_SectionFloorCost -Entries $launchWaitList -Indent '  ') + $reserveAfterLaunchWait
     $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
-    $reserveAfterQuar     = (_LinesCost $parkedHeadLines) +
+    $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
                             (_SectionFloorCost -Entries $parkedEntries -Indent '  ') + $reserveAfterParked
+    $reserveAfterQuar     = (_LinesCost $retryHeadLines) +
+                            (_SectionFloorCost -Entries $retryList -Indent '  ') + $reserveAfterRetry
     $reserveAfterEsc      = $reserveAfterQuar
     if ($quarantinedList.Count -gt 0) {
         $reserveAfterEsc += (_LinesCost @($quarHeadLine)) + (_SectionFloorCost -Entries $quarantinedList -Indent '  ')
@@ -1729,6 +2322,16 @@ function New-DailyDigest {
         }
     }
 
+    # 再試行待ち (T-retry-once-before-quarantine D-6). Between 隔離 and 判断待ち: it is the tier
+    # just below quarantine, and it gets the same floor discipline as every other section.
+    if ($retryList.Count -gt 0) {
+        $lines += $retryHeadLines
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $retryList -MaxLen $Budget -Reserve $reserveAfterRetry -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+    }
+
     # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
     # (msg-814 §5). Rows were built above; only the emission happens here.
     $lines += $parkedHeadLines
@@ -1760,6 +2363,15 @@ function New-DailyDigest {
         # defect: on 2026-09-03 it rendered 1 of 3 rows because 隔離 and 判断待ち had already run.
         $runLen = [ref]($lines -join "`n").Length
         $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve $reserveAfterStarved -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+    }
+
+    # 起動待ち飢餓 is now the last row-emitting section; only the footer follows it.
+    $lines += $launchWaitHeadLines
+    if ($launchWaitList.Count -gt 0) {
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $launchWaitList -MaxLen $Budget -Reserve $reserveAfterLaunchWait -RunningLen $runLen
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
@@ -1926,7 +2538,7 @@ function Send-Notification {
         # deliberately chosen not to run with Discord alerts, and a retry loop makes no sense: the
         # webhook will not appear on its own. The digest gate advances its clock on 'skipped' so
         # a webhook-less run does not permanently flood the log with "sending daily digest" and
-        # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
+        # "notification skipped" on every tick forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
         return @{ status = 'skipped'; class = 'no-webhook'; http_status = 0; error = $null }
     }
@@ -1982,7 +2594,7 @@ function Send-NotificationIfChanged {
         return
     }
     # The dedup record is intentional on every outcome (sent / skipped / any failure class). A
-    # failed send does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever,
+    # failed send does NOT undo the dedup, or a webhook outage would repeat on every tick forever,
     # retraining the channel into noise. A 'skipped' status (no webhook) is treated the same: mark
     # the signature so we do not spam the log with skip messages on every re-attempt.
     # (Endorsed by Tier B naysayer on round 2 of #138.)
@@ -1994,7 +2606,7 @@ function Send-NotificationIfChanged {
     # bypasses the check naturally — `Test-NotificationSuppressed` returns false when the recorded
     # $State[$Key] does not equal the new $Signature — so recording the failed signature never
     # blocks a new-signature alert from firing. Skipping the record produced the exact spam loop
-    # this path exists to prevent: same alert, same signature, 400 every 5 minutes, forever.
+    # this path exists to prevent: same alert, same signature, 400 on every tick, forever.
     #
     # The msg-2013 §3(b) concern ("永久に失われる") that D-3 was addressing is already covered by
     # msg-2099 D-4: the digest is a state sync and re-lists every currently-waiting thread daily,
@@ -2017,7 +2629,7 @@ function Send-NotificationIfChanged {
 #         Silence-on-failure is the failure mode the whole thread was opened to end (msg-1370 §1).
 #   I-3 — the composer is invoked ONCE per (project/thread_id, signature) stop. The dedup is done
 #         BEFORE the CLI is invoked, by consulting pending-decisions.json: same signature => cached
-#         envelope, no CLI call. That is what makes the composer affordable at a 5-minute cadence
+#         envelope, no CLI call. That is what makes the composer affordable at the sweep's cadence
 #         (measured 08-20: the same signature straddled several ticks; naive dispatch would burn
 #         one inference per tick).
 #
@@ -2260,8 +2872,8 @@ function Push-DecisionMaterial {
     )
 
     # DM-3: same dedup predicate as the notification. A same-signature repeat tick must not
-    # re-fire the PUT any more than it re-fires the notification. Without this gate a driven-by-
-    # tick 5-minute cadence would hammer the receiver with an unbounded PUT stream on every parked
+    # re-fire the PUT any more than it re-fires the notification. Without this gate the tick-
+    # driven cadence would hammer the receiver with an unbounded PUT stream on every parked
     # thread — the YAGNI-rejected "retry queue" fallen in through the back door.
     if (Test-NotificationSuppressed -State $NotifyState -Key $Key -Signature $Signature) {
         # Silent-by-design: the same tick will also suppress the notification below, and we already
@@ -2764,7 +3376,7 @@ function Format-DecisionMessage {
 #      whether the PUT succeeded, failed, or was skipped for freshness.
 #
 # The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
-# without it the PUT would fire on every 5-minute tick against a driven-by-human-response wait,
+# without it the PUT would fire on every tick against a driven-by-human-response wait,
 # which is the "無設計の再試行" msg-1445 §DM-3 rules out.
 function Send-HumanParkAlert {
     param(
@@ -2928,15 +3540,20 @@ function Invoke-HeadProbe {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try { $raw = & uv run python $probe --project $Project 2>&1; $code = $LASTEXITCODE }
-        finally { Pop-Location }
+        $r = Invoke-BoundedUvProbe -Label "head-probe-$Project" -TimeoutSeconds $HeadProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project)
+        if (-not $r.ok) {
+            Write-Log "head probe did not complete ($($r.error)) — failing open"
+            return $null
+        }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "head probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) { Write-Log "head probe produced no JSON — failing open"; return $null }
 
         $obj = $json | ConvertFrom-Json
@@ -2997,20 +3614,34 @@ function Invoke-ParkedHumansProbe {
     }
     $payload = @{ candidates = $items } | ConvertTo-Json -Depth 5 -Compress
 
+    # The candidates go through a temp file (`--input`), never stdin: the 2026-10-01 stall was
+    # this exact call sitting at 0 CPU for 20+ minutes with no bound (T-parked-humans-probe-has-
+    # no-timeout). Same `uv run` from the repo root as every other probe (Invoke-BoundedUvProbe).
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            # Same invocation pattern as Invoke-HeadProbe: run under `uv run` from the repo root
-            # so the module import resolves against this checkout's environment.
-            $raw = $payload | & uv run python $probe --project $Project 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payload -Label "parked-humans-$Project"
+        $r = Invoke-BoundedUvProbe -Label "parked-humans-$Project" -TimeoutSeconds $ParkedHumansProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project, '--input', $tmp)
     }
     catch {
         Write-Log "parked-humans probe [$Project] threw ($($_.Exception.Message)) — treating as no-parked (fail-closed)"
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "invocation failed: $($_.Exception.Message)" }); polled = 0 }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+
+    if ($r.timedOut) {
+        # Fail-closed (no parked) like every whole-poll failure, but NOT silent: the error row
+        # lands in the digest's fetch-error section (I-2). Before this, a hung probe produced
+        # nothing at all until an operator killed it by hand.
+        Write-Log "parked-humans probe [$Project] timed out after $($r.elapsedSec)s (bound ${ParkedHumansProbeTimeoutSeconds}s, pid=$($r.pid), killConfirmed=$($r.killConfirmed)) — treating as no-parked"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "timed out after ${ParkedHumansProbeTimeoutSeconds}s (process tree killed)" }); polled = 0 }
+    }
+    if (-not $r.ok) {
+        Write-Log "parked-humans probe [$Project] did not complete ($($r.error)) — treating as no-parked (fail-closed)"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "invocation failed: $($r.error)" }); polled = 0 }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
 
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
@@ -3018,7 +3649,7 @@ function Invoke-ParkedHumansProbe {
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "exit=${code}: $tail" }); polled = 0 }
     }
 
-    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    $json = Get-ProbeJsonLine -Result $r
     if (-not $json) {
         Write-Log "parked-humans probe [$Project] produced no JSON — treating as no-parked"
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = 'no JSON on stdout' }); polled = 0 }
@@ -3043,6 +3674,12 @@ function Invoke-ParkedHumansProbe {
             thread_id   = "$($p.thread_id)"
             head_msg_id = "$($p.head_msg_id)"
             token       = "$($p.token)"
+            # D7 (T-next-role-name-stands-down-to-human): the board lane, decided Python-side by
+            # spirrow_mindwire.conductor.parked_lane. A probe that predates the field reads as
+            # 'decision', which is how every park was listed before.
+            lane               = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+            operator_task      = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            protocol_violation = ($p.PSObject.Properties.Name -contains 'protocol_violation') -and [bool]$p.protocol_violation
         }
     }
     $errorsOut = @()
@@ -3076,15 +3713,20 @@ function Invoke-ControlProbe {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try { $raw = & uv run python $probe --project $Project 2>&1; $code = $LASTEXITCODE }
-        finally { Pop-Location }
+        $r = Invoke-BoundedUvProbe -Label "control-probe-$Project" -TimeoutSeconds $ControlProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project)
+        if (-not $r.ok) {
+            Write-Log "control probe did not complete ($($r.error)) — failing open (the conductor still enforces)"
+            return $null
+        }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "control probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) { Write-Log "control probe produced no JSON — failing open"; return $null }
         return ($json | ConvertFrom-Json)
     }
@@ -3122,22 +3764,28 @@ function Invoke-PredictedResourceProbe {
     }
 
     # Compact JSON with `Depth 3` is enough for `{ "repo_dirs": [str, ...] }` and keeps the
-    # single-line stdin small so we can see it in a log if we need to.
+    # single-line payload small so we can see it in a log if we need to. It goes through a temp
+    # file (`--input`), not stdin and not one `--repo-dir` per entry in argv
+    # (T-parked-humans-probe-has-no-timeout, Bohr msg-5410 / msg-5414 §3).
     $payload = @{ repo_dirs = $RepoDirs } | ConvertTo-Json -Depth 3 -Compress
 
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = $payload | & uv run python $probe --stdin-json 2>&1
-            $code = $LASTEXITCODE
+        $tmp = New-ProbeInputFile -Json $payload -Label 'predicted-resource'
+        $r = Invoke-BoundedUvProbe -Label 'predicted-resource' -TimeoutSeconds $PredictedResourceProbeTimeoutSeconds `
+            -Arguments @($probe, '--input', $tmp)
+        if (-not $r.ok) {
+            Write-Log "predicted-resource probe did not complete ($($r.error)) — failing open"
+            return $null
         }
-        finally { Pop-Location }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "predicted-resource probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) {
             Write-Log "predicted-resource probe produced no JSON — failing open"
             return $null
@@ -3148,6 +3796,7 @@ function Invoke-PredictedResourceProbe {
         Write-Log "predicted-resource probe failed ($($_.Exception.Message)) — failing open"
         return $null
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
 
     $map = @{}
     if ($null -eq $obj.resolutions) {
@@ -3278,14 +3927,15 @@ function Invoke-GateBootstrapTick {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $probe --project $Project --repo-dir $RepoDir 2>&1
-            $code = $LASTEXITCODE
+        $r = Invoke-BoundedUvProbe -Label "gate-bootstrap-$Project" -TimeoutSeconds $GateBootstrapProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project, '--repo-dir', $RepoDir)
+        if (-not $r.ok) {
+            Write-Log "gate-bootstrap [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
         }
-        finally { Pop-Location }
+        $code = $r.code
 
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) {
             Write-Log "gate-bootstrap [$Project]: no JSON on stdout (exit=$code) — failing open"
             return $null
@@ -3310,6 +3960,9 @@ function Invoke-GateBootstrapTick {
 $exitCode = 0
 try {
     Write-Log "=== scheduled conductor run starting (host $env:COMPUTERNAME, user $env:USERNAME) ==="
+    # tickElapsed's origin (T-sweep-starves-deep-candidates, msg-5590): the START of the tick, so
+    # LaunchBudgetSeconds bounds everything (sync, probes, decide, launches), not just the loop.
+    $tickStartUtc = Get-SweepNowUtc
 
     # Loaded before the deploy step, which already needs it to dedupe its own alerts.
     $notifyState = Get-JsonState -Path $notifyStatePath
@@ -3324,7 +3977,7 @@ try {
     # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
     # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
     # run-conductor.ps1 would be read from disk after the pull, and a sweep spanning two versions is
-    # not a thing worth debugging later. The cost is one 5-minute cycle of latency after a merge.
+    # not a thing worth debugging later. The cost is one tick of latency after a merge.
     $sync = Invoke-RepoSync
     if ($null -ne $sync) {
         if ($sync.status -eq 'updated') {
@@ -3356,6 +4009,17 @@ try {
                           "ループは現在チェックアウトされているコードで動き続けます（古い可能性があります）。")
         }
     }
+
+    # Backstop for probe input files a previous run could not remove (T-parked-humans-probe-has-
+    # no-timeout, Bohr msg-5414 §2). Before the sweep, so it runs every tick that sweeps.
+    Remove-StaleProbeInputFiles
+
+    # Launch budgets: argument > env > default, and GateBudgetSeconds < LaunchBudgetSeconds, or the
+    # tick aborts here as a configuration error (Resolve-SweepBudgets throws). Resolved AFTER the
+    # deploy step on purpose: a bad budget must not also stop the sync that could ship its fix.
+    $sweepBudgets = Resolve-SweepBudgets -LaunchArgument $LaunchBudgetSeconds -GateArgument $GateBudgetSeconds `
+        -LaunchEnv ([Environment]::GetEnvironmentVariable($script:SweepLaunchBudgetEnv)) `
+        -GateEnv ([Environment]::GetEnvironmentVariable($script:SweepGateBudgetEnv))
 
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
@@ -3484,6 +4148,8 @@ try {
     # contract. Only quarantine.json needs this — the head-skip state file has a single writer
     # (scripts/head_skip_decide.py) and is never edited by an operator during a sweep.
     $quarantineOriginalKeys = @($quarantineState.Keys)
+    # T-retry-once-before-quarantine D-3. Single writer (this sweep), so no original-keys snapshot.
+    $retryState = ConvertTo-RetryPendingState -Raw (Get-JsonState -Path $retryPendingStatePath)
     $nowUtc = [DateTime]::UtcNow
 
     # --- head-skip decide batch (Bohr msg-1430 §W-2) --------------------------------------------
@@ -3507,6 +4173,7 @@ try {
     # structurally invisible to the starvation metric and re-play msg-1427 §1's 12-hour silence
     # on the metric layer.
     $headSkipMode = Get-HeadSkipMode
+    $decideStartUtc = Get-SweepNowUtc
     $decideVerdicts = @{}
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         $projControl = $controlByProject[$proj]
@@ -3519,6 +4186,8 @@ try {
         $eligible = @()
         foreach ($c in $projCands) {
             if ($quarantineState.ContainsKey($c.key)) { continue }
+            # A retry-pending thread is deliberately NOT excluded (T-retry-once-before-quarantine
+            # D-1): its retry is fired only on a LAUNCH verdict, so backoff paces it like any launch.
             $hid = if ($null -ne $projHeads -and $projHeads.ContainsKey($c.thread_id)) { "$($projHeads[$c.thread_id])" } else { "" }
             $ctl = if ($null -ne $projControl) { "$($projControl.desired_state)" } else { "" }
             $eligible += @{ thread_id = $c.thread_id; head_msg_id = $hid; control_state = $ctl }
@@ -3539,6 +4208,8 @@ try {
             $decideVerdicts["$proj/$tid"] = $decideResult.verdicts[$tid]
         }
     }
+
+    $decideSeconds = Get-SweepElapsedSeconds -Since $decideStartUtc -Now (Get-SweepNowUtc)
 
     # W-2c: refresh the starvation clock for every candidate that received a decide verdict.
     # See Update-EvaluatedTimestamp's header for the full "which dispositions count as evaluated"
@@ -3586,6 +4257,12 @@ try {
     foreach ($k in @($evaluatedState.Keys)) {
         if ($liveKeys -notcontains $k) { [void]$evaluatedState.Remove($k) }
     }
+    # Same prune for retry-pending (Remove-RetryPendingNotLive's header). Report mode never writes
+    # retry-pending.json, so pruning the in-memory copy there changes nothing on disk.
+    foreach ($k in (Remove-RetryPendingNotLive -RetryState $retryState -LiveKeys $liveKeys)) {
+        Confirm-LogWorthKeeping
+        Write-Log "retry-dropped ${k}: no longer on the sweep list — pending retry discarded (not quarantined)"
+    }
 
     # Record first-seen for every live candidate that has never entered the file. This is the
     # timestamp the starvation clock ticks from when the candidate never actually launches (held on
@@ -3598,6 +4275,38 @@ try {
         }
     }
 
+    # --- launch fairness (T-sweep-starves-deep-candidates, Bohr msg-5592 / msg-5596) ------------
+    # launch_wait_since from the verdicts: SKIP clears it, LAUNCH sets it if absent, DEFER keeps it.
+    # Each candidate that actually launches clears it again in the loop. Report mode is a dry run
+    # that launches nothing, so it leaves the clock alone (otherwise every LAUNCH would accrue wait
+    # and show up as launch-wait starvation for a sweep that was never meant to launch).
+    if ($headSkipMode -ne 'report') {
+        Update-LaunchWaitFromVerdicts -EvaluatedState $evaluatedState -Verdicts $decideVerdicts -Now $nowUtc
+    }
+    # Dispatch order: non-launch candidates first (sweep.json order), then the gate lane, then the
+    # role lane, each lane oldest launch_wait_since first (Get-OrderedSweepCandidates). The dispatch
+    # loop below must iterate `$candidates` (tests/Test-SweepSequentiality.ps1 S2), so the ordered
+    # list is put in that variable for the loop and the sweep.json order is restored right after it.
+    # Everything after the loop that walks $candidates (the not-reached pass, the parked-humans poll)
+    # keeps sweep.json order.
+    $sweepOrderCandidates = $candidates
+    $candidates = Get-OrderedSweepCandidates -Candidates $sweepOrderCandidates -Verdicts $decideVerdicts `
+        -EvaluatedState $evaluatedState -Now $nowUtc
+    $gateCandidateCount = @($candidates | Where-Object {
+        $decideVerdicts.ContainsKey($_.key) -and (Get-SweepLane -Verdict $decideVerdicts[$_.key]) -eq 'gate' }).Count
+    $launchScheduler = New-LaunchScheduler -LaunchBudgetSeconds $sweepBudgets.launch -GateBudgetSeconds $sweepBudgets.gate
+    # loopElapsed's origin: decide time is excluded, so a slow decide cannot close the gate lane
+    # (Einstein msg-5589). The tick budget (tickElapsed) still includes it.
+    $loopStartUtc = Get-SweepNowUtc
+    $preLoopSeconds = Get-SweepElapsedSeconds -Since $tickStartUtc -Now $loopStartUtc
+    if ($preLoopSeconds -ge $sweepBudgets.launch) {
+        Confirm-LogWorthKeeping
+        $overheadWhat = if ($decideSeconds -ge $sweepBudgets.launch) { 'decide overhead exceeds launch budget' }
+                        else { 'pre-loop overhead exceeds launch budget' }
+        Write-Log (("WARN $overheadWhat (pre-loop={0:N1}s decide={1:N1}s launch budget={2}s) — nothing will be " +
+                    "launched this tick; fix the budget or the slow phase") -f $preLoopSeconds, $decideSeconds, $sweepBudgets.launch)
+    }
+
     $inner = Join-Path $PSScriptRoot "run-conductor.ps1"
     $didWork = $false
     $attempt = 0
@@ -3605,8 +4314,14 @@ try {
     $skipped = 0
     $held = 0
     $quarantineSkipped = 0     # candidates dropped because already quarantined
-    $newlyQuarantined = 0      # non-zero exits this tick
-    $quarantineErrorCodes = @()  # error_code per quarantine this tick ('' if none) — K alert only
+    $newlyQuarantined = 0      # failed retries quarantined this tick
+    # T-retry-once-before-quarantine D-5: K counts FAILURES (first failures + failed retries), not
+    # quarantines — a first failure no longer quarantines, but it is still a failure in this sweep.
+    $sweepFailures = 0
+    $retryScheduled = 0        # first failures put on retry-pending this tick
+    $retryRecovered = 0        # retries that exited 0 this tick
+    $retryLaunched = 0         # launches this tick that were a retry
+    $quarantineErrorCodes = @()  # error_code per failure this tick ('' if none) — K alert only
     $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
     $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
@@ -3713,7 +4428,16 @@ try {
             # every decide-visited candidate's clock. Repeating it would be a no-op but the
             # duplication would be a lie: it would suggest the refresh depends on the disposition,
             # which is the exact confusion the batch refresh exists to end.
-            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip SKIP (stop-token: $($v.token), head $probeHead), not launching"
+            # reason names WHICH stage skipped (stop-token / terminal-stop:* / thread-<status>);
+            # the token alone is empty on a status skip and would say nothing.
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip SKIP (reason=$($v.reason), token=$($v.token), head $probeHead), not launching"
+            # Stage 0 (T-sweep-admission-ignores-thread-status): a finished thread still listed in
+            # sweep.json is an operator bookkeeping slip. Log only — no notification, because it
+            # would fire every tick until the entry is removed. Grep for STALE SWEEP ENTRY.
+            if ("$($v.reason)" -like 'thread-*') {
+                $staleStatus = if ($v.PSObject.Properties.Name -contains 'thread_status') { "$($v.thread_status)" } else { '' }
+                Write-Log "STALE SWEEP ENTRY [$($cand.key)]: status=$staleStatus — sweep.json から外すこと"
+            }
             continue
         }
         if ($decision -eq 'defer') {
@@ -3737,8 +4461,26 @@ try {
             continue
         }
 
+        # Admission (T-sweep-starves-deep-candidates, msg-5596): checked immediately before each
+        # launch, against the two clocks. Every decision is recorded in $launchScheduler.attempts.
+        $lane = Get-SweepLane -Verdict $v
+        $admitNow = Get-SweepNowUtc
+        $admission = Request-LaunchAdmission -Scheduler $launchScheduler -Lane $lane -Key $cand.key `
+            -TickElapsed (Get-SweepElapsedSeconds -Since $tickStartUtc -Now $admitNow) `
+            -LoopElapsed (Get-SweepElapsedSeconds -Since $loopStartUtc -Now $admitNow)
+        if (-not $admission.admit) {
+            if ($admission.scope -eq 'break') {
+                Confirm-LogWorthKeeping
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — launch budget spent (lane=$lane), not launching it or anything after it (launch_wait_since kept)"
+                $breakReason = 'time-budget'
+                break
+            }
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — gate lane closed ($($admission.reason)), not launching (launch_wait_since kept)"
+            continue
+        }
+
         Confirm-LogWorthKeeping
-        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, reason=$($v.reason), token=$($v.token)) ---"
+        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, lane=$lane, admission=$($admission.reason), reason=$($v.reason), token=$($v.token)) ---"
         # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
         # forced kill (head_skip.py docstring, test #10). The record is written with
         # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
@@ -3756,6 +4498,9 @@ try {
             throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
                    "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
         }
+        if ($commitResult.warning) {
+            Write-Log "WARN T42 stall watchdog disabled for $($cand.key) this launch — $($commitResult.warning)"
+        }
 
         # All three must move together: the daemon reads the thread from [conductor] but the project
         # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
@@ -3765,7 +4510,33 @@ try {
         Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
 
         $launched++
-        $output = (& $inner *>&1) | ForEach-Object { "$_" }
+        # Past commit-launch, so this IS a launch: G counts it, and the wait clock clears.
+        Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'launched'
+        Clear-LaunchWait -EvaluatedState $evaluatedState -Key $cand.key
+        # T42 stall watchdog: hand the conductor the same-head launch count the commit above just
+        # recorded, pinned to the head it was counted on. The conductor stands down (posts STALLED,
+        # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
+        $stallArgs = @('--launches-same-head', "$($commitResult.launches_same_head)")
+        if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
+        # T-retry-once-before-quarantine D-4: a launch of a retry-pending thread IS its one retry.
+        # --retry-of lets the conductor warn roles in RETRY_NOTICE_ROLES (the implementer) that the
+        # failed launch may already have pushed / opened a PR / commented on this same head. It is
+        # passed only when the head IS that same head (Test-RetryNoticeHeadMatches): on a moved head
+        # the notice would claim a failed attempt at a message nobody has attempted yet.
+        if ($retryState.pending.ContainsKey($cand.key)) {
+            $retryLaunched++
+            $pendingForLaunch = $retryState.pending[$cand.key]
+            $retryOf = Get-RetryOfArgument -Record $pendingForLaunch
+            if (Test-RetryNoticeHeadMatches -Record $pendingForLaunch -ProbeHead "$probeHead") {
+                $stallArgs += @('--retry-of', $retryOf)
+                Write-Log "retry-launch $($cand.key): --retry-of $retryOf (same head $probeHead, launches_same_head=$($commitResult.launches_same_head))"
+            }
+            else {
+                $failedHead = $pendingForLaunch.failure_fingerprint.head
+                Write-Log "retry-launch $($cand.key): head moved ($failedHead -> $probeHead) — no --retry-of notice; still the one retry of $retryOf"
+            }
+        }
+        $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
@@ -3825,7 +4596,7 @@ try {
             # Signature is STATE-DERIVED (scope + repo + status_code), not time-derived. A
             # persistent env-terminal fault (revoked PAT, org-disabled repo) produces the same
             # signature on every sweep, so ``Send-NotificationIfChanged`` fires ONCE per state
-            # change instead of every 5 minutes. An earlier revision embedded ``$nowIso`` in
+            # change instead of every tick. An earlier revision embedded ``$nowIso`` in
             # the signature, which made every tick a "new" signature and defeated the whole
             # dedup — pr-review caught it on #280 @ 64bc63f. Restoring the state-derived form
             # is what makes the map-shape dedup work at all (:func:`Test-NotificationSuppressed`
@@ -3870,7 +4641,9 @@ try {
             continue
         }
 
-        # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
+        # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
+        # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
+        # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
         # BEHIND the broken candidate. The direct cause of that starvation is fixed elsewhere
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
@@ -3899,15 +4672,38 @@ try {
             # bug family the ledger was built to catch (row 6: ``$RepoRoot`` — 受け口はあるが誰も読まない).
             $failureClass = Get-FailureClass -SessionLogTail $tail -RepoRoot $repoRoot
             $quarantineReason = Get-QuarantineStopReason -Verdict $verdict
-            $quarantineErrorCodes += if ($verdict.error_code) { "$($verdict.error_code)" } else { '' }
-            $rec = New-QuarantineRecord `
+            $errorCode = if ($verdict.error_code) { "$($verdict.error_code)" } else { '' }
+            $quarantineErrorCodes += $errorCode
+            $sweepFailures++
+            $pendingRec = New-RetryPendingRecord `
                 -FirstFailureAt $nowIso -ExitCode $code -StopReason $quarantineReason `
+                -ErrorCode $errorCode -FailureClass $failureClass `
+                -FailureHead $probeHead -FailureControl $currentControl -SessionLogPath $logPath
+            $transition = Register-CandidateFailure -RetryState $retryState -Key $cand.key `
+                -Record $pendingRec -Now $nowUtc
+        }
+        if ($code -ne 0 -and $transition.action -eq 'retry-scheduled') {
+            # First failure: no quarantine and no Discord alert. The log line is the immediate
+            # record; the digest's summary counts and [retry-pending] section are the daily one.
+            $retryScheduled++
+            Write-Log "retry-scheduled $($cand.key): exit=$code reason=$quarantineReason error_code=$errorCode rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — retried once on a later tick, not quarantined"
+        }
+        elseif ($code -ne 0) {
+            # The retry failed too — quarantine, carrying the first failure over (D-3).
+            $first = $transition.first
+            $firstIso = ConvertTo-RetryIso $first.first_failure_at
+            if (-not $firstIso) { $firstIso = $nowIso }
+            $rec = New-QuarantineRecord `
+                -FirstFailureAt $firstIso -ExitCode $code -StopReason $quarantineReason `
                 -FailureHead $probeHead -FailureControl $currentControl `
                 -SessionLogPath $logPath -SessionLogTail $tail `
-                -FailureClass $failureClass
+                -FailureClass $failureClass `
+                -LastFailureAt $nowIso -ConsecutiveFailures 2 `
+                -FirstAttempt (Get-RetryFirstAttempt -Pending $first)
             $quarantineState[$cand.key] = $rec
             $newlyQuarantined++
-            Write-Log "quarantined $($cand.key): exit=$code reason=$quarantineReason rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — sweep CONTINUES (signal is the notification, not the stop)"
+            $firstCode = if ($first.error_code) { "$($first.error_code)" } else { "exit=$($first.exit_code)" }
+            Write-Log "retry-failed→quarantined $($cand.key): exit=$code reason=$quarantineReason error_code=$errorCode rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) (first failure: $firstCode at $firstIso) — sweep CONTINUES (signal is the notification, not the stop)"
 
             # Initial-quarantine notification. Fires once per newly-recorded quarantine. Signature
             # is the failure fingerprint so a re-quarantine after Clear-Quarantine (which drops the
@@ -3916,7 +4712,7 @@ try {
             $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
                                                  -SessionLogPath $rec.session_log_path `
                                                  -Key $cand.key
-            $notificationBody = "MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$quarantineReason)。" +
+            $notificationBody = "MindWire: **$($cand.key)** は再試行でも失敗したため隔離しました (exit=$code, reason=$quarantineReason; 1 回目: $firstCode)。" +
                                 "以後この tick からは skip されます。復帰するには " +
                                 "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
                                 "ダイジェストにも別掲されます。"
@@ -3930,26 +4726,38 @@ try {
             Send-NotificationIfChanged -State $notifyState -Key "__quarantine__/$($cand.key)" `
                 -Signature "${nowIso}:${code}:${quarantineReason}:${probeHead}" `
                 -Message $notificationBody
-
-            # K-budget short-circuit. Two quarantines in one sweep suggest a shared cause; keep
+        }
+        if ($code -ne 0) {
+            # K-budget short-circuit. Two failures in one sweep suggest a shared cause; keep
             # spending inferences past the second is the exact "keep bleeding" failure mode this
             # design refuses. The sweep breaks and fires a systemic-cause notification.
-            if ($newlyQuarantined -ge $QuarantineFailureBudget) {
-                Write-Log "quarantine budget K=$QuarantineFailureBudget hit in one sweep — stopping (systemic cause suspected)"
+            # T-retry-once-before-quarantine D-5: counted on FAILURES (first failures included),
+            # and a K hit does NOT promote the pending ones to quarantine — after a systemic wave
+            # clears, the next tick's retries recover them instead of leaving two for a human.
+            if ($sweepFailures -ge $QuarantineFailureBudget) {
+                Write-Log "failure budget K=$QuarantineFailureBudget hit in one sweep ($newlyQuarantined quarantined, $retryScheduled retry-scheduled) — stopping (systemic cause suspected)"
                 # Day-bucketed signature (see Get-SystemicAlertSignature): one alert per UTC day of
-                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed every
-                # 5 minutes — exactly the "retraining the channel into noise" mode this file avoids
+                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed on
+                # every tick — exactly the "retraining the channel into noise" mode this file avoids
                 # elsewhere.
                 Send-NotificationIfChanged -State $notifyState -Key "__quarantine_systemic__" `
-                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
-                    -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の quarantine が発生しました。" +
+                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $sweepFailures) `
+                    -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の失敗が発生しました " +
+                              "(隔離 $newlyQuarantined / 再試行待ち $retryScheduled)。" +
                               "systemic な原因の可能性が高いため、この tick を打ち切ります。" +
+                              "再試行待ちは隔離に格上げせず、次の tick 以降で再試行します。" +
                               "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。" +
                               (Get-SystemicCauseHint -Codes $quarantineErrorCodes))
                 $breakReason = 'k-budget-hit'
                 break
             }
             continue
+        }
+        # Exit 0 — the ONLY thing that clears a pending retry (D-3). Exit 2 already `continue`d
+        # above without touching retry-pending, so it neither consumes nor clears a retry.
+        if (Register-CandidateSuccess -RetryState $retryState -Key $cand.key -Now $nowUtc) {
+            $retryRecovered++
+            Write-Log "retry-recovered $($cand.key): exit=0 reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — retry-pending cleared"
         }
         # Fail-safe: no parseable verdict on a zero-exit means we do not actually know whether work
         # happened. That is a declaration failure — the whole point of the record-on-fail path above
@@ -3970,8 +4778,8 @@ try {
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
-        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`
-        # or `self_handoff_to_human` run parks the thread until its head moves — head_skip's
+        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`,
+        # `self_handoff_to_human` or `stalled_to_human` (T42) run parks the thread until its head moves — head_skip's
         # Stage 1b then SKIPs it instead of DEFERring, which is what ends the 72-retry spin
         # measured on T-human-outage-degrade-close-only. Every other reason clears the state.
         $terminalResult = Invoke-HeadSkipCommitTerminal -ThreadId $thread `
@@ -4006,9 +4814,14 @@ try {
 
         if ($verdict.rounds -gt 0) {
             $dispositions[$cand.key] = 'worked'
-            Write-Log "thread did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — sweep done"
             $didWork = $true
-            break
+            # Gate lane: work does not end the sweep (msg-5586 §2). Role lane: it does, as before.
+            if ((Get-PostRunAction -Lane $lane -Rounds $verdict.rounds) -eq 'break') {
+                Write-Log "thread did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — sweep done"
+                break
+            }
+            Write-Log "gate did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — gate lane continues"
+            continue
         }
         $dispositions[$cand.key] = 'no-work'
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
@@ -4019,11 +4832,32 @@ try {
     # "we did not ask." Different failure modes, different fixes (candidate order vs. probe gap vs.
     # sweep break). Not-reached does NOT reset the evaluation timestamp — that is how a permanently
     # backed-up sweep shows up as starvation instead of "healthy and idle."
+    $candidates = $sweepOrderCandidates
     foreach ($cand in $candidates) {
         if (-not $dispositions.ContainsKey($cand.key)) {
             $dispositions[$cand.key] = 'not-reached'
             $notReached++
         }
+    }
+
+    # Tick timing (msg-5590): one line every tick, so the budgets can be tuned against measurements.
+    $tickEndUtc = Get-SweepNowUtc
+    $tickSeconds = Get-SweepElapsedSeconds -Since $tickStartUtc -Now $tickEndUtc
+    $loopSeconds = Get-SweepElapsedSeconds -Since $loopStartUtc -Now $tickEndUtc
+    $gateClosedNote = if ($launchScheduler.gate_closed_reason) { ", gate lane closed: $($launchScheduler.gate_closed_reason)" } else { '' }
+    Write-Log ("tick elapsed={0:N1}s decide={1:N1}s loop={2:N1}s budget=gate {3}/launch {4}s (gate launched {5}/{6} of {7} candidate(s){8})" -f `
+        $tickSeconds, $decideSeconds, $loopSeconds, $sweepBudgets.gate, $sweepBudgets.launch,
+        $launchScheduler.gate_launched, $launchScheduler.gate_max, $gateCandidateCount, $gateClosedNote)
+    if ($tickSeconds -gt $sweepBudgets.launch) {
+        # Admission bounds when a launch may START, not how long it runs, so a launch admitted near
+        # the budget can take the tick past it. Said loudly so the numbers get revisited.
+        Confirm-LogWorthKeeping
+        Write-Log ("WARN tick exceeded launch budget (elapsed={0:N1}s > launch {1}s)" -f $tickSeconds, $sweepBudgets.launch)
+    }
+    $invariantViolation = Test-GateAdmissionInvariant -Scheduler $launchScheduler -GateCandidateCount $gateCandidateCount
+    if ($invariantViolation) {
+        Confirm-LogWorthKeeping
+        Write-Log "WARN gate admission invariant violated: $invariantViolation"
     }
     Write-Log ("dispositions: " + (($dispositions.Keys | Sort-Object | ForEach-Object { "$($_)=$($dispositions[$_])" }) -join ', '))
 
@@ -4038,6 +4872,11 @@ try {
         -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
     Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
     Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
+    # retry-pending.json: single writer (this sweep), so a plain write. Report mode launches
+    # nothing and therefore changed nothing here; it writes nothing either (msg-5434 test list).
+    if ($headSkipMode -ne 'report') {
+        Save-JsonState -Path $retryPendingStatePath -State $retryState
+    }
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
     # collapses to one line), so the metric is visible without waiting for the digest. The digest is
@@ -4047,6 +4886,15 @@ try {
     if ($starved.Count -gt 0) {
         Confirm-LogWorthKeeping
         Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
+    }
+    # Launch-wait starvation (msg-5586 §5): evaluated, LAUNCH, and still not launched. A separate
+    # line from the one above, because it is a separate failure.
+    $launchWaitStarved = Get-LaunchWaitStarved -EvaluatedState $evaluatedState -LiveKeys $liveKeys `
+        -Now $nowUtc -Threshold $LaunchWaitStarvedThreshold
+    if ($launchWaitStarved.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        Write-Log ("launch-wait starved threads (>=$(Format-DurationDigest -Span $LaunchWaitStarvedThreshold) LAUNCH without a launch): " +
+                   (($launchWaitStarved | ForEach-Object { "$($_.key) ($(Format-DurationDigest -Span $_.age))" }) -join ', '))
     }
 
     # T-decision-request-composer S4 (D-32). Poll for threads currently parked on a human
@@ -4101,7 +4949,7 @@ try {
     # Period + delivery-time drops both by CONSTRUCTION — no jitter constant, no drift math.
     #
     # Webhook-less runs (msg-2106 D-3 preservation of #138 R5): still advance last_sent_period so
-    # the loop does not re-enter this branch every 5 minutes. But `last_full_success_period` is NOT
+    # the loop does not re-enter this branch on every tick. But `last_full_success_period` is NOT
     # advanced — a channel that does not exist has not been informed, and the ⚠ predicate is
     # deliberately blind to whether the reason is "no webhook" or "webhook 400s" (both mean the
     # human has not gotten the digest).
@@ -4135,7 +4983,9 @@ try {
                 -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
                 -ParkedPollErrors $parkedPollErrors `
                 -Budget $DigestBudget `
-                -HealthWarning $healthWarning
+                -HealthWarning $healthWarning `
+                -RetryState $retryState `
+                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
@@ -4207,6 +5057,13 @@ try {
             # contents, so ⚠ must stay lit until a full digest lands.
             if (Test-DigestFullSuccess -Result $result) {
                 $notifyHealth['last_full_success_period'] = $currentPeriod
+                # T-retry-once-before-quarantine D-6: the summary counts are "since the last digest
+                # the human actually read", so events[] is pruned only on a FULL delivery — a
+                # degraded one did not show them.
+                if ($headSkipMode -ne 'report' -and @($retryState.events).Count -gt 0) {
+                    $retryState.events = @()
+                    Save-JsonState -Path $retryPendingStatePath -State $retryState
+                }
             }
             Save-JsonState -Path $notifyHealthPath -State $notifyHealth
         }
@@ -4214,9 +5071,9 @@ try {
 
     # Summary line categories, ranked so the most-informative wording wins. Order matters:
     # quarantine and K-hit are louder than a plain idle sweep.
-    if ($newlyQuarantined -gt 0) {
+    if ($newlyQuarantined -gt 0 -or $retryScheduled -gt 0 -or $retryRecovered -gt 0) {
         Confirm-LogWorthKeeping
-        Write-Log "sweep summary: $newlyQuarantined newly quarantined, $quarantineSkipped skipped-as-quarantined, $held held, $skipped head-skipped, $launched launched, $notReached not-reached"
+        Write-Log "sweep summary: $newlyQuarantined newly quarantined, $retryScheduled retry-scheduled, $retryRecovered retry-recovered, $retryLaunched retry-launched, $($retryState.pending.Count) retry-pending, $quarantineSkipped skipped-as-quarantined, $held held, $skipped head-skipped, $launched launched, $notReached not-reached"
     }
     elseif ($held -gt 0 -and ($held + $skipped + $quarantineSkipped) -eq $candidates.Count) {
         # Nothing ran, and at least part of the reason was a deliberate HOLD. Said separately from
@@ -4225,7 +5082,7 @@ try {
         Write-QuietSummary "nothing to run ($held/$($candidates.Count) held by loop control, $skipped heads unchanged, $quarantineSkipped quarantined)"
     }
     elseif ($skipped -eq $candidates.Count) {
-        # The steady state at a 5-minute cadence. One line, no notification: by definition nothing
+        # The steady state at a short sweep interval. One line, no notification: by definition nothing
         # changed, so there is nothing new to tell anyone.
         Write-QuietSummary "no thread moved ($skipped/$($candidates.Count) heads unchanged) — nothing to do"
     }

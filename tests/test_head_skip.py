@@ -164,14 +164,14 @@ def test_stop_tokens_return_skip(token: str) -> None:
         "nonesuch",  # substring of "none" but a different token
     ],
 )
-def test_only_the_two_stop_tokens_return_skip(token: str) -> None:
+def test_only_the_stop_tokens_return_skip(token: str) -> None:
     """Property-style: every non-STOP_TOKENS token stays out of the SKIP branch.
 
     This is the closed-set invariant that fixes the failure mode this module was written for:
     the head-skip cache cannot silently swallow a live thread by mistaking its handoff for a
-    stop. The set is fixed at ``{none, human}`` at import time (:data:`STOP_TOKENS`) and any
-    change requires updating this test — a code refactor cannot expand the skip surface by
-    accident.
+    stop. The set is fixed at ``{none, human, operator}`` at import time (:data:`STOP_TOKENS`)
+    and any change requires updating this test — a code refactor cannot expand the skip
+    surface by accident.
     """
     verdict = decide(
         now=_T0,
@@ -183,10 +183,12 @@ def test_only_the_two_stop_tokens_return_skip(token: str) -> None:
     assert verdict.decision is not Decision.SKIP
 
 
-def test_stop_tokens_frozen_set_is_exactly_none_and_human() -> None:
+def test_stop_tokens_frozen_set_is_exactly_none_human_and_operator() -> None:
     # A separate pin so a would-be expander of the closed set has to update this test AND remove
     # the invariant reason above. Frozenset equality would be brittle to reorderings; use set().
-    assert set(STOP_TOKENS) == {"none", "human"}
+    # ``operator`` joined with T-next-role-name-stands-down-to-human D5 (msg-5416 / msg-5429), and
+    # is conditional on a well-formed head (tests/test_next_role_alias_and_operator.py).
+    assert set(STOP_TOKENS) == {"none", "human", "operator"}
 
 
 # --- 3. fail-open on UNRESOLVED -----------------------------------------------------------------
@@ -354,7 +356,8 @@ def test_progressed_launches_have_zero_delay() -> None:
 
     This is the explicit-fix side of removing ``MIN_GAP``: the progress path has no design-time
     floor. The bound on this path is the ENVIRONMENT (Windows scheduler IgnoreNew + 1-candidate-
-    per-run + 15-25 min measured session length -> 2-4 launches/hour/thread), not the predicate.
+    per-run + the wall-clock length of a session; measurements are in ``head_skip``'s module
+    docstring and ``BASE`` comment), not the predicate.
     Pinning this test is what forces a future change that reintroduces a delay on the progress
     path to be a deliberate, visible change — the human-approved invariant "a progressing thread
     never backs off" is right here.

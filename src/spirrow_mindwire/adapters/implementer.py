@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -73,13 +74,22 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
 )
 
+from ..claude_code.tools.ledger_server import (
+    LEDGER_ALLOWED_TOOLS,
+    LEDGER_SERVER_NAME,
+    build_ledger_mcp_server,
+)
 from ..conductor.handoff import build_handoff_protocol_block
+from ..dispatcher.event_log import spawn_ready_event
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
     AdapterHealthError,
     AdapterSpawnError,
+    AdapterSpawnTimeoutError,
 )
+from ..magickit.client import McpToolCaller
+from ..magickit.ledger_notes import PROCESS_TASK_LOCKS, LedgerHead, LedgerNotes, TaskLocks
 from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
@@ -99,6 +109,7 @@ from ..value_objects import (
 )
 from . import _sdk_job_hook
 from ._cli_selection import cli_selection_kwargs
+from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
     JobState,
@@ -110,6 +121,8 @@ from .claude_code_sdk import (
     SdkTurnTimeoutError,
     _default_client_factory,
     _drain_reply,
+    _emit_observational,
+    _note_cc_session_uuid,
     _SdkClient,
     _shutdown,
 )
@@ -118,7 +131,9 @@ from .claude_code_sdk import (
 # conductor-4h). Both are conservative — smaller than the Task Scheduler's 4 h
 # wall by a wide margin, larger than any healthy turn. Overridable via the
 # constructor + env vars for operational tuning.
-_DEFAULT_SPAWN_TIMEOUT_SECONDS = 60.0
+# The spawn budget is the shared connect budget: the proposer uses the same number (Bohr msg-5053
+# D-4), and defining this one from it is what keeps the two from drifting.
+_DEFAULT_SPAWN_TIMEOUT_SECONDS = DEFAULT_CONNECT_TIMEOUT_SECONDS
 _DEFAULT_TURN_TIMEOUT_SECONDS = 30 * 60.0  # 30 minutes — a long turn is fine,
 # a session that eats hours is what we exist to break.
 
@@ -292,12 +307,16 @@ class ImplementerSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the implementer adapter (§3.4)."""
 
 
-class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError):
+class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError, AdapterSpawnTimeoutError):
     """``spawn`` exceeded its init time budget (v12 B-4).
 
     Distinct subclass so the dispatcher / conductor can tell "the SDK never
     connected" from "the SDK connected but errored". Error code:
     ``adapter.spawn_timeout``.
+
+    Also an :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` (Bohr
+    msg-5053 D-2): that Port-level class is what the conductor catches to retry
+    the spawn once, so it never has to import this one.
     """
 
 
@@ -346,6 +365,12 @@ class _Session:
     # on close, so a double-cleanup does not attempt to close the same handle
     # twice (which on Windows can destroy a recycled handle).
     job_state: JobState | None = None
+    # T45 (loop side): the Claude Code session UUID from ``SystemMessage(init)``;
+    # distinct from the handle's mindwire ULID ``session_id`` (Bohr msg-4884 §2).
+    cc_session_uuid: str | None = None
+    # The message this session is answering, for the ledger tools' provenance header. ``None``
+    # when the adapter was built without a ledger (``ledger_mcp=None``).
+    ledger_head: LedgerHead | None = None
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -452,8 +477,16 @@ class ImplementerSdkAdapter:
         turn_timeout_seconds: float | None = None,
         sdk_executable_path: str | None = None,
         job_module: Any = None,
+        ledger_mcp: McpToolCaller | None = None,
+        ledger_locks: TaskLocks | None = None,
     ) -> None:
         self._cwd = Path(cwd)
+        # Ledger notes (thread T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down, Bohr
+        # msg-5296 / msg-5300): when a Magickit client is given, each session gets the in-process
+        # ``mindwire-ledger`` server — two tools, pinned to the thread's project, append-only — and
+        # never the raw Magickit server. ``None`` attaches nothing.
+        self._ledger_mcp = ledger_mcp
+        self._ledger_locks = ledger_locks if ledger_locks is not None else PROCESS_TASK_LOCKS
         # Inference MUST be routed via Lexora (env spec §4): require an explicit
         # base URL; never fall back to the SDK default (api.anthropic.com).
         self._inference_base_url = (
@@ -524,7 +557,36 @@ class ImplementerSdkAdapter:
         # is the real ``_sdk_job_hook`` module.
         self._job_module = job_module if job_module is not None else _sdk_job_hook
 
-    def _make_options(self) -> ClaudeAgentOptions:
+    def _ledger_for(
+        self, thread_ref: ThreadRef, ctx: SpawnContext
+    ) -> tuple[LedgerHead, Any] | None:
+        """Build this session's ledger server, pinned to ``thread_ref.project_id``.
+
+        ``None`` when the adapter has no Magickit client. The returned head is updated by
+        :meth:`deliver_event` so the provenance header names the message being answered.
+        """
+        if self._ledger_mcp is None:
+            return None
+        head = LedgerHead()
+        notes = LedgerNotes(
+            mcp=self._ledger_mcp,
+            project_id=thread_ref.project_id,
+            thread_id=thread_ref.thread_id,
+            on_event=ctx.on_event_log,
+            head=head,
+            locks=self._ledger_locks,
+        )
+        return head, build_ledger_mcp_server(notes)
+
+    def _make_options(self, *, ledger_server: Any = None) -> ClaudeAgentOptions:
+        mcp_servers = dict(self._mcp_servers)
+        allowed_tools = list(self._allowed_tools)
+        if ledger_server is not None:
+            mcp_servers[LEDGER_SERVER_NAME] = ledger_server
+            # Listed for symmetry with the other roles' wiring. The bound is not here: this
+            # session runs ``bypassPermissions`` with no ``can_use_tool`` (see the module
+            # docstring), so what limits it is that the server exposes only these two tools.
+            allowed_tools.extend(LEDGER_ALLOWED_TOOLS)
         env = {
             "ANTHROPIC_BASE_URL": self._inference_base_url,
             # Force UTF-8 in the CLI subprocess and any Python the agent spawns
@@ -544,8 +606,8 @@ class ImplementerSdkAdapter:
             # built-ins (SDK 0.1.77 → ``--tools ""``), so this list is what the
             # session can call — and, with no per-call guard, the only limit on it.
             "tools": list(_IMPLEMENTER_BUILTIN_TOOLS),
-            "allowed_tools": self._allowed_tools,
-            "mcp_servers": self._mcp_servers,
+            "allowed_tools": allowed_tools,
+            "mcp_servers": mcp_servers,
             # Isolation (T37 #4) — this role had it first; the definition now lives
             # in ``_session_isolation`` so all three roles cannot drift apart.
             **session_isolation_kwargs(),
@@ -595,7 +657,8 @@ class ImplementerSdkAdapter:
                 "MINDWIRE_IMPLEMENTER_BASE_URL): the implementer must route inference "
                 "via Lexora, never api.anthropic.com directly (ADR-07 §2.4 / env spec §4)"
             )
-        options = self._make_options()
+        ledger = self._ledger_for(thread_ref, ctx)
+        options = self._make_options(ledger_server=None if ledger is None else ledger[1])
 
         now = datetime.now(UTC)
         session = _Session(
@@ -606,6 +669,7 @@ class ImplementerSdkAdapter:
             state=SessionState.IDLE,
             last_active_at=now,
             options=options,
+            ledger_head=None if ledger is None else ledger[0],
         )
         session_registered = False
         client: _SdkClient | None = None
@@ -630,6 +694,7 @@ class ImplementerSdkAdapter:
             client = self._client_factory(options)
             job_handle_for_ctx = session.job_state.handle if session.job_state is not None else None
             token = _JOB_HANDLE_CTX.set(job_handle_for_ctx)
+            connect_started = time.monotonic()
             try:
                 await asyncio.wait_for(
                     client.connect(),
@@ -665,6 +730,15 @@ class ImplementerSdkAdapter:
             )
             self._sessions[handle] = session
             session_registered = True
+            # T43 (Bohr msg-4888): connect() returned inside the spawn budget, so the
+            # handle is usable. That is the whole readiness signal — no second clock,
+            # no deferred delivery. It stands in for "listening" only while the session
+            # has no out-of-process MCP server; tests/test_role_tool_surface.py pins
+            # that. A session that connected and then never answers is the stall
+            # watchdog's case (conductor.stalled, T42), not this one's.
+            await _emit_observational(
+                ctx, spawn_ready_event(handle, after_s=time.monotonic() - connect_started)
+            )
             return handle
 
         except TimeoutError as exc:
@@ -678,7 +752,9 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkSpawnTimeoutError(
                 f"adapter.spawn_timeout: SDK spawn did not connect inside "
                 f"{self._spawn_timeout_seconds}s for role {role.value} on "
-                f"thread {thread_ref.thread_id}"
+                f"thread {thread_ref.thread_id}",
+                adapter_id=self.adapter_id,
+                timeout_s=self._spawn_timeout_seconds,
             ) from exc
         except ImplementerSdkSpawnError:
             # Already a spawn error — pass through so the caller sees our
@@ -736,6 +812,8 @@ class ImplementerSdkAdapter:
             # instance self-filter (Gap-2 (b), I3 v2.2): drop our own echoed post
             # (author == our instance_id, e.g. "implementer-1"), not the bare role.
             return
+        if session.ledger_head is not None:
+            session.ledger_head.msg_id = payload.msg_id
 
         session.state = SessionState.PROCESSING
         # B-1 bounded turn drain (v12) — hand ``_drain_reply`` the turn
@@ -743,11 +821,13 @@ class ImplementerSdkAdapter:
         # command cannot hold the drain open past our wall. A hit here
         # raises ``SdkTurnTimeoutError`` which we wrap as
         # ``adapter.turn_timeout``.
+        observed_uuid: list[str] = []
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body = await _drain_reply(
                 session.client,
                 turn_timeout_seconds=self._turn_timeout_seconds,
+                on_init=observed_uuid.append,
             )
             await session.ctx.on_reply(
                 ReplyDraft(
@@ -776,6 +856,10 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
+        finally:
+            # T45: recorded on success AND failure (a timed-out turn is the one whose
+            # transcript is wanted).
+            await _note_cc_session_uuid(session, handle, next(iter(observed_uuid), None))
 
         session.last_active_at = datetime.now(UTC)
         session.state = SessionState.IDLE

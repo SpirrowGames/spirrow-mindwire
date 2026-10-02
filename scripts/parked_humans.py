@@ -40,7 +40,8 @@ Contract with the wrapper:
           "project": "spirrow-voxelworld",
           "polled": 2,
           "parked": [
-            {"thread_id": "T-a", "head_msg_id": "msg-2242", "token": "human"}
+            {"thread_id": "T-a", "head_msg_id": "msg-2242", "token": "human",
+             "lane": "decision", "operator_task": "", "protocol_violation": false}
           ],
           "errors": [
             {"thread_id": "T-c", "reason": "chatroom_get_thread failed: ..."}
@@ -51,6 +52,11 @@ Contract with the wrapper:
     author's ``NEXT:`` line for observability); membership in ``parked`` is decided from
     :attr:`HandoffKind.HUMAN`, which is the case-insensitive reserved sentinel. Non-human
     handoffs (a role, ``none``, absent, ``pr-review``) simply do not appear in ``parked``.
+
+    ``lane`` is :class:`~spirrow_mindwire.conductor.parked_lane.ParkedLane` (``decision`` /
+    ``operator_work`` / ``misroute``); ``operator_task`` is the work on a valid ``NEXT: operator``
+    (``""`` otherwise); ``protocol_violation`` is ``true`` only on the Tier-C-plus-operator
+    stand-down, which stays in the ``decision`` lane (D7 supplement, msg-5428).
 
 Fail direction — the opposite of head_skip's cache, on purpose. head_skip fails OPEN into a
 launch (one cheap MCP call beats a silent park). This poll fails CLOSED on the parked side:
@@ -83,6 +89,7 @@ import sys
 from typing import Any
 
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
+from spirrow_mindwire.conductor.parked_lane import classify_parked
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 
@@ -159,11 +166,17 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
             continue
         handoff = resolve_handoff(body, {})
         if handoff.kind is HandoffKind.HUMAN:
+            # D7 (T-next-role-name-stands-down-to-human): which board lane this park belongs in.
+            # Decided by the grammar owner's modules, never re-spelled here or in the wrapper.
+            lane = classify_parked(body)
             parked.append(
                 {
                     "thread_id": thread_id,
                     "head_msg_id": actual_msg_id,
                     "token": handoff.token or "",
+                    "lane": lane.lane.value,
+                    "operator_task": lane.operator_task or "",
+                    "protocol_violation": lane.protocol_violation,
                 }
             )
     return {

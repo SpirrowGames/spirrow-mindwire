@@ -77,6 +77,7 @@ from spirrow_mindwire.decider.state import (
     SimpleTurn,
     state_builder,
 )
+from spirrow_mindwire.decider.verdict import TierCV2Verdict, TierCVerdictKind
 from spirrow_mindwire.decider.wire import state_to_wire
 from spirrow_mindwire.tier_c_admission_gate import (
     AdmissionDecision,
@@ -106,6 +107,10 @@ class Decider(Protocol):
     def is_target(self, state: DecisionState) -> bool: ...
 
     async def evaluate(self, state: DecisionState) -> DecisionResult | None: ...
+
+    async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
+        """D-4' G3 (veto): evaluate a naysayer's proceed handoff; ``None`` = not called."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -298,7 +303,7 @@ def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
 
 def is_tierc_entry(
     *,
-    author_wrote_next_human: bool,
+    author_requested_human: bool,
     author_role: Role | None,
 ) -> bool:
     """The Tier-C hook's entry condition (msg-4237 DECIDED 2c-1; endorsed msg-4238 / msg-4240;
@@ -307,8 +312,9 @@ def is_tierc_entry(
     Called only for a head the Conductor resolved to ``HandoffKind.HUMAN`` (``_decider_hook``
     returns earlier for any other kind). Both must hold:
 
-    * the author wrote ``NEXT: human`` themself — a field/body mismatch that resolved to HUMAN is
-      a conductor safety valve, not someone asking the human (kept by msg-4360);
+    * the author named the human themself (body ``NEXT: human`` or field ``human`` — the
+      :attr:`Handoff.author_requested_human` fact) — a field/body mismatch that resolved to HUMAN
+      is a conductor safety valve, not someone asking the human (kept by msg-4360);
     * the author's roster role is in :data:`TIERC_ENTRY_ROLES` (``proposer`` / ``implementer`` /
       ``naysayer``) — by role, not by persona name, so a renamed agent does not silently drop
       out. An off-roster author (e.g. ``pr-gate-relay``) has no roster role and never enters:
@@ -324,7 +330,7 @@ def is_tierc_entry(
     Checked at the hook's entry, before anything else: a non-target turn gets no admission-gate
     computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike.
     """
-    return author_wrote_next_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
+    return author_requested_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
 
 
 def routed_from_route(
@@ -451,10 +457,15 @@ async def run_tierc_hook(
     target_role: Role | None,
     spawn_blocked: bool,
     naysayer_role: Role,
-    author_wrote_next_human: bool,
+    author_requested_human: bool,
     now: datetime | None = None,
+    retry_lookup: RetryLookup = never_retry,
 ) -> DecisionResult | None:
     """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
+
+    ``retry_lookup`` is the gate's RETRY store. ``never_retry`` while the gate is compute-only;
+    under ``[tierc_gate] mode = "enforce"`` the Conductor passes the live decisions-log lookup so
+    the ``gate_result`` the Decider sees is the verdict the enforced gate acts on (msg-5143).
 
     ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` are ``_route``'s return values
     for this turn
@@ -464,7 +475,7 @@ async def run_tierc_hook(
     """
     head = messages[-1] if messages else None
     if head is None or not is_tierc_entry(
-        author_wrote_next_human=author_wrote_next_human,
+        author_requested_human=author_requested_human,
         author_role=_roster_role(roster, head.author),
     ):
         return None
@@ -487,6 +498,7 @@ async def run_tierc_hook(
             body=head.content,
             author=head.author,
             now=at,
+            retry_lookup=retry_lookup,
         )
         state = state_builder(
             turn_from_messages(
@@ -541,6 +553,103 @@ async def run_tierc_hook(
     return dr
 
 
+def proceed_vetoed(dr: DecisionResult | None) -> bool:
+    """G3's single reading of a proceed result, as a **veto** (T-pr-2b-3-human-identity-delegate
+    msg-5219 Takahito "a" decide, Bohr msg-5227 R2): vetoed iff the Decider was called, produced
+    an actionable verdict (``EVALUATED`` ∧ ``IN_GATE`` — msg-4184: acting code reads
+    ``actionable_verdict`` only), that verdict is a tierc-v2 one, and its kind is ``CONFIRMED``
+    ("ask the human": ``should_ask_human >= tierc_v2_ask_min``, pre-registered 0.60).
+
+    Everything else is *not vetoed* — G3 then stays out of the way and G1 / G2 decide:
+    ``None`` (not called / off), a null / malformed / transport-error outcome, a v1 verdict,
+    ``UNSURE`` (the grey zone) and ``LIKELY_NOT``."""
+    if dr is None:
+        return False
+    av = dr.actionable_verdict
+    return isinstance(av, TierCV2Verdict) and av.kind is TierCVerdictKind.CONFIRMED
+
+
+def veto_ask_score(dr: DecisionResult | None) -> float | None:
+    """The ``ask_score`` of an actionable v2 result, for the log line and the redirect notice;
+    else ``None``. Reads ``actionable_verdict`` like every acting path (msg-4184 §2-3); the raw
+    verdict still reaches the log through ``decision_result_to_dict``."""
+    if dr is None:
+        return None
+    av = dr.actionable_verdict
+    return av.ask_score if isinstance(av, TierCV2Verdict) else None
+
+
+async def run_proceed_veto(
+    decider: Decider | None,
+    *,
+    thread_id: str,
+    round_index: int,
+    roster: Mapping[str, Role],
+    messages: Sequence[ThreadMessage],
+) -> tuple[bool, float | None]:
+    """D-4' G3 as a veto (T-pr-2b-3-human-identity-delegate msg-5219 Takahito "a" decide, Bohr
+    msg-5227 R2 / msg-5229 R3', Einstein msg-5228 / msg-5230): did the Tier-C Decider judge that
+    the naysayer's proceed handoff at the head of ``messages`` must go to the human?
+
+    Returns ``(vetoed, ask_score)``. **This is a gate, not an observer**, and it is monotone in the
+    safe direction: a veto can only *close* carve-out ③, never open a route the rule-based guard
+    (G1 / G2) would have closed. Only an actionable tierc-v2 ``CONFIRMED`` vetoes
+    (:func:`proceed_vetoed`). Every way of not getting such a verdict answers ``False`` — the
+    Decider being off (``decider is None``, ``backend=off``), declining to call (``None``),
+    raising, a v1 configuration, null / malformed, ``UNSURE``, ``LIKELY_NOT`` — so a Decider
+    outage does not block the loop; G1 / G2 decide (msg-5219: "off・判定を出さない・エラー・
+    grey-zone・LIKELY_NOT のときは G3 は閉じず").
+
+    The distinction between "the Decider was consulted and did not veto" and "the Decider was
+    never consulted" is NOT made here: it is the conductor's cache (``_prefetch_proceed_veto``
+    writes an entry on every consult, including ``decider is None``; a missing entry closes the
+    door — Bohr msg-5229 R3').
+
+    No admission gate runs (``gate_result=None``): the gate classifies ``NEXT: human`` labels and
+    has nothing to say about a proceed turn.
+
+    **Reader of the log line.** One ``decider_proceed_clearance`` ``logger.info`` record per call
+    that reached the Decider (prefix kept so the shadow log stays greppable across the change;
+    field ``vetoed`` plus ``ask_score``), read by the operator off the conductor's own log to
+    reconcile the redirects counted in msg-5219. Nothing is posted to a chatroom thread, so no
+    chatroom fallback surface is involved.
+    """
+    if decider is None or not messages:
+        return False, None
+    try:
+        state = state_builder(
+            turn_from_messages(
+                thread_id=thread_id,
+                round_index=round_index,
+                roster=roster,
+                messages=messages,
+                gate_result=None,
+                dispute_rounds=count_dispute_rounds(roster, messages),
+            )
+        )
+        dr = await decider.clear_proceed(state)
+    except Exception:
+        logger.warning(
+            "decider proceed veto failed; G3 veto unavailable; G1/G2 decide", exc_info=True
+        )
+        return False, None
+    vetoed = proceed_vetoed(dr)
+    ask_score = veto_ask_score(dr)
+    if dr is not None:
+        record: dict[str, Any] = {
+            "thread_id": thread_id,
+            "round_index": round_index,
+            "head_msg_id": messages[-1].msg_id,
+            "vetoed": vetoed,
+            "ask_score": ask_score,
+            **decision_result_to_dict(dr),
+        }
+        logger.info(
+            "decider_proceed_clearance %s", json.dumps(record, ensure_ascii=False, sort_keys=True)
+        )
+    return vetoed, ask_score
+
+
 __all__ = [
     "BODY_HEAD_M",
     "RECENT_EVENTS_N",
@@ -557,7 +666,10 @@ __all__ = [
     "is_tierc_entry",
     "log_decision",
     "never_retry",
+    "proceed_vetoed",
     "routed_from_route",
+    "run_proceed_veto",
     "run_tierc_hook",
     "turn_from_messages",
+    "veto_ask_score",
 ]
