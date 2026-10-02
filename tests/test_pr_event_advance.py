@@ -18,6 +18,7 @@ from spirrow_mindwire.conductor.gate_records import (
     ci_hold_head,
     ci_route_heads,
     prior_advisory_approvals,
+    render_admission_heading,
     render_ci_hold_marker,
     render_relay_heading,
     verdict_heads,
@@ -37,6 +38,7 @@ from spirrow_mindwire.pr_event_advance import (
     PrFacts,
     closes_thread,
     decide,
+    heading_ref,
     operator_handoff,
     read_relay_tail,
 )
@@ -91,12 +93,76 @@ def test_row1_a_non_relay_tail_is_ignored() -> None:
     assert _decide(None, _pr("merged")) == Noop(NoopReason.NOT_RELAY_TAIL)
 
 
-def test_row1_an_admission_post_or_an_unreadable_heading_is_not_a_relay_tail() -> None:
-    admission = f"PR-gate admission (pre-gate CI wait) — {_REF}\n\nNEXT: human"
-    assert read_relay_tail(RELAY_AUTHOR, admission) is None
+def test_row1_an_unreadable_heading_is_not_a_relay_tail() -> None:
     assert read_relay_tail(RELAY_AUTHOR, "") is None
-    garbled = "PR-gate (Tier B independent naysayer) — not-a-ref\n\nNEXT: human"
-    assert read_relay_tail(RELAY_AUTHOR, garbled) is None
+    other = "PR-gate somethingelse — acme/widgets#7\n\nNEXT: human"
+    assert read_relay_tail(RELAY_AUTHOR, other) is None
+
+
+# --------------------------------------------------------------------------- R14 (v0.6 / v0.6.1)
+
+
+def _admission(heading: str, next_line: str = "NEXT: human") -> str:
+    return f"{heading}\n\nADMISSION: route_human (rule=R3)\n\nreason\n\n{next_line}"
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        f"PR-gate admission (pre-gate CI wait) — {_REF}",  # the current writer's form
+        f"PR-gate admission — {_REF}",  # no parenthetical (tests/test_conductor_gate_records.py)
+        f"PR-gate admission (pre-gate CI wait) - {_REF}",  # ASCII hyphen separator
+    ],
+)
+def test_r14a_admission_heading_forms_yield_the_pr(heading: str) -> None:
+    tail = read_relay_tail(RELAY_AUTHOR, _admission(heading))
+    assert tail is not None and tail.pr_ref == _REF and tail.hold_head is None
+
+
+@pytest.mark.parametrize("head", [_HEAD, None])
+def test_r14b_verdict_heading_with_and_without_sha(head: str | None) -> None:
+    tail = read_relay_tail(RELAY_AUTHOR, _relay(head=head))
+    assert tail is not None and tail.pr_ref == _REF
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "PR-gate (Tier B independent naysayer) — not-a-ref",
+        "PR-gate admission (pre-gate CI wait) — not-a-ref",
+        "PR-gate admission — acme/widgets",
+    ],
+)
+def test_r14c_a_ref_that_does_not_parse_is_row1(heading: str) -> None:
+    assert read_relay_tail(RELAY_AUTHOR, _admission(heading)) is None
+    assert heading_ref(heading) is None
+
+
+def test_r14d_render_admission_heading_is_byte_identical_to_the_old_writer() -> None:
+    assert render_admission_heading(_REF) == f"PR-gate admission (pre-gate CI wait) — {_REF}"
+    assert heading_ref(render_admission_heading(_REF)) == _REF
+    assert heading_ref(render_relay_heading(_REF, _HEAD)) == _REF
+    assert heading_ref(render_relay_heading(_REF, None)) == _REF
+
+
+def test_r14_admission_tail_rows() -> None:
+    escalation = read_relay_tail(
+        RELAY_AUTHOR, _admission(render_admission_heading(_REF), "NEXT: human")
+    )
+    ci_route = read_relay_tail(
+        RELAY_AUTHOR, _admission(render_admission_heading(_REF), "NEXT: Heisenberg")
+    )
+    for tail in (escalation, ci_route):
+        closed = _decide(tail, _pr("closed"))
+        assert isinstance(closed, Post) and closed.next_line == "NEXT: Bohr"
+        settled = _decide(tail, _pr("merged", body=f"Closes-thread: {_THREAD}"))
+        assert isinstance(settled, Post) and settled.next_line == "NEXT: none"
+        assert _decide(tail, _pr("open"), ci=CiState.SUCCESS) == Noop(NoopReason.OPEN_NO_HOLD)
+
+
+def test_r14_admission_heading_is_not_read_by_verdict_heads() -> None:
+    # R6 is untouched: an admission heading names no head.
+    assert verdict_heads([_admission(render_admission_heading(_REF))]) == frozenset()
 
 
 def test_row1_a_quoted_heading_below_line_one_does_not_count() -> None:
@@ -208,8 +274,21 @@ def test_closes_thread_is_line_anchored() -> None:
 # --------------------------------------------------------------------------- R13: totality
 
 
+def _tail_body(kind: str, token: str, hold: bool) -> str:
+    marker = f"\n\n{render_ci_hold_marker(head=_HEAD)}" if hold else ""
+    headings = {
+        "verdict": render_relay_heading(_REF, _HEAD),
+        "verdict-no-sha": render_relay_heading(_REF, None),
+        "admission": render_admission_heading(_REF),
+        "admission-bare": f"PR-gate admission — {_REF}",
+        "other": "status update",
+    }
+    return f"{headings[kind]}\n\nbody\n\nNEXT: {token}{marker}"
+
+
 def test_r13_decide_returns_a_value_for_every_input_combination() -> None:
     authors = [RELAY_AUTHOR, "Heisenberg"]
+    kinds = ["verdict", "verdict-no-sha", "admission", "admission-bare", "other"]
     tokens = ["none", "human", "Heisenberg"]
     states = ["open", "merged", "closed", "weird"]
     holds = [True, False]
@@ -218,16 +297,16 @@ def test_r13_decide_returns_a_value_for_every_input_combination() -> None:
     bodies = ["", f"Closes-thread: {_THREAD}"]
     proposers = ["Bohr", None]
     n = 0
-    for author, token, state, hold, head, ci, body, proposer in itertools.product(
-        authors, tokens, states, holds, heads, cis, bodies, proposers
+    for author, kind, token, state, hold, head, ci, body, proposer in itertools.product(
+        authors, kinds, tokens, states, holds, heads, cis, bodies, proposers
     ):
-        tail = read_relay_tail(author, _relay(token=token, hold=_HEAD if hold else None))
+        tail = read_relay_tail(author, _tail_body(kind, token, hold))
         d = _decide(tail, _pr(state, head=head, body=body), ci=ci, proposer=proposer)
-        assert isinstance(d, Noop | Post), (author, token, state, hold, head, ci)
+        assert isinstance(d, Noop | Post), (author, kind, token, state, hold, head, ci)
         if isinstance(d, Post):
             assert d.next_line.splitlines()[-1].startswith("NEXT: ")
         n += 1
-    assert n == 2 * 3 * 4 * 2 * 2 * 5 * 2 * 2
+    assert n == 2 * 5 * 3 * 4 * 2 * 2 * 5 * 2 * 2
 
 
 # --------------------------------------------------------------------------- R9: operator form

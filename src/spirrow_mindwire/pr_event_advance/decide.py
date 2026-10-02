@@ -10,9 +10,21 @@ What this decides
 The thread ↔ PR correspondence is derived from ONE message — the thread's tail — and nothing
 else: no mapping table, no cache, no shadow DB. The tail must be authored by
 :data:`~spirrow_mindwire.conductor.gate_records.RELAY_AUTHOR` and its first line must read as
-:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`. Only the first line and the
-final ``NEXT:`` are read, so a critique that quotes a heading or a marker is not mistaken for one
+either a verdict heading (:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`)
+or an admission heading (:func:`~spirrow_mindwire.conductor.gate_records.render_admission_heading`,
+the R3/R5 escalation and R4 ci-route posts — v0.6 R14). Only the first line and the final
+``NEXT:`` are read, so a critique that quotes a heading or a marker is not mistaken for one
 (the ``verdict_heads`` discipline).
+
+Tolerant on read, exact on write (v0.6.1, Bohr msg-5918): the writers emit one exact form each,
+but this reader also accepts the forms those headings have had before — a verdict heading
+without ``@ sha`` (pre-#244), an admission heading without the parenthetical or with ``-`` as the
+separator — because the oldest stalled threads are the ones 1b exists to rescue. The ref it
+extracts must still pass ``parse_pr_ref`` or the tail is row 1 (fail closed). A misread can only
+write a true GitHub fact and hand to the proposer; ``none`` still needs ``Closes-thread:``
+naming this thread. This tolerance is local to 1b: ``verdict_heads`` / ``ci_route_heads`` (the
+admission inputs) are unchanged. An admission tail never carries a ci-hold, so on an open PR it
+is row 5; only rows 3/4 newly apply to it.
 
 The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 
@@ -61,7 +73,6 @@ from ..conductor.gate_records import (
     RELAY_AUTHOR,
     ci_hold_head,
     normalize_sha,
-    render_relay_heading,
 )
 from ..conductor.handoff import (
     NONE_TOKEN,
@@ -81,9 +92,14 @@ from ..github.client import CiState, parse_pr_ref
 #: ``legitimate: []`` (R3).
 PR_EVENT_RELAY_AUTHOR = "pr-event-relay"
 
-#: The prefix every verdict relay heading starts with, derived from the renderer so a change
-#: to the heading text cannot silently desynchronise this reader.
-_HEADING_PREFIX = render_relay_heading("", None)
+#: Verdict heading, tolerant form (msg-5918 table, verbatim): ``@ sha`` is optional.
+_VERDICT_HEADING_RE = re.compile(
+    r"^PR-gate \(Tier B independent naysayer\) — (?P<ref>\S+)(?:\s*@\s*[0-9a-fA-F]{7,40})?\s*$"
+)
+#: Admission heading, tolerant form (msg-5918 table, verbatim): parenthetical optional with any
+#: content, separator ``—`` or ``-``.
+_ADMISSION_HEADING_RE = re.compile(r"^PR-gate admission(?:\s*\([^)]*\))?\s*[—-]\s*(?P<ref>\S+)\s*$")
+_HEADING_RES = (_VERDICT_HEADING_RE, _ADMISSION_HEADING_RE)
 
 #: ``Closes-thread: <thread_id>`` at the start of a line of the PR body. Several are allowed.
 _CLOSES_THREAD_RE = re.compile(r"^Closes-thread:[ \t]*(T-\S+)[ \t]*\r?$", re.MULTILINE)
@@ -161,14 +177,21 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
         return None
     stripped = body.strip()
     first_line = stripped.splitlines()[0].strip() if stripped else ""
-    if not first_line.startswith(_HEADING_PREFIX):
-        return None
-    rest = first_line[len(_HEADING_PREFIX) :]
-    ref = rest.split(" @ ", 1)[0].strip()
-    if parse_pr_ref(ref) is None:
+    ref = heading_ref(first_line)
+    if ref is None:
         return None
     token = parse_next_token(body)
     return RelayTail(pr_ref=ref, token=token, hold_head=ci_hold_head(body))
+
+
+def heading_ref(first_line: str) -> str | None:
+    """The PR ref named by a verdict or admission heading, or ``None`` (row 1)."""
+    for pattern in _HEADING_RES:
+        match = pattern.match(first_line)
+        if match is not None:
+            ref = match.group("ref")
+            return ref if parse_pr_ref(ref) is not None else None
+    return None
 
 
 def precheck(tail: RelayTail | None) -> Noop | None:
@@ -287,6 +310,7 @@ __all__ = [
     "RelayTail",
     "closes_thread",
     "decide",
+    "heading_ref",
     "lifecycle_of",
     "needs_ci",
     "operator_handoff",

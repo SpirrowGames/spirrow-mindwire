@@ -201,6 +201,18 @@ def ci_hold_head(body: str) -> str | None:
     return found
 
 
+def render_admission_heading(pr_ref: str) -> str:
+    """The first line of both conductor admission posts (R3/R5 escalation and R4 ci-route).
+
+    One writer for the string, so the 1b reader (:mod:`spirrow_mindwire.pr_event_advance`) and
+    the two writers in ``conductor.core`` cannot drift apart silently — the #244 lesson that
+    :func:`render_relay_heading` documents (T-pr-event-advances-thread v0.6 R14). The
+    parenthetical is a fixed label, not a reason: the rule is on the ``ADMISSION:`` line below.
+    Nothing in this module reads this heading; R5 / R6 key only on markers and verdict headings.
+    """
+    return f"PR-gate admission (pre-gate CI wait) — {pr_ref}"
+
+
 def render_relay_heading(pr_ref: str, head: str | None) -> str:
     """The verdict relay's first line, naming the head when one is known.
 
@@ -366,6 +378,7 @@ __all__ = [
     "decide_relay_route",
     "normalize_sha",
     "prior_advisory_approvals",
+    "render_admission_heading",
     "render_ci_hold_marker",
     "render_ci_route_marker",
     "render_relay_heading",

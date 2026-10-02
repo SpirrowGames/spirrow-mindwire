@@ -112,6 +112,7 @@ from .gate_records import (
     RelayRoute,
     ci_route_heads,
     normalize_sha,
+    render_admission_heading,
     render_ci_route_marker,
     verdict_heads,
 )
@@ -2358,7 +2359,7 @@ class Conductor:
         a 6 h / 12 h cap to elapse and R5 needs a second red on an unchanged head.
         """
         body = (
-            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"{render_admission_heading(pr_ref)}\n\n"
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"{decision.reason}\n\n"
             f"The gate was NOT fired. This is a machine observation of CI, not a review.\n\n"
@@ -2384,7 +2385,7 @@ class Conductor:
         )
         checks_line = ", ".join(failing) if failing else "<no named failing check>"
         body = (
-            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"{render_admission_heading(pr_ref)}\n\n"
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"CI is red on {rollup.head_sha[:12]}: {checks_line}\n\n"
             f"{decision.reason}\n\n"
