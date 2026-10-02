@@ -245,6 +245,8 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - **待ち合わせの上限時間を超えたら、gemini-fallback に切り替えます。呼び出し元を失敗させることはしません。** PR-gate やレビューが、ほかのリクエストと重なっただけで落ちることは許しません。コストを抑えることよりも、レビューが確実に終わることを優先します。
   - この切り替えは黙って行いません。共通の notifier で知らせ、attestation にも `gemini-fallback` として残します。
   - 上限時間の値は Lexora の PR で決めます。ふつうの直列化ではまず超えない長さにします。
+  - **1 リクエストにかける時間の合計（待ち合わせ＋codex の実行、または待ち合わせ＋gemini-fallback の実行）は、mindwire が前提にしている backend の時間の上限（`lexora/client.py` の `LEXORA_BACKEND_TIMEOUT_SECONDS`）に収めます。** mindwire のクライアントは、その値に余裕を足した時間だけ待ちます（`naysayer/pr_review.py` の `_DEFAULT_TIMEOUT_SECONDS`）。そのため、Lexora が上限内に返す限り、クライアントが先に接続を切ることはありません。待ち合わせの上限時間は、この合計の予算から gemini-fallback の実行に必要な時間を引いた値以下にします。
+  - それでもクライアント側で時間切れになった場合は、いまの PR-gate の扱い（`_degrade_on_timeout`：COMMENT で保留し、人に知らせる）に従います。黙って失敗することはありません。
 - そのほかに fallback wrapper が gemini-fallback に切り替えるのは、codex 側が失敗したとき（ゲートが閉じている、実行がエラーになった、レート制限やセッションの失効など）です。
 
 **残るリスク**
@@ -270,7 +272,10 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - プロンプトには文字数の上限を設けます。上限を超えたら、次の順に落とし、落としたファイルの名前をプロンプトの冒頭に書きます。
   - PR-gate：(1) 対になるテストファイル → (2) 変更されたファイルの全文（大きいものから）。
   - design-time：(1) 参照されたファイルの全文 → (2) 参照された ADR の全文。スレッドの本文と principles は落としません。
-- **全部落としてもまだ上限を超える場合**
+- **全部落としてもまだ codex ティアの上限を超える場合**
+  - PR-gate と design-time のどちらも：**そのリクエストは codex ティアではなく、Gemini のティアに送ります。** 上限も Gemini のものを使い、切り詰めません。codex の上限を理由にして、Gemini なら収まる PR を REQUEST_CHANGES にすることも、design-time を失敗させることもしません。送り先を変えるこの判定は、ティアを決める関数の中で行います。attestation の期待する値（7.6）も、この判定から導きます（`gemini`）。
+  - 大きい PR を Gemini で扱うのは、いまの PR-gate と同じ扱いです（いまは PR-gate のすべてが Gemini です）。費用が新しく増えるわけではありません。
+- **Gemini のティアの上限も超える場合**
   - PR-gate（diff そのものが大きい場合）：diff を切り詰め、切り詰めたことをプロンプトと結果に明示します。そのうえで、いまの PR-gate の規則（`naysayer/pr_review.py`：切り詰めた diff のレビューは APPROVE せず、REQUEST_CHANGES に倒す）にそのまま従います。黙って切り詰めることも、切り詰めたまま APPROVE することもありません。
   - design-time（スレッドの本文と principles だけで超える場合）：naysayer を呼ばずに、上限を超えたことを理由として呼び出し元に失敗を返します（fail loud）。
 - **上限の値は、mindwire がそのリクエストを送るティアごとに持ちます。** codex ティア（gemini-fallback を予備に持つもの）には codex の上限を使います。N-3 の部分集合のように Gemini に固定して送るリクエストには、Gemini の上限を使います。codex ティアから gemini-fallback に切り替わった場合は、codex の上限で組んだプロンプトがそのまま渡ります（Lexora の中で組み直すことはしません）。
@@ -284,7 +289,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - 素の codex backend を、直接ティアにつなぐことはしません。
 - mindwire の attestation で期待する値は、**リクエストごとに決めます。** 全体で一律に緩めることはしません。
   - codex ティアに送ったリクエスト：正は `codex` です。`gemini-fallback` も、許容されるフォールバックとして受け入れます。
-  - N-3 の部分集合（7.3。Gemini に固定して送るもの）：期待する値は `gemini` だけです。`codex` や `gemini-fallback` が返ってきたら不一致として fail-closed にします。ティアを決める関数が誤って codex ティアに送った場合も、ここで検知できるようにするためです（多層防御）。
+  - Gemini のティアに送ったもの（N-3 の部分集合（7.3）と、codex の上限に収まらないもの（7.5））：期待する値は `gemini` だけです。`codex` や `gemini-fallback` が返ってきたら不一致として fail-closed にします。ティアを決める関数が誤って codex ティアに送った場合も、ここで検知できるようにするためです（多層防御）。
   - 期待する値は、ティアを決める関数と同じ判定から導きます。2 か所で別々に判定することはしません。
 - この変更の対象は、`expected=gemini` を前提にしている箇所です（`naysayer/preflight.py`・`principles.py`・`adapters/naysayer_sdk.py`）。
 - この変更は、Lexora の codex 経路がティアにつながるのと同時に入れます。先に入れると、今の Gemini の経路が attestation で不一致になるからです。
