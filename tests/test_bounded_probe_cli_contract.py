@@ -9,6 +9,10 @@ resolves the script the call runs (the nearest preceding
 ``Join-Path $repoRoot "scripts<sep>X.py"`` assignment, ``<sep>`` being a backslash, to the variable
 in the first argv slot), and checks each ``'--flag'`` literal against
 the script's real ``--help`` output. A new call site, or a renamed flag on either side, reds here.
+
+A call whose argv starts with ``'-m', '<module>'`` (``Get-FailureClass`` -> ``python -m
+spirrow_mindwire.stall_ledger``, Bohr msg-5611 §4) is resolved to that module instead and checked
+against ``python -m <module> --help``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,10 @@ _ASSIGN = re.compile(
     r"\"scripts[\\/](?P<script>[\w.]+\.py)\""
 )
 _FLAG = re.compile(r"'(--[a-z][a-z0-9-]*)'")
+_MODULE = re.compile(r"^'-m'\s*,\s*'(?P<module>[\w.]+)'")
+
+# A target is either ``scripts/<name>.py`` or ``-m <module>``; this prefix marks the latter.
+_MODULE_PREFIX = "-m "
 
 
 def _call_sites() -> list[tuple[str, str, list[str]]]:
@@ -39,6 +47,11 @@ def _call_sites() -> list[tuple[str, str, list[str]]]:
     sites: list[tuple[str, str, list[str]]] = []
     for m in _CALL.finditer(text):
         args = m.group("args")
+        mod = _MODULE.match(args.strip())
+        if mod is not None:
+            target = _MODULE_PREFIX + mod.group("module")
+            sites.append((m.group("label"), target, _FLAG.findall(args)))
+            continue
         first = args.split(",")[0].strip()
         assert first.startswith("$"), f"{m.group('label')}: first argv slot is not a script var"
         var = first[1:]
@@ -55,14 +68,26 @@ _SITES = _call_sites()
 
 
 def test_every_call_site_was_found() -> None:
-    # msg-5414 §3 names eight call sites; a parser miss must not silently shrink coverage.
-    assert len(_SITES) == 8, _SITES
+    # msg-5414 §3 names eight call sites and msg-5611 §3 adds Get-FailureClass as the ninth; a
+    # parser miss must not silently shrink coverage.
+    assert len(_SITES) == 9, _SITES
+
+
+def test_failure_class_call_site_resolves_to_the_classifier_module() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get("'failure-class'") == ("-m spirrow_mindwire.stall_ledger", ["--input"])
+
+
+def _help_command(target: str) -> list[str]:
+    if target.startswith(_MODULE_PREFIX):
+        return [sys.executable, "-m", target[len(_MODULE_PREFIX) :], "--help"]
+    return [sys.executable, str(_REPO_ROOT / "scripts" / target), "--help"]
 
 
 @pytest.mark.parametrize(("label", "script", "flags"), _SITES, ids=[s[0] for s in _SITES])
 def test_target_script_accepts_every_flag(label: str, script: str, flags: list[str]) -> None:
     proc = subprocess.run(
-        [sys.executable, str(_REPO_ROOT / "scripts" / script), "--help"],
+        _help_command(script),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -72,4 +97,4 @@ def test_target_script_accepts_every_flag(label: str, script: str, flags: list[s
     assert proc.returncode == 0, proc.stderr
     accepted = set(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", proc.stdout))
     missing = [f for f in flags if f not in accepted]
-    assert not missing, f"{label} passes {missing} but scripts/{script} does not accept them"
+    assert not missing, f"{label} passes {missing} but {script} does not accept them"

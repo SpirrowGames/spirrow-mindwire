@@ -651,7 +651,9 @@ function Test-HoldForCandidate {
 #
 # THE CONTRACT (helper side — process control only):
 #   * The helper knows nothing about the target script's CLI. It takes argv, launches
-#     `uv run python <argv...>` from the repo root, and never writes to the child's stdin: stdin is
+#     `uv run [<UvOptions...>] python <argv...>` from the repo root (UvOptions is empty unless the
+#     caller passes uv's own flags, e.g. `--directory <root> --quiet` — Bohr msg-5611 §2), and
+#     never writes to the child's stdin: stdin is
 #     redirected and CLOSED immediately after start, so the child and every grandchild inherit an
 #     already-closed pipe instead of the console or this process's stdin.
 #   * Payloads never go through stdin or argv. The CALLER writes structured data to a temp file
@@ -680,12 +682,48 @@ $ParkedHumansProbeTimeoutSeconds = 120
 $ControlProbeTimeoutSeconds = 120
 $PredictedResourceProbeTimeoutSeconds = 120
 $GateBootstrapProbeTimeoutSeconds = 120
+# Get-FailureClass -> spirrow_mindwire.stall_ledger (Bohr msg-5611 §3). The classifier itself runs in
+# milliseconds; the bound is the same as the other probes because uv -> python start-up alone took
+# ~75 s in msg-5322.
+$FailureClassProbeTimeoutSeconds = 120
 $ProbeKillGraceMs = 5000
 $ProbeInputFilePrefix = 'mindwire-probe-'
 $ProbeInputFileMaxAgeMinutes = 60
 # Where probe input files live. %TEMP% in production; tests point it at a private directory so a
 # leaked file is countable.
 $ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+
+# The full command line Invoke-BoundedUvProbe starts, element 0 being the executable. Pure, so the
+# argv composition is testable without launching anything. UvOptions (uv's own flags) go right after
+# the first two Launcher elements — which must be `uv run` — and before the interpreter, which is the only place
+# uv reads them; with UvOptions empty the result is exactly Launcher + Arguments, as before.
+function Get-BoundedProbeCommandLine {
+    param(
+        [Parameter(Mandatory)][string[]]$Launcher,
+        [string[]]$UvOptions = @(),
+        [string[]]$Arguments = @()
+    )
+    $line = [System.Collections.Generic.List[string]]::new()
+    $opts = @($UvOptions | Where-Object { $null -ne $_ })
+    # Checked by shape, not only by length: the insertion point is index 2 because that is where
+    # `uv run` ends, so a launcher that is not literally `uv run <interpreter>` (e.g. a 3-element
+    # `pwsh -NoProfile -File`) is refused rather than given uv flags it would misread.
+    # The basename is taken by splitting on BOTH separators: System.IO.Path on Linux does not treat
+    # `\` as a separator, so GetFileNameWithoutExtension('C:\bin\uv.exe') is not 'uv' there.
+    $exeLeaf = ([string]$Launcher[0] -split '[\\/]')[-1] -replace '\.[^.]*$', ''
+    $isUvRun = $Launcher.Count -ge 3 -and
+        $exeLeaf -ieq 'uv' -and
+        [string]$Launcher[1] -ceq 'run'
+    if ($opts.Count -gt 0 -and -not $isUvRun) {
+        throw "Get-BoundedProbeCommandLine: -UvOptions needs a launcher of the form 'uv run <interpreter>' (got: $($Launcher -join ' '))"
+    }
+    for ($i = 0; $i -lt $Launcher.Count; $i++) {
+        if ($i -eq 2) { foreach ($o in $opts) { $line.Add([string]$o) } }
+        $line.Add([string]$Launcher[$i])
+    }
+    foreach ($a in $Arguments) { $line.Add([string]$a) }
+    return , $line.ToArray()
+}
 
 function Invoke-BoundedUvProbe {
     param(
@@ -696,13 +734,26 @@ function Invoke-BoundedUvProbe {
         [string]$WorkingDirectory = $repoRoot,
         # The command prefix. Production always uses the default; tests substitute a fake probe
         # launcher (e.g. pwsh -File) so the bound and the tree kill run without uv.
-        [string[]]$Launcher = @('uv', 'run', 'python')
+        [string[]]$Launcher = @('uv', 'run', 'python'),
+        # uv's own options, inserted between `uv run` and `python` (see Get-BoundedProbeCommandLine).
+        # Empty by default: a caller that does not pass it gets exactly the argv it got before.
+        [string[]]$UvOptions = @()
     )
 
+    $result = @{
+        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
+        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
+    }
+    # A malformed launcher/option combination is an error RESULT like a failed start, never an
+    # exception: every caller's fail-open / fail-closed policy keys on the result, not on a throw.
+    try { $commandLine = Get-BoundedProbeCommandLine -Launcher $Launcher -UvOptions $UvOptions -Arguments $Arguments }
+    catch {
+        $result.error = "invalid command line: $($_.Exception.Message)"
+        return $result
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Launcher[0]
-    foreach ($a in @($Launcher | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
-    foreach ($a in $Arguments) { $psi.ArgumentList.Add([string]$a) }
+    $psi.FileName = $commandLine[0]
+    foreach ($a in @($commandLine | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -714,10 +765,6 @@ function Invoke-BoundedUvProbe {
     # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
 
-    $result = @{
-        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
-        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
-    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
     try {
@@ -795,9 +842,13 @@ function Get-ProbeJsonLine {
 
 # Write a probe payload to %TEMP%\mindwire-probe-<label>-<guid>.json (UTF-8, no BOM) and return
 # the path. The caller owns the file and MUST hand it to Remove-ProbeInputFile in `finally`.
+# The content is written verbatim: most probes hand JSON (`-Json`), while Get-FailureClass hands a
+# raw session-log tail and says so with the `-Text` alias (Einstein msg-5612 advisory 1). The name
+# keeps the .json extension either way, because Remove-StaleProbeInputFiles sweeps
+# `mindwire-probe-*.json` — a different extension would escape the startup backstop.
 function New-ProbeInputFile {
     param(
-        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][Alias('Text')][AllowEmptyString()][string]$Json,
         [Parameter(Mandatory)][string]$Label,
         [string]$Directory = $ProbeInputDirectory
     )
@@ -1405,7 +1456,8 @@ function Remove-RetryPendingNotLive {
 }
 
 # T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
-# the session log tail by invoking the Python classifier over stdin. The classifier's
+# the session log tail by invoking the Python classifier through the bounded probe helper
+# (``--input <tmp>``; T-parked-humans-probe-has-no-timeout msg-5611 §3). The classifier's
 # rules (which regex catches which error label) are the single SOT so a new signature
 # added there flows to both the persisted field and any digest side that groups on it.
 #
@@ -1482,30 +1534,44 @@ function Get-FailureClass {
 
     $blob = ($SessionLogTail -join "`n")
 
+    $tmp = $null
     try {
-        # ``uv run`` is the repo's convention for invoking a package in the managed venv;
-        # `.mindwire-gate` uses the same. Passing the tail via stdin (not argv) keeps the
-        # command line short and avoids any escaping surprise with quotes / backticks.
+        # Bounded (T-parked-humans-probe-has-no-timeout, Bohr msg-5611 §3). This used to be
+        # `$blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger` —
+        # a stdin feed with no upper bound, the exact shape that hung the parked-humans probe for
+        # 20+ minutes in msg-5322 and stopped every project's conductor. It sits on the sweep's
+        # failure branch, so a hang here would do the same. Now: the tail goes to a probe temp file
+        # (`--input`), the child's stdin is closed at start, and the whole tree is killed at
+        # $FailureClassProbeTimeoutSeconds.
         #
-        # ``--directory $RepoRoot`` pins the working directory of the uv invocation so
-        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD. This
-        # is preferred over ``Push-Location``: uv's own flag never leaks CWD state back
-        # into PowerShell if the child crashes mid-flight, so the sweep's outer scope
-        # cannot be corrupted by a failed classification (matches CON-1's record-then-
-        # execute discipline — if the remedy scope leaks, so does the observation of it).
-        $output = $blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $output) { return 'unknown' }
-        # The CLI prints ONE line — the label. Any surplus (stderr already suppressed
-        # above) is ignored; taking `[0]` guards against a stray blank line.
-        $label = if ($output -is [array]) { $output[0] } else { $output }
-        $label = "$label".Trim()
+        # ``--directory $RepoRoot`` (a uv option, hence -UvOptions) still pins where
+        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD — uv's own flag
+        # never leaks CWD state back into PowerShell (msg-2601 §1-2). -WorkingDirectory is pinned
+        # to the same root so the child's CWD does not depend on the top-level $repoRoot either.
+        $tmp = New-ProbeInputFile -Text $blob -Label 'failure-class'
+        $r = Invoke-BoundedUvProbe -Label 'failure-class' -TimeoutSeconds $FailureClassProbeTimeoutSeconds `
+            -WorkingDirectory $RepoRoot -UvOptions @('--directory', $RepoRoot, '--quiet') `
+            -Arguments @('-m', 'spirrow_mindwire.stall_ledger', '--input', $tmp)
+        # Timeout / start failure / unclosed streams / non-zero exit all collapse to 'unknown'.
+        # Deliberately NO digest notification on timeout (msg-5611 §3, endorsed msg-5612): this
+        # call is an attachment of a failure branch that is already reported loudly as a
+        # quarantine, so 'unknown' is a metadata loss, not a silent stop. The fact that it hung is
+        # still on record — the helper itself logs TIMEOUT / KILL-UNCONFIRMED / STREAMS-UNCLOSED.
+        if (-not $r.ok -or $r.code -ne 0) { return 'unknown' }
+        # stderr is not consulted (as with the old `2>$null`). The CLI prints ONE line — the label;
+        # take the first non-empty stdout line, and if stdout has no non-empty line at all, the
+        # answer is 'unknown' (msg-5612 advisory 2).
+        $label = @("$($r.stdout)" -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) |
+            Select-Object -First 1
         if (-not $label) { return 'unknown' }
         return $label
     } catch {
-        # Absolutely fatal failures (uv missing, venv broken, python crash) still fall
-        # through to the ledger-preserving ``unknown`` — this function is on the hot
-        # path of the sweep's failure branch and must never itself become a new failure.
+        # Absolutely fatal failures (temp dir unwritable, helper missing) still fall through to the
+        # ledger-preserving ``unknown`` — this function is on the hot path of the sweep's failure
+        # branch and must never itself become a new failure.
         return 'unknown'
+    } finally {
+        if ($tmp) { Remove-ProbeInputFile -Path $tmp }
     }
 }
 
