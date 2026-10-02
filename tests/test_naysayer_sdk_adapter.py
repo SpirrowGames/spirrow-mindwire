@@ -396,6 +396,7 @@ def _attestation(*, backend: str = "gemini") -> AttestationRecord:
         expected="gemini",
         route="lexora.local:8110",
         probe="cost-row#6032",
+        scope="probe",
         at=_TS,
     )
 
@@ -751,7 +752,8 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route=lexora.local:8110 · probe=cost-row#6032 · at=2026-06-04T00:00:00Z -->"
+        "· route=lexora.local:8110 · probe=cost-row#6032 · scope=probe "
+        "· at=2026-06-04T00:00:00Z -->"
     )
 
 

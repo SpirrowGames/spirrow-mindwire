@@ -327,6 +327,7 @@ async def attest_backend(
                 expected=expected,
                 route=route,
                 probe=probe,
+                scope="probe",
                 at=clock(),
             )
     finally:
