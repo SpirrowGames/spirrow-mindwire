@@ -683,3 +683,12 @@ obligations:
     # だけである」); the PR-gate face is not wired to this manifest and is not meant to be.
     body: |
       FIX-NOW VS FOLLOW-UP, REVIEW SIDE: the default is that a finding is fixed in the current PR; a split is justified only by the measured gate diff exceeding the gate's warn threshold (`mindwire pr-diff-size`) or by a structural constraint. Do not accept "we will fix it in a follow-up" as a disposition unless it names a tracking destination (a thread ID, new or existing); a follow-up with nowhere to be tracked is a fix that will not happen. When you declare a PR unsplittable as an invariant, state the reason as a structural constraint, so it reads as one and not as a timing preference.
+
+  - id: OBL-TURN-END-CLEAN-CLONE
+    role: implementer
+    # Net-new formulation (no origin). T-timed-out-implementer-turn-leaves-dirty-shared-clone,
+    # design v4 D-3 (Bohr msg-5775 / msg-5781, endorsed Einstein msg-5782). The enforcing side is
+    # the dispatcher's pre-dispatch clone guard (src/spirrow_mindwire/clone_guard.py): a turn that
+    # does not leave the clone this way makes the NEXT dispatch on this clone refuse to start.
+    body: |
+      LEAVE THE SHARED CLONE CLEAN AND ON THE DEFAULT BRANCH AT THE END OF EVERY TURN. The working directory you run in is shared by every thread and every role, and before each dispatch the loop refuses to start anyone in it unless it is clean (no tracked, staged, unmerged or non-ignored untracked changes, no merge / rebase / cherry-pick / revert part-way through) and HEAD is on the default branch (`origin/HEAD`'s target, `main` if that ref is absent). So, as the last thing you do in a turn: commit any work you want to keep to your own feature branch (push it if it should survive this host), then `git switch` back to the default branch. Do not leave uncommitted edits, scratch files in the working tree, or HEAD on your feature branch. Work that spans several turns resumes by switching to your feature branch again at the start of the next turn. Never `stash`, `reset --hard` or `clean` to get there: that is how WIP is lost, and history rewriting is Tier-C anyway. If you cannot reach a clean default-branch state without discarding something, stop and say so in your reply; the next dispatch will refuse the clone and an operator decides.

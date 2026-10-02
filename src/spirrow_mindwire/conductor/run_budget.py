@@ -69,6 +69,7 @@ EVENT_KIND_RUN_KILLED = "conductor.run_killed"
 # sweep wrapper ("unknown non-zero goes to quarantine", the same as 3 and 4); the log tail says
 # which one it was (design §18.5). 7 is the one the sweep branches on: an orphan tree may still be
 # running, so the rest of that tick's sweep is skipped (msg-5498 W-3).
+# 8 is taken too: clone_guard.DIRTY_CLONE_EXIT_CODE (dirty shared clone, not quarantined).
 RUN_TIMEOUT_EXIT_CODE = 5
 RUN_KILLED_EXIT_CODE = 6
 RUN_KILL_UNCONFIRMED_EXIT_CODE = 7

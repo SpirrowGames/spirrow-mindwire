@@ -588,6 +588,30 @@ _CONDUCTOR_ROSTER = {
 }
 
 
+def _clean_clone(tmp_path: Path) -> Path:
+    """A clean git clone on ``main`` with ``.mindwire/`` ignored, as ``[loop].repo_dir`` must be.
+
+    The composition root's dirty-clone guard (T-timed-out-implementer-turn-leaves-dirty-shared-
+    clone) refuses to dispatch into anything else, a bare ``tmp_path`` included.
+    """
+    import subprocess
+
+    repo = tmp_path / "clone"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    (repo / ".gitignore").write_text(".mindwire/\n", encoding="utf-8")
+    git("add", ".gitignore")
+    git("commit", "-q", "-m", "init")
+    return repo
+
+
 def _conductor_settings(
     tmp_path: Path | None = None,
     *,
@@ -763,7 +787,7 @@ async def test_run_conductor_drives_round_trip_and_closes_sessions(
 
     monkeypatch.setattr(loop_runner, "build_conductor", _build)
     monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
-    outcome = await run_conductor(_conductor_settings(tmp_path), mcp=mcp)
+    outcome = await run_conductor(_conductor_settings(_clean_clone(tmp_path)), mcp=mcp)
 
     assert outcome.stop_reason is StopReason.HUMAN
     assert outcome.forced_naysayer_turns == 0  # NEXT named Einstein explicitly
