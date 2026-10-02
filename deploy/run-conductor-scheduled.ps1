@@ -1695,6 +1695,28 @@ function Format-DurationDigest {
     return "${minutes}m"
 }
 
+# Lane tag for a human-parked row, shared by the 判断待ち and 停止中 sections so a new lane or a
+# wording change is made in one place (PR #423 gate advisory, class=structure). D7
+# (T-next-role-name-stands-down-to-human): a park that is not a decision says so on its row. The
+# lane comes from scripts/parked_humans.py. -Default is what a plain decision row shows (判断待ち
+# passes its question snippet, 停止中 passes ''); a protocol-violation tag is PREFIXED to it, the
+# operator-work and misroute tags replace it.
+function Get-ParkedRowTag {
+    param($Row, [string]$Default = '')
+    $lane = if ($Row.PSObject.Properties.Name -contains 'lane' -and $Row.lane) { "$($Row.lane)" } else { 'decision' }
+    if ($lane -eq 'operator_work') {
+        $task = if ($Row.PSObject.Properties.Name -contains 'operator_task') { "$($Row.operator_task)" } else { '' }
+        return "   — [operator 作業] $task"
+    }
+    if ($lane -eq 'misroute') {
+        return "   — [宛先誤り・再ルーティング待ち]"
+    }
+    if (($Row.PSObject.Properties.Name -contains 'protocol_violation') -and $Row.protocol_violation) {
+        return "   — [protocol 違反: Tier-C を operator に渡そうとした]$Default"
+    }
+    return $Default
+}
+
 # Result classifier for a Send-Notification return. Two questions come out of one shape so the two
 # never diverge:
 #   - Test-DigestDelivered: should the cadence gate advance for this period? (i.e., "retrying THIS
@@ -2276,19 +2298,8 @@ function New-DailyDigest {
             }
         }
         $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
-        # D7 (T-next-role-name-stands-down-to-human): a park that is not a decision says so on its
-        # row, so it is not read as one. The lane comes from scripts/parked_humans.py.
-        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
-        if ($lane -eq 'operator_work') {
-            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
-            $suffix = "   — [operator 作業] $task"
-        }
-        elseif ($lane -eq 'misroute') {
-            $suffix = "   — [宛先誤り・再ルーティング待ち]"
-        }
-        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
-            $suffix = "   — [protocol 違反: Tier-C を operator に渡そうとした]$suffix"
-        }
+        # D7: the lane tag (operator 作業 / 宛先誤り / protocol 違反) — see Get-ParkedRowTag.
+        $suffix = Get-ParkedRowTag -Row $p -Default $suffix
         $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
     }
 
@@ -2329,18 +2340,7 @@ function New-DailyDigest {
             $ageText = Format-DurationDigest -Span $age
             $ageSeconds = [int64]$age.TotalSeconds
         }
-        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
-        $tag = ''
-        if ($lane -eq 'operator_work') {
-            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
-            $tag = "   — [operator 作業] $task"
-        }
-        elseif ($lane -eq 'misroute') {
-            $tag = "   — [宛先誤り・再ルーティング待ち]"
-        }
-        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
-            $tag = "   — [protocol 違反: Tier-C を operator に渡そうとした]"
-        }
+        $tag = Get-ParkedRowTag -Row $p -Default ''
         $staleHumanList += [PSCustomObject]@{ Line = "  $($p.key)   [$($p.head_msg_id)]   $ageText$tag"; AgeSeconds = $ageSeconds }
     }
     # Oldest first. Ties are broken by the row text so the order is identical across ticks for the
