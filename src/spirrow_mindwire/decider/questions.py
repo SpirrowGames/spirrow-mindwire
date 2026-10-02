@@ -122,10 +122,12 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 #   この確率 1 本だけで合成する (``verdict.evaluate_tierc_v2``)。
 # * ``matched_rule`` (choice) — 当たったルール 1 つ (``rule_1``..``rule_N``) か ``none``。
 #   通知 / ログの理由表示用で、verdict 合成には使わない (msg-4360)。
-#   Lexora ``/v1/decide`` は ``type: "choice"`` を受け、選択肢は ``criteria`` の
-#   ``[{name, description}]`` から読む (spirrow-lexora main 344d467 の ``decide/contract.py``
-#   ``QuestionSpec`` / ``decide/providers.py`` ``_extract_choice_options``)
-#   ∴ msg-4382 の経路 (a)。 noul 5 問への代替 (経路 (b)) は作らない。
+#   Lexora ``/v1/decide`` は ``type: "choice"`` を受け、``criteria`` をそのまま Jev (TypeSafe) に
+#   渡す ∴ msg-4382 の経路 (a)。 noul 5 問への代替 (経路 (b)) は作らない。
+#   **``criteria`` は ``{選択肢名: 説明}`` の map** (TypeSafe の仕様、
+#   https://docs.typesafe.ai/primitives/choice.md)。以前は Lexora の docstring に従って
+#   ``[{name, description}]`` の配列で送っていたが、Jev はこれを 422 (``dict_type``) で拒否し、
+#   2026-09-30 以降の v2 / v3 の decide は全件 NullProvider (``NO_VERDICT_NULL``) に落ちていた。
 #
 # **何がどこにあるか (msg-4382 / msg-4384).** ルールの文言は Takahito が編集する 1 ファイル
 # (``<data_dir>/config/tierc_rules.toml``、雛形は同梱の ``tierc_rules.default.toml``) にあり、その
@@ -137,6 +139,8 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # criteria は不変 ∴ 過去の記録の読み方は変わらない。config の問いセット選択子
 # (``[decider.tierc].questions = "tierc-v2"``) は set の *種類* を選ぶ名前で、この記録用 version
 # とは別物なので動かさない。proceed 用 (``tierc-v2-proceed``) は枠の文が不変なので動かさない。
+# ``matched_rule`` の ``criteria`` を配列から map に直したときも上げていない。選択肢と説明は
+# 不変で、配列の形の問いは Jev に一度も届いていない (全件 422) ∴ 読み方が変わる記録が無い。
 TIERC_V2_QUESTIONS_VERSION = "tierc-v3"
 """v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
 問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
@@ -318,8 +322,10 @@ def tierc_v2_questions(rules: TierCRules, *, proceed: bool = False) -> dict[str,
         _V2_PROCEED_MATCHED_RULE_INSTRUCTIONS if proceed else _V2_MATCHED_RULE_INSTRUCTIONS
     )
     should_ask = f"{_V2_RULES_HEADER}\n{render_rules_bullets(rules)}\n\n{question}"
-    options = [{"name": r.id, "description": r.text} for r in rules.rules]
-    options.append({"name": MATCHED_RULE_NONE, "description": _V2_NONE_DESCRIPTION})
+    # TypeSafe の choice の criteria は map。rule id は ``rule_N`` で重複も拒否済み
+    # (``load_tierc_rules``) ∴ ``none`` と衝突せず、選択肢が潰れることはない。
+    options = {r.id: r.text for r in rules.rules}
+    options[MATCHED_RULE_NONE] = _V2_NONE_DESCRIPTION
     return {
         SHOULD_ASK_HUMAN_KEY: {
             "type": "noul",
