@@ -1383,3 +1383,53 @@ async def test_add_watch_then_poll_dispatches() -> None:
     dispatched = await watcher.poll_once()
     assert dispatched == 1
     assert len(dispatcher.dispatched) == 1
+
+
+# --- T-pr-event-advances-thread R2 / R11: the ci-hold marker on the production relay body ---- #
+
+
+async def _relay_for(ci_state: CiState, *, ci_gated: bool) -> str:
+    outcome = PrReviewOutcome(
+        verdict=ReviewEvent.COMMENT if ci_gated else ReviewEvent.APPROVE,
+        body="CI is still running\n\nVERDICT: COMMENT",
+        ci_state=ci_state,
+        head_sha="0123abcdef",
+        ci_gated=ci_gated,
+    )
+    orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver(outcome))  # type: ignore[arg-type]
+    _ref, _outcome, relay = await orch.fire_pr_review(
+        project="p", pr_ref="o/r#7", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+    )
+    return str(relay["content"])
+
+
+@pytest.mark.anyio
+async def test_a_ci_pending_hold_relay_carries_the_ci_hold_marker_round_trip() -> None:
+    # R2 round trip over the production writer: the body the orchestrator posts names the held
+    # head, ci_hold_head reads it back, and verdict_heads does NOT count it (R11) — a hold is
+    # not a review, so R6 must not refuse 1b's single re-fire on that head.
+    from spirrow_mindwire.conductor.gate_records import ci_hold_head
+
+    body = await _relay_for(CiState.PENDING, ci_gated=True)
+    assert ci_hold_head(body) == "0123abcdef"
+    assert verdict_heads([body]) == frozenset()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", [CiState.UNKNOWN, CiState.FAILURE])
+async def test_unknown_and_failure_holds_carry_no_ci_hold_marker(state: CiState) -> None:
+    # R2: re-firing on UNKNOWN (token / permission fault) or FAILURE reproduces the same answer,
+    # so neither is marked, and their heading keeps counting for R6 as before.
+    from spirrow_mindwire.conductor.gate_records import ci_hold_head
+
+    body = await _relay_for(state, ci_gated=True)
+    assert ci_hold_head(body) is None
+    assert verdict_heads([body]) == frozenset({"0123abcdef"})
+
+
+@pytest.mark.anyio
+async def test_a_real_verdict_relay_carries_no_ci_hold_marker() -> None:
+    from spirrow_mindwire.conductor.gate_records import ci_hold_head
+
+    body = await _relay_for(CiState.SUCCESS, ci_gated=False)
+    assert ci_hold_head(body) is None

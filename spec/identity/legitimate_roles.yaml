@@ -97,3 +97,18 @@ identities:
       author). msg-2540 §1-4 pins the loader constraint (kind=machine + legitimate=[]);
       giving this identity a role would violate the I-6 invariant the pr-gate-relay entry
       already documents.
+
+  - name: pr-event-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/pr_event_advance/decide.py::PR_EVENT_RELAY_AUTHOR"
+    reason: >-
+      T-pr-event-advances-thread (1b, Bohr msg-5901..msg-5912, Einstein msg-5911 go). Writes one
+      GitHub fact into a work thread whose tail is a PR-gate relay: the PR was merged (sha), the
+      PR was closed without merging, or CI ended on a CI-pending hold so the gate is re-fired
+      once. The body restates GitHub state; no role spoke it, so `legitimate = []` (I-6, the
+      loader's kind=machine invariant) and `independence_class` is not written (derived from
+      kind by registration). Distinct from `pr-gate-relay` so the gate-records readers
+      (verdict_heads / ci_route_heads / prior_advisory_approvals), which narrow to that author,
+      never read a 1b post as a gate record. 1b never calls chatroom_close_thread: its
+      `NEXT: none` is a handoff token, not a status close (msg-5906, R10).

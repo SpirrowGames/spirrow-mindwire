@@ -31,6 +31,7 @@ from .conductor.gate_records import (
     carries_advisory,
     decide_relay_route,
     prior_advisory_approvals,
+    render_ci_hold_marker,
     render_relay_heading,
 )
 from .conductor.handoff import HUMAN_TOKEN
@@ -482,6 +483,12 @@ class PrReviewOrchestrator:
             f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
             f"{outcome.body}\n\n" + "\n\n".join(tail)
         )
+        # T-pr-event-advances-thread R2: a CI-PENDING hold names its head in a ci-hold marker so
+        # 1b (pr_event_advance) can re-fire the gate once CI ends on that head, and so
+        # verdict_heads does not count this hold as a review (R11). Only PENDING: UNKNOWN (a
+        # token / permission fault) and FAILURE would reproduce the same answer if re-fired.
+        if outcome.ci_gated and outcome.ci_state is CiState.PENDING and outcome.head_sha:
+            body = f"{body}\n\n{render_ci_hold_marker(head=outcome.head_sha)}"
         try:
             result = await self._mcp.call_tool(
                 "chatroom_post_message",
