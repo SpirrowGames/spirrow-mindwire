@@ -126,6 +126,7 @@ from .handoff import (
     parse_next_token,
     resolve_handoff,
 )
+from .human_identity import is_human_identity
 from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
 from .spawn_timeout import (
@@ -1680,8 +1681,9 @@ class Conductor:
         ``author`` string, so this carve-out is best-effort loop-level noise-reduction, NOT the
         authoritative Tier-C guard — that is the human's manual ``main`` merge (mirrors the
         implementer allow-list's environment-containment stance). Stronger author authentication
-        (ADR-11 normalization) is a deferred hardening."""
-        return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
+        (ADR-11 normalization) is a deferred hardening. The rule itself lives in
+        :func:`~.human_identity.is_human_identity`, shared with the shadow exporter (2d-14)."""
+        return is_human_identity(author, self._human_identity)
 
     def _attested(self, msg: dict[str, Any]) -> bool:
         """Does ``msg`` carry a well-formed harness attestation stamp (P-3, Tier-C msg-970)?
