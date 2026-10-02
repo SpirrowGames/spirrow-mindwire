@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,10 @@ from spirrow_mindwire.tier_c_admission_gate import LogKind
 from spirrow_mindwire.tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
     DecisionLine,
+    append_log_entries,
     decision_log_entries,
-    has_decision_entries,
+    logged_decision_keys,
+    missing_decision_entries,
     scan_decision_lines,
 )
 from spirrow_mindwire.value_objects import Role
@@ -249,7 +252,7 @@ async def test_same_head_seen_twice_is_logged_once(tmp_path: Path) -> None:
         ).run()
     rows = _rows(log_path)
     assert len(rows) == 2
-    assert has_decision_entries(log_path, thread=_thread_ref().thread_id, msg_id=rows[0]["msg_id"])
+    assert sum(logged_decision_keys(log_path, thread=_thread_ref().thread_id).values()) == 2
 
 
 @pytest.mark.anyio
@@ -278,6 +281,52 @@ async def test_failed_write_is_retried_on_the_next_tick(tmp_path: Path) -> None:
     blocker.mkdir()
     await conductor.run()
     assert [r["kind"] for r in _rows(log_path)] == ["DECIDED", "DEFERRED"]
+
+
+@pytest.mark.anyio
+async def test_decision_message_buried_under_a_later_message_is_logged(tmp_path: Path) -> None:
+    """PR #418 gate, finding 1: the implementer's message is not the head when the conductor
+    first reads the thread (a later message landed before the tick), and must still be logged."""
+    log_path = _log(tmp_path)
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Heisenberg", content=IMPLEMENTER_HEAD)
+    mcp.seed(author="pr-gate-relay", content="status note\n\nNEXT: human")
+    await Conductor(
+        mcp=mcp,
+        dispatcher=_ScriptedDispatcher(mcp, {}),
+        thread_ref=_thread_ref(),
+        roster=ROSTER,
+        naysayer_identity="Einstein",
+        max_rounds=1,
+        decisions_log_path=log_path,
+    ).run()
+    rows = _rows(log_path)
+    assert [r["kind"] for r in rows] == ["DECIDED", "DEFERRED"]
+    assert {r["msg_id"] for r in rows} == {"m2"}
+
+
+@pytest.mark.anyio
+async def test_partial_write_is_completed_without_duplicates(tmp_path: Path) -> None:
+    """PR #418 gate, finding 2: only the DECIDED row of a two-row message reached the log (a write
+    that failed part-way). The next run writes the missing DEFERRED row and does not repeat the
+    DECIDED one."""
+    log_path = _log(tmp_path)
+    scan = scan_decision_lines(IMPLEMENTER_HEAD)
+    first = decision_log_entries(scan, author="Heisenberg", author_role=Role.IMPLEMENTER, now=NOW)
+    append_log_entries(log_path, first[:1], thread=_thread_ref().thread_id, msg_id="m3")
+    await _run(log_path, head=IMPLEMENTER_HEAD, head_author="Heisenberg")
+    rows = _rows(log_path)
+    assert [r["kind"] for r in rows] == ["DECIDED", "DEFERRED"]
+    assert {r["msg_id"] for r in rows} == {"m3"}
+
+
+def test_missing_entries_treats_identical_lines_as_a_multiset() -> None:
+    scan = scan_decision_lines("DECIDED: a — b\nDECIDED: a — b\n")
+    entries = decision_log_entries(scan, author="H", author_role=Role.IMPLEMENTER, now=NOW)
+    logged = Counter({("m1", "DECIDED", "a", "b"): 1})
+    assert len(missing_decision_entries(entries, msg_id="m1", logged=logged)) == 1
+    assert len(missing_decision_entries(entries, msg_id="m2", logged=Counter())) == 2
 
 
 @pytest.mark.anyio

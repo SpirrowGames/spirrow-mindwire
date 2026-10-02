@@ -100,9 +100,11 @@ from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import AdmissionVerdict
 from ..tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
+    DecisionLineScan,
     append_log_entries,
     decision_log_entries,
-    has_decision_entries,
+    logged_decision_keys,
+    missing_decision_entries,
     scan_decision_lines,
 )
 from ..value_objects import (
@@ -498,12 +500,15 @@ class Conductor:
         # ``unattributed_author``). Counted, and each one logged at WARNING, so nothing is dropped
         # silently (msg-5655 / msg-5657). Read through :attr:`decision_log_counts`.
         self._decision_log_counts: Counter[str] = Counter()
-        # Heads whose decision lines this instance has already handled. A long-lived Conductor
-        # re-reads the same stopped head on every tick; without this the ``malformed`` /
-        # ``unattributed_author`` counts and their WARNINGs would repeat once per tick (PR #418
-        # gate advisory). The JSONL's ``has_decision_entries`` check stays as the cross-process
-        # guard for written entries; this set only silences repeats within one process.
-        self._decision_heads_seen: set[str] = set()
+        # Messages whose decision lines this instance has already classified. Every round re-reads
+        # the whole thread; without this the ``malformed`` / ``unattributed_author`` counts and
+        # their WARNINGs would repeat once per tick (PR #418 gate advisory). The log's own keys
+        # (``logged_decision_keys``) stay as the cross-process guard for written entries; this set
+        # only silences repeats within one process.
+        self._decision_msgs_seen: set[str] = set()
+        # Classified messages whose rows are not written yet, by msg_id. Retried on the next round
+        # without classifying (and so counting / warning about) them again.
+        self._decision_writes_pending: dict[str, tuple[str, Role, DecisionLineScan]] = {}
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
@@ -589,9 +594,11 @@ class Conductor:
                 return self._stop(
                     round_index, StopReason.NO_PROGRESS, latest_msg_id, forced, forced_saveable
                 )
-            # §2.6 decision log (U4a): record the head's ``DECIDED:`` / ``DEFERRED:`` lines before
-            # anything routes on it. Observation only — never changes the routing below.
-            self._record_decision_lines(latest)
+            # §2.6 decision log (U4a): record the ``DECIDED:`` / ``DEFERRED:`` lines of every
+            # message in the thread, not only the head — a decision message can be buried under a
+            # later message before any tick reads it (PR #418 gate, finding 1). Observation only —
+            # never changes the routing below.
+            self._record_decision_lines(messages)
 
             handoff = resolve_handoff(
                 _content(latest),
@@ -1126,8 +1133,12 @@ class Conductor:
         ``unattributed_author``). A read-only copy."""
         return dict(self._decision_log_counts)
 
-    def _record_decision_lines(self, latest: dict[str, Any]) -> None:
-        """Append ``latest``'s ``DECIDED:`` / ``DEFERRED:`` lines to the decisions log (U4a).
+    def _record_decision_lines(self, messages: list[dict[str, Any]]) -> None:
+        """Append the ``DECIDED:`` / ``DEFERRED:`` lines of ``messages`` to the decisions log (U4a).
+
+        Every message in the thread is considered, not only the head. If several messages land
+        between two ticks (or while no conductor runs), a decision message is no longer the head
+        when it is first read, and a head-only scan would never log it (PR #418 gate, finding 1).
 
         Grammar and allowlist come from :mod:`..tier_c_decisions_log` (msg-5657), the same
         definitions the U4b acceptance scan imports. The author's role is resolved through the
@@ -1140,23 +1151,73 @@ class Conductor:
           is skipped without a count;
         * malformed lines from an allowed role are counted under ``malformed`` and not written.
 
-        Idempotent per ``(thread, msg_id)``: a head seen again by a later run is not written twice,
-        and a head this instance already handled is not re-scanned, so its counts and WARNINGs are
-        emitted once per process rather than once per tick (a failed write is retried).
-        A failure to read or write the log is logged at WARNING and does not stop the turn. The
-        audit log is an observer of routing, never a gate on it.
+        Each message is classified once per process, so its counts and WARNINGs are emitted once
+        rather than once per tick. Writing is idempotent per *entry*: the rows already in the log
+        are read once per call and only the missing ones are appended. So a message seen again by a
+        later process is not written twice, and a write that failed part-way is completed on the
+        next round (PR #418 gate, finding 2). A failure to read or write the log is logged at
+        WARNING and does not stop the turn: the audit log observes routing and never gates it.
         """
         log_path = self._decisions_log_path
         if log_path is None:
             return
-        msg_id = _msg_id(latest)
-        if msg_id in self._decision_heads_seen:
+        for msg in messages:
+            msg_id = _msg_id(msg)
+            if not msg_id or msg_id in self._decision_msgs_seen:
+                continue
+            self._decision_msgs_seen.add(msg_id)
+            classified = self._classify_decision_message(msg)
+            if classified is not None:
+                self._decision_writes_pending[msg_id] = classified
+        if not self._decision_writes_pending:
             return
-        self._decision_heads_seen.add(msg_id)
-        author = _author(latest)
-        scan = scan_decision_lines(_content(latest))
+        thread = self._thread_ref.thread_id
+        try:
+            logged = logged_decision_keys(log_path, thread=thread)
+        except Exception:
+            logger.warning(
+                "decision log: reading the log failed; %d message(s) left for the next round",
+                len(self._decision_writes_pending),
+                exc_info=True,
+            )
+            return
+        for msg_id, (author, role, scan) in list(self._decision_writes_pending.items()):
+            entries = decision_log_entries(
+                scan, author=author, author_role=role, now=datetime.now(UTC)
+            )
+            missing = missing_decision_entries(entries, msg_id=msg_id, logged=logged)
+            try:
+                append_log_entries(log_path, missing, thread=thread, msg_id=msg_id)
+            except Exception:
+                # Kept pending: the next round re-reads the log and writes only what is missing.
+                logger.warning(
+                    "decision log: writing %d entr(ies) for msg=%s failed",
+                    len(missing),
+                    msg_id,
+                    exc_info=True,
+                )
+                continue
+            del self._decision_writes_pending[msg_id]
+            if missing:
+                logger.info(
+                    "decision log: msg=%s author=%s role=%s wrote %d entr(ies)",
+                    msg_id,
+                    author,
+                    role.value,
+                    len(missing),
+                )
+
+    def _classify_decision_message(
+        self, msg: dict[str, Any]
+    ) -> tuple[str, Role, DecisionLineScan] | None:
+        """``(author, role, scan)`` when ``msg`` has well-formed decision lines to write, else
+        ``None``. Counts and warns about the lines it cannot write (see
+        :meth:`_record_decision_lines`)."""
+        msg_id = _msg_id(msg)
+        author = _author(msg)
+        scan = scan_decision_lines(_content(msg))
         if scan.empty:
-            return
+            return None
         role = self._roster_role(author)
         if role is None:
             self._decision_log_counts["unattributed_author"] += 1
@@ -1167,7 +1228,7 @@ class Conductor:
                 author,
                 len(scan.lines) + len(scan.malformed),
             )
-            return
+            return None
         if role not in DECISION_LOG_AUTHOR_ROLES:
             logger.info(
                 "decision log: msg=%s author=%s role=%s is not a decision-log author; skipped",
@@ -1175,7 +1236,7 @@ class Conductor:
                 author,
                 role.value,
             )
-            return
+            return None
         if scan.malformed:
             self._decision_log_counts["malformed"] += len(scan.malformed)
             for raw in scan.malformed:
@@ -1187,32 +1248,8 @@ class Conductor:
                     raw,
                 )
         if not scan.lines:
-            return
-        thread = self._thread_ref.thread_id
-        try:
-            if has_decision_entries(log_path, thread=thread, msg_id=msg_id):
-                return
-            entries = decision_log_entries(
-                scan, author=author, author_role=role, now=datetime.now(UTC)
-            )
-            append_log_entries(log_path, entries, thread=thread, msg_id=msg_id)
-        except Exception:
-            # Forget the head so a later tick retries the write instead of losing the entries.
-            self._decision_heads_seen.discard(msg_id)
-            logger.warning(
-                "decision log: writing %d entr(ies) for msg=%s failed",
-                len(scan.lines),
-                msg_id,
-                exc_info=True,
-            )
-            return
-        logger.info(
-            "decision log: msg=%s author=%s role=%s wrote %d entr(ies)",
-            msg_id,
-            author,
-            role.value,
-            len(entries),
-        )
+            return None
+        return author, role, scan
 
     def _roster_entry(self, author: str) -> tuple[str, Role]:
         """``(roster identity, role)`` for a roster author, matched case-insensitively like

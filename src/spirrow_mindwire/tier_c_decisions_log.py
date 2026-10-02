@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -359,16 +360,60 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
     return _lookup
 
 
-def has_decision_entries(log_path: Path, *, thread: str, msg_id: str) -> bool:
-    """Whether the log already holds ``DECIDED`` / ``DEFERRED`` rows for ``(thread, msg_id)``.
+DecisionKey = tuple[str, str, str, str]
+"""``(msg_id, kind, what, reason)``: what identifies one decision-log row within a thread."""
 
-    The conductor can see the same head on more than one run: a head that stopped at the human is
-    read again by a later tick. Extraction is therefore idempotent per message, and a message whose
-    rows are already present is not written twice. This is a full scan, for the same reason as
+
+def decision_key(msg_id: str, entry: LogEntry) -> DecisionKey:
+    """The :data:`DecisionKey` of a ``DECIDED`` / ``DEFERRED`` entry built for ``msg_id``."""
+    return (
+        msg_id,
+        entry.kind.value,
+        str(entry.payload.get("what", "")),
+        str(entry.payload.get("reason", "")),
+    )
+
+
+def logged_decision_keys(log_path: Path, *, thread: str) -> Counter[DecisionKey]:
+    """The ``DECIDED`` / ``DEFERRED`` rows already in the log for ``thread``, as a multiset of keys.
+
+    The conductor sees the same message on more than one run (every run re-reads the whole thread),
+    so extraction must be idempotent. It is idempotent per *entry*, not per message: a write that
+    failed after some of a message's rows reached the file leaves the rest missing, and a
+    per-message "any row present" check would then skip them forever (PR #418 gate, finding 2).
+    Comparing keys lets the caller write exactly the rows that are missing. A multiset, so that two
+    identical lines in one message are two rows. One full scan per call, for the same reason as
     :func:`build_retry_lookup`.
     """
     kinds = {LogKind.DECIDED.value, LogKind.DEFERRED.value}
-    return any(
-        row.get("kind") in kinds and row.get("thread") == thread and row.get("msg_id") == msg_id
-        for row in _iter_rows(log_path)
-    )
+    keys: Counter[DecisionKey] = Counter()
+    for row in _iter_rows(log_path):
+        if row.get("kind") not in kinds or row.get("thread") != thread:
+            continue
+        keys[
+            (
+                str(row.get("msg_id", "")),
+                str(row.get("kind")),
+                str(row.get("what", "")),
+                str(row.get("reason", "")),
+            )
+        ] += 1
+    return keys
+
+
+def missing_decision_entries(
+    entries: Iterable[LogEntry], *, msg_id: str, logged: Counter[DecisionKey]
+) -> tuple[LogEntry, ...]:
+    """The subset of ``entries`` (built for ``msg_id``) that ``logged`` does not already hold.
+
+    Order is kept. ``logged`` is consumed as the entries are matched, so it must be a copy the
+    caller can spend, or the caller must want the consumption (several messages share one scan).
+    """
+    missing: list[LogEntry] = []
+    for entry in entries:
+        key = decision_key(msg_id, entry)
+        if logged[key] > 0:
+            logged[key] -= 1
+            continue
+        missing.append(entry)
+    return tuple(missing)
