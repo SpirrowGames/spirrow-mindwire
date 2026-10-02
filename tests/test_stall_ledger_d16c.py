@@ -370,3 +370,40 @@ def test_cli_refuses_an_override_with_no_fetch_room(tmp_path: Path) -> None:
         cli.main(["--data-dir", str(tmp_path), "--t-tick-max-seconds", "130"])
     assert exc.value.code == 2
     assert not (tmp_path / "state").exists()
+
+
+def _load_cli() -> Any:
+    path = REPO / "scripts" / "stall_ledger_tick.py"
+    spec = importlib.util.spec_from_file_location("_d16c_stall_ledger_tick_run", path)
+    assert spec and spec.loader
+    cli = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = cli
+    spec.loader.exec_module(cli)
+    return cli
+
+
+def test_cli_runs_a_full_tick_and_passes_the_fetch_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The PR-gate on 2cf12bc asked whether `_tick` binds `fetch_timeout`; only the refusal
+    # branch of `main()` was exercised. Drive the success path end to end (quarantine-only
+    # source, no network) and check the value the CLI hands to `run_tick`.
+    cli = _load_cli()
+    seen: dict[str, Any] = {}
+    real_run_tick = cli.run_tick
+
+    async def spy(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return await real_run_tick(**kwargs)
+
+    monkeypatch.setattr(cli, "run_tick", spy)
+    code = cli.main(["--data-dir", str(tmp_path), "--fetch-timeout-seconds", "20"])
+    assert code == 0
+    assert seen["fetch_timeout"] == timedelta(seconds=20)
+    assert seen["t_tick_max"] == timing.T_TICK_MAX
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    heartbeat = [line for line in lines if line.get("kind") == "heartbeat"]
+    assert len(heartbeat) == 1
+    assert heartbeat[0]["budget_exhausted"] is False
+    assert heartbeat[0]["deferred_fetches"] == 0
+    assert heartbeat[0]["pending_markers"] == 0
