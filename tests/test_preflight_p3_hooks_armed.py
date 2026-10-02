@@ -162,6 +162,21 @@ def test_p3_default_reader_returns_none_when_unset(tmp_path: Path) -> None:
     assert _real_reader(_repo(tmp_path)) is None
 
 
+def test_p3_default_reader_raises_on_non_unset_git_failure(tmp_path: Path) -> None:
+    # git -C <missing dir> exits 128, not 1: that must raise, never read as "unset".
+    with pytest.raises(subprocess.CalledProcessError) as ei:
+        _real_reader(tmp_path / "no-such-dir")
+    assert ei.value.returncode not in (0, 1)
+
+
+def test_p3_halts_when_default_reader_fails(tmp_path: Path) -> None:
+    # The real reader's raise reaches P3 and fails closed (no mocked exception).
+    with pytest.raises(PreflightError, match="P3"):
+        preflight_mod._p3_secret_guard_armed(
+            tmp_path / "no-such-dir", _real_reader, lambda _p: None
+        )
+
+
 # --------------------------------------------------------------------------- #
 # wiring — P3 is part of preflight_gate, after P0 and before P2/P1
 # --------------------------------------------------------------------------- #
