@@ -24,7 +24,14 @@ from spirrow_mindwire.conductor.gate_records import (
     verdict_heads,
 )
 from spirrow_mindwire.conductor.handoff import HandoffKind, HumanAsk, resolve_handoff
-from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, PrResolution, PrState
+from spirrow_mindwire.github.client import (
+    CiState,
+    CiStatus,
+    GitHubHTTPError,
+    PrRef,
+    PrResolution,
+    PrState,
+)
 from spirrow_mindwire.identity.classification import (
     default_classification_path,
     load_legitimate_roles,
@@ -479,6 +486,54 @@ async def test_r4_gh_unresolvable_writes_nothing() -> None:
     gh = _FakeGh(PrState(ref=_PR, resolution=PrResolution.UNRESOLVABLE))
     out = await advance_thread(mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
     assert (out.action, out.reason) == ("skipped", "gh-unresolvable")
+    assert "chatroom_post_message" not in chat.calls
+
+
+class _RaisingGh(_FakeGh):
+    """A PrSource whose reads raise (gate round 1 on #424): the first ``fail_pr`` PR reads and
+    every CI read when ``fail_ci`` — the transport exception escapes, as a non-client source may."""
+
+    def __init__(self, state: PrState, *, fail_pr: int = 0, fail_ci: bool = False) -> None:
+        super().__init__(state)
+        self.fail_pr = fail_pr
+        self.fail_ci = fail_ci
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        if self.fail_pr > 0:
+            self.fail_pr -= 1
+            raise GitHubHTTPError("502 Bad Gateway")
+        return self.state
+
+    async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
+        if self.fail_ci:
+            raise GitHubHTTPError("connection reset")
+        return await super().fetch_ci_status(pr)
+
+
+@pytest.mark.anyio
+async def test_r4_a_raising_pr_read_skips_that_thread_only_and_the_tick_continues() -> None:
+    chat = _FakeChatroom(
+        {
+            tid: [{"msg_id": "msg-1", "author": RELAY_AUTHOR, "content": _relay()}]
+            for tid in ("T-first", "T-second")
+        }
+    )
+    gh = _RaisingGh(_closed(True), fail_pr=1)  # T-first's read raises, T-second's answers
+    report = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    first, second = report.outcomes
+    assert (first.thread_id, first.action) == ("T-first", "skipped")
+    assert first.reason.startswith("gh-error:") and "502" in first.reason
+    assert (second.thread_id, second.action) == ("T-second", "posted")
+    assert len(chat.threads["T-first"]) == 1  # nothing written on the failed read
+    assert report.as_dict()["posted"] == 1
+
+
+@pytest.mark.anyio
+async def test_r4_a_raising_ci_read_writes_nothing() -> None:
+    chat = _chat(tail_body=_relay(hold=_HEAD))
+    gh = _RaisingGh(_open(), fail_ci=True)
+    out = await advance_thread(mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    assert out.action == "skipped" and out.reason.startswith("gh-error:")
     assert "chatroom_post_message" not in chat.calls
 
 

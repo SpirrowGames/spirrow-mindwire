@@ -181,12 +181,25 @@ async def advance_thread(
     pr = parse_pr_ref(tail.pr_ref)
     if pr is None:  # read_relay_tail already validated the ref; defensive only
         return ThreadOutcome(thread_id, "noop", "not-relay-tail")
-    facts = pr_facts_of(await gh.fetch_pr_state(pr))
+    # Per-thread isolation (PR #424 gate round 1): a GitHub read that *raises* — rather than
+    # returning UNRESOLVABLE / UNKNOWN, which :class:`GitHubClient` does for transport errors —
+    # must cost this thread only, never the rest of the tick's listing. Fail-closed: nothing is
+    # written, the reason is reported, and the next tick reads again.
+    try:
+        state = await gh.fetch_pr_state(pr)
+    except Exception as exc:  # isolation boundary; reported, not swallowed
+        logger.warning("pr-event: fetch_pr_state(%s) raised: %r", tail.pr_ref, exc)
+        return ThreadOutcome(thread_id, "skipped", f"gh-error: {exc!r}", pr_ref=tail.pr_ref)
+    facts = pr_facts_of(state)
     if facts is None:
         return ThreadOutcome(thread_id, "skipped", "gh-unresolvable", pr_ref=tail.pr_ref)
     ci: CiState | None = None
     if needs_ci(tail, facts):
-        status = await gh.fetch_ci_status(pr)
+        try:
+            status = await gh.fetch_ci_status(pr)
+        except Exception as exc:  # isolation boundary; reported, not swallowed
+            logger.warning("pr-event: fetch_ci_status(%s) raised: %r", tail.pr_ref, exc)
+            return ThreadOutcome(thread_id, "skipped", f"gh-error: {exc!r}", pr_ref=tail.pr_ref)
         ci = status.state
         # The CI read is for the head GitHub reports now; if that moved between the two reads,
         # this tick's CI answer is about a different diff — wait for the next tick.
