@@ -27,7 +27,7 @@ from spirrow_mindwire.claude_code.tools.ledger_server import (
     LEDGER_TOOL_NAMES,
     build_ledger_tools,
 )
-from spirrow_mindwire.loop_runner import _log_event_sink
+from spirrow_mindwire.loop_runner import _LEDGER_LOG_FIELDS, _log_event_sink
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.ledger_notes import (
     EVENT_KIND_LEDGER_NOTE_APPENDED,
@@ -777,3 +777,29 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
     for line in (appended_line, failed_line):
         assert line.count("project_id=") == 1
         assert "SECRET" not in line
+
+
+@pytest.mark.anyio
+async def test_a_ledger_event_without_its_keys_logs_a_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bare = Event(
+        event_id="01J00000000000000000000002",
+        occurred_at=_NOW,
+        kind=EVENT_KIND_LEDGER_NOTE_FAILED,
+        fields={},
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.loop_runner"):
+        await _log_event_sink(bare)
+
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_FAILED} event_id=01J00000000000000000000002"
+        " project_id=? task_id=?"
+    )
+
+
+def test_the_extras_allow_list_never_repeats_a_key_the_fixed_format_renders() -> None:
+    # project_id and task_id are rendered by the fixed format; listing either in the extras
+    # allow-list too would print it twice on every ledger line.
+    assert not {"event_id", "project_id", "task_id"} & set(_LEDGER_LOG_FIELDS)
