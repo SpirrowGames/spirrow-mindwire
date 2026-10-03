@@ -3320,6 +3320,38 @@ function Get-ComposerReadHead {
     return "$val"
 }
 
+# The parked-lane fields of the material PUT body, read from the envelope's extras (cli.py
+# `_parked_lane_extras`; T-decision-material-parked-lane-push, Bohr msg-6236 §3). Returns an
+# ordered dictionary holding only the keys to send; an empty one sends none.
+#
+#   parked_lane / operator_task — strings; sent when `-not [string]::IsNullOrEmpty`, the same
+#     guard as stop_reason (never `if ($x)`: the string "0" is falsy in PowerShell).
+#   protocol_violation — extras is dict[str, str], so it arrives as the STRING "true"/"false".
+#     `[bool]"false"` is $true (any non-empty string is), so a cast — or IsNullOrEmpty, or
+#     `if ($pv)` — would turn a false into a true or drop it. It is mapped explicitly: "true" ->
+#     $true, "false" -> $false, anything else (including $null / "" / "yes") -> $null, and the key
+#     is sent only when `$null -ne $pv`. An absent key is NULL on the receiver, which the board
+#     shows as a decision (magickit D7) — the safe side. `$false` in the body goes through
+#     ConvertTo-Json as the literal `false`, which magickit stores distinctly from NULL.
+function Get-ParkedLaneFields {
+    param($Envelope)
+    $out = [ordered]@{}
+    $extras = Get-EnvelopeField -Object $Envelope -Name 'extras'
+    if ($null -eq $extras) { return $out }
+    $lane = Get-EnvelopeField -Object $extras -Name 'parked_lane'
+    if (-not [string]::IsNullOrEmpty($lane)) { $out['parked_lane'] = "$lane" }
+    $task = Get-EnvelopeField -Object $extras -Name 'operator_task'
+    if (-not [string]::IsNullOrEmpty($task)) { $out['operator_task'] = "$task" }
+    $raw = Get-EnvelopeField -Object $extras -Name 'protocol_violation'
+    $pv = $null
+    if ($raw -is [string]) {
+        if ($raw -ceq 'true') { $pv = $true }
+        elseif ($raw -ceq 'false') { $pv = $false }
+    }
+    if ($null -ne $pv) { $out['protocol_violation'] = $pv }
+    return $out
+}
+
 # Push the composer's material to magickit's `/v1/decisions/{project}/{thread_id}/material`.
 # Never throws, never blocks the notification path. Returns the raw Invoke-MaterialPut result for
 # the test seam; the caller ignores the return value in production (D-34: the notification body
@@ -3428,6 +3460,10 @@ function Push-DecisionMaterial {
     # recommendation lines below carry a comment about. No StopReason token is the string "0"
     # today, but the guard costs nothing and the next one might be.
     if (-not [string]::IsNullOrEmpty($StopReason)) { $body['stop_reason'] = "$StopReason" }
+    # The board lane of the head the composer read (T-decision-material-parked-lane-push). The
+    # extras -> body mapping lives in Get-ParkedLaneFields; read its comment before touching it.
+    $parked = Get-ParkedLaneFields -Envelope $Envelope
+    foreach ($k in $parked.Keys) { $body[$k] = $parked[$k] }
     # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
     # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
     # output where `question` or `recommendation` or `recommendation_reason` equals "0"

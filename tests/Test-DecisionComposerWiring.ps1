@@ -74,6 +74,7 @@ $needed = @(
     'New-DecisionLink',
     'New-MaterialUrl',
     'Get-ComposerReadHead',
+    'Get-ParkedLaneFields',
     'Push-DecisionMaterial',
     'Test-NotificationSuppressed',
     'Send-NotificationIfChanged',
@@ -723,6 +724,83 @@ $bNone = $script:materialLastCall.BodyJson | ConvertFrom-Json
 CheckTrue 'an empty stop reason is omitted from the PUT body' `
     (-not ($bNone.PSObject.Properties.Name -contains 'stop_reason')) `
     ("keys=[" + (($bNone.PSObject.Properties.Name) -join ',') + "]")
+
+# ---------- (a3) parked-lane fields (T-decision-material-parked-lane-push, Bohr msg-6236 §3/§6) --
+# extras is dict[str, str] on the Python side, so protocol_violation arrives as the STRING
+# "true"/"false". `[bool]"false"` is $true in PowerShell, so these pins hold the explicit mapping:
+# "false" must reach the wire as the JSON literal false (key present, bool), not vanish and not
+# flip to true. Both envelope shapes are driven: a freshly-written cache row is a hashtable, a
+# re-read one is a PSCustomObject.
+Write-Host ''
+Write-Host '(a3) Push-DecisionMaterial — parked_lane / operator_task / protocol_violation on the PUT body'
+function New-ParkedEnvelope {
+    param([string]$Shape, [hashtable]$Parked)
+    $extras = [ordered]@{ head_msg_id_read = 'msg-777'; tail_count = '3' }
+    foreach ($k in $Parked.Keys) { $extras[$k] = $Parked[$k] }
+    $output = @{ question = 'Adopt A or B?' }
+    if ($Shape -eq 'hashtable') {
+        return @{ composer_status = 'ok'; signature = 'human:msg-1'; extras = $extras; output = $output }
+    }
+    return [PSCustomObject]@{
+        composer_status = 'ok'
+        signature       = 'human:msg-1'
+        extras          = [PSCustomObject]$extras
+        output          = [PSCustomObject]$output
+    }
+}
+function Invoke-ParkedPush {
+    param($Envelope)
+    Reset-MaterialSpy
+    Push-DecisionMaterial -NotifyState @{} -Key 'p/T-parked' -Signature 'human:msg-1' `
+        -Project 'p' -ThreadId 'T-parked' -StopReason 'human' -Envelope $Envelope | Out-Null
+    return $script:materialLastCall.BodyJson
+}
+foreach ($shape in @('hashtable', 'pscustomobject')) {
+    # "false" -> JSON false, key present, value a bool.
+    $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{ parked_lane = 'misroute'; protocol_violation = 'false' })
+    CheckTrue "${shape}: protocol_violation=""false"" is sent as the JSON literal false" `
+        ($json -match '"protocol_violation":false') $json
+    $b = $json | ConvertFrom-Json
+    CheckTrue "${shape}: protocol_violation key is present for ""false""" `
+        ($b.PSObject.Properties.Name -contains 'protocol_violation') $json
+    CheckTrue "${shape}: protocol_violation ""false"" is a bool `$false" `
+        (($b.protocol_violation -is [bool]) -and ($b.protocol_violation -eq $false)) $json
+    Check "${shape}: parked_lane is carried" 'misroute' $b.parked_lane
+    CheckTrue "${shape}: no operator_task when extras has none" `
+        (-not ($b.PSObject.Properties.Name -contains 'operator_task')) $json
+
+    # "true" -> JSON true.
+    $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{ parked_lane = 'decision'; protocol_violation = 'true' })
+    CheckTrue "${shape}: protocol_violation=""true"" is sent as the JSON literal true" `
+        ($json -match '"protocol_violation":true') $json
+    Check "${shape}: parked_lane=decision is carried" 'decision' ($json | ConvertFrom-Json).parked_lane
+
+    # operator_task travels with the operator_work lane.
+    $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{
+            parked_lane = 'operator_work'; operator_task = 'run it by hand'; protocol_violation = 'false' })
+    $b = $json | ConvertFrom-Json
+    Check "${shape}: operator_task is carried" 'run it by hand' $b.operator_task
+    Check "${shape}: parked_lane=operator_work is carried" 'operator_work' $b.parked_lane
+
+    # Anything but "true"/"false" -> key absent (receiver NULL -> decision, the safe side).
+    foreach ($bad in @('yes', '', 'True', '1', '0')) {
+        $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{ parked_lane = 'decision'; protocol_violation = $bad })
+        CheckTrue "${shape}: protocol_violation=""$bad"" is NOT sent" `
+            (-not (($json | ConvertFrom-Json).PSObject.Properties.Name -contains 'protocol_violation')) $json
+    }
+
+    # No parked keys at all (fetch failed / old cached envelope) -> none of the three is sent.
+    $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{})
+    $keys = ($json | ConvertFrom-Json).PSObject.Properties.Name
+    foreach ($k in @('parked_lane', 'operator_task', 'protocol_violation')) {
+        CheckTrue "${shape}: no extras key -> $k absent from the body" (-not ($keys -contains $k)) $json
+    }
+    # Empty strings are absence, too.
+    $json = Invoke-ParkedPush (New-ParkedEnvelope $shape @{ parked_lane = ''; operator_task = '' })
+    $keys = ($json | ConvertFrom-Json).PSObject.Properties.Name
+    CheckTrue "${shape}: empty parked_lane is not sent" (-not ($keys -contains 'parked_lane')) $json
+    CheckTrue "${shape}: empty operator_task is not sent" (-not ($keys -contains 'operator_task')) $json
+}
 
 # --------- (b) fail-open: a throwing / 4xx / 5xx PUT does NOT change the notification --------
 Write-Host ''
