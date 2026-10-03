@@ -79,9 +79,9 @@ from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .clone_guard import (
     DIRTY_CLONE_EXIT_CODE,
-    DIRTY_CLONE_PAYLOAD_PREFIX,
     CloneGuard,
     DirtyCloneError,
+    emit_dirty_clone_payload,
 )
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import (
@@ -1226,14 +1226,6 @@ def _emit_environment_terminal_payload(exc: EnvironmentTerminalError) -> None:
     sys.stdout.flush()
 
 
-def _emit_dirty_clone_payload(exc: DirtyCloneError) -> None:
-    """Print the one ``MINDWIRE_DIRTY_CLONE_PAYLOAD <json>`` row the sweep wrapper parses."""
-    import json
-
-    sys.stdout.write(f"{DIRTY_CLONE_PAYLOAD_PREFIX}{json.dumps(exc.payload())}\n")
-    sys.stdout.flush()
-
-
 def main() -> None:
     """Entry point for the ``mindwire-loop`` console script.
 
@@ -1341,7 +1333,7 @@ def main() -> None:
         # A dedicated exit code — not 2, which the wrapper reads as a GitHub credential fault even
         # when the payload row is unreadable (Einstein msg-5776 #2). The payload row only enriches
         # the notification; the wrapper's do-not-quarantine decision rides on the exit code.
-        _emit_dirty_clone_payload(dirty_exc)
+        emit_dirty_clone_payload(dirty_exc)
         logger.warning(
             "dirty-clone exit=%d: repo_dir=%s reason=%s head=%s",
             DIRTY_CLONE_EXIT_CODE,

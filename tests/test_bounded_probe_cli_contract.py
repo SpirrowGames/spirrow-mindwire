@@ -12,7 +12,10 @@ the script's real ``--help`` output. A new call site, or a renamed flag on eithe
 
 A call whose argv starts with ``'-m', '<module>'`` (``Get-FailureClass`` -> ``python -m
 spirrow_mindwire.stall_ledger``, Bohr msg-5611 §4) is resolved to that module instead and checked
-against ``python -m <module> --help``.
+against ``python -m <module> --help``. When the module argv names a subcommand right after the
+module (``'-m', 'spirrow_mindwire.cli', 'clone-check', ...``, T-clone-guard-pin-ignored-only-in-
+mindwire D-3c), the check runs ``python -m <module> <subcommand> --help``, where the subcommand's
+own flags are listed.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ _ASSIGN = re.compile(
     r"\"scripts[\\/](?P<script>[\w.]+\.py)\""
 )
 _FLAG = re.compile(r"'(--[a-z][a-z0-9-]*)'")
-_MODULE = re.compile(r"^'-m'\s*,\s*'(?P<module>[\w.]+)'")
+_MODULE = re.compile(r"^'-m'\s*,\s*'(?P<module>[\w.]+)'(?:\s*,\s*'(?P<sub>[a-z][a-z0-9-]*)')?")
 
 # A target is either ``scripts/<name>.py`` or ``-m <module>``; this prefix marks the latter.
 _MODULE_PREFIX = "-m "
@@ -50,6 +53,8 @@ def _call_sites() -> list[tuple[str, str, list[str]]]:
         mod = _MODULE.match(args.strip())
         if mod is not None:
             target = _MODULE_PREFIX + mod.group("module")
+            if mod.group("sub"):
+                target += " " + mod.group("sub")
             sites.append((m.group("label"), target, _FLAG.findall(args)))
             continue
         first = args.split(",")[0].strip()
@@ -71,7 +76,18 @@ def test_every_call_site_was_found() -> None:
     # msg-5414 §3 names eight call sites and msg-5611 §3 adds Get-FailureClass as the ninth; a
     # parser miss must not silently shrink coverage. T-pr-event-advances-thread (1b) adds the
     # tenth: Invoke-PrEventAdvanceTick -> -m spirrow_mindwire.pr_event_advance.
-    assert len(_SITES) == 10, _SITES
+    # T-clone-guard-pin-ignored-only-in-mindwire adds two: Invoke-HeadSkipRevertLaunch (D-3a) and
+    # Invoke-CloneCheck -> -m spirrow_mindwire.cli clone-check (D-3c).
+    assert len(_SITES) == 12, _SITES
+
+
+def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get("'clone-check'") == ("-m spirrow_mindwire.cli clone-check", ["--repo-dir"])
+    assert sites.get("'head-skip-revert-launch'") == (
+        "head_skip_decide.py",
+        ["--state-file", "--mode", "--payload-file"],
+    )
 
 
 def test_pr_event_advance_call_site_resolves_to_the_1b_module() -> None:
@@ -89,7 +105,7 @@ def test_failure_class_call_site_resolves_to_the_classifier_module() -> None:
 
 def _help_command(target: str) -> list[str]:
     if target.startswith(_MODULE_PREFIX):
-        return [sys.executable, "-m", target[len(_MODULE_PREFIX) :], "--help"]
+        return [sys.executable, "-m", *target[len(_MODULE_PREFIX) :].split(), "--help"]
     return [sys.executable, str(_REPO_ROOT / "scripts" / target), "--help"]
 
 

@@ -29,6 +29,7 @@ from spirrow_mindwire.clone_guard import (
 )
 from spirrow_mindwire.conductor.core import ConductorStopSlot, ConductorStopSnapshot
 from spirrow_mindwire.config import MindwireSettings
+from spirrow_mindwire.dispatcher import core as dispatcher_core
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.ports import SpawnContext
@@ -383,6 +384,78 @@ async def test_clean_clone_dispatches_and_writes_pin(repo: Path) -> None:
     assert adapter.delivered == 2
 
 
+@pytest.mark.anyio
+async def test_dispatcher_order_is_ensure_then_guard_then_pin_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T-clone-guard-pin-ignored-only-in-mindwire D-1 (msg-6162): ensure → guard → pin write, on a
+    # clone whose .gitignore does NOT list .mindwire/ (every repo but spirrow-mindwire).
+    r = tmp_path / "plain"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@example.invalid")
+    _git(r, "config", "user.name", "t")
+    _git(r, "config", "commit.gpgsign", "false")
+    (r / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(r, "add", ".")
+    _git(r, "commit", "-q", "-m", "init")
+
+    calls: list[str] = []
+    real_ensure = vars(dispatcher_core)["ensure_pin_ignored"]
+    real_check = CloneGuard.check
+    real_write = SpecPinWriter.write_before_dispatch_async
+
+    def _ensure(repo_dir: Path) -> bool:
+        calls.append("ensure")
+        return bool(real_ensure(repo_dir))
+
+    def _check(self: CloneGuard) -> None:
+        calls.append("guard")
+        real_check(self)
+
+    async def _write(self: SpecPinWriter, *a: Any, **kw: Any) -> Any:
+        calls.append("pin")
+        return await real_write(self, *a, **kw)
+
+    monkeypatch.setattr(dispatcher_core, "ensure_pin_ignored", _ensure)
+    monkeypatch.setattr(CloneGuard, "check", _check)
+    monkeypatch.setattr(SpecPinWriter, "write_before_dispatch_async", _write)
+    adapter = _Adapter()
+    disp = _dispatcher(r, adapter)
+    handle = await disp.spawn_instance(_thread(), Role.IMPLEMENTER, "implementer-1")
+    await disp.dispatch(handle, _event("e1"))
+    await disp.dispatch(handle, _event("e2"))  # the pin the first one wrote does not refuse it
+    assert adapter.delivered == 2
+    assert calls == ["ensure", "guard", "pin", "ensure", "guard", "pin"]
+    assert _git(r, "status", "--porcelain=v1") == ""
+
+
+@pytest.mark.anyio
+async def test_dispatcher_ensure_failure_refuses_before_guard_pin_and_delivery(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fail(repo_dir: Path) -> bool:
+        raise DirtyCloneError(
+            repo_dir=repo_dir,
+            reason=DirtyCloneReason.PIN_NOT_IGNORED,
+            head=None,
+            detail="cannot update x: PermissionError: denied",
+        )
+
+    guard_calls: list[str] = []
+    monkeypatch.setattr(dispatcher_core, "ensure_pin_ignored", _fail)
+    monkeypatch.setattr(CloneGuard, "check", lambda self: guard_calls.append("guard"))
+    adapter = _Adapter()
+    disp = _dispatcher(repo, adapter)
+    handle = await disp.spawn_instance(_thread(), Role.PROPOSER, "proposer-1")
+    with pytest.raises(DirtyCloneError) as ei:
+        await disp.dispatch(handle, _event("e1"))
+    assert ei.value.reason == DirtyCloneReason.PIN_NOT_IGNORED
+    assert guard_calls == []
+    assert adapter.delivered == 0
+    assert not (repo / ".mindwire" / "pin").exists()
+
+
 def test_composition_root_injects_the_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,3 +541,8 @@ def test_turn_end_obligation_is_filed_for_the_implementer() -> None:
     (entry,) = [o for o in load_manifest().obligations if o.id == "OBL-TURN-END-CLEAN-CLONE"]
     assert entry.role is Role.IMPLEMENTER
     assert "default branch" in entry.body and "feature branch" in entry.body
+    # T-clone-guard-pin-ignored-only-in-mindwire D-1: the loop owns `.mindwire/` and its ignore.
+    assert "`.mindwire/` is written by the loop, and the loop keeps it git-ignored" in entry.body
+    assert "do not commit, delete, or edit it" in entry.body
+    # The loader already refuses a drifted body; pin that this entry carries a pin at all.
+    assert entry.body_sha256 is not None
