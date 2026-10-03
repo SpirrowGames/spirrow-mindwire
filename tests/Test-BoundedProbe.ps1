@@ -379,7 +379,8 @@ exit 0
     # +1 for Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b): no -UvOptions, like the eight.
     # +2 for Invoke-HeadSkipRevertLaunch and Invoke-CloneCheck (T-clone-guard-pin-ignored-only-in-
     # mindwire D-3a / D-3c): no -UvOptions either.
-    Check 'twelve helper call sites in the sweep script' 12 $helperCalls.Count
+    # +1 for Invoke-ParkWakeTick (T-next-line-carries-who-not-why Slice 3, D-7): no -UvOptions, like 1b.
+    Check 'thirteen helper call sites in the sweep script' 13 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

@@ -340,12 +340,13 @@ _TIER_C_LABEL_RE = re.compile(
 #     STOP: done
 #     STOP: blocked-on <thread:|pr:|deploy:|queue-empty:><operand> wake:<agent>
 #
-# Slice 1 is a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value and the
-# conductor LOGS it on the measurement-only path TIER-C already uses. Nothing is rejected, nothing
-# is forwarded to magickit, routing is unchanged, and the emission prompt
-# (`_HANDOFF_PROTOCOL_CORE`) deliberately does NOT teach the form — a prompt that promises
-# "write this and the thread resolves / parks" must ship in the same unit as the mechanism that
-# keeps that promise (Einstein msg-4717 BLOCKING, accepted in msg-4718 §0/§2).
+# Slice 1 (#363) was a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value
+# and the conductor LOGS it. Slice 3 (msg-5175 §3) ships the prompt together with the mechanism
+# that keeps its promise, as msg-4718 §2 requires: `_HANDOFF_PROTOCOL_CORE` now teaches the two
+# forms, the gateway sends the parse as magickit's `disposition`
+# (:mod:`.disposition`), and the park-wake tick (:mod:`spirrow_mindwire.park_wake`) wakes a
+# `blocked-on` thread when its trigger fires. Routing itself is still unchanged: a `NEXT: none`
+# settles whatever its STOP line says.
 #
 # The form is FIXED and read strictly (msg-4718 §1-1: "崩れた行は寛容に読まず malformed"). The
 # `STOP:` keyword itself is detected loosely (case, leading decoration, whitespace after the
@@ -402,8 +403,9 @@ class StopLine:
 
     ``trigger_arm`` / ``trigger_operand`` / ``wake`` are set only for ``BLOCKED_ON``; ``wake`` is
     the roster's canonical identity. ``raw`` is the stripped line for every status except
-    ``ABSENT`` (so a MALFORMED line can be read back from the log). Slice 1's only consumer is the
-    measurement log; the typed value exists so the later slice's forwarding has one parser.
+    ``ABSENT`` (so a MALFORMED line can be read back from the log). Its consumers (Slice 3) all
+    go through :mod:`.disposition`: the gateway's ``disposition``, the conductor's stop line and
+    the park-wake tick, so the line has one parser and one reading.
     """
 
     status: StopStatus
@@ -1015,6 +1017,35 @@ OPERATOR_FORM_EXAMPLE = (
 )
 _OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
 
+# Slice 3 (T-next-line-carries-who-not-why, Bohr msg-5175 §3 / msg-4716 §2): the two STOP forms
+# the protocol teaches. Like OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each
+# through the parser and requires an accepted status, so the prompt cannot teach a form the
+# parser reads as MALFORMED.
+STOP_FORM_EXAMPLES: tuple[str, ...] = (
+    "STOP: done",
+    "STOP: blocked-on <trigger> wake:<persona>",
+)
+_STOP_FORMS_INDENTED = "\n".join(f"    {line}" for line in STOP_FORM_EXAMPLES)
+#: What each trigger arm waits for, in the words the prompt uses. Keyed in
+#: :data:`STOP_TRIGGER_ARMS` order and checked against it at import, so an arm added to the parser
+#: without a sentence here fails the import instead of being accepted but never taught.
+_STOP_TRIGGER_MEANINGS: dict[str, str] = {
+    "thread": "`thread:<thread-id>` or `thread:<project>/<thread-id>` (that thread is resolved)",
+    "pr": "`pr:<owner/repo#n>` (that pull request is merged or closed)",
+    "deploy": (
+        "`deploy:<request_id>` (that deploy request has succeeded, failed or been interrupted)"
+    ),
+    "queue-empty": (
+        "`queue-empty:<project>` or `queue-empty:<project>:<role>` (no open thread of that "
+        "project hands to a participant, or to one holding that role)"
+    ),
+}
+if tuple(_STOP_TRIGGER_MEANINGS) != STOP_TRIGGER_ARMS:  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        f"STOP trigger prose {tuple(_STOP_TRIGGER_MEANINGS)!r} != arms {STOP_TRIGGER_ARMS!r}"
+    )
+_STOP_TRIGGER_PROSE = "; ".join(_STOP_TRIGGER_MEANINGS[arm] for arm in STOP_TRIGGER_ARMS)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -1038,7 +1069,22 @@ refactor extent, work order, splitting PRs or threads, approving an internal \
 mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
-  - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
+  - `NEXT: {NONE_TOKEN}` — nobody acts next on this thread. Say why on the line directly \
+above it, in exactly one of these two forms:
+
+{_STOP_FORMS_INDENTED}
+
+    `STOP: done` means the work this thread exists for is finished. It is recorded as done \
+and waits for its owner to close it.
+    `STOP: blocked-on <trigger> wake:<persona>` means work remains, but it can start only \
+once something happens that the sweep can see. When `<trigger>` holds, the sweep posts a \
+wake message into this thread ending in `NEXT: <persona>`, and the conductor routes it \
+exactly as it would route that handoff written now (the same gates apply). `<persona>` is \
+a participant of this thread. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
+`{HUMAN_TOKEN}` trigger or wake: a stop that needs a person is `NEXT: {HUMAN_TOKEN}`.
+    Write the line exactly so: `STOP` in capitals, single spaces, nothing else on the \
+line. A `NEXT: {NONE_TOKEN}` without a valid `STOP:` line directly above it is recorded \
+as unclassified — a stop nobody explained.
   - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
 of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
 comes first: if the work is, or could be, any of those types, hand it to \

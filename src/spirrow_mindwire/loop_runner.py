@@ -67,6 +67,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -612,6 +613,7 @@ def _build_dispatcher(
     proposer: RoleAdapter | None,
     implementer: RoleAdapter | None,
     naysayer: RoleAdapter | None,
+    roster: Mapping[str, Role] | None = None,
 ) -> tuple[McpToolCaller, InMemoryAdapterRegistry, Dispatcher]:
     """Shared composition root for the watcher loop and the conductor.
 
@@ -622,6 +624,10 @@ def _build_dispatcher(
     the intake differs (a ``ChatroomWatcher`` vs the serial
     :class:`~spirrow_mindwire.conductor.core.Conductor`). Raises ``SystemExit`` if ``loop.repo_dir``
     is unset and an SDK adapter must be built from config.
+
+    ``roster`` reaches the gateway, which needs it to send a ``STOP:`` line's ``disposition``
+    (T-next-line-carries-who-not-why Slice 3): the wake is resolved on the roster. The conductor
+    passes its roster; the watcher loop passes none and so never sends a disposition.
     """
     cfg = settings.loop
     if mcp is None:
@@ -662,7 +668,7 @@ def _build_dispatcher(
             naysayer = build_naysayer(repo_dir, obligations=obligations)
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
-    gateway = MagickitChatroomGateway(mcp)
+    gateway = MagickitChatroomGateway(mcp, roster=roster)
     # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32 / D-39: the
     # dispatcher writes `.mindwire/pin` before every implementer / naysayer
     # dispatch. The pin lives at ``<repo_root>/.mindwire/pin``, so the writer
@@ -861,7 +867,12 @@ def build_conductor(
         )
 
     mcp, registry, dispatcher = _build_dispatcher(
-        settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+        settings,
+        mcp=mcp,
+        proposer=proposer,
+        implementer=implementer,
+        naysayer=naysayer,
+        roster=dict(cond_cfg.roster),
     )
     if pr_review_driver is None:
         pr_review_driver = build_pr_review_driver(settings.naysayer_gating)

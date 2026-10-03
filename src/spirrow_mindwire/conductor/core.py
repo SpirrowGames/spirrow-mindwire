@@ -120,6 +120,7 @@ from ..value_objects import (
     ThreadRef,
 )
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
+from .disposition import StopClass, classify_stop
 from .gate_records import (
     RELAY_AUTHOR,
     RelayRoute,
@@ -943,7 +944,14 @@ class Conductor:
                         latest_msg_id = await self._post_field_stop_notice(
                             handoff, latest, stop_reason, latest_msg_id
                         )
-                return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
+                return self._stop(
+                    round_index,
+                    stop_reason,
+                    latest_msg_id,
+                    forced,
+                    forced_saveable,
+                    stop_class=self._none_stop_class(handoff, latest, stop_reason),
+                )
             # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
             # count describes the head this launch started on; a later round is on a head this
             # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
@@ -2773,6 +2781,20 @@ class Conductor:
                 )
             raise
 
+    def _none_stop_class(
+        self, handoff: Handoff, latest: dict[str, Any], stop_reason: StopReason | None
+    ) -> StopClass | None:
+        """Why a ``NEXT: none`` settled, for the stop line; ``None`` for every other stop.
+
+        T-next-line-carries-who-not-why Slice 3 (msg-5179 §3): the route is SETTLED whatever the
+        ``STOP:`` line says, but the stop line must not read as "settled" when nobody said why —
+        an agent's ``NEXT: none`` with no valid ``STOP:`` line is written ``unclassified``. The
+        human is the conductor's own rule (:meth:`_is_human`).
+        """
+        if stop_reason is not StopReason.SETTLED or handoff.stop_line is None:
+            return None
+        return classify_stop(handoff.stop_line, author_is_human=self._is_human(_author(latest)))
+
     def _stop(
         self,
         rounds: int,
@@ -2780,15 +2802,21 @@ class Conductor:
         last_msg_id: str | None,
         forced: int,
         forced_saveable: int = 0,
+        *,
+        stop_class: StopClass | None = None,
     ) -> ConductorOutcome:
+        # ``stop_class=`` is appended only on a ``NEXT: none`` settle (see ``_none_stop_class``),
+        # after ``last_msg=``: the wrapper reads each ``key=`` with its own match
+        # (Get-ConductorVerdict), so a field it does not know is ignored.
         logger.info(
             "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
-            "forced_naysayer_saveable=%d last_msg=%s",
+            "forced_naysayer_saveable=%d last_msg=%s%s",
             reason.value,
             rounds,
             forced,
             forced_saveable,
             last_msg_id,
+            f" stop_class={stop_class.value}" if stop_class is not None else "",
         )
         return ConductorOutcome(
             rounds=rounds,
