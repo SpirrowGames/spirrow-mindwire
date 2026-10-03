@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -670,6 +671,53 @@ async def test_concurrent_appends_leave_two_whole_records_in_write_order(
     # Each record holds the notes its own write replaced, so each is recoverable.
     assert records[0]["prior_notes"] == "base"
     assert "from-a" in records[1]["prior_notes"]
+
+
+class _SecondCallerFirstLocks(TaskLocks):
+    """Admits the second caller before the first, as a lock may when acquisition interleaves.
+
+    The first caller to ask waits until the second has left its critical section; only then does
+    it take the real lock. That is the ordering PR #439's gate showed can happen.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._callers = 0
+        self._second_done = asyncio.Event()
+
+    @asynccontextmanager
+    async def hold(self, project_id: str, task_id: str) -> AsyncIterator[None]:
+        self._callers += 1
+        first = self._callers == 1
+        if first:
+            await self._second_done.wait()
+        try:
+            async with super().hold(project_id, task_id):
+                yield
+        finally:
+            if not first:
+                self._second_done.set()
+
+
+@pytest.mark.anyio
+async def test_record_order_follows_lock_order_not_call_order(journal: LedgerJournal) -> None:
+    """PR #439 gate (REQUEST_CHANGES): the event id is issued under the lock, not before it."""
+    mcp = _FakeMagickit({"T42": "base"}, yield_between=True)
+    locks = _SecondCallerFirstLocks()
+    events: list[Event] = []
+    a = _notes(mcp, events, journal, head="msg-a", locks=locks)
+    b = _notes(mcp, events, journal, head="msg-b", locks=locks)
+
+    # a asks first, b is admitted first.
+    await asyncio.gather(a.append_note("T42", "from-a"), b.append_note("T42", "from-b"))
+
+    final = mcp.notes["T42"]
+    assert final.index("from-b") < final.index("from-a")  # b really wrote first
+    records = _records(journal)  # sorted by file name = event_id
+    assert [r["appended_text"] for r in records] == ["from-b", "from-a"]
+    # No temporal inversion: the later record's prior notes hold the earlier record's text.
+    assert records[0]["prior_notes"] == "base"
+    assert "from-b" in records[1]["prior_notes"]
 
 
 def test_monotonic_ulids_strictly_increase_within_one_millisecond() -> None:

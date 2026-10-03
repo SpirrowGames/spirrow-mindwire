@@ -37,8 +37,9 @@ production. :class:`LedgerJournal` writes one JSON file per append,
 ``<root>/<project_id>/<task_id>/<event_id>.json``, with ``atomic_write_text(..., fsync=True)``
 (temp file, fsync, rename): a record is either whole or absent, two processes never share a file,
 and so no file lock is needed (Bohr msg-5886, Einstein msg-5887). ``event_id`` is a ULID issued
-monotonically within this process, so sorting one task's file names gives the order this process
-wrote them in; across processes the order is only as good as the millisecond clock.
+monotonically within this process, and issued while the per-task lock is held, so sorting one
+task's file names gives the order this process wrote them in; across processes the order is only
+as good as the millisecond clock.
 
 **The journal write is an exception to I7.** It is not observation: it is the only recovery path
 strategy 3 has. If it cannot be written, the append is not made — ``ledger.note_failed`` with
@@ -210,13 +211,18 @@ class LedgerJournal:
 
     root: Path
 
-    def path_for(self, project_id: str, task_id: str, event_id: str) -> Path:
+    @staticmethod
+    def check_identifiers(project_id: str, task_id: str) -> None:
+        """Raise ``invalid_identifier`` unless both ids are safe as one path segment each."""
         for name, value in (("project_id", project_id), ("task_id", task_id)):
             if not _IDENTIFIER.fullmatch(value):
                 raise LedgerError(
                     LedgerFailure.INVALID_IDENTIFIER,
                     f"{name} {value!r} must match {_IDENTIFIER.pattern}",
                 )
+
+    def path_for(self, project_id: str, task_id: str, event_id: str) -> Path:
+        self.check_identifiers(project_id, task_id)
         return self.root / project_id / task_id / f"{event_id}.json"
 
     def write(self, record: dict[str, Any]) -> Path:
@@ -267,14 +273,18 @@ class LedgerNotes:
         Magickit. Returns the header, byte count and event id. Errors raise :class:`LedgerError`
         after emitting ``ledger.note_failed``.
         """
-        event_id = self.new_id()
+        event_id = ""
         journaled = False
         try:
             task_id = _require(task_id, "task_id")
             text = _require(text, "text")
             # Refuse a path-unsafe id before locking or reading anything.
-            self.journal.path_for(self.project_id, task_id, event_id)
+            self.journal.check_identifiers(self.project_id, task_id)
             async with self.locks.hold(self.project_id, task_id):
+                # Issued under the per-task lock, never before it: the id orders the record
+                # files, so it must follow the order the read-modify-write cycles run in. An id
+                # taken before the lock lets a later holder carry an earlier id (PR #439 gate).
+                event_id = self.new_id()
                 task, phase = await self._read(task_id)
                 prior = task.get("notes")
                 prior_notes = prior if isinstance(prior, str) else ""
