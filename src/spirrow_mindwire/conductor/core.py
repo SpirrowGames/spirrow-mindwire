@@ -124,6 +124,7 @@ from .gate_records import (
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
+    is_merge_wait_relay,
     normalize_sha,
     render_admission_heading,
     render_ci_route_marker,
@@ -324,6 +325,12 @@ class StopReason(StrEnum):
     # tick re-reads the same handoff and re-derives admission from the fresh rollup; the wait is
     # therefore held by GitHub's state, not by a mindwire-side timer (§A-2 statelessness).
     CI_WAIT = "ci_wait"
+    # The PR-gate APPROVEd a PR whose merge is the human's (base=main). Not a decision: opening the
+    # PR already asked for the merge, and the merge-wait PR list carries it (Takahito, msg-4361
+    # "main へのマージは判断点から外す"; restated 2026-10-03). The relay ends ``NEXT: human`` so
+    # head_skip parks the thread and 1b (pr_event_advance) resumes it once the PR is merged or
+    # closed; this reason keeps the sweep from notifying and from pushing a decision card.
+    MERGE_WAIT = "merge_wait"
     # An adapter's ``deliver_event`` raised (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
     # Bohr msg-4440 D-1''). NEVER returned from :meth:`Conductor.run` and never logged by the
     # conductor: the exception propagates unchanged, and ``loop_runner.main`` is the single place
@@ -783,7 +790,12 @@ class Conductor:
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
-                    return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
+                    reason = (
+                        StopReason.MERGE_WAIT
+                        if relay_msg_id and is_merge_wait_relay(_content(relay_msg))
+                        else StopReason.HUMAN
+                    )
+                    return self._stop(round_index, reason, last, forced, forced_saveable)
                 handle = sessions.get(implementer_identity)
                 if handle is None:
                     spawned = await self._spawn(self._implementer_role, implementer_identity)

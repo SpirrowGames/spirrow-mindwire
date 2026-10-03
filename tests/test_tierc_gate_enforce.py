@@ -59,7 +59,7 @@ from spirrow_mindwire.tier_c_decisions_log import append_log_entries
 from spirrow_mindwire.value_objects import Role
 
 UNLABELLED = "revised\n\nNEXT: human"
-LABELLED = "revised\n\nTIER-C: merge-protected\nNEXT: human"
+LABELLED = "revised\n\nTIER-C: goal\nNEXT: human"
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
 
@@ -345,9 +345,7 @@ async def test_implementer_author_is_dispatched_directly_not_through_guard_i(
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content=_attested("critique\n\nNEXT: Heisenberg"))
     mcp.seed(author="Heisenberg", content="done?\n\nNEXT: human")
-    disp = _ScriptedDispatcher(
-        mcp, {Role.IMPLEMENTER: ["PR up\n\nTIER-C: merge-protected\nNEXT: human"]}
-    )
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["PR up\n\nTIER-C: cost\nNEXT: human"]})
     conductor = Conductor(
         mcp=mcp,
         dispatcher=disp,

@@ -25,7 +25,7 @@ from typing import Any
 
 from .conductor.gate_records import (
     ADVISORY_SELF_TRIAGE_INSTRUCTION,
-    MERGE_REQUEST_TIER_C_LINE,
+    MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     carries_advisory,
@@ -474,8 +474,8 @@ class PrReviewOrchestrator:
                 tail.append(ADVISORY_SELF_TRIAGE_INSTRUCTION)
             tail.append(f"NEXT: {implementer}")
         elif outcome.verdict is ReviewEvent.APPROVE:
-            # Every APPROVE that stops at the human is a merge request (msg-4772 / msg-4774).
-            tail.append(f"{MERGE_REQUEST_TIER_C_LINE}\nNEXT: {HUMAN_TOKEN}")
+            # An APPROVE that stops at the human is a merge WAIT, not a Tier-C decision (msg-4361).
+            tail.append(f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}")
         else:
             tail.append(f"NEXT: {HUMAN_TOKEN}")
         body = (

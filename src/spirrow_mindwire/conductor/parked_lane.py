@@ -13,6 +13,9 @@ not map (msg-5406). This module splits a parked head into three lanes:
 - :attr:`ParkedLane.MISROUTE` — the conductor's own stand-down for a ``NEXT:`` it could not route
   (a typo, an ambiguous role name, a malformed ``NEXT: operator``). It waits for re-routing, not
   for a decision.
+- :attr:`ParkedLane.MERGE_WAIT` — a PR-gate APPROVE relay on a PR whose merge is the human's. The
+  merge-wait PR list already carries it; it is not a decision (Takahito, msg-4361). Read from the
+  relay's column-zero ``MERGE-WAIT:`` line (:func:`.gate_records.is_merge_wait_relay`).
 
 One stand-down is held back in the decision lane: ``operator_tier_c_conflict``. Its author wrote
 ``TIER-C: <type>`` AND ``NEXT: operator``. The handoff is refused, but the work was declared
@@ -31,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from .gate_records import is_merge_wait_relay
 from .handoff import HandoffKind, HumanAsk, resolve_handoff
 from .stand_down import EVENT_KIND_STAND_DOWN, StandDownReason, UnresolvedItem
 from .stop_marker import parse_stop_marker
@@ -42,6 +46,7 @@ class ParkedLane(StrEnum):
     DECISION = "decision"
     OPERATOR_WORK = "operator_work"
     MISROUTE = "misroute"
+    MERGE_WAIT = "merge_wait"
 
 
 #: Stand-down reasons that mean "the ``NEXT:`` could not be routed" — the misroute lane. Listed
@@ -73,6 +78,8 @@ def classify_parked(body: str) -> ParkedClassification:
     Callers pass heads they have already found to be human-parked; a body that does not park is
     still answered (``DECISION``) rather than raised on, because the caller is a scheduled tick.
     """
+    if is_merge_wait_relay(body):
+        return ParkedClassification(ParkedLane.MERGE_WAIT)
     marker = parse_stop_marker(body)
     if (
         marker is not None
