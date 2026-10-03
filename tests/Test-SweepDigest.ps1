@@ -98,7 +98,7 @@ $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
-                  'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
+                  'Format-DurationDigest', 'Get-ParkedRowTag', 'Get-StarvedKeys', 'New-DailyDigest',
                   'ConvertTo-UtcInstant',
                   'Test-DigestDelivered', 'Test-DigestFullSuccess',
                   'Get-DigestPeriod', 'Test-DigestDeliveryDue',

@@ -1,4 +1,4 @@
-"""D-2 log-only enumerator for "unregistered" chatroom threads.
+"""D-2 enumerator for "unregistered" chatroom threads.
 
 Owns the pure predicate behind :ref:`T-sweep-intake-and-quarantine-stalls`'s
 D-2 (Bohr msg-2529 §8 as refined by msg-2531 §1): count threads that would
@@ -27,15 +27,17 @@ order:
    matters: thread ids are only unique WITHIN a project (see the state
    key in ``run-conductor-scheduled.ps1`` L2375).
 
-**Log-only until P-1 ∧ P-2 hold** (msg-2531 §1). This module and its CLI
-produce a JSON report; wiring the count into the daily digest is BLOCKED
-until magickit surfaces a ``parked`` transition (P-1) and the eight
-intentionally-parked threads Bohr enumerated in msg-2529 §3 have been
-moved to ``status=parked`` (P-2). Configuring the digest to render this
-count today would ship an alarm with a known-fixed 31 % false-positive
-rate (msg-2530 point 2), and an alarm ignored on day one becomes an
-alarm ignored on every subsequent day — exactly the failure the
-msg-1181 audit named "silent stop, then silent noise".
+**Wired into the sweep** (msg-5889 D-2 / msg-5893 D-2.1-D-2.4). The
+earlier "log-only until P-1 ∧ P-2 hold" rule (msg-2531 §1) no longer
+applies: Operator Board §F.1 / msg-4900 §2 dropped the plan to express
+"cannot be swept" as a ``parked`` state. The sweep wrapper now adds
+every thread this predicate reports to the current tick's candidates
+(in memory; ``sweep.json`` is never written) when its project passes the
+environment probe, and lists the rest with their reason in the daily
+digest. See ``scripts/unregistered_threads.py`` and
+``deploy/lib/UnregisteredIntake.ps1`` for the split between an
+auto-registered thread (an ordinary candidate, quarantinable) and a
+refused one (never in any state file).
 
 Fail direction: this module makes **no** MCP calls of its own — the CLI
 around it does. What it does with an MCP failure is separated from what
@@ -78,8 +80,8 @@ from typing import Any
 #: Kept string-value-identical to
 #: :data:`spirrow_mindwire.gate_bootstrap._OPEN_ALERT_TARGET_STATUSES`
 #: (Bohr msg-2460 §4). Deliberately excluded: ``resolved`` (done),
-#: ``superseded`` (replaced), ``parked`` (intentionally set aside — the
-#: whole reason D-2 depends on P-1 landing first).
+#: ``superseded`` (replaced), ``parked`` (intentionally set aside — a
+#: parked thread is not live work, so it is never auto-registered).
 LIVE_STATUSES: frozenset[str] = frozenset({"active", "awaiting_reply"})
 
 #: The thread-id prefix used for PR-review threads. Any thread whose id

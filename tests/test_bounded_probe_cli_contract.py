@@ -78,7 +78,13 @@ def test_every_call_site_was_found() -> None:
     # tenth: Invoke-PrEventAdvanceTick -> -m spirrow_mindwire.pr_event_advance.
     # T-clone-guard-pin-ignored-only-in-mindwire adds two: Invoke-HeadSkipRevertLaunch (D-3a) and
     # Invoke-CloneCheck -> -m spirrow_mindwire.cli clone-check (D-3c).
-    assert len(_SITES) == 12, _SITES
+    # T-sweep-intake-and-quarantine-stalls (msg-5889 D-2) adds Invoke-UnregisteredThreadsProbe.
+    assert len(_SITES) == 13, _SITES
+
+
+def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get("'unregistered-threads'") == ("unregistered_threads.py", ["--sweep-config"])
 
 
 def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:

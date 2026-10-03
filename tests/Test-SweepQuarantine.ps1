@@ -55,7 +55,7 @@ foreach ($name in 'Get-BoundedProbeCommandLine', 'Invoke-BoundedUvProbe',
                   'New-QuarantineRecord', 'Get-FailureClass',
                   'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
-                  'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
+                  'Format-DurationDigest', 'Get-ParkedRowTag', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite',
                   'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
                   # T-digest-exceeds-discord-limit-and-is-dropped (msg-2099..2106): Test-DigestClockAdvances

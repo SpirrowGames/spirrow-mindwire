@@ -1,4 +1,4 @@
-"""D-2 log-only enumerator CLI — count threads live in the chatroom but missing from ``sweep.json``.
+"""D-2 enumerator CLI — list threads live in the chatroom but missing from ``sweep.json``.
 
 Owns the CLI side of :ref:`T-sweep-intake-and-quarantine-stalls`'s D-2
 (Bohr msg-2529 §8 refined by msg-2531 §1). The predicate itself lives in
@@ -7,14 +7,27 @@ Owns the CLI side of :ref:`T-sweep-intake-and-quarantine-stalls`'s D-2
 :mod:`scripts.pr_review_sweep_phase0` (write-zero MCP wrapper) and
 :mod:`scripts.parked_humans` (per-project, fail-open on per-item errors).
 
-**Log-only until P-1 ∧ P-2 hold** (msg-2531 §1). The wrapper that would
-render this count in the daily digest is intentionally NOT wired in this
-PR: doing so today would ship an alarm with a known 31 % false-positive
-rate (msg-2530 point 2) because the eight threads Bohr enumerated in
-msg-2529 §3 as "intentionally parked" cannot yet be moved to
-``status=parked`` (magickit exposes no transition, msg-2531 §1 P-1). The
-script exists so those counts can be *observed* against real chatroom
-data before the digest starts publishing them.
+**Wired into the sweep** (msg-5889 D-2, amended by msg-5893 D-2.1-D-2.4;
+Operator Board §F.1 row 3). This replaces the earlier "log-only until
+P-1 ∧ P-2 hold" rule (msg-2531 §1): §F.1 / msg-4900 §2 dropped the plan
+to model "cannot be swept" as a ``parked`` state, so nothing waits on P-1
+any more. Every tick, ``deploy/run-conductor-scheduled.ps1`` runs this
+script and hands its report to ``deploy/lib/UnregisteredIntake.ps1``:
+
+* A listed thread whose project passes the environment probe (exactly one
+  distinct ``repo_dir`` among that project's sweep candidates, fully
+  qualified, existing) joins **that tick's** candidate array, in memory.
+  ``sweep.json`` is never written; this script stays write-zero.
+* From then on it is an ordinary candidate (D-2.2): a failure is retried
+  once and then quarantined, exactly as for a ``sweep.json`` entry. There
+  is no bypass. The append happens before the quarantine / retry-pending /
+  head-skip filters (D-2.3), so a quarantined auto-registered thread is
+  not launched.
+* A thread whose project fails the probe is **not** registered. The
+  reason is derived again every tick and shown in the daily digest's
+  "unregistered (refused)" section; it is never persisted, and the thread gets
+  no ``parked`` state and no ``state/quarantine.json`` entry (§F.1,
+  msg-4900 §2 — the scope of that rule is the refused thread, D-2.1).
 
 Read-only: every chatroom tool this script may call is wrapped in
 :class:`ReadOnlyMcp` (a two-entry read allowlist). A future edit that
@@ -110,10 +123,11 @@ Fail direction
 Wiring
 ------
 
-There is intentionally no ``scripts/`` wiring in this PR. The wrapper
-call site (``deploy/run-conductor-scheduled.ps1`` digest section, around
-L1067 / L1243) will be added in a follow-up once P-1 and P-2 both hold.
-Until then this script is manually runnable for observation.
+Called once per tick by ``Invoke-UnregisteredThreadsProbe`` in
+``deploy/run-conductor-scheduled.ps1``, right after the sweep reads
+``sweep.json``. Any failure of this script (non-zero exit, timeout, no
+JSON) registers nothing that tick and renders as ``?`` in the digest.
+It remains manually runnable for observation.
 """
 
 from __future__ import annotations

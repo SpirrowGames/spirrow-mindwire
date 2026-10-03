@@ -37,7 +37,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($sweepScript, [ref]$null, [ref]$parseErrors)
 if ($parseErrors) { throw "deploy/run-conductor-scheduled.ps1 does not parse" }
 $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant', 'Format-DurationDigest',
+foreach ($name in 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant', 'Format-DurationDigest', 'Get-ParkedRowTag',
                   'New-DailyDigest', 'Get-StarvedKeys') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
