@@ -4772,6 +4772,12 @@ try {
         $null = Update-DirtyCloneParking -Parked $dirtyClonesParked -NotifyState $notifyState `
             -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark
         Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
+        # Persist the notification state in the same breath as the parking state (PR #435 gate,
+        # round 1): a release removes the repo's alert signature from $notifyState, and the only
+        # other save of it is at the end of the sweep — a throw anywhere in between would leave
+        # dirty-clones.json saying "released" while notified.json still holds the old signature,
+        # so the SAME fault coming back would be silently deduped. The two files move together.
+        Save-JsonState -Path $notifyStatePath -State $notifyState
     }
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
@@ -5124,6 +5130,8 @@ try {
             Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
             Send-NotificationIfChanged -State $notifyState -Key $notice.key `
                 -Signature $notice.signature -Message $notice.message
+            # Same pairing as the re-judge block above: parking and its alert signature persist together.
+            Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; repo parked; other candidates on this repo_dir are skipped until clone-check passes, other repos CONTINUE"
             continue
         }

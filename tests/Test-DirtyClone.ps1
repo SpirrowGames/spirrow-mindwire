@@ -298,6 +298,31 @@ Check 'clean: launches_same_head starts at 1' 1 $script:sim.lastLaunchCount
 Check 'clean: alert signature forgotten, so a recurrence alerts again' $false $notify.ContainsKey("__dirty_clone__/$repoKeyP")
 
 Write-Host ''
+Write-Host 'parking — release survives a notified.json round trip (PR #435 gate round 1)'
+# The sweep reloads notified.json every tick, so an in-memory forget only counts once it is
+# persisted. "Disk" is modelled as the JSON text Save-JsonState writes (ConvertTo-Json -Depth 5)
+# and Get-JsonState reads back as a hashtable, so the check needs no file I/O.
+function Save-Sim { param([hashtable]$State) return ($State | ConvertTo-Json -Depth 5) }
+function Load-Sim { param([string]$Text) if (-not $Text) { return @{} } return ($Text | ConvertFrom-Json -AsHashtable) }
+$rtParked = @{}
+$script:sent = @()
+$st = @{}
+$n1 = Get-DirtyCloneNotice -RepoDir $repoP -CandidateKey 'p::T-1' -Output $wrongHead.output -ExitCode 8
+Set-DirtyCloneParked -Parked $rtParked -RepoDir $repoP -Notice $n1 -NowIso '2026-10-03T05:00:00.0000000Z'
+Send-NotificationIfChanged -State $st -Key $n1.key -Signature $n1.signature -Message $n1.message
+$disk = Save-Sim $st
+Check 'round trip: first park alerts' 1 $script:sent.Count
+# tick N: clean -> released, then persisted the way the re-judge block persists it
+$st = Load-Sim $disk
+$null = Update-DirtyCloneParking -Parked $rtParked -NotifyState $st -Probe { param($x) $clean } -NowIso '2026-10-03T06:00:00.0000000Z'
+$disk = Save-Sim $st
+# tick N+1: fresh load, same fault again -> must alert
+$st = Load-Sim $disk
+Check 'round trip: forgotten signature is gone after reload' $false $st.ContainsKey("__dirty_clone__/$repoKeyP")
+Send-NotificationIfChanged -State $st -Key $n1.key -Signature $n1.signature -Message $n1.message
+Check 'round trip: the same fault after a release alerts again' 2 $script:sent.Count
+
+Write-Host ''
 Write-Host 'parking — state file rows normalise'
 $fromJson = '{"k": {"repo_dir": "C:/x", "reason": "wrong_head", "head": "f", "detail": "", "since": "s", "signature": "g"}, "bad": {"reason": "x"}}' | ConvertFrom-Json -AsHashtable
 $norm = ConvertTo-DirtyCloneParking -State $fromJson
@@ -315,6 +340,14 @@ Check 'branch persists the parking' $true ($branchText -match 'Save-JsonState -P
 $scriptText = $ast.Extent.Text
 $posUpdate = $scriptText.IndexOf('Update-DirtyCloneParking -Parked $dirtyClonesParked')
 Check 're-judge runs before the candidate loop' $true ($posUpdate -ge 0 -and $posUpdate -lt $loop.Extent.StartOffset)
+$rejudgeIf = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.IfStatementAst] -and
+        $n.Extent.Text -match 'Update-DirtyCloneParking -Parked \$dirtyClonesParked' -and
+        $n.Extent.Text.Length -lt 4000 }, $true) | Select-Object -First 1
+$rejudgeText = if ($rejudgeIf) { $rejudgeIf.Extent.Text } else { '' }
+Check 're-judge block persists the parking' $true ($rejudgeText -match 'Save-JsonState -Path \$dirtyClonesStatePath')
+Check 're-judge block persists notified.json with it (a release must stick)' $true ($rejudgeText -match 'Save-JsonState -Path \$notifyStatePath -State \$notifyState')
+Check 'exit-8 branch persists notified.json with the parking' $true ($branchText -match 'Save-JsonState -Path \$notifyStatePath -State \$notifyState')
 Check 're-judge probes with Invoke-CloneCheck' $true ($scriptText -match 'Probe \{ param\(\$d\) Invoke-CloneCheck -RepoDir \$d \}')
 Check 'digest receives the parked rows' $true ($scriptText -match '-ParkedCloneLines \(Get-DirtyCloneDigestLines -Parked \$dirtyClonesParked\)')
 $cc = $functions | Where-Object { $_.Name -eq 'Invoke-CloneCheck' } | Select-Object -First 1
