@@ -51,6 +51,7 @@ from spirrow_mindwire.stall_ledger.adapters import (
     ChatroomThreadAdapter,
     GitHubOpenPrAdapter,
     QuarantineFileAdapter,
+    github_credential_present,
 )
 from spirrow_mindwire.stall_ledger.driver import DEFAULT_T_TICK_MAX, TickPaths, run_tick
 from spirrow_mindwire.stall_ledger.lock import read_payload
@@ -117,11 +118,31 @@ async def _tick(args: argparse.Namespace, paths: TickPaths) -> int:
     adapters: list[Adapter] = []
     github = None
     if args.repo:
-        from spirrow_mindwire.github.client import GitHubClient
+        from spirrow_mindwire.github.client import GitHubClient, github_token
 
+        # msg-6415 Q2: decide "is there a credential" here, at the tick's entry, and make a
+        # missing one loud -- the github source then fails as ``auth_missing`` without a
+        # single request instead of running unauthenticated into the per-IP rate limit.
+        credential_present = github_credential_present(github_token())
+        if not credential_present:
+            print(
+                "stall_ledger_tick: no GitHub token (MINDWIRE_GITHUB_TOKEN / GITHUB_TOKEN unset "
+                "or blank); github sources report auth_missing and make no request. The "
+                "scheduled wrapper passes MINDWIRE_STALL_LEDGER_GITHUB_TOKEN through "
+                "(docs/deploy.md, Stall ledger tick).",
+                file=sys.stderr,
+            )
         github = GitHubClient(timeout_seconds=args.fetch_timeout_seconds)
         for owner, repo in args.repo:
-            adapters.append(GitHubOpenPrAdapter(github, owner, repo, fetch_timeout=fetch_timeout))
+            adapters.append(
+                GitHubOpenPrAdapter(
+                    github,
+                    owner,
+                    repo,
+                    fetch_timeout=fetch_timeout,
+                    credential_present=credential_present,
+                )
+            )
     if args.project:
         from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 
