@@ -855,6 +855,7 @@ def build_conductor(
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
     run_phase: RunPhase | None = None,
+    gate_only: bool = False,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -1000,6 +1001,9 @@ def build_conductor(
             decisions_log_path=resolve_tier_c_decisions_log_path(settings),
             # Wall-clock budget (msg-5498 W-1): the phase the run_timeout event reports.
             run_phase=run_phase,
+            # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1'): ``--gate-only``
+            # from the sweep's gate-lane launch. ``False`` for a hand run and a role-lane launch.
+            gate_only=gate_only,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -1029,6 +1033,7 @@ async def run_conductor(
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
+    gate_only: bool = False,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -1059,6 +1064,10 @@ async def run_conductor(
     T-retry-once-before-quarantine D-4: ``retry_of`` is the parsed ``--retry-of`` value, the failed
     launch this run re-fires. Handed to the Conductor unchanged; ``None`` changes no prompt.
 
+    T-sweep-starves-deep-candidates PR-B: ``gate_only`` is ``--gate-only``, passed by the sweep on
+    gate-lane launches only. The Conductor then stops (``slice_end``) right before spawning the
+    implementer on an RC relay / R4 ci-route, leaving that post for the role lane.
+
     Wall-clock budget (msg-5496 / msg-5498 W-1): everything above runs inside
     :func:`~spirrow_mindwire.conductor.run_budget.run_with_budget`, bounded by
     ``[conductor].run_budget_s``. On expiry the ``conductor.run_timeout`` line is written, the run
@@ -1086,6 +1095,7 @@ async def run_conductor(
             launch_head_msg_id=launch_head_msg_id,
             retry_of=retry_of,
             run_phase=run_phase,
+            gate_only=gate_only,
         )
 
     outcome, timed_out = await run_with_budget(
@@ -1132,6 +1142,7 @@ async def _run_conductor_once(
     launch_head_msg_id: str | None,
     retry_of: RetryOf | None,
     run_phase: RunPhase,
+    gate_only: bool = False,
 ) -> ConductorOutcome:
     """The body :func:`run_conductor` bounds: resolve, preflight, build, run, tear down."""
     project = settings.loop.project
@@ -1173,6 +1184,7 @@ async def _run_conductor_once(
         launch_head_msg_id=launch_head_msg_id,
         retry_of=retry_of,
         run_phase=run_phase,
+        gate_only=gate_only,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1344,6 +1356,17 @@ def main() -> None:
             "roles in RETRY_NOTICE_ROLES get a check-before-acting notice on round 0"
         ),
     )
+    # T-sweep-starves-deep-candidates PR-B (Bohr msg-6313 §1' / msg-6316). Written by the sweep on
+    # gate-lane launches only. Absent = the run goes as far as it always did, so a hand-run
+    # conductor and a role-lane launch are unchanged.
+    parser.add_argument(
+        "--gate-only",
+        action="store_true",
+        help=(
+            "conductor: gate-lane run — stop (slice_end) before spawning the implementer on a "
+            "REQUEST_CHANGES relay or R4 ci-route; the next tick resumes it in the role lane"
+        ),
+    )
     args = parser.parse_args()
     settings = load_settings()
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
@@ -1358,6 +1381,7 @@ def main() -> None:
                     launches_same_head=args.launches_same_head,
                     launch_head_msg_id=args.launch_head_msg_id or None,
                     retry_of=parse_retry_of(args.retry_of),
+                    gate_only=args.gate_only,
                 )
             )
         else:
