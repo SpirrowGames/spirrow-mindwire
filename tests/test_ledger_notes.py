@@ -27,7 +27,7 @@ from spirrow_mindwire.claude_code.tools.ledger_server import (
     LEDGER_TOOL_NAMES,
     build_ledger_tools,
 )
-from spirrow_mindwire.loop_runner import _log_event_sink
+from spirrow_mindwire.loop_runner import _LEDGER_LOG_FIELDS, _log_event_sink
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.ledger_notes import (
     EVENT_KIND_LEDGER_NOTE_APPENDED,
@@ -740,6 +740,7 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
         occurred_at=_NOW,
         kind=EVENT_KIND_LEDGER_NOTE_APPENDED,
         fields={
+            "project_id": "spirrow-mindwire",
             "task_id": "T42",
             "prior_notes_sha256": sha,
             "prior_notes": "SECRET-BODY",
@@ -750,16 +751,55 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
         event_id="01J00000000000000000000001",
         occurred_at=_NOW,
         kind=EVENT_KIND_LEDGER_NOTE_FAILED,
-        fields={"task_id": "T44", "reason": "journal_unavailable"},
+        fields={
+            "project_id": "spirrow-mindwire",
+            "task_id": "T44",
+            "reason": "journal_unavailable",
+            "appended_text": "SECRET-TEXT",
+        },
     )
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.loop_runner"):
         await _log_event_sink(appended)
         await _log_event_sink(failed)
 
     appended_line, failed_line = [r.getMessage() for r in caplog.records]
-    assert "event_id=01J00000000000000000000000" in appended_line
-    assert "task_id=T42" in appended_line
-    assert f"prior_notes_sha256={sha}" in appended_line
-    assert "SECRET" not in appended_line  # never the notes themselves
-    assert "task_id=T44" in failed_line
-    assert "reason=journal_unavailable" in failed_line
+    # Exact lines, not substrings: each key appears once (project_id is rendered by the fixed
+    # format, and the extras loop is an allow-list that does not contain it), and nothing
+    # outside the allow-list -- in particular never the notes themselves -- reaches the line.
+    assert appended_line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_APPENDED} event_id=01J00000000000000000000000"
+        f" project_id=spirrow-mindwire task_id=T42 prior_notes_sha256={sha}"
+    )
+    assert failed_line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_FAILED} event_id=01J00000000000000000000001"
+        " project_id=spirrow-mindwire task_id=T44 reason=journal_unavailable"
+    )
+    for line in (appended_line, failed_line):
+        assert line.count("project_id=") == 1
+        assert "SECRET" not in line
+
+
+@pytest.mark.anyio
+async def test_a_ledger_event_without_its_keys_logs_a_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bare = Event(
+        event_id="01J00000000000000000000002",
+        occurred_at=_NOW,
+        kind=EVENT_KIND_LEDGER_NOTE_FAILED,
+        fields={},
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.loop_runner"):
+        await _log_event_sink(bare)
+
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_FAILED} event_id=01J00000000000000000000002"
+        " project_id=? task_id=?"
+    )
+
+
+def test_the_extras_allow_list_never_repeats_a_key_the_fixed_format_renders() -> None:
+    # project_id and task_id are rendered by the fixed format; listing either in the extras
+    # allow-list too would print it twice on every ledger line.
+    assert not {"event_id", "project_id", "task_id"} & set(_LEDGER_LOG_FIELDS)
