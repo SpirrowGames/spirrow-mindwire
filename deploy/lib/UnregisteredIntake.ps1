@@ -33,7 +33,9 @@
 # The PR-review thread prefix. Those threads dispatch to the paid Tier B PR-gate and must never be
 # swept on a timer (Get-SweepCandidates' header). The enumerator already excludes them
 # (spirrow_mindwire.unregistered_threads.PR_REVIEW_PREFIX); this is the second, local check, so a
-# regression there is refused loudly here instead of spending money.
+# regression there is refused loudly here instead of spending money. The two values are pinned equal by
+# tests/test_unregistered_threads.py::test_powershell_pr_review_prefix_matches_python, so this copy
+# cannot drift from the Python one without a red gate.
 $script:UnregisteredPrReviewPrefix = 'T-pr-review-'
 
 # Environment probe for one project. Returns @{ ok; repo_dir; reason }.
