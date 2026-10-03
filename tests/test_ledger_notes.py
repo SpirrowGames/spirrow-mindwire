@@ -740,6 +740,7 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
         occurred_at=_NOW,
         kind=EVENT_KIND_LEDGER_NOTE_APPENDED,
         fields={
+            "project_id": "spirrow-mindwire",
             "task_id": "T42",
             "prior_notes_sha256": sha,
             "prior_notes": "SECRET-BODY",
@@ -750,7 +751,12 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
         event_id="01J00000000000000000000001",
         occurred_at=_NOW,
         kind=EVENT_KIND_LEDGER_NOTE_FAILED,
-        fields={"task_id": "T44", "reason": "journal_unavailable"},
+        fields={
+            "project_id": "spirrow-mindwire",
+            "task_id": "T44",
+            "reason": "journal_unavailable",
+            "appended_text": "SECRET-TEXT",
+        },
     )
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.loop_runner"):
         await _log_event_sink(appended)
@@ -758,8 +764,11 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
 
     appended_line, failed_line = [r.getMessage() for r in caplog.records]
     assert "event_id=01J00000000000000000000000" in appended_line
+    assert "project_id=spirrow-mindwire" in appended_line
     assert "task_id=T42" in appended_line
     assert f"prior_notes_sha256={sha}" in appended_line
     assert "SECRET" not in appended_line  # never the notes themselves
+    assert "project_id=spirrow-mindwire" in failed_line
     assert "task_id=T44" in failed_line
     assert "reason=journal_unavailable" in failed_line
+    assert "SECRET" not in failed_line

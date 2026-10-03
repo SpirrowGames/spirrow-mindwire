@@ -584,9 +584,10 @@ async def _log_event_sink(event: Event) -> None:
         # Ledger events carry no author. Put the keys that match a line to its recovery record
         # (``<logs_dir>/ledger/<project>/<task>/<event_id>.json``) on the line; never the notes.
         logger.info(
-            "loop event %s event_id=%s task_id=%s%s",
+            "loop event %s event_id=%s project_id=%s task_id=%s%s",
             event.kind,
             event.event_id,
+            event.fields.get("project_id", "?"),
             event.fields.get("task_id", "?"),
             "".join(
                 f" {key}={event.fields[key]}"
