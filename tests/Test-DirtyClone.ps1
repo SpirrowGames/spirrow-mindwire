@@ -374,5 +374,99 @@ Check 'digest receives the parked rows' $true ($scriptText -match '-ParkedCloneL
 $cc = $functions | Where-Object { $_.Name -eq 'Invoke-CloneCheck' } | Select-Object -First 1
 Check 'Invoke-CloneCheck runs the clone-check subcommand' $true ($cc.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-check', '--repo-dir'")
 
+# ===================================================================================================
+# PR #435 gate round 3, finding 1 (edge-case): the 駐機中 rows are budgeted like every other section.
+# Before, they were spliced in above the reserve ladder with no bound on their NUMBER, so enough parked
+# repos alone could push the digest past $Budget and no later truncation could bring it back.
+# ===================================================================================================
+Write-Host ''
+Write-Host 'digest budget — many parked repos'
+$manyParked = @{}
+for ($i = 0; $i -lt 40; $i++) {
+    $dir = 'C:/workspace/sandbox/' + ('some-long-repo-name-{0:D2}-impl' -f $i)
+    $manyParked[(ConvertTo-DirtyCloneRepoKey $dir)] = @{
+        repo_dir = $dir; reason = 'wrong_head'; head = 'feature/T-a-rather-long-feature-branch-name-for-width'
+        detail = 'x'; since = ('2026-10-03T00:{0:D2}:00.0000000Z' -f $i); signature = 's'
+    }
+}
+$manyLines = Get-DirtyCloneDigestLines -Parked $manyParked
+$naive = (($manyLines | ForEach-Object { "$_" }) -join "`n").Length
+Check 'many parked: the rows alone exceed the budget (the boundary the gate named)' $true ($naive -gt 1800)
+$bigHumanParked = @(for ($i = 0; $i -lt 5; $i++) { [PSCustomObject]@{ key = "p/T-h$i"; head_msg_id = "msg-$i" } })
+$dgMany = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $nowUtc -LiveKeys @() -HumanParked $bigHumanParked -PendingDecisionsState @{} -ParkedPollErrors @() -Budget 1800 `
+    -ParkedCloneLines $manyLines
+Check 'many parked: digest stays within the budget' $true ($dgMany.Length -le 1800)
+Check 'many parked: header still carries the true count' $true ($dgMany -like '*駐機中 repo*: 40 件*')
+Check 'many parked: the dropped rows are counted, not silent' $true ($dgMany -match '\+\d+ 件（省略')
+Check 'many parked: the oldest parked repo keeps its row' $true ($dgMany -like '*some-long-repo-name-00-impl*')
+Check 'many parked: later sections keep their floor (判断待ち row 0 rendered)' $true ($dgMany -like '*p/T-h0*')
+Check 'many parked: 隔離中 and 飢餓 headers still rendered' $true (($dgMany -like '*隔離中: 0 件*') -and ($dgMany -like '*飢餓*'))
+$dgUnbounded = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $nowUtc -LiveKeys @() -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors @() `
+    -ParkedCloneLines $manyLines
+Check 'many parked: Budget 0 (legacy) still emits every row' 40 ([regex]::Matches($dgUnbounded, 'some-long-repo-name-\d\d-impl')).Count
+
+# ===================================================================================================
+# PR #435 gate round 3, finding 2 (untested): Invoke-HeadSkipRevertLaunch is EXECUTED, not modelled.
+# The real commit-launch and revert-launch wrappers run the real head_skip_decide.py through the real
+# bounded uv probe and the real probe input file, so a serialisation mismatch on the verbatim
+# commit_output string (e.g. a ConvertTo-Json that double-encodes it) fails here.
+# ===================================================================================================
+Write-Host ''
+Write-Host 'revert-launch — real execution through uv'
+$uvOk = $false
+try { $null = & uv --version 2>$null; if ($LASTEXITCODE -eq 0) { $uvOk = $true } } catch { $uvOk = $false }
+if (-not $uvOk) {
+    # Loud, and RED: this path is the one the gate said was untested, so a host without uv must not
+    # report it as passing.
+    $script:failures++
+    Write-Host '  FAIL  uv not on PATH — the real revert-launch execution could not run'
+}
+else {
+    foreach ($name in 'Get-BoundedProbeCommandLine', 'Invoke-BoundedUvProbe', 'Get-ProbeOutputLines',
+                      'New-ProbeInputFile', 'Remove-ProbeInputFile',
+                      'Invoke-HeadSkipCommitLaunch', 'Invoke-HeadSkipRevertLaunch') {
+        $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if (-not $fn) { throw "function not found in sweep script: $name" }
+        Invoke-Expression $fn.Extent.Text
+    }
+    $HeadSkipProbeTimeoutSeconds = 120
+    $ProbeKillGraceMs = 5000
+    $ProbeInputFilePrefix = 'mindwire-probe-'
+    $ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+    $hsState = Join-Path ([System.IO.Path]::GetTempPath()) ('head-skip-revert-test-{0}.json' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $hsPayload = [ordered]@{ thread_id = 'T-revert'; head_msg_id = 'msg-10'; token = 'einstein'; token_raw = 'Einstein'
+                                 attempts_after = 1; control_state = 'run'; head_fetched = $true; thread_status = '' }
+        $c1 = Invoke-HeadSkipCommitLaunch -Payload $hsPayload -StateFilePath $hsState
+        Check 'real: first commit-launch ok' $true ([bool]$c1.ok)
+        Check 'real: first commit-launch counts 1' 1 $c1.launches_same_head
+        $snapshot = [System.IO.File]::ReadAllText($hsState)
+        $allReverted = $true
+        $maxSeen = 0
+        for ($i = 0; $i -lt 3; $i++) {
+            $c = Invoke-HeadSkipCommitLaunch -Payload $hsPayload -StateFilePath $hsState
+            if ($c.launches_same_head -gt $maxSeen) { $maxSeen = $c.launches_same_head }
+            Check "real: commit_output is a raw JSON object string (run $i)" $true ("$($c.commit_output)" -match '^\s*\{')
+            $rv = Invoke-HeadSkipRevertLaunch -CommitOutput $c.commit_output -StateFilePath $hsState
+            if (-not $rv.ok) { $allReverted = $false; Write-Host "    revert error: $($rv.error)" }
+            if ([System.IO.File]::ReadAllText($hsState) -ne $snapshot) { $allReverted = $false }
+        }
+        Check 'real: every revert-launch succeeded and restored the state byte-for-byte' $true $allReverted
+        Check 'real: three refused runs never reach launches_same_head 3' 2 $maxSeen
+        $c5 = Invoke-HeadSkipCommitLaunch -Payload $hsPayload -StateFilePath $hsState
+        Check 'real: next real launch after the reverts counts 2' 2 $c5.launches_same_head
+        # A revert whose record has moved since is refused, never applied.
+        $stale = Invoke-HeadSkipRevertLaunch -CommitOutput $c1.commit_output -StateFilePath $hsState
+        Check 'real: revert of a superseded commit is refused' $false ([bool]$stale.ok)
+        # The double-serialisation the gate described is rejected by the CLI, and the wrapper reports it.
+        $dbl = ConvertTo-Json -InputObject ([string]$c5.commit_output) -Compress
+        $bad = Invoke-HeadSkipRevertLaunch -CommitOutput $dbl -StateFilePath $hsState
+        Check 'real: a double-encoded payload is refused (not silently accepted)' $false ([bool]$bad.ok)
+    }
+    finally { if (Test-Path -LiteralPath $hsState) { Remove-Item -LiteralPath $hsState -Force } }
+}
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all dirty-clone checks passed"

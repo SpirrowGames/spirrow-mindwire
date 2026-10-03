@@ -2023,10 +2023,12 @@ function New-DailyDigest {
         # T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3, RES-A-GAP):
         # the N of the 停止中 section, built from the $HumanParked rows that carry last_msg_at.
         [TimeSpan]$StaleHumanThreshold = [TimeSpan]::FromHours(24),
-        # T-clone-guard-pin-ignored-only-in-mindwire D-3d: the 駐機中 repo rows, built by the caller
-        # with Get-DirtyCloneDigestLines (so this renderer stays liftable without it). Emitted right
-        # under the summary line, where they are counted in every later section's running length;
-        # empty (the default) leaves the digest exactly as it was.
+        # T-clone-guard-pin-ignored-only-in-mindwire D-3d: the 駐機中 repo section, built by the
+        # caller with Get-DirtyCloneDigestLines (so this renderer stays liftable without it). Shape:
+        # [0] = the header (count line), [1..n-2] = one row per parked repo, [n-1] = "". Emitted
+        # right under the summary line; its ROWS go through the same budget ladder as every other
+        # section (PR #435 gate round 3), so N parked repos cannot push the digest past $Budget.
+        # Empty (the default) leaves the digest exactly as it was.
         [string[]]$ParkedCloneLines = @()
     )
 
@@ -2184,7 +2186,6 @@ function New-DailyDigest {
     $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
     $lines += $summary
     $lines += ""
-    if ($ParkedCloneLines.Count -gt 0) { $lines += $ParkedCloneLines }
 
     # T-digest-exceeds-discord-limit-and-is-dropped D-1: emit-with-budget helper. When $Budget is 0
     # every list is emitted in full (legacy behaviour, preserves existing tests). When $Budget > 0,
@@ -2481,7 +2482,35 @@ function New-DailyDigest {
         $reserveAfterStale += (_LinesCost @($escHeadLine)) + (_SectionFloorCost -Entries $escalatedList -Indent '  ')
     }
 
-    $lines += "隔離中: $totalQ 件"
+    # 駐機中 repo (T-clone-guard-pin-ignored-only-in-mindwire D-3d). The first section, so its
+    # reserve is the floor-inclusive cost of EVERYTHING after it: its own trailing blank, the 隔離中
+    # count line, the 隔離中 body at its floor, and $reserveAfterStale. PR #435 gate round 3: the rows
+    # were previously spliced in before the ladder with no bound on their number, so 10+ parked
+    # repos could alone push the digest past $Budget — and no later truncation can undo that.
+    $quarCountLine = "隔離中: $totalQ 件"
+    $reserveAfterCloneParked = (_LinesCost @($quarCountLine))
+    if ($totalQ -eq 0) { $reserveAfterCloneParked += (_LinesCost @("  (該当なし)")) + $reserveAfterQuar }
+    else {
+        $reserveAfterCloneParked += $reserveAfterStale
+        if ($staleList.Count -gt 0) {
+            $reserveAfterCloneParked += (_LinesCost @($staleHeadLine)) + (_SectionFloorCost -Entries $staleList -Indent '  ')
+        }
+    }
+    if ($ParkedCloneLines.Count -gt 0) {
+        $cloneHead = $ParkedCloneLines[0]
+        $cloneRows = @()
+        if ($ParkedCloneLines.Count -gt 2) { $cloneRows = @($ParkedCloneLines[1..($ParkedCloneLines.Count - 2)]) }
+        $cloneTail = @("")
+        $lines += $cloneHead
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $cloneRows -MaxLen $Budget `
+            -Reserve ($reserveAfterCloneParked + (_LinesCost $cloneTail)) -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+        $lines += $cloneTail
+    }
+
+    $lines += $quarCountLine
     if ($totalQ -eq 0) {
         $lines += "  (該当なし)"
     }
