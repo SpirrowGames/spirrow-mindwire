@@ -211,7 +211,7 @@ def load_config(config_path: Path | None) -> MindwireSettings | str:
     ``load_settings`` turns a missing file into the built-in defaults (mode ``off``, empty
     roster); that is the fall-back this must not take, so a missing or unreadable file comes
     back as the reason string instead. ``main`` derives both the roster and the modes from this
-    one result, so a bad ``--config`` reaches the unmeasured path rather than crashing first.
+    one result; on a reason string it measures nothing (no fetch, no counts) and exits 2.
     """
     from spirrow_mindwire.config import _default_config_path, load_settings
 
@@ -262,13 +262,27 @@ def main(argv: list[str] | None = None) -> int:
 
     projects = tuple(args.project or builder.PROJECTS)
     loaded = load_config(args.config)
-    # Unmeasured config: no current roster (the per-thread routing roster still applies), and
-    # the output says so below rather than presenting the empty roster as a measured one.
-    current_roster = {} if isinstance(loaded, str) else dict(loaded.conductor.roster)
+    if isinstance(loaded, str):
+        # No roster, no measurement. Selection (``routing_roster``) and the role filter both
+        # read the configured roster; an empty stand-in pushes every author without a
+        # historical ``role`` into ``other_author`` and reports a clean 0 / 0 / 0 with an empty
+        # ``must_admit_dropped`` — a false "no regressions". So nothing is fetched and no count
+        # is written: the output names the reason and the run exits non-zero.
+        _write(
+            args.out,
+            {
+                "schema": 1,
+                "measured_at": datetime.now(UTC).isoformat(),
+                "projects": list(projects),
+                "unmeasured": loaded,
+            },
+        )
+        print(loaded, file=sys.stderr)
+        return 2
     threads = asyncio.run(builder.harvest(projects))
     result = classify(
         threads,
-        current_roster,
+        dict(loaded.conductor.roster),
         since=args.since,
         until=args.until,
         mode_by_project=modes_from(projects, loaded),
@@ -276,16 +290,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     result["measured_at"] = datetime.now(UTC).isoformat()
     result["projects"] = list(projects)
-    if isinstance(loaded, str):
-        result["current_roster"] = loaded
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(
+    _write(args.out, result)
+    print(json.dumps(result["counts"], ensure_ascii=False), file=sys.stderr)
+    return 0
+
+
+def _write(out: Path, result: Mapping[str, Any]) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
         json.dumps(result, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
         encoding="utf-8",
         newline="\n",
     )
-    print(json.dumps(result["counts"], ensure_ascii=False), file=sys.stderr)
-    return 0
 
 
 if __name__ == "__main__":

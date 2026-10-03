@@ -154,12 +154,55 @@ def test_d_the_script_uses_the_conductors_resolver() -> None:
     assert not hasattr(MEASURE, "_role_of")
 
 
-def test_c_main_reaches_unmeasured_on_a_malformed_explicit_config(
+@pytest.mark.parametrize("kind", ["malformed", "missing"])
+def test_c_main_measures_nothing_without_a_readable_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """No roster, no counts: an empty stand-in roster would report a false clean 0 / 0 / 0.
+
+    A bad ``--config`` is reported, not a crash; but nothing is fetched and no bucket,
+    ``must_admit`` or mode output is written — only the reason, with a non-zero exit.
+    """
+    cfg = tmp_path / "mindwire.toml"
+    if kind == "malformed":
+        cfg.write_text('[tierc_gate]\nmode = "bogus"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+    fetched: list[object] = []
+
+    async def _harvest(projects: object) -> list[object]:
+        fetched.append(projects)
+        return []
+
+    monkeypatch.setattr(MEASURE.builder, "harvest", _harvest)
+    rc = MEASURE.main(
+        [
+            "--since",
+            "2026-09-01",
+            "--until",
+            "2026-10-01",
+            "--project",
+            "a",
+            "--out",
+            str(out),
+            "--config",
+            str(cfg),
+        ]
+    )
+    assert rc == 2
+    assert fetched == []
+    result = json.loads(out.read_text(encoding="utf-8"))
+    reason = {"malformed": "config unreadable", "missing": "config not found"}[kind]
+    assert result["unmeasured"].startswith(f"unmeasured: {reason}")
+    for key in ("counts", "msg_ids", "must_admit", "must_admit_dropped", "mode_by_project"):
+        assert key not in result
+
+
+def test_c_main_measures_with_a_readable_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The config is read once: a malformed ``--config`` is reported, not a crash before it."""
+    """The configured roster and mode reach the output when the config reads."""
     cfg = tmp_path / "mindwire.toml"
-    cfg.write_text('[tierc_gate]\nmode = "bogus"\n', encoding="utf-8")
+    cfg.write_text('[tierc_gate]\nmode = "enforce"\n', encoding="utf-8")
     out = tmp_path / "out.json"
 
     async def _no_threads(projects: object) -> list[object]:
@@ -182,5 +225,5 @@ def test_c_main_reaches_unmeasured_on_a_malformed_explicit_config(
     )
     assert rc == 0
     result = json.loads(out.read_text(encoding="utf-8"))
-    assert result["mode_by_project"]["a"].startswith("unmeasured: config unreadable")
-    assert result["current_roster"].startswith("unmeasured: config unreadable")
+    assert result["mode_by_project"] == {"a": "enforce"}
+    assert "unmeasured" not in result
