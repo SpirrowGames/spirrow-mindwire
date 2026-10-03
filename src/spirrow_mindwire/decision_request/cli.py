@@ -329,14 +329,30 @@ def compose_once(
 # Tail fetching (D-38)
 # --------------------------------------------------------------------------- #
 
+#: What a :data:`TailFetcher` returns:
+#: ``(tail_messages, total_messages, total_chars_after_cap, any_body_truncated, head_body_raw)``.
+TailFetchResult = tuple[tuple[ThreadTailMessage, ...], int, int, bool, str | None]
+
 # ``TailFetcher`` is the seam tests inject to avoid hitting the network. In
 # production it is :func:`_default_fetch_tail`, which delegates to the same
 # magickit MCP tool ``scripts/parked_humans.py`` uses.
+#
+# Contract of the fifth element, ``head_body_raw`` (T-decision-material-parked-lane-push,
+# Bohr msg-6236 §2, Einstein msg-6237 advisory):
+#
+#   ``head_body_raw`` MUST be the body of the LAST message in ``tail_messages`` (the head the
+#   composer read, whose id becomes ``extras.head_msg_id_read``) exactly as the chatroom returned
+#   it — BEFORE ``body_cap`` truncation. It MUST NOT be ``tail_messages[-1].body``: that body is
+#   capped, and the cap cuts off the END of the message, which is exactly where the
+#   ``mindwire:stop`` marker (just above ``NEXT: human``) and the ``OPERATOR-TASK:`` /
+#   ``TIER-C-CHECK:`` / ``NEXT: operator`` lines live. ``classify_parked`` reads those; a capped
+#   body silently files a long ``NEXT: operator`` head as a decision (the P-2 bug). ``None`` when
+#   ``tail_messages`` is empty. Every fetcher — production and test fakes — must honour this.
+#   The fetcher only transports the raw body; it does not classify it.
 TailFetcher = Callable[
     [str, str, int, int],  # project, thread_id, count, body_cap
-    Awaitable[tuple[tuple[ThreadTailMessage, ...], int, int, bool]],
+    Awaitable[TailFetchResult],
 ]
-# Returns: (tail_messages, total_messages, total_chars_after_cap, any_body_truncated).
 
 
 async def _default_fetch_tail(
@@ -344,7 +360,7 @@ async def _default_fetch_tail(
     thread_id: str,
     count: int,
     body_cap: int,
-) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+) -> TailFetchResult:
     """Fetch the last ``count`` messages of ``thread_id`` via magickit MCP.
 
     Reuses the exact tool ``scripts/parked_humans.py`` uses
@@ -354,7 +370,8 @@ async def _default_fetch_tail(
 
     Bodies exceeding ``body_cap`` are truncated with a trailing ``… (省略)``
     marker; the caller records whether any body was truncated in the
-    envelope's extras (``tail_truncated``).
+    envelope's extras (``tail_truncated``). The fifth element is the head's
+    body *before* that cap (see the :data:`TailFetcher` contract).
     """
     # Lazy import: keeps the CLI importable in environments that lack the
     # magickit dependency (unit-test-only harness, dry-run tooling).
@@ -378,10 +395,14 @@ async def _default_fetch_tail(
     out: list[ThreadTailMessage] = []
     total_chars = 0
     any_truncated = False
+    head_body_raw: str | None = None
     for m in tail_slice:
         if not isinstance(m, dict):
             continue
         body = str(m.get("content") or "")
+        # The body of the message appended LAST (non-dict items are skipped above, so this is
+        # not ``tail_slice[-1]``), taken before the cap — the :data:`TailFetcher` contract.
+        head_body_raw = body
         if len(body) > body_cap:
             body = body[:body_cap] + "… (省略)"
             any_truncated = True
@@ -393,7 +414,7 @@ async def _default_fetch_tail(
                 body=body,
             )
         )
-    return tuple(out), total_messages, total_chars, any_truncated
+    return tuple(out), total_messages, total_chars, any_truncated, head_body_raw
 
 
 def _apply_fetched_tail(
@@ -424,7 +445,7 @@ def _run_tail_fetch(
     thread_id: str,
     count: int,
     body_cap: int,
-) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+) -> TailFetchResult:
     """Run an async :type:`TailFetcher` and return its result synchronously.
 
     Extracted so tests can pass a coroutine-returning fake without having
@@ -434,13 +455,37 @@ def _run_tail_fetch(
     """
     import asyncio
 
-    async def _run() -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+    async def _run() -> TailFetchResult:
         # Wrap the caller-supplied awaitable in a coroutine so ``asyncio.run``
         # (which requires a coroutine, not any awaitable) accepts it. Awaiting
         # a coroutine object returned by an ``async def`` fake works too.
         return await fetcher(project, thread_id, count, body_cap)
 
     return asyncio.run(_run())
+
+
+#: The envelope extras keys carrying the parked-lane classification of the head the composer read.
+_PARKED_LANE_KEYS: tuple[str, ...] = ("parked_lane", "operator_task", "protocol_violation")
+
+
+def _parked_lane_extras(head_body: str) -> dict[str, str]:
+    """Classify ``head_body`` (pre-cap) into the envelope's parked-lane extras.
+
+    ``extras`` is ``dict[str, str]``, so ``protocol_violation`` travels as the string ``"true"`` /
+    ``"false"`` (the ``tail_truncated`` precedent); the wrapper maps it to a JSON bool explicitly
+    (``Get-ParkedLaneFields`` in ``deploy/run-conductor-scheduled.ps1``). ``operator_task`` is
+    present only when the classification carries one.
+    """
+    from spirrow_mindwire.conductor.parked_lane import classify_parked
+
+    result = classify_parked(head_body)
+    out: dict[str, str] = {
+        "parked_lane": result.lane.value,
+        "protocol_violation": "true" if result.protocol_violation else "false",
+    }
+    if result.operator_task:
+        out["operator_task"] = result.operator_task
+    return out
 
 
 # Module-level default: swappable in tests by monkey-patching this attribute
@@ -556,9 +601,18 @@ def main(argv: list[str] | None = None) -> int:
     # touches the chatroom (D-36). Runs BEFORE composer construction so
     # the composer receives an already-populated request.
     fetch_extras: dict[str, str] = {}
+    # Parked-lane keys (_PARKED_LANE_KEYS): written AFTER the composer-extras merge below so the
+    # tail fetch is their only source (Bohr msg-6236 §4).
+    parked_extras: dict[str, str] = {}
     if args.tail > 0:
         try:
-            fetched_tail, total_messages, total_chars, any_truncated = _run_tail_fetch(
+            (
+                fetched_tail,
+                total_messages,
+                total_chars,
+                any_truncated,
+                head_body_raw,
+            ) = _run_tail_fetch(
                 DEFAULT_TAIL_FETCHER,
                 request.project,
                 request.thread_id,
@@ -599,6 +653,14 @@ def main(argv: list[str] | None = None) -> int:
             # (Einstein msg-1446 §1).
             if fetched_tail:
                 fetch_extras["head_msg_id_read"] = fetched_tail[-1].msg_id
+                # T-decision-material-parked-lane-push (magickit msg-1070 §2.1, Bohr msg-6236
+                # §2): classify the SAME head whose id was just recorded, in the same branch, so
+                # the lane on the material and ``head_msg_id_read`` cannot describe two different
+                # messages. Classified on the pre-cap body: the markers sit at the end. A fetcher
+                # that returns no raw body falls back to the (possibly capped) tail body.
+                parked_extras = _parked_lane_extras(
+                    head_body_raw if head_body_raw is not None else fetched_tail[-1].body
+                )
 
     composer = _build_composer(
         args.backend,
@@ -617,6 +679,14 @@ def main(argv: list[str] | None = None) -> int:
         # what its extras mean.
         merged = dict(fetch_extras)
         merged.update(envelope.extras)
+        envelope = dataclasses.replace(envelope, extras=merged)
+    # The parked-lane keys win over the composer: the composer classified nothing, and a
+    # same-named key from it must not relabel the head (Bohr msg-6236 §4). When the fetch failed or
+    # read no head, a composer key of that name is dropped too — the fetch is the only source, and
+    # an absent key is NULL (= decision) on the receiver, the safe side (A1).
+    if parked_extras or any(k in envelope.extras for k in _PARKED_LANE_KEYS):
+        merged = {k: v for k, v in envelope.extras.items() if k not in _PARKED_LANE_KEYS}
+        merged.update(parked_extras)
         envelope = dataclasses.replace(envelope, extras=merged)
     # D-33 (msg-1394 §14.3): stdout JSON is ASCII-only. The wrapper reads this pipe as UTF-8,
     # but on Windows the child's ``sys.stdout`` encoding is inherited from the console code page
