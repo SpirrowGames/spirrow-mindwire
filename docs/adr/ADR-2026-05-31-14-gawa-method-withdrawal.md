@@ -204,6 +204,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 **個人のサブスクを headless で使うことの運用上のもろさ**
 - レート制限やセッションの失効が起きると、codex は失敗します。その場合は gemini-fallback に切り替わります（7.4）。レビューは止まりませんが、その間は定額の利点がありません。
 - どれくらいの頻度でフォールバックしたかは、shadow 比較と primary に上げたあとの観測項目にします。フォールバックが常態になるなら、構成を見直します（認証方式の変更は cost / goal の判断です）。
+- Pro の利用枠が naysayer の呼び出し（1 日 200〜280 件の見込み）に足りるかは、まだ測っていません。枠を超えた分は gemini-fallback に切り替わる（7.4）ので、レビューは止まりません。足りるかどうかは、上のフォールバックの頻度の観測で測ります。
 
 **HOST_REPO が private な場合も、その内容が OpenAI に送られます**
 - public なリポジトリを除外する条件（4b）は、撤回しました（msg-5940）。
@@ -251,7 +252,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
     - 待ち合わせの上限を超えて直接 gemini-fallback に切り替える経路は、待ち合わせの上限時間＋gemini-fallback の実行の上限時間なので、上の式を満たせば予算に収まります。
     - この不等式は、Lexora の起動時に確かめます。満たさない値が設定されていたら、起動を拒否します。
   - それでもクライアント側で時間切れになった場合は、いまの PR-gate の扱い（`_degrade_on_timeout`：COMMENT で保留し、人に知らせる）に従います。黙って失敗することはありません。
-- そのほかに fallback wrapper が gemini-fallback に切り替えるのは、codex 側が失敗したとき（ゲートが閉じている、実行がエラーになった、レート制限やセッションの失効など）です。
+- そのほかに fallback wrapper が gemini-fallback に切り替えるのは、codex 側が失敗したとき（ゲートが閉じている、実行がエラーになった、レート制限や Pro の利用枠（usage limit）の超過、セッションの失効など）です。
 
 **残るリスク**
 - `auth.json` は、sandbox の中から読める位置にあります。読まれないことは、ツールが無いことだけで保証しています。
@@ -293,8 +294,9 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - 素の codex backend を、直接ティアにつなぐことはしません。
 - mindwire の attestation で期待する値は、**リクエストごとに決めます。** 全体で一律に緩めることはしません。
   - codex ティアに送ったリクエスト：正は `codex` です。`gemini-fallback` も、許容されるフォールバックとして受け入れます。
-  - Gemini のティアに送ったもの（N-3 の部分集合（7.3）と、codex の上限に収まらないもの（7.5））：期待する値は `gemini` だけです。`codex` や `gemini-fallback` が返ってきたら不一致として fail-closed にします。ティアを決める関数が誤って codex ティアに送った場合も、ここで検知できるようにするためです（多層防御）。
-  - 期待する値は、ティアを決める関数と同じ判定から導きます。2 か所で別々に判定することはしません。
+  - Gemini のティアに送ったもの（N-3 の部分集合（7.3）と、codex の上限に収まらないもの（7.5））：期待する値は `gemini` だけです。`codex` や `gemini-fallback` が返ってきたら不一致として fail-closed にします。
+  - 期待する値は、ティアを決める関数と同じ判定から導きます。2 か所で別々に判定することはしません（二重管理を避けるためです）。
+  - **この照合で検知できるのは、判定より下流の不一致だけです。** たとえば、Lexora 側の配線や設定の誤りで、Gemini のティアに送った要求に `codex` や `gemini-fallback` が答えた場合です。期待する値は判定と同じところから導くので、**判定のロジックそのものの誤り**（N-3 の要求を見落として codex ティアに送るなど）は、期待する値も同じように誤り、ここでは検知できません。判定の誤りは、判定関数のテスト（7.9 の 4）で防ぎます。
 - この変更の対象は、`expected=gemini` を前提にしている箇所です（`naysayer/preflight.py`・`principles.py`・`adapters/naysayer_sdk.py`）。
 - この変更は、Lexora の codex 経路がティアにつながるのと同時に入れます。先に入れると、今の Gemini の経路が attestation で不一致になるからです。
 
@@ -318,6 +320,11 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 2. Lexora のホストで `verify_codex` が成功していること。
 3. 本番の B-2 migration（`answered_by` の列）を確かめ、無ければ当てていること。
 4. mindwire 側に、attestation（7.6）、N-3 の除外（7.3）、プロンプトの構成（7.5）が入っていること。
-   - あわせて、naysayer の principles の SOT（`spec/NAYSAYER_PRINCIPLES.md`）の frontmatter `independent_model`（いまは `gemini-3.1-pro-preview`）を、codex を正・gemini-fallback を予備とする構成に合わせて更新していること。そのままだと、codex に渡す preamble が「Gemini である」と誤って述べることになります。
+   - あわせて、naysayer の principles の SOT（`spec/NAYSAYER_PRINCIPLES.md`）の frontmatter `independent_model`（いまは `gemini-3.1-pro-preview`）を、**naysayer ティアの構成を書く値**に更新していること。例：`independent_model: "codex (primary); gemini-3.1-pro-preview (gemini-fallback, N-3 subset §7.3, over-limit §7.5)"`。
+     - この欄に書くのは「そのリクエストに答えたモデル」ではなく、**ティアの構成**です。ティアの経路は codex（7.6）と Gemini（7.3・7.5）に分かれるので、モデルを 1 つだけ書いた値は、どちらかの経路で必ず誤りになります。いまの値のままだと、codex に渡す preamble が「Gemini である」と誤って述べます。構成を書く値にしておけば、どの経路で呼ばれても、静的なままで正しい記述になります。
+     - 呼ばれた経路に合わせて frontmatter を実行時に書き換えることはしません。principles の SOT は preamble に verbatim で注入するものだからです。
+     - 呼び出しごとに実際にどの backend が答えたかは、attestation の `backend=`（7.6）だけが記録します。この事実を frontmatter には書きません。
+     - SOT の 8000 バイトの上限（`tests/test_naysayer_principles.py`）に収まっていること。上の例の値で約 7976 バイトになり、余裕は小さいので、値を変えるときはサイズを確かめます。
    - **この更新は principles の改訂として扱い、同じ変更で frontmatter の `version:` を上げていること**（あわせて、`naysayer/principles.py` の `EXPECTED_PRINCIPLES_VERSION` も同じ値に上げます。片方だけ上げると起動時にエラーになります）。principles の SOT は、改訂のたびに `version:` を上げることを定めています。naysayer の出力はそれぞれ、判定に使った `principles_version` を記録します。version を上げずに `independent_model` だけを書き換えると、codex のレビューと Gemini のレビューが同じ `principles_version` で記録され、どちらの構成で判定したかを後からたどれなくなります。principles の改訂なので、SOT が定める手続き（proposer / implementer / naysayer の協議と Takahito の承認）にも従います。
+   - ティアを決める関数のテストがあること。N-3 の部分集合（7.3）の要求と、codex の上限に収まらない要求（7.5）が、それぞれ Gemini のティアに送られることを確かめます。判定関数の誤りは、attestation の照合（7.6）では検知できないため、このテストで防ぎます。
 5. shadow 比較のあとで primary に上げること。
