@@ -293,7 +293,9 @@ class LedgerNotes:
                     "prior_notes_sha256": prior_sha256,
                 }
                 try:
-                    self.journal.write(record)
+                    # Off the event loop: fsync latency is unbounded (PR #439 gate advisory).
+                    # Still inside the per-task lock, so the record lands before Magickit.
+                    await asyncio.to_thread(self.journal.write, record)
                 except Exception as exc:
                     raise LedgerError(
                         LedgerFailure.JOURNAL_UNAVAILABLE,

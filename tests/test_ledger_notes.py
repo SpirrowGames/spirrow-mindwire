@@ -555,6 +555,28 @@ async def test_the_record_is_written_before_magickit_is(journal: LedgerJournal) 
 
 
 @pytest.mark.anyio
+async def test_the_record_is_written_off_the_event_loop_thread(
+    journal: LedgerJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fsync latency must not stall the loop (PR #439 gate advisory): the write runs in a worker."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    write_threads: list[int] = []
+    original = LedgerJournal.write
+
+    def spy(self: LedgerJournal, record: dict[str, Any]) -> Path:
+        write_threads.append(threading.get_ident())
+        return original(self, record)
+
+    monkeypatch.setattr(LedgerJournal, "write", spy)
+    await _notes(_FakeMagickit({"T42": "x"}), [], journal).append_note("T42", "y")
+    assert len(write_threads) == 1
+    assert write_threads[0] != loop_thread
+    assert len(_records(journal)) == 1
+
+
+@pytest.mark.anyio
 async def test_an_unwritable_record_means_no_append_and_no_tmp_left(
     journal: LedgerJournal, monkeypatch: pytest.MonkeyPatch
 ) -> None:
