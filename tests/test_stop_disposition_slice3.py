@@ -314,6 +314,31 @@ def test_wake_message_routes_to_the_wake_and_is_not_a_park() -> None:
     assert handoff.stop_line is None
 
 
+def test_a_wake_to_the_implementer_still_meets_guard_i() -> None:
+    """decide.py's claim "including guard (i)": the relay is neither human nor naysayer.
+
+    A park cannot launder a handoff the conductor would gate if it were written directly, so a
+    wake naming the implementer reaches guard (i) exactly as a proposer's ``NEXT: <implementer>``
+    would, and is redirected unless a carve-out applies (none can: the relay author is a machine).
+    """
+    from spirrow_mindwire.routing import GuardIVerdict, guard_proposer_to_implementer
+
+    park = _park("T-1", "msg-7", "thread", "T-a", wake="Heisenberg")
+    handoff = resolve_handoff(render_wake(park), _ROSTER)
+    assert handoff.kind is HandoffKind.ROLE and handoff.role is Role.IMPLEMENTER
+    assert PARK_WAKE_RELAY_AUTHOR not in _ROSTER
+    verdict = guard_proposer_to_implementer(
+        author_is_human=False,
+        author_is_naysayer=False,
+        control_state_is_run=True,
+        message_is_attested=lambda: False,
+        segment_declares_tier_c=lambda: False,
+        naysayer_declared_no_tier_c=lambda: False,
+        decider_vetoes=lambda: False,
+    )
+    assert verdict is GuardIVerdict.REDIRECT
+
+
 # --------------------------------------------------------------------------- 4: D-7 runner
 
 
