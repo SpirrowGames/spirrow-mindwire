@@ -53,12 +53,16 @@ class ParkedLane(StrEnum):
 #: rather than derived from ``unresolved=identity`` because one identity reason is NOT a misroute:
 #: ``identity_not_spawnable`` is a correct nomination of an identity that has no adapter (a web
 #: identity), and ``operator_tier_c_conflict`` stays a decision (module docstring).
+#: ``target_divergence`` / ``field_unresolvable`` (the field and the body's ``NEXT:`` disagree, so
+#: neither routes) are misroutes: they ask for a realigned repost, not a Tier-C decision (msg-6047).
 MISROUTE_REASONS: frozenset[str] = frozenset(
     {
         StandDownReason.IDENTITY_UNRESOLVED.value,
         StandDownReason.IDENTITY_ROLE_AMBIGUOUS.value,
         StandDownReason.IDENTITY_OPERATOR_NO_TASK.value,
         StandDownReason.OPERATOR_NO_TIER_C_CHECK.value,
+        StandDownReason.FIELD_BODY_DIVERGENCE.value,
+        StandDownReason.FIELD_UNRESOLVABLE.value,
     }
 )
 

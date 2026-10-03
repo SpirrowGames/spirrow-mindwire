@@ -435,3 +435,23 @@ def test_load_registered_round_trips(tmp_path: Path) -> None:
     index = load_registered(path)
     assert index.contains("p", "T-a")
     assert not index.contains("p", "T-b")
+
+
+def test_powershell_pr_review_prefix_matches_python() -> None:
+    """The sweep's local PR-review refusal must use the same prefix as the enumerator.
+
+    ``deploy/lib/UnregisteredIntake.ps1`` keeps its own copy of the prefix as a second check
+    against sweeping a paid PR-gate thread (PR #448 gate advisory, class=structure). A copy that
+    drifted would stop protecting anything without a sound, so the two are pinned equal here.
+    """
+    import re
+
+    from spirrow_mindwire.unregistered_threads import PR_REVIEW_PREFIX
+
+    lib = Path(__file__).resolve().parent.parent / "deploy" / "lib" / "UnregisteredIntake.ps1"
+    found = re.findall(
+        r"^\$script:UnregisteredPrReviewPrefix\s*=\s*'([^']*)'\s*$",
+        lib.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    assert found == [PR_REVIEW_PREFIX]

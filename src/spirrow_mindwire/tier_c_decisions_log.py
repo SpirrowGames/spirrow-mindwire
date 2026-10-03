@@ -385,10 +385,23 @@ def logged_decision_keys(log_path: Path, *, thread: str) -> Counter[DecisionKey]
     identical lines in one message are two rows. One full scan per call, for the same reason as
     :func:`build_retry_lookup`.
     """
+    return logged_decision_keys_by_thread(log_path, threads={thread})[thread]
+
+
+def logged_decision_keys_by_thread(
+    log_path: Path, *, threads: Iterable[str]
+) -> dict[str, Counter[DecisionKey]]:
+    """:func:`logged_decision_keys` for several threads in one pass over the log.
+
+    Every requested thread gets an entry, empty if it has no rows. A caller that compares many
+    threads (the U4b acceptance scan) reads the file once instead of once per thread (PR #449
+    gate, advisory 2); :func:`logged_decision_keys` delegates here, so both build keys one way.
+    """
     kinds = {LogKind.DECIDED.value, LogKind.DEFERRED.value}
-    keys: Counter[DecisionKey] = Counter()
+    by_thread: dict[str, Counter[DecisionKey]] = {t: Counter() for t in threads}
     for row in _iter_rows(log_path):
-        if row.get("kind") not in kinds or row.get("thread") != thread:
+        keys = by_thread.get(str(row.get("thread")))
+        if keys is None or row.get("kind") not in kinds:
             continue
         keys[
             (
@@ -398,7 +411,7 @@ def logged_decision_keys(log_path: Path, *, thread: str) -> Counter[DecisionKey]
                 str(row.get("reason", "")),
             )
         ] += 1
-    return keys
+    return by_thread
 
 
 def missing_decision_entries(

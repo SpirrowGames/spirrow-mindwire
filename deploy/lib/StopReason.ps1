@@ -42,6 +42,11 @@
 #               carries it (Takahito, msg-4361: "main へのマージは判断点から外す"), so a Discord
 #               ping and a decision card would be a second copy of the same request. 1b
 #               (pr_event_advance) resumes the thread when the PR is merged or closed.
+#   'resume_retry' — the conductor found a PR-gate post at the head that would resume the
+#               implementer, but could not read GitHub or the PR head had moved past it
+#               (T-sweep-starves-deep-candidates, Bohr msg-6318). Nothing is posted; the next tick
+#               retries, and the stall watchdog stands the third same-head launch down with a
+#               STALLED notice ('stalled_to_human', which IS in the map).
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1

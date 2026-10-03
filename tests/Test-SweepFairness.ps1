@@ -37,7 +37,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($sweepScript, [ref]$null, [ref]$parseErrors)
 if ($parseErrors) { throw "deploy/run-conductor-scheduled.ps1 does not parse" }
 $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant', 'Format-DurationDigest',
+foreach ($name in 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant', 'Format-DurationDigest', 'Get-ParkedRowTag',
                   'New-DailyDigest', 'Get-StarvedKeys') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
@@ -129,6 +129,32 @@ Check "worst-case first launch is tick L-1 = 107" ($maxWait -eq 107) "max=$maxWa
 # Second lap: the head waits behind everyone it already passed.
 $r = Invoke-SimTick -Candidates $cands108 -Verdicts $v108 -State $st -Now $t0.AddMinutes(108)
 Check "lap 2 starts again with the candidate that has waited longest (the head, launched first in lap 1)" ($r.launched[0] -eq 'p/T-000') "got=$($r.launched -join ',')"
+
+# =============================================================================================
+# T-head-skip-progress-path-launch-rate-premise (Bohr msg-6040 D2). head_skip.py gives the progress
+# path no rate cap on purpose; what keeps a thread that LAUNCHes on every tick from starving the
+# others is this ordering, so it is pinned here: a candidate launched on consecutive ticks while it
+# was the only LAUNCH candidate does not keep the front once another LAUNCH candidate is waiting.
+Write-Host "progress path — a candidate launched on consecutive ticks yields to a waiting LAUNCH candidate"
+$cP = @((New-Cand 'p/T-progress'), (New-Cand 'p/T-other'))
+$stP = @{}
+$vAlone = @{ 'p/T-progress' = (New-Verdict); 'p/T-other' = (New-Verdict -Decision 'skip') }
+$aloneLaunches = 0
+for ($tick = 0; $tick -lt 3; $tick++) {
+    $r = Invoke-SimTick -Candidates $cP -Verdicts $vAlone -State $stP -Now $t0.AddMinutes($tick)
+    if (@($r.launched) -contains 'p/T-progress') { $aloneLaunches++ }
+}
+Check "while it is the only LAUNCH candidate, the progress-path thread launches on every tick (no cap)" ($aloneLaunches -eq 3) "launches=$aloneLaunches"
+$vBoth = @{ 'p/T-progress' = (New-Verdict); 'p/T-other' = (New-Verdict) }
+# Tick 3: both wait from this tick, so the tie falls to sweep.json order and p/T-progress goes again;
+# the role lane breaks on its worked run, so p/T-other waits.
+$r3 = Invoke-SimTick -Candidates $cP -Verdicts $vBoth -State $stP -Now $t0.AddMinutes(3)
+Check "tick 3: the tie falls to sweep.json order and the role lane breaks after one worked run" ((@($r3.launched) -join ',') -eq 'p/T-progress') "got=$($r3.launched -join ',')"
+# Tick 4: p/T-progress's wait was cleared by its launch, p/T-other has waited since tick 3.
+$r4 = Invoke-SimTick -Candidates $cP -Verdicts $vBoth -State $stP -Now $t0.AddMinutes(4)
+Check "tick 4: the waiting candidate is launched ahead of the one launched on consecutive ticks" ((@($r4.launched) -join ',') -eq 'p/T-other') "got=$($r4.launched -join ',')"
+$r5 = Invoke-SimTick -Candidates $cP -Verdicts $vBoth -State $stP -Now $t0.AddMinutes(5)
+Check "tick 5: the two alternate, so neither holds the front" ((@($r5.launched) -join ',') -eq 'p/T-progress') "got=$($r5.launched -join ',')"
 
 # =============================================================================================
 Write-Host "gate lane — launched in the same tick whatever the head did"

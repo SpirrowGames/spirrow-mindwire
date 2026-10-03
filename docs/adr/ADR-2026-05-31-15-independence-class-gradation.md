@@ -119,3 +119,30 @@ naysayer の Gemini 化は、SpirrowGames の private な設計情報（ADR / di
 - この gate は **ADR-2026-05-31-14 D-4 が SOT**（C-2 はそれを共有）。決定内容・トレーサビリティ・非変更点（paid 鍵不変条件と ZDR 推奨は不変）・再有効化手順の詳細は **ADR-14 §6 Amendment を参照**。
 - 実装: spirrow-lexora commit `c9aa914`（`main`、push 済）。gate 無効時はリクエストごとに `gemini_governance_gate_disabled` warning をログ出力。
 - C-2 が指摘する「機密の外部移動」リスク本体（Anthropic 境界外への設計情報移動）は本改訂では変わらず引き受けたまま。緩和したのは surface 強制 gate のみで、paid 鍵による学習利用防止は維持。
+
+
+---
+
+## 7. Amendment (2026-10-03): C-2 — 3 社目のベンダーとして OpenAI（Codex）を認める
+
+- **Status**: Proposed（chatroom `T-D8-codex-backend-adr14-15-amendment`）。main に merge されることを、Takahito による承認とします。
+- **SOT は ADR-14 §7 です。** 内容はすべてそちらに書いてあります。この節は、C-2 の読み方が変わる点だけを記録します。
+
+### C-2 の読み方の変更
+
+**「機密の外部移動」の範囲が、Google に加えて OpenAI（3 社目）に広がります**
+- 経路は Lexora の codex backend で、認証は ChatGPT Pro のサブスクです。
+- 最後の防御線は、paid 鍵ではありません。代わりに、データ設定の記録（TTL つき）、`verification_stale`、D-D の 3 つで置き換えます（ADR-14 §7.2）。
+
+**data controls が黙って変わりうるリスクは、受け入れます（ADR-14 §7.3）**
+- paid 鍵と違って、トグルは予告なしに切り替わりえます。この違いを踏まえたうえでの判断です。
+
+**N-3（l.69）は変えません**
+- 再必須化トリガー (ii) に当たる部分集合は、ZDR が必須のままです。
+- codex は ZDR を満たしていません。そのため、この部分集合は Gemini 固定です。
+- ティアを決める関数が、この部分集合では codex を返さないようにします。
+- attestation でも、この部分集合には `gemini` だけを期待します（ADR-14 §7.6）。
+
+**adapter 層の gate（l.70）に当たるもの**
+- codex の経路では、ツールを無効にすることで代えます（ADR-14 §7.4）。
+- 許可リストの方式で fail-closed にし、`apply_patch` は許しません。

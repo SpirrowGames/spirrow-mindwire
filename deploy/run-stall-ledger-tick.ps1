@@ -39,6 +39,19 @@ $day = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
 $outLog = Join-Path $logDir "stall-ledger-$day.jsonl"
 $errLog = Join-Path $logDir "stall-ledger-$day.err.log"
 
+# GitHub identity (T-stalled-pr-has-no-detector msg-6415 Q1). The tick reads GitHub with the token
+# in MINDWIRE_STALL_LEDGER_GITHUB_TOKEN (the implementer PAT, read-only use; never the naysayer
+# token), handed to the child process ONLY, as MINDWIRE_GITHUB_TOKEN. It is a dedicated variable so
+# that setting it does not also reach the conductor, and the wrapper drops any inherited
+# MINDWIRE_GITHUB_TOKEN / GITHUB_TOKEN so the ledger never reads under an identity nobody chose for
+# it. Unset or blank: the child gets no token and the github source reports `auth_missing` on the
+# heartbeat (loud), instead of reading unauthenticated into the per-IP rate limit (msg-6414).
+Remove-Item Env:MINDWIRE_GITHUB_TOKEN -ErrorAction SilentlyContinue
+Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+if ($env:MINDWIRE_STALL_LEDGER_GITHUB_TOKEN -and $env:MINDWIRE_STALL_LEDGER_GITHUB_TOKEN.Trim()) {
+    $env:MINDWIRE_GITHUB_TOKEN = $env:MINDWIRE_STALL_LEDGER_GITHUB_TOKEN
+}
+
 $tickArgs = @('run', 'python', (Join-Path $repoRoot 'scripts/stall_ledger_tick.py'), '--data-dir', $dataDir)
 foreach ($r in $Repo) { $tickArgs += @('--repo', $r) }
 foreach ($p in $Project) { $tickArgs += @('--project', $p) }

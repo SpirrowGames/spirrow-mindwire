@@ -39,7 +39,7 @@ foreach ($name in 'New-QuarantineRecord', 'ConvertTo-RetryPendingState', 'New-Re
                   'Register-CandidateFailure', 'Register-CandidateSuccess', 'Get-RetryFirstAttempt',
                   'Test-RetryNoticeHeadMatches', 'Remove-RetryPendingNotLive',
                   'Get-DerivedQuarantineState', 'Get-FingerprintHint', 'Get-QuarantineReproHint',
-                  'Format-DurationDigest', 'New-DailyDigest', 'Save-JsonState', 'ConvertTo-UtcInstant') {
+                  'Format-DurationDigest', 'Get-ParkedRowTag', 'New-DailyDigest', 'Save-JsonState', 'ConvertTo-UtcInstant') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text

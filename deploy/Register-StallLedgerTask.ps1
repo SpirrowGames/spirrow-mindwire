@@ -32,6 +32,17 @@ $ExecutionTimeLimit = 'PT14M'
 $wrapper = Join-Path $Checkout 'deploy\run-stall-ledger-tick.ps1'
 if (-not (Test-Path -LiteralPath $wrapper)) { throw "wrapper not found: $wrapper" }
 
+# Task Scheduler does not resolve a bare `pwsh` the way a shell does: on a host with the Store build
+# (C:\Program Files\WindowsApps\...\pwsh.exe) a bare name failed every launch with 0x80070002 and the
+# tick wrote nothing at all (T-stalled-pr-has-no-detector msg-6307). Resolve the absolute path NOW,
+# and refuse to register if there is none.
+# SilentlyContinue (not Stop) so a missing pwsh reaches the explicit refusal below rather than a
+# generic CommandNotFoundException (PR #451 gate advisory).
+$pwshPath = (Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $pwshPath -or -not [System.IO.Path]::IsPathRooted($pwshPath)) {
+    throw "could not resolve an absolute path for pwsh (got '$pwshPath'); not registering"
+}
+
 $argList = @('-NoProfile', '-File', "`"$wrapper`"")
 if ($Repo.Count -gt 0) { $argList += @('-Repo', ($Repo -join ',')) }
 if ($Project.Count -gt 0) { $argList += @('-Project', ($Project -join ',')) }
@@ -43,7 +54,7 @@ $limit = [System.Xml.XmlConvert]::ToTimeSpan($ExecutionTimeLimit)
 if ($DryRun) {
     [pscustomobject]@{
         TaskName           = $TaskName
-        Execute            = 'pwsh'
+        Execute            = $pwshPath
         Arguments          = $argString
         RepetitionInterval = $HeartbeatInterval
         ExecutionTimeLimit = $ExecutionTimeLimit
@@ -52,10 +63,10 @@ if ($DryRun) {
     return
 }
 
-$action = New-ScheduledTaskAction -Execute 'pwsh' -Argument $argString -WorkingDirectory $Checkout
+$action = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $Checkout
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $interval
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit $limit `
     -StartWhenAvailable
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
     -Description 'MindWire stall ledger: one log-only heartbeat (D-16c)' | Out-Null
-Write-Output "registered $TaskName (every $HeartbeatInterval, killed after $ExecutionTimeLimit)"
+Write-Output "registered $TaskName ($pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)"

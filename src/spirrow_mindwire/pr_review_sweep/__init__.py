@@ -12,8 +12,11 @@ The sweep's three phases are staged deliberately (msg-2155 D-8):
   ledger's ``can_close()``: the 1a restart (msg-5808) withdrew that plan, because a 1:1
   PR-review ledger is closed unconditionally once its PR ends, and whether a close is
   *allowed* stays with magickit's own policy rather than a mindwire copy of it.
-* **Phase 2** — the actual close of the ``TERMINAL_*`` rows. Irreversible, and not in
-  this package yet.
+* **Phase 2** — the actual close of the ``TERMINAL_*`` rows (:mod:`.phase2`). Irreversible,
+  so it is **off by default**: unless enabled it only lists what it would try. When
+  enabled, the outcome of each close is decided by re-reading the thread, never by
+  parsing the error, and a per-ledger backoff plus least-recently-tried order keep
+  ledgers that are always refused from starving the rest (msg-6016).
 
 Phases 0 and 1 perform **no writes of any kind**: not to the chatroom, not to the
 ledger, not to GitHub. That is not a convention to be observed by careful coding — their
