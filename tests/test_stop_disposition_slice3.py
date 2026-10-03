@@ -42,9 +42,11 @@ from spirrow_mindwire.github.client import PrRef, PrResolution, PrState
 from spirrow_mindwire.magickit.client import MagickitMcpError, ThreadResolvedError
 from spirrow_mindwire.magickit.gateway import (
     DISPOSITION_UNAVAILABLE_ERROR,
+    DISPOSITION_VALUE_ERRORS,
     MagickitChatroomGateway,
 )
 from spirrow_mindwire.park_wake.decide import (
+    DEPLOY_TERMINAL_STATUSES,
     MONOTONIC,
     PARK_WAKE_RELAY_AUTHOR,
     Fact,
@@ -127,7 +129,7 @@ class _PostMcp:
         self.calls.append(dict(arguments))
         if self._fail_with is not None and self._fail_times > 0 and "disposition" in arguments:
             self._fail_times -= 1
-            raise MagickitMcpError("refused", error_type=self._fail_with)
+            raise MagickitMcpError("refused", error_type=self._fail_with or None)
         return {"msg": {"msg_id": f"msg-{len(self.calls)}"}}
 
 
@@ -184,12 +186,32 @@ async def test_gateway_reposts_without_the_field_only_on_a_registry_outage(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "error_type",
-    ["DispositionInvalidError", "DispositionHumanNotAllowedError", "DispositionWakeUnknownError"],
-)
-async def test_gateway_propagates_every_other_refusal(error_type: str) -> None:
+@pytest.mark.parametrize("error_type", sorted(DISPOSITION_VALUE_ERRORS))
+async def test_a_refused_disposition_never_stalls_the_post(
+    error_type: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR #455 REQUEST_CHANGES: the value is agent text, so a refusal must not drop the post.
+
+    Dropping it would leave the head unmoved and replay the same mistake on every tick.
+    """
     mcp = _PostMcp(fail_with=error_type)
+    body = "x\n\nSTOP: blocked-on thread:T-1 wake:Heisenberg\nNEXT: none"
+    with caplog.at_level(logging.ERROR, logger="spirrow_mindwire.magickit.gateway"):
+        msg_id = await _post(MagickitChatroomGateway(mcp, roster=_ROSTER), body)
+    assert msg_id == "msg-2"
+    assert "disposition" in mcp.calls[0] and "disposition" not in mcp.calls[1]
+    assert mcp.calls[1]["content"] == body
+    assert any(r.levelno == logging.ERROR and error_type in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error_type", ["RoleNotAllowed", "ThreadResolvedError", None])
+async def test_gateway_propagates_refusals_that_are_not_about_the_disposition(
+    error_type: str | None,
+) -> None:
+    mcp = _PostMcp(fail_with=error_type)
+    if error_type is None:  # a transport failure with no classification at all
+        mcp._fail_with = ""
     with pytest.raises(MagickitMcpError):
         await _post(MagickitChatroomGateway(mcp, roster=_ROSTER), "x\n\nSTOP: done\nNEXT: none")
     assert len(mcp.calls) == 1
@@ -474,6 +496,20 @@ async def test_tick_wakes_fired_parks_and_holds_the_rest() -> None:
     assert "role" not in posted["T-1"]
     assert posted["T-1"]["content"].endswith("NEXT: Heisenberg")
     assert "msg-5" in posted["T-1"]["content"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", sorted(DEPLOY_TERMINAL_STATUSES))
+async def test_a_terminal_deploy_fires_the_park(status: str) -> None:
+    """The deploy arm's FIRED branch (PR #455 advisory: only ``running`` was covered)."""
+    mcp = _TickMcp()
+    mcp.thread("p", "T-4", content="w\n\nSTOP: blocked-on deploy:r-1 wake:Bohr\nNEXT: none")
+    mcp.deploys["r-1"] = status
+    report = (await run_tick(mcp=mcp, gh=_Gh({}), project="p", roster=_ROSTER)).as_dict()
+    (woken,) = report["woken"]
+    assert woken["thread_id"] == "T-4" and woken["fact"] == f"status={status}"
+    (post,) = mcp.posts
+    assert post["content"].endswith("NEXT: Bohr")
 
 
 @pytest.mark.anyio
