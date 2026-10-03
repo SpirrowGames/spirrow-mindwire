@@ -125,6 +125,7 @@ from .gate_records import (
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
+    is_merge_wait_relay,
     normalize_sha,
     render_admission_heading,
     render_ci_route_marker,
@@ -137,6 +138,7 @@ from .handoff import (
     OPERATOR_TOKEN,
     Handoff,
     HandoffKind,
+    HumanAsk,
     MismatchReason,
     OperatorFault,
     declares_no_tier_c,
@@ -325,6 +327,19 @@ class StopReason(StrEnum):
     # tick re-reads the same handoff and re-derives admission from the fresh rollup; the wait is
     # therefore held by GitHub's state, not by a mindwire-side timer (§A-2 statelessness).
     CI_WAIT = "ci_wait"
+    # The PR-gate APPROVEd a PR whose merge is the human's (base=main). Not a decision: opening the
+    # PR already asked for the merge, and the merge-wait PR list carries it (Takahito, msg-4361
+    # "main へのマージは判断点から外す"; restated 2026-10-03). The relay ends ``NEXT: human`` so
+    # head_skip parks the thread and 1b (pr_event_advance) resumes it once the PR is merged or
+    # closed; this reason keeps the sweep from notifying and from pushing a decision card.
+    MERGE_WAIT = "merge_wait"
+    # A well-formed ``NEXT: operator`` (T-next-operator-is-silent, Bohr msg-5930 D1 / msg-5934):
+    # work by hand, NOT a decision. Kept apart from ``HUMAN`` so the ledger line and the
+    # notification stop calling it "判断待ち", and so the ``StopReason.HUMAN`` consumers (the
+    # Tier-C admission gate, spawn_timeout, the guard-(i) write-back) never read it as one. Like
+    # every ``conductor stopped:`` line, its line carries only closed vocabulary — the task text
+    # stays in the head and reaches the operator through ``parked_lane`` (D2', msg-5932).
+    OPERATOR_WORK = "operator_work_to_human"
     # An adapter's ``deliver_event`` raised (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
     # Bohr msg-4440 D-1''). NEVER returned from :meth:`Conductor.run` and never logged by the
     # conductor: the exception propagates unchanged, and ``loop_runner.main`` is the single place
@@ -784,7 +799,12 @@ class Conductor:
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
-                    return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
+                    reason = (
+                        StopReason.MERGE_WAIT
+                        if relay_msg_id and is_merge_wait_relay(_content(relay_msg))
+                        else StopReason.HUMAN
+                    )
+                    return self._stop(round_index, reason, last, forced, forced_saveable)
                 handle = sessions.get(implementer_identity)
                 if handle is None:
                     spawned = await self._spawn(self._implementer_role, implementer_identity)
@@ -1494,6 +1514,37 @@ class Conductor:
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
+
+        if (
+            handoff.kind is HandoffKind.HUMAN
+            and handoff.human_ask is HumanAsk.OPERATOR_WORK
+            and stage1_skips(_content(messages[-1]))
+        ):
+            # T-next-operator-is-silent D1 (Bohr msg-5930 / msg-5934, Einstein msg-5931 / 5933):
+            # a well-formed ``NEXT: operator`` stops here, WITHOUT going through
+            # :meth:`_human_terminal`. That method's Obj2 forced consult exists to put a
+            # naysayer review in front of an agent's Tier-C proposal; operator work is by
+            # construction not Tier-C (``_check_operator`` refuses one that declares a
+            # ``TIER-C:``), so there is nothing to review, and the consult's reply would become
+            # the new head and bury the task (R2) — the board reads only the head.
+            #
+            # ``stage1_skips`` bounds the shortcut to heads head_skip parks: an operator handoff
+            # that arrived through the ``next_participant`` field on a body with no ``NEXT:
+            # operator`` line is LAUNCHed by head_skip, so it keeps the HUMAN path below, whose
+            # field-stop notice is what moves that head (a silent stop would relaunch forever).
+            logger.info(
+                "conductor operator-work terminal: author=%s author_role=%s",
+                _author(messages[-1]),
+                author_role.value if author_role is not None else None,
+            )
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.OPERATOR_WORK,
+            )
 
         if handoff.kind is HandoffKind.HUMAN:
             # C (T-human-terminal-overuse msg-890 §3): record the TIER-C: <label> the author put

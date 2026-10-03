@@ -2350,6 +2350,10 @@ function New-DailyDigest {
         elseif ($lane -eq 'misroute') {
             $suffix = "   — [宛先誤り・再ルーティング待ち]"
         }
+        elseif ($lane -eq 'merge_wait') {
+            # msg-4361: a merge wait is carried by the merge-wait PR list, not decided here.
+            $suffix = "   — [merge 待ち・PR 一覧に掲載]"
+        }
         elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
             $suffix = "   — [protocol 違反: Tier-C を operator に渡そうとした]$suffix"
         }
@@ -2402,6 +2406,9 @@ function New-DailyDigest {
         elseif ($lane -eq 'misroute') {
             $tag = "   — [宛先誤り・再ルーティング待ち]"
         }
+        elseif ($lane -eq 'merge_wait') {
+            $tag = "   — [merge 待ち・PR 一覧に掲載]"
+        }
         elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
             $tag = "   — [protocol 違反: Tier-C を operator に渡そうとした]"
         }
@@ -2428,10 +2435,15 @@ function New-DailyDigest {
     $laneOf = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
     $operatorCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'operator_work' }).Count
     $misrouteCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'misroute' }).Count
-    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount
+    # msg-4361: a merge wait is not a decision; the merge-wait PR list carries it.
+    $mergeWaitCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'merge_wait' }).Count
+    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount - $mergeWaitCount
     $parkedHeader = "判断待ち: $decisionCount 件"
     if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
         $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"
+    }
+    if ($mergeWaitCount -gt 0) {
+        $parkedHeader += "（merge 待ち $mergeWaitCount 件は PR 一覧）"
     }
     $parkedHeadLines = @("", $parkedHeader)
     if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
@@ -3824,6 +3836,17 @@ function Send-HumanParkAlert {
         [int]$Rounds,
         [string]$RawFallback
     )
+
+    # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
+    # so there is no question for the composer to write and no decision material to push. The
+    # notification is the raw ping alone — the phrase and last_msg, never the task text (the
+    # author's free text stays off every machine-read surface, D2'); the task itself is on the
+    # digest's operator-work lane.
+    if ($StopReason -eq 'operator_work_to_human') {
+        Send-NotificationIfChanged -State $NotifyState -Key $Key `
+            -Signature $Signature -Message $RawFallback
+        return
+    }
 
     $envelope = Get-DecisionEnvelope -State $PendingDecisionsState `
         -Key $Key -Project $Project -ThreadId $ThreadId `

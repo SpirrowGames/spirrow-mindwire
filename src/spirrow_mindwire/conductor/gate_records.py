@@ -74,7 +74,6 @@ from enum import StrEnum
 from ..github.client import ReviewEvent
 from ..github.reviews import parse_verdict_footer
 from ..naysayer.pr_review import ObjectionParse, parse_objections
-from ..tier_c_admission_gate import require_admitted
 
 #: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
 #: admission posts) are written. Both readers below are restricted to messages authored under
@@ -269,14 +268,31 @@ class RelayRoute(StrEnum):
     HUMAN = "human"
 
 
-#: The label an APPROVE → human relay carries on the line above its ``NEXT: human``: every such
-#: hand-off is a merge request, i.e. the ``merge-protected`` Tier-C type (msg-4772 / msg-4774).
-#: Resolved through :func:`~spirrow_mindwire.tier_c_admission_gate.require_admitted`, so if the
-#: gate ever renames or drops the label this module fails at import instead of the relay quietly
-#: emitting a label the gate no longer admits (PR #365 PR-gate advisory, msg-4850). The line and
-#: the implementer instruction below are both built from this one value.
-MERGE_REQUEST_TIER_C_LABEL = require_admitted("merge-protected", where="gate_records")
-MERGE_REQUEST_TIER_C_LINE = f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}"
+#: The line an APPROVE → human relay carries above its ``NEXT: human``. Such a hand-off is a merge
+#: WAIT, not a Tier-C decision: opening a PR whose merge is the human's already asked for the merge,
+#: and the merge-wait PR list carries it (Takahito, T-decider-tierc-v2-all-escalations msg-4361
+#: "main へのマージは判断点から外す ... PR 作成時点で既にエスカレーションになっている";
+#: restated 2026-10-03). U3' (msg-4772 / msg-4774) labelled it ``TIER-C: merge-protected``, which
+#: put every merge wait on the to-do board as a decision. ``NEXT: human`` stays so head_skip parks
+#: the thread and 1b (:mod:`~spirrow_mindwire.pr_event_advance`) resumes it on merge / close; the
+#: conductor stops with ``StopReason.MERGE_WAIT``, which neither notifies nor pushes a card, and
+#: :func:`~spirrow_mindwire.conductor.parked_lane.classify_parked` files it in the merge-wait
+#: lane. The line is column-zero and starts with :data:`MERGE_WAIT_MARK`, the one thing
+#: :func:`is_merge_wait_relay` reads.
+MERGE_WAIT_MARK = "MERGE-WAIT:"
+MERGE_WAIT_LINE = (
+    f"{MERGE_WAIT_MARK} この PR は merge 待ち一覧に載っています (Tier-C の判断依頼ではありません)。"
+    "merge か close を検知したら自動で再開します。"
+)
+
+
+def is_merge_wait_relay(body: str) -> bool:
+    """Does ``body`` carry the column-zero :data:`MERGE_WAIT_MARK` line a merge-wait relay writes?
+
+    Same trust model as the rest of this module: a forged line can only file a head in the
+    merge-wait lane, and the PR it names is on the merge-wait list anyway."""
+    return any(line.startswith(MERGE_WAIT_MARK) for line in body.splitlines())
+
 
 #: Appended (above the ``NEXT:`` line) ONLY on the first-advisory → implementer route, so the
 #: implementer knows on the spot what to do with an advisory-only APPROVE without its global
@@ -287,8 +303,9 @@ MERGE_REQUEST_TIER_C_LINE = f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}"
 ADVISORY_SELF_TRIAGE_INSTRUCTION = (
     "Advisory のみの APPROVE。human に「直すか」を聞かずに、自分で裁くこと: 安く直せるなら同じ "
     "PR で直して push する (再ゲートになる)。見送る advisory は `DECIDED: <どれを> — <理由>` を "
-    "1 行ずつ書く。見送りだけで終える場合は、最後に "
-    f"`{MERGE_REQUEST_TIER_C_LINE}` と `NEXT: human` を書いて merge を依頼する。"
+    "1 行ずつ書く。見送りだけで終える場合は、最後に `NEXT: pr-review <この PR>` を書いて gate に"
+    "戻す (head が同じなら前回の APPROVE が再掲され、merge 待ちになる)。merge は PR を出した時点で"
+    "依頼済みなので、`TIER-C:` 行や `NEXT: human` で merge を頼まないこと。"
 )
 
 #: Objection-parse statuses that mean "no advisory to triage". ``MISSING`` is here on purpose:
@@ -368,14 +385,15 @@ def decide_relay_route(
 
 __all__ = [
     "ADVISORY_SELF_TRIAGE_INSTRUCTION",
-    "MERGE_REQUEST_TIER_C_LABEL",
-    "MERGE_REQUEST_TIER_C_LINE",
+    "MERGE_WAIT_LINE",
+    "MERGE_WAIT_MARK",
     "RELAY_AUTHOR",
     "RelayRoute",
     "carries_advisory",
     "ci_hold_head",
     "ci_route_heads",
     "decide_relay_route",
+    "is_merge_wait_relay",
     "normalize_sha",
     "prior_advisory_approvals",
     "render_admission_heading",

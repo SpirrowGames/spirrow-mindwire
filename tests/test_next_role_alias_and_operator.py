@@ -347,13 +347,15 @@ async def test_operator_stand_down_posts_the_correct_form_and_does_not_spawn(
 
 
 @pytest.mark.anyio
-async def test_valid_operator_parks_like_human() -> None:
+async def test_valid_operator_parks_on_operator_work() -> None:
+    # T-next-operator-is-silent T2 (Bohr msg-5930 / msg-5934): it parks like ``human`` in
+    # head_skip, but its stop reason is its own, so the ledger does not call it a decision.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content=_VALID_OPERATOR)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp).run()
     assert disp.spawns == []
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.OPERATOR_WORK
     assert mcp.posts == []
 
 

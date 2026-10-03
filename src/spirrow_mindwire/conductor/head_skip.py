@@ -209,8 +209,23 @@ def stage1_skips(head_body: str) -> bool:
 # by two rules (Einstein, T-silent-stops thread). The criterion is not "has a notice ending in
 # ``NEXT: human``": ``no_progress_to_human`` posts nothing and depends on this set to park, and
 # ``self_handoff_to_human`` depends on it whenever its notice fails to land.
+#
+# ``no_handoff_to_human`` joined on 2026-10-03 (T-no-field-no-next-handoff-silent-park). A head
+# with neither a ``NEXT:`` line nor a handoff field routes through ``_route``'s ABSENT branch,
+# and that branch is decided by the head alone: it reads no control state, so running this exact
+# head again yields the same NO_HANDOFF. That is "running this exact head again achieves
+# nothing", the criterion above. Before this it was left out, and the sweep re-LAUNCHed such a
+# head on every backoff step forever, doing no inference and never resolving. A NO_HANDOFF whose
+# notice lands moves the head (to a ``NEXT: human`` notice that Stage 1 skips anyway); one whose
+# notice fails to land stops retrying the post, the same property ``self_handoff_to_human``
+# already accepts.
 TERMINAL_STOP_REASONS: frozenset[str] = frozenset(
-    {"no_progress_to_human", "self_handoff_to_human", "stalled_to_human"}
+    {
+        "no_handoff_to_human",
+        "no_progress_to_human",
+        "self_handoff_to_human",
+        "stalled_to_human",
+    }
 )
 
 
@@ -470,8 +485,8 @@ def decide(
             eligible_at=None,
         )
 
-    # --- Stage 1b: terminal-outcome judgment (design §6.2). Reads the recorded outcome + the
-    # head msg id, and NOTHING else. ------------------------------------------------------------
+    # --- Stage 1b: terminal-outcome judgment (design §6.2). Reads the recorded outcome, the
+    # head msg id and the token vs its launch baseline, and NOTHING else. -----------------------
     #
     # A run that ended in :data:`TERMINAL_STOP_REASONS` learned that this exact head goes
     # nowhere. Until the head moves, re-launching buys another identical nothing. Stage 2 cannot
@@ -486,11 +501,35 @@ def decide(
     # ``attempts`` is preserved, not reset: the record still says how many times this thread was
     # launched without progress, which is the audit trail for how long the spin ran before it was
     # terminated. It is simply no longer the input to a retry.
+    #
+    # Edits (T-no-field-no-next-handoff-silent-park). An edit keeps the msg id, so the msg-id test
+    # alone would keep an edited head parked forever: a human who adds ``NEXT: <role>`` to a parked
+    # comment would be stranded with no further alert. The park therefore also requires the
+    # current token to equal the token the parked run was launched on
+    # (``nomination_at_launch``, a launch-family field that neither ``commit_terminal`` nor
+    # ``commit_observation`` overwrites). When an edit has changed the token, the park is passed
+    # through and Stage 2 sees ``token != nomination_at_launch`` as progress and LAUNCHes; that
+    # LAUNCH's ``commit_launch`` clears the terminal fields, so there is no loop. The condition
+    # applies to every terminal reason, because each one has the same edit gap.
+    #
+    # Limits worth stating outright:
+    # - An edit is only seen when the body is re-read, which happens when the cached parse ages
+    #   out (``HEAD_CACHE_TTL``, 60 min). Until then the cached token is unchanged and the head
+    #   stays parked. Posting a new comment moves the msg id and is picked up on the next tick.
+    # - An empty token never passes through. ``""`` is also what a failed fetch synthesises
+    #   (fail-open), and treating it as an edit would turn every fetch failure on a parked
+    #   thread into a paid LAUNCH. This is the same guard as Stage 2's disjunct 3. The cost:
+    #   an edit that REMOVES the ``NEXT:`` line stays parked, and re-running it could only
+    #   produce a NO_HANDOFF anyway.
+    # - A record with no launch baseline (``last_launch_at is None``, e.g. a terminal outcome
+    #   recorded on a record the sweep never launched) has no launch token to compare against,
+    #   so there is no evidence of an edit and the park holds.
     if (
         record is not None
         and record.terminal_stop_reason in TERMINAL_STOP_REASONS
         and record.terminal_head_msg_id != ""
         and record.terminal_head_msg_id == head_msg_id
+        and (record.last_launch_at is None or token == "" or token == record.nomination_at_launch)
     ):
         return Verdict(
             decision=Decision.SKIP,

@@ -17,11 +17,11 @@ import pytest
 
 from spirrow_mindwire.conductor.gate_records import (
     ADVISORY_SELF_TRIAGE_INSTRUCTION,
-    MERGE_REQUEST_TIER_C_LABEL,
-    MERGE_REQUEST_TIER_C_LINE,
+    MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     decide_relay_route,
+    is_merge_wait_relay,
     prior_advisory_approvals,
     render_relay_heading,
 )
@@ -114,11 +114,14 @@ async def _relay(
 
 
 @pytest.mark.anyio
-async def test_1_approve_without_advisory_stops_at_human_as_merge_request() -> None:
+async def test_1_approve_without_advisory_stops_at_human_as_merge_wait() -> None:
     mcp = _ThreadMcp()
     relay = await _relay(mcp, _outcome(ReviewEvent.APPROVE, "[]", "aaaaaaa1"))
     assert relay["route"] is RelayRoute.HUMAN
-    assert relay["content"].endswith(f"{MERGE_REQUEST_TIER_C_LINE}\nNEXT: human")
+    assert relay["content"].endswith(f"{MERGE_WAIT_LINE}\nNEXT: human")
+    assert is_merge_wait_relay(relay["content"])
+    # msg-4361: a merge is not a Tier-C escalation, so the relay carries no TIER-C line.
+    assert not any(ln.startswith("TIER-C:") for ln in relay["content"].splitlines())
     assert ADVISORY_SELF_TRIAGE_INSTRUCTION not in relay["content"]
     # No history read: it could not change the answer.
     assert "chatroom_get_thread" not in mcp.calls
@@ -150,7 +153,7 @@ async def test_4_second_advisory_approve_stops_at_human() -> None:
     assert first["route"] is RelayRoute.IMPLEMENTER
     second = await _relay(mcp, _outcome(ReviewEvent.APPROVE, _ADVISORY, "bbbbbbb2"))
     assert second["route"] is RelayRoute.HUMAN
-    assert second["content"].endswith(f"{MERGE_REQUEST_TIER_C_LINE}\nNEXT: human")
+    assert second["content"].endswith(f"{MERGE_WAIT_LINE}\nNEXT: human")
     assert ADVISORY_SELF_TRIAGE_INSTRUCTION not in second["content"]
 
 
@@ -222,7 +225,7 @@ async def test_no_implementer_fails_to_human() -> None:
         implementer=None,
     )
     assert rc["route"] is RelayRoute.HUMAN
-    assert MERGE_REQUEST_TIER_C_LINE not in rc["content"]  # not a merge request
+    assert not is_merge_wait_relay(rc["content"])  # not a merge wait
 
 
 # ---- test 9: the pure function, every row ---------------------------------------------------- #
@@ -297,34 +300,16 @@ def test_counter_is_zero_on_empty_history() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_merge_request_label_is_admitted_and_drives_both_texts() -> None:
-    assert MERGE_REQUEST_TIER_C_LABEL in ADMIT_LABELS
-    assert f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}" == MERGE_REQUEST_TIER_C_LINE
-    # The implementer instruction teaches the same line, not a second copy of the label.
-    assert f"`{MERGE_REQUEST_TIER_C_LINE}`" in ADVISORY_SELF_TRIAGE_INSTRUCTION
+def test_merge_is_not_a_tier_c_label_and_no_relay_text_teaches_it() -> None:
+    """msg-4361 (restated 2026-10-03): a merge is requested by the PR, not escalated."""
+    assert "merge-protected" not in ADMIT_LABELS
+    assert "merge-protected" not in MERGE_WAIT_LINE
+    assert "merge-protected" not in ADVISORY_SELF_TRIAGE_INSTRUCTION
+    assert "NEXT: pr-review" in ADVISORY_SELF_TRIAGE_INSTRUCTION
+    assert not any(ln.startswith("TIER-C:") for ln in MERGE_WAIT_LINE.splitlines())
 
 
 def test_require_admitted_fails_loudly_on_an_unadmitted_label() -> None:
-    assert require_admitted("merge-protected", where="t") == "merge-protected"
+    assert require_admitted("goal", where="t") == "goal"
     with pytest.raises(RuntimeError, match=r"gate_records: .*'merge-guarded'"):
         require_admitted("merge-guarded", where="gate_records")
-
-
-def test_gate_records_import_fails_if_gate_drops_merge_protected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A gate that stops admitting the label makes gate_records unimportable (no silent drift)."""
-    # Local imports on purpose: this test re-imports gate_records via sys.modules, so its
-    # module handles stay scoped to the test rather than joining the file-level constants.
-    import importlib
-    import sys
-
-    import spirrow_mindwire.tier_c_admission_gate as gate
-
-    monkeypatch.setattr(gate, "ADMIT_LABELS", frozenset({"goal", "cost", "irreversible"}))
-    saved = sys.modules.pop("spirrow_mindwire.conductor.gate_records")
-    try:
-        with pytest.raises(RuntimeError, match="merge-protected"):
-            importlib.import_module("spirrow_mindwire.conductor.gate_records")
-    finally:
-        sys.modules["spirrow_mindwire.conductor.gate_records"] = saved

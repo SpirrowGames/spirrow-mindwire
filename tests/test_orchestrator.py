@@ -14,7 +14,12 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.conductor.gate_records import RelayRoute, render_relay_heading, verdict_heads
+from spirrow_mindwire.conductor.gate_records import (
+    MERGE_WAIT_LINE,
+    RelayRoute,
+    render_relay_heading,
+    verdict_heads,
+)
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
@@ -1165,9 +1170,9 @@ async def test_one_fire_lands_in_both_the_ledger_and_the_design_thread() -> None
         f"{render_relay_heading('o/r#7', 'sha1')}\n\n"
         "VERDICT: APPROVE (ci=success)\n\n"
         "LGTM\n\nVERDICT: APPROVE\n\n"
-        # U3' (T-tier-c-admission-gate msg-4774): an APPROVE that stops at the human is a merge
-        # request, and says so with the merge-protected Tier-C label.
-        "TIER-C: merge-protected\n"
+        # An APPROVE that stops at the human is a merge WAIT, not a Tier-C escalation (msg-4361):
+        # the merge-wait line, no TIER-C line.
+        f"{MERGE_WAIT_LINE}\n"
         "NEXT: human"
     )
     assert relay["route"] is RelayRoute.HUMAN

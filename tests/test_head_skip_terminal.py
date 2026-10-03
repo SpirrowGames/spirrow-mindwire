@@ -52,6 +52,7 @@ def test_terminal_reasons_are_real_stop_reasons() -> None:
     assert values >= TERMINAL_STOP_REASONS
     assert StopReason.NO_PROGRESS.value in TERMINAL_STOP_REASONS
     assert StopReason.SELF_HANDOFF.value in TERMINAL_STOP_REASONS
+    assert StopReason.NO_HANDOFF.value in TERMINAL_STOP_REASONS
     # Not everything human-terminal parks: an explicit `NEXT: human` already parks through Stage
     # 1's stop token, and CI_WAIT / HOLD are waiting on something that WILL change on its own.
     assert StopReason.HUMAN.value not in TERMINAL_STOP_REASONS
@@ -251,3 +252,156 @@ def test_an_empty_terminal_head_never_parks() -> None:
         ).decision
         is not Decision.SKIP
     )
+
+
+# --------------------------------------------------------------------------- #
+# T-no-field-no-next-handoff-silent-park (msg-6187 §4 (a)-(f)): a head with no ``NEXT:`` line and
+# no handoff field ends on NO_HANDOFF. It is now terminal, and an edit that changes the token
+# releases any terminal park.
+# --------------------------------------------------------------------------- #
+
+_NO_NEXT_BODY = "普通のコメントです。NEXT 行はありません。"
+_NO_HANDOFF = StopReason.NO_HANDOFF.value
+
+
+def _no_handoff_parked(head: str = "msg-6090") -> Record:
+    """A human ``NEXT:``-less comment: launched once on token ``""``, ended on NO_HANDOFF."""
+    first = decide(
+        now=_NOW - timedelta(hours=2),
+        head_msg_id=head,
+        head_body=_NO_NEXT_BODY,
+        control_state="run",
+        record=None,
+    )
+    assert first.decision is Decision.LAUNCH
+    assert first.token == ""
+    launched = commit_launch(
+        now=_NOW - timedelta(hours=2),
+        head_msg_id=head,
+        verdict=first,
+        control_state="run",
+    )
+    assert launched.nomination_at_launch == ""
+    return commit_terminal(reason=_NO_HANDOFF, head_msg_id=head, record=launched)
+
+
+def test_nh_a_same_head_same_token_is_parked() -> None:
+    """(a) / (e) Same head, token still ``""`` → SKIP, no re-LAUNCH loop."""
+    record = _no_handoff_parked()
+    for hours in (1, 24, 24 * 30):
+        verdict = decide(
+            now=_NOW + timedelta(hours=hours),
+            head_msg_id="msg-6090",
+            head_body=_NO_NEXT_BODY,
+            control_state="run",
+            record=record,
+        )
+        assert verdict.decision is Decision.SKIP
+        assert verdict.reason == "terminal-stop:no_handoff_to_human"
+
+
+def test_nh_a_control_state_change_does_not_release() -> None:
+    """The ABSENT branch reads no control state, so hold→run is not a reason to re-run."""
+    record = _no_handoff_parked()
+    verdict = decide(
+        now=_NOW,
+        head_msg_id="msg-6090",
+        head_body=_NO_NEXT_BODY,
+        control_state="hold",
+        record=record,
+    )
+    assert verdict.decision is Decision.SKIP
+
+
+def test_nh_b_moved_head_launches_and_launch_clears_terminal() -> None:
+    """(b) A new message (even another ``NEXT:``-less one) moves the head → LAUNCH; the LAUNCH's
+    commit clears the terminal fields."""
+    record = _no_handoff_parked()
+    verdict = decide(
+        now=_NOW,
+        head_msg_id="msg-6091",
+        head_body=_NO_NEXT_BODY,
+        control_state="run",
+        record=record,
+    )
+    assert verdict.decision is Decision.LAUNCH
+    relaunched = commit_launch(
+        now=_NOW,
+        head_msg_id="msg-6091",
+        verdict=verdict,
+        control_state="run",
+        prior_record=record,
+    )
+    assert relaunched.terminal_stop_reason == ""
+    assert relaunched.terminal_head_msg_id == ""
+
+
+def test_nh_c_observation_after_terminal_keeps_the_park() -> None:
+    """(c) The SKIP tick's observation refresh must not erase the terminal state."""
+    record = _no_handoff_parked()
+    observed = commit_observation(now=_NOW, head_msg_id="msg-6090", token="", record=record)
+    assert observed.terminal_stop_reason == _NO_HANDOFF
+    assert observed.terminal_head_msg_id == "msg-6090"
+    verdict = decide(
+        now=_NOW + timedelta(minutes=5),
+        head_msg_id="msg-6090",
+        head_body=_NO_NEXT_BODY,
+        control_state="run",
+        record=observed,
+    )
+    assert verdict.decision is Decision.SKIP
+
+
+def test_nh_d_edit_adding_next_role_launches() -> None:
+    """(d) Same msg id, body edited to add ``NEXT: Bohr`` (token ``""`` → ``"bohr"``) → LAUNCH
+    with ``progressed=True``, not a permanent park."""
+    record = _no_handoff_parked()
+    verdict = decide(
+        now=_NOW,
+        head_msg_id="msg-6090",
+        head_body=_NO_NEXT_BODY + "\n\nNEXT: Bohr",
+        control_state="run",
+        record=record,
+    )
+    assert verdict.decision is Decision.LAUNCH
+    assert verdict.progressed is True
+    assert verdict.token == "bohr"
+
+
+@pytest.mark.parametrize("reason", sorted(TERMINAL_STOP_REASONS))
+def test_nh_f_a_token_changing_edit_releases_every_terminal_reason(reason: str) -> None:
+    """(f) The edit rule is uniform: no reason-specific exception in Stage 1b."""
+    record = commit_terminal(reason=reason, head_msg_id="msg-244", record=_launched_record())
+    verdict = decide(
+        now=_NOW,
+        head_msg_id="msg-244",
+        head_body="F-1 起票\n\nNEXT: Einstein",
+        control_state="run",
+        record=record,
+    )
+    assert verdict.decision is Decision.LAUNCH
+    assert verdict.progressed is True
+
+
+@pytest.mark.parametrize("reason", sorted(TERMINAL_STOP_REASONS))
+def test_nh_g_a_failed_fetch_does_not_release_the_park(reason: str) -> None:
+    """A failed body fetch makes the CLI pass an empty body (token ``""``). That is not an edit.
+    Releasing on it would turn every fetch failure on a parked ``NEXT: Bohr`` head into a paid
+    LAUNCH, so an empty token never passes Stage 1b."""
+    record = commit_terminal(reason=reason, head_msg_id="msg-244", record=_launched_record())
+    verdict = decide(
+        now=_NOW, head_msg_id="msg-244", head_body="", control_state="run", record=record
+    )
+    assert verdict.decision is Decision.SKIP
+    assert verdict.reason == f"terminal-stop:{reason}"
+
+
+def test_nh_h_no_launch_baseline_keeps_the_park() -> None:
+    """A terminal record with no launch baseline has no launch token to compare, so a non-empty
+    token is not evidence of an edit and the park holds."""
+    record = commit_terminal(reason=_NO_HANDOFF, head_msg_id="m7", record=None)
+    verdict = decide(
+        now=_NOW, head_msg_id="m7", head_body="NEXT: Bohr", control_state="run", record=record
+    )
+    assert verdict.decision is Decision.SKIP
+    assert verdict.reason == "terminal-stop:no_handoff_to_human"

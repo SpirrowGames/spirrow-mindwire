@@ -37,6 +37,11 @@
 #               'human' via R3, which IS in the map above.
 # This set is not a narrowing of the notification predicate (note 1): every reason that means
 # "the loop parked and needs a person" is still in the map. Do not add 'ci_wait' to it.
+#   'merge_wait' — the PR-gate APPROVEd a PR whose merge is the human's (base=main). Opening the
+#               PR already asked for the merge and the merge-wait PR list (/dashboard/prs)
+#               carries it (Takahito, msg-4361: "main へのマージは判断点から外す"), so a Discord
+#               ping and a decision card would be a second copy of the same request. 1b
+#               (pr_event_advance) resumes the thread when the PR is merged or closed.
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1
@@ -49,6 +54,11 @@
 #
 # 2026-09-30 (T42): 'stalled_to_human' joined the MAP for the same reason. The stall watchdog
 # posts STALLED and exits 0, so this notification is how the operator hears about it.
+#
+# 2026-10-03 (T-next-operator-is-silent, Bohr msg-5930 D3 / msg-5934): 'operator_work_to_human'
+# joined the MAP. A valid `NEXT: operator` is work a person has to do by hand, so it must be
+# heard (note 1) — but it is not a decision, so its phrase does not say 判断待ち, and
+# Send-HumanParkAlert does not ask the decision composer to write a question for it (D4').
 #
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
@@ -66,12 +76,16 @@ function Get-StopReasonPhraseMap {
     # Returns a FRESH hashtable on every call, so mutation by one caller cannot leak into another.
     # The map's contents mirror the $needsHuman literal that used to live in
     # deploy/run-conductor-scheduled.ps1 verbatim; the migration must not change any wording.
+    # That was a migration-time rule. The wording is human-facing display only; the machine-read key
+    # is `reason=` (file header L11-16 contract). 'no_handoff_to_human' gained its resume hint on
+    # 2026-10-03 (T-no-field-no-next-handoff-silent-park).
     return @{
         'human'                 = "あなたの判断待ちで停止しました"
-        'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました"
+        'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました。再開は NEXT: 行付きの新しいコメントで（編集だと反映に最大 60 分）"
         'no_progress_to_human'  = "dispatch した role が何も投稿せず停止しました"
         'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
         'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
+        'operator_work_to_human' = "operator の手作業待ちで停止しました"
         'round_cap'             = "ラウンド上限で停止しました（暴走バックストップ発動）"
         'empty_thread'          = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }
