@@ -469,7 +469,7 @@ class Conductor:
             raise ValueError("max_rounds must be >= 1")
         if not naysayer_identity.strip():
             raise ValueError("naysayer_identity must be non-empty (it authors a forced review)")
-        if _roster_role(roster, naysayer_identity) is not naysayer_role:
+        if roster_role(roster, naysayer_identity) is not naysayer_role:
             raise ValueError(
                 f"naysayer_identity {naysayer_identity!r} must map to role {naysayer_role.value!r} "
                 f"in the roster: Obj2 recognises a forced naysayer turn by this mapping, so a "
@@ -2193,7 +2193,7 @@ class Conductor:
 
     def _roster_role(self, author: str) -> Role | None:
         """Resolve a message author (persona name) to its role, case-insensitively."""
-        return _roster_role(self._roster, author)
+        return roster_role(self._roster, author)
 
     async def _fetch_messages(self) -> list[dict[str, Any]]:
         # T-error-envelope-read-as-data (msg-1115 §2): a refused read used to
@@ -2898,7 +2898,7 @@ def _next_participant(msg: dict[str, Any]) -> str | None:
     return None
 
 
-def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
+def roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
     """Resolve an author (persona name) to its role via the roster, case-insensitively."""
     direct = roster.get(author)
     if direct is not None:
