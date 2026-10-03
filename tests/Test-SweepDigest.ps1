@@ -107,7 +107,9 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   # For the PR-gate regression block below (alert-path spam-loop pin,
                   # degraded-fallback class-propagation pin).
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged',
-                  'Resolve-DigestSendResult') {
+                  'Resolve-DigestSendResult',
+                  # T-next-line-carries-who-not-why Slice 3: the stop-reason line.
+                  'Get-StopClassDigestLines') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -933,6 +935,35 @@ CheckTrue "判断待ち keeps its floor" ($shRows.parked -ge 1) ($shRows | Out-S
 CheckTrue "停止中 keeps its floor" ($shRows.stalehuman -ge 1) ($shRows | Out-String)
 CheckTrue "飢餓 keeps its floor after 停止中" ($shRows.starved -ge 1) ($shRows | Out-String)
 CheckTrue "停止中 header keeps the true total (60) when rows are dropped" ($shBudgeted -match '停止中（[^）]*）: 60 件') $shBudgeted
+
+# =============================================================================================
+# T-next-line-carries-who-not-why Slice 3 — the stop-reason line (magickit msg-1015 v11 §1).
+# =============================================================================================
+Write-Host ""
+Write-Host "Get-StopClassDigestLines — why each open NEXT: none thread stopped"
+
+# Captured the way the caller binds it (a [string[]] parameter / a variable), which unrolls the
+# `, @()` the function returns; wrapping the call in @() would count the wrapper itself.
+$scNone = Get-StopClassDigestLines -ByProject @{}
+Check "no project reported and none failed -> no lines (digest unchanged)" 0 $scNone.Count
+$scA = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 2; blocked_on = 1; unclassified = 2; human_close = 1 }; unclassified = @('T-a', 'T-b') }
+$scB = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 1; human_close = 0 }; unclassified = @('T-c') }
+$scLines = Get-StopClassDigestLines -ByProject @{ 'p1' = $scA; 'p2' = $scB }
+Check "counts are summed over projects" `
+    '停止理由（NEXT: none）: 決着 2 / 着手条件待ち 1 / 未分類 3 / 人の close 1' $scLines[0]
+Check "unclassified threads are named project/thread" '  未分類: p1/T-a, p1/T-b, p2/T-c' $scLines[1]
+Check "the block ends with a blank separator" '' $scLines[2]
+$scFailed = Get-StopClassDigestLines -ByProject @{ 'p1' = $scB } -Failed @('p9')
+CheckTrue "a project whose tick failed is named, not counted as zero" ($scFailed[0] -match '取得失敗: p9') $scFailed[0]
+$scLong = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 40; human_close = 0 }; unclassified = @(0..39 | ForEach-Object { "T-a-long-thread-name-$_" }) }
+$scLongLines = Get-StopClassDigestLines -ByProject @{ 'p' = $scLong }
+CheckTrue "the unclassified list is capped at 300 chars" ($scLongLines[1].Length -le 300) $scLongLines[1].Length
+$scDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @() -StopClassLines $scLines
+CheckTrue "New-DailyDigest renders the stop-reason line" ($scDigest -match '停止理由（NEXT: none）: 決着 2') $scDigest
+$scPlain = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @()
+CheckTrue "without -StopClassLines the digest has no stop-reason line" (-not ($scPlain -match '停止理由')) $scPlain
 
 if ($script:failures -gt 0) {
     Write-Host ""

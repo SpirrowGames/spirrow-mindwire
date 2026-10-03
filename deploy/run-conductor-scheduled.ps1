@@ -717,6 +717,9 @@ $GateBootstrapProbeTimeoutSeconds = 120
 # 1b (T-pr-event-advances-thread): one chatroom read per open thread of the project, plus a GitHub
 # read only for threads whose tail is a PR-gate relay. Longer than the single-call probes for that.
 $PrEventAdvanceProbeTimeoutSeconds = 300
+# Park wake (T-next-line-carries-who-not-why Slice 3, D-7): the same per-open-thread read as 1b,
+# plus one fact read per distinct trigger. Same bound as 1b for the same reason.
+$ParkWakeProbeTimeoutSeconds = 300
 # Get-FailureClass -> spirrow_mindwire.stall_ledger (Bohr msg-5611 §3). The classifier itself runs in
 # milliseconds; the bound is the same as the other probes because uv -> python start-up alone took
 # ~75 s in msg-5322.
@@ -2062,6 +2065,10 @@ function New-DailyDigest {
         # section (PR #435 gate round 3), so N parked repos cannot push the digest past $Budget.
         # Empty (the default) leaves the digest exactly as it was.
         [string[]]$ParkedCloneLines = @(),
+        # T-next-line-carries-who-not-why Slice 3: the stop-reason lines, built by the caller with
+        # Get-StopClassDigestLines. Fixed size (two lines, the second capped), emitted after the
+        # 駐機中 section. Empty (the default) leaves the digest exactly as it was.
+        [string[]]$StopClassLines = @(),
         # T-sweep-intake-and-quarantine-stalls msg-5889 D-2: this tick's intake, the return value of
         # Resolve-UnregisteredIntake (lib/UnregisteredIntake.ps1). Renders the 未登録（登録不可）section
         # right after 停止中. $null (the default) omits the section, so a caller that predates the
@@ -2545,6 +2552,7 @@ function New-DailyDigest {
         $lines += _SectionOverflowLines -Result $result -Indent '  '
         $lines += $cloneTail
     }
+    if ($StopClassLines.Count -gt 0) { $lines += $StopClassLines }
 
     $lines += $quarCountLine
     if ($totalQ -eq 0) {
@@ -4514,6 +4522,76 @@ function Invoke-PrEventAdvanceTick {
     }
 }
 
+# --- park wake: STOP: blocked-on threads wake when their trigger fires -------------------------
+# For each distinct project in the sweep list, run `python -m spirrow_mindwire.park_wake`
+# (T-next-line-carries-who-not-why Slice 3, D-7). It reads every open thread of the project,
+# classifies each `NEXT: none` head (done / blocked_on / unclassified / human_close — the counts the
+# digest shows), and for a `STOP: blocked-on <trigger> wake:<persona>` head whose trigger has fired
+# writes ONE message ending in `NEXT: <persona>`. The conductor routes that like any handoff.
+#
+# Same placement and fail direction as 1b: after the HOLD check (a held project gets no writes),
+# before the head probe (a thread it woke has a moved head and is launched this tick), and
+# fail-open on the SWEEP — a broken tick returns $null and the sweep goes on. The classification is
+# Python-side; this wrapper never parses a STOP: line.
+function Invoke-ParkWakeTick {
+    param([string]$Project)
+
+    try {
+        $r = Invoke-BoundedUvProbe -Label "park-wake-$Project" -TimeoutSeconds $ParkWakeProbeTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.park_wake', '--project', $Project, '--sweep-config', $sweepConfigPath)
+        if (-not $r.ok) {
+            Write-Log "park-wake [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
+        }
+        $json = Get-ProbeJsonLine -Result $r
+        if (-not $json) {
+            Write-Log "park-wake [$Project]: no JSON on stdout (exit=$($r.code)) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($r.code -ne 0) {
+            Write-Log "park-wake [$Project]: tick failed (exit=$($r.code)): $($obj.error)"
+            return $null
+        }
+        if (@($obj.woken).Count -gt 0 -or @($obj.errors).Count -gt 0) {
+            Write-Log "park-wake [$Project]: $json"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "park-wake [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
+        return $null
+    }
+}
+
+# The digest's stop-reason line (T-next-line-carries-who-not-why Slice 3; magickit msg-1015 v11 §1):
+# why each open `NEXT: none` thread stopped, summed over the projects whose park-wake tick ran this
+# tick, plus the unclassified ones by name — those are the candidates for "nobody nominated anyone"
+# (msg-2014 §1 (4)). A project whose tick failed is named instead of being counted as zero. Returns
+# @() when no project reported, so the digest is unchanged.
+function Get-StopClassDigestLines {
+    param([hashtable]$ByProject, [string[]]$Failed = @())
+    if (($null -eq $ByProject -or $ByProject.Count -eq 0) -and $Failed.Count -eq 0) { return , @() }
+    $done = 0; $blocked = 0; $unclassified = 0; $humanClose = 0
+    $names = @()
+    foreach ($proj in ($ByProject.Keys | Sort-Object)) {
+        $c = $ByProject[$proj].counts
+        $done += [int]$c.done; $blocked += [int]$c.blocked_on
+        $unclassified += [int]$c.unclassified; $humanClose += [int]$c.human_close
+        $names += @($ByProject[$proj].unclassified | ForEach-Object { "$proj/$_" })
+    }
+    $line = "停止理由（NEXT: none）: 決着 $done / 着手条件待ち $blocked / 未分類 $unclassified / 人の close $humanClose"
+    if ($Failed.Count -gt 0) { $line += "（取得失敗: $(($Failed | Sort-Object) -join ', ')）" }
+    $lines = @($line)
+    if ($names.Count -gt 0) {
+        $list = "  未分類: " + ($names -join ', ')
+        if ($list.Length -gt 300) { $list = $list.Substring(0, 299) + '…' }
+        $lines += $list
+    }
+    $lines += ""
+    return , $lines
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -4636,6 +4714,9 @@ try {
     # in a single call, so N candidates in one project still cost one call.
     $headsByProject = @{}
     $controlByProject = @{}
+    # Park-wake tick output per project (Slice 3), for the digest's stop-reason line.
+    $stopClassByProject = @{}
+    $stopClassFailed = @()
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         # Control first: a project whose hold has already landed needs no head probe at all, so asking
         # in this order keeps a settled HOLD to exactly one MCP read per project per tick. A hold the
@@ -4674,6 +4755,9 @@ try {
         # writes either, and BEFORE the head probe, so a thread it writes to shows a moved head
         # in this same tick. Fail-open (see Invoke-PrEventAdvanceTick).
         [void](Invoke-PrEventAdvanceTick -Project $proj)
+        # Park wake (Slice 3, D-7): same slot and same reasons as 1b above.
+        $parkWake = Invoke-ParkWakeTick -Project $proj
+        if ($null -ne $parkWake) { $stopClassByProject[$proj] = $parkWake } else { $stopClassFailed += $proj }
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
@@ -5656,6 +5740,7 @@ try {
                 -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
                 -StaleHumanThreshold $StaleHumanThreshold `
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
+                -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
                 -UnregisteredIntake $unregisteredIntake
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"

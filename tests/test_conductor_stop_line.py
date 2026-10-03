@@ -9,7 +9,9 @@ What this file pins, item by item:
    ``STOP``-less ``NEXT: none`` shows up as ``stop_line=absent`` — and routes identically;
 3. the Decider is not affected: whether a ``STOP:`` line exists does not change whether the
    author's ``NEXT: human`` enters the tierc hook;
-4. the emission prompt (``_HANDOFF_PROTOCOL_CORE``) does not teach ``STOP:``.
+4. the emission prompt (``_HANDOFF_PROTOCOL_CORE``) teaches ``STOP:`` only from Slice 3 on, and
+   only in forms the parser accepts (item 4 below; Slice 3's own pins are in
+   ``tests/test_stop_disposition_slice3.py``).
 """
 
 from __future__ import annotations
@@ -315,14 +317,39 @@ def test_decider_files_do_not_read_the_stop_line() -> None:
         assert "stop_line" not in text and "StopLine" not in text, path
 
 
-# --------------------------------------------------------------------------- item 4: no prompt
+# --------------------------------------------------------------------------- item 4: prompt
 
 
 @pytest.mark.parametrize("role", list(Role))
-def test_protocol_block_does_not_teach_stop(role: Role) -> None:
-    """Einstein msg-4717 BLOCKING / msg-4718 §1-4: the prompt must not promise resolved/parked
-    until the mechanism that keeps the promise ships with it."""
+def test_protocol_block_teaches_only_forms_the_parser_accepts(role: Role) -> None:
+    """Slice 3 (msg-5175 §3) ships the prompt with the mechanism, so the block now teaches the two
+    forms — and every concrete instance of what it teaches must parse as accepted, never as
+    MALFORMED (the Slice 1 pin that the prompt is silent is retired with this)."""
     block = build_handoff_protocol_block(role)
-    assert "STOP:" not in block
-    assert "blocked-on" not in block
-    assert "STOP:" not in handoff_mod._HANDOFF_PROTOCOL_CORE
+    for form in handoff_mod.STOP_FORM_EXAMPLES:
+        assert form in block
+    for arm in STOP_TRIGGER_ARMS:
+        assert f"`{arm}:" in block
+    concrete = [
+        "STOP: done",
+        "STOP: blocked-on thread:T-foo wake:Einstein",
+        "STOP: blocked-on thread:spirrow-magickit/T-foo wake:Einstein",
+        "STOP: blocked-on pr:acme/widgets#7 wake:Heisenberg",
+        "STOP: blocked-on deploy:req-123 wake:Bohr",
+        "STOP: blocked-on queue-empty:spirrow-mindwire wake:Bohr",
+        "STOP: blocked-on queue-empty:spirrow-mindwire:implementer wake:Bohr",
+    ]
+    for line in concrete:
+        stop = _stop(f"x\n\n{line}\nNEXT: none")
+        assert stop is not None
+        assert stop.status in (StopStatus.DONE, StopStatus.BLOCKED_ON), line
+
+
+def test_protocol_block_does_not_promise_a_close_or_a_park() -> None:
+    """Einstein msg-4717: the prompt may promise only what the code does. Slice 3 does not close
+    a thread on ``STOP: done`` nor set a ``parked`` status (no magickit tool does), so the text
+    must not say it does."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    assert "resolved" not in core.replace("(that thread is resolved)", "")
+    assert "parked" not in core
+    assert "waits for its owner to close it" in core
