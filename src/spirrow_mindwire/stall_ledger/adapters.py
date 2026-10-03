@@ -263,6 +263,16 @@ def _failed(
     )
 
 
+def github_credential_present(token: str | None) -> bool:
+    """True when ``token`` can authenticate a request: not ``None``, not blank.
+
+    Truthiness after ``strip()`` rather than ``is None`` (Einstein's advisory on msg-6415): a
+    wrapper that copies an unset variable can hand over ``""``, and a blank token must
+    fail as ``auth_missing`` too, not slip through to an unauthenticated request.
+    """
+    return token is not None and bool(token.strip())
+
+
 # ─── GitHub ────────────────────────────────────────────────────────────────────────────
 
 #: ``mergeable_state`` values under which the merge is executable. Every other
@@ -327,6 +337,16 @@ class GitHubOpenPrAdapter:
       and pushed later carries its old ``committedDate``, so that push reads as older
       motion than it is and the stall can open EARLY (by up to the commit-to-push gap).
       This errs to the loud side and is not corrected here.
+
+    **No credential, no request** (T-stalled-pr-has-no-detector msg-6415 Q2). The caller
+    says whether a GitHub token is configured (``credential_present``; the tick decides it
+    at its entry point, :func:`github_credential_present`). Without one, :meth:`fetch`
+    returns ``auth_missing`` and :meth:`check_marker` answers unverifiable, both without
+    touching the client. :class:`GitHubClient` itself still sends an unauthenticated
+    request when it has no token -- that is the conductor's contract and is left alone --
+    but for the ledger it was measured (msg-6414) to exhaust the 60/h per-IP limit and
+    surface only as ``unrecognized == examined``, a silent failure. Failing loudly here
+    puts the cause on the heartbeat's source line instead.
     """
 
     def __init__(
@@ -336,11 +356,13 @@ class GitHubOpenPrAdapter:
         repo: str,
         *,
         fetch_timeout: timedelta = DEFAULT_FETCH_TIMEOUT,
+        credential_present: bool = True,
     ) -> None:
         self._client = client
         self._owner = owner
         self._repo = repo
         self._timeout = fetch_timeout
+        self._credential_present = credential_present
         self.name = f"github:{owner}/{repo}"
 
     def scope(self, unit: Unit) -> bool:
@@ -353,6 +375,8 @@ class GitHubOpenPrAdapter:
         return Unit(UnitKind.PR, ref.slug)
 
     async def fetch(self) -> SourceResult:
+        if not self._credential_present:
+            return _failed(self.name, FetchOutcome.AUTH_MISSING, self.scope, self)
         try:
             listing = await _bounded(
                 self._client.list_open_prs(self._owner, self._repo), self._timeout
@@ -411,6 +435,8 @@ class GitHubOpenPrAdapter:
         )
 
     async def check_marker(self, unit: Unit, event: MotionEvent) -> MarkerCheck:
+        if not self._credential_present:
+            return Unverifiable("fetch_failed")
         if event.type != MotionType.REVIEW:
             # The driver only asks about reviews / msgs; a msg on a PR unit is not ours.
             return Unverifiable("fetch_failed")

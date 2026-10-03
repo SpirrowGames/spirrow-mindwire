@@ -683,7 +683,19 @@ pwsh -NoProfile -File deploy\Register-StallLedgerTask.ps1 -Checkout (Get-Locatio
     -Repo SpirrowGames/spirrow-mindwire -Project spirrow-mindwire
 ```
 
-Run it as the same user as the sweep task, so the tick sees the same GitHub token and data dir.
+Run it as the same user as the sweep task, so the tick sees the same data dir. The task's action is
+the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`): Task Scheduler
+does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
+without writing a line. Registration stops if no absolute path can be resolved.
+
+**GitHub token.** Set `MINDWIRE_STALL_LEDGER_GITHUB_TOKEN` in that user's **User** environment to
+the implementer PAT (`takahito-spirrowgames`; the ledger only reads). Never use the naysayer token.
+`run-stall-ledger-tick.ps1` hands it to the tick process only, as `MINDWIRE_GITHUB_TOKEN`, and drops
+any inherited `MINDWIRE_GITHUB_TOKEN` / `GITHUB_TOKEN`. It is a separate variable so that it does
+not also reach the conductor. Do not put the token in the task definition or its arguments. If it
+is unset or blank, the github source makes no request and reports `fetch_outcome: auth_missing`
+(heartbeat `ingest_failure`, plus a line in the `.err.log`). Without a token the tick would
+otherwise read unauthenticated and run into GitHub's 60/hour per-IP limit.
 `-Repo` / `-Project` repeat as comma lists. Check that it is working: after one interval, the
 newest line of the day's `stall-ledger-*.jsonl` is a `heartbeat`. In that line,
 `budget_exhausted: true` together with a `pending_markers` count that keeps growing means body
