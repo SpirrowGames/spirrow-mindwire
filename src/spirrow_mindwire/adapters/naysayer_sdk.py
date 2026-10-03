@@ -72,7 +72,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -92,18 +92,8 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
-from ..lexora.client import LexoraClient
 from ..naysayer.adr_index import build_adr_index_block
-from ..naysayer.preflight import (
-    CUSTOM_HEADERS_ENV,
-    PREFLIGHT_TIMEOUT_SECONDS,
-    TRACE_READ_LIMIT,
-    PreflightError,
-    TurnRowReader,
-    attest_backend,
-    attest_turn,
-    custom_headers_env_value,
-)
+from ..naysayer.preflight import PreflightError, attest_backend
 from ..naysayer.principles import (
     NAYSAYER_EXPECTED_BACKEND,
     NAYSAYER_MODEL_TIER,
@@ -367,9 +357,8 @@ def _session_facts(result: Any) -> dict[str, Any]:
     So: the value of P-1c is **operational observability** — how long the turn
     took, which SDK session it was, how many turns it burned. It is not, and
     must not be presented as, evidence of which distribution answered. That
-    evidence can only come from the server side: the turn's own accounting rows,
-    read back by its trace id (:func:`~spirrow_mindwire.naysayer.preflight.
-    attest_turn`, T-per-turn-backend-attestation).
+    evidence can only come from the server side (P-2's accounting-row read-back
+    / P-5's per-request streaming record).
 
     **★ ``sdk_session_id`` reads differently since the 1-turn-1-session change**
     (T-naysayer-sdk-session-carries-the-whole-conversation-every-turn): each
@@ -450,19 +439,9 @@ class NaysayerSdkAdapter:
         client_factory: Callable[[Any], _SdkClient] | None = None,
         expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
-        turn_rows: TurnRowReader | None = None,
         shutdown_grace: timedelta = timedelta(seconds=5),
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     ) -> None:
-        if extra_env and CUSTOM_HEADERS_ENV in extra_env:
-            # The per-turn trace header is written into exactly this variable
-            # (``_turn_options``). Merging a caller's value into it would mean
-            # inventing a multi-header encoding nobody has measured; overwriting
-            # it would silently drop the caller's headers. Refuse instead.
-            raise ValueError(
-                f"extra_env may not set {CUSTOM_HEADERS_ENV}: the adapter owns it "
-                f"for the per-turn trace header"
-            )
         self._cwd = Path(cwd)
         # Upper bound on the per-turn ``connect()`` in deliver_event (Einstein
         # msg-5054 advisory on T-agmsg-transport-lessons-readiness-session-claim-
@@ -505,10 +484,6 @@ class NaysayerSdkAdapter:
         # would be an attestation of the wrong thing, stated with the same
         # confidence as a true one.
         self._preflight = preflight
-        # Injectable for the same reason as ``preflight``. Unset, the default
-        # reads ``/stats/costs/recent?trace_id=`` from **this adapter's own**
-        # inference base URL — the host the turn's requests actually went to.
-        self._turn_rows = turn_rows
         self._sessions: dict[SessionHandle, _Session] = {}
 
     async def _run_preflight(self) -> AttestationRecord:
@@ -528,27 +503,6 @@ class NaysayerSdkAdapter:
             tier=self._model,
             expected=self._expected_backend,
         )
-
-    async def _read_turn_rows(self, trace_id: str) -> list[dict[str, Any]]:
-        if self._turn_rows is not None:
-            return await self._turn_rows(trace_id)
-        async with LexoraClient(
-            self._inference_base_url, timeout_seconds=PREFLIGHT_TIMEOUT_SECONDS
-        ) as client:
-            return await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
-
-    @staticmethod
-    def _turn_options(options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
-        """Copy the session's ``options`` so its subprocess tags every request with ``trace_id``.
-
-        The spawn-time ``options`` object is not modified: it is what the
-        ``source:`` marker is rendered from, and the only field that differs here
-        is the trace header, which the marker does not describe. The header lives
-        in the subprocess **env** — the SDK subprocess is per turn
-        (1-turn-1-session), so an env value is scoped to exactly one turn.
-        """
-        env = {**options.env, CUSTOM_HEADERS_ENV: custom_headers_env_value(trace_id)}
-        return replace(options, env=env)
 
     def _make_options(self) -> ClaudeAgentOptions:
         env = {"ANTHROPIC_BASE_URL": self._inference_base_url, **self._extra_env}
@@ -606,7 +560,7 @@ class NaysayerSdkAdapter:
         #
         # A transient fault does not reach this fail-closed path on the first
         # blip. ``attest_backend`` retries transport failures up to
-        # ``PREFLIGHT_ATTEMPTS`` (= 3) with a fresh trace id each time, sized
+        # ``PREFLIGHT_ATTEMPTS`` (= 3) with a fresh baseline each time, sized
         # from the T36 learning that Gemini 502s are frequent and self-resolving
         # (msg-954 §3; ``test_transient_http_failure_is_retried_and_can_succeed``,
         # ``test_attempts_are_bounded_at_three``). A backend MISMATCH is the one
@@ -666,10 +620,8 @@ class NaysayerSdkAdapter:
             last_active_at=now,
             # Retain the exact ``ClaudeAgentOptions`` for the harness marker
             # (msg-805 D3 / msg-834 §2 (a)) — never re-read, never re-declared.
-            # Each per-turn ``_client_factory`` call receives a copy of THIS
-            # object that differs only in the trace header env
-            # (``_turn_options``), a field the marker does not render, so the
-            # subprocess and the marker cannot drift on anything the marker says.
+            # Each per-turn ``_client_factory(options)`` call receives THIS
+            # object, so the subprocess and the marker cannot drift.
             options=options,
             attestation=None,  # per-turn: written by deliver_event
         )
@@ -699,14 +651,12 @@ class NaysayerSdkAdapter:
         distinguish "each turn was independently attested" from "one turn was, and
         the rest inherited its evidence".
 
-        **And it is a claim about the streaming turn itself**
-        (T-per-turn-backend-attestation): the record is the one
-        :func:`~spirrow_mindwire.naysayer.preflight.attest_turn` built from the
-        turn's OWN accounting rows, selected by the trace id the turn's subprocess
-        sent, so it reads ``scope=turn`` and its ``probe`` field names those rows —
-        not the preflight probe's. The probe still runs first, as a cheap gate, but
-        its record is never what a post is stamped with. ``None`` until a turn has
-        been attested; a turn that cannot be attested is not posted at all.
+        **Still not** a claim about the streaming turn itself. The probe is a
+        separate non-streaming request made immediately before it, so it evidences
+        the route and the tier→backend resolution at that instant, not the tokens
+        that came back. ``at=`` is the observation's timestamp precisely so a reader
+        can check the distance. Closing that last gap needs streaming request records
+        on the gateway side (P-5, different repo, not done).
         """
         session = self._sessions.get(handle)
         return None if session is None else session.attestation
@@ -753,12 +703,13 @@ class NaysayerSdkAdapter:
         # posts spanning 8m59s, so 38% of attested verdicts were evidenced by an
         # observation made for a different verdict.
         #
-        # The probe is a separate non-streaming request, so on its own it would
-        # prove the route at this instant and nothing about the streaming turn.
-        # It is therefore only a GATE now (refuse to pay for a turn on a route
-        # that is already wrong); the post is stamped with the turn's own
-        # attestation, taken after the drain below
-        # (T-per-turn-backend-attestation).
+        # What this buys, exactly: the stamp now records an observation taken
+        # immediately before this turn's inference, on this session's own route.
+        # What it still does NOT buy: proof that the streaming turn itself resolved
+        # to that backend. The probe is a separate non-streaming request; closing
+        # that gap needs streaming request records on the gateway side (P-5,
+        # different repo, not done). "Different probe per post" is a real strengthening
+        # and is not the same claim as "this post's backend".
         #
         # Fail-closed, same as spawn: a failed re-attest raises out of deliver_event
         # BEFORE ``on_reply``, so no unattested verdict is posted. The turn is lost
@@ -778,11 +729,8 @@ class NaysayerSdkAdapter:
         # continues to hold, and the per-process/per-verdict mismatch it
         # highlighted is gone at the code level as well as at the accounting
         # level.
-        # Never let a previous turn's record survive into this one: if anything
-        # below fails, nothing is attested for this turn.
-        session.attestation = None
         try:
-            probe_record = await self._run_preflight()
+            session.attestation = await self._run_preflight()
         except Exception as exc:
             # Yield to halt: the preflight is awaited with no client published,
             # so a halt landing here is a pure state transition that may already
@@ -837,12 +785,6 @@ class NaysayerSdkAdapter:
         # operationally distinct from a mid-turn SDK error (dispatcher /
         # operator want to react to it separately, e.g. quarantine harder
         # rather than retry).
-        # One trace id per turn. Every request the turn's subprocess makes carries
-        # it (``_turn_options``), and the gateway records it on every cost row those
-        # requests cause, streaming included — the exact join the turn attestation
-        # below selects on (Einstein msg-5391: no id window, no tier filter).
-        turn_trace_id = new_ulid()
-        turn_options = self._turn_options(session.options, turn_trace_id)
         client: _SdkClient | None = None
         body_success = False
         try:
@@ -858,7 +800,7 @@ class NaysayerSdkAdapter:
                         f"per-turn client could be published; refusing to spawn "
                         f"an SDK subprocess for a halted session"
                     )
-                client = self._client_factory(turn_options)
+                client = self._client_factory(session.options)
                 session.client = client
             # Bounded: this adapter connects per turn, not at spawn, so the
             # conductor's spawn-timeout retry never sees it. A connect still
@@ -990,38 +932,6 @@ class NaysayerSdkAdapter:
         # anyway; this check is what makes that state read authoritative.
         if session.state in _SHUTDOWN_STATES:
             return
-
-        # Turn-scope attestation (T-per-turn-backend-attestation). Read back the
-        # rows THIS turn caused, by its trace id, and judge their ``backend``.
-        # Fail-closed in every branch that does not prove the route — mismatch,
-        # no row, a possibly truncated read, an unreadable ledger — and there is
-        # deliberately no fallback to the probe's record (msg-5390 §2): a verdict
-        # whose own route is unproven is not posted. It was paid for; it is lost
-        # loudly, the same way a failed preflight loses a turn.
-        try:
-            turn_record = await attest_turn(
-                route=probe_record.route,
-                tier=probe_record.tier,
-                expected=self._expected_backend,
-                trace_id=turn_trace_id,
-                read_rows=self._read_turn_rows,
-            )
-        except Exception as exc:
-            if session.state not in _SHUTDOWN_STATES:
-                session.state = SessionState.FAILED
-                session.error = ErrorInfo(
-                    code="adapter.delivery_failed",
-                    message=str(exc),
-                    raised_at=datetime.now(UTC),
-                )
-            raise NaysayerSdkDeliveryError(
-                f"turn attestation failed for session {handle.session_id}; "
-                f"refusing to post a naysayer verdict whose own route is unproven: {exc}"
-            ) from exc
-        # attest_turn awaits; a halt may have landed meanwhile. Same rule as above.
-        if session.state in _SHUTDOWN_STATES:
-            return
-        session.attestation = turn_record
 
         try:
             await session.ctx.on_reply(

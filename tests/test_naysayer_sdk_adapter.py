@@ -11,9 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import re
 from collections.abc import AsyncIterator, Callable
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,12 +28,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
-from spirrow_mindwire.naysayer.preflight import (
-    CUSTOM_HEADERS_ENV,
-    TRACE_READ_LIMIT,
-    PreflightError,
-    custom_headers_env_value,
-)
+from spirrow_mindwire.naysayer.preflight import PreflightError
 from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -249,7 +242,6 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, opts),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     # 1-turn-1-session
@@ -264,14 +256,11 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
     assert stored_opts.model == "naysayer"
     assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
-    # The per-turn factory receives a COPY of the stored options that differs in
-    # exactly one place — the trace header env (T-per-turn-backend-attestation) —
-    # so the marker and the subprocess cannot drift on anything the marker says.
+    # And the SAME options object is handed to the per-turn factory in deliver_event
+    # (nothing is re-built between turns), so the marker and the subprocess cannot
+    # drift from each other.
     await adapter.deliver_event(handle, _event())
-    assert len(opts) == 1
-    assert opts[0] is not stored_opts
-    assert replace(opts[0], env=stored_opts.env) == stored_opts
-    assert CUSTOM_HEADERS_ENV not in stored_opts.env  # spawn options untouched
+    assert opts and opts[0] is stored_opts
 
 
 @pytest.mark.anyio
@@ -286,7 +275,6 @@ async def test_deliver_event_posts_critique(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -317,7 +305,6 @@ async def test_reply_metadata_retains_sdk_session_facts(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -352,7 +339,6 @@ async def test_reply_metadata_never_carries_the_model_echo(tmp_path: Path) -> No
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -375,7 +361,6 @@ async def test_reply_body_is_unchanged_by_result_retention(tmp_path: Path) -> No
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -392,7 +377,6 @@ async def test_self_post_is_filtered(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event(author="naysayer-1"))  # our own echoed post
@@ -426,31 +410,6 @@ def _preflight_ok(calls: list[int] | None = None) -> Callable[[], Any]:
     return run
 
 
-def _turn_rows_ok(
-    seen: list[str] | None = None, *, backend: str = "gemini", row_id: int = 7001
-) -> Callable[[str], Any]:
-    """Fake ``/stats/costs/recent?trace_id=`` reader: one row for the asked trace.
-
-    ``seen`` collects the trace ids the adapter asked for, so a test can join
-    them to the header the turn's subprocess was configured with.
-    """
-
-    async def read(trace_id: str) -> list[dict[str, Any]]:
-        if seen is not None:
-            seen.append(trace_id)
-        return [
-            {
-                "id": row_id,
-                "trace_id": trace_id,
-                "backend": backend,
-                "tier": "naysayer",
-                "endpoint": "/v1/messages",
-            }
-        ]
-
-    return read
-
-
 def _preflight_failing(exc: Exception) -> Callable[[], Any]:
     async def run() -> AttestationRecord:
         raise exc
@@ -478,7 +437,6 @@ async def test_spawn_runs_a_dry_run_preflight_and_discards_the_record(
         inference_base_url=_BASE_URL,
         client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
         preflight=_preflight_ok(calls),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     # Dry-run happened (fail-loud at attach time is the whole point of keeping it)…
@@ -506,7 +464,6 @@ async def test_per_turn_preflight_populates_the_record_deliver_event_reads(
         inference_base_url=_BASE_URL,
         client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     assert adapter.attestation_record(handle) is None  # dry-run was discarded
@@ -587,7 +544,6 @@ async def test_attestation_record_is_none_for_an_unknown_handle(tmp_path: Path) 
         inference_base_url=_BASE_URL,
         client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     await adapter.deliver_event(handle, _event())  # populates session.attestation
@@ -615,7 +571,6 @@ async def test_missing_base_url_is_refused_without_burning_a_preflight(
         obligations=_OBLIGATIONS,
         inference_base_url="",
         preflight=_preflight_ok(calls),
-        turn_rows=_turn_rows_ok(),
     )
     with pytest.raises(NaysayerSdkSpawnError):
         await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
@@ -685,7 +640,6 @@ async def test_naysayer_sdk_is_error_carries_the_reason_and_the_specific_code(
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
@@ -725,7 +679,6 @@ async def test_naysayer_on_reply_failure_uses_the_on_reply_code(tmp_path: Path) 
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, ctx)
     with pytest.raises(NaysayerSdkDeliveryError):
@@ -782,7 +735,6 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
         inference_base_url="http://{{IP_SERVICES}}:8110",
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), []),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     registry = InMemoryAdapterRegistry()
     registry.register(adapter)
@@ -798,14 +750,11 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
         "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
         "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
-    # The stamp is the TURN's attestation: its own row (7001, from the trace-id
-    # read-back), ``scope=turn`` — not the preflight probe's row 6032.
-    assert re.fullmatch(
-        r"<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        r"· route=lexora\.local:8110 · probe=cost-row#7001 · scope=turn "
-        r"· at=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -->",
-        lines[-1],
-    ), lines[-1]
+    assert lines[-1] == (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        "· route=lexora.local:8110 · probe=cost-row#6032 · scope=probe "
+        "· at=2026-06-04T00:00:00Z -->"
+    )
 
 
 @pytest.mark.anyio
@@ -825,7 +774,6 @@ async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> No
         inference_base_url="http://{{IP_SERVICES}}:8110",
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), captured),
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     # 1-turn-1-session: the factory is called per turn in ``deliver_event``,
     # not at spawn. Inspect the stored options directly for the invariant
@@ -898,7 +846,6 @@ async def test_deliver_event_builds_a_fresh_client_per_turn_and_shuts_it_down(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     captured: list[ReplyDraft] = []
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
@@ -913,13 +860,9 @@ async def test_deliver_event_builds_a_fresh_client_per_turn_and_shuts_it_down(
         # try/finally shutdown path — no leaked subprocess between turns.
         assert client.interrupted == 1
         assert client.disconnected == 1
-    # Each per-turn factory call gets its own copy of the stored options, equal to
-    # it in everything but the trace header (msg-834 §2 (a) still holds for every
-    # field the marker renders), and the two turns carry DIFFERENT trace ids.
-    stored = adapter.source_marker_options(handle)
-    for call in factory.calls:
-        assert replace(call, env=stored.env) == stored
-    assert factory.calls[0].env[CUSTOM_HEADERS_ENV] != factory.calls[1].env[CUSTOM_HEADERS_ENV]
+    # The stored options object is handed unchanged to every per-turn factory
+    # call (msg-834 §2 (a) — subprocess and marker cannot drift from each other).
+    assert factory.calls[0] is factory.calls[1]
 
 
 class _RaisingConnectClient(_ShutdownRecordingClient):
@@ -953,7 +896,6 @@ async def test_partial_init_safe_when_connect_raises(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
@@ -985,7 +927,6 @@ async def test_partial_init_safe_when_factory_raises(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
@@ -1040,7 +981,6 @@ async def test_shutdown_failure_after_successful_turn_is_propagated(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
@@ -1113,7 +1053,6 @@ async def test_shutdown_failure_during_error_unwinding_does_not_mask_original(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     with (
@@ -1155,7 +1094,6 @@ async def test_halt_after_a_successful_turn_needs_no_subprocess(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     await adapter.deliver_event(handle, _event())
@@ -1233,7 +1171,6 @@ async def test_halt_during_a_running_turn_actively_shuts_down_the_subprocess(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
 
@@ -1283,7 +1220,6 @@ async def test_halt_during_a_running_turn_is_exactly_one_shutdown(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
@@ -1328,7 +1264,6 @@ async def test_halt_grace_timeout_fires_halt_failed(tmp_path: Path) -> None:
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
@@ -1361,7 +1296,6 @@ async def test_halt_between_turns_is_a_pure_state_transition(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     # No deliver_event has run — session.client is None from spawn.
@@ -1406,7 +1340,6 @@ def _adapter_with(tmp_path: Path, client: Any, *, shutdown_grace: timedelta) -> 
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
         shutdown_grace=shutdown_grace,
     )
 
@@ -1573,7 +1506,6 @@ async def test_deliver_event_on_a_halted_session_skips_the_preflight(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(calls),
-        turn_rows=_turn_rows_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     assert calls == [1]  # spawn's dry-run
@@ -1707,7 +1639,6 @@ async def test_a_per_turn_connect_that_hangs_fails_the_turn_inside_the_budget(
         inference_base_url=_BASE_URL,
         client_factory=factory,
         preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
         connect_timeout_seconds=0.05,
     )
     captured: list[ReplyDraft] = []
@@ -1728,153 +1659,3 @@ async def test_a_per_turn_connect_that_hangs_fails_the_turn_inside_the_budget(
 def test_the_naysayer_connect_budget_is_the_shared_one() -> None:
     default = inspect.signature(NaysayerSdkAdapter.__init__).parameters["connect_timeout_seconds"]
     assert default.default is DEFAULT_CONNECT_TIMEOUT_SECONDS
-
-
-# --------------------------------------------------------------------------- #
-# T-per-turn-backend-attestation — the post is stamped from the turn's OWN rows
-# --------------------------------------------------------------------------- #
-
-
-def _turn_adapter(
-    tmp_path: Path,
-    *,
-    opts: list[Any],
-    client: _FakeClient | None = None,
-    turn_rows: Callable[[str], Any] | None = None,
-) -> NaysayerSdkAdapter:
-    return NaysayerSdkAdapter(
-        cwd=tmp_path,
-        obligations=_OBLIGATIONS,
-        inference_base_url=_BASE_URL,
-        client_factory=_factory(client or _FakeClient([_assistant("x"), _result()]), opts),
-        preflight=_preflight_ok(),
-        turn_rows=turn_rows if turn_rows is not None else _turn_rows_ok(),
-    )
-
-
-@pytest.mark.anyio
-async def test_the_turn_is_read_back_by_the_trace_id_its_own_subprocess_sent(
-    tmp_path: Path,
-) -> None:
-    """★ The join: the id read back IS the id the turn's subprocess was told to send.
-
-    The subprocess env carries ``ANTHROPIC_CUSTOM_HEADERS="X-Mindwire-Trace: <id>"``
-    (the single format D-0a measured the production CLI to accept), and the
-    turn attestation asks the ledger for exactly that ``<id>``. Break either side
-    — a different id minted for the read, or a different header format — and
-    this reds.
-    """
-    opts: list[Any] = []
-    asked: list[str] = []
-    adapter = _turn_adapter(tmp_path, opts=opts, turn_rows=_turn_rows_ok(asked))
-    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
-    await adapter.deliver_event(handle, _event())
-
-    assert len(asked) == 1
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == custom_headers_env_value(asked[0])
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == f"X-Mindwire-Trace: {asked[0]}"
-    record = adapter.attestation_record(handle)
-    assert record is not None
-    assert record.scope == "turn"
-    assert record.probe == "cost-row#7001"  # the turn's row, not the probe's 6032
-
-
-@pytest.mark.anyio
-async def test_a_turn_whose_own_row_names_another_backend_is_not_posted(
-    tmp_path: Path,
-) -> None:
-    """★ The gap this thread closes. The probe said gemini; the turn did not.
-
-    The preflight passes (``_preflight_ok``), so before this change the verdict
-    would have been posted stamped ``backend=gemini``. Now the turn's own row is
-    judged, says ``anthropic``, and the verdict is refused — fail-closed, no
-    ``on_reply``, FAILED, one :class:`NaysayerSdkDeliveryError`.
-    """
-    captured: list[ReplyDraft] = []
-    adapter = NaysayerSdkAdapter(
-        cwd=tmp_path,
-        obligations=_OBLIGATIONS,
-        inference_base_url=_BASE_URL,
-        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
-        preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(backend="anthropic"),
-    )
-    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
-    with pytest.raises(NaysayerSdkDeliveryError, match="turn attestation failed"):
-        await adapter.deliver_event(handle, _event())
-    assert captured == []
-    assert adapter.attestation_record(handle) is None
-    health = await adapter.health(handle)
-    assert health.state is SessionState.FAILED
-    assert health.error is not None
-    assert "anthropic" in health.error.message
-
-
-@pytest.mark.anyio
-async def test_a_mismatching_turn_row_is_judged_once_not_re_read(tmp_path: Path) -> None:
-    reads: list[str] = []
-    adapter = _turn_adapter(tmp_path, opts=[], turn_rows=_turn_rows_ok(reads, backend="anthropic"))
-    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
-    with pytest.raises(NaysayerSdkDeliveryError):
-        await adapter.deliver_event(handle, _event())
-    assert len(reads) == 1
-
-
-@pytest.mark.anyio
-async def test_a_turn_attested_on_a_full_read_is_refused(tmp_path: Path) -> None:
-    """A read that comes back at the limit may hide a mismatching sibling."""
-
-    async def full(trace_id: str) -> list[dict[str, Any]]:
-        return [
-            {"id": 9000 + i, "trace_id": trace_id, "backend": "gemini"}
-            for i in range(TRACE_READ_LIMIT)
-        ]
-
-    captured: list[ReplyDraft] = []
-    adapter = NaysayerSdkAdapter(
-        cwd=tmp_path,
-        obligations=_OBLIGATIONS,
-        inference_base_url=_BASE_URL,
-        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
-        preflight=_preflight_ok(),
-        turn_rows=full,
-    )
-    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
-    with pytest.raises(NaysayerSdkDeliveryError, match="came back full"):
-        await adapter.deliver_event(handle, _event())
-    assert captured == []
-
-
-@pytest.mark.anyio
-async def test_a_previous_turns_record_does_not_survive_a_failed_turn(tmp_path: Path) -> None:
-    """Turn 1 attests; turn 2's read-back fails. The record must not still say turn 1."""
-    calls = {"n": 0}
-
-    async def rows(trace_id: str) -> list[dict[str, Any]]:
-        calls["n"] += 1
-        backend = "gemini" if calls["n"] == 1 else "anthropic"
-        return [{"id": calls["n"], "trace_id": trace_id, "backend": backend}]
-
-    adapter = _turn_adapter(
-        tmp_path,
-        opts=[],
-        client=_FakeClient([_assistant("x"), _result()]),
-        turn_rows=rows,
-    )
-    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
-    await adapter.deliver_event(handle, _event(msg_id="m1"))
-    assert adapter.attestation_record(handle) is not None
-    with pytest.raises(NaysayerSdkDeliveryError):
-        await adapter.deliver_event(handle, _event(msg_id="m2"))
-    assert adapter.attestation_record(handle) is None
-
-
-def test_extra_env_may_not_claim_the_trace_header_variable(tmp_path: Path) -> None:
-    """The adapter owns ``ANTHROPIC_CUSTOM_HEADERS``; a caller's value is refused, not merged."""
-    with pytest.raises(ValueError, match=CUSTOM_HEADERS_ENV):
-        NaysayerSdkAdapter(
-            cwd=tmp_path,
-            obligations=_OBLIGATIONS,
-            inference_base_url=_BASE_URL,
-            extra_env={CUSTOM_HEADERS_ENV: "X-Other: 1"},
-        )
