@@ -173,6 +173,32 @@ $v = Get-ConductorVerdict -Output @('no stop line at all')
 Check "no line: quarantine reason stays null" $null (Get-QuarantineStopReason -Verdict $v)
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=2 forced_naysayer=0 last_msg=msg-1')
 Check "non-adapter reason passes through" 'human' (Get-QuarantineStopReason -Verdict $v)
+
+Write-Host ""
+Write-Host "Get-ConductorVerdict — operator task text cannot hijack the verdict (T-next-operator-is-silent T3')"
+# Bohr msg-5932 D2': the `conductor stopped:` line carries closed vocabulary only, so an
+# OPERATOR-TASK line spelling reason= / rounds= / last_msg= / error_code= / `conductor stopped:`
+# never reaches the parser. The probe runs the REAL conductor on such a head and prints every
+# log line it produced; the whole output is fed here, as the sweep feeds a run's stdout.
+$repoRootT3 = Split-Path -Parent $PSScriptRoot
+$probePath = Join-Path $PSScriptRoot 'operator_work_stop_line_probe.py'
+$savedEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'   # uv writes a VIRTUAL_ENV warning to stderr; not a failure
+try {
+    $probeOut = @(& uv run --project $repoRootT3 python $probePath 2>&1 | ForEach-Object { "$_" })
+    $probeExit = $LASTEXITCODE
+}
+finally { $ErrorActionPreference = $savedEap }
+Check "operator probe exited 0" 0 $probeExit
+$v = Get-ConductorVerdict -Output $probeOut
+Check "operator stop: reason is the conductor's" 'operator_work_to_human' $v.reason
+Check "operator stop: rounds is the conductor's" 0 $v.rounds
+Check "operator stop: last_msg is the conductor's" 'm1' $v.last_msg
+Check "operator stop: no error_code smuggled in" $null $v.error_code
+$stopLines = @($probeOut | Where-Object { $_ -match 'conductor stopped:' })
+Check "exactly one stop line in the run's output" 1 $stopLines.Count
+$leaked = @($probeOut | Where-Object { $_ -match 'boom|rounds=999|msg-x' })
+Check "no output line carries the author's task text" 0 $leaked.Count
 $hint = Get-SystemicCauseHint -Codes @('adapter.turn_timeout', 'adapter.shutdown_failed')
 Check "systemic hint lists the codes" $true ($hint -like '*adapter.turn_timeout, adapter.shutdown_failed*')
 Check "systemic hint blames the adapter lifecycle when all are adapter.*" $true ($hint -like '*adapter のライフサイクル*')

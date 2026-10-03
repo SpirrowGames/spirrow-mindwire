@@ -92,11 +92,13 @@ $map = Get-StopReasonPhraseMap
 #
 # 2026-09-30 (T42): grew from six to seven with 'stalled_to_human' (the stall watchdog exits 0
 # after posting STALLED, so this notification is the operator's signal).
-$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'round_cap', 'empty_thread')
+# 2026-10-03 (T-next-operator-is-silent D3): grew to eight with 'operator_work_to_human' — a valid
+# `NEXT: operator` is work a person must do, so it is heard; its phrase is not 判断待ち.
+$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'operator_work_to_human', 'round_cap', 'empty_thread')
 foreach ($k in $expectedKeys) {
     CheckTrue "map has key '$k'" ($map.ContainsKey($k))
 }
-Check 'map has exactly 7 keys (narrowing = notification loss, §4 §W-4)' 7 $map.Count
+Check 'map has exactly 8 keys (narrowing = notification loss, §4 §W-4)' 8 $map.Count
 
 Write-Host 'Get-StopReasonPhraseMap — returns a fresh hashtable each call (no shared state)'
 $m1 = Get-StopReasonPhraseMap
