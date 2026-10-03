@@ -66,9 +66,12 @@ function Get-StopReasonPhraseMap {
     # Returns a FRESH hashtable on every call, so mutation by one caller cannot leak into another.
     # The map's contents mirror the $needsHuman literal that used to live in
     # deploy/run-conductor-scheduled.ps1 verbatim; the migration must not change any wording.
+    # That was a migration-time rule. The wording is human-facing display only; the machine-read key
+    # is `reason=` (file header L11-16 contract). 'no_handoff_to_human' gained its resume hint on
+    # 2026-10-03 (T-no-field-no-next-handoff-silent-park).
     return @{
         'human'                 = "あなたの判断待ちで停止しました"
-        'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました"
+        'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました。再開は NEXT: 行付きの新しいコメントで（編集だと反映に最大 60 分）"
         'no_progress_to_human'  = "dispatch した role が何も投稿せず停止しました"
         'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
         'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
