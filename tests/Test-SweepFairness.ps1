@@ -503,9 +503,13 @@ $laneArgCalls = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Autom
 Check "dispatch loop calls Get-ConductorLaneArgs exactly once" ($laneArgCalls.Count -eq 1)
 Check "and passes it the loop's own lane (-Lane `$lane)" ($laneArgCalls.Count -eq 1 -and $laneArgCalls[0].Extent.Text -match '-Lane\s+\$lane\b')
 $laneAppend = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $n.Left.Extent.Text -eq '$stallArgs' -and $n.Right.Extent.Text -match 'Get-ConductorLaneArgs' }, $true))
-Check "its result is appended to the conductor's argument list" ($laneAppend.Count -eq 1)
+    $n.Left.Extent.Text -eq '$laneArgs' -and $n.Operator -eq 'Equals' -and $n.Right.Extent.Text -match 'Get-ConductorLaneArgs' }, $true))
+Check "its result is (re-)assigned to its own `$laneArgs on every candidate, not appended" ($laneAppend.Count -eq 1)
 Check "before the conductor is spawned" ($laneAppend.Count -eq 1 -and $laneAppend[0].Extent.StartOffset -lt $spawn[0].Extent.StartOffset)
+Check "and the spawn splats it" (@($spawn[0].CommandElements | Where-Object { $_.Extent.Text -eq '@laneArgs' }).Count -eq 1)
+$stallAppend = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -eq '$stallArgs' -and $n.Right.Extent.Text -match 'Get-ConductorLaneArgs' }, $true))
+Check "lane arguments never go into `$stallArgs" ($stallAppend.Count -eq 0)
 $wrapperText = Get-Content -LiteralPath $sweepScript -Raw
 $innerText = Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/run-conductor.ps1') -Raw
 Check "the wrapper never spells --gate-only itself (the lib decides)" (-not $wrapperText.Contains('--gate-only'))

@@ -5158,9 +5158,11 @@ try {
             }
         }
         # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1′): a gate-lane launch
-        # stops before the implementer's turn; that turn is launched later from the role lane.
-        $stallArgs += @(Get-ConductorLaneArgs -Lane $lane)
-        $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
+        # stops before the implementer's turn; that turn is launched later from the role lane. Kept
+        # apart from $stallArgs (the T42 / retry arguments) and re-assigned on every candidate, so
+        # nothing can accumulate across iterations (PR #458 gate advisory).
+        $laneArgs = @(Get-ConductorLaneArgs -Lane $lane)
+        $output = (& $inner @stallArgs @laneArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
