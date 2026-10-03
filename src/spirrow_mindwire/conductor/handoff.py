@@ -971,7 +971,6 @@ _TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
         "cannot be undone: data deletion, public release, destructive migration, history "
         "rewrite, an external side effect"
     ),
-    "merge-protected": "a merge to a protected branch, or a deploy only a human can perform",
 }
 
 
@@ -1111,11 +1110,12 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
         "the independent naysayer review runs before any human merge. For other work, hand back "
-        "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
-        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
-        f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
-        "e.g.:\n\n"
-        f"    TIER-C: {require_admitted('merge-protected', where='handoff example')}\n"
+        "to the proposer for a spec-review (`NEXT: <proposer persona>`). You never merge to the "
+        "main branch yourself, and you never ask the human to merge: the open PR already requests "
+        "the merge and the merge-wait PR list carries it, so a merge is not a Tier-C decision. "
+        f"For a genuine Tier-C decision, hand to `{HUMAN_TOKEN}` and name the Tier-C type on the "
+        "line above your handoff, e.g.:\n\n"
+        f"    TIER-C: {require_admitted('cost', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (

@@ -391,10 +391,10 @@ class TestTierCLabelLookback:
     """`TIER-C: <label>` on line n-1 of the LAST `NEXT: human`, else None."""
 
     def test_records_enum_label_from_the_line_above_next_human(self) -> None:
-        body = "body\n\nTIER-C: merge-protected\nNEXT: human"
+        body = "body\n\nTIER-C: irreversible\nNEXT: human"
         h = resolve_handoff(body, _ROSTER)
         assert h.kind is HandoffKind.HUMAN
-        assert h.tier_c_label == "merge-protected"
+        assert h.tier_c_label == "irreversible"
 
     def test_case_of_label_is_normalised_but_reason_of_other_is_preserved(self) -> None:
         # `SCOPE` and `scope` are the same label for aggregation, but the reason text on an
@@ -1293,14 +1293,16 @@ def test_tier_c_labels_are_derived_from_the_admission_gate_enum() -> None:
     assert len(TIER_C_LABELS) == len(ADMIT_LABELS)
 
 
-def test_handoff_core_drops_design_approval_example_and_lists_the_four_types() -> None:
+def test_handoff_core_drops_design_approval_example_and_lists_the_tier_c_types() -> None:
     # msg-3630 §2.7: "approving a design for implementation" taught internal design approval
-    # as Tier-C. It is gone; the four types and the not-Tier-C list are in its place.
+    # as Tier-C. It is gone; the Tier-C types and the not-Tier-C list are in its place.
+    # msg-4361: a merge is not a Tier-C type, so `merge-protected` is no longer taught.
     for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
         block = build_handoff_protocol_block(role)
         assert "approving a design for implementation" not in block
-        for label in ("goal", "cost", "irreversible", "merge-protected"):
+        for label in ("goal", "cost", "irreversible"):
             assert f"`{label}`" in block, (role, label)
+        assert "`merge-protected`" not in block, role
         assert "Tier-C — decide it yourself" in block
         assert "whether and how to address review findings" in block
     for stale in ("`scope`", "`billing`", "`release-cross-repo`"):
@@ -1347,7 +1349,8 @@ class TestLabelProseIsDerivedNotHardcoded:
         # require_admitted itself is covered in tests/test_relay_route.py, and importing this
         # module already proves the import-time check passed; pin only the rendered output here.
         assert "    TIER-C: goal\n" in build_handoff_protocol_block(Role.PROPOSER)
-        assert "    TIER-C: merge-protected\n" in build_handoff_protocol_block(Role.IMPLEMENTER)
+        assert "    TIER-C: cost\n" in build_handoff_protocol_block(Role.IMPLEMENTER)
+        assert "TIER-C: merge-protected" not in build_handoff_protocol_block(Role.IMPLEMENTER)
 
     def test_count_word_follows_len(self) -> None:
         from spirrow_mindwire.conductor import handoff
@@ -1377,6 +1380,11 @@ class TestLegacyLabelsStillMeasured:
             assert h.tier_c_label == label, label
 
     def test_new_labels_parse(self) -> None:
-        for label in ("goal", "cost", "irreversible", "merge-protected"):
+        for label in ("goal", "cost", "irreversible"):
             h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
             assert h.tier_c_label == label, label
+
+    def test_merge_protected_is_no_longer_a_tier_c_label(self) -> None:
+        # msg-4361: a merge is requested by the PR, so the label neither records nor latches.
+        h = resolve_handoff("TIER-C: merge-protected\nNEXT: human", _ROSTER)
+        assert h.tier_c_label is None

@@ -248,6 +248,7 @@ $unnotified = @(
     'none'           # thread settled: the normal end, the sweep just moves on
     'hold'           # the operator asked for the stop, so telling them is not news
     'ci_wait'        # pre-gate CI-wait DEFER (design v0.3.1 §5.2A); past the cap it becomes 'human'
+    'merge_wait'     # PR-gate APPROVE on a human-merged PR: the merge-wait PR list carries it (msg-4361)
     'adapter_error'  # adapter raised; exit!=0 -> quarantine, where the K alert sounds
 )
 

@@ -542,9 +542,25 @@ class TestRetryPrologue:
 class TestStructuralInvariants:
     """Invariants pinned in the function shape, not its body."""
 
-    def test_admit_labels_are_the_four_tier_c_intents(self) -> None:
-        """msg-3630 §2.1 — the four intents are the entire ADMIT set."""
-        assert frozenset({"goal", "cost", "irreversible", "merge-protected"}) == ADMIT_LABELS
+    def test_admit_labels_are_the_tier_c_intents(self) -> None:
+        """msg-3630 §2.1, minus ``merge-protected`` (msg-4361, 2026-10-03)."""
+        assert frozenset({"goal", "cost", "irreversible"}) == ADMIT_LABELS
+
+    def test_merge_protected_bounces_as_not_tier_c(self) -> None:
+        """msg-4361: a merge is requested by the PR; the label bounces and says why."""
+        result = decide_admission(
+            body="PR up\n\nTIER-C: merge-protected\nNEXT: human",
+            author="Heisenberg",
+            retry_lookup=lambda _u, _a: False,
+            now=datetime(2026, 10, 3, tzinfo=UTC),
+            bounce_uuid="u",
+        )
+        assert result.verdict is AdmissionVerdict.BOUNCE
+        assert result.bounce_reason is BounceReason.MERGE_IS_NOT_TIER_C
+        assert result.bounce_hint is not None and "merge-wait PR list" in result.bounce_hint
+        (entry,) = result.log_entries
+        assert entry.kind is LogKind.BOUNCED
+        assert entry.payload["reason"] == "merge-is-not-tier-c"
 
     def test_legacy_map_covers_the_two_pre_v1_aliases(self) -> None:
         """msg-3646 D1 — scope→goal and billing→cost, and no others."""

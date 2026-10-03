@@ -37,6 +37,11 @@
 #               'human' via R3, which IS in the map above.
 # This set is not a narrowing of the notification predicate (note 1): every reason that means
 # "the loop parked and needs a person" is still in the map. Do not add 'ci_wait' to it.
+#   'merge_wait' — the PR-gate APPROVEd a PR whose merge is the human's (base=main). Opening the
+#               PR already asked for the merge and the merge-wait PR list (/dashboard/prs)
+#               carries it (Takahito, msg-4361: "main へのマージは判断点から外す"), so a Discord
+#               ping and a decision card would be a second copy of the same request. 1b
+#               (pr_event_advance) resumes the thread when the PR is merged or closed.
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1
