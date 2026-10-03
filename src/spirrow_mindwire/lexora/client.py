@@ -68,12 +68,6 @@ _CLIENT_DEFAULT_MARGIN_SECONDS = 30.0
 # required).
 _DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_DEFAULT_MARGIN_SECONDS
 
-# The request header the gateway records onto a request's cost row (``trace_id``
-# column) so a caller can read exactly its own rows back. Contract with
-# spirrow-lexora, T-per-turn-backend-attestation msg-5392. Lives here because
-# this is the module that sends it; the preflight re-exports it.
-TRACE_HEADER = "X-Mindwire-Trace"
-
 
 def lexora_url() -> str:
     """Resolve the Lexora URL from ``MINDWIRE_LEXORA_URL`` (env) or the default.
@@ -265,9 +259,7 @@ class LexoraClient:
             raise LexoraHTTPError(f"/health: expected a JSON object, got {type(body).__name__}")
         return body
 
-    async def stats_costs_recent(
-        self, *, limit: int = 50, trace_id: str | None = None
-    ) -> list[dict[str, Any]]:
+    async def stats_costs_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
         """``GET /stats/costs/recent`` — the gateway's own per-request accounting rows.
 
         **Why this read exists (P-2, msg-953 §3).** It is the only place in the
@@ -281,15 +273,10 @@ class LexoraClient:
              "tokens_input": 2, "tokens_output": 0, "cost_usd": 0.0,
              "duration_seconds": 1.96, "success": 1}
 
-        ``backend`` is what served it. The rows come back newest-first (``id``
-        descending, verified live).
-
-        ``trace_id`` asks the gateway for only the rows recorded under that
-        ``X-Mindwire-Trace`` value (T-per-turn-backend-attestation). It is
-        sent as a query parameter and **not trusted**: a gateway that predates
-        the filter ignores it and returns unfiltered rows, so callers select on
-        the row's own ``trace_id`` column as well (see
-        :func:`spirrow_mindwire.naysayer.preflight._judge`).
+        ``model`` is the *tier* asked for, ``backend`` is what served it. The
+        rows come back newest-first (``id`` descending, verified live) and the
+        endpoint takes only ``limit`` — there is no server-side filter, so the
+        caller narrows the window itself.
 
         Deliberately **not** added to the :class:`LexoraChatClient` Protocol:
         that Protocol describes what the naysayer *adapter* drives, and every
@@ -297,10 +284,7 @@ class LexoraClient:
         view (``LexoraPreflightClient``) over just the two methods it uses.
         """
         try:
-            params: dict[str, Any] = {"limit": limit}
-            if trace_id is not None:
-                params["trace_id"] = trace_id
-            resp = await self._client.get("/stats/costs/recent", params=params)
+            resp = await self._client.get("/stats/costs/recent", params={"limit": limit})
         except httpx.TimeoutException as e:
             # Caught before RequestError (its superclass) so it surfaces as the
             # retryable subtype — the preflight distinguishes them.
@@ -328,7 +312,6 @@ class LexoraClient:
         model: str,
         messages: list[ChatMessage],
         max_tokens: int,
-        trace_id: str | None = None,
     ) -> ChatCompletion:
         """``POST /v1/chat/completions`` for ``model`` (a Lexora tier name).
 
@@ -336,10 +319,6 @@ class LexoraClient:
         the upstream ``detail`` (so an unknown tier never degrades into a
         silent fallback). Raises :class:`LexoraAPIError` if a 2xx body has
         no assistant turn.
-
-        ``trace_id``, when given, is sent as the ``X-Mindwire-Trace`` header so
-        the gateway records it on this request's cost row — the preflight reads
-        its own row back by it (T-per-turn-backend-attestation).
         """
         body = {
             "model": model,
@@ -347,8 +326,7 @@ class LexoraClient:
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
         try:
-            headers = {TRACE_HEADER: trace_id} if trace_id is not None else None
-            resp = await self._client.post("/v1/chat/completions", json=body, headers=headers)
+            resp = await self._client.post("/v1/chat/completions", json=body)
         except httpx.TimeoutException as e:
             # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
             # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
@@ -425,7 +403,6 @@ def _error_detail(resp: httpx.Response) -> str:
 
 __all__ = [
     "LEXORA_BACKEND_TIMEOUT_SECONDS",
-    "TRACE_HEADER",
     "ChatCompletion",
     "ChatMessage",
     "LexoraAPIError",

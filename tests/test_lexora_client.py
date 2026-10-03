@@ -19,7 +19,6 @@ from spirrow_mindwire.lexora.client import (
     _DEFAULT_LEXORA_URL,
     _DEFAULT_TIMEOUT_SECONDS,
     LEXORA_BACKEND_TIMEOUT_SECONDS,
-    TRACE_HEADER,
     ChatMessage,
     LexoraAPIError,
     LexoraClient,
@@ -255,37 +254,3 @@ async def test_health_non_2xx_raises_with_detail() -> None:
             await client.health()
     assert ei.value.status_code == 503
     assert "backend unavailable" in str(ei.value)
-
-
-# ---------- trace id (T-per-turn-backend-attestation) ----------------------
-
-
-@pytest.mark.anyio
-async def test_chat_completion_sends_the_trace_header_only_when_given() -> None:
-    seen: list[str | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.headers.get(TRACE_HEADER))
-        return _completion()
-
-    async with _client(handler) as client:
-        await client.chat_completion(model="naysayer", messages=_msgs(), max_tokens=8)
-        await client.chat_completion(
-            model="naysayer", messages=_msgs(), max_tokens=8, trace_id="01TRACE"
-        )
-    assert seen == [None, "01TRACE"]
-    assert TRACE_HEADER == "X-Mindwire-Trace"
-
-
-@pytest.mark.anyio
-async def test_stats_costs_recent_passes_the_trace_filter_only_when_given() -> None:
-    seen: list[dict[str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(dict(request.url.params))
-        return httpx.Response(200, json=[])
-
-    async with _client(handler) as client:
-        await client.stats_costs_recent(limit=5)
-        await client.stats_costs_recent(limit=200, trace_id="01TRACE")
-    assert seen == [{"limit": "5"}, {"limit": "200", "trace_id": "01TRACE"}]
