@@ -78,7 +78,9 @@ def test_every_call_site_was_found() -> None:
     # tenth: Invoke-PrEventAdvanceTick -> -m spirrow_mindwire.pr_event_advance.
     # T-clone-guard-pin-ignored-only-in-mindwire adds two: Invoke-HeadSkipRevertLaunch (D-3a) and
     # Invoke-CloneCheck -> -m spirrow_mindwire.cli clone-check (D-3c).
-    assert len(_SITES) == 12, _SITES
+    # T-next-line-carries-who-not-why Slice 3 adds the thirteenth: Invoke-ParkWakeTick ->
+    # -m spirrow_mindwire.park_wake (D-7).
+    assert len(_SITES) == 13, _SITES
 
 
 def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:
@@ -94,6 +96,14 @@ def test_pr_event_advance_call_site_resolves_to_the_1b_module() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
     assert sites.get('"pr-event-advance-$Project"') == (
         "-m spirrow_mindwire.pr_event_advance",
+        ["--project", "--sweep-config"],
+    )
+
+
+def test_park_wake_call_site_resolves_to_the_d7_module() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"park-wake-$Project"') == (
+        "-m spirrow_mindwire.park_wake",
         ["--project", "--sweep-config"],
     )
 
