@@ -177,6 +177,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+JEV_BOUNCEABLE_LABELS: frozenset[str] = ADMIT_LABELS - {"merge-protected"}
+"""The admitted labels a Jev ``LIKELY_NOT`` may bounce (``[decider.tierc] mode = "bounce"``).
+
+``merge-protected`` is excluded: a merge into a protected branch is Tier-C by definition, and none
+of the five tierc-v2 rules (``tierc_rules.toml``) names it, so Jev scores a genuine merge request
+low (2026-10-03 board re-sort: two merge-request heads at ``should_ask_human`` 0.20)."""
+
 # Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
 _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 
@@ -1197,14 +1204,15 @@ class Conductor:
         """The ``ask_score`` to bounce a label-admitted head on, or ``None`` to let it through.
 
         ``None`` unless the Decider runs in ``bounce`` mode, the admission was an ordinary label
-        admit (``R1-*``: not ``RETRY:``, not ``unsure:goal?``) and the result is an actionable
-        tierc-v2 ``LIKELY_NOT`` (acting code reads ``actionable_verdict`` only, msg-4184).
+        admit (``R1-*``: not ``RETRY:``, not ``unsure:goal?``) on a label in
+        :data:`JEV_BOUNCEABLE_LABELS`, and the result is an actionable tierc-v2 ``LIKELY_NOT``
+        (acting code reads ``actionable_verdict`` only, msg-4184).
         """
         if self._decider is None or self._decider.tierc_mode != "bounce":
             return None
         if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith("R1"):
             return None
-        if decision.normalized_label not in ADMIT_LABELS:
+        if decision.normalized_label not in JEV_BOUNCEABLE_LABELS:
             return None
         if decider_result is None:
             return None

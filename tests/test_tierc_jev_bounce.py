@@ -35,7 +35,8 @@ from spirrow_mindwire.tier_c_admission_gate import BounceReason, LogKind
 from spirrow_mindwire.tier_c_decisions_log import build_retry_lookup
 from spirrow_mindwire.value_objects import Role
 
-LABELLED = "revised\n\nTIER-C: merge-protected\nNEXT: human"
+LABELLED = "revised\n\nTIER-C: goal\nNEXT: human"
+MERGE = "revised\n\nTIER-C: merge-protected\nNEXT: human"
 UNSURE = "revised\n\nTIER-C: unsure:goal?\nNEXT: human"
 
 
@@ -138,7 +139,7 @@ async def test_likely_not_bounces_a_label_admitted_human_to_its_author(tmp_path:
     (row,) = _rows(gate)
     assert row["kind"] == LogKind.BOUNCED.value
     assert row["reason"] == BounceReason.JEV_LIKELY_NOT.value
-    assert row["label"] == "merge-protected"
+    assert row["label"] == "goal"
     assert row["retry_uuid"] == "u-2"
     assert row["author"] == "Bohr"
     assert row["msg_id"] == "m3"
@@ -150,7 +151,7 @@ async def test_likely_not_bounces_a_label_admitted_human_to_its_author(tmp_path:
 async def test_retry_of_a_jev_bounce_always_reaches_the_human(tmp_path: Path) -> None:
     gate = _gate(tmp_path)
     decider = _Decider(LIKELY_NOT)
-    retry = "still needed\n\nRETRY: u-2\nTIER-C: merge-protected\nNEXT: human"
+    retry = "still needed\n\nRETRY: u-2\nTIER-C: goal\nNEXT: human"
     outcome, _, mcp = await _run(gate, decider, proposer_replies=[retry])
     assert outcome.stop_reason is StopReason.HUMAN
     assert len(_bounces(mcp)) == 1
@@ -252,3 +253,14 @@ def test_jev_notice_parse_is_hijack_safe() -> None:
     line_start_next = [ln for ln in body.splitlines() if ln.startswith("NEXT:")]
     assert line_start_next == ["NEXT: Heisenberg"]
     assert not any(ln.startswith("TIER-C:") for ln in body.splitlines())
+
+
+@pytest.mark.anyio
+async def test_merge_protected_is_never_bounced_by_jev(tmp_path: Path) -> None:
+    """None of the tierc-v2 rules names a protected-branch merge, so Jev scores it low; the
+    label is excluded from the Jev bounce (``JEV_BOUNCEABLE_LABELS``)."""
+    gate = _gate(tmp_path)
+    outcome, _, mcp = await _run(gate, _Decider(LIKELY_NOT), head=MERGE)
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert _bounces(mcp) == []
+    assert _rows(gate) == []
