@@ -2491,6 +2491,10 @@ function New-DailyDigest {
     $reserveAfterCloneParked = (_LinesCost @($quarCountLine))
     if ($totalQ -eq 0) { $reserveAfterCloneParked += (_LinesCost @("  (該当なし)")) + $reserveAfterQuar }
     else {
+        # $reserveAfterStale already carries the escalated AND quarantined tiers at their floors
+        # (via $reserveAfterEsc above) plus everything below 隔離中; only the stale tier — the
+        # first one rendered — is added here. PR #435 gate round 4 read this as missing the
+        # quarantine floor; Test-DirtyClone.ps1 "many parked + quarantine" pins all three tiers.
         $reserveAfterCloneParked += $reserveAfterStale
         if ($staleList.Count -gt 0) {
             $reserveAfterCloneParked += (_LinesCost @($staleHeadLine)) + (_SectionFloorCost -Entries $staleList -Indent '  ')

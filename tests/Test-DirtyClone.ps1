@@ -162,7 +162,8 @@ Check 'exit 2 branch still precedes the generic non-zero branch' $true ($posEnv2
 # ===================================================================================================
 foreach ($name in 'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update-DirtyCloneParking',
                   'Get-DirtyCloneDigestLines', 'New-DailyDigest', 'Get-FingerprintHint',
-                  'Get-DerivedQuarantineState', 'Format-DurationDigest', 'ConvertTo-UtcInstant') {
+                  'Get-DerivedQuarantineState', 'Format-DurationDigest', 'ConvertTo-UtcInstant',
+                  'Get-QuarantineReproHint') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -406,6 +407,35 @@ $dgUnbounded = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsBy
     -Now $nowUtc -LiveKeys @() -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors @() `
     -ParkedCloneLines $manyLines
 Check 'many parked: Budget 0 (legacy) still emits every row' 40 ([regex]::Matches($dgUnbounded, 'some-long-repo-name-\d\d-impl')).Count
+
+# PR #435 gate round 4 (correctness): with $totalQ -gt 0, the 駐機中 reserve must cover the floor of
+# EVERY 隔離中 tier (stale / escalated / quarantined), not just the count line. The round-3 test passed
+# -QuarantineState @{} and so never reached the $totalQ -gt 0 branch. Here all three tiers are
+# populated, several rows each, and 40 parked repos press on the same 1800-char budget.
+# The sweep's own thresholds (run-conductor-scheduled.ps1 lines 101-102); this harness dot-sources
+# functions only, so the script-scope values are restated here as Test-SweepDigest.ps1 does.
+$script:QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
+$script:QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
+$quarMixed = @{}
+for ($i = 0; $i -lt 4; $i++) {
+    $quarMixed[('p/T-stale-quarantine-thread-{0:D2}' -f $i)] = @{ state = 'quarantined'
+        first_failure_at = $nowUtc.AddDays(-8 - $i).ToString('o'); failure_fingerprint = @{ head = "msg-s$i"; control = 'run' } }
+    $quarMixed[('p/T-escalated-quarantine-thread-{0:D2}' -f $i)] = @{ state = 'quarantined'
+        first_failure_at = $nowUtc.AddHours(-30 - $i).ToString('o'); failure_fingerprint = @{ head = "msg-e$i"; control = 'run' } }
+    $quarMixed[('p/T-fresh-quarantine-thread-{0:D2}' -f $i)] = @{ state = 'quarantined'
+        first_failure_at = $nowUtc.AddHours(-2 - $i).ToString('o'); failure_fingerprint = @{ head = "msg-f$i"; control = 'run' } }
+}
+$dgQ = New-DailyDigest -QuarantineState $quarMixed -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $nowUtc -LiveKeys @() -HumanParked $bigHumanParked -PendingDecisionsState @{} -ParkedPollErrors @() -Budget 1800 `
+    -ParkedCloneLines $manyLines
+Check 'many parked + quarantine: digest stays within the budget' $true ($dgQ.Length -le 1800)
+Check 'many parked + quarantine: 隔離中 count line carries all 12' $true ($dgQ -like '*隔離中: 12 件*')
+Check 'many parked + quarantine: stale tier keeps its floor row (oldest)' $true ($dgQ -like '*T-stale-quarantine-thread-03*')
+Check 'many parked + quarantine: escalated tier keeps its floor row (oldest)' $true ($dgQ -like '*T-escalated-quarantine-thread-03*')
+Check 'many parked + quarantine: quarantined tier keeps its floor row (oldest)' $true ($dgQ -like '*T-fresh-quarantine-thread-03*')
+Check 'many parked + quarantine: no tier reports a floor-unmet 0-row section' $false ($dgQ -like '*予算不足で 0 行*')
+Check 'many parked + quarantine: 判断待ち row 0 still rendered' $true ($dgQ -like '*p/T-h0*')
+Check 'many parked + quarantine: 駐機中 rows were the ones truncated' $true ($dgQ -match '\+\d+ 件（省略）')
 
 # ===================================================================================================
 # PR #435 gate round 3, finding 2 (untested): Invoke-HeadSkipRevertLaunch is EXECUTED, not modelled.
