@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 from io import StringIO
+from typing import Any
 
 import pytest
 
@@ -47,7 +48,7 @@ from spirrow_mindwire.decision_request import (
     StubComposer,
     ThreadTailMessage,
 )
-from spirrow_mindwire.decision_request.cli import compose_once, main
+from spirrow_mindwire.decision_request.cli import TailFetcher, TailFetchResult, compose_once, main
 from spirrow_mindwire.decision_request.ports import DecisionRequestComposer
 from spirrow_mindwire.decision_request.stub import (
     DEFAULT_STUB_IDENTITY,
@@ -699,7 +700,7 @@ class TestCliClaudeCodeBackend:
 
         async def fake_fetch(
             project: str, thread_id: str, count: int, body_cap: int
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+        ) -> TailFetchResult:
             assert project == "spirrow-voxelworld"
             assert thread_id == "T-slope-extension-dead-mode"
             assert count == 3
@@ -718,7 +719,7 @@ class TestCliClaudeCodeBackend:
                 for i, b in enumerate(bodies)
             )
             total_chars = sum(len(m.body) for m in msgs)
-            return msgs, 42, total_chars, True
+            return msgs, 42, total_chars, True, bodies[-1]
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", fake_fetch)
 
@@ -763,9 +764,7 @@ class TestCliClaudeCodeBackend:
         from spirrow_mindwire.decision_request import cli as cli_mod
         from spirrow_mindwire.decision_request.claude_code import SubprocessResult
 
-        async def failing_fetch(
-            *_args: object, **_kwargs: object
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+        async def failing_fetch(*_args: object, **_kwargs: object) -> TailFetchResult:
             raise RuntimeError("chatroom is on fire")
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", failing_fetch)
@@ -794,9 +793,7 @@ class TestCliClaudeCodeBackend:
         # cannot silently start fetching for the stub path.
         from spirrow_mindwire.decision_request import cli as cli_mod
 
-        async def must_not_be_called(
-            *_args: object, **_kwargs: object
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+        async def must_not_be_called(*_args: object, **_kwargs: object) -> TailFetchResult:
             pytest.fail("--tail 0 must not call the fetcher")
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", must_not_be_called)
@@ -839,7 +836,7 @@ class TestCliClaudeCodeBackend:
 
         async def fake_fetch(
             project: str, thread_id: str, count: int, body_cap: int
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+        ) -> TailFetchResult:
             # Ascending msg_id order — the head is msg-2702, the last
             # element. Any tuple order regression would flip this pin.
             msgs = (
@@ -847,7 +844,7 @@ class TestCliClaudeCodeBackend:
                 ThreadTailMessage(msg_id="msg-2701", author="b", body="b1"),
                 ThreadTailMessage(msg_id="msg-2702", author="c", body="b2"),
             )
-            return msgs, 42, sum(len(m.body) for m in msgs), False
+            return msgs, 42, sum(len(m.body) for m in msgs), False, "b2"
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", fake_fetch)
         monkeypatch.setattr(
@@ -878,9 +875,7 @@ class TestCliClaudeCodeBackend:
         from spirrow_mindwire.decision_request import cli as cli_mod
         from spirrow_mindwire.decision_request.claude_code import SubprocessResult
 
-        async def failing_fetch(
-            *_args: object, **_kwargs: object
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+        async def failing_fetch(*_args: object, **_kwargs: object) -> TailFetchResult:
             raise RuntimeError("chatroom outage")
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", failing_fetch)
@@ -917,10 +912,8 @@ class TestCliClaudeCodeBackend:
         from spirrow_mindwire.decision_request import cli as cli_mod
         from spirrow_mindwire.decision_request.claude_code import SubprocessResult
 
-        async def empty_fetch(
-            *_args: object, **_kwargs: object
-        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
-            return (), 0, 0, False
+        async def empty_fetch(*_args: object, **_kwargs: object) -> TailFetchResult:
+            return (), 0, 0, False, None
 
         monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", empty_fetch)
         monkeypatch.setattr(
@@ -937,3 +930,202 @@ class TestCliClaudeCodeBackend:
         # head-read key is not — no head was actually read.
         assert row["extras"]["tail_count"] == "0"
         assert "head_msg_id_read" not in row["extras"]
+
+
+# --------------------------------------------------------------------------- #
+# Parked-lane classification on the head the composer read
+# (T-decision-material-parked-lane-push, Bohr msg-6236 §2-§6, Einstein msg-6237)
+# --------------------------------------------------------------------------- #
+
+
+def _marked_stand_down(reason_name: str, notice: str) -> str:
+    """A stand-down notice carrying the conductor's real stop marker (core._with_stop_marker)."""
+    from spirrow_mindwire.conductor.core import _with_stop_marker
+    from spirrow_mindwire.conductor.stand_down import (
+        StandDownReason,
+        UnresolvedItem,
+        stand_down_event,
+    )
+
+    event = stand_down_event(
+        unresolved=UnresolvedItem.IDENTITY,
+        reason=StandDownReason[reason_name],
+        project="p",
+        thread="t",
+        detail="d",
+    )
+    return _with_stop_marker(notice, event)
+
+
+_OPERATOR_TAIL = "OPERATOR-TASK: re-run the deploy by hand\nTIER-C-CHECK: none\nNEXT: operator"
+
+
+def _fetch_of(head_body: str) -> TailFetcher:
+    """A fetcher honouring the TailFetcher contract: capped tail body, raw 5th element."""
+
+    async def fetch(project: str, thread_id: str, count: int, body_cap: int) -> TailFetchResult:
+        capped = head_body
+        truncated = len(capped) > body_cap
+        if truncated:
+            capped = capped[:body_cap] + "… (省略)"
+        msgs = (
+            ThreadTailMessage(msg_id="msg-1", author="a", body="earlier"),
+            ThreadTailMessage(msg_id="msg-2", author="b", body=capped),
+        )
+        return msgs, 2, sum(len(m.body) for m in msgs), truncated, head_body
+
+    return fetch
+
+
+async def _failing_fetch(
+    project: str, thread_id: str, count: int, body_cap: int
+) -> TailFetchResult:
+    raise RuntimeError("down")
+
+
+async def _empty_fetch(project: str, thread_id: str, count: int, body_cap: int) -> TailFetchResult:
+    return (), 0, 0, False, None
+
+
+class TestCliParkedLaneExtras:
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fetch: TailFetcher,
+        *,
+        composer_extras: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        from spirrow_mindwire.decision_request import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", fetch)
+        if composer_extras is not None:
+            original = cli_mod._build_composer
+            injected = dict(composer_extras)
+
+            def build(backend: str, identity: str, **kwargs: Any) -> DecisionRequestComposer:
+                composer = original(backend, identity, **kwargs)
+                composer.last_extras = injected  # type: ignore[attr-defined]
+                return composer
+
+            monkeypatch.setattr(cli_mod, "_build_composer", build)
+        payload = TestCliClaudeCodeBackend()._payload()
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(payload)))
+        rc = main(["--backend", "stub", "--tail", "3", "--body-cap", "4000"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        extras: dict[str, str] = row["extras"]
+        return extras
+
+    def test_long_operator_head_is_classified_on_the_pre_cap_body(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # P-2 regression pin: the 3 operator lines sit past the 4000-char cap.
+        body = "x" * 5000 + "\n\n" + _OPERATOR_TAIL
+        extras = self._run(monkeypatch, capsys, _fetch_of(body))
+        assert extras["tail_truncated"] == "true"
+        assert extras["head_msg_id_read"] == "msg-2"
+        assert extras["parked_lane"] == "operator_work"
+        assert extras["operator_task"] == "re-run the deploy by hand"
+        assert extras["protocol_violation"] == "false"
+
+    def test_production_fetcher_returns_the_pre_cap_head_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The production fetcher honours its own contract (Einstein msg-6237): the 5th element
+        # is the LAST appended message's body before the cap, skipping a trailing non-dict item.
+        import asyncio
+
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.magickit import client as client_mod
+
+        long_body = "y" * 50 + "\n" + _OPERATOR_TAIL
+
+        class FakeMcp:
+            def __init__(self, _cfg: object) -> None:
+                pass
+
+            async def call_tool(self, name: str, args: dict[str, object]) -> object:
+                return {
+                    "messages": [
+                        {"msg_id": "msg-1", "author": "a", "content": "first"},
+                        {"msg_id": "msg-2", "author": "b", "content": long_body},
+                        "not-a-dict",
+                    ]
+                }
+
+        monkeypatch.setattr(client_mod, "StreamableHttpChatroomMcp", FakeMcp)
+        msgs, total, _chars, truncated, raw = asyncio.run(
+            cli_mod._default_fetch_tail("p", "t", 3, 10)
+        )
+        assert total == 3
+        assert truncated is True
+        assert msgs[-1].msg_id == "msg-2"
+        assert msgs[-1].body.endswith("… (省略)")
+        assert raw == long_body
+
+    def test_identity_unresolved_stand_down_is_misroute(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        body = _marked_stand_down("IDENTITY_UNRESOLVED", "could not route\n\nNEXT: human")
+        extras = self._run(monkeypatch, capsys, _fetch_of(body))
+        assert extras["parked_lane"] == "misroute"
+        assert extras["protocol_violation"] == "false"
+        assert "operator_task" not in extras
+
+    def test_operator_tier_c_conflict_is_a_decision_with_protocol_violation(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        body = _marked_stand_down("OPERATOR_TIER_C_CONFLICT", "tier-c + operator\n\nNEXT: human")
+        extras = self._run(monkeypatch, capsys, _fetch_of(body))
+        assert extras["parked_lane"] == "decision"
+        assert extras["protocol_violation"] == "true"
+        assert "operator_task" not in extras
+
+    def test_fetch_failure_writes_no_parked_lane_keys(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(monkeypatch, capsys, _failing_fetch)
+        assert "tail_fetch_error" in extras
+        for key in ("parked_lane", "operator_task", "protocol_violation"):
+            assert key not in extras
+
+    def test_empty_tail_writes_no_parked_lane_keys(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(monkeypatch, capsys, _empty_fetch)
+        assert "head_msg_id_read" not in extras
+        for key in ("parked_lane", "operator_task", "protocol_violation"):
+            assert key not in extras
+
+    def test_fetch_side_classification_wins_over_composer_extras(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(
+            monkeypatch,
+            capsys,
+            _fetch_of("plain decision\n\nNEXT: human"),
+            composer_extras={
+                "parked_lane": "misroute",
+                "operator_task": "bogus",
+                "protocol_violation": "true",
+                "backend": "stub-x",
+            },
+        )
+        assert extras["parked_lane"] == "decision"
+        assert extras["protocol_violation"] == "false"
+        assert "operator_task" not in extras
+        assert extras["backend"] == "stub-x"  # other composer keys still merge
+
+    def test_composer_parked_keys_dropped_when_fetch_failed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(
+            monkeypatch,
+            capsys,
+            _failing_fetch,
+            composer_extras={"parked_lane": "misroute", "protocol_violation": "false"},
+        )
+        assert "parked_lane" not in extras
+        assert "protocol_violation" not in extras
