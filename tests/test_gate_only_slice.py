@@ -634,3 +634,54 @@ def test_main_forwards_gate_only(
     monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor", *argv])
     loop_runner.main()
     assert seen["gate_only"] is expected
+
+
+# --------------------------------------------------------------------------- #
+# 9. the slice predicate, called directly on a real Conductor
+# --------------------------------------------------------------------------- #
+
+
+def test_slice_predicate_runs_on_a_real_conductor_with_its_real_names() -> None:
+    # PR #458 gate round 1 read the diff alone and concluded that ``resolve_handoff``,
+    # ``HandoffKind`` and ``resume_candidate`` were not imported in ``core.py`` and that
+    # ``Conductor`` had no ``_implementer_role``. All four predate this PR (the gate resume of
+    # #444 uses the same expression), so they are not in the diff. This calls the predicate
+    # directly so a NameError / AttributeError there would fail here, not only in the end-to-end
+    # tests above.
+    from spirrow_mindwire.conductor import core as core_module
+
+    for name in ("resolve_handoff", "HandoffKind", "resume_candidate"):
+        assert hasattr(core_module, name), name
+    mcp = _opened()
+    conductor = _conductor(
+        mcp,
+        _fixer(mcp),
+        gate=None,
+        rollups=_ScriptedRollupSource(_rollup(*_GREEN)),
+        reviews=_rc_reviews(),
+        gate_only=True,
+    )
+    assert conductor._implementer_role is Role.IMPLEMENTER
+    rc_relay = {
+        "msg_id": "m9",
+        "author": RELAY_AUTHOR,
+        "content": (
+            f"{render_relay_heading(_PR, _HEAD)}\n\nVERDICT: request_changes (ci=success)\n\n"
+            f"critique\n\n<!-- mindwire:verdict head_sha={_HEAD} event=REQUEST_CHANGES -->\n\n"
+            "NEXT: Heisenberg"
+        ),
+    }
+    assert conductor._slices_before_implementer(rc_relay) is True
+    # The same body under another author, or naming the human, is not resumable: no slice.
+    assert conductor._slices_before_implementer({**rc_relay, "author": "Heisenberg"}) is False
+    human = {**rc_relay, "content": rc_relay["content"].replace("NEXT: Heisenberg", "NEXT: human")}
+    assert conductor._slices_before_implementer(human) is False
+    # Not a gate-lane run: never slices.
+    plain = _conductor(
+        mcp,
+        _fixer(mcp),
+        gate=None,
+        rollups=_ScriptedRollupSource(_rollup(*_GREEN)),
+        reviews=_rc_reviews(),
+    )
+    assert plain._slices_before_implementer(rc_relay) is False
