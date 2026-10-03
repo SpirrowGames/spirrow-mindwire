@@ -214,6 +214,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # Launch fairness (T-sweep-starves-deep-candidates): dispatch order, launch_wait_since, gate lane,
 # and the two-clock admission rule. Pure helpers; the dispatch loop below is a skeleton around them.
 . (Join-Path $PSScriptRoot 'lib/SweepFairness.ps1')
+# Auto-registration of unregistered live threads into this tick's candidates (T-sweep-intake-and-
+# quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Pure helpers; the probe call and the
+# append live in the run section below.
+. (Join-Path $PSScriptRoot 'lib/UnregisteredIntake.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -705,6 +709,8 @@ function Test-HoldForCandidate {
 $HeadSkipProbeTimeoutSeconds = 120
 $HeadProbeTimeoutSeconds = 120
 $ParkedHumansProbeTimeoutSeconds = 120
+# scripts/unregistered_threads.py: one paged chatroom_list_threads walk per project (msg-5889 D-2).
+$UnregisteredThreadsProbeTimeoutSeconds = 120
 $ControlProbeTimeoutSeconds = 120
 $PredictedResourceProbeTimeoutSeconds = 120
 $GateBootstrapProbeTimeoutSeconds = 120
@@ -2055,7 +2061,12 @@ function New-DailyDigest {
         # right under the summary line; its ROWS go through the same budget ladder as every other
         # section (PR #435 gate round 3), so N parked repos cannot push the digest past $Budget.
         # Empty (the default) leaves the digest exactly as it was.
-        [string[]]$ParkedCloneLines = @()
+        [string[]]$ParkedCloneLines = @(),
+        # T-sweep-intake-and-quarantine-stalls msg-5889 D-2: this tick's intake, the return value of
+        # Resolve-UnregisteredIntake (lib/UnregisteredIntake.ps1). Renders the 未登録（登録不可）section
+        # right after 停止中. $null (the default) omits the section, so a caller that predates the
+        # intake renders exactly what it always did; the production caller always passes it.
+        $UnregisteredIntake = $null
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2450,6 +2461,16 @@ function New-DailyDigest {
     $staleHumanHeadLines = @("", "停止中（末尾 NEXT: human のまま $([int]$StaleHumanThreshold.TotalHours)h 以上、古い順）: $($staleHumanList.Count) 件")
     if ($staleHumanList.Count -eq 0) { $staleHumanHeadLines += "  (該当なし)" }
 
+    # 未登録（登録不可）(msg-5889 D-2). Reasons are derived from this tick's intake and never stored;
+    # "?" rows (unmeasured project / probe failure) come first so a blind day cannot be truncated away.
+    $unregEntries = @()
+    $unregHeadLines = @()
+    if ($null -ne $UnregisteredIntake) {
+        $unregEntries = Get-UnregisteredIntakeDigestRows -Intake $UnregisteredIntake
+        $unregHeadLines = @("", (Get-UnregisteredIntakeHeader -Intake $UnregisteredIntake))
+        if ($unregEntries.Count -eq 0) { $unregHeadLines += "  (該当なし)" }
+    }
+
     $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
     if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
 
@@ -2472,8 +2493,10 @@ function New-DailyDigest {
     $reserveAfterLaunchWait = _LinesCost $footerLines
     $reserveAfterStarved  = (_LinesCost $launchWaitHeadLines) +
                             (_SectionFloorCost -Entries $launchWaitList -Indent '  ') + $reserveAfterLaunchWait
-    $reserveAfterStaleHuman = (_LinesCost $starvedHeadLines) +
+    $reserveAfterUnreg    = (_LinesCost $starvedHeadLines) +
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
+    $reserveAfterStaleHuman = (_LinesCost $unregHeadLines) +
+                            (_SectionFloorCost -Entries $unregEntries -Indent '  ') + $reserveAfterUnreg
     $reserveAfterFetchErr = (_LinesCost $staleHumanHeadLines) +
                             (_SectionFloorCost -Entries $staleHumanList -Indent '  ') + $reserveAfterStaleHuman
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
@@ -2597,6 +2620,17 @@ function New-DailyDigest {
         $result = _AddSectionEntries -Entries $staleHumanList -MaxLen $Budget -Reserve $reserveAfterStaleHuman -RunningLen $runLen
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '  '
+    }
+
+    # 未登録（登録不可）(msg-5889 D-2). Same floor discipline as every other section.
+    if ($unregHeadLines.Count -gt 0) {
+        $lines += $unregHeadLines
+        if ($unregEntries.Count -gt 0) {
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $unregEntries -MaxLen $Budget -Reserve $reserveAfterUnreg -RunningLen $runLen
+            $lines += $result.Emitted
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
+        }
     }
 
     $lines += $starvedHeadLines
@@ -4012,6 +4046,33 @@ function Invoke-HeadProbe {
     }
 }
 
+# --- unregistered-threads probe (T-sweep-intake-and-quarantine-stalls msg-5889 D-2) -------------
+# Runs scripts/unregistered_threads.py over sweep.json and returns @{ report; error }. Exactly one of
+# the two is set. Never throws: any failure (script missing, timeout, non-zero exit, no JSON) becomes
+# `error`, which Resolve-UnregisteredIntake turns into "nothing auto-registered this tick" plus a "?"
+# row in the digest. Failing that way is safe in both directions: the listed candidates still run,
+# and the operator sees that the intake did not look.
+function Invoke-UnregisteredThreadsProbe {
+    param([string]$SweepConfigPath)
+    $probe = Join-Path $repoRoot "scripts\unregistered_threads.py"
+    if (-not (Test-Path -LiteralPath $probe)) { return @{ report = $null; error = "script not found: $probe" } }
+    try {
+        $r = Invoke-BoundedUvProbe -Label 'unregistered-threads' -TimeoutSeconds $UnregisteredThreadsProbeTimeoutSeconds `
+            -Arguments @($probe, '--sweep-config', $SweepConfigPath)
+    }
+    catch { return @{ report = $null; error = "invocation failed: $($_.Exception.Message)" } }
+    if ($r.timedOut) { return @{ report = $null; error = "timed out after ${UnregisteredThreadsProbeTimeoutSeconds}s (process tree killed)" } }
+    if (-not $r.ok) { return @{ report = $null; error = "invocation failed: $($r.error)" } }
+    if ($r.code -ne 0) {
+        $tail = ((Get-ProbeOutputLines -Result $r) | ForEach-Object { "$_" }) -join ' / '
+        return @{ report = $null; error = "exit=$($r.code): $tail" }
+    }
+    $json = Get-ProbeJsonLine -Result $r
+    if (-not $json) { return @{ report = $null; error = 'no JSON on stdout' } }
+    try { return @{ report = ($json | ConvertFrom-Json); error = $null } }
+    catch { return @{ report = $null; error = "JSON unparseable: $($_.Exception.Message)" } }
+}
+
 # --- parked-humans probe (T-decision-request-composer S4 / D-32) --------------------------------
 # Poll the sweep candidates and return the subset currently parked on a human decision. Delegates
 # to ``scripts/parked_humans.py``, which re-uses the ``spirrow_mindwire.conductor.handoff``
@@ -4032,7 +4093,12 @@ function Invoke-ParkedHumansProbe {
     param(
         [string]$Project,
         [array]$Candidates,
-        [hashtable]$HeadsByProject
+        [hashtable]$HeadsByProject,
+        # msg-5889 D-1: unregistered threads the intake could NOT register (lib/UnregisteredIntake.ps1
+        # `refused`), objects { project; thread_id }. Polled with head_msg_id '' — parked_humans.py
+        # then trusts the fetched tail without a head cross-check — so a thread that stalls on a human
+        # is listed in 停止中 even though the sweep cannot drive it.
+        [array]$ExtraThreads = @()
     )
 
     $empty = @{ parked = @(); errors = @(); polled = 0 }
@@ -4048,7 +4114,8 @@ function Invoke-ParkedHumansProbe {
     # cross-check in that case and trusts the fetched head). All-or-nothing: an empty candidate
     # list means "no work for this project" and the probe returns polled=0 immediately.
     $projectCands = @($Candidates | Where-Object { $_.project -eq $Project })
-    if ($projectCands.Count -eq 0) { return $empty }
+    $projectExtra = @($ExtraThreads | Where-Object { $_.project -eq $Project })
+    if ($projectCands.Count -eq 0 -and $projectExtra.Count -eq 0) { return $empty }
 
     $heads = if ($HeadsByProject.ContainsKey($Project)) { $HeadsByProject[$Project] } else { $null }
     $items = @()
@@ -4057,6 +4124,7 @@ function Invoke-ParkedHumansProbe {
         if ($null -ne $heads -and $heads.ContainsKey($c.thread_id)) { $hid = "$($heads[$c.thread_id])" }
         $items += @{ thread_id = "$($c.thread_id)"; head_msg_id = $hid }
     }
+    foreach ($x in $projectExtra) { $items += @{ thread_id = "$($x.thread_id)"; head_msg_id = '' } }
     $payload = @{ candidates = $items } | ConvertTo-Json -Depth 5 -Compress
 
     # The candidates go through a temp file (`--input`), never stdin: the 2026-10-01 stall was
@@ -4140,7 +4208,7 @@ function Invoke-ParkedHumansProbe {
             reason    = "$($e.reason)"
         }
     }
-    $polled = if ($obj.PSObject.Properties.Name -contains 'polled') { [int]$obj.polled } else { $projectCands.Count }
+    $polled = if ($obj.PSObject.Properties.Name -contains 'polled') { [int]$obj.polled } else { $items.Count }
     return @{ parked = $parkedOut; errors = $errorsOut; polled = $polled }
 }
 
@@ -4513,6 +4581,30 @@ try {
 
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
+
+    # Auto-registration (msg-5889 D-2 / msg-5893 D-2.1-D-2.4, lib/UnregisteredIntake.ps1). Live threads
+    # that sweep.json does not list join THIS tick's candidates — in memory only, sweep.json is not
+    # written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
+    # head-skip code below (D-2.3): every filter has to see the added threads, or a quarantined one
+    # would launch on every tick. Added threads are ordinary candidates from here on (D-2.2). Refused
+    # ones never join, so no state file can get their key (D-2.1); they are carried only to the
+    # parked-humans poll and the digest. tests/Test-UnregisteredIntake.ps1 pins the order.
+    $unregProbe = Invoke-UnregisteredThreadsProbe -SweepConfigPath $sweepConfigPath
+    $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error
+    $candidates = Join-UnregisteredCandidates -Candidates $candidates -Intake $unregisteredIntake
+    if ($unregisteredIntake.probe_error) {
+        Write-Log "unregistered intake: ? — $($unregisteredIntake.probe_error) (nothing auto-registered this tick)"
+    }
+    foreach ($u in @($unregisteredIntake.unmeasured)) {
+        Write-Log "unregistered intake [$($u.project)]: ? — not measured ($($u.reason))"
+    }
+    if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0) {
+        Confirm-LogWorthKeeping
+        Write-Log ("unregistered intake: auto-registered $(@($unregisteredIntake.added).Count) " +
+                   "[$((@($unregisteredIntake.added) | ForEach-Object { $_.key }) -join ', ')], " +
+                   "refused $(@($unregisteredIntake.refused).Count) " +
+                   "[$((@($unregisteredIntake.refused) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')]")
+    }
 
     # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the
     # alert thread is open by the time the first candidate on a fresh project actually gets picked up.
@@ -5482,8 +5574,10 @@ try {
     $humanParked = @()
     $parkedPollErrors = @()
     $parkedPolled = 0
-    foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
-        $probe = Invoke-ParkedHumansProbe -Project $proj -Candidates $candidates -HeadsByProject $headsByProject
+    $parkedExtra = @($unregisteredIntake.refused)
+    foreach ($proj in (@($candidates) + $parkedExtra | ForEach-Object { $_.project } | Sort-Object -Unique)) {
+        $probe = Invoke-ParkedHumansProbe -Project $proj -Candidates $candidates -HeadsByProject $headsByProject `
+            -ExtraThreads $parkedExtra
         $humanParked      += @($probe.parked)
         $parkedPollErrors += @($probe.errors)
         $parkedPolled     += [int]$probe.polled
@@ -5561,7 +5655,8 @@ try {
                 -RetryState $retryState `
                 -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
                 -StaleHumanThreshold $StaleHumanThreshold `
-                -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked)
+                -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
+                -UnregisteredIntake $unregisteredIntake
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest

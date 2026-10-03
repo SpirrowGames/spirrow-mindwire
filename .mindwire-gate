@@ -26,4 +26,5 @@ pwsh -NoProfile -File tests/Test-SweepFairness.ps1
 pwsh -NoProfile -File tests/Test-BoundedProbe.ps1
 pwsh -NoProfile -File tests/Test-ConductorWallClock.ps1
 pwsh -NoProfile -File tests/Test-DirtyClone.ps1
+pwsh -NoProfile -File tests/Test-UnregisteredIntake.ps1
 uv run pytest
