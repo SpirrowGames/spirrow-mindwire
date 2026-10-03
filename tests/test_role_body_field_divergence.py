@@ -34,6 +34,7 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.conductor.head_skip import Decision, decide, stage1_skips
+from spirrow_mindwire.conductor.parked_lane import ParkedLane, classify_parked
 from spirrow_mindwire.conductor.stand_down import (
     EVENT_KIND_STAND_DOWN,
     StandDownError,
@@ -315,3 +316,33 @@ async def test_stop_token_body_with_a_diverging_field_posts_nothing() -> None:
     outcome = await conductor.run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert mcp.posts == []
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up (msg-6047) — N1 notices land in the board's misroute lane
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body_id", "field_id", "reason"),
+    [
+        ("persona", "other_persona", StandDownReason.FIELD_BODY_DIVERGENCE),
+        ("persona", "unresolvable", StandDownReason.FIELD_UNRESOLVABLE),
+    ],
+    ids=["div", "unres"],
+)
+async def test_n1_notice_is_classified_as_a_misroute(
+    body_id: str, field_id: str, reason: StandDownReason
+) -> None:
+    mcp = _FakeChatroomMcp()
+    _seed(mcp, body=_BODIES[body_id], field=_FIELDS[field_id], consulted=True)
+    conductor, _ = _run_parts(mcp)
+    await conductor.run()
+    (post,) = mcp.posts
+    content = str(post["content"])
+    marker = parse_stop_marker(content)
+    assert marker is not None and marker["reason"] == reason.value
+    lane = classify_parked(content)
+    assert lane.lane is ParkedLane.MISROUTE
+    assert lane.protocol_violation is False
