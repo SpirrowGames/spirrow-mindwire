@@ -64,6 +64,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     # Not in §6.3. Like CI_WAIT: a silent retry of the same head, posting nothing; when it does
     # not clear, the stall watchdog's STALLED notice (StopKind.STALLED) is the stop.
     StopReason.RESUME_RETRY: None,
+    # Not in §6.3. A gate-lane run handing its relay / ci-route head to the role lane; the next
+    # tick resumes the implementer from it. Not a stall and not a stop anyone waits on.
+    StopReason.SLICE_END: None,
     # Not in §6.3. A merge waiting on the PR list, not a stall; 1b resumes it.
     StopReason.MERGE_WAIT: None,
     # Not in §6.3. Its notice ends ``NEXT: human``, so it is read as a human stop like HUMAN.

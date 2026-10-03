@@ -489,6 +489,93 @@ foreach ($fnName in 'Resolve-SweepBudgets', 'Update-LaunchWaitFromVerdicts', 'Ge
     Check "wrapper calls $fnName" ($runTopCalls -contains $fnName)
 }
 
+# =============================================================================================
+# Gate-only slice (PR-B, Bohr msg-6313 §1′ / msg-6316): a gate-lane launch passes --gate-only, so the
+# conductor stops before the implementer's turn and that turn waits in the role lane instead.
+Write-Host "gate-only slice — lane arguments"
+Check "gate lane gets --gate-only" ((@(Get-ConductorLaneArgs -Lane 'gate') -join ' ') -eq '--gate-only')
+Check "role lane gets nothing" (@(Get-ConductorLaneArgs -Lane 'role').Count -eq 0)
+Check "a non-launch lane gets nothing" (@(Get-ConductorLaneArgs -Lane 'none').Count -eq 0)
+
+Write-Host "gate-only slice — wiring (only the gate-lane launch carries the flag)"
+$laneArgCalls = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+    $n.GetCommandName() -eq 'Get-ConductorLaneArgs' }, $true))
+Check "dispatch loop calls Get-ConductorLaneArgs exactly once" ($laneArgCalls.Count -eq 1)
+Check "and passes it the loop's own lane (-Lane `$lane)" ($laneArgCalls.Count -eq 1 -and $laneArgCalls[0].Extent.Text -match '-Lane\s+\$lane\b')
+$laneAppend = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -eq '$stallArgs' -and $n.Right.Extent.Text -match 'Get-ConductorLaneArgs' }, $true))
+Check "its result is appended to the conductor's argument list" ($laneAppend.Count -eq 1)
+Check "before the conductor is spawned" ($laneAppend.Count -eq 1 -and $laneAppend[0].Extent.StartOffset -lt $spawn[0].Extent.StartOffset)
+$wrapperText = Get-Content -LiteralPath $sweepScript -Raw
+$innerText = Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/run-conductor.ps1') -Raw
+Check "the wrapper never spells --gate-only itself (the lib decides)" (-not $wrapperText.Contains('--gate-only'))
+Check "a hand run (deploy/run-conductor.ps1) never adds --gate-only" (-not $innerText.Contains('--gate-only'))
+
+# Six simulated hours of wall-clock with gate candidates arriving all the time. Durations come from
+# the §0 measurement (msg-6312): a gate review ~200s, the implementer turn after it ~500s, a role
+# turn ~300s. Without the slice the gate run carries the implementer turn (700s); with it the gate
+# run is 200s and the implementer turn comes back next tick as a role-lane LAUNCH, queued by
+# launch_wait_since like any other. The scheduling is the real lib, through Invoke-SimTick.
+function Invoke-SliceSim {
+    param([bool]$Slice, [int]$Horizon = 21600, [int]$GateEvery = 900, [int]$RoleEvery = 1200)
+    $pending = [ordered]@{}    # key -> @{ kind = 'gate'|'role'; since = seconds; seconds = run length; orig = 'role'|'impl' }
+    $arrivals = [System.Collections.ArrayList]::new()
+    for ($s = 0; $s -lt $Horizon; $s += $GateEvery) { [void]$arrivals.Add(@{ at = $s; key = "p/T-g$s"; kind = 'gate' }) }
+    foreach ($i in 0..3) { [void]$arrivals.Add(@{ at = 0; key = "p/T-r0-$i"; kind = 'role' }) }
+    for ($s = $RoleEvery; $s -lt $Horizon; $s += $RoleEvery) { [void]$arrivals.Add(@{ at = $s; key = "p/T-r$s"; kind = 'role' }) }
+    $arrivals = @($arrivals | Sort-Object { $_.at })
+    $next = 0; $T = 0.0; $state = @{}
+    $roleWaits = @(); $implWaits = @()
+    while ($T -lt $Horizon) {
+        while ($next -lt $arrivals.Count -and $arrivals[$next].at -le $T) {
+            $a = $arrivals[$next]; $next++
+            $pending[$a.key] = @{ kind = $a.kind; since = [double]$a.at; seconds = $(if ($a.kind -eq 'gate') { 200 } else { 300 }); orig = 'role' }
+        }
+        if ($pending.Count -eq 0) { $T += 60; continue }
+        $cands = @($pending.Keys | ForEach-Object { New-Cand $_ })
+        $verdicts = @{}
+        foreach ($k in $pending.Keys) { $verdicts[$k] = New-Verdict -Token $(if ($pending[$k].kind -eq 'gate') { 'pr-review' } else { 'heisenberg' }) }
+        $dur = @{}
+        foreach ($k in $pending.Keys) {
+            $p = $pending[$k]
+            $dur[$k] = if ($p.kind -eq 'gate' -and -not $Slice) { 700 } else { $p.seconds }
+        }
+        $r = Invoke-SimTick -Candidates $cands -Verdicts $verdicts -State $state -Now $t0.AddSeconds($T) -PreLoop 10 `
+            -RunSeconds { param($k) $dur[$k] }.GetNewClosure()
+        $clock = $T + 10
+        foreach ($k in $r.launched) {
+            $p = $pending[$k]
+            $end = $clock + $dur[$k]
+            if ($p.kind -eq 'gate') {
+                $pending.Remove($k)
+                if ($Slice) { $pending[$k] = @{ kind = 'role'; since = $end; seconds = 500; orig = 'impl' } }
+            }
+            else {
+                if ($p.orig -eq 'impl') { $implWaits += ($clock - $p.since) } else { $roleWaits += ($clock - $p.since) }
+                $pending.Remove($k)
+            }
+            $clock = $end
+        }
+        $T = if ($r.launched.Count -gt 0) { $clock } else { $T + 60 }
+    }
+    $stillWaiting = @($pending.Values | Where-Object { $_.kind -eq 'role' -and $_.orig -eq 'role' } | ForEach-Object { $Horizon - $_.since })
+    $allRole = @($roleWaits) + $stillWaiting
+    return @{
+        role_max = ($allRole | Measure-Object -Maximum).Maximum
+        role_done = $roleWaits.Count
+        impl_max = $(if ($implWaits.Count) { ($implWaits | Measure-Object -Maximum).Maximum } else { 0 })
+        impl_done = $implWaits.Count
+    }
+}
+Write-Host "gate-only slice — simulation (6h, a gate candidate every 15 min)"
+$before = Invoke-SliceSim -Slice $false
+$after = Invoke-SliceSim -Slice $true
+Write-Host ("  before: role wait max {0:N0}s over {1} role turns" -f $before.role_max, $before.role_done)
+Write-Host ("  after:  role wait max {0:N0}s over {1} role turns; implementer turns {2}, wait max {3:N0}s" -f $after.role_max, $after.role_done, $after.impl_done, $after.impl_max)
+Check "the longest role-lane wait shrinks with the slice" ($after.role_max -lt $before.role_max) "before=$($before.role_max) after=$($after.role_max)"
+Check "more role turns complete with the slice" ($after.role_done -gt $before.role_done) "before=$($before.role_done) after=$($after.role_done)"
+Check "sliced implementer turns do get launched from the role lane" ($after.impl_done -gt 0)
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
 Write-Host "all launch-fairness checks passed"

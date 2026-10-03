@@ -5157,6 +5157,9 @@ try {
                 Write-Log "retry-launch $($cand.key): head moved ($failedHead -> $probeHead) — no --retry-of notice; still the one retry of $retryOf"
             }
         }
+        # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1′): a gate-lane launch
+        # stops before the implementer's turn; that turn is launched later from the role lane.
+        $stallArgs += @(Get-ConductorLaneArgs -Lane $lane)
         $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
