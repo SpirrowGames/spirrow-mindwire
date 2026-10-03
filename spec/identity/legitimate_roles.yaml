@@ -116,3 +116,18 @@ identities:
       (verdict_heads / ci_route_heads / prior_advisory_approvals), which narrow to that author,
       never read a 1b post as a gate record. 1b never calls chatroom_close_thread: its
       `NEXT: none` is a handoff token, not a status close (msg-5906, R10).
+
+  - name: park-wake-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/park_wake/decide.py::PARK_WAKE_RELAY_AUTHOR"
+    reason: >-
+      T-next-line-carries-who-not-why Slice 3 (D-7, Bohr msg-2142 / msg-4716 §2 / msg-5175 §3).
+      When a thread parked with `STOP: blocked-on <trigger> wake:<persona>` above `NEXT: none`
+      has its trigger fire (a thread resolved, a PR merged or closed, a deploy request ended, a
+      project's queue emptied), the park-wake tick posts one message restating that fact and
+      ending in `NEXT: <persona>` — the handoff the park deferred. The body restates a sweep
+      observation; no role spoke it, so `legitimate = []` (I-6, the loader's kind=machine
+      invariant). A distinct author from `pr-event-relay` / `conductor-relay` so no reader that
+      narrows to those authors reads a wake as one of their records. The conductor routes the
+      wake like any handoff, guard (i) included, so a park cannot launder a gated handoff.
