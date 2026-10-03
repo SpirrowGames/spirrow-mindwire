@@ -48,9 +48,10 @@ standing for both is the defect ``T-reconcile-field-mismatch-flag-overloaded`` i
 Exclusions are never silent -- :func:`report_to_json` emits the count and every
 ``thread_id``.
 
-Phase 0 stops there. Splitting ``a_union_b`` into A (provably closable) and B (not) needs the
-ledger's ``can_close()``, which does not exist yet — that is Phase 1, in another
-repository. So the number this module produces is deliberately the *union*, and the
+Phase 0 stops there. The original plan split ``a_union_b`` into A (provably closable) and B
+(not) with a ledger ``can_close()`` in another repository; the 1a restart (msg-5808)
+withdrew that plan, and Phase 1 (:mod:`.phase1`) now sorts ledgers by PR state in this
+package instead. So the number this module produces is deliberately the *union*, and the
 threshold it feeds is the union's: ``>= 5`` proceeds, ``< 5`` is a no-go whose record
 carries the whole (by definition <= 4 element) list for a human to read by hand
 (msg-2162 ④, msg-2172 R-37).
