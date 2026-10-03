@@ -447,14 +447,20 @@ def test_build_decider_lexora_requires_url(monkeypatch: pytest.MonkeyPatch) -> N
         build_decider(config_backend="lexora", tierc_mode="shadow")
 
 
-@pytest.mark.parametrize("mode", ["annotate", "bounce"])
-def test_build_decider_refuses_unimplemented_acting_modes(
-    monkeypatch: pytest.MonkeyPatch, mode: str
-) -> None:
+def test_build_decider_refuses_unimplemented_annotate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
     monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
     with pytest.raises(ValueError, match="not implemented"):
-        build_decider(config_backend="lexora", tierc_mode=mode)
+        build_decider(config_backend="lexora", tierc_mode="annotate")
+
+
+def test_build_decider_accepts_bounce(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
+    monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
+    built = build_decider(
+        config_backend="lexora", tierc_mode="bounce", rules_path=tierc_rules_template_path()
+    )
+    assert isinstance(built, DeciderLexoraAdapter) and built.tierc_mode == "bounce"
 
 
 def test_timeout_is_five_seconds() -> None:

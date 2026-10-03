@@ -167,12 +167,19 @@ class BounceReason(StrEnum):
       choose (msg-3646 D1, echoed in msg-3706 §1).
     * ``UNKNOWN_LABEL`` — the label parsed but did not match any known
       enum value.
+    * ``JEV_LIKELY_NOT`` — the label was admitted, but the Tier-C Decider
+      (Jev, ``[decider.tierc] mode = "bounce"``) judged the turn
+      ``LIKELY_NOT`` a human decision. Never emitted by
+      :func:`decide_admission`; written by
+      :meth:`~spirrow_mindwire.conductor.tierc_gate.TierCGate.jev_bounce` so
+      the same RETRY store redeems it.
     """
 
     NO_LABEL = "no-label"
     OTHER_NOT_ADMITTED = "other-not-admitted"
     RELEASE_CROSS_REPO_NEEDS_AUTHOR_CHOICE = "release-cross-repo-needs-author-choice"
     UNKNOWN_LABEL = "unknown-label"
+    JEV_LIKELY_NOT = "jev-likely-not"
 
 
 # ---------------------------------------------------------------------------

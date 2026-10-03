@@ -582,8 +582,9 @@ def build_decider(
 
     Raises ``ValueError`` for configurations that would be silently wrong: an unknown backend,
     ``lexora`` without ``MINDWIRE_LEXORA_URL``, or a Tier-C mode whose acting half is not built
-    yet (``annotate`` / ``bounce`` — step 2 ships shadow only; accepting them would log as if
-    annotating while annotating nothing).
+    yet (``annotate`` — accepting it would log as if annotating while annotating nothing).
+    ``bounce`` is acted on by the Conductor under ``[tierc_gate] mode = "enforce"``
+    (:meth:`~spirrow_mindwire.conductor.core.Conductor._enforce_tierc_gate`).
 
     ``questions="tierc-v2"`` reads the rules file at ``rules_path`` **once, here** (msg-4384: no
     hot-reload; edit the file, then restart). A missing, unreadable or malformed file raises
@@ -601,10 +602,10 @@ def build_decider(
         return None
     if backend != "lexora":
         raise ValueError(f"unknown decider backend {backend!r} (expected 'off' or 'lexora')")
-    if tierc_mode != "shadow":
+    if tierc_mode not in ("shadow", "bounce"):
         raise ValueError(
-            f"[decider.tierc].mode={tierc_mode!r} is not implemented yet: step 2 wires "
-            "'shadow' only (annotate / bounce land in later steps)"
+            f"[decider.tierc].mode={tierc_mode!r} is not implemented yet: 'shadow' and "
+            "'bounce' are wired ('annotate' lands in a later step)"
         )
     if questions not in ("tierc-v1", "tierc-v2"):
         raise ValueError(f"unknown [decider.tierc].questions {questions!r}")

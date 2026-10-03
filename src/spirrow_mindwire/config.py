@@ -528,8 +528,11 @@ class DeciderTierCConfig(_StrictModel):
     * ``annotate`` — LIKELY_NOT に対して escalation 通知に注釈 1 行を
       付ける。 §6-C 制約 1 (genuine 見逃し 0 件) を満たしたときのみ
       投入 (D15)。
-    * ``bounce`` — LIKELY_NOT かつ ``answerable_from_thread`` の場合に
-      呼び出し元 agent へ 1 回だけ差し戻す。 Takahito 追加承認事項 (D15)。
+    * ``bounce`` — tierc-v2: label gate が通した (``RETRY:`` / ``unsure:goal?``
+      以外の) ``NEXT: human`` に Jev が actionable な ``LIKELY_NOT`` を出したとき、
+      書いた本人へ 1 回だけ差し戻す。 ``RETRY:`` は必ず人へ届く。 ``[tierc_gate]
+      mode = "enforce"`` が前提 (RETRY の記録を共有する)。 Takahito 承認
+      2026-10-03 (D15 の追加承認、「すぐ運用に乗せて」)。
 
     :attr:`skip_naysayer_when_confirmed` は Decider が CONFIRMED を
     出したときに ``force_naysayer_only_on_explicit_human`` の Gemini
