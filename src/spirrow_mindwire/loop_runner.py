@@ -121,6 +121,7 @@ from .github.client import (
     EnvironmentTerminalError,
     GitHubClient,
     PrRef,
+    ReviewInfo,
     naysayer_github_token,
 )
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
@@ -813,6 +814,27 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
+class _PerCallReviewSource:
+    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+
+    Same shape and token as :class:`_PerCallCheckRollupSource`: the resume compares the reviews
+    against the rollup, so both must be read through the credential the gate itself uses.
+
+    Unlike the rollup source this one RAISES on a failed read (``fetch_pr_reviews_strict``):
+    the resume must tell "no gate review on the head" (CONTRADICTED → the human) apart from
+    "GitHub could not be asked" (UNAVAILABLE → retry next tick), and the fail-soft read
+    collapses the two into ``[]`` (Bohr msg-6318).
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_reviews_strict(pr)
+
+
 def build_conductor(
     settings: MindwireSettings,
     *,
@@ -942,6 +964,12 @@ def build_conductor(
             # already a structural off-switch that does not need a flag — an unreadable rollup
             # degrades to the pre-wiring path (fire the gate) inside ``Conductor._admit``.
             rollup_source=_PerCallCheckRollupSource(),
+            # Gate resume (T-sweep-starves-deep-candidates, Bohr msg-6316 / msg-6318): what
+            # checks an RC relay left at the head against GitHub before the implementer is
+            # resumed from it. Wired unconditionally like the rollup; an unreadable answer is
+            # UNAVAILABLE (retry next tick), never VERIFIED.
+            review_source=_PerCallReviewSource(),
+            review_login=settings.naysayer_gating.review_login,
             decider=decider,
             # Adapter-error side channel (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``

@@ -61,6 +61,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.HOLD: None,  # waiting
     # Not in §6.3 (added after it). A DEFER, not a stop; the next tick re-derives admission.
     StopReason.CI_WAIT: None,
+    # Not in §6.3. Like CI_WAIT: a silent retry of the same head, posting nothing; when it does
+    # not clear, the stall watchdog's STALLED notice (StopKind.STALLED) is the stop.
+    StopReason.RESUME_RETRY: None,
     # Not in §6.3. A merge waiting on the PR list, not a stall; 1b resumes it.
     StopReason.MERGE_WAIT: None,
     # Not in §6.3. Its notice ends ``NEXT: human``, so it is read as a human stop like HUMAN.
