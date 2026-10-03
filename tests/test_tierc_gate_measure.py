@@ -7,6 +7,7 @@ Like the rest of the script, every output is counts plus ``msg_id`` lists: no pa
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -151,3 +152,35 @@ def test_d_the_script_uses_the_conductors_resolver() -> None:
 
     assert MEASURE.roster_role is roster_role
     assert not hasattr(MEASURE, "_role_of")
+
+
+def test_c_main_reaches_unmeasured_on_a_malformed_explicit_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The config is read once: a malformed ``--config`` is reported, not a crash before it."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text('[tierc_gate]\nmode = "bogus"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+
+    async def _no_threads(projects: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr(MEASURE.builder, "harvest", _no_threads)
+    rc = MEASURE.main(
+        [
+            "--since",
+            "2026-09-01",
+            "--until",
+            "2026-10-01",
+            "--project",
+            "a",
+            "--out",
+            str(out),
+            "--config",
+            str(cfg),
+        ]
+    )
+    assert rc == 0
+    result = json.loads(out.read_text(encoding="utf-8"))
+    assert result["mode_by_project"]["a"].startswith("unmeasured: config unreadable")
+    assert result["current_roster"].startswith("unmeasured: config unreadable")

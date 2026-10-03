@@ -62,6 +62,7 @@ from typing import Any
 from spirrow_mindwire.conductor.core import roster_role
 from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
+from spirrow_mindwire.config import MindwireSettings
 from spirrow_mindwire.decider.hook import TIERC_ENTRY_ROLES, never_retry
 from spirrow_mindwire.tier_c_admission_gate import (
     ADMIT_LABELS,
@@ -204,23 +205,39 @@ def classify(
     }
 
 
-def read_modes(projects: Sequence[str], config_path: Path | None) -> dict[str, str]:
-    """``[tierc_gate].mode`` for each project, or ``unmeasured: <reason>`` — never a default.
+def load_config(config_path: Path | None) -> MindwireSettings | str:
+    """Read ``mindwire.toml`` once: the settings, or ``unmeasured: <reason>`` — never a default.
 
-    The daemon reads one ``mindwire.toml`` for every project it drives, so every project gets the
-    same value. A missing file would load as the built-in default ``off``; that is the fall-back
-    this must not take, so it is reported as unmeasured instead.
+    ``load_settings`` turns a missing file into the built-in defaults (mode ``off``, empty
+    roster); that is the fall-back this must not take, so a missing or unreadable file comes
+    back as the reason string instead. ``main`` derives both the roster and the modes from this
+    one result, so a bad ``--config`` reaches the unmeasured path rather than crashing first.
     """
     from spirrow_mindwire.config import _default_config_path, load_settings
 
     path = config_path if config_path is not None else _default_config_path()
     if not path.is_file():
-        return dict.fromkeys(projects, f"unmeasured: config not found at {path}")
+        return f"unmeasured: config not found at {path}"
     try:
-        mode = str(load_settings(path).tierc_gate.mode)
+        return load_settings(path)
     except Exception as exc:  # an unreadable config is an unmeasured mode, not a crash
-        return dict.fromkeys(projects, f"unmeasured: config unreadable ({type(exc).__name__})")
-    return dict.fromkeys(projects, mode)
+        return f"unmeasured: config unreadable ({type(exc).__name__})"
+
+
+def modes_from(projects: Sequence[str], loaded: MindwireSettings | str) -> dict[str, str]:
+    """``[tierc_gate].mode`` for each project from a :func:`load_config` result.
+
+    The daemon reads one ``mindwire.toml`` for every project it drives, so every project gets the
+    same value; an unmeasured config gives every project its reason string.
+    """
+    if isinstance(loaded, str):
+        return dict.fromkeys(projects, loaded)
+    return dict.fromkeys(projects, str(loaded.tierc_gate.mode))
+
+
+def read_modes(projects: Sequence[str], config_path: Path | None) -> dict[str, str]:
+    """``[tierc_gate].mode`` for each project, or ``unmeasured: <reason>`` — never a default."""
+    return modes_from(projects, load_config(config_path))
 
 
 def _date(raw: str) -> datetime:
@@ -243,21 +260,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=None, help="default: the daemon's toml")
     args = parser.parse_args(argv)
 
-    from spirrow_mindwire.config import load_settings
-
     projects = tuple(args.project or builder.PROJECTS)
-    current_roster = dict(load_settings(args.config).conductor.roster)
+    loaded = load_config(args.config)
+    # Unmeasured config: no current roster (the per-thread routing roster still applies), and
+    # the output says so below rather than presenting the empty roster as a measured one.
+    current_roster = {} if isinstance(loaded, str) else dict(loaded.conductor.roster)
     threads = asyncio.run(builder.harvest(projects))
     result = classify(
         threads,
         current_roster,
         since=args.since,
         until=args.until,
-        mode_by_project=read_modes(projects, args.config),
+        mode_by_project=modes_from(projects, loaded),
         must_admit=tuple(args.must_admit or DEFAULT_MUST_ADMIT),
     )
     result["measured_at"] = datetime.now(UTC).isoformat()
     result["projects"] = list(projects)
+    if isinstance(loaded, str):
+        result["current_roster"] = loaded
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
         json.dumps(result, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
