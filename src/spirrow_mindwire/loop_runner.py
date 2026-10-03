@@ -125,6 +125,7 @@ from .github.client import (
 )
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
+from .magickit.ledger_notes import JOURNAL_DIR_NAME, LedgerJournal
 from .magickit.watcher import ChatroomWatcher, WatchSpec
 from .naysayer.pr_review import NaysayerPrReviewDriver
 from .obligations import ObligationsError, ObligationsManifest, load_manifest
@@ -393,6 +394,7 @@ def build_implementer(
     model: str | None = None,
     cli_path: Path | None = None,
     ledger_mcp: McpToolCaller | None = None,
+    ledger_journal_dir: Path | None = None,
 ) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
@@ -421,6 +423,10 @@ def build_implementer(
     ``T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down`` Bohr msg-5296 / msg-5300).
     :func:`_build_dispatcher` passes the loop's own client, so every implementer session gets the
     two ledger tools and nothing else from Magickit. Proposer and naysayer get none.
+
+    ``ledger_journal_dir`` is where each append's recovery record is written before Magickit is
+    (Bohr msg-5884 / msg-5886): ``<logs_dir>/ledger``. It is required whenever ``ledger_mcp`` is
+    given; the adapter refuses a ledger without it.
     """
     from .adapters import _sdk_job_hook
 
@@ -431,6 +437,7 @@ def build_implementer(
         model=model,
         cli_path=cli_path,
         ledger_mcp=ledger_mcp,
+        ledger_journal=None if ledger_journal_dir is None else LedgerJournal(ledger_journal_dir),
     )
 
 
@@ -559,6 +566,11 @@ def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
     )
 
 
+_LEDGER_EVENT_PREFIX = "ledger."
+# Optional fields rendered on a ledger event's log line, in this order (Bohr msg-5884 item 4).
+_LEDGER_LOG_FIELDS = ("prior_notes_sha256", "reason", "journal_event_id")
+
+
 async def _log_event_sink(event: Event) -> None:
     """Observational event-log sink (I7): log reply.sent / delivery.failed.
 
@@ -568,7 +580,21 @@ async def _log_event_sink(event: Event) -> None:
     session halts (``spec/design/T-denial-detail-and-overdeny.md``).
     """
     author = event.fields.get(EVENT_FIELD_AUTHOR, "?")
-    if event.kind == EVENT_KIND_DELIVERY_FAILED:
+    if event.kind.startswith(_LEDGER_EVENT_PREFIX):
+        # Ledger events carry no author. Put the keys that match a line to its recovery record
+        # (``<logs_dir>/ledger/<project>/<task>/<event_id>.json``) on the line; never the notes.
+        logger.info(
+            "loop event %s event_id=%s task_id=%s%s",
+            event.kind,
+            event.event_id,
+            event.fields.get("task_id", "?"),
+            "".join(
+                f" {key}={event.fields[key]}"
+                for key in _LEDGER_LOG_FIELDS
+                if event.fields.get(key) is not None
+            ),
+        )
+    elif event.kind == EVENT_KIND_DELIVERY_FAILED:
         logger.warning(
             "loop event %s author=%s error=%s",
             event.kind,
@@ -627,6 +653,7 @@ def _build_dispatcher(
                 model=cfg.role_model,
                 cli_path=role_cli_path,
                 ledger_mcp=mcp,
+                ledger_journal_dir=settings.paths.logs_dir / JOURNAL_DIR_NAME,
             )
         if naysayer is None:
             # No model / cli_path here, by design: the naysayer's independence is

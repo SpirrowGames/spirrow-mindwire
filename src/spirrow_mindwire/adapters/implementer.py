@@ -89,7 +89,13 @@ from ..exceptions import (
     AdapterSpawnTimeoutError,
 )
 from ..magickit.client import McpToolCaller
-from ..magickit.ledger_notes import PROCESS_TASK_LOCKS, LedgerHead, LedgerNotes, TaskLocks
+from ..magickit.ledger_notes import (
+    PROCESS_TASK_LOCKS,
+    LedgerHead,
+    LedgerJournal,
+    LedgerNotes,
+    TaskLocks,
+)
 from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
@@ -479,6 +485,7 @@ class ImplementerSdkAdapter:
         job_module: Any = None,
         ledger_mcp: McpToolCaller | None = None,
         ledger_locks: TaskLocks | None = None,
+        ledger_journal: LedgerJournal | None = None,
     ) -> None:
         self._cwd = Path(cwd)
         # Ledger notes (thread T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down, Bohr
@@ -486,6 +493,12 @@ class ImplementerSdkAdapter:
         # ``mindwire-ledger`` server — two tools, pinned to the thread's project, append-only — and
         # never the raw Magickit server. ``None`` attaches nothing.
         self._ledger_mcp = ledger_mcp
+        # The recovery record every append writes before it touches Magickit (Bohr msg-5884 /
+        # msg-5886). No ledger without one: an append that cannot be recovered is the silent loss
+        # the journal exists to prevent, so a client without a journal is a wiring error.
+        if ledger_mcp is not None and ledger_journal is None:
+            raise ValueError("ledger_mcp requires ledger_journal (the append recovery record)")
+        self._ledger_journal = ledger_journal
         self._ledger_locks = ledger_locks if ledger_locks is not None else PROCESS_TASK_LOCKS
         # Inference MUST be routed via Lexora (env spec §4): require an explicit
         # base URL; never fall back to the SDK default (api.anthropic.com).
@@ -565,7 +578,7 @@ class ImplementerSdkAdapter:
         ``None`` when the adapter has no Magickit client. The returned head is updated by
         :meth:`deliver_event` so the provenance header names the message being answered.
         """
-        if self._ledger_mcp is None:
+        if self._ledger_mcp is None or self._ledger_journal is None:
             return None
         head = LedgerHead()
         notes = LedgerNotes(
@@ -573,6 +586,7 @@ class ImplementerSdkAdapter:
             project_id=thread_ref.project_id,
             thread_id=thread_ref.thread_id,
             on_event=ctx.on_event_log,
+            journal=self._ledger_journal,
             head=head,
             locks=self._ledger_locks,
         )

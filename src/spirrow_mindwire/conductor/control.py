@@ -63,8 +63,12 @@ logger = logging.getLogger(__name__)
 # T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down msg-5296 / msg-5300). Residual risk
 # of that ledger append, stated as it is: it does not detect collisions — a write by another
 # process or a person that lands between its read and its write is overwritten, and recovery from
-# an overlap relies on the event_log (``ledger.note_appended`` records the notes it read); a
-# person's UI write is not recoverable from there. It is
+# an overlap relies on the append's recovery record — one JSON file per append under
+# ``<logs_dir>/ledger/<project>/<task>/<event_id>.json``, written (atomic, fsync) BEFORE the
+# Magickit write, holding the notes it read (msg-5884 / msg-5886; the event_log line carries only
+# its keys). That record is the one exception to I7 here: if it cannot be written the append is
+# refused (``journal_unavailable``) rather than made unrecoverable. A person's UI write leaves no
+# record and is not recoverable from there. It is
 # NOT a sandbox: the implementer session has shell tools and the magickit endpoint is unauthed on
 # the tailnet, so an implementer that decided to could POST to it directly. That residual is the
 # same environment trust model the rest of the loop rests on (see ``adapters/implementer.py`` on the

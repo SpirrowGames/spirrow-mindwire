@@ -27,13 +27,30 @@ So the append is read-modify-write through ``update_task(description=...)`` ("Ne
 (stored in notes)" in Magickit's own docstring). What this module does about that:
 
 * (a) appends to the same task from this process are serialised by a per-(project, task) lock;
-* (d) every successful append records, in ``ledger.note_appended``, the full notes it read, their
-  sha256, and the text it appended — so an append by another mindwire process that this write
-  overwrote can be rebuilt from that process's own event.
+* (d) every append first writes a **recovery record** — the full notes it read, their sha256, and
+  the text it is about to append — to its own file, and only then writes Magickit. An append by
+  another mindwire process that this write overwrote can be rebuilt from that process's record.
 
-**Strategy 3 does not detect collisions. Recovery from an overlap relies on the event_log.** A
+**The recovery record is the journal, not the event_log.** The loop's event sink logs one line per
+event and drops its payload (thread msg-5884), so ``ledger.note_appended`` alone recovers nothing in
+production. :class:`LedgerJournal` writes one JSON file per append,
+``<root>/<project_id>/<task_id>/<event_id>.json``, with ``atomic_write_text(..., fsync=True)``
+(temp file, fsync, rename): a record is either whole or absent, two processes never share a file,
+and so no file lock is needed (Bohr msg-5886, Einstein msg-5887). ``event_id`` is a ULID issued
+monotonically within this process, so sorting one task's file names gives the order this process
+wrote them in; across processes the order is only as good as the millisecond clock.
+
+**The journal write is an exception to I7.** It is not observation: it is the only recovery path
+strategy 3 has. If it cannot be written, the append is not made — ``ledger.note_failed`` with
+``reason=journal_unavailable`` — because appending without it is exactly the silent loss T42 exists
+to prevent. A record whose Magickit write then failed stays on disk; the ``ledger.note_failed``
+event names it in ``journal_event_id`` so a reader can tell an attempt from an applied append.
+Records are never deleted by this module: they are the recovery data (Einstein msg-5887 noted the
+unbounded growth as a non-blocking advisory).
+
+**Strategy 3 does not detect collisions. Recovery from an overlap relies on the journal.** A
 write by another process, or by a person in the Magickit UI, that lands between this module's read
-and its write is overwritten, and nothing here notices. A person's write leaves no event, so it
+and its write is overwritten, and nothing here notices. A person's write leaves no record, so it
 cannot be recovered from here at all. The permanent fix is an append operation on the Magickit side
 (another repository); there is deliberately no post-write check here, because reading back what
 you just wrote cannot show that you overwrote someone else (Einstein msg-5299).
@@ -46,16 +63,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import re
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
+from ulid import ULID
+
 from .._time import iso_z
-from ..ulid_util import new_ulid
+from ..filesystem.atomic import atomic_write_text
 from ..value_objects import Event
 from .client import MagickitMcpError, McpToolCaller
 
@@ -70,6 +93,13 @@ _TOOL_UPDATE_TASK = "update_task"
 # ``phase=""`` asks Magickit to resolve the phase from the task id (its own documented behaviour
 # when the id is unique across phases). The phase Magickit answers with is then used for the write.
 _AUTO_PHASE = ""
+
+# Path components of a journal record. Anything else (``..``, separators, drive letters, spaces)
+# is refused before a path is built, so a task id cannot place a file outside the journal root.
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
+
+JOURNAL_DIR_NAME = "ledger"
+"""Under ``settings.paths.logs_dir``; see :func:`spirrow_mindwire.loop_runner._build_dispatcher`."""
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +120,10 @@ class LedgerFailure(StrEnum):
     """``get_task`` answered ``success: false`` / no task."""
     WRITE_REJECTED = "write_rejected"
     """``update_task`` answered without ``success: true``."""
+    INVALID_IDENTIFIER = "invalid_identifier"
+    """``project_id`` or ``task_id`` is not ``[A-Za-z0-9_-]+``, so it cannot name a journal path."""
+    JOURNAL_UNAVAILABLE = "journal_unavailable"
+    """The recovery record could not be written, so the append was not made (I7 exception)."""
     UNEXPECTED_ERROR = "unexpected_error"
     """Anything else. Still reported; never swallowed."""
 
@@ -141,6 +175,57 @@ class TaskLocks:
 PROCESS_TASK_LOCKS = TaskLocks()
 
 
+class MonotonicUlids:
+    """ULIDs that strictly increase within this process.
+
+    Two random ULIDs from the same millisecond are not ordered, so plain ``new_ulid`` would not
+    make "sort the file names" mean "the order they were written". When the clock has not moved
+    past the last id, the next id is the last one plus one.
+    """
+
+    def __init__(self) -> None:
+        self._last = 0
+        self._guard = threading.Lock()
+
+    def __call__(self) -> str:
+        with self._guard:
+            candidate = int(ULID())
+            if candidate <= self._last:
+                candidate = self._last + 1
+            self._last = candidate
+            return str(ULID.from_int(candidate))
+
+
+PROCESS_ULIDS = MonotonicUlids()
+
+
+@dataclass(frozen=True)
+class LedgerJournal:
+    """One recovery record per append, one file per record (Bohr msg-5886).
+
+    ``root`` is ``<logs_dir>/ledger`` in production. :meth:`write` is ``atomic_write_text`` with
+    fsync; any exception from it propagates, and :class:`LedgerNotes` turns it into
+    ``journal_unavailable`` before Magickit is touched.
+    """
+
+    root: Path
+
+    def path_for(self, project_id: str, task_id: str, event_id: str) -> Path:
+        for name, value in (("project_id", project_id), ("task_id", task_id)):
+            if not _IDENTIFIER.fullmatch(value):
+                raise LedgerError(
+                    LedgerFailure.INVALID_IDENTIFIER,
+                    f"{name} {value!r} must match {_IDENTIFIER.pattern}",
+                )
+        return self.root / project_id / task_id / f"{event_id}.json"
+
+    def write(self, record: dict[str, Any]) -> Path:
+        path = self.path_for(record["project_id"], record["task_id"], record["event_id"])
+        text = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=1) + "\n"
+        atomic_write_text(path, text, fsync=True)
+        return path
+
+
 @dataclass
 class LedgerHead:
     """The chatroom message the session is currently answering, for the provenance header.
@@ -160,9 +245,11 @@ class LedgerNotes:
     project_id: str
     thread_id: str
     on_event: Callable[[Event], Awaitable[None]]
+    journal: LedgerJournal
     head: LedgerHead = field(default_factory=LedgerHead)
     locks: TaskLocks = field(default_factory=lambda: PROCESS_TASK_LOCKS)
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    new_id: Callable[[], str] = field(default=lambda: PROCESS_ULIDS())
 
     async def get_task(self, task_id: str) -> dict[str, Any]:
         """Return the task (with its notes and phase). Errors raise :class:`LedgerError`."""
@@ -176,19 +263,44 @@ class LedgerNotes:
     async def append_note(self, task_id: str, text: str) -> dict[str, Any]:
         """Append ``text`` under a provenance header to the task's notes.
 
-        Returns the header and byte count. Errors raise :class:`LedgerError` after emitting
-        ``ledger.note_failed``.
+        Order: read the notes, write the recovery record (:class:`LedgerJournal`), then write
+        Magickit. Returns the header, byte count and event id. Errors raise :class:`LedgerError`
+        after emitting ``ledger.note_failed``.
         """
+        event_id = self.new_id()
+        journaled = False
         try:
             task_id = _require(task_id, "task_id")
             text = _require(text, "text")
+            # Refuse a path-unsafe id before locking or reading anything.
+            self.journal.path_for(self.project_id, task_id, event_id)
             async with self.locks.hold(self.project_id, task_id):
                 task, phase = await self._read(task_id)
                 prior = task.get("notes")
                 prior_notes = prior if isinstance(prior, str) else ""
+                prior_sha256 = hashlib.sha256(prior_notes.encode("utf-8")).hexdigest()
                 header = self._header()
                 addition = f"{header}\n{text}"
                 new_notes = f"{prior_notes}\n\n{addition}" if prior_notes else addition
+                record = {
+                    "event_id": event_id,
+                    "project_id": self.project_id,
+                    "thread_id": self.thread_id,
+                    "task_id": task_id,
+                    "header": header,
+                    "appended_text": text,
+                    "prior_notes": prior_notes,
+                    "prior_notes_sha256": prior_sha256,
+                }
+                try:
+                    self.journal.write(record)
+                except Exception as exc:
+                    raise LedgerError(
+                        LedgerFailure.JOURNAL_UNAVAILABLE,
+                        f"recovery record for {task_id} could not be written, so nothing was "
+                        f"appended: {type(exc).__name__}: {exc}",
+                    ) from exc
+                journaled = True
                 result = await self.mcp.call_tool(
                     _TOOL_UPDATE_TASK,
                     {
@@ -204,7 +316,12 @@ class LedgerNotes:
                         f"update_task did not report success for {task_id}: {_short(result)}",
                     )
         except Exception as exc:
-            raise await self._fail(LedgerOperation.APPEND, task_id, exc) from exc
+            raise await self._fail(
+                LedgerOperation.APPEND,
+                task_id,
+                exc,
+                journal_event_id=event_id if journaled else None,
+            ) from exc
 
         appended_bytes = len(addition.encode("utf-8"))
         await self._emit(
@@ -217,10 +334,16 @@ class LedgerNotes:
                 "appended_text": text,
                 "appended_bytes": appended_bytes,
                 "prior_notes": prior_notes,
-                "prior_notes_sha256": hashlib.sha256(prior_notes.encode("utf-8")).hexdigest(),
+                "prior_notes_sha256": prior_sha256,
             },
+            event_id=event_id,
         )
-        return {"task_id": task_id, "header": header, "appended_bytes": appended_bytes}
+        return {
+            "task_id": task_id,
+            "header": header,
+            "appended_bytes": appended_bytes,
+            "event_id": event_id,
+        }
 
     async def _read(self, task_id: str) -> tuple[dict[str, Any], str]:
         result = await self.mcp.call_tool(
@@ -247,29 +370,45 @@ class LedgerNotes:
         head = self.head.msg_id or "no-head"
         return f"[mindwire {self.thread_id} {head} {iso_z(self.now())}]"
 
-    async def _fail(self, op: LedgerOperation, task_id: object, exc: Exception) -> LedgerError:
+    async def _fail(
+        self,
+        op: LedgerOperation,
+        task_id: object,
+        exc: Exception,
+        *,
+        journal_event_id: str | None = None,
+    ) -> LedgerError:
         if isinstance(exc, LedgerError):
             error = exc
         elif isinstance(exc, MagickitMcpError):
             error = LedgerError(LedgerFailure.MAGICKIT_UNREACHABLE, f"magickit call failed: {exc}")
         else:
             error = LedgerError(LedgerFailure.UNEXPECTED_ERROR, f"{type(exc).__name__}: {exc}")
-        await self._emit(
-            EVENT_KIND_LEDGER_NOTE_FAILED,
-            {
-                "project_id": self.project_id,
-                "thread_id": self.thread_id,
-                "task_id": str(task_id),
-                "operation": op.value,
-                "reason": error.reason.value,
-                "error": str(error),
-            },
-        )
+        fields: dict[str, Any] = {
+            "project_id": self.project_id,
+            "thread_id": self.thread_id,
+            "task_id": str(task_id),
+            "operation": op.value,
+            "reason": error.reason.value,
+            "error": str(error),
+        }
+        if journal_event_id is not None:
+            # A recovery record was written, but the Magickit write after it did not land.
+            fields["journal_event_id"] = journal_event_id
+        await self._emit(EVENT_KIND_LEDGER_NOTE_FAILED, fields)
         return error
 
-    async def _emit(self, kind: str, fields: dict[str, Any]) -> None:
+    async def _emit(
+        self, kind: str, fields: dict[str, Any], *, event_id: str | None = None
+    ) -> None:
         # Observational (I7): a raising sink must not turn a ledger result into a different one.
-        event = Event(event_id=new_ulid(), occurred_at=self.now(), kind=kind, fields=fields)
+        # The journal write is the I7 exception, and it happens before this, never here.
+        event = Event(
+            event_id=event_id if event_id is not None else self.new_id(),
+            occurred_at=self.now(),
+            kind=kind,
+            fields=fields,
+        )
         try:
             await self.on_event(event)
         except Exception:
@@ -290,11 +429,15 @@ def _short(value: object) -> str:
 __all__ = [
     "EVENT_KIND_LEDGER_NOTE_APPENDED",
     "EVENT_KIND_LEDGER_NOTE_FAILED",
+    "JOURNAL_DIR_NAME",
     "PROCESS_TASK_LOCKS",
+    "PROCESS_ULIDS",
     "LedgerError",
     "LedgerFailure",
     "LedgerHead",
+    "LedgerJournal",
     "LedgerNotes",
     "LedgerOperation",
+    "MonotonicUlids",
     "TaskLocks",
 ]
