@@ -597,6 +597,16 @@ might be worthwhile, the head id knows.
 thread with no recorded head all launch the conductor anyway: a gap must cost one cheap run rather
 than silently parking a live thread forever.
 
+**A head with no `NEXT:` line and no handoff field is launched once, then parked**
+(T-no-field-no-next-handoff-silent-park). The conductor ends that run on `no_handoff_to_human`.
+Because that stop is decided by the head alone, `no_handoff_to_human` is one of the
+`TERMINAL_STOP_REASONS` in `head_skip.py`. As long as the head stays the same, the log shows
+`terminal-stop:no_handoff_to_human` (SKIP) every tick instead of a new launch, and the Discord
+alert fires once. Adding a `NEXT:` line by **editing** the parked message works, but only when the
+cached parse ages out (`HEAD_CACHE_TTL`, up to 60 min). Until then the edit is not seen. To resume
+right away, post a **new** comment with a `NEXT:` line. A new message moves the head, so the next
+tick launches it. The same edit rule applies to every terminal stop reason.
+
 > **2026-09-30 (T-unread-correlated-count-scale)**: the probe used to call `chatroom_my_unread` as a
 > dedicated never-reads identity (`conductor-probe`), so that every thread stayed unread and hence
 > listed. That inbox evaluates a per-thread unread count for every thread in conclair — a cursorless

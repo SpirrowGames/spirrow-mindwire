@@ -149,13 +149,14 @@ def test_count_round_trips_and_a_legacy_record_reads_zero() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_stalled_is_terminal_like_the_other_two_dead_head_reasons() -> None:
+def test_stalled_is_terminal_like_the_other_dead_head_reasons() -> None:
     assert {
+        StopReason.NO_HANDOFF.value,
         StopReason.NO_PROGRESS.value,
         StopReason.SELF_HANDOFF.value,
         StopReason.STALLED.value,
     } == TERMINAL_STOP_REASONS
-    # And it parks the posted notice's id like the other two.
+    # And it parks the posted notice's id like the other dead-head reasons.
     rec = commit_terminal(reason=StopReason.STALLED.value, head_msg_id="m10", record=None)
     assert rec.terminal_stop_reason == "stalled_to_human"
     assert rec.terminal_head_msg_id == "m10"
