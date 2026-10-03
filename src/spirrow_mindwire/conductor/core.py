@@ -89,6 +89,8 @@ from ..decider.hook import (
     run_proceed_veto,
     run_tierc_hook,
 )
+from ..decider.result import DecisionResult
+from ..decider.verdict import TierCV2Verdict, TierCVerdictKind
 from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
@@ -98,7 +100,7 @@ from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
-from ..tier_c_admission_gate import AdmissionVerdict
+from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
     DecisionLineScan,
@@ -162,7 +164,13 @@ from .stand_down import (
     stand_down_event,
 )
 from .stop_marker import render_stop_marker
-from .tierc_gate import TierCGate, bounced_msg_id, is_bounce_notice, render_bounce_body
+from .tierc_gate import (
+    TierCGate,
+    bounced_msg_id,
+    is_bounce_notice,
+    render_bounce_body,
+    render_jev_bounce_body,
+)
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -821,7 +829,7 @@ class Conductor:
             stop_reason = route.stop_reason
             # Tier-C Decider hook: right after the rule-based routing decision, before it is acted
             # on. Observation only — the hook reads ``_route``'s outputs, never writes them back.
-            await self._decider_hook(
+            decider_result = await self._decider_hook(
                 handoff,
                 messages,
                 round_index,
@@ -842,7 +850,7 @@ class Conductor:
                 and not spawn_blocked
                 and self._tierc_gate is not None
             ):
-                bounce_msg = await self._enforce_tierc_gate(handoff, latest)
+                bounce_msg = await self._enforce_tierc_gate(handoff, latest, decider_result)
                 if bounce_msg is not None:
                     author_identity, author_role = self._roster_entry(_author(latest))
                     handle = sessions.get(author_identity)
@@ -1017,7 +1025,7 @@ class Conductor:
         is_forced: bool,
         target_role: Role | None,
         spawn_blocked: bool,
-    ) -> None:
+    ) -> DecisionResult | None:
         """Hand the turn to the Tier-C Decider hook (msg-4180 §4; 2b 4200; 2c 4237/4239/4280).
 
         Only a ``HandoffKind.HUMAN`` head reaches the hook. The rest of the entry condition is
@@ -1036,15 +1044,18 @@ class Conductor:
         admission gate compute-only (nothing written to the decisions log); under tierc-v2 the
         turn goes to Lexora whether or not the gate produced a result (msg-4380 Δ2). Every
         value passed is read only, never modified.
+
+        Returns the hook's result (``None`` when the Decider was off or not called). Only
+        :meth:`_enforce_tierc_gate` reads it, under ``[decider.tierc] mode = "bounce"``.
         """
         if self._decider is None:
-            return
+            return None
         # Load-bearing since 2c: the hook's entry no longer checks the rule stop, so a proposer's
         # valid ``NEXT: <role>`` (mismatch_reason None) would otherwise reach ``routed_from_route``
         # and raise RoutingInvariantError. Pinned by
         # test_conductor_proposer_non_human_handoff_never_reaches_routed_mapping.
         if handoff.kind is not HandoffKind.HUMAN:
-            return
+            return None
         thread_msgs = [
             ThreadMessage(
                 msg_id=_msg_id(m),
@@ -1060,7 +1071,7 @@ class Conductor:
         thread_msgs[-1] = ThreadMessage(
             msg_id=head.msg_id, author=head.author, content=head.content, parsed_next=HUMAN_TOKEN
         )
-        await run_tierc_hook(
+        return await run_tierc_hook(
             self._decider,
             thread_id=self._thread_ref.thread_id,
             round_index=round_index,
@@ -1084,7 +1095,10 @@ class Conductor:
         )
 
     async def _enforce_tierc_gate(
-        self, handoff: Handoff, latest: dict[str, Any]
+        self,
+        handoff: Handoff,
+        latest: dict[str, Any],
+        decider_result: DecisionResult | None = None,
     ) -> dict[str, Any] | None:
         """Run the enforced admission gate on a head ``_route`` stopped at the human (2e-1b).
 
@@ -1099,6 +1113,14 @@ class Conductor:
         to render the notice, or a notice that did not land (resolved thread / no ``msg_id``) all
         return ``None``. The gate's rows are written before the notice is posted
         (:meth:`.tierc_gate.TierCGate.admit`).
+
+        **Jev bounce** (``[decider.tierc] mode = "bounce"``, Takahito 2026-10-03). A head the label
+        gate *admitted* is bounced once more, by the Decider, when all of these hold: the admission
+        was an ordinary label admit (not ``RETRY:`` — one retry always reaches the human — and not
+        ``unsure:goal?``), and ``decider_result`` carries an actionable tierc-v2 ``LIKELY_NOT``.
+        Anything else — no result, a null / malformed / transport-error outcome, ``UNSURE``,
+        ``CONFIRMED`` — reaches the human. The bounce is an ordinary ``BOUNCED`` row
+        (:meth:`.tierc_gate.TierCGate.jev_bounce`), redeemed by the same ``RETRY:`` store.
         """
         gate = self._tierc_gate
         if gate is None:
@@ -1123,11 +1145,36 @@ class Conductor:
                 decision.verdict.value,
                 decision.rule,
             )
-            if decision.verdict is not AdmissionVerdict.BOUNCE:
-                return None
-            body = render_bounce_body(
-                author=author, decision=decision, bounced_msg_id=_msg_id(latest)
-            )
+            if decision.verdict is AdmissionVerdict.BOUNCE:
+                body = render_bounce_body(
+                    author=author, decision=decision, bounced_msg_id=_msg_id(latest)
+                )
+            else:
+                ask_score = self._jev_bounce_score(decision, decider_result)
+                if ask_score is None:
+                    return None
+                retry_uuid = gate.jev_bounce(
+                    author=author,
+                    label=decision.normalized_label,
+                    ask_score=ask_score,
+                    thread=self._thread_ref.thread_id,
+                    msg_id=_msg_id(latest),
+                    now=datetime.now(UTC),
+                )
+                logger.info(
+                    "tierc_gate jev bounce: msg=%s author=%s label=%s ask_score=%.3f",
+                    _msg_id(latest),
+                    author,
+                    decision.normalized_label,
+                    ask_score,
+                )
+                body = render_jev_bounce_body(
+                    author=author,
+                    bounced_msg_id=_msg_id(latest),
+                    retry_uuid=retry_uuid,
+                    label=decision.normalized_label,
+                    ask_score=ask_score,
+                )
         except Exception:
             logger.warning(
                 "tierc_gate failed on msg=%s; stopping at the human (fail-open)",
@@ -1143,6 +1190,28 @@ class Conductor:
             )
             return None
         return posted
+
+    def _jev_bounce_score(
+        self, decision: AdmissionDecision, decider_result: DecisionResult | None
+    ) -> float | None:
+        """The ``ask_score`` to bounce a label-admitted head on, or ``None`` to let it through.
+
+        ``None`` unless the Decider runs in ``bounce`` mode, the admission was an ordinary label
+        admit (``R1-*``: not ``RETRY:``, not ``unsure:goal?``) and the result is an actionable
+        tierc-v2 ``LIKELY_NOT`` (acting code reads ``actionable_verdict`` only, msg-4184).
+        """
+        if self._decider is None or self._decider.tierc_mode != "bounce":
+            return None
+        if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith("R1"):
+            return None
+        if decision.normalized_label not in ADMIT_LABELS:
+            return None
+        if decider_result is None:
+            return None
+        av = decider_result.actionable_verdict
+        if not isinstance(av, TierCV2Verdict) or av.kind is not TierCVerdictKind.LIKELY_NOT:
+            return None
+        return av.ask_score
 
     @property
     def decision_log_counts(self) -> Mapping[str, int]:

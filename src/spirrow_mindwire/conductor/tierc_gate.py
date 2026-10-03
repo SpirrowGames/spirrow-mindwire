@@ -48,6 +48,8 @@ from ..tier_c_admission_gate import (
     ADMIT_LABELS,
     AdmissionDecision,
     AdmissionVerdict,
+    BounceReason,
+    LogEntry,
     LogKind,
     decide_admission,
 )
@@ -102,6 +104,38 @@ class TierCGate:
         )
         append_log_entries(self.log_path, decision.log_entries, thread=thread, msg_id=msg_id)
         return decision
+
+    def jev_bounce(
+        self,
+        *,
+        author: str,
+        label: str | None,
+        ask_score: float,
+        thread: str,
+        msg_id: str,
+        now: datetime,
+    ) -> str:
+        """Record a Jev bounce of a label-admitted ``NEXT: human`` and return its RETRY uuid.
+
+        The row is an ordinary ``BOUNCED`` entry (reason ``jev-likely-not``), so
+        :func:`build_retry_lookup` redeems a ``RETRY: <uuid>`` for it exactly as for a label
+        bounce: one retry always reaches the human. As in :meth:`admit`, the row is written before
+        the caller posts the notice; exceptions propagate and the caller fails open.
+        """
+        retry_uuid = self.uuid_factory()
+        entry = LogEntry(
+            kind=LogKind.BOUNCED,
+            payload={
+                "ts": now.isoformat(),
+                "author": author,
+                "reason": BounceReason.JEV_LIKELY_NOT.value,
+                "label": label,
+                "retry_uuid": retry_uuid,
+                "ask_score": ask_score,
+            },
+        )
+        append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
+        return retry_uuid
 
 
 def bounce_retry_uuid(decision: AdmissionDecision) -> str:
@@ -168,6 +202,32 @@ def render_bounce_body(*, author: str, decision: AdmissionDecision, bounced_msg_
     )
 
 
+def render_jev_bounce_body(
+    *, author: str, bounced_msg_id: str, retry_uuid: str, label: str | None, ask_score: float
+) -> str:
+    """The notice for a Jev bounce: same header, ``bounced:`` line and ``RETRY:`` line as
+    :func:`render_bounce_body`, so :func:`is_bounce_notice` / :func:`bounced_msg_id` read it and
+    the conductor treats it like a label bounce. Ends ``NEXT: <author>``; every other ``NEXT:`` /
+    ``TIER-C:`` mention is inline inside backticks."""
+    shown_label = f"`TIER-C: {label}`" if label else "ラベル"
+    return (
+        f"{TIERC_BOUNCE_HEADER}\n\n"
+        f"bounced: `{bounced_msg_id}`\n\n"
+        f"{author} の `NEXT: human` は {shown_label} 付きでしたが、Tier-C 判定 (Jev) が"
+        f"「人に聞く必要は低い」と判定したため、人に届けず書いた本人に差し戻しました"
+        f" (理由: `{BounceReason.JEV_LIKELY_NOT.value}`、should_ask_human={ask_score:.2f})。\n\n"
+        "次のどれかで続けてください。\n"
+        "- 人に聞かずに決められるなら、自分で決めて進めてください。"
+        "決めた内容は `DECIDED:` 行で残してください。\n"
+        "- それでも人の判断が要ると考えるなら、返信に次の1行をそのまま単独で書いてください。"
+        "この差し戻しに対して1回だけ、判定に関係なく人へ通します。\n\n"
+        f"RETRY: {retry_uuid}\n\n"
+        "この post は conductor の書き戻しです (author: `conductor-relay`、role: なし。"
+        '`[decider.tierc] mode = "bounce"`)。\n\n'
+        f"NEXT: {author}"
+    )
+
+
 __all__ = [
     "TIERC_BOUNCE_HEADER",
     "TierCGate",
@@ -175,4 +235,5 @@ __all__ = [
     "bounced_msg_id",
     "is_bounce_notice",
     "render_bounce_body",
+    "render_jev_bounce_body",
 ]

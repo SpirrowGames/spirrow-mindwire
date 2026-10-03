@@ -871,6 +871,11 @@ def build_conductor(
     # One INFO line each, on every start, whatever the value (DECIDED 2e-1b, the msg-4748
     # recurrence fix): the Decider sat at backend=off for days with nothing in the log to say so.
     # ``built`` is whether a Decider object exists — the only fact the hook acts on.
+    if dec_cfg.tierc.mode == "bounce" and settings.tierc_gate.mode != "enforce":
+        logger.warning(
+            'decider: tierc=bounce has no effect without [tierc_gate] mode = "enforce" '
+            "(the Jev bounce shares the gate's RETRY store); acting as shadow"
+        )
     logger.info(
         "decider: backend=%s tierc=%s questions=%s built=%s",
         resolve_decider_backend(dec_cfg.backend),
