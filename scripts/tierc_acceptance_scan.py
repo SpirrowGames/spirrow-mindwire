@@ -41,13 +41,15 @@ def log_kind_totals(log_path: Path, threads: set[str]) -> dict[str, int | str]:
     if not log_path.exists():
         return dict.fromkeys(kinds, f"unmeasured: decisions log not found at {log_path}")
     counts: Counter[str] = Counter()
-    for raw in log_path.read_text(encoding="utf-8").splitlines():
-        try:
-            row = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(row, dict) and row.get("thread") in threads and row.get("kind") in kinds:
-            counts[str(row["kind"])] += 1
+    # Stream line by line: the log is append-only and grows without bound.
+    with log_path.open(encoding="utf-8") as fh:
+        for raw in fh:
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and row.get("thread") in threads and row.get("kind") in kinds:
+                counts[str(row["kind"])] += 1
     return {k: counts[k] for k in kinds}
 
 
