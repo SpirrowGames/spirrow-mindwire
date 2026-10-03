@@ -62,9 +62,13 @@ identities:
     legitimate: []
     primary_source: "src/spirrow_mindwire/orchestrator.py::_DEFAULT_OWNER"
     reason: >-
-      Used only as the thread-metadata `owner` on chatroom_open_thread calls, never as an
-      `author` on any chatroom_post_message. No LLM speaks under this name; it is a label
-      for who opened the ledger, not who authored anything.
+      Passed as the `owner` on the PR-review ledger's chatroom_open_thread call
+      (PrReviewOrchestrator._open_thread). The thread's opening message, the fixed
+      "naysayer review request" text in fire_pr_review, is recorded with this name as its
+      author. So it IS a post author: 675 posts in the live corpus (msg-5819 §3, corrected
+      in msg-6019 §1 (b)). It never calls chatroom_post_message itself, and no LLM speaks
+      under this name. Every post under it is template text written by the harness, so it
+      carries no role because it is a machine. A participant's role is never omitted here.
 
   - name: pr-gate-relay
     kind: machine
