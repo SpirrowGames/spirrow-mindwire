@@ -763,12 +763,17 @@ async def test_the_log_line_for_a_ledger_event_carries_its_matching_keys(
         await _log_event_sink(failed)
 
     appended_line, failed_line = [r.getMessage() for r in caplog.records]
-    assert "event_id=01J00000000000000000000000" in appended_line
-    assert "project_id=spirrow-mindwire" in appended_line
-    assert "task_id=T42" in appended_line
-    assert f"prior_notes_sha256={sha}" in appended_line
-    assert "SECRET" not in appended_line  # never the notes themselves
-    assert "project_id=spirrow-mindwire" in failed_line
-    assert "task_id=T44" in failed_line
-    assert "reason=journal_unavailable" in failed_line
-    assert "SECRET" not in failed_line
+    # Exact lines, not substrings: each key appears once (project_id is rendered by the fixed
+    # format, and the extras loop is an allow-list that does not contain it), and nothing
+    # outside the allow-list -- in particular never the notes themselves -- reaches the line.
+    assert appended_line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_APPENDED} event_id=01J00000000000000000000000"
+        f" project_id=spirrow-mindwire task_id=T42 prior_notes_sha256={sha}"
+    )
+    assert failed_line == (
+        f"loop event {EVENT_KIND_LEDGER_NOTE_FAILED} event_id=01J00000000000000000000001"
+        " project_id=spirrow-mindwire task_id=T44 reason=journal_unavailable"
+    )
+    for line in (appended_line, failed_line):
+        assert line.count("project_id=") == 1
+        assert "SECRET" not in line
