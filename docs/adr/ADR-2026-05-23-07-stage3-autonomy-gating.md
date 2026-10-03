@@ -63,6 +63,10 @@ Takahito
 
 ### 2.4 環境セキュリティ（独立 PC）
 
+> **本節は §8 Amendment（2026-10-04）で改訂済み。** loop host は作業用 PC との兼用を認める。
+> 再開・継続の必須条件は「プログラム単位で Squid の許可リストを迂回できる外向き許可が無いこと」だけで、
+> 以下の他の項目は §8 に書いた残留リスクとして受け入れている —— **現行の規則は §8 を読むこと。**
+
 EXECUTE_CODE を全開放するため、blast radius は **loop のゲートではなく環境レベルで物理的に封じる**。
 
 - **Tailscale ACL を絞る**: implementer ノードからの到達先を **Lexora（naysayer 用エンドポイント）と magickit 等の一部許可ツールに限定**。Vaultwarden / SSH / その他内部ホスト・ポートには到達不可。
@@ -201,6 +205,58 @@ Drive→Git 移行（Phase 2）は 2026-09-11 に完了し、`spec/adr_index.yam
   足したサーバーが chatroom を経由しない通信経路を開かないことを説明し、あわせて T43 の `spawn.ready`
   （connect 完了 = ready）の条件を設計し直すこと。
 - 記録: chatroom thread `T-agmsg-transport-lessons-readiness-session-claim-board`（Bohr msg-4957、Einstein msg-4956 ほか）。
+
+---
+
+## 8. Amendment (2026-10-04): loop host を兼用 PC として認め、§2.4 の必須条件を egress の迂回禁止に絞る — Takahito 判断
+
+**本改訂は Takahito（human owner）の Tier-C 判断である。** trilateral では X′ / Y / Z の 3 案まで
+収束していた（chatroom thread `T-real-infra-values-egress-from-agent-context`、Bohr msg-6359、
+Einstein msg-6362 で承認）。Takahito はそのどれでもなく、下の (b) だけを実施して運転を続ける判断をした
+（2026-10-04、operator との対話で決定）。
+
+### 前提が崩れていた事実（2026-10-02〜04 の実測）
+
+§2.4 は「独立 PC」を前提にしていたが、`{{HOST_LOOP}}` はそうなっていなかった。
+
+- (a) **Vaultwarden に届く。** ただし host 上に解錠の材料は無かった: `bw` CLI はログアウト状態
+  （状態ファイルは接続先設定とアプリ ID のみ）、`BW_*` 環境変数なし、ブラウザ拡張・デスクトップアプリなし。
+  金庫はクライアント側で暗号化されており、到達だけでは中身は読めない。
+- (b) **プログラム単位の迂回があった。** 外向きは既定で遮断・Squid 許可リスト経由が設計だが、Store 版
+  アプリの packaged-app 許可ルール（`…-Out-Allow-AllCapabilities`）が Store 版 PowerShell 7・Windows
+  ターミナル・Take a Test に宛先・ポート Any の直接通信を許していた。loop の `pwsh` は Store 版なので、
+  implementer は `pwsh -c "Invoke-WebRequest … -NoProxy"` だけで許可リストもログも迂回できた（実測: 直接
+  接続が 200）。他のプログラム（`curl.exe`・Python）は遮断されていた。
+- (c) **implementer から作業ユーザーの長期 credential が見える。** user env の reviewer 用 PAT と通知用
+  webhook、gh keyring の PAT、Claude の OAuth credentials file。
+- (d) **implementer は作業ユーザーと同じ OS user で動く。**
+
+### 決定内容
+
+1. **(b) だけを必須とする。** loop host 上に、implementer が起動できるプログラムが Squid の許可リストを
+   迂回して任意の宛先へ出られる外向き許可ルールがあってはならない。
+   - 2026-10-04 に該当 3 ルールを無効化した。結果: Store 版 `pwsh` の直接接続は遮断、Squid 経由の GitHub
+     と tailnet（Lexora・dashboard）は従来どおり到達。
+   - Store アプリの更新はこのルールを再登録するので、SYSTEM の scheduled task（`spirrow-egress-guard`、
+     起動時と毎時）が再び無効化し、無効化した事実をログに残す。再登録を見つけて無効化したことは試験で確認済み。
+2. **兼用 PC を認める。** §2.4 の「独立 PC」は前提から外す。
+3. **(a)・(c)・(d) は実施しない。** 以下を残留リスクとして受け入れる:
+   - implementer は作業ユーザーの長期 credential（(c) に列挙）を読める。GitHub は仕事に必要で許可リスト
+     から外せないため、読んだものを PR・issue・comment・push で GitHub に書き出す経路は残る。(b) により、
+     書き出し先は許可リスト内の宛先に限られ、Squid のログに残る。
+   - Vaultwarden に届く。解錠の材料を host に置かないこと（`bw` をこの host でログイン・アンロックした
+     ままにしない）を運用で守る。
+   - implementer と作業ユーザーの間に OS レベルの分離は無い。
+4. **自律運転は止めない。** X′（4 点完了まで停止）は採らない。
+
+### 変えないもの
+
+- §2.4 の **scoped credentials の方針そのもの**（implementer に渡す GitHub token は最小権限）は維持する。
+  受け入れたのは「作業ユーザーの credential が同じ OS user から読める」ことであって、implementer 用 token の
+  権限を広げることではない。
+- `develop → main` の merge は Tier-C のまま。
+- 将来 (c)・(d) を行う場合は本 §8 を改訂する。そのときの作業内容は `T-real-infra-values-egress-from-agent-context`
+  の Bohr msg-6359 §2 にある。
 
 ---
 
