@@ -338,7 +338,8 @@ async def test_n1_notice_is_classified_as_a_misroute(
     mcp = _FakeChatroomMcp()
     _seed(mcp, body=_BODIES[body_id], field=_FIELDS[field_id], consulted=True)
     conductor, _ = _run_parts(mcp)
-    await conductor.run()
+    outcome = await conductor.run()
+    assert outcome.stop_reason is StopReason.HUMAN
     (post,) = mcp.posts
     content = str(post["content"])
     marker = parse_stop_marker(content)
