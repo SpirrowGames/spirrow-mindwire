@@ -330,15 +330,19 @@ async def run_tick(
                 reason = f"author-role-unreadable: {head.author}"
                 report.errors.append({"thread_id": head.thread_id, "reason": reason})
                 continue
-        report.classify(classify_stop(stop, author_is_human=bool(human)), head.thread_id)
         if stop.status is StopStatus.BLOCKED_ON:
             park = park_of(stop, thread_id=head.thread_id, head_msg_id=head.msg_id, project=project)
             if park is None:
+                # A park whose trigger cannot be read will never wake, so it must not be counted
+                # as "waiting on a condition": that would show a stall as a safe park. It is
+                # counted as unclassified (accident (4)), where the digest lists it by thread.
+                report.classify(StopClass.UNCLASSIFIED, head.thread_id)
                 report.errors.append(
                     {"thread_id": head.thread_id, "reason": f"trigger-unreadable: {stop.raw}"}
                 )
-            else:
-                parks.append(park)
+                continue
+            parks.append(park)
+        report.classify(classify_stop(stop, author_is_human=bool(human)), head.thread_id)
 
     reader = FactReader(
         mcp=mcp,

@@ -499,6 +499,21 @@ async def test_tick_wakes_fired_parks_and_holds_the_rest() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("operand", ["thread:not_a_thread", "pr:not-a-pr", "queue-empty:p:nope"])
+async def test_an_unreadable_trigger_is_unclassified_not_parked(operand: str) -> None:
+    """PR #455 advisory: a park that can never wake is not counted as waiting on a condition."""
+    mcp = _TickMcp()
+    content = f"w\n\nSTOP: blocked-on {operand} wake:Bohr\nNEXT: none"
+    mcp.thread("p", "T-1", content=content)
+    report = (await run_tick(mcp=mcp, gh=_Gh({}), project="p", roster=_ROSTER)).as_dict()
+    assert report["counts"] == {"done": 0, "blocked_on": 0, "unclassified": 1, "human_close": 0}
+    assert report["unclassified"] == ["T-1"]
+    (error,) = report["errors"]
+    assert error["thread_id"] == "T-1" and error["reason"].startswith("trigger-unreadable: ")
+    assert report["woken"] == [] and report["held"] == [] and mcp.posts == []
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("status", sorted(DEPLOY_TERMINAL_STATUSES))
 async def test_a_terminal_deploy_fires_the_park(status: str) -> None:
     """The deploy arm's FIRED branch (PR #455 advisory: only ``running`` was covered)."""
