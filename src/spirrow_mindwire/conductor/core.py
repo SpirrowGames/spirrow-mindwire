@@ -343,6 +343,14 @@ class StopReason(StrEnum):
     # tick launches the same head again. Not terminal (head_skip treats it like ``ci_wait``): the
     # bound is the stall watchdog, which stands the third same-head launch down with a notice.
     RESUME_RETRY = "resume_retry"
+    # Gate-only slice (T-sweep-starves-deep-candidates PR-B, Bohr msg-6313 §1' / msg-6316): a
+    # gate-lane run (``--gate-only``) posted its RC relay or R4 ci-route and stopped right before
+    # spawning the implementer. The post stays the unprocessed head, so the next tick decides it
+    # ``LAUNCH lane=role`` and the gate resume (:mod:`.gate_resume`) picks it up there, at the back
+    # of the fair role queue. Like ``ci_wait``: not terminal, posts nothing of its own, notifies
+    # nobody. Deliberately not ``ROUND_CAP``, which is the runaway backstop and means something
+    # else.
+    SLICE_END = "slice_end"
     # The PR-gate APPROVEd a PR whose merge is the human's (base=main). Not a decision: opening the
     # PR already asked for the merge, and the merge-wait PR list carries it (Takahito, msg-4361
     # "main へのマージは判断点から外す"; restated 2026-10-03). The relay ends ``NEXT: human`` so
@@ -483,6 +491,7 @@ class Conductor:
         retry_of: RetryOf | None = None,
         decisions_log_path: Path | None = None,
         run_phase: RunPhase | None = None,
+        gate_only: bool = False,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -523,6 +532,10 @@ class Conductor:
         # ``None`` makes every RC resume CONTRADICTED (fall through to ``_route``), never VERIFIED.
         self._review_source = review_source
         self._review_login = review_login
+        # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1' / msg-6316). Set only
+        # by the sweep's gate-lane launch (``--gate-only``); a hand run and a role-lane launch keep
+        # ``False`` and run as before. See :meth:`_slices_before_implementer` for when it applies.
+        self._gate_only = gate_only
         # ADR-2026-09-14-21 D-2 / D-3: identities the conductor must NOT spawn, by embodiment.
         # Merged over the ADR's shipped default (Fermi = web_ai_chat) so a loop host that never
         # wrote the config line still refuses to spawn-attempt a web identity. An identity absent
@@ -776,6 +789,17 @@ class Conductor:
                                 forced,
                                 forced_saveable,
                             )
+                        # Gate-only slice (msg-6313 §1'): the ci-route post is written (its marker
+                        # keys the next R5) and stays the head; the implementer is resumed from it
+                        # on a later tick, in the role lane.
+                        if self._slices_before_implementer(route_msg):
+                            return self._stop(
+                                round_index,
+                                StopReason.SLICE_END,
+                                route_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
                         # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
                         # this round's fetch, so it is not in ``messages``. The context builder
                         # requires the trigger to be present; append it NON-destructively so
@@ -815,6 +839,13 @@ class Conductor:
                         else StopReason.HUMAN
                     )
                     return self._stop(round_index, reason, last, forced, forced_saveable)
+                # Gate-only slice (msg-6313 §1'): the relay is posted and stays the head; the
+                # implementer is resumed from it on a later tick, in the role lane. An advisory
+                # APPROVE that routes to the implementer (U3') is not resumable and is not sliced.
+                if self._slices_before_implementer(relay_msg):
+                    return self._stop(
+                        round_index, StopReason.SLICE_END, relay_msg_id, forced, forced_saveable
+                    )
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
                 # R-1b: ``relay_msg`` post-dates this round's fetch; hand the builder
@@ -2888,6 +2919,50 @@ class Conductor:
             )
             raise StalledError(stall_event)
         return self._stop(round_index, StopReason.STALLED, posted_id, forced, forced_saveable)
+
+    def _slices_before_implementer(self, posted: dict[str, Any]) -> bool:
+        """Gate-only slice: stop before spawning the implementer on ``posted``? (msg-6313 §1').
+
+        True only when all hold:
+
+        - this run is a gate-lane run (``gate_only``);
+        - both sources the gate resume reads are wired (msg-6316 PR-B): without them the next
+          tick's resume could never be VERIFIED, so slicing would strand the work. Logged as
+          ``conductor.gate_only.ignored reason=resume_unavailable`` and the run goes on inline;
+        - ``posted`` is exactly what the next tick's :func:`~.gate_resume.resume_candidate` will
+          accept (same function, same author / body / handoff test). This is what keeps "sliced
+          but not resumable" structurally impossible: anything the resume would not pick up — an
+          advisory APPROVE routed to the implementer (U3'), a relay missing its verdict footer —
+          is logged as ``reason=not_resumable`` and dispatched inline, as before.
+
+        The post itself is left as the head: no ``processed_msg_id`` is recorded for it, so the
+        next tick's decide sees an unprocessed head naming the implementer (``LAUNCH lane=role``).
+        """
+        if not self._gate_only:
+            return False
+        if self._rollup_source is None or self._review_source is None:
+            logger.info("conductor.gate_only.ignored reason=resume_unavailable")
+            return False
+        body = _content(posted)
+        handoff = resolve_handoff(body, self._roster)
+        candidate = resume_candidate(
+            author=_author(posted),
+            body=body,
+            names_implementer=(
+                handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role
+            ),
+        )
+        if candidate is None:
+            logger.info("conductor.gate_only.ignored reason=not_resumable")
+            return False
+        logger.info(
+            "conductor.gate_only.slice_end pr=%s kind=%s sha=%s msg=%s",
+            candidate.pr.slug,
+            candidate.kind.value,
+            candidate.head_sha,
+            _msg_id(posted),
+        )
+        return True
 
     async def _dispatch_implementer(
         self,

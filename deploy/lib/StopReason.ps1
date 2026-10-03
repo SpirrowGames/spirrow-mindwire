@@ -47,6 +47,10 @@
 #               (T-sweep-starves-deep-candidates, Bohr msg-6318). Nothing is posted; the next tick
 #               retries, and the stall watchdog stands the third same-head launch down with a
 #               STALLED notice ('stalled_to_human', which IS in the map).
+#   'slice_end' — a gate-lane run (--gate-only) posted its REQUEST_CHANGES relay or R4 ci-route and
+#               stopped before spawning the implementer (T-sweep-starves-deep-candidates PR-B,
+#               Bohr msg-6313 §1′). The post stays the head; the next tick launches it in the role
+#               lane and the gate resume picks it up. Routine hand-off, not a stop anyone waits on.
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1

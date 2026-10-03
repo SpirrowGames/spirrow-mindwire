@@ -284,6 +284,18 @@ function Get-PostRunAction {
     return 'continue'
 }
 
+# The conductor arguments that depend on the lane (T-sweep-starves-deep-candidates PR-B, Bohr
+# msg-6313 §1′). A gate-lane launch gets `--gate-only`: the conductor posts the gate's relay (or the
+# R4 ci-route) and stops on `slice_end` instead of spawning the implementer, so the implementer's
+# turn waits in the fair role queue rather than riding the priority lane. Every other lane gets
+# nothing. The flag is spelled only here; the wrapper's dispatch loop is the one caller, and
+# deploy/run-conductor.ps1 (a hand run) never adds it.
+function Get-ConductorLaneArgs {
+    param([string]$Lane)
+    if ($Lane -eq 'gate') { return @('--gate-only') }
+    return @()
+}
+
 # The invariant (msg-5596): when the tick had gate candidates and a role turn was admitted, at
 # least one gate candidate was attempted before that role turn. Returns $null when it holds, or a
 # description of the violation.

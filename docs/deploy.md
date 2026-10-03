@@ -481,6 +481,18 @@ The code is in `deploy/lib/SweepFairness.ps1`, and the tests are in `tests/Test-
   and a gate that did work does not stop the sweep. After the gate lane, role turns run as before:
   the first one that did work ends the sweep. Gate failures count toward the same K-budget, and
   reaching K stops both lanes.
+- **Gate-only slice.** A gate-lane launch passes `--gate-only` to the conductor (role-lane launches
+  and hand runs do not). When the gate returns REQUEST_CHANGES, or CI is red on the head (R4), the
+  conductor posts the relay (or the ci-route) and stops on `slice_end` instead of starting the
+  implementer. The post stays the head, so the next tick decides it LAUNCH in the role lane and the
+  gate resume restarts the implementer from it, after checking GitHub. The trade-off is deliberate:
+  a CI-red fix or a REQUEST_CHANGES fix no longer jumps ahead of other threads. It waits its turn in
+  the role queue, because only the cheap part (firing the gate) gets priority. In the §0 measurement
+  (msg-6312), 88% of gate-lane time was the implementer's turn riding the priority lane. The slice
+  is skipped when the conductor has no rollup or review source wired
+  (`conductor.gate_only.ignored reason=resume_unavailable`). It is also skipped for a relay the
+  resume would not pick up (`reason=not_resumable`, for example the first advisory APPROVE). Both of
+  those run inline as before. `slice_end` is not terminal and sends no notification.
 - **Budgets — two clocks, checked before every launch.**
 
   | Admission of | Condition |
