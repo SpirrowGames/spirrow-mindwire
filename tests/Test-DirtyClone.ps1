@@ -323,6 +323,27 @@ Send-NotificationIfChanged -State $st -Key $n1.key -Signature $n1.signature -Mes
 Check 'round trip: the same fault after a release alerts again' 2 $script:sent.Count
 
 Write-Host ''
+Write-Host 'parking — the notice contract fails loudly on drift (PR #435 gate round 2)'
+$okNotice = Get-DirtyCloneNotice -RepoDir $repoP -CandidateKey 'p::T-1' -Output $wrongHead.output -ExitCode 8
+$pfNotice = Get-DirtyCloneNotice -RepoDir $repoP -CandidateKey 'p::T-1' -Output @('garbage') -ExitCode 8
+$cParked = @{}
+$threw = $false; try { Set-DirtyCloneParked -Parked $cParked -RepoDir $repoP -Notice $pfNotice -NowIso 'n' } catch { $threw = $true }
+Check 'contract: a parse-failed notice (null head) still parks' $false $threw
+foreach ($drop in 'repo_key', 'reason', 'head', 'detail', 'signature') {
+    $bad = $okNotice.Clone(); $bad.Remove($drop)
+    $msg = ''
+    try { Set-DirtyCloneParked -Parked @{} -RepoDir $repoP -Notice $bad -NowIso 'n' } catch { $msg = "$_" }
+    Check "contract: dropping '$drop' throws and names it" $true ($msg -match "missing key\(s\): $drop")
+}
+foreach ($blank in 'repo_key', 'reason', 'signature') {
+    $bad = $okNotice.Clone(); $bad[$blank] = ''
+    $p = @{}; $msg = ''
+    try { Set-DirtyCloneParked -Parked $p -RepoDir $repoP -Notice $bad -NowIso 'n' } catch { $msg = "$_" }
+    Check "contract: empty '$blank' throws" $true ($msg -match "'$blank' is empty")
+    Check "contract: empty '$blank' writes nothing" 0 $p.Count
+}
+
+Write-Host ''
 Write-Host 'parking — state file rows normalise'
 $fromJson = '{"k": {"repo_dir": "C:/x", "reason": "wrong_head", "head": "f", "detail": "", "since": "s", "signature": "g"}, "bad": {"reason": "x"}}' | ConvertFrom-Json -AsHashtable
 $norm = ConvertTo-DirtyCloneParking -State $fromJson

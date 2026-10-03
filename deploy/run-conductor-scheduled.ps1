@@ -2918,6 +2918,14 @@ function ConvertTo-DirtyCloneParking {
 # is never moved by a later refusal or re-judge.
 function Set-DirtyCloneParked {
     param([hashtable]$Parked, [string]$RepoDir, [hashtable]$Notice, [string]$NowIso)
+    # The notice is Get-DirtyCloneNotice's hashtable. Check its keys here, so a later rename or drop
+    # there throws instead of writing empty fields into dirty-clones.json (PR #435 gate round 2).
+    # `head` and `detail` must be present but may be empty: a parse-failed notice has no head.
+    $missing = @('repo_key', 'reason', 'head', 'detail', 'signature' | Where-Object { -not $Notice.ContainsKey($_) })
+    if ($missing.Count -gt 0) { throw "Set-DirtyCloneParked: notice is missing key(s): $($missing -join ', ')" }
+    foreach ($f in 'repo_key', 'reason', 'signature') {
+        if (-not "$($Notice[$f])") { throw "Set-DirtyCloneParked: notice key '$f' is empty" }
+    }
     $key = $Notice.repo_key
     $since = $NowIso
     if ($Parked.ContainsKey($key) -and $Parked[$key].since) { $since = "$($Parked[$key].since)" }
