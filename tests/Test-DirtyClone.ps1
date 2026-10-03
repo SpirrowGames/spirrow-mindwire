@@ -7,6 +7,9 @@
 #   * keep launching candidates on OTHER repos (Einstein msg-5778 #1);
 #   * notify on the per-repo key __dirty_clone__/<repo>, even when the payload row is unreadable,
 #     and never on a GitHub credential key (Einstein msg-5776 #2).
+# T-clone-guard-pin-ignored-only-in-mindwire, design v2.1 D-3 (Bohr msg-6162 / msg-6164): exit 8
+# also reverts the LAUNCH commit (never STALLED), parks the repo, and re-judges it with one
+# `mindwire clone-check` per tick until it is clean (see the second half of this file).
 #
 # Functions are lifted out of the sweep script's AST (dot-sourcing would run the sweep), and the
 # loop's ORDERING — which a lifted function cannot show — is checked on the AST of the loop body.
@@ -151,6 +154,171 @@ Check 'exit 2 still continues the sweep' $true ($env2Text -match '(?m)^\s*contin
 Check 'exit 2 branch does not mark the repo dirty' $false ($env2Text -match 'dirtyRepoDirs')
 $posEnv2 = $body.IndexOf('if ($code -eq 2)')
 Check 'exit 2 branch still precedes the generic non-zero branch' $true ($posEnv2 -ge 0 -and $posEnv2 -lt $posNonZero)
+
+# ===================================================================================================
+# T-clone-guard-pin-ignored-only-in-mindwire, design v2.1 D-3 (Bohr msg-6162 / msg-6164, endorsed by
+# Einstein msg-6165): exit 8 is not counted against the thread; the REPO is parked and re-judged by
+# one `mindwire clone-check` per tick.
+# ===================================================================================================
+foreach ($name in 'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update-DirtyCloneParking',
+                  'Get-DirtyCloneDigestLines', 'New-DailyDigest', 'Get-FingerprintHint',
+                  'Get-DerivedQuarantineState', 'Format-DurationDigest', 'ConvertTo-UtcInstant') {
+    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $fn) { throw "function not found in sweep script: $name" }
+    Invoke-Expression $fn.Extent.Text
+}
+
+function New-Payload {
+    param([string]$Reason, [string]$Head)
+    $obj = [ordered]@{ repo_dir = 'x'; reason = $Reason; head = $Head; porcelain = @(); detail = "d-$Reason" }
+    return 'MINDWIRE_DIRTY_CLONE_PAYLOAD ' + ($obj | ConvertTo-Json -Compress)
+}
+
+# A model of one sweep tick over ONE repo, wired the way the real loop is (the AST checks below pin
+# the real loop to the same order): re-judge parked repos → skip parked candidates → commit-launch →
+# daemon → on exit 8 revert the commit and park the repo. head_skip's launches_same_head is modelled
+# as a counter that commit-launch increments and revert-launch decrements; T42 fires at 3.
+$repoP = Join-Path ([System.IO.Path]::GetTempPath()) 'clone-P'
+$repoKeyP = ConvertTo-DirtyCloneRepoKey $repoP
+$script:sim = @{ launches = 0; daemonRuns = 0; commits = 0; reverts = 0; stalled = 0; lastLaunchCount = 0 }
+function Invoke-SimTick {
+    param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [scriptblock]$Daemon, [string]$Now)
+    $null = Update-DirtyCloneParking -Parked $Parked -NotifyState $NotifyState -Probe $Probe -NowIso $Now
+    $disp = @{}
+    foreach ($cand in @(@{ key = 'p::T-1'; repo_dir = $repoP }, @{ key = 'p::T-2'; repo_dir = $repoP })) {
+        $dirtyThisTick = @{}
+        if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $Parked) { $disp[$cand.key] = 'dirty-clone-parked'; continue }
+        $script:sim.commits++
+        $script:sim.launches++
+        $script:sim.lastLaunchCount = $script:sim.launches
+        if ($script:sim.launches -ge 3) { $script:sim.stalled++ }
+        $script:sim.daemonRuns++
+        $r = & $Daemon
+        if ($r.code -eq $DirtyCloneExitCode) {
+            $script:sim.launches--          # Invoke-HeadSkipRevertLaunch
+            $script:sim.reverts++
+            $notice = Get-DirtyCloneNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $r.output -ExitCode 8
+            Set-DirtyCloneParked -Parked $Parked -RepoDir $cand.repo_dir -Notice $notice -NowIso $Now
+            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $notice.signature -Message $notice.message
+            $disp[$cand.key] = 'dirty-clone'
+            continue
+        }
+        $disp[$cand.key] = 'worked'
+        break  # a worked thread ends the tick, as in the real sweep
+    }
+    return $disp
+}
+
+Write-Host ''
+Write-Host 'parking — wrong_head held for 5 ticks'
+$parked = @{}
+$notify = @{}
+$script:sent = @()
+$wrongHead = @{ code = 8; output = @(New-Payload -Reason 'wrong_head' -Head 'feature/x'); stderr = '' }
+$script:probeCalls = 0
+$probeWrong = { param($d) $script:probeCalls++; return $wrongHead }
+$daemonWrong = { return $wrongHead }
+$t0 = '2026-10-03T00:00:00.0000000Z'
+foreach ($i in 1..5) {
+    $d = Invoke-SimTick -Parked $parked -NotifyState $notify -Probe $probeWrong -Daemon $daemonWrong -Now ("2026-10-03T00:0{0}:00.0000000Z" -f $i)
+    if ($i -eq 1) { $t0 = $parked[$repoKeyP].since; $tick1 = $d }
+}
+Check 'tick 1: first candidate refused (exit 8)' 'dirty-clone' $tick1['p::T-1']
+Check 'tick 1: second candidate on the same clone is parked, not launched' 'dirty-clone-parked' $tick1['p::T-2']
+Check '5 ticks: the daemon ran once' 1 $script:sim.daemonRuns
+Check '5 ticks: one notification' 1 $script:sent.Count
+Check '5 ticks: no STALLED' 0 $script:sim.stalled
+Check '5 ticks: net LAUNCH commits 0 (the one commit was reverted)' 0 ($script:sim.commits - $script:sim.reverts)
+Check '5 ticks: clone-check ran once per tick after parking (4)' 4 $script:probeCalls
+Check 'parked record carries reason' 'wrong_head' $parked[$repoKeyP].reason
+Check 'parked record carries head' 'feature/x' $parked[$repoKeyP].head
+Check 'parked record carries detail' 'd-wrong_head' $parked[$repoKeyP].detail
+Check 'parked record carries signature' 'dirty-clone:wrong_head:feature/x' $parked[$repoKeyP].signature
+Check 'parked record keeps repo_dir for the probe' $repoP $parked[$repoKeyP].repo_dir
+
+Write-Host ''
+Write-Host 'parking — the state changes while parked (wrong_head -> dirty_tree)'
+$dirtyTree = @{ code = 8; output = @(New-Payload -Reason 'dirty_tree' -Head 'main'); stderr = '' }
+$sinceBefore = $parked[$repoKeyP].since
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T01:00:00.0000000Z'
+Check 'changed state: a second notification' 2 $script:sent.Count
+Check 'changed state: reason rewritten' 'dirty_tree' $parked[$repoKeyP].reason
+Check 'changed state: signature rewritten' 'dirty-clone:dirty_tree:main' $parked[$repoKeyP].signature
+Check 'changed state: since unchanged' $sinceBefore $parked[$repoKeyP].since
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T01:05:00.0000000Z'
+Check 'unchanged state: no further notification' 2 $script:sent.Count
+
+Write-Host ''
+Write-Host 'parking — clone-check could not judge (exit 1)'
+$probeFail = @{ code = 1; output = @(); stderr = "clone-check: cannot judge x: RuntimeError: boom" }
+$script:sim.daemonRuns = 0
+foreach ($i in 1..2) {
+    $d = Invoke-SimTick -Parked $parked -NotifyState $notify -Probe { param($x) $probeFail } -Daemon $daemonWrong -Now '2026-10-03T02:00:00.0000000Z'
+}
+Check 'probe-failed: repo stays parked' $true $parked.ContainsKey($repoKeyP)
+Check 'probe-failed: candidates parked, no launch' 'dirty-clone-parked' $d['p::T-1']
+Check 'probe-failed: daemon never started' 0 $script:sim.daemonRuns
+Check 'probe-failed: exactly one notification over two ticks' 3 $script:sent.Count
+Check 'probe-failed: signature names the exit' 'dirty-clone:probe-failed:1' $parked[$repoKeyP].signature
+Check 'probe-failed: notice carries the stderr tail' $true ($script:sent[-1] -like '*RuntimeError: boom*')
+Check 'probe-failed: since unchanged' $sinceBefore $parked[$repoKeyP].since
+
+Write-Host ''
+Write-Host 'parking — unparseable clone-check payload stays parked (parse-failed)'
+$bad = @{ code = 8; output = @('MINDWIRE_DIRTY_CLONE_PAYLOAD {nope'); stderr = '' }
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($x) $bad } -NowIso '2026-10-03T02:30:00.0000000Z'
+Check 'parse-failed: still parked' $true $parked.ContainsKey($repoKeyP)
+Check 'parse-failed: signature' 'dirty-clone:parse-failed' $parked[$repoKeyP].signature
+
+Write-Host ''
+Write-Host 'parking — digest rows'
+$digestLines = Get-DirtyCloneDigestLines -Parked $parked
+Check 'digest: header counts parked repos' $true ($digestLines[0] -like '駐機中 repo*1 件')
+Check 'digest: one row naming the repo, reason and since' $true ($digestLines[1] -like "*$repoP*reason=parse-failed*since=$sinceBefore*")
+Check 'digest: nothing when nothing is parked' 0 (Get-DirtyCloneDigestLines -Parked @{}).Count
+$script:StarvedThreshold = [TimeSpan]::FromHours(24)
+$nowUtc = [DateTime]::Parse('2026-10-03T03:00:00Z', $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+$dg = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $nowUtc -LiveKeys @() -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors @() -Budget 1800 `
+    -ParkedCloneLines $digestLines
+Check 'digest: the 駐機中 row is rendered' $true ($dg -like "*駐機中 repo*$repoP*")
+Check 'digest: budget still holds' $true ($dg.Length -le 1800)
+$dg0 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $nowUtc -LiveKeys @() -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors @()
+Check 'digest: no 駐機中 section without parked repos' $false ($dg0 -like '*駐機中 repo*')
+
+Write-Host ''
+Write-Host 'parking — the clone is clean again'
+$script:sim.launches = 0; $script:sim.daemonRuns = 0
+$clean = @{ code = 0; output = @(); stderr = '' }
+$d = Invoke-SimTick -Parked $parked -NotifyState $notify -Probe { param($x) $clean } -Daemon { @{ code = 0; output = @() } } -Now '2026-10-03T04:00:00.0000000Z'
+Check 'clean: repo released' $false $parked.ContainsKey($repoKeyP)
+Check 'clean: launched in the same tick' 'worked' $d['p::T-1']
+Check 'clean: launches_same_head starts at 1' 1 $script:sim.lastLaunchCount
+Check 'clean: alert signature forgotten, so a recurrence alerts again' $false $notify.ContainsKey("__dirty_clone__/$repoKeyP")
+
+Write-Host ''
+Write-Host 'parking — state file rows normalise'
+$fromJson = '{"k": {"repo_dir": "C:/x", "reason": "wrong_head", "head": "f", "detail": "", "since": "s", "signature": "g"}, "bad": {"reason": "x"}}' | ConvertFrom-Json -AsHashtable
+$norm = ConvertTo-DirtyCloneParking -State $fromJson
+Check 'normalise: row kept' 'wrong_head' $norm['k'].reason
+Check 'normalise: row without repo_dir dropped' $false $norm.ContainsKey('bad')
+
+# --- the real loop: D-3 wiring (AST) ------------------------------------------------------------------
+Write-Host ''
+Write-Host 'parking — the real sweep is wired the same way'
+$posParkedSkip = $body.IndexOf('-DirtyRepoDirs $dirtyClonesParked')
+Check 'parked skip precedes commit-launch' $true ($posParkedSkip -ge 0 -and $posParkedSkip -lt $posCommit)
+Check 'branch reverts the LAUNCH commit' $true ($branchText -match 'Invoke-HeadSkipRevertLaunch')
+Check 'branch parks the repo' $true ($branchText -match 'Set-DirtyCloneParked')
+Check 'branch persists the parking' $true ($branchText -match 'Save-JsonState -Path \$dirtyClonesStatePath')
+$scriptText = $ast.Extent.Text
+$posUpdate = $scriptText.IndexOf('Update-DirtyCloneParking -Parked $dirtyClonesParked')
+Check 're-judge runs before the candidate loop' $true ($posUpdate -ge 0 -and $posUpdate -lt $loop.Extent.StartOffset)
+Check 're-judge probes with Invoke-CloneCheck' $true ($scriptText -match 'Probe \{ param\(\$d\) Invoke-CloneCheck -RepoDir \$d \}')
+Check 'digest receives the parked rows' $true ($scriptText -match '-ParkedCloneLines \(Get-DirtyCloneDigestLines -Parked \$dirtyClonesParked\)')
+$cc = $functions | Where-Object { $_.Name -eq 'Invoke-CloneCheck' } | Select-Object -First 1
+Check 'Invoke-CloneCheck runs the clone-check subcommand' $true ($cc.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-check', '--repo-dir'")
 
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all dirty-clone checks passed"

@@ -19,8 +19,15 @@ the index lock ``git status`` would otherwise grab to refresh the stat cache (de
   → else ``op_in_progress``;
 * ``index.lock`` is absent, or goes away within :data:`LOCK_WAIT_S` (polled every
   :data:`LOCK_POLL_S`) → else ``clone_busy``;
+* ``git check-ignore -q .mindwire/pin`` says the pin path is ignored → else ``pin_not_ignored``
+  (detail: ``pin is tracked in this repo`` when ``git ls-files --error-unmatch`` finds it,
+  ``exclude not effective`` otherwise). Only the spirrow-mindwire repo lists ``.mindwire/`` in
+  its ``.gitignore``; for every clone the dispatcher calls
+  :func:`spirrow_mindwire.pin_ignore.ensure_pin_ignored` *before* this guard, which keeps
+  ``/.mindwire/`` in the clone's ``info/exclude``. This check verifies the result, whichever of the
+  two makes it true (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1 D-1);
 * ``git status --porcelain=v1 -z --untracked-files=normal`` prints nothing → else ``dirty_tree``
-  (``.mindwire/pin`` is git-ignored, so the pin the dispatcher writes never trips this);
+  (the pin is ignored by the check above, so the pin the dispatcher writes never trips this);
 * HEAD is a branch and that branch is the default branch → else ``wrong_head``. The default
   branch is ``refs/remotes/origin/HEAD``'s target; only when that ref does not exist does
   :data:`FALLBACK_DEFAULT_BRANCH` apply;
@@ -58,6 +65,7 @@ GIT_TIMEOUT_S = 10.0  # same budget as loop_resource's git probe
 LOCK_WAIT_S = 5.0
 LOCK_POLL_S = 0.25
 FALLBACK_DEFAULT_BRANCH = "main"
+PIN_PATH = ".mindwire/pin"  # the file spec_pin.SpecPinWriter writes, relative to the clone root
 PORCELAIN_MAX_ENTRIES = 20
 
 # Files / directories under the git dir that mean an operation stopped half-way.
@@ -81,6 +89,7 @@ class DirtyCloneReason(StrEnum):
     CLONE_BUSY = "clone_busy"
     WRONG_HEAD = "wrong_head"
     GIT_UNAVAILABLE = "git_unavailable"
+    PIN_NOT_IGNORED = "pin_not_ignored"
 
 
 class DirtyCloneError(Exception):
@@ -120,6 +129,21 @@ class DirtyCloneError(Exception):
             "porcelain": list(self.porcelain),
             "detail": self.detail,
         }
+
+
+def emit_dirty_clone_payload(exc: DirtyCloneError) -> None:
+    """Print the one ``MINDWIRE_DIRTY_CLONE_PAYLOAD <json>`` row the sweep wrapper parses.
+
+    The single writer of that row: ``loop_runner.main`` (daemon, exit 8) and
+    ``mindwire clone-check`` (parked-repo re-judge, exit 8) both call it, so the wrapper's
+    ``Get-DirtyCloneNotice`` reads one format (T-clone-guard-pin-ignored-only-in-mindwire,
+    design v2.1 D-3c).
+    """
+    import json
+    import sys
+
+    sys.stdout.write(f"{DIRTY_CLONE_PAYLOAD_PREFIX}{json.dumps(exc.payload())}\n")
+    sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -181,6 +205,22 @@ class CloneGuard:
                 )
 
         self._wait_for_index_lock(git_dir)
+
+        # No ``--no-index``: a tracked pin is reported as NOT ignored, which is what we want.
+        ignored = self._run(["check-ignore", "-q", PIN_PATH], head=None, ok_codes=(0, 1))
+        if ignored.returncode == 1:
+            tracked = self._run(
+                ["ls-files", "--error-unmatch", PIN_PATH], head=None, ok_codes=(0, 1)
+            )
+            raise self._error(
+                DirtyCloneReason.PIN_NOT_IGNORED,
+                head=self._head_or_none(),
+                detail=(
+                    "pin is tracked in this repo"
+                    if tracked.returncode == 0
+                    else "exclude not effective"
+                ),
+            )
 
         status = self._run(
             ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], head=None
@@ -281,8 +321,10 @@ __all__ = [
     "DIRTY_CLONE_EXIT_CODE",
     "DIRTY_CLONE_PAYLOAD_PREFIX",
     "ERROR_CODE",
+    "PIN_PATH",
     "CloneGuard",
     "DirtyCloneError",
     "DirtyCloneReason",
     "GitResult",
+    "emit_dirty_clone_payload",
 ]

@@ -377,7 +377,9 @@ exit 0
                 param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
                 $n.GetCommandName() -eq 'Invoke-BoundedUvProbe' }, $true))
     # +1 for Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b): no -UvOptions, like the eight.
-    Check 'ten helper call sites in the sweep script' 10 $helperCalls.Count
+    # +2 for Invoke-HeadSkipRevertLaunch and Invoke-CloneCheck (T-clone-guard-pin-ignored-only-in-
+    # mindwire D-3a / D-3c): no -UvOptions either.
+    Check 'twelve helper call sites in the sweep script' 12 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

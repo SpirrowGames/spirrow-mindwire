@@ -158,6 +158,9 @@ $ConductorKillUnconfirmedExitCode = 7
 # DIRTY_CLONE_EXIT_CODE in src/spirrow_mindwire/clone_guard.py (a pytest pins the two). Not 5: 5/6/7
 # are the wall-clock budget's codes above.
 $DirtyCloneExitCode = 8
+# Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
+# guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
+$CloneCheckTimeoutSeconds = 60
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -173,6 +176,9 @@ $notifyStatePath = Join-Path $dataDir "state\notified.json"
 # supersedes the old $headsStatePath (state\heads.json) — that file is deleted, its readers/
 # writers/merge-on-write have been removed as one atomic change (Bohr msg-1432 §W-2 update).
 $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
+# Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
+# D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
+$dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
@@ -1099,7 +1105,41 @@ function Invoke-HeadSkipCommitLaunch {
     if ($null -eq $readWarning -and $launchesSameHead -lt 1) {
         $readWarning = 'launches_same_head missing or < 1 in the committed record (key drift?)'
     }
-    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning }
+    # `commit_output` is the CLI's JSON line VERBATIM ({thread_id, record, prior_record}): it is the
+    # payload Invoke-HeadSkipRevertLaunch feeds back, never round-tripped through ConvertFrom-Json
+    # (which would re-shape its timestamps).
+    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning
+              commit_output = $jsonLine }
+}
+
+# Invoke `head_skip_decide.py --mode revert-launch --payload-file <tmp>` to undo ONE commit-launch
+# whose session never started — the daemon exited $DirtyCloneExitCode because the clone guard
+# refused the clone (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1 D-3a). $CommitOutput
+# is Invoke-HeadSkipCommitLaunch's `commit_output`. Returns @{ ok; error }. The CLI refuses when
+# the record moved since the commit, so a failure here never overwrites somebody else's write.
+function Invoke-HeadSkipRevertLaunch {
+    param([string]$CommitOutput, [string]$StateFilePath)
+    $decideScript = Join-Path $repoRoot "scripts\head_skip_decide.py"
+    if (-not (Test-Path -LiteralPath $decideScript)) {
+        return @{ ok = $false; error = "head_skip_decide.py not found at $decideScript" }
+    }
+    if (-not $CommitOutput) { return @{ ok = $false; error = "no commit-launch output to revert" } }
+    $tmp = $null
+    try {
+        $tmp = New-ProbeInputFile -Json $CommitOutput -Label 'head-skip-revert-launch'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-revert-launch' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--state-file', $StateFilePath, '--mode', 'revert-launch', '--payload-file', $tmp)
+    }
+    catch {
+        return @{ ok = $false; error = "head_skip revert-launch invocation failed: $($_.Exception.Message)" }
+    }
+    finally { Remove-ProbeInputFile -Path $tmp }
+    if (-not $r.ok) { return @{ ok = $false; error = "head_skip revert-launch invocation failed: $($r.error)" } }
+    if ($r.code -ne 0) {
+        $tail = (Get-ProbeOutputLines -Result $r | ForEach-Object { "$_" }) -join ' / '
+        return @{ ok = $false; error = "head_skip revert-launch exited $($r.code): $tail" }
+    }
+    return @{ ok = $true; error = $null }
 }
 
 # Invoke `head_skip_decide.py --mode commit-terminal --payload-file <tmp>` for one thread.
@@ -1982,7 +2022,12 @@ function New-DailyDigest {
         [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6),
         # T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3, RES-A-GAP):
         # the N of the 停止中 section, built from the $HumanParked rows that carry last_msg_at.
-        [TimeSpan]$StaleHumanThreshold = [TimeSpan]::FromHours(24)
+        [TimeSpan]$StaleHumanThreshold = [TimeSpan]::FromHours(24),
+        # T-clone-guard-pin-ignored-only-in-mindwire D-3d: the 駐機中 repo rows, built by the caller
+        # with Get-DirtyCloneDigestLines (so this renderer stays liftable without it). Emitted right
+        # under the summary line, where they are counted in every later section's running length;
+        # empty (the default) leaves the digest exactly as it was.
+        [string[]]$ParkedCloneLines = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2139,6 +2184,7 @@ function New-DailyDigest {
     $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
     $lines += $summary
     $lines += ""
+    if ($ParkedCloneLines.Count -gt 0) { $lines += $ParkedCloneLines }
 
     # T-digest-exceeds-discord-limit-and-is-dropped D-1: emit-with-budget helper. When $Budget is 0
     # every list is emitted in full (legacy behaviour, preserves existing tests). When $Budget > 0,
@@ -2808,8 +2854,13 @@ function Get-DirtyCloneNotice {
     }
     $sig = 'dirty-clone:parse-failed'
     $detailLine = '(payload parse failed)'
+    $reason = 'parse-failed'
+    $head = $null
+    $detail = ''
     if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'reason') {
         $head = if ($payload.head) { "$($payload.head)" } else { '-' }
+        $reason = "$($payload.reason)"
+        $detail = if ($payload.detail) { "$($payload.detail)" } else { '' }
         $sig = "dirty-clone:$($payload.reason):$head"
         $detailLine = "reason=$($payload.reason) head=$head"
         if ($payload.detail) { $detailLine += " ($($payload.detail))" }
@@ -2819,10 +2870,135 @@ function Get-DirtyCloneNotice {
         }
     }
     $body = ("MindWire: 共有 clone が汚れているため起動を拒否しました — **$CandidateKey** exit=$ExitCode。" +
-             "スレッドは無傷（quarantine 書かず）。この tick の同じ clone の候補は skip しました。`n" +
+             "スレッドは無傷（quarantine も STALLED のカウントもしない）。この clone は駐機し、clean に戻るまで同じ clone の候補は起動しません（毎 tick ``mindwire clone-check`` で再判定し、戻れば自動で再開）。`n" +
              "clone: $RepoDir`n$detailLine`n" +
              "clone を確認し、要る WIP は退避してからデフォルトブランチの clean な状態に戻してください（自動では片付けません）。")
-    return @{ key = "__dirty_clone__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey }
+    return @{ key = "__dirty_clone__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey
+              reason = $reason; head = $head; detail = $detail }
+}
+
+# --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
+# An exit $DirtyCloneExitCode used to be counted like any launch: the LAUNCH commit stayed in
+# head_skip.json, so three refused runs on one head reached T42's threshold and the conductor
+# posted a generic STALLED `NEXT: human` into a thread that had done nothing wrong (msg-6109).
+# Design v2.1 (Bohr msg-6162 / msg-6164, endorsed Einstein msg-6165):
+#   a. the refused run's LAUNCH commit is reverted (Invoke-HeadSkipRevertLaunch) — no backoff,
+#      no launches_same_head, no STALLED;
+#   b. the REPO is parked in $dirtyClonesStatePath: { repo_key: { repo_dir, reason, head, detail,
+#      since, signature } } (repo_dir is kept so the re-judge knows what to probe);
+#   c. at the head of every tick each parked repo gets ONE `mindwire clone-check` (no session, no
+#      MCP): exit 0 releases it, exit 8 re-reads the payload and keeps it parked (its candidates
+#      are skipped as 'dirty-clone-parked', no LAUNCH commit, no daemon), anything else keeps it
+#      parked as 'probe-failed' — an unjudgeable clone stays stopped;
+#   d. the reader is the operator (cleaning a clone is operator work, not a decision): the
+#      notification is the per-repo `__dirty_clone__/<repo>` key through Send-NotificationIfChanged
+#      (re-fires only when reason / head changes), plus one 駐機中 row per repo in the daily digest.
+#      Nothing is posted into any thread.
+
+# Normalise the state file's rows into hashtables (Get-JsonState returns PSCustomObjects inside).
+function ConvertTo-DirtyCloneParking {
+    param([hashtable]$State)
+    $out = @{}
+    if ($null -eq $State) { return $out }
+    foreach ($k in @($State.Keys)) {
+        $v = $State[$k]
+        if ($null -eq $v) { continue }
+        $row = @{}
+        foreach ($f in 'repo_dir', 'reason', 'head', 'detail', 'since', 'signature') {
+            $val = if ($v -is [hashtable]) { $v[$f] } elseif ($v.PSObject.Properties.Name -contains $f) { $v.$f } else { $null }
+            $row[$f] = if ($null -ne $val) { "$val" } else { $null }
+        }
+        if (-not $row.repo_dir) { continue }  # unprobeable without it; a fresh exit 8 re-adds it
+        $out["$k"] = $row
+    }
+    return $out
+}
+
+# Park (or re-park) one repo from a dirty-clone notice. `since` is the FIRST time it was parked and
+# is never moved by a later refusal or re-judge.
+function Set-DirtyCloneParked {
+    param([hashtable]$Parked, [string]$RepoDir, [hashtable]$Notice, [string]$NowIso)
+    $key = $Notice.repo_key
+    $since = $NowIso
+    if ($Parked.ContainsKey($key) -and $Parked[$key].since) { $since = "$($Parked[$key].since)" }
+    $Parked[$key] = @{
+        repo_dir = $RepoDir; reason = "$($Notice.reason)"; head = $Notice.head
+        detail = "$($Notice.detail)"; since = $since; signature = "$($Notice.signature)"
+    }
+}
+
+# Run `python -m spirrow_mindwire.cli clone-check --repo-dir <dir>` once, bounded. Returns
+# @{ code; output (stdout lines); stderr }. A probe that could not run or timed out reports code -1.
+function Invoke-CloneCheck {
+    param([string]$RepoDir)
+    $r = Invoke-BoundedUvProbe -Label 'clone-check' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-check', '--repo-dir', $RepoDir)
+    if (-not $r.ok) { return @{ code = -1; output = @(); stderr = "$($r.error)" } }
+    $out = @()
+    if ($r.stdout) { $out = @($r.stdout -split "`r?`n" | Where-Object { $_ -ne '' }) }
+    return @{ code = [int]$r.code; output = $out; stderr = "$($r.stderr)" }
+}
+
+# D-3c: re-judge every parked repo once. $Probe is a scriptblock taking the repo_dir and returning
+# Invoke-CloneCheck's shape (Invoke-CloneCheck in production, a stub in tests). Returns the repo
+# keys released this tick. Mutates $Parked and $NotifyState.
+function Update-DirtyCloneParking {
+    param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [string]$NowIso)
+    $released = @()
+    foreach ($key in @($Parked.Keys)) {
+        $rec = $Parked[$key]
+        $repoDir = "$($rec.repo_dir)"
+        $res = & $Probe $repoDir
+        $code = if ($null -ne $res -and $null -ne $res.code) { [int]$res.code } else { -1 }
+        if ($code -eq 0) {
+            $Parked.Remove($key)
+            # Forget the alert signature too, so the SAME fault coming back later alerts again.
+            $NotifyState.Remove("__dirty_clone__/$key")
+            $released += $key
+            Write-Log "dirty-clone-released ${repoDir}: clone-check exit 0 (parked since $($rec.since)) — candidates on it launch normally from this tick"
+            continue
+        }
+        if ($code -eq $DirtyCloneExitCode) {
+            # An unparseable payload falls into Get-DirtyCloneNotice's existing parse-failed path.
+            $notice = Get-DirtyCloneNotice -RepoDir $repoDir -CandidateKey '(clone-check)' -Output $res.output -ExitCode $code
+            Set-DirtyCloneParked -Parked $Parked -RepoDir $repoDir -Notice $notice -NowIso $NowIso
+            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $notice.signature -Message $notice.message
+            Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($notice.signature) (since $($Parked[$key].since))"
+            continue
+        }
+        # Exit 1 (could not judge), a timeout, or anything else: stay parked — an unjudgeable clone
+        # is not a clean one — and say so on the same per-repo key.
+        $tailLines = @("$($res.stderr)" -split "`r?`n" | Where-Object { $_ -ne '' } | Select-Object -Last 5)
+        $sig = "dirty-clone:probe-failed:$code"
+        $rec.reason = 'probe-failed'
+        $rec.detail = ($tailLines -join ' / ')
+        $rec.signature = $sig
+        $tailText = if ($tailLines.Count -gt 0) { $tailLines -join "`n" } else { '(stderr なし)' }
+        $body = ("MindWire: 駐機中の共有 clone を再判定できませんでした（mindwire clone-check exit=$code）。駐機は続けます。`n" +
+                 "clone: $repoDir`n$tailText")
+        Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $sig -Message $body
+        Write-Log "dirty-clone-probe-failed ${repoDir}: clone-check exit=$code — stays parked"
+    }
+    return , $released
+}
+
+# One 駐機中 row per parked repo for the daily digest (D-3d), oldest first. Each row is bounded so
+# a long detail cannot crowd out the budgeted sections below it. Empty when nothing is parked, so
+# a digest without parked repos is byte-identical to before.
+function Get-DirtyCloneDigestLines {
+    param([hashtable]$Parked)
+    if ($null -eq $Parked -or $Parked.Count -eq 0) { return , @() }
+    $rows = foreach ($k in $Parked.Keys) {
+        $r = $Parked[$k]
+        $head = if ($r.head) { "$($r.head)" } else { '-' }
+        $line = "  $($r.repo_dir)   reason=$($r.reason) head=$head since=$($r.since)"
+        if ($line.Length -gt 200) { $line = $line.Substring(0, 199) + '…' }
+        [PSCustomObject]@{ Line = $line; Since = "$($r.since)" }
+    }
+    $lines = @("駐機中 repo（共有 clone が汚れて起動拒否中・operator 作業）: $($Parked.Count) 件")
+    $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
+    $lines += ""
+    return , $lines
 }
 
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
@@ -4584,8 +4760,19 @@ try {
     $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
     $breakReason = $null       # human-readable reason for a mid-sweep break, or $null if it ran to end
     # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
-    # $DirtyCloneExitCode). Per tick only: the next tick's guard re-judges the clone.
+    # $DirtyCloneExitCode). Per tick only; the persistent record is $dirtyClonesParked below.
     $dirtyRepoDirs = @{}
+    # D-3b/c (T-clone-guard-pin-ignored-only-in-mindwire v2.1): repos parked by an earlier exit 8.
+    # Each gets exactly one `mindwire clone-check` here, before any candidate is looked at: exit 0
+    # releases it (its candidates launch this tick, launches_same_head starting at 1 because the
+    # refused launches were reverted), anything else keeps it parked.
+    $dirtyClonesParked = ConvertTo-DirtyCloneParking -State (Get-JsonState -Path $dirtyClonesStatePath)
+    if ($dirtyClonesParked.Count -gt 0) {
+        $nowIsoPark = (Get-Date).ToUniversalTime().ToString('o')
+        $null = Update-DirtyCloneParking -Parked $dirtyClonesParked -NotifyState $notifyState `
+            -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark
+        Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
+    }
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
     # `*_to_human` fallback are all "the loop parked on a human", and round_cap / empty_thread are
@@ -4664,6 +4851,13 @@ try {
         if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $dirtyRepoDirs) {
             $dispositions[$cand.key] = 'dirty-clone-skip'
             Write-Log "dirty-clone-skip $($cand.key): repo_dir=$($cand.repo_dir) was refused as dirty earlier this tick, not launching"
+            continue
+        }
+        # Parked by an earlier tick and still not clean after this tick's clone-check (D-3c): no
+        # LAUNCH commit, no daemon. Nothing about the thread is recorded — it is not its fault.
+        if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $dirtyClonesParked) {
+            $dispositions[$cand.key] = 'dirty-clone-parked'
+            Write-Log "dirty-clone-parked $($cand.key): repo_dir=$($cand.repo_dir) is parked (clone not clean), not launching"
             continue
         }
 
@@ -4917,9 +5111,20 @@ try {
             $dispositions[$cand.key] = 'dirty-clone'
             $notice = Get-DirtyCloneNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code
             $dirtyRepoDirs[$notice.repo_key] = $true
+            # D-3a: no session ran, so this launch must not count — not in head_skip's backoff, not
+            # in T42's launches_same_head (three refused runs used to become a STALLED `NEXT: human`
+            # in a blameless thread). A failed revert is logged and the sweep goes on: the repo is
+            # parked below, so no further launch can stack on top of the unreverted one.
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "dirty-clone $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN dirty-clone $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            # D-3b: park the repo until a clone-check says it is clean.
+            Set-DirtyCloneParked -Parked $dirtyClonesParked -RepoDir $cand.repo_dir -Notice $notice `
+                -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+            Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
             Send-NotificationIfChanged -State $notifyState -Key $notice.key `
                 -Signature $notice.signature -Message $notice.message
-            Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; other candidates on this repo_dir are skipped this tick, other repos CONTINUE"
+            Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; repo parked; other candidates on this repo_dir are skipped until clone-check passes, other repos CONTINUE"
             continue
         }
 
@@ -5286,7 +5491,8 @@ try {
                 -HealthWarning $healthWarning `
                 -RetryState $retryState `
                 -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
-                -StaleHumanThreshold $StaleHumanThreshold
+                -StaleHumanThreshold $StaleHumanThreshold `
+                -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked)
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
