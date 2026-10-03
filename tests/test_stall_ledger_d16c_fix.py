@@ -240,7 +240,9 @@ def test_register_task_resolves_an_absolute_pwsh() -> None:
     code = _code_lines(_ps1("Register-StallLedgerTask.ps1"))
     assert not re.search(r"-Execute\s+['\"]pwsh(\.exe)?['\"]", code)
     assert not re.search(r"Execute\s*=\s*['\"]pwsh(\.exe)?['\"]", code)
-    assert re.search(r"Get-Command\s+pwsh\b[^\n]*-ErrorAction\s+Stop", code)
+    # A missing pwsh must reach the explicit refusal, not die inside Get-Command.
+    assert re.search(r"Get-Command\s+pwsh\b[^\n]*-ErrorAction\s+SilentlyContinue", code)
+    assert "could not resolve an absolute path for pwsh" in code
     assert re.search(r"IsPathRooted\(\$pwshPath\)", code)
     assert re.search(r"-Execute\s+\$pwshPath", code)
     # -DryRun shows the path that would be registered.

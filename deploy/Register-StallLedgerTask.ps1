@@ -36,7 +36,9 @@ if (-not (Test-Path -LiteralPath $wrapper)) { throw "wrapper not found: $wrapper
 # (C:\Program Files\WindowsApps\...\pwsh.exe) a bare name failed every launch with 0x80070002 and the
 # tick wrote nothing at all (T-stalled-pr-has-no-detector msg-6307). Resolve the absolute path NOW,
 # and refuse to register if there is none.
-$pwshPath = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+# SilentlyContinue (not Stop) so a missing pwsh reaches the explicit refusal below rather than a
+# generic CommandNotFoundException (PR #451 gate advisory).
+$pwshPath = (Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $pwshPath -or -not [System.IO.Path]::IsPathRooted($pwshPath)) {
     throw "could not resolve an absolute path for pwsh (got '$pwshPath'); not registering"
 }
