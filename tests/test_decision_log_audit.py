@@ -229,3 +229,70 @@ def test_script_totals_and_lists_only_non_clean_threads(tmp_path: Path) -> None:
     assert [t["thread"] for t in report["threads"]] == ["T-b"]
     assert report["threads"][0]["missing"][0]["thread_status"] == "closed"
     assert report["log_kinds"] == {"DECIDED": 2, "DEFERRED": 0, "BOUNCED": 1}
+
+
+class _Pager:
+    """A ``chatroom_list_threads`` stand-in serving ``n`` threads, with or without ``total``."""
+
+    def __init__(self, n: int, *, with_total: bool) -> None:
+        self.rows = [{"thread_id": f"T-{i}"} for i in range(n)]
+        self.with_total = with_total
+        self.calls = 0
+
+    async def __call__(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        assert tool == "chatroom_list_threads"
+        self.calls += 1
+        off, lim = args["offset"], args["limit"]
+        page: dict[str, Any] = {"items": self.rows[off : off + lim]}
+        if self.with_total:
+            page["total"] = len(self.rows)
+        return page
+
+
+@pytest.mark.parametrize("with_total", [True, False])
+@pytest.mark.parametrize("extra", [0, 1, 7])
+def test_script_pages_past_the_first_page_with_or_without_total(
+    with_total: bool, extra: int
+) -> None:
+    """PR #449 gate finding 1: a response without ``total`` must not stop after page one."""
+    import asyncio
+
+    mod = _script()
+    n = mod._PAGE * 2 + extra
+    pager = _Pager(n, with_total=with_total)
+    threads = asyncio.run(mod.list_threads(pager, "p"))
+    assert [t["thread_id"] for t in threads] == [f"T-{i}" for i in range(n)]
+
+
+def test_script_reads_the_log_once_for_all_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #449 gate advisory 2: one pass over the log, not one per thread."""
+    import json
+
+    from spirrow_mindwire import tier_c_decisions_log as tcl
+
+    log_path = tmp_path / "log.jsonl"
+    rows = [
+        {"kind": "DECIDED", "thread": f"T-{i}", "msg_id": "m1", "what": "rename", "reason": "cheap"}
+        for i in range(5)
+    ]
+    log_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    passes = 0
+    real = tcl._iter_rows
+
+    def counting(path: Path) -> Any:
+        nonlocal passes
+        passes += 1
+        return real(path)
+
+    monkeypatch.setattr(tcl, "_iter_rows", counting)
+    fetched = [(f"T-{i}", "active", [_msg("m1", "Heisenberg", LINE)]) for i in range(5)]
+    report = _script().scan(fetched, log_path=log_path, roster=ROSTER)
+    assert passes == 1
+    assert report["threads"] == []
+    for i in range(5):
+        assert tcl.logged_decision_keys_by_thread(log_path, threads={f"T-{i}", "T-x"}) == {
+            f"T-{i}": logged_decision_keys(log_path, thread=f"T-{i}"),
+            "T-x": Counter(),
+        }

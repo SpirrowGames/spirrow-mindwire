@@ -23,13 +23,13 @@ import argparse
 import asyncio
 import json
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.decision_log_audit import ThreadAudit, audit_thread
 from spirrow_mindwire.tier_c_admission_gate import LogKind
-from spirrow_mindwire.tier_c_decisions_log import logged_decision_keys
+from spirrow_mindwire.tier_c_decisions_log import logged_decision_keys_by_thread
 from spirrow_mindwire.value_objects import Role
 
 _PAGE = 200
@@ -72,6 +72,35 @@ def summarise(audits: Sequence[ThreadAudit]) -> dict[str, Any]:
     }
 
 
+async def list_threads(
+    call_tool: Callable[[str, dict[str, Any]], Awaitable[Any]], project: str
+) -> list[dict[str, Any]]:
+    """Every thread of ``project``, paging ``chatroom_list_threads`` until the list is exhausted.
+
+    Stops on an empty page; else, when the response carries an integer ``total``, once ``offset``
+    reaches it; else (no ``total``) on a short page. Defaulting a missing ``total`` to the count
+    read so far would stop after the first page every time (PR #449 gate, finding 1).
+    """
+    threads: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = await call_tool(
+            "chatroom_list_threads", {"project": project, "limit": _PAGE, "offset": offset}
+        )
+        items = (page.get("items") or []) if isinstance(page, dict) else []
+        threads.extend(t for t in items if isinstance(t, dict))
+        offset += len(items)
+        total = page.get("total") if isinstance(page, dict) else None
+        if not items:
+            break
+        if isinstance(total, int) and not isinstance(total, bool):
+            if offset >= total:
+                break
+        elif len(items) < _PAGE:
+            break
+    return threads
+
+
 async def _fetch(
     projects: Sequence[str], only: set[str] | None
 ) -> list[tuple[str, str, list[dict[str, Any]]]]:
@@ -80,18 +109,7 @@ async def _fetch(
     mcp = StreamableHttpChatroomMcp()
     out: list[tuple[str, str, list[dict[str, Any]]]] = []
     for project in projects:
-        threads: list[dict[str, Any]] = []
-        offset = 0
-        while True:
-            page = await mcp.call_tool(
-                "chatroom_list_threads", {"project": project, "limit": _PAGE, "offset": offset}
-            )
-            items = page.get("items") or [] if isinstance(page, dict) else []
-            threads.extend(t for t in items if isinstance(t, dict))
-            offset += len(items)
-            if not items or offset >= page.get("total", len(threads)):
-                break
-        for t in threads:
+        for t in await list_threads(mcp.call_tool, project):
             thread_id = str(t.get("thread_id", ""))
             if only is not None and thread_id not in only:
                 continue
@@ -113,12 +131,13 @@ def scan(
     """The whole report for already-fetched threads. Pure apart from reading ``log_path``."""
     if not log_path.exists():
         return {"comparison": f"unmeasured: decisions log not found at {log_path}"}
+    logged = logged_decision_keys_by_thread(log_path, threads={t for t, _, _ in fetched})
     audits = [
         audit_thread(
             thread=thread,
             status=status,
             messages=msgs,
-            logged=logged_decision_keys(log_path, thread=thread),
+            logged=logged[thread],
             roster=roster,
         )
         for thread, status, msgs in fetched
