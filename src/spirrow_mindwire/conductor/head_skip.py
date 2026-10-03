@@ -75,15 +75,18 @@ Cost invariants worth stating outright, because the spec depends on them:
 - **The stop-token skip set is fixed and closed** at ``{none, human}``. This is the "the head-skip
   cache can never starve a live thread" property. Property-tested at test #2.
 - **Backoff has an upper bound** (:attr:`CAP`) and never terminates. Even a degenerate spin
-  eventually launches every :attr:`CAP` (defaults: 1 launch/hour). No design-time upper bound
-  applies to the *progress* path (a thread whose nomination changes every turn is dispatched at
-  the sweep's full cadence) — that is intentional (the human-approved invariant "a progressing
-  thread never backs off") and is instead bounded by the environment: Windows scheduler's
-  ``MultipleInstancesPolicy=IgnoreNew`` keeps the conductor to one live process, the conductor
-  processes one candidate per run, and a session takes wall-clock time. Measured 2026-09-17 to
-  2026-09-30 (method under ``BASE`` below): a session launched on the progress path ran a median
-  of 3.2 min (p90 23.4 min, n=425), and the most progress-path launches any one thread received
-  inside 60 minutes was 6. This is a *load-bearing operational premise*, not a design guarantee.
+  eventually launches every :attr:`CAP` (defaults: 1 launch/hour). The *progress* path (a thread
+  whose nomination changes every turn) has no upper bound by design: that is the human-approved
+  invariant "a progressing thread never backs off", and nothing in this module caps it. Starving
+  the other candidates — the harm described at the top of this docstring — is prevented by the
+  sweep's launch fairness in ``deploy/lib/SweepFairness.ps1``, which owns that rule; it is not
+  restated here. When a thread is the only LAUNCH candidate, how often it launches is set only by
+  the tick interval and by session wall-clock time, with Windows scheduler's
+  ``MultipleInstancesPolicy=IgnoreNew`` keeping the conductor to one live process; that is
+  deliberate, so a progressing thread is never held back. The most progress-path launches any
+  one thread received inside 60 minutes was 6, measured 2026-09-17 to 2026-09-30 (method under
+  ``BASE`` below; session median 3.2 min, p90 23.4 min, n=425). That is an observation, not a
+  limit.
 - **``eligible_at`` is a display value only**. It is emitted on every verdict (for report-mode
   audit and for the log) but never persisted to the record — the record only stores observations
   (``last_launch_at`` etc.), and :func:`decide` recomputes the eligibility each call. Storing a
