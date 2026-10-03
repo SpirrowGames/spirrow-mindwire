@@ -820,6 +820,34 @@ Check 'non-ok envelope: PUT was NOT called' 0 $script:materialCallCount
 Check 'non-ok envelope: notification still fired (raw ping fell through)' 1 $script:notificationCallCount
 Check 'non-ok envelope: notification body is the raw fallback' 'raw ping for T-nonok' $script:notificationLastMessage
 
+# ---------- (f) operator work: no composer, no PUT, raw ping only ------------------------------
+# T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): a valid `NEXT: operator` is work,
+# not a decision. The composer must not be asked for a question that does not exist, and the
+# notification is the raw fallback the caller built (phrase + last_msg, no task text).
+Write-Host ''
+Write-Host "(f) Send-HumanParkAlert — operator_work_to_human never calls the composer (D4')"
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+$script:DecisionComposerBackend = 'claude-code'
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-op' -Project 'p' -ThreadId 'T-op' `
+    -Signature 'operator_work_to_human:msg-9' -LastMsgId 'msg-9' `
+    -StopReason 'operator_work_to_human' -Rounds 0 -RawFallback 'raw ping for T-op'
+Check 'operator work: composer was NOT called' 0 $script:composerCallCount
+Check 'operator work: PUT was NOT called' 0 $script:materialCallCount
+Check 'operator work: notification fired once' 1 $script:notificationCallCount
+Check 'operator work: notification body is the raw fallback' 'raw ping for T-op' $script:notificationLastMessage
+CheckTrue 'operator work: no pending decision was cached' ($pending.Count -eq 0)
+# Same signature again: the notify dedupe still applies on this path.
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-op' -Project 'p' -ThreadId 'T-op' `
+    -Signature 'operator_work_to_human:msg-9' -LastMsgId 'msg-9' `
+    -StopReason 'operator_work_to_human' -Rounds 0 -RawFallback 'raw ping for T-op'
+Check 'operator work: same signature does not re-notify' 1 $script:notificationCallCount
+
 # ---------- extras.head_msg_id_read missing: PUT skipped (DM-4 / I-16) ------------------------
 Write-Host ''
 Write-Host 'Send-HumanParkAlert — missing extras.head_msg_id_read skips PUT (DM-4 / I-16)'

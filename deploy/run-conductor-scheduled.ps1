@@ -3829,6 +3829,17 @@ function Send-HumanParkAlert {
         [string]$RawFallback
     )
 
+    # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
+    # so there is no question for the composer to write and no decision material to push. The
+    # notification is the raw ping alone — the phrase and last_msg, never the task text (the
+    # author's free text stays off every machine-read surface, D2'); the task itself is on the
+    # digest's operator-work lane.
+    if ($StopReason -eq 'operator_work_to_human') {
+        Send-NotificationIfChanged -State $NotifyState -Key $Key `
+            -Signature $Signature -Message $RawFallback
+        return
+    }
+
     $envelope = Get-DecisionEnvelope -State $PendingDecisionsState `
         -Key $Key -Project $Project -ThreadId $ThreadId `
         -Signature $Signature -LastMsgId $LastMsgId `
