@@ -310,7 +310,9 @@ class TestFindingsStoreCheck:
             "independence_class": MACHINE_INDEPENDENCE_CLASS,
             "allowed_roles": ["naysayer"],
         }
-        rows, errors = asyncio.run(_FINDINGS._check_store(store, _shipped()))
+        rows, errors = asyncio.run(
+            _FINDINGS._check_store(_FINDINGS._IdentityLookups(store), _shipped())
+        )
         assert errors == []
         by_name = {r["identity_name"]: r for r in rows}
         assert by_name["pr-gate-relay"]["violations"][0]["code"] == ("machine_has_roles")

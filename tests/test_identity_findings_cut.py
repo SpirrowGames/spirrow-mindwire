@@ -261,7 +261,8 @@ class _CorpusMcp:
                     "msg_id": "msg-1",
                     "author": "Bohr",
                     "role": None,
-                    "timestamp": "2026-08-01T00:00:00Z",
+                    # After the #153 floor (08-16T15:09Z), before --since (08-25).
+                    "timestamp": "2026-08-20T00:00:00Z",
                 },
                 {
                     "msg_id": "msg-2",
@@ -292,7 +293,7 @@ def test_measure_cut_ignores_since_and_covers_the_critical_path(
         )
     )
     rows = {r["identity_name"]: r for r in result["identity_cut"]}
-    # Bohr's 08-01 null post is before --since (so outside "authors"), yet after Bohr's cut.
+    # Bohr's 08-20 null post is before --since (so outside "authors"), yet after Bohr's cut.
     assert "Bohr" not in {a["raw_name"] for a in result["authors"]}
     assert rows["Bohr"]["state"] == "violated"
     assert rows["operator"]["cut_reason"] == "unregistered"
@@ -301,6 +302,137 @@ def test_measure_cut_ignores_since_and_covers_the_critical_path(
     assert result["scope"]["store_naive_tz"] == "+09:00"
     assert result["phase2_start"]["pass"] is False
     assert result["totals"]["phase2_start_pass"] is False
+    # Registered 05-29 (before #153), so the cut is the #153 floor, not the registration.
+    assert rows["Bohr"]["registered_at"] == "2026-05-29T08:07:47.497866Z"
+    assert rows["Bohr"]["cut_basis"] == "pr153_deploy"
     assert datetime.fromisoformat(rows["Bohr"]["cut"].replace("Z", "+00:00")) == datetime(
-        2026, 5, 29, 8, 7, 47, 497866, tzinfo=UTC
+        2026, 8, 16, 15, 9, 16, tzinfo=UTC
     )
+    # msg-6019 §1 (c): each identity is fetched from the store once, even though both the
+    # store check and the cut read it (Bohr is both classified-absent and a critical path
+    # name; naysayer-pr-review is in both the classification and the critical path).
+    assert len(fake.lookups) == len(set(fake.lookups))
+    assert "naysayer-pr-review" in fake.lookups
+
+
+# --- PR-D (msg-6019 §1 (a)): cut = max(store created_at, #153 deploy) -----------------
+
+# Just either side of the #153 floor, 2026-08-16T15:09:16Z (= 2026-08-17T00:09:16 JST).
+_PRE_153 = _t("2026-08-16T15:09:15Z")
+_POST_153 = _t("2026-08-16T15:09:17Z")
+
+
+def test_pr153_floor_is_the_13618e9_merge_time() -> None:
+    assert datetime(2026, 8, 16, 15, 9, 16, tzinfo=UTC) == _MODULE._PR153_DEPLOY_CUT
+    # Not the decision-date `_DEFAULT_SINCE` (msg-6019 §1 (a): "don't reuse it as-is").
+    assert _MODULE._parse_cutoff(_MODULE._DEFAULT_SINCE) != _MODULE._PR153_DEPLOY_CUT
+
+
+def test_identity_registered_before_153_is_cut_at_153_not_registration() -> None:
+    # Einstein's shape: registered 05-29, last nulls before #153, role supplied since.
+    posts: list[tuple[datetime, str | None, bool]] = [
+        (_t("2026-06-01T00:00:00Z"), None, False),
+        (_PRE_153, None, False),
+        (_POST_153, "naysayer", False),
+    ]
+    row = _MODULE._cut_row(
+        "Einstein", _found("independent", created_at="2026-05-29T17:07:47"), posts, _JST
+    )
+    assert row["cut_basis"] == "pr153_deploy"
+    assert row["registered_at"] == "2026-05-29T08:07:47Z"
+    assert row["cut"] == "2026-08-16T15:09:16Z"
+    assert row["pre_cut"] == {"posts": 2, "null_role": 2}
+    assert row["post_cut"] == {"posts": 1, "null_role": 0}
+    assert row["state"] == "evidenced"
+
+
+def test_identity_registered_before_153_still_violates_on_a_post_153_null() -> None:
+    posts = [(_POST_153, None, False)]
+    row = _MODULE._cut_row(
+        "Bohr", _found("main-chain", created_at="2026-05-29T17:07:47"), posts, _JST
+    )
+    assert row["cut_basis"] == "pr153_deploy"
+    assert row["state"] == "violated"
+
+
+def test_identity_registered_after_153_keeps_its_registration_cut() -> None:
+    # naysayer-pr-review's shape: registered 2026-09-30, a null between #153 and registration
+    # is history for it, not a violation.
+    posts = [(_POST_153, None, False), (_AFTER, "naysayer", False)]
+    row = _MODULE._cut_row("naysayer-pr-review", _found("independent"), posts, _JST)
+    assert row["cut_basis"] == "registration"
+    assert row["cut"] == "2026-09-30T07:52:37.196996Z"
+    assert row["pre_cut"] == {"posts": 1, "null_role": 1}
+    assert row["state"] == "evidenced"
+
+
+def test_registration_exactly_at_153_counts_as_registration() -> None:
+    row = _MODULE._cut_row("x", _found("main-chain", created_at="2026-08-17T00:09:16"), [], _JST)
+    assert row["cut_basis"] == "registration"
+    assert row["cut"] == "2026-08-16T15:09:16Z"
+
+
+def test_unparseable_created_at_is_not_rescued_by_the_153_floor() -> None:
+    row = _MODULE._cut_row(
+        "Bohr", _found("main-chain", created_at="not-a-date"), [(_POST_153, "p", False)], _JST
+    )
+    assert row["cut"] is None
+    assert row["cut_basis"] is None
+    assert row["state"] == "undetermined"
+
+
+# --- PR-D (msg-6019 §1 (c)): one shared lookup, failure behaviour unchanged ----------
+
+
+class _CountingStore:
+    def __init__(self, fail: frozenset[str] = frozenset()) -> None:
+        self.calls: list[str] = []
+        self._fail = fail
+
+    async def call_tool(self, name: str, params: dict[str, Any]) -> Any:
+        assert name == "get_identity"
+        who = params["identity_name"]
+        self.calls.append(who)
+        if who in self._fail:
+            raise _MODULE.MagickitMcpError(f"transport down for {who}")
+        return _found("main-chain")
+
+
+def test_lookups_fetch_each_identity_once() -> None:
+    store = _CountingStore()
+    lookups = _MODULE._IdentityLookups(store)
+
+    async def go() -> None:
+        await lookups.get("Bohr")
+        await lookups.get("Bohr")
+        await lookups.get("Einstein")
+
+    asyncio.run(go())
+    assert store.calls == ["Bohr", "Einstein"]
+
+
+def test_cached_failure_stays_a_failure_for_both_readers() -> None:
+    store = _CountingStore(fail=frozenset({"naysayer-pr-review"}))
+    lookups = _MODULE._IdentityLookups(store)
+    path = _REPO_ROOT / "spec" / "identity" / "legitimate_roles.yaml"
+
+    async def go() -> tuple[Any, Any]:
+        checked = await _MODULE._check_store(lookups, load_legitimate_roles(path))
+        cut = await _MODULE._identity_cut(lookups, {}, _JST)
+        return checked, cut
+
+    (store_rows, store_errors), (cut_rows, cut_errors) = asyncio.run(go())
+    # One network call for the failing identity, even though both readers asked.
+    assert store.calls.count("naysayer-pr-review") == 1
+    # _check_store: still an error and a lookup_failed row (never not_found).
+    srow = next(r for r in store_rows if r["identity_name"] == "naysayer-pr-review")
+    assert srow["status"] == "lookup_failed"
+    assert any(e["identity_name"] == "naysayer-pr-review" for e in store_errors)
+    # _identity_cut: still an error and an undetermined row (never "unregistered").
+    crow = next(r for r in cut_rows if r["identity_name"] == "naysayer-pr-review")
+    assert crow["state"] == "undetermined"
+    assert crow["cut_reason"] == "store_status:lookup_failed"
+    assert any(e["identity_name"] == "naysayer-pr-review" for e in cut_errors)
+    # And it fails start condition 1.
+    phase2 = _MODULE._phase2_start(cut_rows)
+    assert "naysayer-pr-review" in phase2["condition_1_no_violated"]["undetermined"]

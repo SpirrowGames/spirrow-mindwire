@@ -26,7 +26,9 @@ before the write half can supply values to ``upsert_identity``:
 
   6. Per-identity registration cut (PR-C, msg-5676 §1/§4 + msg-5678 §2 + msg-5680 §2-§3).
      For every author in the scanned corpus, plus every critical-path identity, the store
-     record (``get_identity``) supplies the cut: that identity's own ``created_at``. Posts
+     record (``get_identity``) supplies the cut: max(that identity's own ``created_at``,
+     the #153 deploy :data:`_PR153_DEPLOY_CUT`), per msg-6019 §1 (a). ``cut_basis`` names
+     the side of the max that won (``registration`` / ``pr153_deploy``). Posts
      are split into before / after the cut, and each registered participant
      (``independence_class != "machine"``) gets exactly one state:
 
@@ -47,14 +49,16 @@ before the write half can supply values to ``upsert_identity``:
           ``evidenced``;
        3. other participants may be ``silent``.
 
-     The cut is the store's value, not a date this script chooses (msg-5674 §2). So the
+     The cut is the store's value floored at #153's deploy, not a date picked per run
+     (msg-5674 §2, msg-6019 §1 (a)). So the
      cut block reads EVERY scanned message and ignores ``--since-created-at`` /
      ``--since-msg-id`` (those still scope sections 1-4). For ``human``, the post-cut
      null posts are further split by whether the body carries the delegation record
      (operator posting on Takahito's behalf, msg-5222 / msg-5692).
 
 The script is READ-ONLY. It never posts, never marks read, and never writes the identity
-store (``get_identity`` is its only store call). It is the "測る" half of msg-1491 §4's
+store (``get_identity`` is its only store call, made at most once per identity per run
+through :class:`_IdentityLookups`). It is the "測る" half of msg-1491 §4's
 read/write split. It can always run and does not depend on the readiness lock.
 
 Output shape (stdout JSON):
@@ -95,8 +99,10 @@ Output shape (stdout JSON):
       "identity_cut": [
         {"identity_name": "human", "store_status": "found", "independence_class": "human",
          "participant": true, "critical_path": true,
-         "created_at": "2026-05-29T23:44:46.084011", "cut": "2026-05-29T14:44:46.084011Z",
-         "cut_reason": null, "first_post_at": "...", "last_post_at": "...",
+         "created_at": "2026-05-29T23:44:46.084011",
+         "registered_at": "2026-05-29T14:44:46.084011Z", "cut": "2026-08-16T15:09:16Z",
+         "cut_basis": "pr153_deploy", "cut_reason": null,
+         "first_post_at": "...", "last_post_at": "...",
          "pre_cut": {"posts": 0, "null_role": 0}, "post_cut": {"posts": 453, "null_role": 418},
          "undated": {"posts": 0, "null_role": 0}, "state": "violated",
          "last_post_cut_null_at": "2026-10-02T00:27:53Z",
@@ -186,6 +192,28 @@ from spirrow_mindwire.magickit.client import (
 # "履歴は null のまま残す" carry-forward.
 _DEFAULT_SINCE = "2026-08-17T00:00:00+00:00"
 _DEFAULT_PROJECTS = ("spirrow-mindwire", "spirrow-voxelworld")
+
+# The #153 floor for the per-identity cut (msg-6019 §1 (a)): an identity's cut is
+# max(its store `created_at`, this instant). msg-1179 §7 scopes the start condition to posts
+# made AFTER the #153 deploy. A registration-time cut only agrees with that for identities
+# registered after #153. Bohr, Einstein and Heisenberg were registered on 2026-05-29, so their
+# pre-#153 nulls (written before the conductor supplied any role) counted against them, and
+# condition 1 could never pass for Einstein or Heisenberg (msg-5819 §3 finding 1). The max
+# keeps the registration cut for identities registered later (naysayer-pr-review, 2026-09-30)
+# and floors everyone else at #153.
+#
+# Source: the committer time of 13618e9b773e4929d85cdcf09372c28ae0fe6828 ("feat: conductor
+# supplies role, per-verdict attestation, and thread ground truth (#153)"), the merge commit
+# msg-1179 §1 names as the daemon checkout: 2026-08-17T00:09:16+09:00. GitHub reports the
+# same instant as the PR's mergedAt (2026-08-16T15:09:16Z). The deploy instant itself (the
+# daemon restarting onto that checkout) is not recorded anywhere this repo can read, so this
+# is the merge time, as msg-6019 §1 (a) directs when the deploy time cannot be found. A real
+# deploy can only be later than the merge, so this floor can at most count a few post-merge,
+# pre-restart nulls against an identity. It cannot hide one.
+#
+# Deliberately NOT `_DEFAULT_SINCE` below. That value is the decision date
+# (2026-08-17T00:00Z), nine hours after the merge, and it only scopes sections 1-4.
+_PR153_DEPLOY_CUT = datetime(2026, 8, 16, 15, 9, 16, tzinfo=UTC)
 
 # Start condition 2's critical path, fixed in the design thread (msg-5678 §2, extended with
 # `human` in msg-5680 §2): the identities whose rejection would stop the loop. They carry the
@@ -397,7 +425,9 @@ def _cut_row(
         "participant": None,
         "critical_path": name in _CRITICAL_PATH,
         "created_at": None,
+        "registered_at": None,
         "cut": None,
+        "cut_basis": None,
         "cut_reason": None,
         "first_post_at": _iso_z(dated[0]) if dated else None,
         "last_post_at": _iso_z(dated[-1]) if dated else None,
@@ -410,9 +440,19 @@ def _cut_row(
         # The Phase 2 rule verbatim (msg-5678 §1): participant iff class != "machine".
         row["participant"] = ic != MACHINE_INDEPENDENCE_CLASS
         row["created_at"] = record.get("created_at")
-        cut = _parse_store_time(record.get("created_at"), naive_tz)
-        if cut is None:
+        registered = _parse_store_time(record.get("created_at"), naive_tz)
+        if registered is None:
+            # Unchanged: no usable registration time is a failed measurement. The #153 floor
+            # is NOT substituted for it, because that would turn a broken record into a cut
+            # that looks computed.
             row["cut_reason"] = "created_at_unparseable"
+        else:
+            row["registered_at"] = _iso_z(registered)
+            # msg-6019 §1 (a): cut = max(store created_at, #153 deploy).
+            if registered >= _PR153_DEPLOY_CUT:
+                cut, row["cut_basis"] = registered, "registration"
+            else:
+                cut, row["cut_basis"] = _PR153_DEPLOY_CUT, "pr153_deploy"
     elif status == "not_found":
         row["cut_reason"] = "unregistered"
     else:
@@ -495,8 +535,43 @@ def _phase2_start(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+class _IdentityLookups:
+    """One ``get_identity`` call per identity name per run, shared by every store reader.
+
+    :func:`_check_store` and :func:`_identity_cut` need the same records. They used to fetch
+    them independently (the msg-5831 advisory). Both now read through this cache.
+
+    A FAILED call is cached as the failure. It is not dropped and not converted: :meth:`get`
+    re-raises the same :class:`MagickitMcpError` to every reader without calling the store
+    again. So each reader keeps its own failure behaviour exactly as before (msg-6019
+    §1 (c)). ``_check_store`` records an error and a ``lookup_failed`` row, and
+    ``_identity_cut`` records an error and an ``undetermined`` row. A cached failure can
+    never surface as a ``not_found`` ("unregistered") response, because the cache only holds
+    what the call actually returned or raised.
+    """
+
+    def __init__(self, mcp: McpToolCaller) -> None:
+        self._mcp = mcp
+        self._results: dict[str, Any] = {}
+        self._failures: dict[str, MagickitMcpError] = {}
+
+    async def get(self, name: str) -> Any:
+        """The raw ``get_identity`` response for ``name``. Raises the cached failure."""
+        if name in self._failures:
+            raise self._failures[name]
+        if name not in self._results:
+            try:
+                self._results[name] = await self._mcp.call_tool(
+                    "get_identity", {"identity_name": name}
+                )
+            except MagickitMcpError as exc:
+                self._failures[name] = exc
+                raise
+        return self._results[name]
+
+
 async def _identity_cut(
-    mcp: McpToolCaller, author_posts: dict[str, list[_Post]], naive_tz: timezone
+    lookups: _IdentityLookups, author_posts: dict[str, list[_Post]], naive_tz: timezone
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Look every corpus author (plus the critical path) up in the store and build cut rows."""
     rows: list[dict[str, Any]] = []
@@ -504,7 +579,7 @@ async def _identity_cut(
     for name in sorted(set(author_posts) | set(_CRITICAL_PATH)):
         lookup: dict[str, Any] | None
         try:
-            got: Any = await mcp.call_tool("get_identity", {"identity_name": name})
+            got: Any = await lookups.get(name)
             lookup = got if isinstance(got, dict) else {"status": "malformed_response"}
         except MagickitMcpError as exc:
             errors.append({"identity_name": name, "reason": f"get_identity failed: {exc}"})
@@ -581,7 +656,7 @@ def _summarise(
 
 
 async def _check_store(
-    mcp: McpToolCaller, classification: LegitimateRolesFile
+    lookups: _IdentityLookups, classification: LegitimateRolesFile
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Read each classified identity's store record and run the write-path guard on it.
 
@@ -592,7 +667,7 @@ async def _check_store(
     errors: list[dict[str, str]] = []
     for entry in classification.entries:
         try:
-            got: Any = await mcp.call_tool("get_identity", {"identity_name": entry.name})
+            got: Any = await lookups.get(entry.name)
         except MagickitMcpError as exc:
             errors.append({"identity_name": entry.name, "reason": f"get_identity failed: {exc}"})
             rows.append(
@@ -681,9 +756,11 @@ async def _measure(
                 assert isinstance(author, str)
                 author_role_counts[author][role_key] += 1
 
-    store_rows, store_errors = await _check_store(mcp, classification)
+    # One shared cache, so an identity both readers need is fetched once (msg-6019 §1 (c)).
+    lookups = _IdentityLookups(mcp)
+    store_rows, store_errors = await _check_store(lookups, classification)
     errors.extend(store_errors)
-    cut_rows, cut_errors = await _identity_cut(mcp, dict(author_posts), naive_tz)
+    cut_rows, cut_errors = await _identity_cut(lookups, dict(author_posts), naive_tz)
     errors.extend(cut_errors)
     phase2 = _phase2_start(cut_rows)
 
