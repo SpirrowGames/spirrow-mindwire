@@ -19,6 +19,24 @@ as an author-written ``NEXT: human``. Each falls into exactly one bucket:
   counted on its own; it is not part of the role total.
 * ``other_author`` — anyone else (operator, the human, off-roster authors). Never gated.
 
+**U4c additions** (T-tier-c-admission-gate Bohr msg-6488 / 6490, endorsed by Einstein):
+
+* ``iii_admitted_by_label`` — ``iii_admitted`` split by the label the gate admitted on
+  (:attr:`AdmissionDecision.normalized_label`, the gate's own output; the body is not parsed a
+  second time). ``goal`` / ``cost`` / ``irreversible`` / ``unsure:goal?`` are always present; the
+  values add up to ``counts.iii_admitted``.
+* ``must_admit`` / ``must_admit_dropped`` — the regression refs (``--must-admit``; default the two
+  goal-level messages magickit msg-829 / msg-740) mapped to the bucket each landed in.
+  ``dropped`` = ``i_bounce`` or ``not_found``; a ref outside the window or the harvest is
+  ``not_found``, so "not measured" never reads as "admitted". No pass/fail verdict: the reader
+  judges (msg-6252).
+* ``mode_by_project`` / ``i_bounce_by_mode`` — each project's ``[tierc_gate].mode`` as an input.
+  ``enforced`` = bounced in an ``enforce`` project (it never reached the human); ``shadow`` =
+  would have bounced but reached the human (``off``); ``mode_unmeasured`` = the mode could not be
+  read (``unmeasured: <reason>``, never a default). The mode is the one in the config file at
+  measurement time: the daemon reads a single ``mindwire.toml`` for every project, and no history
+  of the setting exists, so a window that spans a mode switch is attributed to the current mode.
+
 ``retry_lookup`` is ``never_retry``: no past turn carries a ``RETRY:`` token issued by a live
 gate, so "no unresolved bounce exists" is the true answer for history.
 
@@ -41,10 +59,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from spirrow_mindwire.conductor.core import roster_role
 from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.decider.hook import TIERC_ENTRY_ROLES, never_retry
-from spirrow_mindwire.tier_c_admission_gate import AdmissionVerdict, LogKind, decide_admission
+from spirrow_mindwire.tier_c_admission_gate import (
+    ADMIT_LABELS,
+    UNSURE_LABEL,
+    AdmissionVerdict,
+    LogKind,
+    decide_admission,
+)
 from spirrow_mindwire.value_objects import Role
 
 
@@ -71,12 +96,25 @@ BUCKETS: tuple[str, ...] = (
 )
 
 
-def _role_of(roster: Mapping[str, Role], author: str) -> Role | None:
-    folded = author.casefold()
-    for name, role in roster.items():
-        if name.casefold() == folded:
-            return role
-    return None
+#: The goal-level regression set of msg-3630 §3: the gate must not bounce these.
+DEFAULT_MUST_ADMIT: tuple[str, ...] = (
+    "spirrow-magickit/T-merged-to-main-without-gate-artifact#msg-829",
+    "spirrow-magickit/T-dashboard-system-page-retirement-unfiled#msg-740",
+)
+
+#: Labels always reported in ``iii_admitted_by_label``, zero or not.
+ADMITTED_LABELS: tuple[str, ...] = (*sorted(ADMIT_LABELS), UNSURE_LABEL)
+
+NOT_FOUND = "not_found"
+BOUNCE_MODES: tuple[str, ...] = ("enforced", "shadow", "mode_unmeasured")
+
+
+def _bounce_mode(mode: str | None) -> str:
+    if mode == "enforce":
+        return "enforced"
+    if mode == "off":
+        return "shadow"
+    return "mode_unmeasured"
 
 
 def classify(
@@ -85,13 +123,24 @@ def classify(
     *,
     since: datetime,
     until: datetime,
+    mode_by_project: Mapping[str, str] | None = None,
+    must_admit: Sequence[str] = DEFAULT_MUST_ADMIT,
 ) -> dict[str, Any]:
-    """Bucket every author-written ``NEXT: human`` in ``[since, until)``. Pure; counts + ids."""
+    """Bucket every author-written ``NEXT: human`` in ``[since, until)``. Pure; counts + ids.
+
+    ``mode_by_project`` maps a project to its ``[tierc_gate].mode`` (``off`` / ``enforce``) or to
+    an ``unmeasured: <reason>`` string; a project missing from it is unmeasured too.
+    """
+    modes = dict(mode_by_project or {})
     ids: dict[str, list[str]] = {b: [] for b in BUCKETS}
     unsure: list[str] = []
+    by_label: dict[str, list[str]] = {label: [] for label in ADMITTED_LABELS}
+    by_mode: dict[str, list[str]] = {m: [] for m in BOUNCE_MODES}
+    projects_seen: set[str] = set()
     bounce_reasons: Counter[str] = Counter()
     by_author: Counter[str] = Counter()
     for project, thread_id, messages in threads:
+        projects_seen.add(project)
         for i, m in enumerate(messages):
             if not (since <= m.timestamp < until):
                 continue
@@ -103,7 +152,7 @@ def classify(
             if m.author == RELAY_AUTHOR:
                 ids["iv_pr_gate_relay"].append(ref)
                 continue
-            if _role_of(roster, m.author) not in TIERC_ENTRY_ROLES:
+            if roster_role(roster, m.author) not in TIERC_ENTRY_ROLES:
                 ids["other_author"].append(ref)
                 continue
             by_author[m.author] += 1
@@ -119,13 +168,17 @@ def classify(
                 ids["i_bounce"].append(ref)
                 assert decision.bounce_reason is not None
                 bounce_reasons[decision.bounce_reason.value] += 1
+                by_mode[_bounce_mode(modes.get(project))].append(ref)
             elif LogKind.LABEL_MIGRATION in kinds:
                 ids["ii_migrated"].append(ref)
             else:
                 ids["iii_admitted"].append(ref)
+                by_label.setdefault(str(decision.normalized_label), []).append(ref)
                 if LogKind.ADMIT_UNSURE in kinds:
                     unsure.append(ref)
     role_total = len(ids["i_bounce"]) + len(ids["ii_migrated"]) + len(ids["iii_admitted"])
+    bucket_of = {ref: bucket for bucket, refs in ids.items() for ref in refs}
+    must = {ref: bucket_of.get(ref, NOT_FOUND) for ref in must_admit}
     return {
         "schema": 1,
         "since": since.isoformat(),
@@ -138,7 +191,36 @@ def classify(
         "i_bounce_by_reason": dict(sorted(bounce_reasons.items())),
         "role_total_by_author": dict(sorted(by_author.items())),
         "msg_ids": {**ids, "iii_unsure": unsure},
+        "iii_admitted_by_label": {label: len(v) for label, v in by_label.items()},
+        "iii_admitted_by_label_msg_ids": by_label,
+        "mode_by_project": {
+            p: modes.get(p, "unmeasured: no mode given for this project")
+            for p in sorted(projects_seen | set(modes))
+        },
+        "i_bounce_by_mode": {m: len(v) for m, v in by_mode.items()},
+        "i_bounce_by_mode_msg_ids": by_mode,
+        "must_admit": must,
+        "must_admit_dropped": [r for r, b in must.items() if b in ("i_bounce", NOT_FOUND)],
     }
+
+
+def read_modes(projects: Sequence[str], config_path: Path | None) -> dict[str, str]:
+    """``[tierc_gate].mode`` for each project, or ``unmeasured: <reason>`` — never a default.
+
+    The daemon reads one ``mindwire.toml`` for every project it drives, so every project gets the
+    same value. A missing file would load as the built-in default ``off``; that is the fall-back
+    this must not take, so it is reported as unmeasured instead.
+    """
+    from spirrow_mindwire.config import _default_config_path, load_settings
+
+    path = config_path if config_path is not None else _default_config_path()
+    if not path.is_file():
+        return dict.fromkeys(projects, f"unmeasured: config not found at {path}")
+    try:
+        mode = str(load_settings(path).tierc_gate.mode)
+    except Exception as exc:  # an unreadable config is an unmeasured mode, not a crash
+        return dict.fromkeys(projects, f"unmeasured: config unreadable ({type(exc).__name__})")
+    return dict.fromkeys(projects, mode)
 
 
 def _date(raw: str) -> datetime:
@@ -151,15 +233,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--until", type=_date, required=True, help="ISO date/time, exclusive")
     parser.add_argument("--project", action="append", default=None)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--must-admit",
+        action="append",
+        default=None,
+        metavar="PROJECT/THREAD#MSG",
+        help="regression ref the gate must not bounce (repeatable; default: msg-829, msg-740)",
+    )
+    parser.add_argument("--config", type=Path, default=None, help="default: the daemon's toml")
     args = parser.parse_args(argv)
 
     from spirrow_mindwire.config import load_settings
 
-    current_roster = dict(load_settings().conductor.roster)
-    threads = asyncio.run(builder.harvest(tuple(args.project or builder.PROJECTS)))
-    result = classify(threads, current_roster, since=args.since, until=args.until)
+    projects = tuple(args.project or builder.PROJECTS)
+    current_roster = dict(load_settings(args.config).conductor.roster)
+    threads = asyncio.run(builder.harvest(projects))
+    result = classify(
+        threads,
+        current_roster,
+        since=args.since,
+        until=args.until,
+        mode_by_project=read_modes(projects, args.config),
+        must_admit=tuple(args.must_admit or DEFAULT_MUST_ADMIT),
+    )
     result["measured_at"] = datetime.now(UTC).isoformat()
-    result["projects"] = list(args.project or builder.PROJECTS)
+    result["projects"] = list(projects)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
         json.dumps(result, ensure_ascii=False, indent=1, sort_keys=True) + "\n",

@@ -264,13 +264,12 @@ def test_script_pages_past_the_first_page_with_or_without_total(
     assert [t["thread_id"] for t in threads] == [f"T-{i}" for i in range(n)]
 
 
-def test_script_reads_the_log_once_for_all_threads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PR #449 gate advisory 2: one pass over the log, not one per thread."""
-    import json
+# --------------------------------------------------------------------------- U4c step E / F
+# Spec: Bohr msg-6490 (revised step E) and msg-6488 step F, endorsed by Einstein.
 
-    from spirrow_mindwire import tier_c_decisions_log as tcl
+
+def _five_thread_log(tmp_path: Path) -> Path:
+    import json
 
     log_path = tmp_path / "log.jsonl"
     rows = [
@@ -278,21 +277,87 @@ def test_script_reads_the_log_once_for_all_threads(
         for i in range(5)
     ]
     log_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    passes = 0
-    real = tcl._iter_rows
+    return log_path
 
-    def counting(path: Path) -> Any:
-        nonlocal passes
-        passes += 1
-        return real(path)
 
-    monkeypatch.setattr(tcl, "_iter_rows", counting)
+def test_e1_scan_reads_the_log_once_through_iter_rows_and_one_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E1: one ``iter_rows`` call and one ``Path.open`` of the log for a 5-thread scan.
+
+    Counting ``Path.open`` catches a second read that bypasses the shared reader (msg-6427).
+    """
+    mod = _script()
+    log_path = _five_thread_log(tmp_path)
+    reads = 0
+    opens = 0
+    real_iter = mod.iter_rows
+    real_open = Path.open
+
+    def counting_iter(path: Path) -> Any:
+        nonlocal reads
+        reads += 1
+        return real_iter(path)
+
+    def counting_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal opens
+        if self == log_path:
+            opens += 1
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "iter_rows", counting_iter)
+    monkeypatch.setattr(Path, "open", counting_open)
     fetched = [(f"T-{i}", "active", [_msg("m1", "Heisenberg", LINE)]) for i in range(5)]
-    report = _script().scan(fetched, log_path=log_path, roster=ROSTER)
-    assert passes == 1
+    report = mod.scan(fetched, log_path=log_path, roster=ROSTER)
+    assert (reads, opens) == (1, 1)
     assert report["threads"] == []
-    for i in range(5):
-        assert tcl.logged_decision_keys_by_thread(log_path, threads={f"T-{i}", "T-x"}) == {
-            f"T-{i}": logged_decision_keys(log_path, thread=f"T-{i}"),
-            "T-x": Counter(),
-        }
+    assert report["log_kinds"] == {"DECIDED": 5, "DEFERRED": 0, "BOUNCED": 0}
+
+
+def test_e2_tally_kinds_counts_in_set_threads_and_yields_every_row_unchanged() -> None:
+    mod = _script()
+    rows: list[dict[str, Any]] = [
+        {"kind": "DECIDED", "thread": "T-a"},
+        {"kind": "BOUNCED", "thread": "T-a"},
+        {"kind": "DECIDED", "thread": "T-out"},
+        {"kind": "LABEL_MIGRATION", "thread": "T-a"},
+        {"kind": "DEFERRED", "thread": "T-b"},
+        {"thread": "T-a"},
+    ]
+    counts: Counter[str] = Counter()
+    passed = list(mod.tally_kinds(iter(rows), {"T-a", "T-b"}, counts))
+    assert passed == rows
+    assert all(a is b for a, b in zip(passed, rows, strict=True))
+    assert counts == Counter({"DECIDED": 1, "BOUNCED": 1, "DEFERRED": 1})
+
+
+def test_e3_decision_keys_from_rows_equal_the_conductors_path_reader(tmp_path: Path) -> None:
+    from spirrow_mindwire import tier_c_decisions_log as tcl
+
+    log_path = _five_thread_log(tmp_path)
+    threads = {"T-0", "T-3", "T-x"}
+    via_rows = tcl.decision_keys_by_thread(tcl.iter_rows(log_path), threads=threads)
+    assert via_rows == tcl.logged_decision_keys_by_thread(log_path, threads=threads)
+    assert via_rows["T-x"] == Counter()
+    for t in ("T-0", "T-3"):
+        assert via_rows[t] == logged_decision_keys(log_path, thread=t)
+
+
+def test_f_main_with_a_missing_log_makes_no_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    mod = _script()
+
+    async def no_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("_fetch must not run when the log is missing")
+
+    monkeypatch.setattr(mod, "_fetch", no_fetch)
+    out = tmp_path / "out.json"
+    missing = tmp_path / "none.jsonl"
+    assert mod.main(["--project", "p", "--log", str(missing), "--out", str(out)]) == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["comparison"].startswith("unmeasured:")
+    assert str(missing) in report["comparison"]
+    assert json.loads(capsys.readouterr().out) == report

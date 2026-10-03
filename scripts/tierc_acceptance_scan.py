@@ -23,34 +23,39 @@ import argparse
 import asyncio
 import json
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.decision_log_audit import ThreadAudit, audit_thread
 from spirrow_mindwire.tier_c_admission_gate import LogKind
-from spirrow_mindwire.tier_c_decisions_log import logged_decision_keys_by_thread
+from spirrow_mindwire.tier_c_decisions_log import decision_keys_by_thread, iter_rows
 from spirrow_mindwire.value_objects import Role
 
 _PAGE = 200
 
 
-def log_kind_totals(log_path: Path, threads: set[str]) -> dict[str, int | str]:
-    """``DECIDED`` / ``DEFERRED`` / ``BOUNCED`` row counts for ``threads``; unmeasured if no log."""
-    kinds = (LogKind.DECIDED.value, LogKind.DEFERRED.value, LogKind.BOUNCED.value)
-    if not log_path.exists():
-        return dict.fromkeys(kinds, f"unmeasured: decisions log not found at {log_path}")
-    counts: Counter[str] = Counter()
-    # Stream line by line: the log is append-only and grows without bound.
-    with log_path.open(encoding="utf-8") as fh:
-        for raw in fh:
-            try:
-                row = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict) and row.get("thread") in threads and row.get("kind") in kinds:
-                counts[str(row["kind"])] += 1
-    return {k: counts[k] for k in kinds}
+KINDS: tuple[str, ...] = (LogKind.DECIDED.value, LogKind.DEFERRED.value, LogKind.BOUNCED.value)
+
+
+def tally_kinds(
+    rows: Iterable[dict[str, Any]], threads: set[str], counts: Counter[str]
+) -> Iterator[dict[str, Any]]:
+    """Pass every row through unchanged, adding ``threads``' :data:`KINDS` rows to ``counts``.
+
+    Opens no file and parses no JSON: it sits between :func:`iter_rows` and
+    :func:`decision_keys_by_thread` so one read of the log yields both the comparison keys and the
+    kind totals (U4c, Bohr msg-6490 step E; PR #449 gate msg-6427, advisory 1). ``counts`` is
+    complete only once the consumer has exhausted the generator.
+    """
+    for row in rows:
+        if row.get("thread") in threads and row.get("kind") in KINDS:
+            counts[str(row["kind"])] += 1
+        yield row
+
+
+def _unmeasured_log(log_path: Path) -> str:
+    return f"unmeasured: decisions log not found at {log_path}"
 
 
 def summarise(audits: Sequence[ThreadAudit]) -> dict[str, Any]:
@@ -132,8 +137,14 @@ def scan(
 ) -> dict[str, Any]:
     """The whole report for already-fetched threads. Pure apart from reading ``log_path``."""
     if not log_path.exists():
-        return {"comparison": f"unmeasured: decisions log not found at {log_path}"}
-    logged = logged_decision_keys_by_thread(log_path, threads={t for t, _, _ in fetched})
+        return {"comparison": _unmeasured_log(log_path)}
+    threads = {t for t, _, _ in fetched}
+    kind_counts: Counter[str] = Counter()
+    # The one read of the log: ``iter_rows`` opens it, ``tally_kinds`` counts kinds on the way
+    # through, ``decision_keys_by_thread`` consumes it (msg-6490 step E).
+    logged = decision_keys_by_thread(
+        tally_kinds(iter_rows(log_path), threads, kind_counts), threads=threads
+    )
     audits = [
         audit_thread(
             thread=thread,
@@ -145,7 +156,7 @@ def scan(
         for thread, status, msgs in fetched
     ]
     report = summarise(audits)
-    report["log_kinds"] = log_kind_totals(log_path, {t for t, _, _ in fetched})
+    report["log_kinds"] = {k: kind_counts[k] for k in KINDS}
     return report
 
 
@@ -161,14 +172,22 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings()
     log_path = args.log or resolve_tier_c_decisions_log_path(settings)
+    if not log_path.exists():
+        # Checked before any network call: a missing log makes the whole comparison unmeasured,
+        # so fetching every thread first would be wasted (PR #449 gate msg-6427, advisory 2).
+        _emit({"comparison": _unmeasured_log(log_path)}, args.out)
+        return 0
     fetched = asyncio.run(_fetch(args.project, set(args.thread) if args.thread else None))
-    report = scan(fetched, log_path=log_path, roster=dict(settings.conductor.roster))
-    text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    if args.out is not None:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_bytes(text.encode("utf-8"))
-    print(text, end="")
+    _emit(scan(fetched, log_path=log_path, roster=dict(settings.conductor.roster)), args.out)
     return 0
+
+
+def _emit(report: Mapping[str, Any], out: Path | None) -> None:
+    text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(text.encode("utf-8"))
+    print(text, end="")
 
 
 if __name__ == "__main__":

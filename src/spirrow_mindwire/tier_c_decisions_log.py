@@ -78,7 +78,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -267,7 +267,7 @@ def append_log_entries(
         append_log_entry(log_path, entry, thread=thread, msg_id=msg_id)
 
 
-def _iter_rows(log_path: Path) -> Iterable[dict[str, Any]]:
+def iter_rows(log_path: Path) -> Iterator[dict[str, Any]]:
     """Yield each JSONL row in ``log_path``, skipping malformed rows.
 
     A malformed row is not a fatal condition here — the JSONL file
@@ -345,7 +345,7 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
         # different UUID or a different author are irrelevant to this
         # author's retry state and are skipped whole.
         bounced = False
-        for row in _iter_rows(log_path):
+        for row in iter_rows(log_path):
             if row.get("retry_uuid") != uuid:
                 continue
             if row.get("author") != author:
@@ -397,9 +397,21 @@ def logged_decision_keys_by_thread(
     threads (the U4b acceptance scan) reads the file once instead of once per thread (PR #449
     gate, advisory 2); :func:`logged_decision_keys` delegates here, so both build keys one way.
     """
+    return decision_keys_by_thread(iter_rows(log_path), threads=threads)
+
+
+def decision_keys_by_thread(
+    rows: Iterable[Mapping[str, Any]], *, threads: Iterable[str]
+) -> dict[str, Counter[DecisionKey]]:
+    """The key-building half of :func:`logged_decision_keys_by_thread`, over rows already read.
+
+    Opens no file: a caller that needs something else from the same pass (the acceptance scan's
+    ``DECIDED`` / ``DEFERRED`` / ``BOUNCED`` totals) feeds a pass-through over :func:`iter_rows`
+    in, so the log is read exactly once (U4c, Bohr msg-6490 step E).
+    """
     kinds = {LogKind.DECIDED.value, LogKind.DEFERRED.value}
     by_thread: dict[str, Counter[DecisionKey]] = {t: Counter() for t in threads}
-    for row in _iter_rows(log_path):
+    for row in rows:
         keys = by_thread.get(str(row.get("thread")))
         if keys is None or row.get("kind") not in kinds:
             continue
