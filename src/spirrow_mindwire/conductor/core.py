@@ -80,7 +80,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
+from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS, NaysayerGatingConfig
 from ..decider.hook import (
     Decider,
     ThreadMessage,
@@ -129,6 +129,13 @@ from .gate_records import (
     render_admission_heading,
     render_ci_route_marker,
     verdict_heads,
+)
+from .gate_resume import (
+    ResumeOutcome,
+    ReviewSource,
+    log_resume_check,
+    resume_candidate,
+    verify_resume,
 )
 from .handoff import (
     HUMAN_TOKEN,
@@ -181,6 +188,10 @@ logger = logging.getLogger(__name__)
 
 # Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
 _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
+#: The login whose reviews count as the PR-gate's when a REQUEST_CHANGES relay is resumed
+#: (:mod:`.gate_resume`). Read off the config default so a bare Conductor and the gate driver
+#: agree; ``build_conductor`` passes ``[naysayer_gating].review_login``.
+DEFAULT_REVIEW_LOGIN: str = NaysayerGatingConfig.model_fields["review_login"].default
 
 #: The reserved author under which the conductor's guard-(i) redirect write-back is posted
 #: (T-human-terminal-overuse D-1, Bohr msg-2540 § approved by Einstein msg-2539). When a non-human,
@@ -326,6 +337,12 @@ class StopReason(StrEnum):
     # tick re-reads the same handoff and re-derives admission from the fresh rollup; the wait is
     # therefore held by GitHub's state, not by a mindwire-side timer (§A-2 statelessness).
     CI_WAIT = "ci_wait"
+    # Gate resume (T-sweep-starves-deep-candidates, Bohr msg-6318): the head is a PR-gate post
+    # that would resume the implementer, but GitHub could not be read (UNAVAILABLE) or the PR's
+    # head has moved past the post (STALE). Nothing is posted and nobody is summoned; the next
+    # tick launches the same head again. Not terminal (head_skip treats it like ``ci_wait``): the
+    # bound is the stall watchdog, which stands the third same-head launch down with a notice.
+    RESUME_RETRY = "resume_retry"
     # The PR-gate APPROVEd a PR whose merge is the human's (base=main). Not a decision: opening the
     # PR already asked for the merge, and the merge-wait PR list carries it (Takahito, msg-4361
     # "main へのマージは判断点から外す"; restated 2026-10-03). The relay ends ``NEXT: human`` so
@@ -455,6 +472,8 @@ class Conductor:
         force_naysayer_only_on_explicit_human: bool = False,
         control: LoopControl | None = None,
         rollup_source: CheckRollupSource | None = None,
+        review_source: ReviewSource | None = None,
+        review_login: str = DEFAULT_REVIEW_LOGIN,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
         stop_slot: ConductorStopSlot | None = None,
@@ -499,6 +518,11 @@ class Conductor:
         # source IS wired but cannot read (see ``_admit``), so "admission is off" and "admission
         # could not see" produce the same, already-shipped behaviour rather than two new ones.
         self._rollup_source = rollup_source
+        # Gate resume (:mod:`.gate_resume`, msg-6316 / msg-6318): the reviews read that checks a
+        # REQUEST_CHANGES relay left at the head, and the login whose reviews count as the gate's.
+        # ``None`` makes every RC resume CONTRADICTED (fall through to ``_route``), never VERIFIED.
+        self._review_source = review_source
+        self._review_login = review_login
         # ADR-2026-09-14-21 D-2 / D-3: identities the conductor must NOT spawn, by embodiment.
         # Merged over the ADR's shipped default (Fermi = web_ai_chat) so a loop host that never
         # wrote the config line still refuses to spawn-attempt a web identity. An identity absent
@@ -752,34 +776,21 @@ class Conductor:
                                 forced,
                                 forced_saveable,
                             )
-                        handle = sessions.get(implementer_identity)
-                        if handle is None:
-                            spawned = await self._spawn(
-                                self._implementer_role, implementer_identity
-                            )
-                            if isinstance(spawned, SpawnGaveUp):
-                                return self._stop(
-                                    round_index,
-                                    StopReason.HUMAN,
-                                    spawned.notice_msg_id,
-                                    forced,
-                                    forced_saveable,
-                                )
-                            handle = spawned
-                            sessions[implementer_identity] = handle
                         # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
                         # this round's fetch, so it is not in ``messages``. The context builder
                         # requires the trigger to be present; append it NON-destructively so
                         # nothing else this round reads sees a changed list.
-                        await self._dispatch_recording(
-                            handle,
+                        gave_up = await self._dispatch_implementer(
+                            sessions,
+                            implementer_identity,
                             route_msg,
                             [*messages, route_msg],
-                            role=self._implementer_role,
-                            rounds=round_index,
+                            round_index=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
                         )
+                        if gave_up is not None:
+                            return gave_up
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
@@ -804,36 +815,72 @@ class Conductor:
                         else StopReason.HUMAN
                     )
                     return self._stop(round_index, reason, last, forced, forced_saveable)
-                handle = sessions.get(implementer_identity)
-                if handle is None:
-                    spawned = await self._spawn(self._implementer_role, implementer_identity)
-                    if isinstance(spawned, SpawnGaveUp):
-                        return self._stop(
-                            round_index,
-                            StopReason.HUMAN,
-                            spawned.notice_msg_id,
-                            forced,
-                            forced_saveable,
-                        )
-                    handle = spawned
-                    sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
                 # R-1b: ``relay_msg`` post-dates this round's fetch; hand the builder
                 # ``[*messages, relay_msg]`` (a new list — ``messages`` stays as fetched).
-                await self._dispatch_recording(
-                    handle,
+                gave_up = await self._dispatch_implementer(
+                    sessions,
+                    implementer_identity,
                     relay_msg,
                     [*messages, relay_msg],
-                    role=self._implementer_role,
-                    rounds=round_index,
+                    round_index=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
                 )
+                if gave_up is not None:
+                    return gave_up
                 # Track the relay: a silent implementer leaves the relay as the next latest, so the
                 # no-progress guard stops it (the relay's NEXT is never re-routed).
                 processed_msg_id = relay_msg_id
                 continue
+
+            # Gate resume (:mod:`.gate_resume`, Bohr msg-6316 / msg-6318). A PR-gate post at the
+            # head (an RC relay or an R4 ci-route) that no run has acted on yet. Only a VERIFIED
+            # check — GitHub's state read back now, never the author name — dispatches the
+            # implementer; UNAVAILABLE / STALE stop silently for the next tick; CONTRADICTED falls
+            # through to ``_route`` below, i.e. exactly the path this head took before.
+            candidate = resume_candidate(
+                author=_author(latest),
+                body=_content(latest),
+                names_implementer=(
+                    handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role
+                ),
+            )
+            resume_identity = self._implementer_identity
+            if candidate is not None and resume_identity:
+                # The watchdog first: UNAVAILABLE / STALE post nothing, so this is their bound.
+                stalled = await self._stand_down_if_stalled(
+                    round_index, latest_msg_id, resume_identity, forced, forced_saveable
+                )
+                if stalled is not None:
+                    return stalled
+                check = await verify_resume(
+                    candidate,
+                    rollup_source=self._rollup_source,
+                    review_source=self._review_source,
+                    review_login=self._review_login,
+                )
+                log_resume_check(candidate, check)
+                if check.outcome is ResumeOutcome.VERIFIED:
+                    gave_up = await self._dispatch_implementer(
+                        sessions,
+                        resume_identity,
+                        latest,
+                        messages,
+                        round_index=round_index,
+                        forced=forced,
+                        forced_saveable=forced_saveable,
+                    )
+                    if gave_up is not None:
+                        return gave_up
+                    processed_msg_id = latest_msg_id
+                    continue
+                if check.outcome in (ResumeOutcome.UNAVAILABLE, ResumeOutcome.STALE):
+                    return self._stop(
+                        round_index, StopReason.RESUME_RETRY, latest_msg_id, forced, forced_saveable
+                    )
+                # CONTRADICTED: fall through to the ordinary route.
 
             # D-4' G3: fetch the Decider's veto answer for a naysayer proceed BEFORE the synchronous
             # ``_route`` consults it. Only called when every other carve-out ③ condition already
@@ -969,36 +1016,11 @@ class Conductor:
             # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
             # roster-resolved "AI-addressed" test (msg-4532 §1) — the PR-gate path (a CI wait on
             # one head is legitimate) and every stop above never reach here.
-            if round_index == 0 and is_stalled(
-                launches_same_head=self._launches_same_head,
-                launch_head_msg_id=self._launch_head_msg_id,
-                head_msg_id=latest_msg_id,
-            ):
-                stall_event = stalled_event(
-                    project=self._thread_ref.project_id,
-                    thread=self._thread_ref.thread_id,
-                    head_msg_id=latest_msg_id,
-                    launches_same_head=self._launches_same_head,
-                    target=target_identity,
-                )
-                emit_stalled(stall_event)
-                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
-                # the human who owns this thread, who opens it because its head asked for work.
-                # Fallback when the thread is gone: disposition (3), fail loudly. ``_post_as_relay``
-                # turns a ThreadResolvedError into an empty ``msg_id``; that, or any post that
-                # returns no ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine
-                # and Discord alert, with the ``conductor.stalled`` line above in the log tail.
-                posted = await self._post_as_relay(render_stalled_notice(stall_event))
-                posted_id = _msg_id(posted)
-                if not posted_id:
-                    logger.warning(
-                        "conductor.stalled notice did not land in thread %r — exiting non-zero",
-                        self._thread_ref.thread_id,
-                    )
-                    raise StalledError(stall_event)
-                return self._stop(
-                    round_index, StopReason.STALLED, posted_id, forced, forced_saveable
-                )
+            stalled = await self._stand_down_if_stalled(
+                round_index, latest_msg_id, target_identity, forced, forced_saveable
+            )
+            if stalled is not None:
+                return stalled
             # The session first, the forced-consult count after: a spawn that gave up stops the
             # run here, and a consult that never ran must not be reported as one that did.
             handle = sessions.get(target_identity)
@@ -2823,6 +2845,87 @@ class Conductor:
                     error_code=adapter_error_code(exc),
                 )
             raise
+
+    async def _stand_down_if_stalled(
+        self,
+        round_index: int,
+        latest_msg_id: str,
+        target_identity: str,
+        forced: int,
+        forced_saveable: int,
+    ) -> ConductorOutcome | None:
+        """T42 watchdog: stand down (STALLED notice, no spawn) or return ``None`` to go on.
+
+        Extracted so the ordinary role path and the gate resume (:mod:`.gate_resume`) share one
+        copy; the resume's silent ``resume_retry`` stops rely on it as their only bound.
+        """
+        if round_index != 0 or not is_stalled(
+            launches_same_head=self._launches_same_head,
+            launch_head_msg_id=self._launch_head_msg_id,
+            head_msg_id=latest_msg_id,
+        ):
+            return None
+        stall_event = stalled_event(
+            project=self._thread_ref.project_id,
+            thread=self._thread_ref.thread_id,
+            head_msg_id=latest_msg_id,
+            launches_same_head=self._launches_same_head,
+            target=target_identity,
+        )
+        emit_stalled(stall_event)
+        # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader: the human
+        # who owns this thread, who opens it because its head asked for work. Fallback when the
+        # thread is gone: disposition (3), fail loudly. ``_post_as_relay`` turns a
+        # ThreadResolvedError into an empty ``msg_id``; that, or any post that returns no
+        # ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine and Discord alert,
+        # with the ``conductor.stalled`` line above in the log tail.
+        posted = await self._post_as_relay(render_stalled_notice(stall_event))
+        posted_id = _msg_id(posted)
+        if not posted_id:
+            logger.warning(
+                "conductor.stalled notice did not land in thread %r — exiting non-zero",
+                self._thread_ref.thread_id,
+            )
+            raise StalledError(stall_event)
+        return self._stop(round_index, StopReason.STALLED, posted_id, forced, forced_saveable)
+
+    async def _dispatch_implementer(
+        self,
+        sessions: dict[str, SessionHandle],
+        implementer_identity: str,
+        trigger: dict[str, Any],
+        thread: list[dict[str, Any]],
+        *,
+        round_index: int,
+        forced: int,
+        forced_saveable: int,
+    ) -> ConductorOutcome | None:
+        """Spawn (or reuse) the implementer and dispatch it on ``trigger``. The one copy.
+
+        Shared by the REQUEST_CHANGES relay, the R4 ci-route and the gate resume (msg-6316: "the
+        same helper"), so a resumed implementer turn behaves exactly like one dispatched in the
+        run that fired the gate. Returns a stop outcome only when the spawn gave up; ``None``
+        means the turn was dispatched.
+        """
+        handle = sessions.get(implementer_identity)
+        if handle is None:
+            spawned = await self._spawn(self._implementer_role, implementer_identity)
+            if isinstance(spawned, SpawnGaveUp):
+                return self._stop(
+                    round_index, StopReason.HUMAN, spawned.notice_msg_id, forced, forced_saveable
+                )
+            handle = spawned
+            sessions[implementer_identity] = handle
+        await self._dispatch_recording(
+            handle,
+            trigger,
+            thread,
+            role=self._implementer_role,
+            rounds=round_index,
+            forced=forced,
+            forced_saveable=forced_saveable,
+        )
+        return None
 
     def _stop(
         self,

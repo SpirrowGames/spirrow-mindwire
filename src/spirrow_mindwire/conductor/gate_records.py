@@ -209,7 +209,45 @@ def render_admission_heading(pr_ref: str) -> str:
     parenthetical is a fixed label, not a reason: the rule is on the ``ADMISSION:`` line below.
     Nothing in this module reads this heading; R5 / R6 key only on markers and verdict headings.
     """
-    return f"PR-gate admission (pre-gate CI wait) — {pr_ref}"
+    return f"{_ADMISSION_HEADING_PREFIX}{pr_ref}"
+
+
+#: The fixed prefixes of the two headings above. One constant per heading, read by both the
+#: writer and the reader below, so a reworded heading cannot leave the reader matching nothing.
+_ADMISSION_HEADING_PREFIX = "PR-gate admission (pre-gate CI wait) — "
+_RELAY_HEADING_PREFIX = "PR-gate (Tier B independent naysayer) — "
+
+
+def _first_line(body: str) -> str:
+    stripped = body.strip()
+    return stripped.splitlines()[0].strip() if stripped else ""
+
+
+def admission_heading_pr_ref(body: str) -> str | None:
+    """The PR ref named on an admission post's heading (:func:`render_admission_heading`).
+
+    ``None`` when the first line is not that heading. Reads the first line only, for the same
+    reason :func:`verdict_heads` does: a critique quoting a heading must not read as one. The
+    returned ref is raw; the caller normalises it with ``parse_pr_ref``.
+    """
+    line = _first_line(body)
+    if not line.startswith(_ADMISSION_HEADING_PREFIX):
+        return None
+    ref = line[len(_ADMISSION_HEADING_PREFIX) :].strip()
+    return ref or None
+
+
+def relay_heading_pr_ref(body: str) -> str | None:
+    """The PR ref named on a verdict relay's heading (:func:`render_relay_heading`).
+
+    The optional `` @ <sha>`` suffix is dropped. ``None`` when the first line is not the relay
+    heading. First line only (see :func:`admission_heading_pr_ref`).
+    """
+    line = _first_line(body)
+    if not line.startswith(_RELAY_HEADING_PREFIX):
+        return None
+    ref = _RELAY_HEAD_RE.sub("", line[len(_RELAY_HEADING_PREFIX) :]).strip()
+    return ref or None
 
 
 def render_relay_heading(pr_ref: str, head: str | None) -> str:
@@ -221,7 +259,7 @@ def render_relay_heading(pr_ref: str, head: str | None) -> str:
     That is the correct outcome, not a gap to paper over: R6 must dedupe a re-review only when
     it can name the head the first verdict was about.
     """
-    heading = f"PR-gate (Tier B independent naysayer) — {pr_ref}"
+    heading = f"{_RELAY_HEADING_PREFIX}{pr_ref}"
     return f"{heading} @ {normalize_sha(head)}" if head else heading
 
 
@@ -389,6 +427,7 @@ __all__ = [
     "MERGE_WAIT_MARK",
     "RELAY_AUTHOR",
     "RelayRoute",
+    "admission_heading_pr_ref",
     "carries_advisory",
     "ci_hold_head",
     "ci_route_heads",
@@ -396,6 +435,7 @@ __all__ = [
     "is_merge_wait_relay",
     "normalize_sha",
     "prior_advisory_approvals",
+    "relay_heading_pr_ref",
     "render_admission_heading",
     "render_ci_hold_marker",
     "render_ci_route_marker",

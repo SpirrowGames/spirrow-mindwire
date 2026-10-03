@@ -317,6 +317,15 @@ def _red(rollup: Sequence[CheckRow]) -> bool:
     return _concluded(rollup) and any((c.conclusion or "") in RED_CONCLUSIONS for c in rollup)
 
 
+def rollup_is_red(rollup: Sequence[CheckRow]) -> bool:
+    """Public form of the red test R4 / R5 apply (``_red``), for the conductor's gate resume.
+
+    The resume check (``conductor.gate_resume``) must call a rollup red exactly when admission
+    would, or a head admission routed to the implementer could fail its own resume check.
+    """
+    return _red(rollup)
+
+
 def ci_clock_start(
     rollup: Sequence[CheckRow],
     head_committed_date: datetime,
