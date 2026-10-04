@@ -4468,7 +4468,7 @@ function Get-SweepDeclaredProjects {
     $out = @()
     foreach ($p in $value) {
         if ($p -isnot [string] -or [string]::IsNullOrWhiteSpace($p)) {
-            return @{ projects = @(); error = "sweep.json 'projects' has a blank or non-string entry: $($p | ConvertTo-Json -Compress)" }
+            return @{ projects = @(); error = "sweep.json 'projects' has a blank or non-string entry: $($p | ConvertTo-Json -Compress -Depth 10)" }
         }
         $out += $p.Trim()
     }

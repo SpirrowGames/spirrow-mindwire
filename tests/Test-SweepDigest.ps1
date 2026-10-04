@@ -1003,6 +1003,9 @@ foreach ($bad in @('"spirrow-magickit"', '{ "a": 1 }', 'null', '[ "ok", "" ]', '
     CheckTrue "a malformed projects key ($bad) is reported, not read as empty" ($null -ne $dpBad.error) ($dpBad | Out-String)
     Check "a malformed projects key ($bad) scans nothing" 0 @($dpBad.projects).Count
 }
+$dpDeep = Invoke-DeclaredRead "{ ""projects"": [ ""ok"", { ""a"": { ""b"": { ""c"": { ""d"": { ""e"": ""deep-leaf"" } } } } } ], $cand }"
+CheckTrue "a nested non-string entry is shown in full in the error (no depth-2 truncation)" `
+    (($dpDeep.error -match 'deep-leaf') -and ($dpDeep.error -notmatch 'System\.Collections')) $dpDeep.error
 
 # The scan, with the three probes it calls stubbed. Each tick JSON has the shape park_wake prints.
 $script:parkWakeCalls = @()
