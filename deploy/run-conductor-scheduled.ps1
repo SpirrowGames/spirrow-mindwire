@@ -203,6 +203,12 @@ $notifyHealthPath = Join-Path $dataDir "state\notify-health.json"
 # (question + options) and its signature; the wrapper reuses it when the
 # signature has not changed (I-3: ≤1 composer call per reason:last_msg stop).
 $pendingDecisionsPath = Join-Path $dataDir "state\pending-decisions.json"
+# T-composer-entrypoint-missing-drops-decision-cards D-2': deps_hash of the last SUCCESSFUL venv
+# sync. Written only by deploy/sync-repo.ps1; the wrapper just tells it where the file is.
+$venvSyncStatePath = Join-Path $dataDir "state\venv-sync.json"
+# T-composer-entrypoint-missing-drops-decision-cards D-3: parked decisions whose material did not
+# reach magickit (key -> { signature, reason, first_seen, last_attempt, attempts, ... }).
+$materialMissingPath = Join-Path $dataDir "state\material-missing.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 # --- library dot-sources -------------------------------------------------------------------------
@@ -2069,6 +2075,12 @@ function New-DailyDigest {
         # Get-StopClassDigestLines. Fixed size (two lines, the second capped), emitted after the
         # 駐機中 section. Empty (the default) leaves the digest exactly as it was.
         [string[]]$StopClassLines = @(),
+        # T-composer-entrypoint-missing-drops-decision-cards D-3: the 材料未送信の判断待ち section,
+        # built by the caller with Get-MaterialMissingDigestLines (same shape as $ParkedCloneLines:
+        # header, rows, trailing ""). Emitted first among the caller-built sections — a decision with
+        # no card on the board is the one a human is otherwise least likely to find. Rows go through
+        # the same budget ladder. Empty (the default) leaves the digest exactly as it was.
+        [string[]]$MaterialMissingLines = @(),
         # T-sweep-intake-and-quarantine-stalls msg-5889 D-2: this tick's intake, the return value of
         # Resolve-UnregisteredIntake (lib/UnregisteredIntake.ps1). Renders the 未登録（登録不可）section
         # right after 停止中. $null (the default) omits the section, so a caller that predates the
@@ -2538,6 +2550,28 @@ function New-DailyDigest {
         if ($staleList.Count -gt 0) {
             $reserveAfterCloneParked += (_LinesCost @($staleHeadLine)) + (_SectionFloorCost -Entries $staleList -Indent '  ')
         }
+    }
+    # 材料未送信 (D-3). Placed before 駐機中, so its reserve is everything after it: the 駐機中
+    # section at its floor, the stop-reason lines, and $reserveAfterCloneParked.
+    if ($MaterialMissingLines.Count -gt 0) {
+        $reserveAfterMaterialMissing = $reserveAfterCloneParked + (_LinesCost $StopClassLines)
+        if ($ParkedCloneLines.Count -gt 0) {
+            $cloneFloorRows = @()
+            if ($ParkedCloneLines.Count -gt 2) { $cloneFloorRows = @($ParkedCloneLines[1..($ParkedCloneLines.Count - 2)]) }
+            $reserveAfterMaterialMissing += (_LinesCost @($ParkedCloneLines[0], "")) +
+                (_SectionFloorCost -Entries $cloneFloorRows -Indent '  ')
+        }
+        $mmHead = $MaterialMissingLines[0]
+        $mmRows = @()
+        if ($MaterialMissingLines.Count -gt 2) { $mmRows = @($MaterialMissingLines[1..($MaterialMissingLines.Count - 2)]) }
+        $mmTail = @("")
+        $lines += $mmHead
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $mmRows -MaxLen $Budget `
+            -Reserve ($reserveAfterMaterialMissing + (_LinesCost $mmTail)) -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+        $lines += $mmTail
     }
     if ($ParkedCloneLines.Count -gt 0) {
         $cloneHead = $ParkedCloneLines[0]
@@ -3361,9 +3395,20 @@ function Get-ParkedLaneFields {
 }
 
 # Push the composer's material to magickit's `/v1/decisions/{project}/{thread_id}/material`.
-# Never throws, never blocks the notification path. Returns the raw Invoke-MaterialPut result for
-# the test seam; the caller ignores the return value in production (D-34: the notification body
-# does NOT branch on the PUT's fate).
+# Never throws, never blocks the notification path.
+#
+# Returns @{ outcome; reason; put } (T-composer-entrypoint-missing-drops-decision-cards D-3):
+#   outcome = 'suppressed' — same signature as the last alert (DM-3); nothing attempted.
+#             'pushed'     — the PUT returned ok.
+#             'missing'    — a parked decision whose material did NOT reach magickit: no envelope
+#                            (composer failed), any of the three skip branches, or a failed PUT.
+#   reason  = a short machine-greppable cause for 'missing' (composer_failed / composer_status=X /
+#             no_head_msg_id_read[: tail_fetch_error] / no_output / put_http_N / put_error).
+#   put     = the raw Invoke-MaterialPut result when a PUT was attempted, else $null.
+# Before D-3 the caller ignored the outcome (D-34: the notification body did not branch on the PUT).
+# D-3 amends that on one point only: on 'missing' the caller prepends a ⚠ line to the SAME
+# notification, because six skips on 2026-10-04 went unseen while the notifications themselves
+# were delivered. The PUT stays fail-open: the notification still fires on every outcome.
 #
 # Log lines (DM-5, msg-1445 §3): every branch produces exactly one line and calls Confirm-
 # LogWorthKeeping so nothing gets dropped by the idle-tick collapse. Textually pinned so an
@@ -3387,13 +3432,15 @@ function Push-DecisionMaterial {
         # Silent-by-design: the same tick will also suppress the notification below, and we already
         # logged this same signature once. Adding another line would double the log volume on every
         # parked-thread tick.
-        return $null
+        return @{ outcome = 'suppressed'; reason = $null; put = $null }
     }
 
     if ($null -eq $Envelope) {
         # No composer output at all — the wrapper will fire the raw ping. Do not PUT; there is
-        # nothing to PUT.
-        return $null
+        # nothing to PUT. Still a decision with no material on the board (D-3).
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — composer が envelope を返さなかった ∴ 材料を送らない"
+        return @{ outcome = 'missing'; reason = 'composer_failed'; put = $null }
     }
 
     # Every field access below goes through Get-EnvelopeField so a hashtable envelope (from a
@@ -3408,7 +3455,7 @@ function Push-DecisionMaterial {
     if ($status -and $status -ne 'ok') {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — composer_status=$status ∴ 材料なし"
-        return $null
+        return @{ outcome = 'missing'; reason = "composer_status=$status"; put = $null }
     }
 
     # DM-4 (I-16): the head msg id must be the one the composer *actually read*. If missing (e.g.
@@ -3418,7 +3465,13 @@ function Push-DecisionMaterial {
     if (-not $head) {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — composer が読んだ head が不明 (extras.head_msg_id_read 無し) ∴ 材料を送らない (ページは J-absent)"
-        return $null
+        # The composer records why it has no head (2026-10-04: `tail_fetch_error: ModuleNotFoundError:
+        # No module named 'ulid'`). Carrying it into the reason is what makes the ⚠ line and the
+        # digest row say what broke instead of only that something did.
+        $why = 'no_head_msg_id_read'
+        $tailErr = Get-EnvelopeField -Object (Get-EnvelopeField -Object $Envelope -Name 'extras') -Name 'tail_fetch_error'
+        if (-not [string]::IsNullOrEmpty($tailErr)) { $why = "no_head_msg_id_read: $tailErr" }
+        return @{ outcome = 'missing'; reason = $why; put = $null }
     }
 
     # Build the PUT body. Follows magickit's S5 slice §1.1 field table verbatim. All fields except
@@ -3437,7 +3490,7 @@ function Push-DecisionMaterial {
     if ($null -eq $output) {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — envelope に output が無い (composer_status=ok だが output=null) ∴ 材料を送らない"
-        return $null
+        return @{ outcome = 'missing'; reason = 'no_output'; put = $null }
     }
 
     # $output is guaranteed non-null here by the DM-6 guard above.
@@ -3545,7 +3598,28 @@ function Push-DecisionMaterial {
     else {
         Write-Log "material push FAILED (non-fatal): $Key head=$head — $($result.error) — 通知は継続"
     }
-    return $result
+    if ($result.ok) { return @{ outcome = 'pushed'; reason = $null; put = $result } }
+    $why = if ($result.status) { "put_http_$($result.status)" } else { 'put_error' }
+    return @{ outcome = 'missing'; reason = $why; put = $result }
+}
+
+# The composer's uv argument string (T-composer-entrypoint-missing-drops-decision-cards D-1').
+#
+# `run --no-sync python -m spirrow_mindwire.decision_request.cli`, NOT `run mindwire-compose-decision`:
+#   * By entry-point name, uv resolved `mindwire-compose-decision` from PATH when the venv's
+#     `.venv\Scripts\mindwire-compose-decision.exe` was missing (a partial `uv sync`). In production
+#     that fell through to a global Python's stale editable install pointing at the implementer's
+#     working clone, and every material push from 2026-10-04 02:23 JST was skipped. `python -m`
+#     runs the project venv's python.exe and imports from it; there is no PATH fallback.
+#   * `--no-sync` keeps uv from syncing the venv in the middle of a tick (while the conductor runs).
+#     The venv is synced in one place only: deploy/sync-repo.ps1, with `uv sync --locked`.
+# Its own function so Test-DecisionComposerWiring.ps1 can pin the shape without spawning uv.
+function Get-ComposerCliArguments {
+    param([string]$Backend, [string]$Identity, [int]$TailCount = 0)
+    # S3 spec D-38: pass --tail N when the caller asks for it (currently: only the claude-code
+    # backend does).
+    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
+    return "run --no-sync python -m spirrow_mindwire.decision_request.cli --backend $Backend --identity `"$Identity`"$tailArg"
 }
 
 # Invoke the CLI with the input JSON on stdin, return @{ ok; envelope; error }. This is the seam
@@ -3577,8 +3651,7 @@ function Invoke-ComposerCli {
     # (payload tail is what the CLI sees) is untouched. Kept as a caller-supplied parameter rather
     # than an in-function branch on $Backend so the seam stays testable without threading the
     # backend through Format-DecisionMessage etc.
-    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
-    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`"$tailArg"
+    $psi.Arguments = Get-ComposerCliArguments -Backend $Backend -Identity $Identity -TailCount $TailCount
     $psi.WorkingDirectory = $repoRoot
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -3872,20 +3945,167 @@ function Format-DecisionMessage {
     return $body
 }
 
+# --- material-missing (T-composer-entrypoint-missing-drops-decision-cards D-3) -------------------
+# A parked decision whose material never reached magickit has no card on the board: on 2026-10-04
+# three real Tier-C escalations dropped off the live column this way, and the six skips behind it
+# were only log lines nobody reads. state\material-missing.json makes that a STATE:
+#
+#   { "<project>/<thread>": { signature, reason, first_seen, last_attempt, attempts,
+#                              project, thread_id, last_msg_id, stop_reason, rounds } }
+#
+# Recorded on every 'missing' outcome of Push-DecisionMaterial (composer failed, the three skip
+# branches, a failed PUT). Removed when a PUT succeeds, when the thread's signature advances, or
+# when the key leaves the sweep list. Surfaced on two paths: a ⚠ line at the top of that tick's
+# notification, and a section of the daily digest. Retried at most once per
+# $MaterialMissingRetryInterval, without re-notifying (see Invoke-MaterialMissingRetry).
+#
+# I-16 still holds: a retry re-runs the composer and PUTs only the head it read. Nothing here fills
+# a missing head from last_msg_id.
+$MaterialMissingRetryInterval = [TimeSpan]::FromHours(1)
+
+# The ⚠ line, in one place so the notification and the tests read the same string.
+function Get-MaterialMissingWarningLine {
+    param([string]$Reason)
+    $r = "$Reason"
+    if ($r.Length -gt 160) { $r = $r.Substring(0, 159) + '…' }
+    return "⚠ 判断材料を送れていない（$r）— ボードに判断カードが出ません"
+}
+
+# Upsert. The same signature as the existing record = another failed attempt at the same stop: keep
+# first_seen, bump attempts. A different signature is a new stop: start over.
+function Set-MaterialMissing {
+    param(
+        [hashtable]$State, [string]$Key, [string]$Signature, [string]$Reason,
+        [string]$Project, [string]$ThreadId, [string]$LastMsgId, [string]$StopReason, [int]$Rounds,
+        [datetime]$Now = (Get-Date).ToUniversalTime()
+    )
+    $nowIso = $Now.ToUniversalTime().ToString('o')
+    $prev = if ($State.ContainsKey($Key)) { $State[$Key] } else { $null }
+    $prevSig = if ($null -ne $prev) { "$(Get-EnvelopeField -Object $prev -Name 'signature')" } else { '' }
+    $firstSeen = $nowIso
+    $attempts = 1
+    if ($null -ne $prev -and $prevSig -eq $Signature) {
+        # Through ConvertTo-UtcInstant: a re-read state file hands back a [DateTime], not the string.
+        $fs = Get-EnvelopeField -Object $prev -Name 'first_seen'
+        if ($fs) { $firstSeen = (ConvertTo-UtcInstant $fs).ToString('o') }
+        $attempts = 1 + [int](Get-EnvelopeField -Object $prev -Name 'attempts')
+    }
+    $State[$Key] = @{
+        signature = $Signature; reason = $Reason
+        first_seen = $firstSeen; last_attempt = $nowIso; attempts = $attempts
+        project = $Project; thread_id = $ThreadId; last_msg_id = $LastMsgId
+        stop_reason = $StopReason; rounds = $Rounds
+    }
+}
+
+# The sweep calls this with every verdict's "$reason:$last_msg". Once the signature moves, the stop
+# the record describes is over, and so is the record (D-3: "signature が進んだとき").
+function Clear-MaterialMissingIfAdvanced {
+    param([hashtable]$State, [string]$Key, [string]$Signature)
+    if ($null -eq $State -or -not $State.ContainsKey($Key)) { return }
+    if ("$(Get-EnvelopeField -Object $State[$Key] -Name 'signature')" -ne $Signature) { $State.Remove($Key) }
+}
+
+# The bounded retry (D-3). For each record whose last_attempt is at least $Interval old: run the
+# composer again (dropping a cached envelope that could not be pushed) and PUT, bypassing the
+# notification dedup but NOT notifying. DM-3 rejected an unbounded PUT stream to every parked thread
+# on every tick. This covers only the keys that failed, at most once per $Interval each, and it
+# stops at the first success. A key no longer in the sweep list is dropped instead of retried.
+function Invoke-MaterialMissingRetry {
+    param(
+        [hashtable]$MissingState,
+        [hashtable]$PendingDecisionsState,
+        [string[]]$LiveKeys,
+        [datetime]$Now = (Get-Date).ToUniversalTime(),
+        [TimeSpan]$Interval = $MaterialMissingRetryInterval
+    )
+    $retried = 0
+    foreach ($key in @($MissingState.Keys)) {
+        if ($LiveKeys -notcontains $key) {
+            Write-Log "material-missing dropped: $key — no longer in the sweep list"
+            $MissingState.Remove($key)
+            continue
+        }
+        $rec = $MissingState[$key]
+        $rawLast = Get-EnvelopeField -Object $rec -Name 'last_attempt'
+        $last = if ($rawLast) { ConvertTo-UtcInstant $rawLast } else { $null }
+        if ($null -ne $last -and ($Now.ToUniversalTime() - $last) -lt $Interval) { continue }
+
+        $sig = "$(Get-EnvelopeField -Object $rec -Name 'signature')"
+        $reason = "$(Get-EnvelopeField -Object $rec -Name 'reason')"
+        # A cached envelope is reused only when the PUT was what failed: the envelope itself was
+        # fine. Every other reason means the envelope was the problem, so compose again.
+        if (-not $reason.StartsWith('put_') -and $PendingDecisionsState.ContainsKey($key)) {
+            $PendingDecisionsState.Remove($key)
+        }
+        $project = "$(Get-EnvelopeField -Object $rec -Name 'project')"
+        $thread = "$(Get-EnvelopeField -Object $rec -Name 'thread_id')"
+        $lastMsg = "$(Get-EnvelopeField -Object $rec -Name 'last_msg_id')"
+        $stopReason = "$(Get-EnvelopeField -Object $rec -Name 'stop_reason')"
+        $rounds = [int](Get-EnvelopeField -Object $rec -Name 'rounds')
+
+        Confirm-LogWorthKeeping
+        Write-Log "material-missing retry: $key signature=$sig (previous reason: $reason)"
+        $envelope = Get-DecisionEnvelope -State $PendingDecisionsState `
+            -Key $key -Project $project -ThreadId $thread `
+            -Signature $sig -LastMsgId $lastMsg -StopReason $stopReason -Rounds $rounds
+        # An empty NotifyState: the retry bypasses the notification dedup on purpose. The
+        # notification for this signature already went out, with its ⚠ line.
+        $push = Push-DecisionMaterial -NotifyState @{} -Key $key -Signature $sig `
+            -Project $project -ThreadId $thread -StopReason $stopReason -Envelope $envelope
+        $retried++
+        if ($push.outcome -eq 'pushed') {
+            Write-Log "material-missing recovered: $key — material pushed on retry"
+            $MissingState.Remove($key)
+        }
+        else {
+            Set-MaterialMissing -State $MissingState -Key $key -Signature $sig -Reason "$($push.reason)" `
+                -Project $project -ThreadId $thread -LastMsgId $lastMsg -StopReason $stopReason `
+                -Rounds $rounds -Now $Now
+        }
+    }
+    return $retried
+}
+
+# The digest section (D-3): header, one row per key (oldest first), trailing blank. Same shape as
+# Get-DirtyCloneDigestLines, so New-DailyDigest budgets its rows the same way. Empty when nothing is
+# missing, so such a digest is byte-identical to before.
+function Get-MaterialMissingDigestLines {
+    param([hashtable]$State, [datetime]$Now)
+    if ($null -eq $State -or $State.Count -eq 0) { return , @() }
+    $rows = foreach ($k in $State.Keys) {
+        $r = $State[$k]
+        $rawFirst = Get-EnvelopeField -Object $r -Name 'first_seen'
+        $since = if ($rawFirst) { ConvertTo-UtcInstant $rawFirst } else { $null }
+        $first = if ($null -ne $since) { $since.ToString('o') } else { '' }
+        $age = if ($null -ne $since) { Format-DurationDigest -Span ($Now.ToUniversalTime() - $since) } else { '?' }
+        $line = "  $k   reason=$(Get-EnvelopeField -Object $r -Name 'reason') 経過=$age 試行=$(Get-EnvelopeField -Object $r -Name 'attempts')"
+        if ($line.Length -gt 200) { $line = $line.Substring(0, 199) + '…' }
+        [PSCustomObject]@{ Line = $line; Since = $first }
+    }
+    $lines = @("材料未送信の判断待ち（ボードに判断カードが出ていない）: $($State.Count) 件")
+    $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
+    $lines += ""
+    return , $lines
+}
+
 # The full "the loop is parked on a human decision" sequence, extracted from the sweep tick so the
 # order (material PUT → notification) and the fail-open behaviour (a broken PUT never suppresses
 # the notification) are testable in isolation (msg-1445 §5 / W-3). Inlined, this sequence is
 # unreachable from the AST-lift test harness — the only way to pin that the PUT precedes the
-# notification and that the notification body is 1 character identical whether the PUT threw or
-# returned 4xx or 5xx is to make the sequence a named function.
+# notification, and that below the D-3 ⚠ line the notification body is 1 character identical
+# whether the PUT threw or returned 4xx or 5xx, is to make the sequence a named function.
 #
-# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5):
+# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5, amended by
+# T-composer-entrypoint-missing-drops-decision-cards D-3):
 #   1. Compose (or reuse the cached) envelope for this ({Key}, {Signature}).
-#   2. Push the material to magickit — non-blocking, fail-open, its result is ignored.
+#   2. Push the material to magickit — non-blocking, fail-open. Its outcome is used for one thing
+#      only: on 'missing', record material-missing.json and prepend the ⚠ line (D-3).
 #   3. Format the Discord body from the envelope. If enrichment fails for any reason, use the
 #      $RawFallback the caller built.
-#   4. Send-NotificationIfChanged: the caller sees exactly the body the enrichment produced,
-#      whether the PUT succeeded, failed, or was skipped for freshness.
+#   4. Send-NotificationIfChanged: the notification fires whether the PUT succeeded, failed, or
+#      was skipped. The body is the enrichment's output, preceded by the ⚠ line when material is
+#      missing; nothing else in it depends on the PUT.
 #
 # The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
 # without it the PUT would fire on every tick against a driven-by-human-response wait,
@@ -3901,7 +4121,10 @@ function Send-HumanParkAlert {
         [string]$LastMsgId,
         [string]$StopReason,
         [int]$Rounds,
-        [string]$RawFallback
+        [string]$RawFallback,
+        # D-3: state\material-missing.json. $null (tests that predate D-3) records nothing; the ⚠
+        # line is added either way, because it depends only on this tick's outcome.
+        [hashtable]$MaterialMissingState = $null
     )
 
     # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
@@ -3920,15 +4143,36 @@ function Send-HumanParkAlert {
         -Signature $Signature -LastMsgId $LastMsgId `
         -StopReason $StopReason -Rounds $Rounds
 
-    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
-    # discarded; the notification body below does NOT branch on it.
-    $null = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
+    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Fail-open: its failure never
+    # suppresses the notification. The body below branches on it in exactly one way (D-3, which
+    # amends D-34): a 'missing' outcome prepends the ⚠ line; the rest of the body is unchanged.
+    $push = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
         -Project $Project -ThreadId $ThreadId -StopReason $StopReason -Envelope $envelope
 
+    # D-3: record the outcome, and on 'missing' put a ⚠ line at the top of this notification. On
+    # 2026-10-04 the notifications reached a person while the skips did not, so this is the
+    # quickest place to be seen. The body's budget gives up the line's length, so the total stays
+    # within $DecisionMessageDiscordBudget.
+    $warning = $null
+    if ($push.outcome -eq 'missing') {
+        $warning = Get-MaterialMissingWarningLine -Reason $push.reason
+        if ($null -ne $MaterialMissingState) {
+            Set-MaterialMissing -State $MaterialMissingState -Key $Key -Signature $Signature `
+                -Reason "$($push.reason)" -Project $Project -ThreadId $ThreadId -LastMsgId $LastMsgId `
+                -StopReason $StopReason -Rounds $Rounds
+        }
+    }
+    elseif ($push.outcome -eq 'pushed' -and $null -ne $MaterialMissingState -and $MaterialMissingState.ContainsKey($Key)) {
+        $MaterialMissingState.Remove($Key)
+    }
+
+    $formatBudget = $DecisionMessageDiscordBudget
+    if ($warning) { $formatBudget -= ($warning.Length + 1) }
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `
-        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope
+        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget
     $message = if ($enriched) { $enriched } else { $RawFallback }
+    if ($warning) { $message = "$warning`n$message" }
 
     Send-NotificationIfChanged -State $NotifyState -Key $Key `
         -Signature $Signature -Message $message
@@ -4519,7 +4763,7 @@ function Invoke-RepoSync {
         return $null
     }
     try {
-        $raw = & pwsh -NoProfile -File $probe 2>&1
+        $raw = & pwsh -NoProfile -File $probe -StatePath $venvSyncStatePath 2>&1
         $code = $LASTEXITCODE
         if ($code -ne 0) {
             Write-Log "repo sync exited $code — running whatever code is checked out. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
@@ -4533,6 +4777,19 @@ function Invoke-RepoSync {
         Write-Log "repo sync failed ($($_.Exception.Message)) — running whatever code is checked out"
         return $null
     }
+}
+
+# The dedup signature of a non-happy deploy verdict (skipped / blocked / failed) for the
+# `__deploy_health__` notification. A verdict carrying `deps_hash` is a venv-sync failure
+# (T-composer-entrypoint-missing-drops-decision-cards D-2' + Einstein's closing [edge-case] advisory): it is
+# keyed on the hash, not on uv's message text, so every failure of the same pyproject/uv.lock state
+# (lock mismatch, import check, `os error 32`, …) alerts once while sync-repo retries it every tick,
+# and a new commit that still fails (new hash) alerts again. Git-step verdicts keep their old key.
+function Get-DeployHealthSignature {
+    param($Sync)
+    $hash = if ($Sync.PSObject.Properties.Name -contains 'deps_hash') { "$($Sync.deps_hash)" } else { '' }
+    if ($hash) { return "$($Sync.status):deps:$hash" }
+    return "$($Sync.status):$($Sync.reason)"
 }
 
 # --- gate-bootstrap tick -------------------------------------------------------------------------
@@ -4716,6 +4973,11 @@ try {
     # fresh composer call per parked thread this tick and self-heals; a missing pending-decisions
     # file is not a fatal condition.
     $pendingDecisionsState = Get-JsonState -Path $pendingDecisionsPath
+    # D-3 (T-composer-entrypoint-missing-drops-decision-cards): parked decisions whose material did
+    # not reach magickit. Same lifetime as the composer cache: read here, written at the end of the
+    # tick next to it. A corrupt file collapses to empty, which loses at most the retry of those
+    # keys until their next failure records them again.
+    $materialMissingState = Get-JsonState -Path $materialMissingPath
 
     # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
     # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
@@ -4738,7 +5000,13 @@ try {
         }
         elseif ($sync.status -eq 'current') {
             # Buffered, not committed: on an idle tick this collapses away with everything else.
-            Write-Log "repo up to date ($($sync.head))"
+            # Except a venv re-sync (D-2': first tick on a new sync-repo, or a retry after a failed
+            # sync that has now succeeded) — that changed the environment, so keep it.
+            if ($sync.PSObject.Properties.Name -contains 'synced_deps' -and $sync.synced_deps) {
+                Confirm-LogWorthKeeping
+                Write-Log "repo up to date ($($sync.head)); venv synced (deps_hash differed from the last successful sync)"
+            }
+            else { Write-Log "repo up to date ($($sync.head))" }
         }
         else {
             # skipped / blocked / failed. Deliberately NOT committed to the log on its own: the log is
@@ -4747,7 +5015,7 @@ try {
             # week on a feature branch costs one alert, not 2016.
             Write-Log "repo sync $($sync.status): $($sync.reason)"
             Send-NotificationIfChanged -State $notifyState -Key "__deploy_health__" `
-                -Signature "$($sync.status):$($sync.reason)" `
+                -Signature (Get-DeployHealthSignature -Sync $sync) `
                 -Message ("MindWire: main の自動取り込みが **$($sync.status)** です — $($sync.reason)。" +
                           "ループは現在チェックアウトされているコードで動き続けます（古い可能性があります）。")
         }
@@ -5647,6 +5915,10 @@ try {
         # candidate we did not act on would reproduce the exponential-starvation loop #140 was
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
+        # D-3: a material-missing record describes one stop; once this thread's signature moves,
+        # that stop is over.
+        Clear-MaterialMissingIfAdvanced -State $materialMissingState -Key $cand.key `
+            -Signature "$($verdict.reason):$($verdict.last_msg)"
 
         # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`,
         # `self_handoff_to_human` or `stalled_to_human` (T42) run parks the thread until its head moves — head_skip's
@@ -5675,6 +5947,7 @@ try {
                             " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
                             "chatroom を確認してください。")
             Send-HumanParkAlert -PendingDecisionsState $pendingDecisionsState `
+                -MaterialMissingState $materialMissingState `
                 -NotifyState $notifyState -Key $cand.key `
                 -Project $cand.project -ThreadId $thread `
                 -Signature $sig -LastMsgId $verdict.last_msg `
@@ -5746,6 +6019,20 @@ try {
     # nothing and therefore changed nothing here; it writes nothing either (msg-5434 test list).
     if ($headSkipMode -ne 'report') {
         Save-JsonState -Path $retryPendingStatePath -State $retryState
+    }
+
+    # D-3: the bounded material retry — keys in material-missing.json whose last attempt is at least
+    # $MaterialMissingRetryInterval old get one more composer + PUT, with no notification. Not in
+    # report mode, which promises to launch nothing (a composer run is a launch of its own).
+    if ($headSkipMode -ne 'report' -and $materialMissingState.Count -gt 0) {
+        $null = Invoke-MaterialMissingRetry -MissingState $materialMissingState `
+            -PendingDecisionsState $pendingDecisionsState -LiveKeys $liveKeys -Now $nowUtc
+    }
+    if ($materialMissingState.Count -gt 0) {
+        # Buffered, not committed: a standing record must not defeat the idle-tick collapse. The
+        # notification's ⚠ line and the digest are the channels a person reads.
+        Write-Log ("material missing (no decision card on the board): " +
+                   (($materialMissingState.Keys | Sort-Object | ForEach-Object { "$_ ($($materialMissingState[$_].reason))" }) -join ', '))
     }
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
@@ -5861,6 +6148,7 @@ try {
                 -StaleHumanThreshold $StaleHumanThreshold `
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
                 -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
+                -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
@@ -5978,6 +6266,7 @@ try {
 
     Save-JsonState -Path $notifyStatePath -State $notifyState
     Save-JsonState -Path $pendingDecisionsPath -State $pendingDecisionsState
+    Save-JsonState -Path $materialMissingPath -State $materialMissingState
 }
 catch {
     $exitCode = 1
