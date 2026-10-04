@@ -54,8 +54,14 @@ def tally_kinds(
         yield row
 
 
-def _unmeasured_log(log_path: Path) -> str:
-    return f"unmeasured: decisions log not found at {log_path}"
+def unmeasured_comparison(log_path: Path) -> dict[str, Any]:
+    """The whole report when the decisions log is missing — the one place that shape is built.
+
+    Both :func:`scan` and :func:`main` (before any fetch) return this, so the unmeasured report
+    cannot drift between them (PR #457 gate msg-6518, advisory 1). ``main`` calls this rather
+    than ``scan([], ..., roster={})`` so it never depends on where ``scan`` checks for the log.
+    """
+    return {"comparison": f"unmeasured: decisions log not found at {log_path}"}
 
 
 def summarise(audits: Sequence[ThreadAudit]) -> dict[str, Any]:
@@ -137,7 +143,7 @@ def scan(
 ) -> dict[str, Any]:
     """The whole report for already-fetched threads. Pure apart from reading ``log_path``."""
     if not log_path.exists():
-        return {"comparison": _unmeasured_log(log_path)}
+        return unmeasured_comparison(log_path)
     threads = {t for t, _, _ in fetched}
     kind_counts: Counter[str] = Counter()
     # The one read of the log: ``iter_rows`` opens it, ``tally_kinds`` counts kinds on the way
@@ -175,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     if not log_path.exists():
         # Checked before any network call: a missing log makes the whole comparison unmeasured,
         # so fetching every thread first would be wasted (PR #449 gate msg-6427, advisory 2).
-        _emit({"comparison": _unmeasured_log(log_path)}, args.out)
+        _emit(unmeasured_comparison(log_path), args.out)
         return 0
     fetched = asyncio.run(_fetch(args.project, set(args.thread) if args.thread else None))
     _emit(scan(fetched, log_path=log_path, roster=dict(settings.conductor.roster)), args.out)

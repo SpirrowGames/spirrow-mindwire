@@ -235,11 +235,6 @@ def modes_from(projects: Sequence[str], loaded: MindwireSettings | str) -> dict[
     return dict.fromkeys(projects, str(loaded.tierc_gate.mode))
 
 
-def read_modes(projects: Sequence[str], config_path: Path | None) -> dict[str, str]:
-    """``[tierc_gate].mode`` for each project, or ``unmeasured: <reason>`` — never a default."""
-    return modes_from(projects, load_config(config_path))
-
-
 def _date(raw: str) -> datetime:
     return builder.parse_timestamp(raw)  # type: ignore[no-any-return]
 

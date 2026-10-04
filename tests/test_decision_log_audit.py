@@ -361,3 +361,24 @@ def test_f_main_with_a_missing_log_makes_no_network_call(
     assert report["comparison"].startswith("unmeasured:")
     assert str(missing) in report["comparison"]
     assert json.loads(capsys.readouterr().out) == report
+
+
+def test_g1_scan_and_main_give_the_same_unmeasured_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One builder for the missing-log report: ``scan`` and ``main`` cannot drift (U4d G)."""
+    import json
+
+    mod = _script()
+
+    async def no_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("_fetch must not run when the log is missing")
+
+    monkeypatch.setattr(mod, "_fetch", no_fetch)
+    out = tmp_path / "out.json"
+    missing = tmp_path / "none.jsonl"
+    assert mod.main(["--project", "p", "--log", str(missing), "--out", str(out)]) == 0
+    from_main = json.loads(out.read_text(encoding="utf-8"))
+    from_scan = mod.scan([(T, "active", [])], log_path=missing, roster=ROSTER)
+    assert from_main == from_scan == mod.unmeasured_comparison(missing)
+    assert not hasattr(mod, "_unmeasured_log")
