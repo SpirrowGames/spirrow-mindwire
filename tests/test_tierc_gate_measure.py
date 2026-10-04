@@ -229,14 +229,10 @@ def test_c_main_measures_with_a_readable_config(
     assert "unmeasured" not in result
 
 
-def test_h1_read_modes_is_gone_and_nothing_calls_it() -> None:
-    """``read_modes`` was a test-only wrapper; tests run ``main``'s own sequence (U4d H)."""
+def test_h1_read_modes_is_gone() -> None:
+    """``read_modes`` was a test-only wrapper; tests run ``main``'s own sequence (U4d H).
+
+    A leftover caller would fail at runtime (the G/C tests drive ``main``), so a text search of
+    the tree is not needed and would false-fail on a mere comment (PR #460 gate advisory).
+    """
     assert not hasattr(MEASURE, "read_modes")
-    root = Path(__file__).resolve().parents[1]
-    callers = [
-        p
-        for d in ("src", "scripts")
-        for p in (root / d).rglob("*.py")
-        if "read_modes" in p.read_text(encoding="utf-8")
-    ]
-    assert callers == []
