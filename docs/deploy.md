@@ -241,6 +241,9 @@ glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When 
 be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
 notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
 
+**Design time is wired by the PR stacked on #463.** Until that PR lands, every design-time turn goes to
+`naysayer-gemini` (fail-safe), and the design-time bullets above describe what that PR adds.
+
 **Design time carries no file contents today.** The design-time prompt is the thread plus the
 principles, so the list of referenced files is empty. When the §7.5 prompt builder starts including
 files, it must pass the adapter the list of what it includes (`referenced_files`).
