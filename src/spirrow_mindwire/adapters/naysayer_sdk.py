@@ -71,7 +71,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -94,7 +94,21 @@ from ..exceptions import (
 )
 from ..lexora.client import LexoraClient
 from ..naysayer.adr_index import build_adr_index_block
-from ..naysayer.n3_routing import GlobLoad, N3Request, TierDecision, route_tier
+from ..naysayer.n3_routing import (
+    ConfigReader,
+    GlobLoad,
+    N3Request,
+    TierDecision,
+    UnresolvedNotifier,
+    find_repo_root,
+    has_marker,
+    load_n3_globs,
+    notify_unresolved,
+    remote_default_branch_reader,
+    resolve_design_time_paths,
+    route_tier,
+    working_config_reader,
+)
 from ..naysayer.preflight import (
     CUSTOM_HEADERS_ENV,
     PREFLIGHT_TIMEOUT_SECONDS,
@@ -167,14 +181,12 @@ _ROUTED = _Routed()
 
 
 def design_time_tier_decision() -> TierDecision:
-    """The design-time naysayer's tier, decided by :func:`route_tier` (ADR-14 §7.3 / §7.6).
+    """The design-time tier when NO turn inputs exist yet (ADR-14 §7.3 / §7.6).
 
-    **Fail-safe until the design-time inputs are wired.** The thread's
-    ``n3-sensitive`` tag, the referenced files and the §7.5 prompt are not read
-    yet, so the request is presented with ``marker=None`` ("could not read"), and
-    the decision is the Gemini-only tier. That keeps the §7.3 invariant (N-3 never
-    reaches codex) in the merged state; the codex tier opens for design-time only
-    when a caller can pass a marker it actually read.
+    Used at spawn, before any event (the spawn-time dry-run preflight and the
+    ``source:`` options stored at spawn): with nothing read, ``route_tier`` sees
+    ``marker=None`` and answers the Gemini-only tier. Each turn then re-decides on its
+    own inputs (:meth:`NaysayerSdkAdapter._turn_tier`).
     """
     return route_tier(
         N3Request(
@@ -473,6 +485,10 @@ class NaysayerSdkAdapter:
         extra_env: dict[str, str] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
+        referenced_files: Callable[[ChatroomEvent], Sequence[str]] | None = None,
+        repo_root_finder: Callable[[Path], Awaitable[Path | None]] | None = None,
+        trusted_reader: Callable[[Path | None], ConfigReader] | None = None,
+        n3_notifier: UnresolvedNotifier | None = None,
         turn_rows: TurnRowReader | None = None,
         shutdown_grace: timedelta = timedelta(seconds=5),
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -505,9 +521,22 @@ class NaysayerSdkAdapter:
         # ADR-14 §7.6: the tier is chosen by ``route_tier`` (the one decision point) unless a
         # caller pins one; the accepted backends are ALWAYS derived from the chosen tier through
         # the same table, never passed in separately.
+        self._routed = isinstance(model, _Routed)
         self._model: str | None = (
             design_time_tier_decision().tier if isinstance(model, _Routed) else model
         )
+        # Per-turn N-3 routing inputs (ADR-14 §7.3; thread msg-6475..6579). Each is
+        # injectable so tests touch neither git nor GitHub.
+        # - referenced_files: the paths whose CONTENT the turn's prompt carries (§7.5). The
+        #   current design-time prompt carries no file content, so the default is none; the
+        #   §7.5 builder must supply its list here when it lands.
+        # - repo_root_finder: the prompt source's git top level (never the process cwd).
+        # - trusted_reader: the remote default branch through the contents API.
+        # - n3_notifier: told when the trusted side cannot be resolved (msg-6477).
+        self._referenced_files = referenced_files or (lambda _event: ())
+        self._repo_root_finder = repo_root_finder or find_repo_root
+        self._trusted_reader = trusted_reader or remote_default_branch_reader
+        self._n3_notifier = n3_notifier
         # Loop-readable obligations are injected — the manifest passed in is the
         # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
         # adapter never reaches for a module-global path itself. The verdict-
@@ -538,10 +567,57 @@ class NaysayerSdkAdapter:
         self._turn_rows = turn_rows
         self._sessions: dict[SessionHandle, _Session] = {}
 
-    async def _run_preflight(self) -> AttestationRecord:
+    async def _turn_tier(self, event: ChatroomEvent, prompt: str) -> TierDecision | None:
+        """This turn's tier from :func:`route_tier`; ``None`` when the caller pinned one.
+
+        Inputs (design-time branch of msg-6579): the thread's tags (``None`` = not read →
+        Gemini); the referenced files, resolved against the repository root with the
+        out-of-tree / symlink / existence checks; the config as the union of the remote
+        default branch (trusted) and the root's ``N3_CONFIG_PATH`` (working); the size of
+        the prompt this turn would send. Globs are loaded only when the marker was read and
+        is absent — a marked or unread request goes to Gemini whatever they say.
+        """
+        if not self._routed:
+            return None
+        tags = event.thread_tags
+        marker = None if tags is None else has_marker(tags)
+        prompt_chars = len(self._system_prompt) + len(prompt)
+        globs = GlobLoad(None, "not loaded: marker set or unread")
+        paths: tuple[str, ...] = ()
+        problem: str | None = None
+        if marker is False:
+            root = await self._repo_root_finder(self._cwd)
+            globs = await load_n3_globs(
+                trusted=self._trusted_reader(root), working=working_config_reader(root)
+            )
+            paths, problem = resolve_design_time_paths(
+                tuple(self._referenced_files(event)), summon_dir=self._cwd, repo_root=root
+            )
+            await notify_unresolved(
+                globs, f"design-time {event.thread_ref.thread_id}", self._n3_notifier
+            )
+        decision = route_tier(
+            N3Request(
+                marker=marker,
+                paths=paths,
+                globs=globs,
+                prompt_chars=prompt_chars,
+                path_problem=problem,
+            )
+        )
+        logger.info(
+            "n3 routing: design-time %s -> tier=%s (%s)",
+            event.thread_ref.thread_id,
+            decision.tier,
+            decision.reason,
+        )
+        return decision
+
+    async def _run_preflight(self, tier: str | None = None) -> AttestationRecord:
         if self._preflight is not None:
             return await self._preflight()
-        if not self._model:
+        tier = tier if tier is not None else self._model
+        if not tier:
             # Nothing to attest: with no model kwarg the session does not name a
             # tier, so there is no tier→backend resolution to observe. Refusing
             # is the honest answer; probing with an empty model would fail with
@@ -552,8 +628,8 @@ class NaysayerSdkAdapter:
             )
         return await attest_backend(
             base_url=self._inference_base_url,
-            tier=self._model,
-            allowed=allowed_backends(self._model),
+            tier=tier,
+            allowed=allowed_backends(tier),
         )
 
     async def _read_turn_rows(self, trace_id: str) -> list[dict[str, Any]]:
@@ -808,8 +884,16 @@ class NaysayerSdkAdapter:
         # Never let a previous turn's record survive into this one: if anything
         # below fails, nothing is attested for this turn.
         session.attestation = None
+        prompt = _build_prompt(event, session.own_role)
         try:
-            probe_record = await self._run_preflight()
+            # ADR-14 §7.3 / §7.6: decide this turn's tier first; the preflight, the session's
+            # options (and so the source: line) and the turn attestation all follow it.
+            decision = await self._turn_tier(event, prompt)
+            if decision is not None:
+                session.options = replace(session.options, model=decision.tier)
+            probe_record = await self._run_preflight(
+                decision.tier if decision is not None else None
+            )
         except Exception as exc:
             # Yield to halt: the preflight is awaited with no client published,
             # so a halt landing here is a pure state transition that may already
@@ -895,7 +979,7 @@ class NaysayerSdkAdapter:
             # abandoned client down. No retry here: the turn fails loudly.
             # The ``query`` and the drain after it are still unbounded.
             await connect_bounded(client, self._connect_timeout_seconds)
-            await client.query(_build_prompt(event, session.own_role))
+            await client.query(prompt)
             body, result = await _drain_reply(client)
             body_success = True
         except SdkIsErrorSignal as sig:

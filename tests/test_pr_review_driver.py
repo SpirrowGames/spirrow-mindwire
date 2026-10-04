@@ -22,6 +22,7 @@ from spirrow_mindwire.github.client import (
     CrossPrApproveCoverage,
     GitHubClient,
     GitHubHTTPError,
+    PrFileList,
     PrRef,
     PrRoutingFacts,
     ReviewEvent,
@@ -152,6 +153,8 @@ class _FakeGitHub:
         self.file_reads: list[tuple[PrRef, str, str]] = []
         # ADR-14 §7.3: what ``fetch_pr_routing_facts`` returns; ``None`` → it raises.
         self.routing_facts: PrRoutingFacts | None = None
+        # What ``fetch_pr_files`` returns; ``None`` → it raises.
+        self.pr_files: PrFileList | None = None
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         self.fetched.append(pr)
@@ -194,6 +197,11 @@ class _FakeGitHub:
         # Default: credential lives (200). Terminal-classification tests override this
         # in a subclass to route the fault into ENVIRONMENT_* / TARGET / UNKNOWN scopes.
         return 200
+
+    async def fetch_pr_files(self, pr: PrRef) -> PrFileList:
+        if self.pr_files is None:
+            raise NotImplementedError
+        return self.pr_files
 
     async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts:
         # ADR-14 §7.3. Unset, raising reads as "could not read the PR's labels", which the
@@ -5203,10 +5211,24 @@ def _routed_github(
     labels: frozenset[str] = frozenset(),
     base_cfg: str | None = "n3_sensitive_paths = []\n",
     head_cfg: str | None = None,
-    diff: str = "diff --git a/src/app.py b/src/app.py\n+x",
+    paths: tuple[str, ...] = ("src/app.py",),
+    entries: int | None = None,
+    changed_files: int | None = None,
 ) -> _FakeGitHub:
-    github = _FakeGitHub(diff=diff, files={(_N3, "main"): base_cfg, (_N3, "sha-head"): head_cfg})
-    github.routing_facts = PrRoutingFacts(base_ref="main", head_sha="sha-head", labels=labels)
+    """A fake PR whose files endpoint lists ``paths`` (``entries`` file entries).
+
+    ``changed_files`` is GitHub's own count on the PR; it defaults to ``entries`` (a complete
+    list). ``entries`` defaults to ``len(paths)``.
+    """
+    github = _FakeGitHub(files={(_N3, "main"): base_cfg, (_N3, "sha-head"): head_cfg})
+    listed = len(paths) if entries is None else entries
+    github.routing_facts = PrRoutingFacts(
+        base_ref="main",
+        head_sha="sha-head",
+        labels=labels,
+        changed_files=listed if changed_files is None else changed_files,
+    )
+    github.pr_files = PrFileList(paths=paths, entries=listed)
     return github
 
 
@@ -5240,19 +5262,77 @@ async def test_routing_reads_globs_at_base_and_head() -> None:
 
 
 @pytest.mark.anyio
-async def test_routing_missing_base_config_goes_to_gemini_and_warns(
+async def test_routing_missing_base_config_goes_to_gemini_and_notifies(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    told: list[str] = []
+
+    async def notifier(line: str) -> None:
+        told.append(line)
+
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_routed_github(base_cfg=None), n3_notifier=notifier
+    )
     with caplog.at_level("WARNING"):
-        model = await _pass1_model(_routed_github(base_cfg=None))
-    assert model == "naysayer-gemini"
-    assert "config unresolved at base" in caplog.text
+        await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {"naysayer-gemini"}
+    assert "n3-routing-unresolved" in caplog.text
+    assert len(told) == 1 and "PR-gate" in told[0]
 
 
 @pytest.mark.anyio
 async def test_routing_pr_touching_the_config_goes_to_gemini() -> None:
-    github = _routed_github(diff=f"diff --git a/{_N3} b/{_N3}\n+x")
+    assert await _pass1_model(_routed_github(paths=(_N3,))) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_19_incomplete_changed_file_list_goes_to_gemini() -> None:
+    """msg-6573 (b): GitHub's files endpoint stops at 3000; a short list is not trusted."""
+    short = _routed_github(paths=("src/app.py",), entries=1, changed_files=4000)
+    assert await _pass1_model(short) == "naysayer-gemini"
+    capped = _routed_github(paths=("src/app.py",), entries=3000, changed_files=3000)
+    assert await _pass1_model(capped) == "naysayer-gemini"
+    unreadable = _routed_github()
+    unreadable.pr_files = None  # the files endpoint raises
+    assert await _pass1_model(unreadable) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_27_deleted_non_sensitive_file_goes_to_codex() -> None:
+    """msg-6579: the PR-gate never checks the disk, so a deleted path is just a path."""
+    github = _routed_github(
+        base_cfg='n3_sensitive_paths = ["deploy/*"]\n', paths=("src/gone_forever.py",)
+    )
+    assert await _pass1_model(github) == "naysayer"
+
+
+@pytest.mark.anyio
+async def test_28_deleted_sensitive_file_goes_to_gemini() -> None:
+    github = _routed_github(base_cfg='n3_sensitive_paths = ["deploy/*"]\n', paths=("deploy/x.ps1",))
     assert await _pass1_model(github) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_29_rename_or_copy_out_of_a_sensitive_glob_goes_to_gemini() -> None:
+    """msg-6579 + Einstein's advisory: ``previous_filename`` counts, renamed OR copied.
+
+    The client puts both names into ``PrFileList.paths`` (one file entry); this pins that
+    the decision sees the old name.
+    """
+    github = _routed_github(
+        base_cfg='n3_sensitive_paths = ["secrets/*"]\n',
+        paths=("src/now_public.py", "secrets/key.pem"),
+        entries=1,
+    )
+    assert await _pass1_model(github) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("bad", ["../outside.py", "/etc/passwd", "C:/x.py"])
+async def test_30_abnormal_api_path_goes_to_gemini(bad: str) -> None:
+    assert await _pass1_model(_routed_github(paths=(bad,))) == "naysayer-gemini"
 
 
 @pytest.mark.anyio

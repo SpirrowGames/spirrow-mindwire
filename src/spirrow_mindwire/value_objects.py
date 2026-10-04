@@ -247,6 +247,10 @@ class ChatroomEvent:
     payload: EventPayload  # union by event_type
     thread_context: ThreadContext | None = None
     retry_notice: str | None = None
+    # The thread's tags, as the reader saw them (``chatroom_get_thread`` ``thread.tags``).
+    # ``None`` = not read. The naysayer's tier routing reads the ``n3-sensitive`` marker
+    # here and treats ``None`` as "marked" (ADR-14 §7.3, fail-safe to the Gemini tier).
+    thread_tags: tuple[str, ...] | None = None
 
 
 # --------------------------------------------------------------------------- #

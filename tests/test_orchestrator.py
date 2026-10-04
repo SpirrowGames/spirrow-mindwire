@@ -1292,6 +1292,10 @@ class _FakeGitHubCi:
         # GitHubReviewClient Protocol compliance (T-gate-review-submit-failure-handling PR-A).
         return 200
 
+    async def fetch_pr_files(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance (never reached: routing facts already raise).
+        raise NotImplementedError
+
     async def fetch_pr_routing_facts(self, pr: PrRef) -> Any:
         # ADR-14 §7.3 Protocol compliance. Raising reads as "could not read the PR's labels",
         # which the driver routes fail-safe to the Gemini tier.

@@ -26,14 +26,25 @@ to Gemini:
    always enforced, so a change cannot loosen the rules it is judged by) and a
    *working* side (PR head / the prompt builder's source: may only ADD globs).
 4. **Unresolvable config** — trusted side unreadable, file or key missing there,
-   or either side malformed. Forgetting the key never sends anything to codex;
-   only an explicitly written ``[]`` means "no sensitive paths".
+   either side malformed, or (design time) no repository root. Forgetting the key
+   never sends anything to codex; only an explicitly written ``[]`` means "no
+   sensitive paths".
+5. **Path boundary** (msg-6575 → msg-6579) — a path that cannot be placed inside
+   the repository. The PR-gate checks GitHub's file list *lexically*
+   (:func:`lexical_path_problem`, no disk: a deleted file is just a path) and counts
+   ``previous_filename`` for renames and copies; design time resolves each reference
+   against the realpath of the git top level (:func:`resolve_design_time_paths`:
+   ``~``, relative-to-summon-dir, symlinks followed, must exist, must be under the
+   root). Either way the matcher then sees root-relative POSIX paths.
+6. **Incomplete file list** (msg-6573 (b)) — the PR-gate could not be sure it saw
+   every changed file.
 
 Plus §7.5: a prompt over the codex tier's limit goes to Gemini.
 
-Residual, authorised (Takahito, this thread, answering Einstein msg-6482, TIER-C
-goal): a vulnerability that the review itself discovers, on a path nobody listed
-and without a marker, cannot be classified in advance and reaches the codex tier.
+Residual, authorised (Takahito msg-6563, TIER-C goal, answering Einstein
+msg-6482): a vulnerability that the review itself discovers, on a path nobody
+listed and without a marker, cannot be classified in advance and reaches the codex
+tier.
 
 Paths are normalised before ANY comparison — ``\\`` → ``/``, leading ``./`` and
 ``/`` dropped, case-folded — and so are the globs (Einstein msg-6482 advisory).
@@ -44,11 +55,16 @@ crosses ``/``; again the over-matching direction.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import re
+import subprocess
 import tomllib
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+from pathlib import Path
 
 from .principles import (
     CODEX_TIER_PROMPT_CHAR_LIMIT,
@@ -59,6 +75,8 @@ from .principles import (
     NAYSAYER_MODEL_TIER,
     allowed_backends,
 )
+
+logger = logging.getLogger(__name__)
 
 ConfigReader = Callable[[], Awaitable[str | None]]
 """Reads :data:`N3_CONFIG_PATH` at one side: its text, ``None`` if absent; raises if unreadable."""
@@ -173,6 +191,12 @@ class N3Request:
     paths: tuple[str, ...]
     globs: GlobLoad
     prompt_chars: int
+    # ``False``: the caller cannot be sure ``paths`` is every changed file (GitHub's PR files
+    # endpoint stops at 3000) → Gemini (msg-6573 (b), test 19).
+    paths_complete: bool = True
+    # Set by the design-time resolver when a referenced path is out of tree or unresolvable
+    # (msg-6577) → Gemini, before anything is matched.
+    path_problem: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,12 +212,45 @@ def _gemini(reason: str) -> TierDecision:
     return TierDecision(NAYSAYER_GEMINI_TIER, allowed_backends(NAYSAYER_GEMINI_TIER), reason)
 
 
+def lexical_path_problem(path: str) -> str | None:
+    """Why ``path`` is not a plain repo-relative path, or ``None`` (msg-6579, PR-gate branch).
+
+    No disk access: a PR's file list describes the PR, not this host's tree (a deleted file
+    does not exist on disk and must not fail closed for that). A path that is absolute,
+    carries a drive letter, or has a ``..`` segment cannot be placed inside the repository,
+    so its request goes to Gemini. :func:`route_tier` applies it to EVERY path, so it is also
+    a no-op guard on design-time paths the resolver already made root-relative.
+    """
+    text = path.strip().replace("\\", "/")
+    if not text:
+        return "empty path"
+    if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return f"{path!r} is absolute"
+    if ".." in text.split("/"):
+        return f"{path!r} has a '..' segment"
+    return None
+
+
 def route_tier(request: N3Request) -> TierDecision:
-    """Decide the tier for one request. The only decision point (§7.6)."""
+    """Decide the tier for one request. The only decision point (§7.6).
+
+    Order: marker → path boundary (the design-time resolver's problem, then the lexical
+    check on every path) → incomplete file list → the config file itself → unresolvable
+    config → globs → prompt size. Every path is normalised before BOTH the config-file
+    match and the glob match (Einstein msg-6482).
+    """
     if request.marker is None:
         return _gemini(f"{N3_SENSITIVE_MARKER} marker not read")
     if request.marker:
         return _gemini(f"{N3_SENSITIVE_MARKER} marker")
+    if request.path_problem is not None:
+        return _gemini(f"path outside the repository boundary: {request.path_problem}")
+    for raw in request.paths:
+        problem = lexical_path_problem(raw)
+        if problem is not None:
+            return _gemini(f"path outside the repository boundary: {problem}")
+    if not request.paths_complete:
+        return _gemini("changed-file list may be incomplete")
     paths = [normalize_path(p) for p in request.paths]
     if _NORMALIZED_CONFIG_PATH in paths:
         return _gemini(f"touches {N3_CONFIG_PATH}")
@@ -210,23 +267,153 @@ def route_tier(request: N3Request) -> TierDecision:
     return TierDecision(NAYSAYER_MODEL_TIER, allowed_backends(NAYSAYER_MODEL_TIER), "codex tier")
 
 
-_DIFF_HEADER = re.compile(r'^diff --git (?:"a/(.*)"|a/(\S+)) (?:"b/(.*)"|b/(\S+))$')
+# ---------- design-time path resolution (msg-6575 / 6577 / 6579) -------------------- #
 
 
-def changed_files_from_diff(diff: str) -> tuple[str, ...]:
-    """Return every path a unified git diff names (both sides, so a rename counts twice).
+def _cased(path: Path) -> Path:
+    return Path(os.path.normcase(str(path)))
 
-    Read from the FULL diff, never the model-facing truncated view: a file past the
-    truncation point is still a changed file.
+
+def resolve_design_time_paths(
+    refs: Sequence[str], *, summon_dir: Path, repo_root: Path | None
+) -> tuple[tuple[str, ...], str | None]:
+    """Turn a thread's referenced paths into root-relative POSIX paths, or say why not.
+
+    Returns ``(paths, None)`` or ``((), problem)``; a problem routes the WHOLE request to
+    Gemini. Each reference has ``~`` expanded, is made absolute against ``summon_dir``, and
+    is ``realpath``-ed strictly, so a symlink is judged by where it points and a missing file
+    is a problem (msg-6577). The root is ``realpath``-ed too (a clone under a symlinked
+    directory, msg-6578 advisory), and containment is :meth:`Path.is_relative_to` on
+    ``normcase``-d paths, never a string prefix, which would put ``/repo2/x`` inside
+    ``/repo`` (msg-6579). Design-time only: the PR-gate never touches the disk.
     """
-    found: list[str] = []
-    for line in diff.splitlines():
-        match = _DIFF_HEADER.match(line)
-        if match:
-            a = match.group(1) or match.group(2)
-            b = match.group(3) or match.group(4)
-            found.extend(p for p in (a, b) if p and p not in found)
-    return tuple(found)
+    if not refs:
+        return (), None
+    if repo_root is None:
+        return (), "no repository root for the referenced files"
+    try:
+        root = _cased(Path(os.path.realpath(repo_root, strict=True)))
+    except OSError as exc:
+        return (), f"cannot resolve the repository root {str(repo_root)!r}: {exc}"
+    out: list[str] = []
+    for ref in refs:
+        candidate = Path(os.path.expanduser(ref))
+        if not candidate.is_absolute():
+            candidate = summon_dir / candidate
+        try:
+            resolved = _cased(Path(os.path.realpath(candidate, strict=True)))
+        except OSError as exc:
+            return (), f"cannot resolve {ref!r}: {exc}"
+        if not resolved.is_relative_to(root):
+            return (), f"{ref!r} resolves outside the repository root"
+        out.append(resolved.relative_to(root).as_posix())
+    return tuple(out), None
+
+
+def _git_toplevel(source_dir: Path) -> Path | None:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(source_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    top = done.stdout.strip()
+    return Path(top) if done.returncode == 0 and top else None
+
+
+async def find_repo_root(source_dir: Path) -> Path | None:
+    """``git rev-parse --show-toplevel`` for ``source_dir``; ``None`` if it is no work tree."""
+    return await asyncio.to_thread(_git_toplevel, source_dir)
+
+
+def working_config_reader(repo_root: Path | None) -> ConfigReader:
+    """Read :data:`N3_CONFIG_PATH` at the repository ROOT, never the process cwd (msg-6575).
+
+    No root → raise (the working side is unreadable → Gemini, test 22). Root found but no
+    file → ``None`` (adds nothing; the trusted side decides).
+    """
+
+    async def read() -> str | None:
+        if repo_root is None:
+            raise FileNotFoundError("no git repository root for the working-side config")
+        try:
+            return (repo_root / N3_CONFIG_PATH).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+
+    return read
+
+
+_GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+def _origin_slug(repo_root: Path) -> tuple[str, str] | None:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _GITHUB_REMOTE.search(done.stdout.strip()) if done.returncode == 0 else None
+    return (match.group(1), match.group(2)) if match else None
+
+
+def remote_default_branch_reader(repo_root: Path | None) -> ConfigReader:
+    """Design-time TRUSTED side: :data:`N3_CONFIG_PATH` on the HOST_REPO's remote default
+    branch, read through the GitHub contents API at call time — never the local tree or the
+    checked-out branch (msg-6477). Any failure raises (→ unresolved → notify + Gemini).
+    """
+
+    async def read() -> str | None:
+        from ..github.client import GitHubClient, PrRef
+
+        if repo_root is None:
+            raise FileNotFoundError("no git repository root, so no HOST_REPO to read")
+        slug = await asyncio.to_thread(_origin_slug, repo_root)
+        if slug is None:
+            raise LookupError(f"origin of {repo_root} is not a github.com remote")
+        owner, repo = slug
+        async with GitHubClient() as client:
+            branch = await client.fetch_default_branch(owner, repo)
+            # ``fetch_file_at`` reads ``/repos/{owner}/{repo}/contents/...`` and uses only the
+            # owner/repo of its PrRef; there is no PR here, so the number is a placeholder.
+            return await client.fetch_file_at(
+                PrRef(owner, repo, 0), path=N3_CONFIG_PATH, ref=branch
+            )
+
+    return read
+
+
+UnresolvedNotifier = Callable[[str], Awaitable[None]]
+"""Receives a one-line description when the TRUSTED side cannot be resolved (msg-6477)."""
+
+
+async def notify_unresolved(
+    globs: GlobLoad, where: str, notifier: UnresolvedNotifier | None
+) -> None:
+    """Log at WARNING with the stable token ``n3-routing-unresolved``, then call ``notifier``.
+
+    Fires only for a trusted-side failure. A persistent one would otherwise turn every
+    request into a Gemini request without anyone noticing (msg-6477). A failing notifier is
+    logged and swallowed: the routing decision (Gemini) is already safe.
+    """
+    if not globs.trusted_unresolved:
+        return
+    line = f"n3-routing-unresolved: {where}: {globs.failure}; routing to the Gemini tier"
+    logger.warning("%s", line)
+    if notifier is not None:
+        try:
+            await notifier(line)
+        except Exception:
+            logger.exception("n3-routing-unresolved notifier failed")
 
 
 def has_marker(names: Iterable[str]) -> bool:
@@ -239,9 +426,15 @@ __all__ = [
     "GlobLoad",
     "N3Request",
     "TierDecision",
-    "changed_files_from_diff",
+    "UnresolvedNotifier",
+    "find_repo_root",
     "has_marker",
+    "lexical_path_problem",
     "load_n3_globs",
     "normalize_path",
+    "notify_unresolved",
+    "remote_default_branch_reader",
+    "resolve_design_time_paths",
     "route_tier",
+    "working_config_reader",
 ]

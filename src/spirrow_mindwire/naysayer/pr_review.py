@@ -52,6 +52,7 @@ from enum import Enum
 from typing import Any
 
 from ..github.client import (
+    PR_FILES_LIST_CAP,
     CiState,
     CiStatus,
     CrossPrApproveCoverage,
@@ -61,6 +62,7 @@ from ..github.client import (
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    PrRoutingFacts,
     Retryability,
     ReviewEvent,
     ReviewInfo,
@@ -86,9 +88,10 @@ from ..lexora.client import (
 from .n3_routing import (
     N3Request,
     TierDecision,
-    changed_files_from_diff,
+    UnresolvedNotifier,
     has_marker,
     load_n3_globs,
+    notify_unresolved,
     route_tier,
 )
 from .pr_review_adr_pointers import (
@@ -2123,6 +2126,7 @@ class NaysayerPrReviewDriver:
         review_login: str = _DEFAULT_REVIEW_LOGIN,
         shadow: bool = False,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        n3_notifier: UnresolvedNotifier | None = None,
     ) -> None:
         # ``None`` (the default): the tier is decided per PR by ``route_tier`` (ADR-14 §7.3 /
         # §7.6, :meth:`_route`). A string pins it (tests / an operator override).
@@ -2130,6 +2134,8 @@ class NaysayerPrReviewDriver:
         # Injected so the submit-retry backoff (``_submit_review``) is testable without real
         # waiting; production uses asyncio.sleep.
         self._sleep = sleep
+        # ADR-14 §7.3 / msg-6477: told when the base-side N-3 config cannot be resolved.
+        self._n3_notifier = n3_notifier
         self._max_tokens = max_tokens
         self._skip_if_head_unchanged = skip_if_head_unchanged
         self._max_review_rounds = max_review_rounds
@@ -2334,7 +2340,7 @@ class NaysayerPrReviewDriver:
         tier = (
             self._model
             if self._model is not None
-            else (await self._route(pr, diff=diff, view=view, coverage=coverage)).tier
+            else (await self._route(pr, view=view, coverage=coverage)).tier
         )
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
             view, pr.slug, coverage=coverage, tier=tier
@@ -2461,7 +2467,6 @@ class NaysayerPrReviewDriver:
         self,
         pr: PrRef,
         *,
-        diff: str,
         view: DiffView,
         coverage: list[CrossPrApproveCoverage],
     ) -> TierDecision:
@@ -2470,15 +2475,21 @@ class NaysayerPrReviewDriver:
         Inputs, each read fail-safe toward the Gemini tier:
 
         - **marker**: the PR's labels. Unreadable labels → ``None`` (→ Gemini).
-        - **paths**: every file the FULL diff names (not the truncated view).
+        - **paths**: ``GET /pulls/{n}/files`` — every ``filename`` and every
+          ``previous_filename`` (renamed OR copied). Never the disk: a deleted file is just
+          a path (msg-6579). The list counts as complete only if it is readable, its entry
+          count equals the PR's ``changed_files``, and it is under GitHub's 3000-file cap;
+          otherwise → Gemini (msg-6573 (b), test 19).
         - **globs**: ``load_n3_globs`` with trusted = the PR's base ref, working = its
           head. A PR cannot loosen the boundary it is judged against (base is always
           enforced), and a glob it adds counts at once (head may only add).
         - **prompt size**: pass 1's messages as built for this PR.
 
-        A trusted-side resolution failure is logged at WARNING so a persistent one cannot
-        quietly turn every review into a Gemini review (thread msg-6477).
+        A trusted-side resolution failure goes to :func:`notify_unresolved` (WARNING with
+        the ``n3-routing-unresolved`` token, plus the injected notifier) so a persistent one
+        cannot quietly turn every review into a Gemini review (thread msg-6477).
         """
+        facts: PrRoutingFacts | None
         try:
             facts = await self._github.fetch_pr_routing_facts(pr)
         except Exception as exc:
@@ -2492,30 +2503,38 @@ class NaysayerPrReviewDriver:
         async def _read_at(ref: str) -> str | None:
             return await self._github.fetch_file_at(pr, path=N3_CONFIG_PATH, ref=ref)
 
+        paths: tuple[str, ...] = ()
+        complete = False
         if facts is None:
             marker: bool | None = None
             globs = await load_n3_globs(trusted=_raise_unread, working=None)
         else:
             marker = has_marker(facts.labels)
+            base_ref, head_sha = facts.base_ref, facts.head_sha
             globs = await load_n3_globs(
-                trusted=lambda: _read_at(facts.base_ref),
-                working=lambda: _read_at(facts.head_sha),
+                trusted=lambda: _read_at(base_ref),
+                working=lambda: _read_at(head_sha),
             )
+            try:
+                listed = await self._github.fetch_pr_files(pr)
+            except Exception as exc:
+                logger.warning("n3 routing: cannot list files of %s (%s)", pr.slug, exc)
+            else:
+                paths = listed.paths
+                complete = (
+                    listed.entries == facts.changed_files and listed.entries < PR_FILES_LIST_CAP
+                )
         messages = _build_messages(view.text, pr.slug, coverage=coverage)
         decision = route_tier(
             N3Request(
                 marker=marker,
-                paths=changed_files_from_diff(diff),
+                paths=paths,
                 globs=globs,
                 prompt_chars=sum(len(m.content or "") for m in messages),
+                paths_complete=complete,
             )
         )
-        if globs.trusted_unresolved:
-            logger.warning(
-                "n3 routing: %s config unresolved at base (%s); routing to the Gemini tier",
-                pr.slug,
-                globs.failure,
-            )
+        await notify_unresolved(globs, f"PR-gate {pr.slug} (base)", self._n3_notifier)
         logger.info("n3 routing: %s -> tier=%s (%s)", pr.slug, decision.tier, decision.reason)
         return decision
 
