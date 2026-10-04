@@ -199,6 +199,44 @@ behaviour or coverage** — the full review still runs:
   and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
   review — so Item 2's saving is measured before you enforce it.
 
+## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6)
+
+The naysayer answers through one of two Lexora tiers, chosen per request by
+`naysayer/n3_routing.py::route_tier` (the only place that decides):
+
+| tier | answered by | the attestation accepts |
+|---|---|---|
+| `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
+| `naysayer-gemini` | Gemini only | `gemini` |
+
+A request goes to `naysayer-gemini` when **any** of these holds:
+
+- it carries the marker `n3-sensitive`: a PR **label** at the PR-gate, a thread **tag** at design time.
+  A label set the driver cannot read counts as marked;
+- it touches `.mindwire-n3.toml`, the per-repo config file, whatever the globs say;
+- a changed or referenced file matches a glob in that file's `n3_sensitive_paths` list. The PR-gate
+  reads the list at the PR's **base** ref and unions it with the **head** copy, which may only add globs;
+- the config can't be resolved: file or key missing at base, a read error, or malformed TOML on
+  either side. **Leaving the key out sends everything to Gemini.** Writing `n3_sensitive_paths = []`
+  explicitly is the only way to say "no sensitive paths";
+- the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5).
+
+Paths and globs are normalised (`\` → `/`, case-folded) and matched with `fnmatch`, so `*` also
+crosses `/`. A base-side resolution failure is logged at WARNING (`n3 routing: … config unresolved`).
+If that line keeps appearing, every review is quietly running on Gemini.
+
+**Design time is fail-safe for now.** The design-time adapter doesn't read thread tags or
+referenced files yet, so `route_tier` sends every design-time turn to `naysayer-gemini`.
+
+**Residual risk, authorised by Takahito as a TIER-C goal decision on thread
+T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a vulnerability, on a path
+no glob lists and with no marker set. That request can't be classified in advance, and it reaches the
+codex tier.
+
+**Merge order (§7.6):** this routing and the per-tier attestation take effect together with Lexora's
+codex path. Lexora must serve both `naysayer` (the fallback wrapper) and `naysayer-gemini` before this
+is deployed. Otherwise every naysayer attestation fails closed.
+
 ## Run
 
 ```powershell

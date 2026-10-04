@@ -98,7 +98,7 @@ from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
-from ..source_marker import parse_attestation_marker
+from ..source_marker import attestation_agrees, parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
@@ -2172,7 +2172,9 @@ class Conductor:
         session — the thing the loop's carve-outs are named after ("the *independent* naysayer")
         was never shown to be independent for that post.
 
-        ``backend == expected`` is required as well as well-formedness, and what that buys is
+        ``backend`` within ``expected`` (:func:`~spirrow_mindwire.source_marker.attestation_agrees`:
+        equality for a single backend, subset for the codex tier's ``codex|gemini-fallback``,
+        ADR-14 §7.6) is required as well as well-formedness, and what that buys is
         narrow enough to be worth stating exactly. It refuses a stamp whose own fields RECORD a
         mismatch — an observation that the tier resolved somewhere other than the independent
         distribution. P-2 fails closed before such a record is ever rendered, so the harness does
@@ -2207,7 +2209,7 @@ class Conductor:
         marker" — is a constraint on the write path and is untouched.
         """
         record = parse_attestation_marker(_content(msg))
-        return record is not None and record.backend == record.expected
+        return record is not None and attestation_agrees(record)
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has an ATTESTED naysayer posted since the last ``NEXT: human`` boundary (excl. latest)?

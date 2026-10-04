@@ -262,7 +262,9 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     stored_opts = adapter.source_marker_options(handle)
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
     assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
-    assert stored_opts.model == "naysayer"
+    # ADR-14 §7.3 / §7.6: decided by route_tier — the Gemini-only tier while the design-time
+    # marker is not read (fail-safe), so N-3 cannot reach the codex tier.
+    assert stored_opts.model == "naysayer-gemini"
     assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
     # The per-turn factory receives a COPY of the stored options that differs in
     # exactly one place — the trace header env (T-per-turn-backend-attestation) —
@@ -406,8 +408,9 @@ async def test_self_post_is_filtered(tmp_path: Path) -> None:
 
 
 def _attestation(*, backend: str = "gemini") -> AttestationRecord:
+    # ADR-14 §7.3: design-time routes to the Gemini-only tier until its inputs are wired.
     return AttestationRecord(
-        tier="naysayer",
+        tier="naysayer-gemini",
         backend=backend,
         expected="gemini",
         route="lexora.local:8110",
@@ -796,12 +799,12 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
-        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer-gemini -->"
     )
     # The stamp is the TURN's attestation: its own row (7001, from the trace-id
     # read-back), ``scope=turn`` — not the preflight probe's row 6032.
     assert re.fullmatch(
-        r"<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        r"<!-- attest: tier=naysayer-gemini · backend=gemini · expected=gemini "
         r"· route=lexora\.local:8110 · probe=cost-row#7001 · scope=turn "
         r"· at=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -->",
         lines[-1],

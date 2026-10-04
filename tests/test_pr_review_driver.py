@@ -23,6 +23,7 @@ from spirrow_mindwire.github.client import (
     GitHubClient,
     GitHubHTTPError,
     PrRef,
+    PrRoutingFacts,
     ReviewEvent,
     ReviewInfo,
 )
@@ -149,6 +150,8 @@ class _FakeGitHub:
         # per ``(path, ref)`` on a single review, so tests can assert on the exact call
         # sequence rather than just the final content.
         self.file_reads: list[tuple[PrRef, str, str]] = []
+        # ADR-14 §7.3: what ``fetch_pr_routing_facts`` returns; ``None`` → it raises.
+        self.routing_facts: PrRoutingFacts | None = None
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         self.fetched.append(pr)
@@ -191,6 +194,13 @@ class _FakeGitHub:
         # Default: credential lives (200). Terminal-classification tests override this
         # in a subclass to route the fault into ENVIRONMENT_* / TARGET / UNKNOWN scopes.
         return 200
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts:
+        # ADR-14 §7.3. Unset, raising reads as "could not read the PR's labels", which the
+        # driver routes fail-safe to the Gemini tier.
+        if self.routing_facts is None:
+            raise NotImplementedError
+        return self.routing_facts
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
         # T-gate-blocks-on-miscounted-line-numbers. Default fixture behaviour: raise if the
@@ -771,7 +781,8 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
     # not order.
     pass_1 = max(lexora.calls, key=lambda call: call[2])
     model, _messages, max_tokens = pass_1
-    assert model == "naysayer"
+    # The fake cannot read labels → route_tier's fail-safe → the Gemini-only tier (ADR-14 §7.3).
+    assert model == "naysayer-gemini"
     assert max_tokens >= 8000  # reasoning-model floor (4096 truncated the critique)
 
 
@@ -1161,7 +1172,8 @@ async def test_lexora_timeout_degrades_to_comment_not_raise() -> None:
     assert event is ReviewEvent.COMMENT  # GitHub review submitted as COMMENT (not RC)
     assert outcome.verdict is ReviewEvent.COMMENT
     assert outcome.timed_out is True
-    assert outcome.model == "naysayer"  # model telemetry preserved on the timeout-degrade path
+    # model telemetry preserved on the timeout-degrade path (routed tier; fake → fail-safe Gemini)
+    assert outcome.model == "naysayer-gemini"
     assert outcome.head_sha == "sha-to"  # CI head SHA still recorded
     assert outcome.ci_state is CiState.SUCCESS
 
@@ -5179,3 +5191,74 @@ async def test_classify_exception_returns_raw_retryable_unchanged() -> None:
     original = GitHubHTTPError("POST /reviews returned 503", status_code=503)
     result = await driver._classify_exception(_pr(), original, origin="submit")
     assert result is original
+
+
+# ---------- ADR-14 §7.3 / §7.6: per-PR tier routing ------------------------ #
+
+_N3 = ".mindwire-n3.toml"
+
+
+def _routed_github(
+    *,
+    labels: frozenset[str] = frozenset(),
+    base_cfg: str | None = "n3_sensitive_paths = []\n",
+    head_cfg: str | None = None,
+    diff: str = "diff --git a/src/app.py b/src/app.py\n+x",
+) -> _FakeGitHub:
+    github = _FakeGitHub(diff=diff, files={(_N3, "main"): base_cfg, (_N3, "sha-head"): head_cfg})
+    github.routing_facts = PrRoutingFacts(base_ref="main", head_sha="sha-head", labels=labels)
+    return github
+
+
+async def _pass1_model(github: _FakeGitHub) -> str:
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    await NaysayerPrReviewDriver(lexora=lexora, github=github).review(_pr(), post_critique=post)
+    models = {call[0] for call in lexora.calls}
+    assert len(models) == 1, models  # pass 1 and pass 2 go to the same tier
+    return models.pop()
+
+
+@pytest.mark.anyio
+async def test_routing_unmarked_pr_with_explicit_empty_list_goes_to_codex_tier() -> None:
+    assert await _pass1_model(_routed_github()) == "naysayer"
+
+
+@pytest.mark.anyio
+async def test_routing_marker_label_goes_to_gemini_tier() -> None:
+    github = _routed_github(labels=frozenset({"n3-sensitive"}))
+    assert await _pass1_model(github) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_routing_reads_globs_at_base_and_head() -> None:
+    base = _routed_github(base_cfg='n3_sensitive_paths = ["src/*"]\n')
+    assert await _pass1_model(base) == "naysayer-gemini"
+    head = _routed_github(head_cfg='n3_sensitive_paths = ["src/app.py"]\n')
+    assert await _pass1_model(head) == "naysayer-gemini"
+    assert (_N3, "main") in {(path, ref) for _pr_, path, ref in head.file_reads}
+
+
+@pytest.mark.anyio
+async def test_routing_missing_base_config_goes_to_gemini_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        model = await _pass1_model(_routed_github(base_cfg=None))
+    assert model == "naysayer-gemini"
+    assert "config unresolved at base" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_routing_pr_touching_the_config_goes_to_gemini() -> None:
+    github = _routed_github(diff=f"diff --git a/{_N3} b/{_N3}\n+x")
+    assert await _pass1_model(github) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_pinned_model_bypasses_routing() -> None:
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub(), model="pinned")
+    await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {"pinned"}

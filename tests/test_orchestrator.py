@@ -1292,6 +1292,11 @@ class _FakeGitHubCi:
         # GitHubReviewClient Protocol compliance (T-gate-review-submit-failure-handling PR-A).
         return 200
 
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance. Raising reads as "could not read the PR's labels",
+        # which the driver routes fail-safe to the Gemini tier.
+        raise NotImplementedError
+
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
         # Orchestrator L2 tests never exercise the T-gate-blocks-on-miscounted-line-numbers
         # verify_citations pass. Kept for GitHubReviewClient Protocol compliance.

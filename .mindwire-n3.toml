@@ -1,0 +1,26 @@
+# N-3 subset globs for this repository (ADR-14 §7.3; thread T-D8-codex-backend-adr14-15-amendment).
+#
+# A naysayer request whose changed files (PR-gate) or referenced files (design-time) match any
+# glob below goes to the Gemini-only tier (`naysayer-gemini`), never to the codex tier: ADR-15
+# C-2 keeps ZDR mandatory for this subset and the codex path has none.
+#
+# - The PR-gate reads this file at the PR's BASE ref (always enforced) and unions it with the
+#   HEAD copy (which may only add globs). A PR that touches this file goes to Gemini outright.
+# - Deleting the key or the file sends EVERY request to Gemini (fail-safe); `[]` written out
+#   explicitly is the only way to say "no sensitive paths".
+# - Paths and globs are normalised (`\` -> `/`, case-folded) and matched with fnmatch: `*` also
+#   crosses `/`.
+#
+# Draft list (Heisenberg, msg-6475): the routing code and its constants, the attestation, the
+# credential/route reducers, session isolation, deploy and CI configuration.
+n3_sensitive_paths = [
+    "src/spirrow_mindwire/naysayer/n3_routing.py",
+    "src/spirrow_mindwire/naysayer/principles.py",
+    "src/spirrow_mindwire/naysayer/preflight.py",
+    "src/spirrow_mindwire/mcp_write_server/auth.py",
+    "src/spirrow_mindwire/route_authority.py",
+    "src/spirrow_mindwire/adapters/_session_isolation.py",
+    "deploy/*",
+    "spec/deploy/*",
+    ".github/workflows/*",
+]

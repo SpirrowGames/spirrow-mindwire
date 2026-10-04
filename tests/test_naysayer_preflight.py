@@ -52,9 +52,10 @@ from spirrow_mindwire.naysayer.preflight import (
     custom_headers_env_value,
 )
 from spirrow_mindwire.naysayer.principles import (
-    NAYSAYER_EXPECTED_BACKEND,
+    NAYSAYER_GEMINI_TIER,
     NAYSAYER_MODEL_TIER,
     NAYSAYER_UPSTREAM_MODEL,
+    allowed_backends,
 )
 from spirrow_mindwire.value_objects import AttestationRecord
 
@@ -193,7 +194,7 @@ async def _attest(gateway: _FakeGateway, **kwargs: Any) -> AttestationRecord:
     return await attest_backend(
         base_url=_ROUTE,
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
         **kwargs,
@@ -241,7 +242,7 @@ async def test_route_is_the_credential_guarded_authority_not_the_raw_url() -> No
     record = await attest_backend(
         base_url="https://user:t0ken@gw.example:8443/v1",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
     )
@@ -255,7 +256,7 @@ async def test_route_redacts_when_the_userinfo_boundary_is_unresolvable() -> Non
     record = await attest_backend(
         base_url="https://admin:p/assword@api.internal:8443/",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
     )
@@ -513,7 +514,7 @@ async def test_a_mismatch_in_hand_beats_a_full_read() -> None:
     rows = [_row(10_000 + i) for i in range(TRACE_READ_LIMIT - 1)]
     rows.append(_row(20_000, backend="anthropic"))
     gateway = _FakeGateway(append_on_call=[rows, [_row(1)], [_row(2)]])
-    with pytest.raises(PreflightError, match="did not resolve to the expected backend"):
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
         await _attest(gateway)
     assert len(gateway.calls) == 1
 
@@ -578,23 +579,24 @@ async def test_empty_reply_body_does_not_fail_the_attestation() -> None:
 
 @pytest.mark.anyio
 async def test_production_constants_attest_against_a_live_shaped_row() -> None:
-    """The values the daemon spawns with must attest a row shaped like the real one.
+    """The Gemini tier's production allowed set must attest a row shaped like the real one.
 
-    Mutate ``NAYSAYER_EXPECTED_BACKEND`` to the upstream model id and the row
-    saying ``backend: "gemini"`` stops matching, and this reds.
+    Put the upstream model id into ``TIER_ALLOWED_BACKENDS`` instead of ``gemini`` and the
+    row saying ``backend: "gemini"`` stops matching, and this reds.
     """
     gateway = _FakeGateway(
         append_on_call=[[_row(6032, tier="naysayer", model=_LIVE_MODEL_ID, backend="gemini")]],
     )
     record = await attest_backend(
         base_url=_ROUTE,
-        tier=NAYSAYER_MODEL_TIER,
-        expected=NAYSAYER_EXPECTED_BACKEND,
+        tier=NAYSAYER_GEMINI_TIER,
+        allowed=allowed_backends(NAYSAYER_GEMINI_TIER),
         client=gateway,
         now=lambda: _NOW,
     )
     assert record.backend == "gemini"
-    assert record.tier == "naysayer"
+    assert record.expected == "gemini"
+    assert record.tier == NAYSAYER_GEMINI_TIER
 
 
 @pytest.mark.anyio
@@ -603,15 +605,71 @@ async def test_comparing_against_the_upstream_model_id_fails_every_attestation()
     gateway = _FakeGateway(
         append_on_call=[[_row(6032, tier="naysayer", model=_LIVE_MODEL_ID, backend="gemini")]],
     )
-    with pytest.raises(PreflightError, match="did not resolve to the expected backend"):
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
         await attest_backend(
             base_url=_ROUTE,
             tier=NAYSAYER_MODEL_TIER,
-            expected=NAYSAYER_UPSTREAM_MODEL,
+            allowed=frozenset({NAYSAYER_UPSTREAM_MODEL}),
             client=gateway,
             now=lambda: _NOW,
             attempts=1,
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["codex", "gemini-fallback"])
+async def test_codex_tier_accepts_codex_and_gemini_fallback(backend: str) -> None:
+    """ADR-14 §7.6: the codex tier accepts ``codex`` (primary) and ``gemini-fallback``."""
+    gateway = _FakeGateway(append_on_call=[[_row(7001, tier="naysayer", backend=backend)]])
+    record = await attest_backend(
+        base_url=_ROUTE,
+        tier=NAYSAYER_MODEL_TIER,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
+        client=gateway,
+        now=lambda: _NOW,
+    )
+    assert record.backend == backend
+    assert record.expected == "codex|gemini-fallback"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tier", "backend"),
+    [
+        (NAYSAYER_MODEL_TIER, "gemini"),
+        (NAYSAYER_GEMINI_TIER, "codex"),
+        (NAYSAYER_GEMINI_TIER, "gemini-fallback"),
+    ],
+)
+async def test_backend_outside_the_tier_set_fails_closed(tier: str, backend: str) -> None:
+    """ADR-14 §7.6: plain ``gemini`` on the codex tier, or codex/fallback on the Gemini tier,
+    is a downstream wiring mismatch and fails closed (never retried)."""
+    gateway = _FakeGateway(append_on_call=[[_row(7002, tier=tier, backend=backend)]] * 3)
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
+        await attest_backend(
+            base_url=_ROUTE,
+            tier=tier,
+            allowed=allowed_backends(tier),
+            client=gateway,
+            now=lambda: _NOW,
+        )
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_codex_tier_turn_with_both_codex_and_fallback_rows_passes() -> None:
+    """A turn whose codex attempt failed and fell back writes a row for each; both allowed."""
+    ledger = _Ledger([[_turn_row(1, backend="codex"), _turn_row(2, backend="gemini-fallback")]])
+    record = await attest_turn(
+        route=_ROUTE,
+        tier=NAYSAYER_MODEL_TIER,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
+        trace_id=_TRACE,
+        read_rows=ledger,
+        now=lambda: _NOW,
+    )
+    assert record.backend == "codex|gemini-fallback"
+    assert record.probe == "cost-row#1+2"
 
 
 # --------------------------------------------------------------------------- #
@@ -652,7 +710,7 @@ async def _attest_turn(ledger: _Ledger, sleeps: _Sleeps, **kwargs: Any) -> Attes
     return await attest_turn(
         route="lexora.local:8110",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         trace_id=_TRACE,
         read_rows=ledger,
         sleep=sleeps,
@@ -799,7 +857,7 @@ async def test_manual_live_preflight_against_the_real_gateway() -> None:
     record = await attest_backend(
         base_url=base_url,
         tier=NAYSAYER_MODEL_TIER,
-        expected=NAYSAYER_EXPECTED_BACKEND,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
     )
-    assert record.backend == NAYSAYER_EXPECTED_BACKEND
+    assert record.backend in allowed_backends(NAYSAYER_MODEL_TIER)
     assert record.probe.startswith("cost-row#")

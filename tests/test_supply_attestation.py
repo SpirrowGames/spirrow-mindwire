@@ -75,7 +75,7 @@ def _new_message(msg_id: str) -> ChatroomEvent:
 
 def _record(probe: str) -> AttestationRecord:
     return AttestationRecord(
-        tier="naysayer",
+        tier="naysayer-gemini",  # ADR-14 §7.3: design-time is Gemini-only for now
         backend="gemini",
         expected="gemini",
         route="host:8110",

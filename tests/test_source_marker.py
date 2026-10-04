@@ -54,6 +54,7 @@ from spirrow_mindwire.source_marker import (
     SOURCE_MARKER_SUFFIX,
     append_markers,
     append_source_marker,
+    attestation_agrees,
     parse_attestation_marker,
     render_attestation_marker,
     render_source_marker,
@@ -834,3 +835,47 @@ def test_parse_cannot_tell_a_forged_stamp_from_a_real_one() -> None:
     record = parse_attestation_marker(forged)
     assert record is not None
     assert record.probe == "made-up"
+
+
+# ---------- ADR-14 §7.6: backend sets on the attest line ------------------- #
+
+
+def _rec(backend: str, expected: str) -> AttestationRecord:
+    from datetime import UTC, datetime
+
+    return AttestationRecord(
+        tier="naysayer",
+        backend=backend,
+        expected=expected,
+        route="lexora.local:8110",
+        probe="cost-row#1",
+        scope="turn",
+        at=datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected", "agrees"),
+    [
+        ("gemini", "gemini", True),
+        ("codex", "codex|gemini-fallback", True),
+        ("gemini-fallback", "codex|gemini-fallback", True),
+        ("codex|gemini-fallback", "codex|gemini-fallback", True),
+        ("gemini", "codex|gemini-fallback", False),
+        ("codex", "gemini", False),
+        ("codex|gemini", "codex|gemini-fallback", False),
+        ("|", "codex|gemini-fallback", False),
+    ],
+)
+def test_attestation_agrees_is_subset(backend: str, expected: str, agrees: bool) -> None:
+    assert attestation_agrees(_rec(backend, expected)) is agrees
+
+
+def test_backend_set_round_trips_through_the_marker() -> None:
+    from spirrow_mindwire.value_objects import join_backends, split_backends
+
+    record = _rec(join_backends(frozenset({"gemini-fallback", "codex"})), "codex|gemini-fallback")
+    assert record.backend == "codex|gemini-fallback"
+    parsed = parse_attestation_marker(render_attestation_marker(record))
+    assert parsed == record
+    assert split_backends(parsed.backend) == frozenset({"codex", "gemini-fallback"})

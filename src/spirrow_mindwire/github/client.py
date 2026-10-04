@@ -480,6 +480,15 @@ class GitHubHTTPError(GitHubError):
         self.rate_limited = rate_limited
 
 
+@dataclass(frozen=True)
+class PrRoutingFacts:
+    """What the naysayer tier routing reads off one PR (ADR-14 §7.3): base, head, labels."""
+
+    base_ref: str
+    head_sha: str
+    labels: frozenset[str]
+
+
 class GitHubReviewClient(Protocol):
     """Structural view of the GitHub methods the naysayer adapter drives."""
 
@@ -502,6 +511,8 @@ class GitHubReviewClient(Protocol):
     ) -> list[CrossPrApproveCoverage]: ...
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None: ...
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts: ...
 
     async def aclose(self) -> None: ...
 
@@ -614,6 +625,37 @@ class GitHubClient:
         if not base_ref or not head_sha:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
         return base_ref, head_sha
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts:
+        """``GET /repos/{owner}/{repo}/pulls/{n}`` → base ref, head sha and label names, fail-loud.
+
+        Feeds the naysayer tier routing (ADR-14 §7.3). The caller treats ANY failure here as
+        "could not read" and routes to the Gemini tier, so this raises rather than guessing an
+        empty label set — an empty set would read as "no ``n3-sensitive`` marker".
+        """
+        meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        try:
+            resp = await self._client.get(meta_path)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {meta_path} (routing facts): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {meta_path} (routing facts) returned {resp.status_code}: "
+                f"{_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            payload = resp.json()
+            base_ref = str(payload["base"]["ref"])
+            head_sha = str(payload["head"]["sha"])
+            labels = frozenset(str(label["name"]) for label in payload["labels"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubHTTPError(
+                f"GET {meta_path} (routing facts): malformed response: {exc}"
+            ) from exc
+        if not base_ref or not head_sha:
+            raise GitHubHTTPError(f"GET {meta_path} (routing facts): missing base.ref or head.sha")
+        return PrRoutingFacts(base_ref=base_ref, head_sha=head_sha, labels=labels)
 
     async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         """Step 2 of :meth:`fetch_pr_diff`: the three-dot ``compare`` diff, fail-loud.
@@ -2083,6 +2125,7 @@ __all__ = [
     "GitHubReviewClient",
     "PrRef",
     "PrResolution",
+    "PrRoutingFacts",
     "PrState",
     "Retryability",
     "ReviewEvent",

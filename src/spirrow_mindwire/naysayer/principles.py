@@ -7,8 +7,9 @@ invocation (design-time relay and the PR-gate alike). Principles are never
 restated as Python string literals here — a one-place edit to the markdown
 propagates to all injections (D-1 "常時注入").
 
-The independent model identity is pinned here too (N-4: SOT = Gemini), so the
-adapters/driver import the tier name from one place instead of hardcoding it.
+The naysayer tier names, the backends each may be answered by, and the N-3 routing names
+(ADR-14 §7.3 / §7.6) are pinned here too, so the adapters/driver import them from one place
+instead of hardcoding them.
 """
 
 from __future__ import annotations
@@ -18,29 +19,86 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
 
-# N-4 (ADR-17): the independent naysayer runs on **Gemini** (SOT). ``naysayer``
-# is the Lexora *tier* name that routes to it; the upstream model id is recorded
-# for traceability/observability. Pinned here = the one place to change it.
+# ADR-14 §7.6: the independent naysayer runs behind one of TWO Lexora tiers, and which one a
+# request goes to is decided per request by
+# :func:`spirrow_mindwire.naysayer.n3_routing.route_tier` — never here, never at a call site.
+#
+# - ``naysayer`` — Lexora's fallback wrapper: ``codex`` primary, ``gemini-fallback`` backup.
+#   The name is the pre-existing one on purpose, so an existing caller lands on the codex tier.
+# - ``naysayer-gemini`` — Gemini only. Serves the N-3 subset (ADR-14 §7.3, ADR-15 C-2: ZDR is
+#   mandatory there and the ChatGPT Pro codex path has none) and requests over the codex
+#   tier's prompt limit (§7.5).
 NAYSAYER_MODEL_TIER = "naysayer"
+NAYSAYER_GEMINI_TIER = "naysayer-gemini"
 NAYSAYER_UPSTREAM_MODEL = "gemini-3.1-pro-preview"
 
-# The value P-2's preflight requires to find in the gateway's own accounting row
-# for a ``naysayer``-tier request (msg-953 §3: "成功条件: ``backend ==
-# expected_backend`` (config 単一 SOT)"). Pinned beside the tier for the same
-# reason N-4 pinned that: one place to change when the independent distribution
-# changes.
+# The values a gateway accounting row's ``backend`` column may carry (msg-953 §3: the row's
+# ``backend`` names the backend Lexora routed to, not the upstream model id — comparing against
+# :data:`NAYSAYER_UPSTREAM_MODEL` would fail every attestation; measured against the live
+# gateway, row 6032, 2026-08-13).
 #
-# **Not** the same string as :data:`NAYSAYER_UPSTREAM_MODEL`, and the difference
-# is load-bearing. The cost row's ``backend`` field names the *backend* Lexora
-# routed to (``"gemini"``); the upstream model id (``"gemini-3.1-pro-preview"``)
-# is a finer-grained fact the row does not carry. Comparing against the model id
-# would fail every attestation; comparing against the backend is what the row
-# can actually answer. Measured against the live gateway, row 6032, 2026-08-13.
-NAYSAYER_EXPECTED_BACKEND = "gemini"
+# ``gemini-fallback`` is a CONSTANT, not configuration (thread msg-6471 gap (d), Einstein
+# msg-6469 advisory 1): the Lexora fallback wrapper must write exactly this string, and a value
+# configurable on either side would be a second copy free to drift from this one.
+CODEX_BACKEND = "codex"
+GEMINI_FALLBACK_BACKEND = "gemini-fallback"
+GEMINI_BACKEND = "gemini"
+
+# ADR-14 §7.6: the backends an attestation accepts, per tier. The ONE table both the routing
+# decision and the attestation read, so "where did we send it" and "who may answer it" cannot
+# be decided in two places. A row whose ``backend`` is outside its tier's set fails closed.
+TIER_ALLOWED_BACKENDS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        NAYSAYER_MODEL_TIER: frozenset({CODEX_BACKEND, GEMINI_FALLBACK_BACKEND}),
+        NAYSAYER_GEMINI_TIER: frozenset({GEMINI_BACKEND}),
+    }
+)
+
+# ADR-14 §7.3 — how the N-3 subset is identified (thread msg-6471..6479, Einstein msg-6480).
+# Each name is defined here ONCE; ``tests/test_n3_routing.py`` pins that the routing module,
+# the config loader and docs/deploy.md use these constants rather than restating them.
+#
+# The opt-in marker: a PR label (PR-gate) or a thread tag (design-time) with this name.
+N3_SENSITIVE_MARKER = "n3-sensitive"
+# The per-HOST_REPO config file. Any request touching it is N-3 unconditionally (it defines the
+# boundary itself). Thread msg-6475 named ``.mindwire/n3.toml``; that directory is the loop's
+# own git-ignored state (the dispatcher's ``.mindwire/pin``; ``info/exclude``) and may not carry
+# a tracked file, so the file sits beside ``.mindwire-gate`` at the repo root instead.
+N3_CONFIG_PATH = ".mindwire-n3.toml"
+# The key inside :data:`N3_CONFIG_PATH`: a list of globs over repo-relative POSIX paths.
+N3_SENSITIVE_PATHS_KEY = "n3_sensitive_paths"
+
+# ADR-14 §7.5: the codex tier's prompt limit, in characters, counted as one character per token
+# (conservative for Japanese, the worst case for ordinary text). The rule (thread msg-6471 §3) is
+# ``context_window - max_tokens`` of the model entry Lexora pins in ``model_catalog_json``.
+# PROVISIONAL: Lexora develop (fbbfdea, 2026-10-04) pins no catalog yet, so this is the
+# Gemini-tier value (pr_review._MAX_DIFF_CHARS) until the shadow comparison measures codex.
+# Heuristic: dense hex/emoji payloads can overflow the token window first; codex then errors
+# and the Lexora fallback wrapper answers with gemini-fallback (§7.4) — tracked as part of the
+# fallback-frequency observation (§7.3).
+CODEX_TIER_PROMPT_CHAR_LIMIT = 150_000
+
+
+def allowed_backends(tier: str) -> frozenset[str]:
+    """Return the backends an attestation accepts for ``tier`` (ADR-14 §7.6), fail-loud.
+
+    An unknown tier is a :class:`PrinciplesError`, never an empty or permissive set: a tier
+    with no row in :data:`TIER_ALLOWED_BACKENDS` has no defined answerer, so nothing can attest
+    it.
+    """
+    try:
+        return TIER_ALLOWED_BACKENDS[tier]
+    except KeyError:
+        raise PrinciplesError(
+            f"naysayer tier {tier!r} has no row in TIER_ALLOWED_BACKENDS "
+            f"(known: {sorted(TIER_ALLOWED_BACKENDS)!r}); refusing to attest it"
+        ) from None
+
 
 _ENV_PRINCIPLES_PATH = "MINDWIRE_NAYSAYER_PRINCIPLES_PATH"
 # principles.py -> naysayer -> spirrow_mindwire -> src -> <repo root>
@@ -242,12 +300,21 @@ def build_preamble() -> str:
 
 
 __all__ = [
+    "CODEX_BACKEND",
+    "CODEX_TIER_PROMPT_CHAR_LIMIT",
     "EXPECTED_PRINCIPLES_VERSION",
-    "NAYSAYER_EXPECTED_BACKEND",
+    "GEMINI_BACKEND",
+    "GEMINI_FALLBACK_BACKEND",
+    "N3_CONFIG_PATH",
+    "N3_SENSITIVE_MARKER",
+    "N3_SENSITIVE_PATHS_KEY",
+    "NAYSAYER_GEMINI_TIER",
     "NAYSAYER_MODEL_TIER",
     "NAYSAYER_UPSTREAM_MODEL",
+    "TIER_ALLOWED_BACKENDS",
     "ObjectionClass",
     "PrinciplesError",
+    "allowed_backends",
     "build_preamble",
     "load_principles",
     "objection_classes",
