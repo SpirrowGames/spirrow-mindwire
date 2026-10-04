@@ -507,6 +507,9 @@ class Conductor:
         self._mcp = mcp
         self._dispatcher = dispatcher
         self._thread_ref = thread_ref
+        # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
+        # the response carries none) — handed to every event for the naysayer's N-3 routing.
+        self._thread_tags: tuple[str, ...] | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -2280,6 +2283,7 @@ class Conductor:
                 },
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
+        self._thread_tags = _thread_tags(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -2775,6 +2779,7 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
             retry_notice=retry_notice,
+            thread_tags=self._thread_tags,
         )
 
     async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
@@ -3072,6 +3077,19 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_tags(result: Any) -> tuple[str, ...] | None:
+    """``thread.tags`` of a ``chatroom_get_thread`` response, or None if absent/malformed.
+
+    The measured ``mode="full"`` shape (msg-4749) carries thread metadata under
+    ``thread``. Anything else is "not read", which the N-3 routing treats as marked.
+    """
+    thread = result.get("thread") if isinstance(result, dict) else None
+    tags = thread.get("tags") if isinstance(thread, dict) else None
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None
+    return tuple(tags)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:
