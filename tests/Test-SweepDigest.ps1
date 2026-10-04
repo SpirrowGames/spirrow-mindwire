@@ -109,7 +109,9 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged',
                   'Resolve-DigestSendResult',
                   # T-next-line-carries-who-not-why Slice 3: the stop-reason line.
-                  'Get-StopClassDigestLines') {
+                  'Get-StopClassDigestLines',
+                  # Slice 3b S3b-1: sweep.json `projects` and the declared-only park-wake scan.
+                  'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -964,6 +966,78 @@ CheckTrue "New-DailyDigest renders the stop-reason line" ($scDigest -match '停�
 $scPlain = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
     -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @()
 CheckTrue "without -StopClassLines the digest has no stop-reason line" (-not ($scPlain -match '停止理由')) $scPlain
+
+# =============================================================================================
+# Slice 3b S3b-1 (Bohr msg-6525) — projects declared in sweep.json are scanned with no sweep entry.
+# =============================================================================================
+Write-Host ""
+Write-Host "Get-SweepDeclaredProjects / Invoke-DeclaredProjectsParkWake — the sweep.json projects key"
+
+function Invoke-DeclaredRead {
+    param([string]$Json)
+    $tmp = New-TemporaryFile
+    try {
+        [System.IO.File]::WriteAllText($tmp.FullName, $Json)
+        return Get-SweepDeclaredProjects -Path $tmp.FullName
+    }
+    finally { Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue }
+}
+$cand = '"candidates": [ { "project": "p-cand", "thread_id": "t", "repo_dir": "C:/x" } ]'
+
+$dpAbsent = Invoke-DeclaredRead "{ $cand }"
+Check "no projects key -> no declared project" 0 @($dpAbsent.projects).Count
+Check "no projects key -> no error (behaviour unchanged)" $null $dpAbsent.error
+$dpArrayRoot = Invoke-DeclaredRead '[ { "project": "p", "thread_id": "t", "repo_dir": "C:/x" } ]'
+Check "a legacy array root reads as no projects" 0 @($dpArrayRoot.projects).Count
+Check "a legacy array root is not an error" $null $dpArrayRoot.error
+$dpOk = Invoke-DeclaredRead "{ ""projects"": [ ""spirrow-magickit"", "" p-cand "", ""spirrow-magickit"" ], $cand }"
+Check "projects are read, trimmed and de-duplicated" 'p-cand,spirrow-magickit' ((@($dpOk.projects)) -join ',')
+Check "a well-formed projects key has no error" $null $dpOk.error
+$dpOne = Invoke-DeclaredRead "{ ""projects"": [ ""spirrow-magickit"" ], $cand }"
+Check "a one-element projects array is read (not unrolled into a string)" 'spirrow-magickit' ((@($dpOne.projects)) -join ',')
+Check "a one-element projects array has no error" $null $dpOne.error
+$dpEmpty = Invoke-DeclaredRead "{ ""projects"": [], $cand }"
+Check "an empty projects array is not an error" $null $dpEmpty.error
+foreach ($bad in @('"spirrow-magickit"', '{ "a": 1 }', 'null', '[ "ok", "" ]', '[ "ok", 3 ]')) {
+    $dpBad = Invoke-DeclaredRead "{ ""projects"": $bad, $cand }"
+    CheckTrue "a malformed projects key ($bad) is reported, not read as empty" ($null -ne $dpBad.error) ($dpBad | Out-String)
+    Check "a malformed projects key ($bad) scans nothing" 0 @($dpBad.projects).Count
+}
+
+# The scan, with the three probes it calls stubbed. Each tick JSON has the shape park_wake prints.
+$script:parkWakeCalls = @()
+$script:controlFor = @{ 'p-held' = [PSCustomObject]@{ desired_state = 'hold'; observed_state = 'hold' } }
+function Invoke-ControlProbe { param([string]$Project) return $script:controlFor[$Project] }
+function Invoke-ParkWakeTick {
+    param([string]$Project)
+    $script:parkWakeCalls += $Project
+    if ($Project -eq 'p-broken') { return $null }   # listing unreadable -> the wrapper returns $null
+    return [PSCustomObject]@{
+        counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 1; human_close = 0 }
+        unclassified = @('T-none-without-stop')
+    }
+}
+$scan = Invoke-DeclaredProjectsParkWake `
+    -Declared @{ projects = @('p-cand', 'p-broken', 'p-declared', 'p-held'); error = $null } `
+    -CandidateProjects @('p-cand')
+Check "only declared projects no candidate names are ticked, held ones skipped" `
+    'p-broken,p-declared' (($script:parkWakeCalls | Sort-Object) -join ',')
+$scanLines = Get-StopClassDigestLines -ByProject $scan.byProject -Failed $scan.failed
+CheckTrue "a STOP-less NEXT: none in a declared-only project is counted unclassified" `
+    ($scanLines[0] -match '未分類 1') $scanLines[0]
+Check "and named by project/thread" '  未分類: p-declared/T-none-without-stop' $scanLines[1]
+CheckTrue "a declared project whose listing failed is named as not scanned" `
+    ($scanLines[0] -match '取得失敗: p-broken') $scanLines[0]
+$script:parkWakeCalls = @()
+$scanBad = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error = 'bad' } -CandidateProjects @('p-cand')
+Check "a malformed projects key ticks nothing" 0 $script:parkWakeCalls.Count
+CheckTrue "a malformed projects key is named in the digest" `
+    ((Get-StopClassDigestLines -ByProject $scanBad.byProject -Failed $scanBad.failed)[0] -match '取得失敗: sweep.json:projects') ''
+$script:parkWakeCalls = @()
+$scanNone = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error = $null } -CandidateProjects @('p-cand')
+Check "no declared project -> nothing ticked" 0 $script:parkWakeCalls.Count
+Check "no declared project -> nothing failed" 0 @($scanNone.failed).Count
+Check "no declared project -> digest unchanged" 0 (Get-StopClassDigestLines -ByProject $scanNone.byProject -Failed $scanNone.failed).Count
 
 if ($script:failures -gt 0) {
     Write-Host ""

@@ -17,9 +17,19 @@
     "without re-typing. Missing owner_map = gate OFF (fully backward compatible; behaviour is",
     "then identical to before the resource axis existed).",
     "",
+    "projects is OPTIONAL: chatroom projects whose open threads the park-wake tick reads and",
+    "classifies (the digest's 停止理由 line) even when no candidate below names them, so a thread",
+    "outside the sweep is not left unseen. The scan is the union of these and the candidates'",
+    "projects; nothing is launched for a project listed only here. Missing projects = the",
+    "candidates' projects only (behaviour before the key existed). A malformed value is named in",
+    "the digest as 'sweep.json:projects' and scans nothing extra; it does not stop the sweep.",
+    "",
     "Do NOT list T-pr-review-* threads: they resolve to `NEXT: pr-review <ref>`, which fires the",
     "Tier B PR-gate against the paid Lexora/Gemini backend. Driving those from an unattended sweep",
     "would spend money on a timer, so it stays an explicit human action."
+  ],
+  "projects": [
+    "spirrow-magickit"
   ],
   "owner_map": {
     "github.com/spirrowgames/spirrow-mindwire": "spirrow-mindwire",

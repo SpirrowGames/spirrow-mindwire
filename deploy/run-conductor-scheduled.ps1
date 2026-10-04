@@ -4434,6 +4434,76 @@ function Get-SweepOwnerMap {
     return $map
 }
 
+# --- sweep.json projects reader (T-next-line-carries-who-not-why Slice 3b, S3b-1; Bohr msg-6525) ---
+# Returns @{ projects = <string[]>; error = <string or $null> } from sweep.json's OPTIONAL top-level
+# `projects` array: the projects the park-wake tick classifies even when no candidate names them
+# (msg-2014 §2 (4): a thread outside the sweep is otherwise never looked at). The scan set is the
+# union of these and the candidates' projects. Only this file — mindwire's own, kept by the
+# operator — names a mindwire project: magickit's listing would also return chatrooms that are not
+# mindwire's (Einstein msg-6524), and loop_control has no listing and no row for an untouched
+# project (msg-6525).
+#
+# Missing key = @() and no error: exactly the behaviour before the key existed. A root that is not
+# a JSON object (a legacy array, Einstein's advisory on msg-6525) is read the same way — there is
+# no `projects` to read — and is not this reader's to reject (Get-SweepCandidates owns the file's
+# shape). A PRESENT but malformed key (not an array, a blank or non-string entry) is NOT silently
+# treated as empty: `error` says what is wrong and `projects` is @(), so the caller can name it in
+# the digest. Unlike owner_map's reader this does not throw: the key only widens the scan, and a
+# typo in it must not stop the sweep that launches every other thread.
+function Get-SweepDeclaredProjects {
+    param([string]$Path)
+
+    $none = @{ projects = @(); error = $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $none }   # Get-SweepCandidates already threw
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($raw -isnot [System.Management.Automation.PSCustomObject]) { return $none }
+    if (-not ($raw.PSObject.Properties.Name -contains 'projects')) { return $none }
+    $value = $raw.projects
+    # `ConvertFrom-Json` yields [object[]] for a JSON array; anything else (string, object, number,
+    # null) is a shape error.
+    if ($value -isnot [System.Array]) {
+        $kind = if ($null -eq $value) { 'null' } else { $value.GetType().Name }
+        return @{ projects = @(); error = "sweep.json 'projects' must be an array of project names; found $kind" }
+    }
+    $out = @()
+    foreach ($p in $value) {
+        if ($p -isnot [string] -or [string]::IsNullOrWhiteSpace($p)) {
+            return @{ projects = @(); error = "sweep.json 'projects' has a blank or non-string entry: $($p | ConvertTo-Json -Compress)" }
+        }
+        $out += $p.Trim()
+    }
+    return @{ projects = @($out | Sort-Object -Unique); error = $null }
+}
+
+# The S3b-1 scan of declared-only projects (Bohr msg-6525): every project Get-SweepDeclaredProjects
+# returned that no candidate names gets the park-wake tick, so its open threads are classified (and
+# its fired parks woken). Control first and the same HOLD skip as the candidate loop, so a held
+# project gets no writes; no 1b and no head probe — with no candidate there is nothing to launch.
+# The control answer is NOT put in $controlByProject: that map feeds the resource-axis HOLD gate
+# and the digest's per-candidate view, and new rows would change them.
+#
+# Returns @{ byProject = @{ <project> = <tick JSON> }; failed = <string[]> } for
+# Get-StopClassDigestLines. A tick that failed (thread listing unreadable, crash, no JSON) and a
+# malformed `projects` key ('sweep.json:projects') are in `failed`, which the digest names: never a
+# silent zero.
+function Invoke-DeclaredProjectsParkWake {
+    param([hashtable]$Declared, [string[]]$CandidateProjects = @())
+
+    $byProject = @{}
+    $failed = @()
+    if ($null -ne $Declared.error) {
+        Write-Log "WARN $($Declared.error) — declared projects not scanned this tick"
+        $failed += 'sweep.json:projects'
+    }
+    foreach ($proj in @($Declared.projects | Where-Object { $CandidateProjects -notcontains $_ })) {
+        $control = Invoke-ControlProbe -Project $proj
+        if (Test-HoldObserved -Control $control) { continue }
+        $parkWake = Invoke-ParkWakeTick -Project $proj
+        if ($null -ne $parkWake) { $byProject[$proj] = $parkWake } else { $failed += $proj }
+    }
+    return @{ byProject = $byProject; failed = $failed }
+}
+
 # --- deploy probe ---------------------------------------------------------------------------------
 # Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
 # verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
@@ -4559,7 +4629,8 @@ function Invoke-PrEventAdvanceTick {
 }
 
 # --- park wake: STOP: blocked-on threads wake when their trigger fires -------------------------
-# For each distinct project in the sweep list, run `python -m spirrow_mindwire.park_wake`
+# For each distinct project in the sweep list (and, since Slice 3b, each project sweep.json declares
+# under `projects` — see Invoke-DeclaredProjectsParkWake), run `python -m spirrow_mindwire.park_wake`
 # (T-next-line-carries-who-not-why Slice 3, D-7). It reads every open thread of the project,
 # classifies each `NEXT: none` head (done / blocked_on / unclassified / human_close — the counts the
 # digest shows), and for a `STOP: blocked-on <trigger> wake:<persona>` head whose trigger has fired
@@ -4798,6 +4869,14 @@ try {
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
+
+    # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
+    # are classified too. See Invoke-DeclaredProjectsParkWake.
+    $declaredScan = Invoke-DeclaredProjectsParkWake `
+        -Declared (Get-SweepDeclaredProjects -Path $sweepConfigPath) `
+        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)
+    foreach ($k in $declaredScan.byProject.Keys) { $stopClassByProject[$k] = $declaredScan.byProject[$k] }
+    $stopClassFailed += @($declaredScan.failed)
 
     # --- resource-axis HOLD: one probe per DISTINCT repo_dir (§5a v2, D-KEY-4c) ----------------
     # Batch the resolver call once per tick. The distinct repo_dir set is small (7 today per
