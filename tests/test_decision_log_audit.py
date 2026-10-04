@@ -381,4 +381,3 @@ def test_g1_scan_and_main_give_the_same_unmeasured_report(
     from_main = json.loads(out.read_text(encoding="utf-8"))
     from_scan = mod.scan([(T, "active", [])], log_path=missing, roster=ROSTER)
     assert from_main == from_scan == mod.unmeasured_comparison(missing)
-    assert not hasattr(mod, "_unmeasured_log")

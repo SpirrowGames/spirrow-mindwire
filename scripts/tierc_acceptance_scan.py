@@ -57,9 +57,9 @@ def tally_kinds(
 def unmeasured_comparison(log_path: Path) -> dict[str, Any]:
     """The whole report when the decisions log is missing — the one place that shape is built.
 
-    Both :func:`scan` and :func:`main` (before any fetch) return this, so the unmeasured report
-    cannot drift between them (PR #457 gate msg-6518, advisory 1). ``main`` calls this rather
-    than ``scan([], ..., roster={})`` so it never depends on where ``scan`` checks for the log.
+    :func:`scan` returns this and :func:`main` emits it before any fetch, so both paths produce
+    the same report (PR #457 gate msg-6518, advisory 1). ``main`` calls this rather than
+    ``scan([], ..., roster={})`` so it never depends on where ``scan`` checks for the log.
     """
     return {"comparison": f"unmeasured: decisions log not found at {log_path}"}
 
