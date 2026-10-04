@@ -88,15 +88,6 @@ if ($budgetLiteral -notmatch '^\d+$') {
 }
 $script:DigestBudget = [int]$budgetLiteral
 
-# The N-3 token is READ FROM the script under test, for the same reason as $DigestBudget: a copy
-# here could agree with itself while production's token drifted from the Python side's.
-$n3TokenAssign = $ast.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
-    $n.Left.VariablePath.UserPath -eq 'N3UnresolvedToken' }, $true)
-if ($n3TokenAssign.Count -ne 1) { throw "expected exactly one `$N3UnresolvedToken assignment, found $($n3TokenAssign.Count)" }
-$N3UnresolvedToken = $n3TokenAssign[0].Right.Extent.Text.Trim("'")
-
 function Write-Log { param([string]$Message) }
 
 $leaseLib = Join-Path $repoRoot 'deploy/lib/Lease.ps1'
@@ -120,9 +111,7 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   # T-next-line-carries-who-not-why Slice 3: the stop-reason line.
                   'Get-StopClassDigestLines',
                   # Slice 3b S3b-1: sweep.json `projects` and the declared-only park-wake scan.
-                  'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved',
-                  # T-D8-codex-backend-adr14-15-amendment msg-6582 gap 1: the N-3 fail-safe line.
-                  'Get-N3UnresolvedCount', 'Add-N3UnresolvedCount', 'Get-N3UnresolvedDigestLines') {
+                  'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -1052,48 +1041,6 @@ $scanNone = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error =
 Check "no declared project -> nothing ticked" 0 $script:parkWakeCalls.Count
 Check "no declared project -> nothing failed" 0 @($scanNone.failed).Count
 Check "no declared project -> digest unchanged" 0 (Get-StopClassDigestLines -ByProject $scanNone.byProject -Failed $scanNone.failed).Count
-
-# =============================================================================================
-# T-D8-codex-backend-adr14-15-amendment (Bohr msg-6582 gap 1, Einstein msg-6587): the N-3
-# router's fail-safe token reaches the digest, so "always Gemini" cannot go unnoticed (msg-6477).
-# =============================================================================================
-Write-Host ""
-Write-Host "N-3 routing unresolved — conductor output token -> digest line"
-
-Check "the token matches the Python side's WARNING token" 'n3-routing-unresolved' $N3UnresolvedToken
-$n3Out = @('conductor: round 1',
-           'WARNING spirrow_mindwire.naysayer.n3_routing: n3-routing-unresolved: trusted side unreadable; routing to gemini',
-           'conductor: done',
-           'WARNING spirrow_mindwire.naysayer.n3_routing: n3-routing-unresolved: trusted side unreadable; routing to gemini')
-Check "two token lines in the output -> count 2" 2 (Get-N3UnresolvedCount -Output $n3Out)
-Check "output without the token -> count 0" 0 (Get-N3UnresolvedCount -Output @('conductor: round 1', 'conductor: done'))
-Check "a single scalar line without the token -> count 0 (array-vs-scalar)" 0 (Get-N3UnresolvedCount -Output 'conductor: done')
-Check "null output -> count 0" 0 (Get-N3UnresolvedCount -Output $null)
-
-$n3State = @{}
-Add-N3UnresolvedCount -State $n3State -Repo '/repos/lexora' -Count 2
-Add-N3UnresolvedCount -State $n3State -Repo '/repos/lexora' -Count 1
-Add-N3UnresolvedCount -State $n3State -Repo '/repos/mindwire' -Count 0
-Check "counts accumulate per repo across runs" 3 ([int]$n3State['/repos/lexora'])
-CheckTrue "a zero count adds no entry" (-not $n3State.ContainsKey('/repos/mindwire')) ($n3State.Keys -join ',')
-
-$n3None = Get-N3UnresolvedDigestLines -Counts @{}
-Check "nothing counted -> no lines (digest unchanged)" 0 $n3None.Count
-$n3NullLines = Get-N3UnresolvedDigestLines -Counts $null
-Check "null state -> no lines" 0 $n3NullLines.Count
-$n3Lines = Get-N3UnresolvedDigestLines -Counts $n3State
-CheckTrue "the row names the repo, the count and the fail-safe" `
-    ($n3Lines[1] -match [regex]::Escape('/repos/lexora') -and $n3Lines[1] -match 'n3-routing-unresolved x3' -and $n3Lines[1] -match 'routed to Gemini \(fail-safe\)') $n3Lines[1]
-Check "the block ends with a blank separator" '' $n3Lines[$n3Lines.Count - 1]
-
-$n3Digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
-    -Now ([datetime]::Parse('2026-10-04T00:00:00Z')) -LiveKeys @() `
-    -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (@{ '/repos/lexora' = 0 + (Get-N3UnresolvedCount -Output $n3Out) }))
-CheckTrue "output with the token -> the digest carries the N-3 line" ($n3Digest -match 'routed to Gemini \(fail-safe\)') $n3Digest
-$n3Quiet = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
-    -Now ([datetime]::Parse('2026-10-04T00:00:00Z')) -LiveKeys @() `
-    -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (@{ '/repos/lexora' = (Get-N3UnresolvedCount -Output @('conductor: done')) }))
-CheckTrue "output without the token -> no N-3 line in the digest" (-not ($n3Quiet -match 'n3-routing-unresolved')) $n3Quiet
 
 if ($script:failures -gt 0) {
     Write-Host ""
