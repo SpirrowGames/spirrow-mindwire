@@ -61,6 +61,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from ..github.client import parse_pr_ref
+from ..identity.normalize import normalize_identity_key
 from ..tier_c_admission_gate import (
     ADMIT_LABELS,
     LEGACY_LABEL_MAP,
@@ -360,6 +361,16 @@ _TIER_C_LABEL_RE = re.compile(
 # for the mechanism's own D-8 ③ fallback and is never read off an author's line.
 STOP_TRIGGER_ARMS: tuple[str, ...] = ("thread", "pr", "deploy", "queue-empty")
 
+# Slice 3b S3b-2 (Bohr msg-6523 §2 / msg-6525): a wake may name only these roles. A fired park is
+# posted by ``park-wake-relay`` (a machine), so a wake naming the implementer always meets guard
+# (i) and lands at the human terminal — the same second route from an agent's STOP line to the
+# human that B-5 closed for `human`. It is closed the same way, at the same place: such a wake is
+# MALFORMED, whoever wrote it (the parser does not know the author, and need not: a person can
+# hand to the implementer directly with `NEXT:`). To resume implementation, wake the proposer,
+# who checks the scope and hands on. The prompt's sentence is rendered from this tuple, so the
+# two cannot disagree.
+STOP_WAKE_ROLES: tuple[Role, ...] = (Role.PROPOSER, Role.NAYSAYER)
+
 # Decoration or whitespace BETWEEN the keyword and the colon (`**STOP**: done`, `STOP : done`) is
 # also detected (PR-gate #363 finding 1): without it those lines fell through to ABSENT. Detection
 # only — a non-empty `gap` makes the line MALFORMED, it is never accepted.
@@ -557,6 +568,8 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
     where "no STOP line" is itself the measurement (``StopStatus.ABSENT``). ``wake`` must resolve
     on the roster (a registered agent of this thread); ``human`` / ``none`` / an unknown name is
     ``MALFORMED``. There is no ``human`` trigger arm, so ``blocked-on human`` is ``MALFORMED`` too.
+    A wake whose roster role is not in :data:`STOP_WAKE_ROLES` (the implementer) is ``MALFORMED``
+    as well (S3b-2), whoever wrote the line.
     """
     line = _line_above_last_next(body)
     if line is None:
@@ -578,8 +591,8 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
     wake = blocked.group("wake")
     if wake.casefold() in (HUMAN_TOKEN, NONE_TOKEN):
         return StopLine(StopStatus.MALFORMED, raw=raw)
-    resolved = _roster_lookup(roster, wake)
-    if resolved is None:
+    resolved = _wake_lookup(roster, wake)
+    if resolved is None or resolved[1] not in STOP_WAKE_ROLES:
         return StopLine(StopStatus.MALFORMED, raw=raw)
     return StopLine(
         StopStatus.BLOCKED_ON,
@@ -1045,6 +1058,8 @@ if tuple(_STOP_TRIGGER_MEANINGS) != STOP_TRIGGER_ARMS:  # pragma: no cover - imp
     )
 _STOP_TRIGGER_PROSE = "; ".join(_STOP_TRIGGER_MEANINGS[arm] for arm in STOP_TRIGGER_ARMS)
 
+_STOP_WAKE_ROLES_PROSE = " or ".join(role.value for role in STOP_WAKE_ROLES)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -1079,7 +1094,9 @@ and waits for its owner to close it.
 once something happens that the sweep can see. When `<trigger>` holds, the sweep posts a \
 wake message into this thread ending in `NEXT: <persona>`, and the conductor routes it \
 exactly as it would route that handoff written now (the same gates apply). `<persona>` is \
-a participant of this thread. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
+a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never the \
+implementer: to resume implementation, wake the proposer, who checks the scope and hands \
+it on. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
 `{HUMAN_TOKEN}` trigger or wake: a stop that needs a person is `NEXT: {HUMAN_TOKEN}`.
     Write the line exactly so: `STOP` in capitals, single spaces, nothing else on the \
 line. A `NEXT: {NONE_TOKEN}` without a valid `STOP:` line directly above it is recorded \
@@ -1236,6 +1253,25 @@ def _role_alias(token: str) -> Role | None:
     return None
 
 
+def _wake_lookup(roster: Mapping[str, Role], wake: str) -> tuple[str, Role] | None:
+    """Resolve a STOP line's ``wake`` the way magickit's ``_lookup_wake`` does (S3b-3).
+
+    magickit looks the wake up as given and then by its ADR-11 key
+    (:func:`~spirrow_mindwire.identity.normalize.normalize_identity_key`), so a spelling it
+    accepts — ``PR_Gate_Relay`` for ``pr-gate-relay`` — must resolve here too, or the line is
+    read as MALFORMED and no disposition is sent for a wake magickit would have taken. The
+    conformance vectors are in ``tests/test_stop_wake_adr11_conformance.py``. The value sent is
+    always the roster's canonical spelling.
+    """
+    resolved = _roster_lookup(roster, wake)
+    if resolved is not None:
+        return resolved
+    key = normalize_identity_key(wake)
+    if key and key != wake and key in roster:
+        return key, roster[key]
+    return None
+
+
 def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | None:
     """Case-insensitive identity→role lookup; returns the **canonical** (identity, role)."""
     direct = roster.get(name)
@@ -1256,6 +1292,7 @@ __all__ = [
     "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
     "STOP_TRIGGER_ARMS",
+    "STOP_WAKE_ROLES",
     "TIER_C_CHECK_KEYWORD",
     "TIER_C_CHECK_NONE",
     "TIER_C_LABELS",

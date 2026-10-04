@@ -75,11 +75,11 @@ def _line(body: str) -> StopLine:
 
 def test_payload_for_done_and_blocked_on() -> None:
     assert disposition_payload(_line("x\n\nSTOP: done\nNEXT: none")) == {"kind": "done"}
-    stop = _line("x\n\nSTOP: blocked-on pr:acme/widgets#7 wake:heisenberg\nNEXT: none")
+    stop = _line("x\n\nSTOP: blocked-on pr:acme/widgets#7 wake:einstein\nNEXT: none")
     assert disposition_payload(stop) == {
         "kind": "blocked_on",
         "trigger": {"arm": "pr", "ref": "acme/widgets#7"},
-        "wake": "Heisenberg",  # the roster's canonical spelling, not the author's
+        "wake": "Einstein",  # the roster's canonical spelling, not the author's
     }
 
 
@@ -195,7 +195,7 @@ async def test_a_refused_disposition_never_stalls_the_post(
     Dropping it would leave the head unmoved and replay the same mistake on every tick.
     """
     mcp = _PostMcp(fail_with=error_type)
-    body = "x\n\nSTOP: blocked-on thread:T-1 wake:Heisenberg\nNEXT: none"
+    body = "x\n\nSTOP: blocked-on thread:T-1 wake:Einstein\nNEXT: none"
     with caplog.at_level(logging.ERROR, logger="spirrow_mindwire.magickit.gateway"):
         msg_id = await _post(MagickitChatroomGateway(mcp, roster=_ROSTER), body)
     assert msg_id == "msg-2"
@@ -234,7 +234,7 @@ def _stopped_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
         ("Bohr", "x\n\nSTOP: done\nNEXT: none", "stop_class=done"),
         (
             "Bohr",
-            "x\n\nSTOP: blocked-on thread:T-a wake:Heisenberg\nNEXT: none",
+            "x\n\nSTOP: blocked-on thread:T-a wake:Einstein\nNEXT: none",
             "stop_class=blocked_on",
         ),
         ("human", "close it\n\nNEXT: none", "stop_class=human_close"),
@@ -473,7 +473,7 @@ async def test_tick_wakes_fired_parks_and_holds_the_rest() -> None:
         "p",
         "T-1",
         msg_id="msg-5",
-        content="w\n\nSTOP: blocked-on thread:T-a wake:Heisenberg\nNEXT: none",
+        content="w\n\nSTOP: blocked-on thread:T-a wake:Einstein\nNEXT: none",
     )
     mcp.thread("p", "T-2", content="w\n\nSTOP: blocked-on thread:T-b wake:Bohr\nNEXT: none")
     mcp.thread("p", "T-3", content="w\n\nSTOP: blocked-on pr:acme/w#1 wake:Bohr\nNEXT: none")
@@ -494,7 +494,7 @@ async def test_tick_wakes_fired_parks_and_holds_the_rest() -> None:
     posted = {p["thread_id"]: p for p in mcp.posts}
     assert posted["T-1"]["author"] == PARK_WAKE_RELAY_AUTHOR
     assert "role" not in posted["T-1"]
-    assert posted["T-1"]["content"].endswith("NEXT: Heisenberg")
+    assert posted["T-1"]["content"].endswith("NEXT: Einstein")
     assert "msg-5" in posted["T-1"]["content"]
 
 
@@ -550,7 +550,7 @@ async def test_queue_empty_reads_the_committed_state_and_wakes_one() -> None:
             "p",
             tid,
             msg_id=msg,
-            content="w\n\nSTOP: blocked-on queue-empty:p:proposer wake:Heisenberg\nNEXT: none",
+            content="w\n\nSTOP: blocked-on queue-empty:p:proposer wake:Einstein\nNEXT: none",
         )
     mcp.thread(
         "p", "T-3", content="w\n\nSTOP: blocked-on queue-empty:p:implementer wake:Bohr\nNEXT: none"

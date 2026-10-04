@@ -62,10 +62,10 @@ def test_done_is_parsed() -> None:
     [
         ("STOP: blocked-on thread:T-foo wake:Bohr", "thread", "T-foo", "Bohr"),
         (
-            "STOP: blocked-on pr:acme/widgets#7 wake:heisenberg",
+            "STOP: blocked-on pr:acme/widgets#7 wake:einstein",
             "pr",
             "acme/widgets#7",
-            "Heisenberg",
+            "Einstein",
         ),
         (
             "STOP: blocked-on deploy:mindwire@abc123 wake:Einstein",
@@ -224,9 +224,9 @@ def _none_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
         ("done\n\nNEXT: none", "stop_line=absent stop_disposition=absent"),
         ("done\n\nSTOP: done\nNEXT: none", "stop_line=present stop_disposition=done"),
         (
-            "wait\n\nSTOP: blocked-on pr:acme/widgets#7 wake:Heisenberg\nNEXT: none",
+            "wait\n\nSTOP: blocked-on pr:acme/widgets#7 wake:Einstein\nNEXT: none",
             "stop_line=present stop_disposition=blocked_on stop_trigger=pr:acme/widgets#7 "
-            "stop_wake=Heisenberg",
+            "stop_wake=Einstein",
         ),
         (
             "wait\n\nSTOP: blocked-on human wake:human\nNEXT: none",
@@ -334,7 +334,7 @@ def test_protocol_block_teaches_only_forms_the_parser_accepts(role: Role) -> Non
         "STOP: done",
         "STOP: blocked-on thread:T-foo wake:Einstein",
         "STOP: blocked-on thread:spirrow-magickit/T-foo wake:Einstein",
-        "STOP: blocked-on pr:acme/widgets#7 wake:Heisenberg",
+        "STOP: blocked-on pr:acme/widgets#7 wake:Einstein",
         "STOP: blocked-on deploy:req-123 wake:Bohr",
         "STOP: blocked-on queue-empty:spirrow-mindwire wake:Bohr",
         "STOP: blocked-on queue-empty:spirrow-mindwire:implementer wake:Bohr",
