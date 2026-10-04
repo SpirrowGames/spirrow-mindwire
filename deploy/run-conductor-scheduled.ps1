@@ -4093,16 +4093,19 @@ function Get-MaterialMissingDigestLines {
 # order (material PUT → notification) and the fail-open behaviour (a broken PUT never suppresses
 # the notification) are testable in isolation (msg-1445 §5 / W-3). Inlined, this sequence is
 # unreachable from the AST-lift test harness — the only way to pin that the PUT precedes the
-# notification and that the notification body is 1 character identical whether the PUT threw or
-# returned 4xx or 5xx is to make the sequence a named function.
+# notification, and that below the D-3 ⚠ line the notification body is 1 character identical
+# whether the PUT threw or returned 4xx or 5xx, is to make the sequence a named function.
 #
-# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5):
+# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5, amended by
+# T-composer-entrypoint-missing-drops-decision-cards D-3):
 #   1. Compose (or reuse the cached) envelope for this ({Key}, {Signature}).
-#   2. Push the material to magickit — non-blocking, fail-open, its result is ignored.
+#   2. Push the material to magickit — non-blocking, fail-open. Its outcome is used for one thing
+#      only: on 'missing', record material-missing.json and prepend the ⚠ line (D-3).
 #   3. Format the Discord body from the envelope. If enrichment fails for any reason, use the
 #      $RawFallback the caller built.
-#   4. Send-NotificationIfChanged: the caller sees exactly the body the enrichment produced,
-#      whether the PUT succeeded, failed, or was skipped for freshness.
+#   4. Send-NotificationIfChanged: the notification fires whether the PUT succeeded, failed, or
+#      was skipped. The body is the enrichment's output, preceded by the ⚠ line when material is
+#      missing; nothing else in it depends on the PUT.
 #
 # The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
 # without it the PUT would fire on every tick against a driven-by-human-response wait,
@@ -4140,8 +4143,9 @@ function Send-HumanParkAlert {
         -Signature $Signature -LastMsgId $LastMsgId `
         -StopReason $StopReason -Rounds $Rounds
 
-    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
-    # discarded; the notification body below does NOT branch on it.
+    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Fail-open: its failure never
+    # suppresses the notification. The body below branches on it in exactly one way (D-3, which
+    # amends D-34): a 'missing' outcome prepends the ⚠ line; the rest of the body is unchanged.
     $push = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
         -Project $Project -ThreadId $ThreadId -StopReason $StopReason -Envelope $envelope
 
