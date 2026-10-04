@@ -1,6 +1,7 @@
 """ADR-14 §7.3 — design-time inputs to the naysayer tier decision.
 
-Thread T-D8-codex-backend-adr14-15-amendment: tests 20-22 (Bohr msg-6575: the working
+Thread T-D8-codex-backend-adr14-15-amendment: tests 33-36 and the prompt-file structure
+test (msg-6588: host files vs MindWire system assets), tests 20-22 (Bohr msg-6575: the working
 side is read at the repository root, referenced paths are made root-relative, no root
 → Gemini), 23-26 (msg-6577: out-of-tree, symlink and unresolvable references → Gemini;
 an in-tree absolute path is not blocked), 31-32 (msg-6579: symlinked root, prefix-
@@ -17,8 +18,12 @@ from typing import Any
 import pytest
 
 from spirrow_mindwire.naysayer.n3_design_time import (
+    MINDWIRE_ROOT,
+    PROMPT_ASSETS,
+    PromptFiles,
     find_repo_root,
     resolve_design_time_paths,
+    resolve_prompt_files,
     working_config_reader,
 )
 from spirrow_mindwire.naysayer.n3_routing import (
@@ -275,7 +280,7 @@ async def test_11_design_time_read_tags_no_marker_populated_list_routes_to_codex
         root,
         repo_root_finder=_root_finder(root),
         trusted_reader=_trusted(_toml("deploy/*")),
-        referenced_files=lambda _e: ["src/backend/x.py"],
+        prompt_files=PromptFiles(host_files=("src/backend/x.py",), system_assets=()),
     )
     decision = await adapter._turn_tier(_event(("design",)), "prompt")
     assert decision.tier == _CODEX, decision.reason
@@ -309,7 +314,7 @@ async def test_design_time_out_of_tree_reference_routes_to_gemini(tmp_path: Path
         root,
         repo_root_finder=_root_finder(root),
         trusted_reader=_trusted(_toml()),
-        referenced_files=lambda _e: ["../secrets.env"],
+        prompt_files=PromptFiles(host_files=("../secrets.env",), system_assets=()),
     )
     decision = await adapter._turn_tier(_event(()), "prompt")
     assert decision.tier == _GEMINI and "outside" in decision.reason
@@ -345,3 +350,192 @@ def test_conductor_hands_get_thread_tags_to_the_event() -> None:
     assert _thread_tags({"thread": {"tags": []}}) == ()
     assert _thread_tags({"messages": []}) is None  # not read → the routing treats as marked
     assert _thread_tags({"thread": {"tags": [1]}}) is None
+
+
+# ---------- prompt files: host files vs MindWire system assets (msg-6588) -------- #
+
+
+def _mindwire_toml() -> str:
+    return (MINDWIRE_ROOT / N3_CONFIG_PATH).read_text(encoding="utf-8")
+
+
+def test_prompt_assets_are_the_two_files_the_builder_reads() -> None:
+    assert frozenset({"spec/NAYSAYER_PRINCIPLES.md", "spec/adr_index.yaml"}) == PROMPT_ASSETS
+
+
+def test_structure_files_read_by_the_builder_equal_host_files_and_system_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every file ``build_naysayer_system_prompt`` opens is declared to routing (msg-6588).
+
+    Spies on the two ways the builder's loaders read a file and clears the principles
+    loader's caches first, so a cached read cannot hide a file from the spy.
+    """
+    import builtins
+    import io
+
+    from spirrow_mindwire.adapters.naysayer_sdk import (
+        build_naysayer_system_prompt,
+        naysayer_prompt_files,
+    )
+    from spirrow_mindwire.naysayer import principles
+    from spirrow_mindwire.obligations import load_manifest
+
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_PRINCIPLES_PATH", raising=False)
+    obligations = load_manifest()
+    read: set[str] = set()
+    real_read_text = Path.read_text
+    real_open = builtins.open
+    real_io_open = io.open
+
+    def spy_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        read.add(os.path.realpath(self))
+        return real_read_text(self, *args, **kwargs)
+
+    def spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(file, (str, os.PathLike)):
+            read.add(os.path.realpath(file))
+        return real_open(file, *args, **kwargs)
+
+    for cached in (principles._read, principles._frontmatter):
+        cached.cache_clear()
+    monkeypatch.setattr(Path, "read_text", spy_read_text)
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(io, "open", spy_open)
+    try:
+        build_naysayer_system_prompt(obligations=obligations)
+    finally:
+        monkeypatch.setattr(io, "open", real_io_open)
+    files = naysayer_prompt_files()
+    declared = {os.path.realpath(p) for p in files.host_files} | {
+        os.path.realpath(p) for p in files.system_assets
+    }
+    assert read == declared
+
+
+def test_routed_adapter_with_its_own_system_prompt_must_declare_prompt_files(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="prompt_files"):
+        _adapter(tmp_path, system_prompt="custom")
+
+
+@pytest.mark.anyio
+async def test_33_host_is_not_mindwire_assets_from_mindwire_root_route_to_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_PRINCIPLES_PATH", raising=False)
+    root = _repo(tmp_path)
+    adapter = _adapter(root, repo_root_finder=_root_finder(root), trusted_reader=_trusted(_toml()))
+    assert len(adapter._prompt_files.system_assets) == 2
+    decision = await adapter._turn_tier(_event(("design",)), "prompt")
+    assert decision.tier == _CODEX, decision.reason
+
+
+@pytest.mark.anyio
+async def test_34_host_is_mindwire_with_its_real_config_routes_to_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Einstein's dogfooding case: the assets are not on mindwire's own glob list."""
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_PRINCIPLES_PATH", raising=False)
+    adapter = _adapter(
+        MINDWIRE_ROOT,
+        repo_root_finder=_root_finder(MINDWIRE_ROOT),
+        trusted_reader=_trusted(_mindwire_toml()),
+    )
+    decision = await adapter._turn_tier(_event(("design",)), "prompt")
+    assert decision.tier == _CODEX, decision.reason
+
+
+@pytest.mark.anyio
+async def test_35_principles_override_outside_mindwire_root_routes_to_gemini(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "NAYSAYER_PRINCIPLES.md"
+    override.write_text(
+        (MINDWIRE_ROOT / "spec" / "NAYSAYER_PRINCIPLES.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_PRINCIPLES_PATH", str(override))
+    root = _repo(tmp_path / "host")
+    adapter = _adapter(root, repo_root_finder=_root_finder(root), trusted_reader=_trusted(_toml()))
+    decision = await adapter._turn_tier(_event(("design",)), "prompt")
+    assert decision.tier == _GEMINI
+    assert "outside the MindWire root" in decision.reason
+
+
+def _fake_mindwire(tmp_path: Path) -> Path:
+    mw = tmp_path / "mindwire"
+    (mw / "spec").mkdir(parents=True)
+    for name in ("NAYSAYER_PRINCIPLES.md", "adr_index.yaml", "OTHER.md"):
+        (mw / "spec" / name).write_text("x", encoding="utf-8")
+    return mw
+
+
+def test_35_system_asset_not_in_prompt_assets_routes_to_gemini(tmp_path: Path) -> None:
+    mw = _fake_mindwire(tmp_path)
+    host = _repo(tmp_path)
+    paths, problem = resolve_prompt_files(
+        host_files=(),
+        system_assets=(mw / "spec" / "NAYSAYER_PRINCIPLES.md", mw / "spec" / "OTHER.md"),
+        summon_dir=host,
+        repo_root=host,
+        mindwire_root=mw,
+    )
+    assert paths == () and problem is not None and "PROMPT_ASSETS" in problem
+    decision = route_tier(
+        N3Request(
+            marker=False,
+            paths=paths,
+            globs=GlobLoad(frozenset(), None),
+            prompt_chars=1,
+            path_problem=problem,
+        )
+    )
+    assert decision.tier == _GEMINI
+
+
+def test_35_missing_system_asset_routes_to_gemini(tmp_path: Path) -> None:
+    mw = _fake_mindwire(tmp_path)
+    _paths, problem = resolve_prompt_files(
+        host_files=(),
+        system_assets=(mw / "spec" / "gone.md",),
+        summon_dir=tmp_path,
+        repo_root=None,
+        mindwire_root=mw,
+    )
+    assert problem is not None and "cannot resolve system asset" in problem
+
+
+def test_assets_are_host_files_only_when_the_host_is_mindwire(tmp_path: Path) -> None:
+    mw = _fake_mindwire(tmp_path)
+    assets = (mw / "spec" / "NAYSAYER_PRINCIPLES.md", mw / "spec" / "adr_index.yaml")
+    host = _repo(tmp_path)
+    other, problem = resolve_prompt_files(
+        host_files=("src/backend/x.py",),
+        system_assets=assets,
+        summon_dir=host,
+        repo_root=host,
+        mindwire_root=mw,
+    )
+    assert problem is None and other == ("src/backend/x.py",)
+    selfhosted, problem = resolve_prompt_files(
+        host_files=(), system_assets=assets, summon_dir=mw, repo_root=mw, mindwire_root=mw
+    )
+    assert problem is None
+    assert {p.casefold() for p in selfhosted} == {a.casefold() for a in PROMPT_ASSETS}
+
+
+@pytest.mark.anyio
+async def test_36_host_is_mindwire_and_a_glob_covers_an_asset_routes_to_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-hosting: the assets are also matched as host files, under mindwire's globs."""
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_PRINCIPLES_PATH", raising=False)
+    adapter = _adapter(
+        MINDWIRE_ROOT,
+        repo_root_finder=_root_finder(MINDWIRE_ROOT),
+        trusted_reader=_trusted(_toml("spec/adr_index.yaml")),
+    )
+    decision = await adapter._turn_tier(_event(("design",)), "prompt")
+    assert decision.tier == _GEMINI

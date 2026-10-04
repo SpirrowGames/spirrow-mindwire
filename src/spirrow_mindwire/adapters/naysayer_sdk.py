@@ -71,7 +71,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -93,11 +93,12 @@ from ..exceptions import (
     AdapterSpawnError,
 )
 from ..lexora.client import LexoraClient
-from ..naysayer.adr_index import build_adr_index_block
+from ..naysayer.adr_index import adr_manifest_path, build_adr_index_block
 from ..naysayer.n3_design_time import (
+    PromptFiles,
     find_repo_root,
     remote_default_branch_reader,
-    resolve_design_time_paths,
+    resolve_prompt_files,
     working_config_reader,
 )
 from ..naysayer.n3_routing import (
@@ -121,7 +122,7 @@ from ..naysayer.preflight import (
     attest_turn,
     custom_headers_env_value,
 )
-from ..naysayer.principles import allowed_backends, build_preamble
+from ..naysayer.principles import allowed_backends, build_preamble, principles_path
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -380,6 +381,25 @@ def build_naysayer_system_prompt(
     )
 
 
+def naysayer_prompt_files(*, repo_root: Path | None = None) -> PromptFiles:
+    """The files :func:`build_naysayer_system_prompt` reads, split as N-3 routing needs them
+    (thread msg-6582 gap 2 as corrected by msg-6588).
+
+    Both are MindWire's own files, so both are ``system_assets``: the principles SOT from
+    :func:`principles_path` and the ADR manifest from :func:`adr_manifest_path` — the same
+    expressions the two loaders read, so this list cannot name a different file than the one
+    the prompt carries. The design-time prompt carries no host-repository file today, so
+    ``host_files`` is empty. ``tests/test_n3_design_time.py`` pins that the set of files the
+    builder actually opens equals the union of ``host_files`` and ``system_assets``; a
+    builder change that adds a file must add it here or that test reds. The per-turn prompt
+    (:func:`build_turn_prompt`) carries thread text only, no file.
+    """
+    return PromptFiles(
+        host_files=(),
+        system_assets=(principles_path(), adr_manifest_path(repo_root)),
+    )
+
+
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
     return build_turn_prompt(event, own_role, "Reply to this message in your role.")
 
@@ -487,7 +507,7 @@ class NaysayerSdkAdapter:
         extra_env: dict[str, str] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
-        referenced_files: Callable[[ChatroomEvent], Sequence[str]] | None = None,
+        prompt_files: PromptFiles | None = None,
         repo_root_finder: Callable[[Path], Awaitable[Path | None]] | None = None,
         trusted_reader: Callable[[Path | None], ConfigReader] | None = None,
         n3_notifier: UnresolvedNotifier | None = None,
@@ -529,13 +549,20 @@ class NaysayerSdkAdapter:
         )
         # Per-turn N-3 routing inputs (ADR-14 §7.3; thread msg-6475..6579). Each is
         # injectable so tests touch neither git nor GitHub.
-        # - referenced_files: the paths whose CONTENT the turn's prompt carries (§7.5). The
-        #   current design-time prompt carries no file content, so the default is none; the
-        #   §7.5 builder must supply its list here when it lands.
+        # - prompt_files: the files whose CONTENT the prompt carries (§7.5), split into host
+        #   files and MindWire system assets (msg-6588). Unset, it is what the builder that
+        #   renders the system prompt reports (naysayer_prompt_files). A caller that supplies
+        #   its own system_prompt must also say which files it carries: there is no default
+        #   that could quietly claim "none".
         # - repo_root_finder: the prompt source's git top level (never the process cwd).
         # - trusted_reader: the remote default branch through the contents API.
         # - n3_notifier: told when the trusted side cannot be resolved (msg-6477).
-        self._referenced_files = referenced_files or (lambda _event: ())
+        if prompt_files is None and system_prompt is not None and self._routed:
+            raise ValueError(
+                "a routed NaysayerSdkAdapter given its own system_prompt must also be given "
+                "prompt_files: N-3 routing has to know which files that prompt carries"
+            )
+        self._prompt_files = prompt_files if prompt_files is not None else naysayer_prompt_files()
         self._repo_root_finder = repo_root_finder or find_repo_root
         self._trusted_reader = trusted_reader or remote_default_branch_reader
         self._n3_notifier = n3_notifier
@@ -592,8 +619,11 @@ class NaysayerSdkAdapter:
             globs = await load_n3_globs(
                 trusted=self._trusted_reader(root), working=working_config_reader(root)
             )
-            paths, problem = resolve_design_time_paths(
-                tuple(self._referenced_files(event)), summon_dir=self._cwd, repo_root=root
+            paths, problem = resolve_prompt_files(
+                host_files=self._prompt_files.host_files,
+                system_assets=self._prompt_files.system_assets,
+                summon_dir=self._cwd,
+                repo_root=root,
             )
             await notify_unresolved(
                 globs, f"design-time {event.thread_ref.thread_id}", self._n3_notifier

@@ -5,6 +5,8 @@ prepares what the design-time call site feeds it:
 
 - :func:`resolve_design_time_paths`: referenced files → root-relative POSIX paths,
   with the boundary checks the PR-gate's lexical check cannot do (it has no disk);
+- :func:`resolve_prompt_files`: the prompt's host files plus MindWire's own system assets
+  (:data:`PROMPT_ASSETS`, checked against :data:`MINDWIRE_ROOT`, msg-6588);
 - :func:`find_repo_root`: the prompt source's git top level, never the process cwd;
 - :func:`working_config_reader`: the working side, ``N3_CONFIG_PATH`` at that root;
 - :func:`remote_default_branch_reader`: the trusted side, the HOST_REPO's remote
@@ -18,6 +20,7 @@ import os
 import re
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from .n3_routing import ConfigReader
@@ -62,6 +65,98 @@ def resolve_design_time_paths(
             return (), f"{ref!r} resolves outside the repository root"
         out.append(resolved.relative_to(root).as_posix())
     return tuple(out), None
+
+
+# --------------------------------------------------------------------------------------- #
+# What the design-time prompt carries (thread msg-6582 gap 2, corrected by msg-6588;
+# Einstein msg-6587 / the msg-6588 review).
+#
+# The prompt carries two kinds of file. HOST files come from the reviewed repository and go
+# through :func:`resolve_design_time_paths` and the host's globs like any reference. SYSTEM
+# ASSETS ship with MindWire itself (the principles SOT and the ADR manifest, read from
+# MindWire's own install root, NOT the host): judged against the host root they would always
+# be "outside the tree" and send every non-mindwire request to Gemini. They are instead
+# checked against :data:`MINDWIRE_ROOT` and the closed set :data:`PROMPT_ASSETS`.
+# --------------------------------------------------------------------------------------- #
+
+# n3_design_time.py -> naysayer -> spirrow_mindwire -> src -> <repo root>: the same idiom
+# (and so the same directory) as ``principles._REPO_ROOT`` and ``adr_index._REPO_ROOT``, the
+# roots the two loaders read their files from.
+MINDWIRE_ROOT = Path(__file__).resolve().parents[3]
+
+# The ONLY MindWire files the design-time prompt may carry, as POSIX paths relative to
+# :data:`MINDWIRE_ROOT`. Closed on purpose: anything else passed as a system asset (an
+# override of ``MINDWIRE_NAYSAYER_PRINCIPLES_PATH`` pointing elsewhere, a new file a future
+# builder starts reading) routes the whole request to Gemini until this constant is changed.
+# This module is on mindwire's own ``.mindwire-n3.toml`` list, so that change is itself a
+# Gemini-reviewed PR (msg-6588).
+PROMPT_ASSETS: frozenset[str] = frozenset({"spec/NAYSAYER_PRINCIPLES.md", "spec/adr_index.yaml"})
+
+
+@dataclass(frozen=True)
+class PromptFiles:
+    """The files a design-time prompt carries, split by where they come from (msg-6588)."""
+
+    host_files: tuple[str, ...]
+    system_assets: tuple[Path, ...]
+
+
+def _realpath_cased(path: Path) -> Path:
+    return _cased(Path(os.path.realpath(path, strict=True)))
+
+
+def _check_system_assets(assets: Sequence[Path], mindwire_root: Path) -> str | None:
+    """``None`` when every asset is a :data:`PROMPT_ASSETS` file under ``mindwire_root``."""
+    if not assets:
+        return None
+    try:
+        root = _realpath_cased(mindwire_root)
+    except OSError as exc:
+        return f"cannot resolve the MindWire root {str(mindwire_root)!r}: {exc}"
+    allowed = {_cased(Path(a)).as_posix() for a in PROMPT_ASSETS}
+    for asset in assets:
+        try:
+            resolved = _realpath_cased(Path(asset))
+        except OSError as exc:
+            return f"cannot resolve system asset {str(asset)!r}: {exc}"
+        if not resolved.is_relative_to(root):
+            return f"system asset {str(asset)!r} resolves outside the MindWire root"
+        if resolved.relative_to(root).as_posix() not in allowed:
+            return f"system asset {str(asset)!r} is not in PROMPT_ASSETS"
+    return None
+
+
+def resolve_prompt_files(
+    *,
+    host_files: Sequence[str],
+    system_assets: Sequence[Path],
+    summon_dir: Path,
+    repo_root: Path | None,
+    mindwire_root: Path = MINDWIRE_ROOT,
+) -> tuple[tuple[str, ...], str | None]:
+    """Root-relative host paths to match against the host's globs, or why the request is
+    Gemini. Both file kinds are REQUIRED keyword arguments with no default (msg-6588), so a
+    prompt builder that starts carrying a new file cannot reach routing without saying so.
+
+    - ``system_assets`` must each resolve under ``realpath(mindwire_root)`` to a path in
+      :data:`PROMPT_ASSETS`; anything else is a problem (→ Gemini). They are NOT matched
+      against the host's globs, being no host content.
+    - When the host IS mindwire (the two roots resolve equal), the assets are ALSO treated as
+      host files, so mindwire's own globs still apply to them (msg-6588, test 36).
+    - ``host_files`` go through :func:`resolve_design_time_paths`.
+    """
+    problem = _check_system_assets(system_assets, mindwire_root)
+    if problem is not None:
+        return (), problem
+    refs: list[str] = list(host_files)
+    if system_assets and repo_root is not None:
+        try:
+            self_hosted = _realpath_cased(repo_root) == _realpath_cased(mindwire_root)
+        except OSError as exc:
+            return (), f"cannot resolve the repository root {str(repo_root)!r}: {exc}"
+        if self_hosted:
+            refs.extend(str(asset) for asset in system_assets)
+    return resolve_design_time_paths(tuple(refs), summon_dir=summon_dir, repo_root=repo_root)
 
 
 def _git_toplevel(source_dir: Path) -> Path | None:
@@ -147,8 +242,12 @@ def remote_default_branch_reader(repo_root: Path | None) -> ConfigReader:
 
 
 __all__ = [
+    "MINDWIRE_ROOT",
+    "PROMPT_ASSETS",
+    "PromptFiles",
     "find_repo_root",
     "remote_default_branch_reader",
     "resolve_design_time_paths",
+    "resolve_prompt_files",
     "working_config_reader",
 ]

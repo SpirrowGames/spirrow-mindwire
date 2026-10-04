@@ -406,6 +406,8 @@ def test_this_repo_carries_a_resolvable_n3_config() -> None:
     assert N3_CONFIG_PATH in globs  # msg-6573: listed even though matched unconditionally
     for path in (
         "src/spirrow_mindwire/naysayer/n3_routing.py",
+        # msg-6588: holds PROMPT_ASSETS, so widening it is a Gemini-reviewed change.
+        "src/spirrow_mindwire/naysayer/n3_design_time.py",
         "src/spirrow_mindwire/naysayer/principles.py",
     ):
         assert _route(load, path) == _GEMINI, path

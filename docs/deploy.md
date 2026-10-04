@@ -240,10 +240,17 @@ Paths and globs are normalised (`\` → `/`, case-folded) before both the config
 glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
 be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
 notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+The scheduled sweep counts that token in each conductor run's output and the daily digest carries
+one line per repo ("routed to Gemini (fail-safe)"); the counts reset after a full digest delivery.
 
-**Design time carries no file contents today.** The design-time prompt is the thread plus the
-principles, so the list of referenced files is empty. When the §7.5 prompt builder starts including
-files, it must pass the adapter the list of what it includes (`referenced_files`).
+**Which files design time routes on.** The design-time prompt is the thread, the principles SOT
+(`spec/NAYSAYER_PRINCIPLES.md`) and the ADR manifest (`spec/adr_index.yaml`). The two files are
+MindWire's own *system assets*, read from MindWire's install, not the host: they must resolve under
+MindWire's root to a path in `PROMPT_ASSETS`, or the request goes to Gemini (a principles override
+pointing elsewhere included). They are not matched against the host's globs, except when the host
+is mindwire itself. *Host files* (none today) go through the boundary check and the host's globs.
+A builder change that starts carrying another file must declare it; a structure test fails if the
+files the builder reads and the files it declares differ.
 
 **Residual risk, authorised by Takahito as a TIER-C goal decision on thread
 T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a vulnerability, on a path
