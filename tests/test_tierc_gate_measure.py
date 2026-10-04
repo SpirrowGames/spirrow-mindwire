@@ -128,7 +128,7 @@ def test_c_bounces_split_by_each_projects_mode() -> None:
 
 
 def test_c_a_missing_config_reads_as_unmeasured_not_the_default(tmp_path: Path) -> None:
-    modes = MEASURE.read_modes(("a", "b"), tmp_path / "absent.toml")
+    modes = MEASURE.modes_from(("a", "b"), MEASURE.load_config(tmp_path / "absent.toml"))
     assert set(modes) == {"a", "b"}
     assert all(v.startswith("unmeasured: config not found") for v in modes.values())
 
@@ -137,13 +137,13 @@ def test_c_a_missing_config_reads_as_unmeasured_not_the_default(tmp_path: Path) 
 def test_c_the_configured_mode_is_read_for_every_project(tmp_path: Path, mode: str) -> None:
     cfg = tmp_path / "mindwire.toml"
     cfg.write_text(f'[tierc_gate]\nmode = "{mode}"\n', encoding="utf-8")
-    assert MEASURE.read_modes(("a", "b"), cfg) == {"a": mode, "b": mode}
+    assert MEASURE.modes_from(("a", "b"), MEASURE.load_config(cfg)) == {"a": mode, "b": mode}
 
 
 def test_c_an_unreadable_config_reads_as_unmeasured(tmp_path: Path) -> None:
     cfg = tmp_path / "mindwire.toml"
     cfg.write_text('[tierc_gate]\nmode = "bogus"\n', encoding="utf-8")
-    modes = MEASURE.read_modes(("a",), cfg)
+    modes = MEASURE.modes_from(("a",), MEASURE.load_config(cfg))
     assert modes["a"].startswith("unmeasured: config unreadable")
 
 
@@ -227,3 +227,16 @@ def test_c_main_measures_with_a_readable_config(
     result = json.loads(out.read_text(encoding="utf-8"))
     assert result["mode_by_project"] == {"a": "enforce"}
     assert "unmeasured" not in result
+
+
+def test_h1_read_modes_is_gone_and_nothing_calls_it() -> None:
+    """``read_modes`` was a test-only wrapper; tests run ``main``'s own sequence (U4d H)."""
+    assert not hasattr(MEASURE, "read_modes")
+    root = Path(__file__).resolve().parents[1]
+    callers = [
+        p
+        for d in ("src", "scripts")
+        for p in (root / d).rglob("*.py")
+        if "read_modes" in p.read_text(encoding="utf-8")
+    ]
+    assert callers == []
