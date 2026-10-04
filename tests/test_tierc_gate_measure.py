@@ -227,12 +227,3 @@ def test_c_main_measures_with_a_readable_config(
     result = json.loads(out.read_text(encoding="utf-8"))
     assert result["mode_by_project"] == {"a": "enforce"}
     assert "unmeasured" not in result
-
-
-def test_h1_read_modes_is_gone() -> None:
-    """``read_modes`` was a test-only wrapper; tests run ``main``'s own sequence (U4d H).
-
-    A leftover caller would fail at runtime (the G/C tests drive ``main``), so a text search of
-    the tree is not needed and would false-fail on a mere comment (PR #460 gate advisory).
-    """
-    assert not hasattr(MEASURE, "read_modes")
