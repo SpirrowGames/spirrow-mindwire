@@ -270,7 +270,7 @@ the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
-**Merging is not deploying.** The task runs `uv run mindwire-loop` from this checkout — the venv holds
+**Merging is not deploying.** The task runs the loop (`uv run --no-sync python -m spirrow_mindwire.loop_runner`) from this checkout — the venv holds
 an *editable* install, so the working tree IS the running module — and nothing pulled it. A merged fix
 could therefore sit undeployed indefinitely, with GitHub showing it merged and the task history
 showing exit 0. The only way to notice was to compare `git log` against `origin/main` by hand.
@@ -298,6 +298,15 @@ Three rules are load-bearing:
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
   and a fast-forward cannot conflict with them.
+- **The venv is synced by `sync-repo.ps1` and nowhere else** (T-composer-entrypoint-missing-drops-
+  decision-cards D-2'). The loop and the decision composer both launch as
+  `uv run --no-sync python -m <module>`, so nothing syncs mid-tick, and no `.venv\Scripts\mindwire-*.exe`
+  is either needed or held open. `sync-repo.ps1` runs `uv sync --locked` whenever the SHA-256 over
+  `pyproject.toml` + `uv.lock` differs from the one recorded by the last *successful* sync
+  (`<data_dir>/state/venv-sync.json`), and counts a sync as successful only if the two launched
+  modules then import. A failed sync records nothing, so every tick retries it. It reports
+  `status=failed` with `deps_hash`, and the alert is deduplicated on that hash. `--locked` never
+  rewrites `uv.lock`: a stale lock fails loudly and is fixed by committing a regenerated lock.
 - **A sync failure is not a sweep failure.** One unreachable GitHub must not stop the loop; it keeps
   running the code it has, which is known-good and merely possibly old.
 

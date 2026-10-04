@@ -1507,3 +1507,12 @@ __all__ = [
     "run_conductor",
     "run_loop",
 ]
+
+
+# `python -m spirrow_mindwire.loop_runner` is how deploy/run-conductor.ps1 launches the daemon
+# (T-composer-entrypoint-missing-drops-decision-cards D-1'). Going through the venv's python.exe
+# instead of `.venv\Scripts\mindwire-loop.exe` means a running conductor no longer holds the
+# package's console-script exe open, so `uv sync --reinstall-package spirrow-mindwire` cannot stop
+# part-way on `os error 32` against it and leave other entry points missing.
+if __name__ == "__main__":  # pragma: no cover
+    main()

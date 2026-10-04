@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # deploy/sync-repo.ps1 — fast-forward the daemon's own checkout to origin/main, and say what it did.
 #
-# Why this exists: merging a PR did not deploy it. The scheduled task runs `uv run mindwire-loop`
+# Why this exists: merging a PR did not deploy it. The scheduled task runs the loop
 # from this checkout, and nothing pulled it, so the loop kept running whatever commit the working
 # tree happened to sit on. The gap is invisible from both ends — GitHub shows the fix merged, the
 # task history shows exit 0 — and the only way to notice was to compare `git log` against
@@ -42,6 +42,38 @@
 #
 # Untracked files never block: the live host deliberately carries untracked working notes
 # (`spec/loop-autonomy-control.md`), and a fast-forward cannot conflict with them.
+#
+# **The venv is synced here and nowhere else** (T-composer-entrypoint-missing-drops-decision-cards
+# D-2'). Every launch the wrapper makes is `uv run --no-sync python -m ...`, so nothing re-syncs the
+# venv in the middle of a tick. That makes this step the only place a broken venv gets repaired, so
+# it must not give up after one failed try:
+#
+# - Trigger: `deps_hash` (SHA-256 over `pyproject.toml` + `uv.lock`) differs from the hash recorded
+#   by the last SUCCESSFUL sync in -StatePath (default `<data_dir>/state/venv-sync.json`). It is NOT
+#   "the manifests moved in this pull": that rule never retried a failed sync, so one bad deploy
+#   left a broken venv running for good. A failed sync records nothing, so the next tick tries
+#   again. A checkout carrying neither file has nothing to sync.
+# - `uv sync --locked`, never a bare `uv sync`. A bare sync may rewrite `uv.lock` here, and a
+#   modified tracked file blocks every later deploy (`blocked` above). `--locked` refuses a lock
+#   that does not match `pyproject.toml` and changes nothing, so the fix is a commit, made where
+#   commits are made. (`--frozen` was rejected: it installs a stale lock and reports success.)
+# - Success = exit 0 AND the two modules the wrapper launches import from the venv
+#   (`spirrow_mindwire.loop_runner`, `spirrow_mindwire.decision_request.cli`). The check is on the
+#   modules actually launched, not on `.venv\Scripts\*.exe`, which nothing launches any more.
+# - Every failure of this step reports `status=failed` with `deps_hash`, and the wrapper keys its
+#   alert dedup on that hash, not on uv's message text: the same broken state alerts once, and a
+#   new commit (new hash) that still fails alerts again.
+#
+#   {"status":"current","branch":"main","head":"b79a698","synced_deps":true}
+#   {"status":"failed","branch":"main","deps_hash":"3f2a...","reason":"'uv sync --locked' failed ..."}
+
+param(
+    # Where the last successful sync's deps_hash is recorded. The wrapper passes its own
+    # state\venv-sync.json; a hand-run falls back to the same file under the data root.
+    [string]$StatePath = '',
+    # The uv executable. A parameter only so tests/Test-SyncRepo.ps1 can substitute a stub.
+    [string]$Uv = 'uv'
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -112,53 +144,124 @@ if (-not $target.Ok) {
     Write-Result @{ status = "failed"; branch = $branch; reason = "cannot resolve origin/main: $(Get-OneLine $target.Output)" }
 }
 if ($before -eq $target.Output) {
-    Write-Result @{ status = "current"; branch = $branch; head = $before.Substring(0, 7) }
+    $gitResult = @{ status = "current"; branch = $branch; head = $before.Substring(0, 7) }
 }
-
-# Refuse anything that is not a pure fast-forward. A diverged checkout means someone committed here;
-# merging or resetting would be this script inventing a resolution nobody asked for.
-$ff = Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', 'origin/main')
-if (-not $ff.Ok) {
-    Write-Result @{
-        status = "blocked"; branch = $branch
-        reason = "local main has diverged from origin/main - not a fast-forward"
-    }
-}
-
-$countResult = Invoke-Git @('rev-list', '--count', 'HEAD..origin/main')
-$commits = if ($countResult.Ok) { [int]$countResult.Output } else { $null }
-
-$merge = Invoke-Git @('merge', '--ff-only', 'origin/main')
-if (-not $merge.Ok) {
-    Write-Result @{ status = "failed"; branch = $branch; reason = "ff-only merge failed: $(Get-OneLine $merge.Output)" }
-}
-$after = (Invoke-Git @('rev-parse', 'HEAD')).Output
-
-# `uv run` syncs the environment on its own, so this is not strictly required — but a dependency
-# change that cannot install should surface HERE, attributed to the deploy that caused it, rather
-# than as an unexplained failure on the next tick. Only run it when the manifests actually moved.
-$syncedDeps = $false
-$touched = Invoke-Git @('diff', '--name-only', "$before..$after", '--', 'pyproject.toml', 'uv.lock')
-if ($touched.Ok -and $touched.Output) {
-    Push-Location $repoRoot
-    try {
-        $uvOut = & uv sync 2>&1
-        $uvCode = $LASTEXITCODE
-    }
-    finally { Pop-Location }
-    if ($uvCode -ne 0) {
+else {
+    # Refuse anything that is not a pure fast-forward. A diverged checkout means someone committed
+    # here; merging or resetting would be this script inventing a resolution nobody asked for.
+    $ff = Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', 'origin/main')
+    if (-not $ff.Ok) {
         Write-Result @{
-            status = "failed"; branch = $branch
-            from   = $before.Substring(0, 7); to = $after.Substring(0, 7)
-            reason = "pulled, but 'uv sync' failed: $((($uvOut | ForEach-Object { "$_" }) -join ' ').Trim())"
+            status = "blocked"; branch = $branch
+            reason = "local main has diverged from origin/main - not a fast-forward"
         }
     }
+
+    $countResult = Invoke-Git @('rev-list', '--count', 'HEAD..origin/main')
+    $commits = if ($countResult.Ok) { [int]$countResult.Output } else { $null }
+
+    $merge = Invoke-Git @('merge', '--ff-only', 'origin/main')
+    if (-not $merge.Ok) {
+        Write-Result @{ status = "failed"; branch = $branch; reason = "ff-only merge failed: $(Get-OneLine $merge.Output)" }
+    }
+    $after = (Invoke-Git @('rev-parse', 'HEAD')).Output
+    $gitResult = @{
+        status  = "updated"; branch = $branch
+        from    = $before.Substring(0, 7); to = $after.Substring(0, 7)
+        commits = $commits
+    }
+}
+
+# --- venv sync (D-2', see the header) --------------------------------------------------------------
+
+# SHA-256 over pyproject.toml + uv.lock: each file's SHA-256, prefixed with its name, in a fixed
+# order, joined with newlines and hashed again. $null when neither file exists (nothing to sync).
+function Get-DepsHash {
+    $parts = @()
+    $present = 0
+    foreach ($name in @('pyproject.toml', 'uv.lock')) {
+        $path = Join-Path $repoRoot $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $present++
+            $parts += "${name}:$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())"
+        }
+        else { $parts += "${name}:<missing>" }
+    }
+    if ($present -eq 0) { return $null }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose() }
+}
+
+# The deps_hash of the last successful sync, or $null. No record and an unreadable record get the
+# same answer, "sync again", which costs one no-op `uv sync --locked`.
+function Get-RecordedDepsHash {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $rec = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($rec -and $rec.deps_hash) { return [string]$rec.deps_hash }
+    }
+    catch { }
+    return $null
+}
+
+function Save-DepsHash {
+    param([string]$Path, [string]$Hash)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $json = @{ deps_hash = $Hash; synced_at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
+function Invoke-Uv {
+    param([string[]]$UvArgs)
+    Push-Location $repoRoot
+    try {
+        $out = & $Uv @UvArgs 2>&1
+        $code = $LASTEXITCODE
+    }
+    finally { Pop-Location }
+    return [pscustomobject]@{ Code = $code; Output = (Get-OneLine (($out | ForEach-Object { "$_" }) -join ' ')) }
+}
+
+if (-not $StatePath) {
+    $dataRoot = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
+    $StatePath = Join-Path $dataRoot "state/venv-sync.json"
+}
+
+# Computed ONCE, before the sync: `--locked` never writes a tracked file, so the value cannot move
+# under us, and the hash recorded on success is exactly the one that decided to sync.
+$depsHash = Get-DepsHash
+$syncedDeps = $false
+if ($null -ne $depsHash -and $depsHash -ne (Get-RecordedDepsHash -Path $StatePath)) {
+    $failure = $null
+    $sync = Invoke-Uv @('sync', '--locked')
+    if ($sync.Code -ne 0) {
+        $failure = "'uv sync --locked' failed (exit $($sync.Code)): $($sync.Output)"
+    }
+    else {
+        $import = Invoke-Uv @('run', '--no-sync', 'python', '-c',
+            'import spirrow_mindwire.loop_runner, spirrow_mindwire.decision_request.cli')
+        if ($import.Code -ne 0) {
+            $failure = "'uv sync --locked' exited 0 but the launched modules do not import (exit $($import.Code)): $($import.Output)"
+        }
+    }
+    if ($failure) {
+        # Nothing recorded, so the next tick tries again. deps_hash is the wrapper's dedup key.
+        $result = @{ status = "failed"; branch = $branch; deps_hash = $depsHash; reason = $failure }
+        if ($gitResult.status -eq 'updated') {
+            $result.from = $gitResult.from; $result.to = $gitResult.to
+            $result.reason = "pulled, but $failure"
+        }
+        Write-Result $result
+    }
+    Save-DepsHash -Path $StatePath -Hash $depsHash
     $syncedDeps = $true
 }
 
-Write-Result @{
-    status      = "updated"; branch = $branch
-    from        = $before.Substring(0, 7); to = $after.Substring(0, 7)
-    commits     = $commits
-    synced_deps = $syncedDeps
-}
+$gitResult.synced_deps = $syncedDeps
+Write-Result $gitResult

@@ -78,7 +78,14 @@ $needed = @(
     'Push-DecisionMaterial',
     'Test-NotificationSuppressed',
     'Send-NotificationIfChanged',
-    'Send-HumanParkAlert'
+    'Send-HumanParkAlert',
+    # T-composer-entrypoint-missing-drops-decision-cards D-1' / D-3.
+    'Get-ComposerCliArguments',
+    'Get-MaterialMissingWarningLine',
+    'Set-MaterialMissing',
+    'Clear-MaterialMissingIfAdvanced',
+    'Invoke-MaterialMissingRetry',
+    'Get-MaterialMissingDigestLines'
 )
 foreach ($name in $needed) {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -846,9 +853,14 @@ Check '500 PUT: notification still fired exactly once' 1 $script:notificationCal
 $normalizedFailBody = ($script:notificationLastMessage `
     -replace 'T-500', 'T-ok' `
     -replace [regex]::Escape('/T-500'), '/T-ok')
-CheckTrue 'fail-open: notification body is character-identical to the OK-PUT baseline' `
-    ($normalizedFailBody -eq $msgWithOkPut) `
-    ("ok=[$msgWithOkPut] fail=[$normalizedFailBody]")
+# D-3 amends D-34 on exactly one point: a PUT that did not land puts a ⚠ line on TOP of the same
+# body. Everything below that line is still character-identical to the OK-PUT baseline.
+$failLines = $normalizedFailBody -split "`n", 2
+Check 'fail-open: a failed PUT prepends the D-3 warning line' `
+    (Get-MaterialMissingWarningLine -Reason 'put_http_500') $failLines[0]
+CheckTrue 'fail-open: below the warning, the body is character-identical to the OK-PUT baseline' `
+    ($failLines[1] -eq $msgWithOkPut) `
+    ("ok=[$msgWithOkPut] fail=[$($failLines[1])]")
 
 # Reset the fake back to success for the tests below.
 $script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
@@ -896,7 +908,8 @@ Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
     -StopReason 'human' -Rounds 4 -RawFallback 'raw ping for T-nonok'
 Check 'non-ok envelope: PUT was NOT called' 0 $script:materialCallCount
 Check 'non-ok envelope: notification still fired (raw ping fell through)' 1 $script:notificationCallCount
-Check 'non-ok envelope: notification body is the raw fallback' 'raw ping for T-nonok' $script:notificationLastMessage
+Check 'non-ok envelope: notification body is the D-3 warning + the raw fallback' `
+    "$(Get-MaterialMissingWarningLine -Reason 'composer_status=error')`nraw ping for T-nonok" $script:notificationLastMessage
 
 # ---------- (f) operator work: no composer, no PUT, raw ping only ------------------------------
 # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): a valid `NEXT: operator` is work,
@@ -1131,7 +1144,8 @@ Check 'null output: notification still fired (fail-open per D-34)' 1 $script:not
 # Because Format-DecisionMessage returns $null on non-ok / missing output as well, the
 # notification body should fall back to the raw ping. Same behaviour as the composer_status
 # != ok case above.
-Check 'null output: notification body is the raw fallback' 'raw ping for null-output' $script:notificationLastMessage
+Check 'null output: notification body is the D-3 warning + the raw fallback' `
+    "$(Get-MaterialMissingWarningLine -Reason 'no_output')`nraw ping for null-output" $script:notificationLastMessage
 
 # ---------- (e) I-17: PUT URL and link body share {project}/{thread_id} -----------------------
 Write-Host ''
@@ -1151,6 +1165,207 @@ CheckTrue 'PUT URL contains {project}=proj-x' ($putUrl -match '/decisions/proj-x
 CheckTrue 'PUT URL contains {thread_id}=T-share' ($putUrl -match '/proj-x/T-share/') $putUrl
 CheckTrue 'notification body contains the SAME {project}/{thread_id} in its link' `
     ($notifBody -match 'dashboard/decisions/proj-x/T-share') $notifBody
+
+
+# ===============================================================================================
+# T-composer-entrypoint-missing-drops-decision-cards (Bohr msg-6555 / msg-6557 / msg-6559 /
+# msg-6561): D-1' launch shape, D-3 material-missing state, ⚠ line, digest section, bounded retry.
+# ===============================================================================================
+Write-Host ''
+Write-Host "--- T-composer-entrypoint-missing-drops-decision-cards ---"
+
+Write-Host ''
+Write-Host "D-1' Get-ComposerCliArguments — venv python -m, never the entry-point exe, never a mid-tick sync"
+$cliArgs = Get-ComposerCliArguments -Backend 'claude-code' -Identity 'Composer' -TailCount 5
+Check 'composer launch is run --no-sync python -m spirrow_mindwire.decision_request.cli' `
+    'run --no-sync python -m spirrow_mindwire.decision_request.cli --backend claude-code --identity "Composer" --tail 5' $cliArgs
+CheckTrue 'composer launch does not name the mindwire-compose-decision entry point' `
+    (-not $cliArgs.Contains('mindwire-compose-decision')) $cliArgs
+Check 'no --tail when TailCount=0' `
+    'run --no-sync python -m spirrow_mindwire.decision_request.cli --backend stub --identity "Composer"' `
+    (Get-ComposerCliArguments -Backend 'stub' -Identity 'Composer' -TailCount 0)
+# The loop launch lives in deploy/run-conductor.ps1, which runs the daemon when executed, so its
+# argument list is pinned textually rather than by running it.
+$runConductor = Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/run-conductor.ps1') -Raw -Encoding utf8
+CheckTrue 'loop launch is uv run --no-sync python -m spirrow_mindwire.loop_runner' `
+    ($runConductor.Contains("@('run', '--no-sync', 'python', '-m', 'spirrow_mindwire.loop_runner', '--mode', 'conductor')"))
+CheckTrue 'loop launch no longer goes through the mindwire-loop entry point' `
+    (-not ($runConductor -match "'run',\s*'mindwire-loop'"))
+
+# The three skip branches, a composer failure, and a failed PUT each record material_missing and put
+# the ⚠ line in that tick's notification.
+Write-Host ''
+Write-Host 'D-3 Send-HumanParkAlert — every missing outcome records state and warns in the notification'
+$noHeadTailErr = [PSCustomObject]@{
+    composer_status = 'ok'
+    extras          = [PSCustomObject]@{ tail_fetch_error = "ModuleNotFoundError: No module named 'ulid'" }
+    output          = [PSCustomObject]@{ question = 'q?'; options = @(); unknowns = @() }
+}
+$cases = @(
+    @{ name = 'composer failed (no envelope)'; composer = @{ ok = $false; envelope = $null; error = 'boom' }; put = $null; reason = 'composer_failed' },
+    @{ name = 'composer_status != ok'; composer = @{ ok = $true; envelope = $errorEnvelope; error = $null }; put = $null; reason = 'composer_status=error' },
+    @{ name = 'no head_msg_id_read (tail_fetch_error carried)'; composer = @{ ok = $true; envelope = $noHeadTailErr; error = $null }; put = $null; reason = "no_head_msg_id_read: ModuleNotFoundError: No module named 'ulid'" },
+    @{ name = 'output null'; composer = @{ ok = $true; envelope = $nullOutputEnvelope; error = $null }; put = $null; reason = 'no_output' },
+    @{ name = 'PUT HTTP 500'; composer = @{ ok = $true; envelope = $freshEnvelope; error = $null }; put = @{ ok = $false; status = 500; body = 'x'; elapsed_ms = 1; error = 'HTTP 500' }; reason = 'put_http_500' },
+    @{ name = 'PUT transport error'; composer = @{ ok = $true; envelope = $freshEnvelope; error = $null }; put = @{ ok = $false; status = $null; body = $null; elapsed_ms = 1; error = 'tls' }; reason = 'put_error' }
+)
+foreach ($c in $cases) {
+    Reset-MaterialSpy
+    $pending = @{}
+    $notified = @{}
+    $missing = @{}
+    $script:composerReturn = $c.composer
+    if ($c.put) { $script:materialReturn = $c.put }
+    Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified -MaterialMissingState $missing `
+        -Key 'p/T-mm' -Project 'p' -ThreadId 'T-mm' -Signature 'human:msg-10' -LastMsgId 'msg-10' `
+        -StopReason 'human' -Rounds 2 -RawFallback 'raw ping'
+    $script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
+    CheckTrue "$($c.name): recorded in material-missing" ($missing.ContainsKey('p/T-mm'))
+    Check "$($c.name): reason" $c.reason $missing['p/T-mm'].reason
+    Check "$($c.name): signature recorded" 'human:msg-10' $missing['p/T-mm'].signature
+    Check "$($c.name): attempts = 1" 1 $missing['p/T-mm'].attempts
+    Check "$($c.name): notification still fired" 1 $script:notificationCallCount
+    Check "$($c.name): notification starts with the ⚠ line" `
+        (Get-MaterialMissingWarningLine -Reason $c.reason) (($script:notificationLastMessage -split "`n")[0])
+}
+
+Write-Host ''
+Write-Host 'D-3 Send-HumanParkAlert — a successful PUT clears the record and adds no ⚠ line'
+Reset-MaterialSpy
+$missing = @{ 'p/T-mm' = @{ signature = 'human:msg-9'; reason = 'composer_failed'; first_seen = '2026-10-04T00:00:00Z'; last_attempt = '2026-10-04T00:00:00Z'; attempts = 3 } }
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState @{} -NotifyState @{} -MaterialMissingState $missing `
+    -Key 'p/T-mm' -Project 'p' -ThreadId 'T-mm' -Signature 'human:msg-10' -LastMsgId 'msg-10' `
+    -StopReason 'human' -Rounds 2 -RawFallback 'raw ping'
+CheckTrue 'pushed: record removed' (-not $missing.ContainsKey('p/T-mm'))
+CheckTrue 'pushed: notification carries no ⚠ line' (-not $script:notificationLastMessage.StartsWith('⚠'))
+
+Write-Host ''
+Write-Host 'D-3 ⚠ line keeps the notification inside the Discord budget'
+Reset-MaterialSpy
+$script:materialReturn = @{ ok = $false; status = 503; body = 'x'; elapsed_ms = 1; error = 'HTTP 503' }
+$bigEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-1' }
+    output          = [PSCustomObject]@{
+        question = ('Q' * 600); options = @(
+            [PSCustomObject]@{ id = 'A'; label = ('a' * 300); gain = ('g' * 300); loss = ('l' * 300) },
+            [PSCustomObject]@{ id = 'B'; label = ('b' * 300); gain = ('g' * 300); loss = ('l' * 300) })
+        recommendation = 'A'; recommendation_reason = ('r' * 400); unknowns = @(('u' * 300))
+    }
+}
+$script:composerReturn = @{ ok = $true; envelope = $bigEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState @{} -NotifyState @{} -MaterialMissingState @{} `
+    -Key 'p/T-big' -Project 'p' -ThreadId 'T-big' -Signature 'human:msg-1' -LastMsgId 'msg-1' `
+    -StopReason 'human' -Rounds 1 -RawFallback 'raw ping'
+$script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
+CheckTrue 'warned notification is within $DecisionMessageDiscordBudget' `
+    ($script:notificationLastMessage.Length -le $script:DecisionMessageDiscordBudget) "len=$($script:notificationLastMessage.Length)"
+CheckTrue 'warned notification starts with the ⚠ line' ($script:notificationLastMessage.StartsWith('⚠'))
+
+Write-Host ''
+Write-Host 'D-3 Set-MaterialMissing / Clear-MaterialMissingIfAdvanced'
+$mm = @{}
+$t0 = [datetime]::Parse('2026-10-04T00:00:00Z').ToUniversalTime()
+Set-MaterialMissing -State $mm -Key 'k' -Signature 's1' -Reason 'r1' -Project 'p' -ThreadId 'T' -LastMsgId 'm' -StopReason 'human' -Rounds 1 -Now $t0
+Set-MaterialMissing -State $mm -Key 'k' -Signature 's1' -Reason 'r2' -Project 'p' -ThreadId 'T' -LastMsgId 'm' -StopReason 'human' -Rounds 1 -Now $t0.AddHours(1)
+Check 'same signature: attempts bumped' 2 $mm['k'].attempts
+Check 'same signature: first_seen kept' $t0.ToString('o') $mm['k'].first_seen
+Check 'same signature: latest reason kept' 'r2' $mm['k'].reason
+Set-MaterialMissing -State $mm -Key 'k' -Signature 's2' -Reason 'r3' -Project 'p' -ThreadId 'T' -LastMsgId 'm' -StopReason 'human' -Rounds 1 -Now $t0.AddHours(2)
+Check 'new signature: attempts restart' 1 $mm['k'].attempts
+Clear-MaterialMissingIfAdvanced -State $mm -Key 'k' -Signature 's2'
+CheckTrue 'same signature verdict: record kept' ($mm.ContainsKey('k'))
+Clear-MaterialMissingIfAdvanced -State $mm -Key 'k' -Signature 's3'
+CheckTrue 'advanced signature: record removed' (-not $mm.ContainsKey('k'))
+# A state file re-read through ConvertFrom-Json hands timestamps back as [DateTime].
+$mmRoundTrip = @{ k = (@{ signature = 's1'; first_seen = '2026-10-04T00:00:00Z'; attempts = 1 } | ConvertTo-Json | ConvertFrom-Json) }
+Set-MaterialMissing -State $mmRoundTrip -Key 'k' -Signature 's1' -Reason 'r' -Project 'p' -ThreadId 'T' -LastMsgId 'm' -StopReason 'human' -Rounds 1 -Now $t0.AddHours(5)
+Check 'round-tripped first_seen stays the same UTC instant' $t0.ToString('o') $mmRoundTrip['k'].first_seen
+
+Write-Host ''
+Write-Host 'D-3 Invoke-MaterialMissingRetry — at most once per interval, no notification, cleared on success'
+function New-MissingRecord {
+    param([string]$Reason, [datetime]$LastAttempt)
+    return @{ signature = 'human:msg-20'; reason = $Reason; first_seen = $LastAttempt.ToString('o'); last_attempt = $LastAttempt.ToString('o');
+        attempts = 1; project = 'p'; thread_id = 'T-r'; last_msg_id = 'msg-20'; stop_reason = 'human'; rounds = 2 }
+}
+$now = [datetime]::Parse('2026-10-04T10:00:00Z').ToUniversalTime()
+Reset-MaterialSpy
+$script:composerCallCount = 0
+$mm = @{ 'p/T-r' = (New-MissingRecord -Reason 'composer_failed' -LastAttempt $now.AddMinutes(-30)) }
+$n = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState @{} -LiveKeys @('p/T-r') -Now $now -Interval ([TimeSpan]::FromHours(1))
+Check 'under an hour since the last attempt: not retried' 0 $n
+Check 'under an hour: composer not called' 0 $script:composerCallCount
+Check 'under an hour: no PUT' 0 $script:materialCallCount
+
+# Stale cached envelope (the broken one) must be dropped so the composer runs again.
+$pending = @{ 'p/T-r' = @{ signature = 'human:msg-20'; envelope = $noHeadTailErr; cached_at = 'x' } }
+$mm = @{ 'p/T-r' = (New-MissingRecord -Reason 'no_head_msg_id_read' -LastAttempt $now.AddMinutes(-61)) }
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+$n = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState $pending -LiveKeys @('p/T-r') -Now $now -Interval ([TimeSpan]::FromHours(1))
+Check 'over an hour: retried once' 1 $n
+Check 'over an hour: composer re-run (broken cached envelope dropped)' 1 $script:composerCallCount
+Check 'over an hour: PUT fired once' 1 $script:materialCallCount
+Check 'retry PUT carries the composer-read head (I-16), not last_msg_id' 'msg-777' (($script:materialLastCall.BodyJson | ConvertFrom-Json).head_msg_id)
+Check 'retry: NO notification' 0 $script:notificationCallCount
+CheckTrue 'retry success: record cleared' (-not $mm.ContainsKey('p/T-r'))
+
+Reset-MaterialSpy
+$script:composerCallCount = 0
+$mm = @{ 'p/T-r' = (New-MissingRecord -Reason 'composer_failed' -LastAttempt $now.AddHours(-2)) }
+$script:composerReturn = @{ ok = $false; envelope = $null; error = 'still broken' }
+$null = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState @{} -LiveKeys @('p/T-r') -Now $now -Interval ([TimeSpan]::FromHours(1))
+CheckTrue 'retry failure: record kept' ($mm.ContainsKey('p/T-r'))
+Check 'retry failure: attempts bumped' 2 $mm['p/T-r'].attempts
+Check 'retry failure: last_attempt moved to now (next retry in an hour)' $now.ToString('o') $mm['p/T-r'].last_attempt
+Check 'retry failure: no notification' 0 $script:notificationCallCount
+$script:composerCallCount = 0
+$null = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState @{} -LiveKeys @('p/T-r') -Now $now.AddMinutes(10) -Interval ([TimeSpan]::FromHours(1))
+Check 'just retried: the next tick does not retry again' 0 $script:composerCallCount
+
+# A PUT failure reuses the cached (good) envelope instead of paying for another composer run.
+Reset-MaterialSpy
+$script:composerCallCount = 0
+$pending = @{ 'p/T-r' = @{ signature = 'human:msg-20'; envelope = $freshEnvelope; cached_at = 'x' } }
+$mm = @{ 'p/T-r' = (New-MissingRecord -Reason 'put_http_502' -LastAttempt $now.AddHours(-2)) }
+$null = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState $pending -LiveKeys @('p/T-r') -Now $now -Interval ([TimeSpan]::FromHours(1))
+Check 'put_* reason: cached envelope reused (no composer call)' 0 $script:composerCallCount
+Check 'put_* reason: PUT retried' 1 $script:materialCallCount
+CheckTrue 'put_* reason: cleared on success' (-not $mm.ContainsKey('p/T-r'))
+
+$mm = @{ 'p/T-gone' = (New-MissingRecord -Reason 'composer_failed' -LastAttempt $now.AddHours(-2)) }
+Reset-MaterialSpy
+$null = Invoke-MaterialMissingRetry -MissingState $mm -PendingDecisionsState @{} -LiveKeys @('p/T-other') -Now $now -Interval ([TimeSpan]::FromHours(1))
+CheckTrue 'key no longer in the sweep list: dropped, not retried' (-not $mm.ContainsKey('p/T-gone'))
+Check 'key no longer in the sweep list: no PUT' 0 $script:materialCallCount
+
+Write-Host ''
+Write-Host 'D-3 digest — 材料未送信の判断待ち section'
+$mm = @{
+    'p/T-new' = @{ signature = 's'; reason = 'put_http_500'; first_seen = $now.AddHours(-1).ToString('o'); attempts = 1 }
+    'p/T-old' = @{ signature = 's'; reason = 'no_head_msg_id_read'; first_seen = $now.AddHours(-8).ToString('o'); attempts = 8 }
+}
+$mmLines = Get-MaterialMissingDigestLines -State $mm -Now $now
+CheckTrue 'header carries the count' ($mmLines[0].Contains(': 2 件')) $mmLines[0]
+CheckTrue 'oldest first' ($mmLines[1].Contains('p/T-old') -and $mmLines[2].Contains('p/T-new')) ($mmLines -join ' | ')
+CheckTrue 'row carries reason and elapsed time' ($mmLines[1].Contains('reason=no_head_msg_id_read') -and $mmLines[1].Contains('経過=8h')) $mmLines[1]
+Check 'empty state -> no lines' 0 (Get-MaterialMissingDigestLines -State @{} -Now $now).Count
+$digestMm = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -MaterialMissingLines $mmLines
+CheckTrue 'digest renders the section' ($digestMm.Contains('材料未送信の判断待ち') -and $digestMm.Contains('p/T-old')) $digestMm
+$digestNone = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} -Now $now
+CheckTrue 'no records -> digest has no such section' (-not $digestNone.Contains('材料未送信'))
+# Budget: many rows must not push the digest past the budget.
+$many = @{}
+for ($i = 0; $i -lt 60; $i++) {
+    $many["proj/T-$i-" + ('x' * 40)] = @{ signature = 's'; reason = ('no_head_msg_id_read: ' + ('e' * 80)); first_seen = $now.AddHours(-$i).ToString('o'); attempts = $i }
+}
+$digestMany = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -Budget 1900 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $many -Now $now)
+CheckTrue 'many records: digest stays within budget' ($digestMany.Length -le 1900) "len=$($digestMany.Length)"
+CheckTrue 'many records: header keeps the true count' ($digestMany.Contains(': 60 件'))
+CheckTrue 'many records: overflow marker present' ($digestMany -match '\+\d+ 件（省略）')
 
 Write-Host ''
 if ($script:failures -gt 0) {
