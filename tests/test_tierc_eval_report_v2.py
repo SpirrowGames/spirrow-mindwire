@@ -444,8 +444,22 @@ def test_manifest_registering_a_non_v2_version_is_refused(
 def test_manifest_without_a_version_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """A missing version reaches the version check (PR #416 gate advisory), not the parse
+    error."""
     _, replay, fixture, manifest, labels = _v2_export(tmp_path)
     _set_manifest_version(manifest, None)
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    err = capsys.readouterr().err
+    assert "registers questions_version None" in err and "not a v2-structure version" in err
+    assert "not an export.json" not in err
+
+
+@pytest.mark.parametrize("content", ["[]", '"tierc-v3"', "{not json"])
+def test_manifest_that_is_not_a_json_object_is_not_an_export(
+    tmp_path: Path, content: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    manifest.write_text(content, encoding="utf-8")
     assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
     assert "not an export.json" in capsys.readouterr().err
 

@@ -167,12 +167,16 @@ def run_version(replay: Sequence[Mapping[str, Any]]) -> str:
 
 def manifest_version(manifest: Path) -> str:
     """msg-6011 DECIDED 2d-16: the version ``export.json`` registers decides the structure. It
-    must be in :data:`V2_STRUCTURE_VERSIONS` — no manifest describes a v1 run."""
+    must be in :data:`V2_STRUCTURE_VERSIONS` — no manifest describes a v1 run. An unreadable file
+    or a non-object is "not an export.json"; a missing / out-of-set version is the version error
+    (PR #416 gate advisory: one message per cause)."""
     try:
         raw = json.loads(manifest.read_text(encoding="utf-8"))
-        version = raw["questions_version"] if isinstance(raw, dict) else None
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError) as exc:
         raise InputError(f"{manifest}: not an export.json: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise InputError(f"{manifest}: not an export.json: top level is {type(raw).__name__}")
+    version = raw.get("questions_version")
     if version not in V2_STRUCTURE_VERSIONS:
         raise InputError(
             f"{manifest} registers questions_version {version!r}, which is not a v2-structure "
