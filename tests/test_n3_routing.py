@@ -8,10 +8,8 @@ msg-6479 14-18; Einstein msg-6480 / msg-6482).
 
 Design-time cases (10-13, 15) exercise ``load_n3_globs`` + ``route_tier`` with
 the design-time readers' semantics (trusted = remote default branch, working =
-the prompt builder's source). Their call site is not wired yet — the design-time
-adapter routes fail-safe to the Gemini tier until it is
-(``test_design_time_adapter_is_fail_safe_gemini_until_wired``); the call site and
-tests 20-26, 31, 32 land in the stacked PR (``tests/test_n3_design_time.py``).
+the prompt builder's source). The design-time call site and tests 20-26, 31, 32
+are in ``tests/test_n3_design_time.py``.
 PR-gate tests 19 and 27-30 are in ``tests/test_pr_review_driver.py``.
 """
 
@@ -330,7 +328,7 @@ def test_lexical_path_problem(path: str, bad: bool) -> None:
 
 
 def test_design_time_adapter_is_fail_safe_gemini_until_wired() -> None:
-    """Design time stays Gemini-only until the stacked PR wires its inputs (tags, files)."""
+    """With no turn inputs yet (spawn time), the design-time tier is Gemini-only."""
     from spirrow_mindwire.adapters.naysayer_sdk import design_time_tier_decision
 
     decision = design_time_tier_decision()
@@ -408,6 +406,8 @@ def test_this_repo_carries_a_resolvable_n3_config() -> None:
     assert N3_CONFIG_PATH in globs  # msg-6573: listed even though matched unconditionally
     for path in (
         "src/spirrow_mindwire/naysayer/n3_routing.py",
+        # msg-6588: holds PROMPT_ASSETS, so widening it is a Gemini-reviewed change.
+        "src/spirrow_mindwire/naysayer/n3_design_time.py",
         "src/spirrow_mindwire/naysayer/principles.py",
     ):
         assert _route(load, path) == _GEMINI, path
@@ -439,3 +439,56 @@ def test_output_reserve_covers_the_named_naysayer_requests() -> None:
         preflight.PREFLIGHT_MAX_TOKENS,
     ):
         assert value <= principles.CODEX_OUTPUT_RESERVE_TOKENS
+
+
+def _int_literal(value: ast.expr | None) -> int | None:
+    if isinstance(value, ast.Constant) and type(value.value) is int:
+        return value.value
+    return None
+
+
+def _max_tokens_literals(src_root: Path) -> list[tuple[str, int, int]]:
+    """Every int literal bound to a ``*max_tokens*`` name, keyword argument or parameter default."""
+    found: list[tuple[str, int, int]] = []
+
+    def hit(path: Path, name: str, lineno: int, value: ast.expr | None) -> None:
+        literal = _int_literal(value)
+        if literal is not None and "max_tokens" in name.lower() and not name.startswith("CODEX_"):
+            found.append((str(path), lineno, literal))
+
+    for path in sorted(src_root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        hit(path, target.id, node.lineno, node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                hit(path, node.target.id, node.lineno, node.value)
+            elif isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg is not None:
+                        hit(path, kw.arg, node.lineno, kw.value)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                positional = node.args.posonlyargs + node.args.args
+                padded: list[ast.expr | None] = [None] * (len(positional) - len(node.args.defaults))
+                pairs = zip(
+                    positional + node.args.kwonlyargs,
+                    padded + list(node.args.defaults) + list(node.args.kw_defaults),
+                    strict=True,
+                )
+                for arg, default in pairs:
+                    hit(path, arg.arg, node.lineno, default)
+    return found
+
+
+def test_output_reserve_covers_every_max_tokens_literal_in_src() -> None:
+    """Discovers request budgets instead of listing them (Einstein msg-6613 advisory 1).
+
+    A new request type whose ``max_tokens`` exceeds the codex output reserve reds this test
+    without anyone having to remember to add it to an import list.
+    """
+    src_root = Path(principles.__file__).resolve().parents[1]
+    found = _max_tokens_literals(src_root)
+    assert len(found) >= 4, found  # the four named constants above are discovered
+    over = [f for f in found if f[2] > principles.CODEX_OUTPUT_RESERVE_TOKENS]
+    assert over == [], over
