@@ -411,3 +411,31 @@ def test_this_repo_carries_a_resolvable_n3_config() -> None:
         "src/spirrow_mindwire/naysayer/principles.py",
     ):
         assert _route(load, path) == _GEMINI, path
+
+
+# ---------- codex limit derivation (thread msg-6612, Einstein msg-6613) ----- #
+
+
+def test_codex_limit_is_pinned_from_the_three_terms() -> None:
+    assert principles.CODEX_CONTEXT_WINDOW_TOKENS == 272_000
+    assert principles.CODEX_HARNESS_RESERVE_TOKENS == 60_928
+    assert principles.CODEX_OUTPUT_RESERVE_TOKENS == 32_000
+    assert CODEX_TIER_PROMPT_CHAR_LIMIT == 179_072
+    assert CODEX_TIER_PROMPT_CHAR_LIMIT == (
+        principles.CODEX_CONTEXT_WINDOW_TOKENS
+        - principles.CODEX_HARNESS_RESERVE_TOKENS
+        - principles.CODEX_OUTPUT_RESERVE_TOKENS
+    )
+
+
+def test_output_reserve_covers_the_named_naysayer_requests() -> None:
+    from spirrow_mindwire.adapters import naysayer_lexora
+    from spirrow_mindwire.naysayer import pr_review, preflight
+
+    for value in (
+        pr_review._DEFAULT_MAX_TOKENS,
+        pr_review._ADR_POINTER_MAX_TOKENS,
+        naysayer_lexora._DEFAULT_MAX_TOKENS,
+        preflight.PREFLIGHT_MAX_TOKENS,
+    ):
+        assert value <= principles.CODEX_OUTPUT_RESERVE_TOKENS
