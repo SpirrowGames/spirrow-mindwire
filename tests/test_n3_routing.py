@@ -439,3 +439,56 @@ def test_output_reserve_covers_the_named_naysayer_requests() -> None:
         preflight.PREFLIGHT_MAX_TOKENS,
     ):
         assert value <= principles.CODEX_OUTPUT_RESERVE_TOKENS
+
+
+def _int_literal(value: ast.expr | None) -> int | None:
+    if isinstance(value, ast.Constant) and type(value.value) is int:
+        return value.value
+    return None
+
+
+def _max_tokens_literals(src_root: Path) -> list[tuple[str, int, int]]:
+    """Every int literal bound to a ``*max_tokens*`` name, keyword argument or parameter default."""
+    found: list[tuple[str, int, int]] = []
+
+    def hit(path: Path, name: str, lineno: int, value: ast.expr | None) -> None:
+        literal = _int_literal(value)
+        if literal is not None and "max_tokens" in name.lower() and not name.startswith("CODEX_"):
+            found.append((str(path), lineno, literal))
+
+    for path in sorted(src_root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        hit(path, target.id, node.lineno, node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                hit(path, node.target.id, node.lineno, node.value)
+            elif isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg is not None:
+                        hit(path, kw.arg, node.lineno, kw.value)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                positional = node.args.posonlyargs + node.args.args
+                padded: list[ast.expr | None] = [None] * (len(positional) - len(node.args.defaults))
+                pairs = zip(
+                    positional + node.args.kwonlyargs,
+                    padded + list(node.args.defaults) + list(node.args.kw_defaults),
+                    strict=True,
+                )
+                for arg, default in pairs:
+                    hit(path, arg.arg, node.lineno, default)
+    return found
+
+
+def test_output_reserve_covers_every_max_tokens_literal_in_src() -> None:
+    """Discovers request budgets instead of listing them (Einstein msg-6613 advisory 1).
+
+    A new request type whose ``max_tokens`` exceeds the codex output reserve reds this test
+    without anyone having to remember to add it to an import list.
+    """
+    src_root = Path(principles.__file__).resolve().parents[1]
+    found = _max_tokens_literals(src_root)
+    assert len(found) >= 4, found  # the four named constants above are discovered
+    over = [f for f in found if f[2] > principles.CODEX_OUTPUT_RESERVE_TOKENS]
+    assert over == [], over
