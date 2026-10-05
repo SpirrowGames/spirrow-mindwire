@@ -48,6 +48,16 @@ manifest's. ``as_of`` is not compared (nothing else carries it); it is printed a
 v2 section with the three hashes and the manifest's own sha256. A v1 run given
 ``--export-manifest`` is an error: nothing would be checked, so nothing may claim it was.
 
+**The manifest picks the structure (T-decider-conductor-hook msg-6009 / msg-6011 DECIDED 2d-16).**
+When ``--export-manifest`` is given, the report structure comes from the version the exporter
+registered (``export.json``'s ``questions_version``, written from the exporter's
+``REGISTERED_QUESTIONS_VERSION``, msg-5753 DECIDED 2d-15), not from counting rows — so an export
+with zero rows still renders the v2 structure (``n = 0``, "no counted rows", exit 0). That
+version must be in :data:`V2_STRUCTURE_VERSIONS`, and so must every replay row's; a row in the
+set but with another version than the manifest's (``tierc-v2`` under ``tierc-v3``) is allowed
+and shows in the version count. "Contradicts" means the two need different structures, never
+that the strings differ. Without a manifest, path selection from row counts is unchanged.
+
 **Reader of the output.** Markdown on stdout / ``--out``. Nothing is posted anywhere.
 """
 
@@ -153,6 +163,39 @@ def run_version(replay: Sequence[Mapping[str, Any]]) -> str:
             "one evaluation run is v1 only or v2 only"
         )
     return "v2" if v2 else "v1"
+
+
+def manifest_version(manifest: Path) -> str:
+    """msg-6011 DECIDED 2d-16: the version ``export.json`` registers decides the structure. It
+    must be in :data:`V2_STRUCTURE_VERSIONS` — no manifest describes a v1 run."""
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        version = raw["questions_version"] if isinstance(raw, dict) else None
+    except (OSError, ValueError, KeyError) as exc:
+        raise InputError(f"{manifest}: not an export.json: {exc}") from exc
+    if version not in V2_STRUCTURE_VERSIONS:
+        raise InputError(
+            f"{manifest} registers questions_version {version!r}, which is not a v2-structure "
+            f"version {sorted(V2_STRUCTURE_VERSIONS)}; nothing would be checked (msg-6011)"
+        )
+    return str(version)
+
+
+def check_rows_under_manifest(replay: Sequence[Mapping[str, Any]], manifest: Path) -> None:
+    """msg-6011 DECIDED 2d-16: under a manifest every row must have the v2 structure. Set
+    membership, not equality with the manifest's version: ``tierc-v2`` rows under a ``tierc-v3``
+    manifest are valid (2d-15 item 3)."""
+    bad = Counter(
+        record_version(r) or "<missing>"
+        for r in replay
+        if record_version(r) not in V2_STRUCTURE_VERSIONS
+    )
+    if bad:
+        raise InputError(
+            f"--replay has {sum(bad.values())} record(s) outside the v2 structure "
+            f"{dict(sorted(bad.items()))} under {manifest}; one evaluation run is v1 only or "
+            "v2 only (msg-6011)"
+        )
 
 
 def verify_export_lock(manifest: Path, fixture: Path, replay: Path) -> ExportLock:
@@ -575,11 +618,13 @@ def render(
     th_v2: TierCV2Thresholds | None = None,
     export: ExportLock | None = None,
     rules_snapshots: RulesSnapshotReport | None = None,
+    force_v2: bool = False,
 ) -> str:
     """One version per run (msg-4639 DECIDED 2d-5, msg-4650). No v2 row → the v1 report,
-    unchanged; all v2 → the v2 section; a mix is an :class:`InputError`."""
+    unchanged; all v2 → the v2 section; a mix is an :class:`InputError`. ``force_v2`` (a manifest
+    was given, msg-6011 DECIDED 2d-16) renders the v2 section even with zero rows."""
     v2 = [r for r in all_rows if r.questions_version in V2_STRUCTURE_VERSIONS]
-    if not v2:
+    if not v2 and not force_v2:
         return _render_v1(
             all_rows,
             labellers,
@@ -904,6 +949,11 @@ def render_v2(
         f"- outcome: {dict(Counter(r.outcome or 'not_called' for r in rows))}",
         f"- questions_version: {dict(sorted(Counter(r.questions_version for r in rows).items()))}",
     ]
+    if n == 0:
+        # msg-6009 DECIDED 2d-16: an empty export still gets the v2 report. It counts and judges
+        # nothing; the §4 verdict comes only from the pre-registered rules.
+        lines += ["- **no counted rows** — no headline, sweep or AUC is computed."]
+        return "\n".join(lines)
     if no_verdict:
         lines += [
             "",
@@ -1099,15 +1149,17 @@ def main(argv: list[str] | None = None) -> int:
     replay_records = read_jsonl(args.replay)
     export: ExportLock | None = None
     try:
-        version = run_version(replay_records)
+        if args.export_manifest is not None:
+            # msg-6009 / msg-6011 DECIDED 2d-16: the manifest, not the row count, picks the path.
+            manifest_version(args.export_manifest)
+            check_rows_under_manifest(replay_records, args.export_manifest)
+            version = "v2"
+        else:
+            version = run_version(replay_records)
         if version == "v2":
             if args.export_manifest is None:
                 raise InputError("a tierc-v2 run requires --export-manifest (msg-4648)")
             export = verify_export_lock(args.export_manifest, args.fixture, args.replay)
-        elif args.export_manifest is not None:
-            raise InputError(
-                "--export-manifest given for a v1 run; nothing would be checked (msg-4648)"
-            )
     except InputError as exc:
         print(f"tierc_eval_report: {exc}", file=sys.stderr)
         return 2
@@ -1160,6 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
         th_v2=TierCV2Thresholds(),
         export=export,
         rules_snapshots=snap,
+        force_v2=args.export_manifest is not None,
     )
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8", newline="\n")
