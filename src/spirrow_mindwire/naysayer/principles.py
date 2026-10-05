@@ -73,15 +73,31 @@ N3_CONFIG_PATH = ".mindwire-n3.toml"
 # The key inside :data:`N3_CONFIG_PATH`: a list of globs over repo-relative POSIX paths.
 N3_SENSITIVE_PATHS_KEY = "n3_sensitive_paths"
 
-# ADR-14 §7.5: the codex tier's prompt limit, in characters, counted as one character per token
-# (conservative for Japanese, the worst case for ordinary text). The rule (thread msg-6471 §3) is
-# ``context_window - max_tokens`` of the model entry Lexora pins in ``model_catalog_json``.
-# PROVISIONAL: Lexora develop (fbbfdea, 2026-10-04) pins no catalog yet, so this is the
-# Gemini-tier value (pr_review._MAX_DIFF_CHARS) until the shadow comparison measures codex.
-# Heuristic: dense hex/emoji payloads can overflow the token window first; codex then errors
-# and the Lexora fallback wrapper answers with gemini-fallback (§7.4) — tracked as part of the
-# fallback-frequency observation (§7.3).
-CODEX_TIER_PROMPT_CHAR_LIMIT = 150_000
+# ADR-14 §7.5: the codex tier's prompt limit, in characters. Rule (thread msg-6612, replacing
+# msg-6471 §3): ``context_window - harness reserve - output reserve``, every term counted as one
+# character per token (the worst-case tokenization ratio; ordinary English runs ~4 chars/token, and
+# that slack absorbs what the catalog does not list: tool schemas, any effective-window percentage
+# the CLI applies — an assumption, not a measurement).
+# Source of the catalog terms: openai/codex tag ``rust-v0.160.0`` (commit
+# a956835d020762cb2b570053af06f643a11c0ecc), ``codex-rs/models-manager/models.json``
+# (blob 77e0389c56000ca19df5029278c30c3e9528af51), slug ``gpt-6.1-sol`` — the model Lexora pins.
+# If Lexora changes its codex model or CLI tag, these values must be re-pinned (cross-repo; no test
+# can see it).
+# Heuristic; overflow → gemini-fallback (§7.4): codex errors on context length, the Lexora fallback
+# wrapper answers with gemini-fallback, and it shows in the fallback-frequency observation (§7.3).
+#
+# ``context_window`` of the pinned entry.
+CODEX_CONTEXT_WINDOW_TOKENS = 272_000
+# Total characters of every string value in the same entry's ``model_messages`` — the text codex
+# itself may inject into the window (an upper bound: it counts policies that may not apply).
+CODEX_HARNESS_RESERVE_TOKENS = 60_928
+# Decided on the mindwire side: the catalog has no output limit and Lexora passes
+# ``max_output_tokens=None``. This is the largest ``max_tokens`` mindwire sends to a naysayer tier;
+# ``tests/test_n3_routing.py`` keeps every such request at or below it.
+CODEX_OUTPUT_RESERVE_TOKENS = 32_000
+CODEX_TIER_PROMPT_CHAR_LIMIT = (
+    CODEX_CONTEXT_WINDOW_TOKENS - CODEX_HARNESS_RESERVE_TOKENS - CODEX_OUTPUT_RESERVE_TOKENS
+)
 
 
 def allowed_backends(tier: str) -> frozenset[str]:
@@ -301,6 +317,9 @@ def build_preamble() -> str:
 
 __all__ = [
     "CODEX_BACKEND",
+    "CODEX_CONTEXT_WINDOW_TOKENS",
+    "CODEX_HARNESS_RESERVE_TOKENS",
+    "CODEX_OUTPUT_RESERVE_TOKENS",
     "CODEX_TIER_PROMPT_CHAR_LIMIT",
     "EXPECTED_PRINCIPLES_VERSION",
     "GEMINI_BACKEND",
