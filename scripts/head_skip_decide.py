@@ -69,6 +69,17 @@ Input to ``commit-terminal`` (``--payload <json>``):
 
     {"thread_id": "T-a", "reason": "no_progress_to_human", "head_msg_id": "msg-244"}
 
+**Phase 2b (``revert-launch`` mode):** undo ONE commit-launch whose session never started. The
+sweep calls it when ``mindwire-loop`` exited with the dirty-clone code (8): the pre-dispatch clone
+guard refused the clone, so no role ran and the launch must count neither in the backoff nor in
+the T42 ``launches_same_head`` (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1 D-3a,
+Bohr msg-6162). ``commit-launch`` prints the record it replaced as ``prior_record`` beside the
+committed ``record``; the sweep feeds that output line back VERBATIM as the revert payload
+(``{"thread_id", "record", "prior_record", ...}`` — no PowerShell JSON round-trip). The prior
+record is restored (or the key removed when it was ``null``) only if the current record is still
+exactly ``record``; otherwise the CLI refuses (exit 1) rather than overwrite a change it did not
+make.
+
 State file: one JSON object keyed by ``thread_id`` (values are Record dicts per
 :func:`~spirrow_mindwire.conductor.head_skip.record_to_json`). Written in both live modes;
 ``--mode report`` prints the verdicts but touches nothing on disk.
@@ -436,6 +447,37 @@ def _apply_commit_launch(
     return new_record
 
 
+def _apply_revert_launch(*, state_path: Path, payload: dict[str, Any]) -> Record | None:
+    """Restore the record a ``commit-launch`` replaced. Returns the restored record (or ``None``).
+
+    Refuses (``ValueError``) when the thread's current record is no longer the one the launch
+    committed: the state moved under us, and putting the old record back would erase that move.
+    """
+    thread_id = str(payload.get("thread_id") or "")
+    if not thread_id:
+        raise ValueError("revert-launch payload missing thread_id")
+    committed = payload.get("record")
+    if not isinstance(committed, dict):
+        raise ValueError("revert-launch payload missing the committed record")
+    prior_raw = payload.get("prior_record")
+    if prior_raw is not None and not isinstance(prior_raw, dict):
+        raise ValueError("revert-launch prior_record must be an object or null")
+    state = _load_state(state_path)
+    current = state.get(thread_id)
+    expected = record_from_json(committed)
+    if current is None or expected is None or record_to_json(current) != record_to_json(expected):
+        raise ValueError(
+            f"revert-launch refused for {thread_id}: the current record is not the committed one"
+        )
+    prior = record_from_json(prior_raw) if prior_raw is not None else None
+    if prior is None:
+        del state[thread_id]
+    else:
+        state[thread_id] = prior
+    _save_state(state_path, state)
+    return prior
+
+
 def _apply_commit_terminal(*, state_path: Path, payload: dict[str, Any]) -> Record:
     """Apply a commit-terminal payload to the state file for one thread.
 
@@ -527,6 +569,10 @@ def _main_commit_launch(args: argparse.Namespace) -> int:
     state_path = Path(args.state_file)
     now = _resolve_now(args.now_iso)
     try:
+        # The record this launch replaces — printed as ``prior_record`` for revert-launch. The
+        # sweep is the state file's single writer, so nothing moves between this read and the
+        # commit below.
+        prior_record = _load_state(state_path).get(str(payload.get("thread_id") or ""))
         new_record = _apply_commit_launch(state_path=state_path, payload=payload, now=now)
     except ValueError as exc:
         print(f"head_skip: commit-launch failed: {exc}", file=sys.stderr)
@@ -537,9 +583,44 @@ def _main_commit_launch(args: argparse.Namespace) -> int:
                 "mode": "commit-launch",
                 "thread_id": payload.get("thread_id", ""),
                 "record": record_to_json(new_record),
+                # What revert-launch restores if the session never starts (dirty clone, exit 8).
+                "prior_record": (
+                    record_to_json(prior_record) if prior_record is not None else None
+                ),
             },
             # Machine-read output — see comment on the decide-mode print
             # above (msg-2292 D-3).
+            ensure_ascii=True,
+        )
+    )
+    return 0
+
+
+def _main_revert_launch(args: argparse.Namespace) -> int:
+    try:
+        if args.payload_file:
+            payload_raw = Path(args.payload_file).read_text(encoding="utf-8")
+        else:
+            payload_raw = args.payload or sys.stdin.read()
+        payload = json.loads(payload_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"head_skip: revert-launch payload unreadable: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("head_skip: revert-launch payload must be a JSON object", file=sys.stderr)
+        return 1
+    try:
+        restored = _apply_revert_launch(state_path=Path(args.state_file), payload=payload)
+    except ValueError as exc:
+        print(f"head_skip: revert-launch failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "mode": "revert-launch",
+                "thread_id": payload.get("thread_id", ""),
+                "record": record_to_json(restored) if restored is not None else None,
+            },
             ensure_ascii=True,
         )
     )
@@ -594,10 +675,11 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         default="decide",
-        choices=("decide", "commit-launch", "commit-terminal", REPORT_MODE_VALUE),
+        choices=("decide", "commit-launch", "revert-launch", "commit-terminal", REPORT_MODE_VALUE),
         help=(
             "decide: batch-evaluate, emit verdicts, refresh observation only (never touch "
             "launch baseline); commit-launch: apply launch baseline for one thread; "
+            "revert-launch: undo one commit-launch whose session never started; "
             "commit-terminal: record (or clear) one thread's terminal stop after the session "
             "returns; report: dry-run decide (never touch state)"
         ),
@@ -627,6 +709,8 @@ def main() -> int:
 
     if args.mode == "commit-launch":
         return _main_commit_launch(args)
+    if args.mode == "revert-launch":
+        return _main_revert_launch(args)
     if args.mode == "commit-terminal":
         return _main_commit_terminal(args)
     # decide (default) or report

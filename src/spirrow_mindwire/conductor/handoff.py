@@ -61,6 +61,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from ..github.client import parse_pr_ref
+from ..identity.normalize import normalize_identity_key
 from ..tier_c_admission_gate import (
     ADMIT_LABELS,
     LEGACY_LABEL_MAP,
@@ -340,12 +341,13 @@ _TIER_C_LABEL_RE = re.compile(
 #     STOP: done
 #     STOP: blocked-on <thread:|pr:|deploy:|queue-empty:><operand> wake:<agent>
 #
-# Slice 1 is a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value and the
-# conductor LOGS it on the measurement-only path TIER-C already uses. Nothing is rejected, nothing
-# is forwarded to magickit, routing is unchanged, and the emission prompt
-# (`_HANDOFF_PROTOCOL_CORE`) deliberately does NOT teach the form — a prompt that promises
-# "write this and the thread resolves / parks" must ship in the same unit as the mechanism that
-# keeps that promise (Einstein msg-4717 BLOCKING, accepted in msg-4718 §0/§2).
+# Slice 1 (#363) was a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value
+# and the conductor LOGS it. Slice 3 (msg-5175 §3) ships the prompt together with the mechanism
+# that keeps its promise, as msg-4718 §2 requires: `_HANDOFF_PROTOCOL_CORE` now teaches the two
+# forms, the gateway sends the parse as magickit's `disposition`
+# (:mod:`.disposition`), and the park-wake tick (:mod:`spirrow_mindwire.park_wake`) wakes a
+# `blocked-on` thread when its trigger fires. Routing itself is still unchanged: a `NEXT: none`
+# settles whatever its STOP line says.
 #
 # The form is FIXED and read strictly (msg-4718 §1-1: "崩れた行は寛容に読まず malformed"). The
 # `STOP:` keyword itself is detected loosely (case, leading decoration, whitespace after the
@@ -358,6 +360,16 @@ _TIER_C_LABEL_RE = re.compile(
 # on a human is `NEXT: human`, which is the Decider's entry. `parked(human, human)` is reserved
 # for the mechanism's own D-8 ③ fallback and is never read off an author's line.
 STOP_TRIGGER_ARMS: tuple[str, ...] = ("thread", "pr", "deploy", "queue-empty")
+
+# Slice 3b S3b-2 (Bohr msg-6523 §2 / msg-6525): a wake may name only these roles. A fired park is
+# posted by ``park-wake-relay`` (a machine), so a wake naming the implementer always meets guard
+# (i) and lands at the human terminal — the same second route from an agent's STOP line to the
+# human that B-5 closed for `human`. It is closed the same way, at the same place: such a wake is
+# MALFORMED, whoever wrote it (the parser does not know the author, and need not: a person can
+# hand to the implementer directly with `NEXT:`). To resume implementation, wake the proposer,
+# who checks the scope and hands on. The prompt's sentence is rendered from this tuple, so the
+# two cannot disagree.
+STOP_WAKE_ROLES: tuple[Role, ...] = (Role.PROPOSER, Role.NAYSAYER)
 
 # Decoration or whitespace BETWEEN the keyword and the colon (`**STOP**: done`, `STOP : done`) is
 # also detected (PR-gate #363 finding 1): without it those lines fell through to ABSENT. Detection
@@ -402,8 +414,9 @@ class StopLine:
 
     ``trigger_arm`` / ``trigger_operand`` / ``wake`` are set only for ``BLOCKED_ON``; ``wake`` is
     the roster's canonical identity. ``raw`` is the stripped line for every status except
-    ``ABSENT`` (so a MALFORMED line can be read back from the log). Slice 1's only consumer is the
-    measurement log; the typed value exists so the later slice's forwarding has one parser.
+    ``ABSENT`` (so a MALFORMED line can be read back from the log). Its consumers (Slice 3) all
+    go through :mod:`.disposition`: the gateway's ``disposition``, the conductor's stop line and
+    the park-wake tick, so the line has one parser and one reading.
     """
 
     status: StopStatus
@@ -555,6 +568,8 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
     where "no STOP line" is itself the measurement (``StopStatus.ABSENT``). ``wake`` must resolve
     on the roster (a registered agent of this thread); ``human`` / ``none`` / an unknown name is
     ``MALFORMED``. There is no ``human`` trigger arm, so ``blocked-on human`` is ``MALFORMED`` too.
+    A wake whose roster role is not in :data:`STOP_WAKE_ROLES` (the implementer) is ``MALFORMED``
+    as well (S3b-2), whoever wrote the line.
     """
     line = _line_above_last_next(body)
     if line is None:
@@ -576,8 +591,8 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
     wake = blocked.group("wake")
     if wake.casefold() in (HUMAN_TOKEN, NONE_TOKEN):
         return StopLine(StopStatus.MALFORMED, raw=raw)
-    resolved = _roster_lookup(roster, wake)
-    if resolved is None:
+    resolved = _wake_lookup(roster, wake)
+    if resolved is None or resolved[1] not in STOP_WAKE_ROLES:
         return StopLine(StopStatus.MALFORMED, raw=raw)
     return StopLine(
         StopStatus.BLOCKED_ON,
@@ -971,7 +986,6 @@ _TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
         "cannot be undone: data deletion, public release, destructive migration, history "
         "rewrite, an external side effect"
     ),
-    "merge-protected": "a merge to a protected branch, or a deploy only a human can perform",
 }
 
 
@@ -1015,6 +1029,37 @@ OPERATOR_FORM_EXAMPLE = (
 )
 _OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
 
+# Slice 3 (T-next-line-carries-who-not-why, Bohr msg-5175 §3 / msg-4716 §2): the two STOP forms
+# the protocol teaches. Like OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each
+# through the parser and requires an accepted status, so the prompt cannot teach a form the
+# parser reads as MALFORMED.
+STOP_FORM_EXAMPLES: tuple[str, ...] = (
+    "STOP: done",
+    "STOP: blocked-on <trigger> wake:<persona>",
+)
+_STOP_FORMS_INDENTED = "\n".join(f"    {line}" for line in STOP_FORM_EXAMPLES)
+#: What each trigger arm waits for, in the words the prompt uses. Keyed in
+#: :data:`STOP_TRIGGER_ARMS` order and checked against it at import, so an arm added to the parser
+#: without a sentence here fails the import instead of being accepted but never taught.
+_STOP_TRIGGER_MEANINGS: dict[str, str] = {
+    "thread": "`thread:<thread-id>` or `thread:<project>/<thread-id>` (that thread is resolved)",
+    "pr": "`pr:<owner/repo#n>` (that pull request is merged or closed)",
+    "deploy": (
+        "`deploy:<request_id>` (that deploy request has succeeded, failed or been interrupted)"
+    ),
+    "queue-empty": (
+        "`queue-empty:<project>` or `queue-empty:<project>:<role>` (no open thread of that "
+        "project hands to a participant, or to one holding that role)"
+    ),
+}
+if tuple(_STOP_TRIGGER_MEANINGS) != STOP_TRIGGER_ARMS:  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        f"STOP trigger prose {tuple(_STOP_TRIGGER_MEANINGS)!r} != arms {STOP_TRIGGER_ARMS!r}"
+    )
+_STOP_TRIGGER_PROSE = "; ".join(_STOP_TRIGGER_MEANINGS[arm] for arm in STOP_TRIGGER_ARMS)
+
+_STOP_WAKE_ROLES_PROSE = " or ".join(role.value for role in STOP_WAKE_ROLES)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -1038,7 +1083,24 @@ refactor extent, work order, splitting PRs or threads, approving an internal \
 mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
-  - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
+  - `NEXT: {NONE_TOKEN}` — nobody acts next on this thread. Say why on the line directly \
+above it, in exactly one of these two forms:
+
+{_STOP_FORMS_INDENTED}
+
+    `STOP: done` means the work this thread exists for is finished. It is recorded as done \
+and waits for its owner to close it.
+    `STOP: blocked-on <trigger> wake:<persona>` means work remains, but it can start only \
+once something happens that the sweep can see. When `<trigger>` holds, the sweep posts a \
+wake message into this thread ending in `NEXT: <persona>`, and the conductor routes it \
+exactly as it would route that handoff written now (the same gates apply). `<persona>` is \
+a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never the \
+implementer: to resume implementation, wake the proposer, who checks the scope and hands \
+it on. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
+`{HUMAN_TOKEN}` trigger or wake: a stop that needs a person is `NEXT: {HUMAN_TOKEN}`.
+    Write the line exactly so: `STOP` in capitals, single spaces, nothing else on the \
+line. A `NEXT: {NONE_TOKEN}` without a valid `STOP:` line directly above it is recorded \
+as unclassified — a stop nobody explained.
   - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
 of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
 comes first: if the work is, or could be, any of those types, hand it to \
@@ -1111,11 +1173,12 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
         "the independent naysayer review runs before any human merge. For other work, hand back "
-        "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
-        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
-        f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
-        "e.g.:\n\n"
-        f"    TIER-C: {require_admitted('merge-protected', where='handoff example')}\n"
+        "to the proposer for a spec-review (`NEXT: <proposer persona>`). You never merge to the "
+        "main branch yourself, and you never ask the human to merge: the open PR already requests "
+        "the merge and the merge-wait PR list carries it, so a merge is not a Tier-C decision. "
+        f"For a genuine Tier-C decision, hand to `{HUMAN_TOKEN}` and name the Tier-C type on the "
+        "line above your handoff, e.g.:\n\n"
+        f"    TIER-C: {require_admitted('cost', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (
@@ -1190,6 +1253,25 @@ def _role_alias(token: str) -> Role | None:
     return None
 
 
+def _wake_lookup(roster: Mapping[str, Role], wake: str) -> tuple[str, Role] | None:
+    """Resolve a STOP line's ``wake`` the way magickit's ``_lookup_wake`` does (S3b-3).
+
+    magickit looks the wake up as given and then by its ADR-11 key
+    (:func:`~spirrow_mindwire.identity.normalize.normalize_identity_key`), so a spelling it
+    accepts — ``PR_Gate_Relay`` for ``pr-gate-relay`` — must resolve here too, or the line is
+    read as MALFORMED and no disposition is sent for a wake magickit would have taken. The
+    conformance vectors are in ``tests/test_stop_wake_adr11_conformance.py``. The value sent is
+    always the roster's canonical spelling.
+    """
+    resolved = _roster_lookup(roster, wake)
+    if resolved is not None:
+        return resolved
+    key = normalize_identity_key(wake)
+    if key and key != wake and key in roster:
+        return key, roster[key]
+    return None
+
+
 def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | None:
     """Case-insensitive identity→role lookup; returns the **canonical** (identity, role)."""
     direct = roster.get(name)
@@ -1210,6 +1292,7 @@ __all__ = [
     "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
     "STOP_TRIGGER_ARMS",
+    "STOP_WAKE_ROLES",
     "TIER_C_CHECK_KEYWORD",
     "TIER_C_CHECK_NONE",
     "TIER_C_LABELS",

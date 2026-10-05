@@ -5,7 +5,7 @@ msg-4699 §2 (``--list-quarantined`` / ``--clear-quarantined``).
 
 Three modes::
 
-    # one heartbeat (the scheduled call site is D-16c's; this is the entry point)
+    # one heartbeat (scheduled by deploy/run-stall-ledger-tick.ps1, D-16c)
     uv run python scripts/stall_ledger_tick.py --data-dir ~/spirrow-mindwire-data \\
         --repo SpirrowGames/spirrow-mindwire --project spirrow-mindwire
 
@@ -51,6 +51,7 @@ from spirrow_mindwire.stall_ledger.adapters import (
     ChatroomThreadAdapter,
     GitHubOpenPrAdapter,
     QuarantineFileAdapter,
+    github_credential_present,
 )
 from spirrow_mindwire.stall_ledger.driver import DEFAULT_T_TICK_MAX, TickPaths, run_tick
 from spirrow_mindwire.stall_ledger.lock import read_payload
@@ -59,6 +60,7 @@ from spirrow_mindwire.stall_ledger.store import (
     read_clear_requests,
     write_clear_request,
 )
+from spirrow_mindwire.stall_ledger.timing import check_timing
 
 
 def _parse_repo(text: str) -> tuple[str, str]:
@@ -116,11 +118,31 @@ async def _tick(args: argparse.Namespace, paths: TickPaths) -> int:
     adapters: list[Adapter] = []
     github = None
     if args.repo:
-        from spirrow_mindwire.github.client import GitHubClient
+        from spirrow_mindwire.github.client import GitHubClient, github_token
 
+        # msg-6415 Q2: decide "is there a credential" here, at the tick's entry, and make a
+        # missing one loud -- the github source then fails as ``auth_missing`` without a
+        # single request instead of running unauthenticated into the per-IP rate limit.
+        credential_present = github_credential_present(github_token())
+        if not credential_present:
+            print(
+                "stall_ledger_tick: no GitHub token (MINDWIRE_GITHUB_TOKEN / GITHUB_TOKEN unset "
+                "or blank); github sources report auth_missing and make no request. The "
+                "scheduled wrapper passes MINDWIRE_STALL_LEDGER_GITHUB_TOKEN through "
+                "(docs/deploy.md, Stall ledger tick).",
+                file=sys.stderr,
+            )
         github = GitHubClient(timeout_seconds=args.fetch_timeout_seconds)
         for owner, repo in args.repo:
-            adapters.append(GitHubOpenPrAdapter(github, owner, repo, fetch_timeout=fetch_timeout))
+            adapters.append(
+                GitHubOpenPrAdapter(
+                    github,
+                    owner,
+                    repo,
+                    fetch_timeout=fetch_timeout,
+                    credential_present=credential_present,
+                )
+            )
     if args.project:
         from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 
@@ -133,6 +155,7 @@ async def _tick(args: argparse.Namespace, paths: TickPaths) -> int:
             paths=paths,
             adapters=adapters,
             t_tick_max=timedelta(seconds=args.t_tick_max_seconds),
+            fetch_timeout=fetch_timeout,
         )
     finally:
         if github is not None:
@@ -155,19 +178,28 @@ def main(argv: list[str] | None = None) -> int:
         "--t-tick-max-seconds",
         type=float,
         default=DEFAULT_T_TICK_MAX.total_seconds(),
-        help="whole-tick deadline (provisional; D-16c fixes it)",
+        help="whole-tick deadline (default: stall_ledger.timing.T_TICK_MAX)",
     )
     parser.add_argument(
         "--fetch-timeout-seconds",
         type=float,
         default=DEFAULT_FETCH_TIMEOUT.total_seconds(),
-        help="per-fetch timeout (provisional; D-16c fixes it)",
+        help="per-fetch timeout (default: stall_ledger.timing.FETCH_TIMEOUT)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list-quarantined", action="store_true")
     mode.add_argument("--clear-quarantined", metavar="UNIT_KEY")
     parser.add_argument("--requested-by", default=None)
     args = parser.parse_args(argv)
+    # An override that leaves no room for one body fetch would stop owed fetches from
+    # ever draining (msg-5747 advisory); refuse it rather than run a tick that can't
+    # make progress.
+    problem = check_timing(
+        t_tick_max=timedelta(seconds=args.t_tick_max_seconds),
+        fetch_timeout=timedelta(seconds=args.fetch_timeout_seconds),
+    )
+    if problem is not None:
+        parser.error(problem)
 
     paths = TickPaths(state_dir=args.data_dir / "state")
     if args.list_quarantined:

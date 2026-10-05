@@ -25,12 +25,13 @@ from typing import Any
 
 from .conductor.gate_records import (
     ADVISORY_SELF_TRIAGE_INSTRUCTION,
-    MERGE_REQUEST_TIER_C_LINE,
+    MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     carries_advisory,
     decide_relay_route,
     prior_advisory_approvals,
+    render_ci_hold_marker,
     render_relay_heading,
 )
 from .conductor.handoff import HUMAN_TOKEN
@@ -473,8 +474,8 @@ class PrReviewOrchestrator:
                 tail.append(ADVISORY_SELF_TRIAGE_INSTRUCTION)
             tail.append(f"NEXT: {implementer}")
         elif outcome.verdict is ReviewEvent.APPROVE:
-            # Every APPROVE that stops at the human is a merge request (msg-4772 / msg-4774).
-            tail.append(f"{MERGE_REQUEST_TIER_C_LINE}\nNEXT: {HUMAN_TOKEN}")
+            # An APPROVE that stops at the human is a merge WAIT, not a Tier-C decision (msg-4361).
+            tail.append(f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}")
         else:
             tail.append(f"NEXT: {HUMAN_TOKEN}")
         body = (
@@ -482,6 +483,12 @@ class PrReviewOrchestrator:
             f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
             f"{outcome.body}\n\n" + "\n\n".join(tail)
         )
+        # T-pr-event-advances-thread R2: a CI-PENDING hold names its head in a ci-hold marker so
+        # 1b (pr_event_advance) can re-fire the gate once CI ends on that head, and so
+        # verdict_heads does not count this hold as a review (R11). Only PENDING: UNKNOWN (a
+        # token / permission fault) and FAILURE would reproduce the same answer if re-fired.
+        if outcome.ci_gated and outcome.ci_state is CiState.PENDING and outcome.head_sha:
+            body = f"{body}\n\n{render_ci_hold_marker(head=outcome.head_sha)}"
         try:
             result = await self._mcp.call_tool(
                 "chatroom_post_message",

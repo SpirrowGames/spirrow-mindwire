@@ -1,9 +1,13 @@
 """Tier-C admission gate — is a ``NEXT: human`` handoff eligible for the human?
 
 This is the label-based entry gate the Fermi/Bohr/Einstein design in
-T-tier-c-admission-gate converged on: only handoffs that name one of four
-Tier-C intents (goal / cost / irreversible / merge-protected) may reach the
-human. Every other label class is either bounced back to the author for
+T-tier-c-admission-gate converged on: only handoffs that name one of three
+Tier-C intents (goal / cost / irreversible) may reach the human.
+``merge-protected`` was the fourth until 2026-10-03: a merge into a protected
+branch is requested by opening the PR and is carried by the merge-wait PR
+list, so it is not a Tier-C escalation (Takahito, msg-4361); the label now
+bounces with :attr:`BounceReason.MERGE_IS_NOT_TIER_C`. Every other label class is
+either bounced back to the author for
 re-labelling, migrated forward (``scope`` → ``goal``, ``billing`` → ``cost``),
 or held for author choice (``release-cross-repo``).
 
@@ -36,8 +40,8 @@ admits (msg-3648 v1 §2's "書き直されていれば admit、書き直され�
 2 回目として admit" rule). Legacy label normalisation (``scope``/``billing``
 → ``goal``/``cost``) happens both in the RETRY prologue and in the main
 path (msg-3710 §1 0a). ``release-cross-repo`` is NEVER auto-rewritten —
-the author must choose between ``merge-protected`` (protected-branch
-deploy) and ``irreversible`` (public release) themselves.
+the author must decide whether it is ``irreversible`` (a public release) or
+not a Tier-C escalation at all (a merge, which the PR itself requests).
 
 Attribution
 -----------
@@ -101,10 +105,13 @@ class LogKind(StrEnum):
     append-only file with a ``kind`` field is one physical source of
     truth).
 
-    * ``DECIDED`` — implementer chose to fix an advisory in the same PR
-      (source: workspace LLM via conductor extraction).
-    * ``DEFERRED`` — implementer chose to skip an advisory (source:
-      workspace LLM via conductor extraction).
+    * ``DECIDED`` — a proposer or implementer recorded a discretionary
+      decision, such as fixing an advisory in the same PR or choosing an
+      approach (source: workspace LLM via conductor extraction; the
+      ``author_role`` field tells them apart, msg-5657).
+    * ``DEFERRED`` — a proposer or implementer chose to skip something,
+      typically an advisory (source: workspace LLM via conductor
+      extraction).
     * ``BOUNCED`` — admission gate rejected a handoff (source: infra;
       this module's :func:`decide_admission`).
     * ``LABEL_MIGRATION`` — legacy label auto-rewritten to the new enum
@@ -160,16 +167,27 @@ class BounceReason(StrEnum):
       calibration escape hatch is not an entry ticket (msg-3630 §2.2).
     * ``RELEASE_CROSS_REPO_NEEDS_AUTHOR_CHOICE`` — the label was
       ``release-cross-repo``. The gate refuses to guess whether this
-      is ``merge-protected`` or ``irreversible``; the author must
+      is ``irreversible`` or not Tier-C at all (a merge); the author must
       choose (msg-3646 D1, echoed in msg-3706 §1).
     * ``UNKNOWN_LABEL`` — the label parsed but did not match any known
       enum value.
+    * ``MERGE_IS_NOT_TIER_C`` — the label was ``merge-protected``. A merge
+      into a protected branch is requested by opening the PR and carried by
+      the merge-wait PR list, so it is not escalated (Takahito, msg-4361).
+    * ``JEV_LIKELY_NOT`` — the label was admitted, but the Tier-C Decider
+      (Jev, ``[decider.tierc] mode = "bounce"``) judged the turn
+      ``LIKELY_NOT`` a human decision. Never emitted by
+      :func:`decide_admission`; written by
+      :meth:`~spirrow_mindwire.conductor.tierc_gate.TierCGate.jev_bounce` so
+      the same RETRY store redeems it.
     """
 
     NO_LABEL = "no-label"
     OTHER_NOT_ADMITTED = "other-not-admitted"
     RELEASE_CROSS_REPO_NEEDS_AUTHOR_CHOICE = "release-cross-repo-needs-author-choice"
     UNKNOWN_LABEL = "unknown-label"
+    MERGE_IS_NOT_TIER_C = "merge-is-not-tier-c"
+    JEV_LIKELY_NOT = "jev-likely-not"
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +195,21 @@ class BounceReason(StrEnum):
 # ---------------------------------------------------------------------------
 
 
-#: The four Tier-C intents that constitute a valid admission label
-#: (msg-3630 §2.1). No other label reaches the human without a RETRY
-#: force-admit.
-ADMIT_LABELS: frozenset[str] = frozenset({"goal", "cost", "irreversible", "merge-protected"})
+#: The Tier-C intents that constitute a valid admission label (msg-3630 §2.1;
+#: ``merge-protected`` removed 2026-10-03, msg-4361). No other label reaches
+#: the human without a RETRY force-admit.
+ADMIT_LABELS: frozenset[str] = frozenset({"goal", "cost", "irreversible"})
+
+#: The former fourth label. Recognised so its bounce can say why (a merge is
+#: requested by the PR itself), instead of reading as an unknown label.
+MERGE_LABEL: str = "merge-protected"
+
+#: The hint delivered on a :attr:`BounceReason.MERGE_IS_NOT_TIER_C` bounce.
+MERGE_NOT_TIER_C_HINT: str = (
+    "a merge into a protected branch is already requested by the open PR and listed on the "
+    "merge-wait PR list; do not escalate it. Hand the PR to the gate (`NEXT: pr-review <ref>`) "
+    "or, if the gate already approved it, end without asking the human"
+)
 
 
 def require_admitted(label: str, *, where: str) -> str:
@@ -229,7 +258,8 @@ RELEASE_CROSS_REPO_LABEL: str = "release-cross-repo"
 #: Kept as a module constant so the tests can pin the wire text without
 #: reaching into private state.
 RELEASE_CROSS_REPO_HINT: str = (
-    "choose merge-protected (protected-branch deploy) or irreversible (public release)"
+    "choose irreversible (public release); a merge or a protected-branch deploy is requested by "
+    "its PR and is not a Tier-C escalation"
 )
 
 
@@ -601,6 +631,7 @@ def decide_admission(
     # msg-3710 §1 exactly:
     #
     #   1. no label                        → bounce(no-label)
+    #   1b. label == MERGE_LABEL           → bounce(merge-is-not-tier-c) (2026-10-03)
     #   2. label in ADMIT_LABELS           → admit
     #   3. label == UNSURE_LABEL           → admit, ADMIT_UNSURE
     #   4. label starts "other:"           → bounce(other-not-admitted)
@@ -616,7 +647,7 @@ def decide_admission(
             bounce_reason=BounceReason.NO_LABEL,
             bounce_hint=(
                 "attach a `TIER-C: <label>` line above `NEXT: human` "
-                "with one of: goal, cost, irreversible, merge-protected"
+                "with one of: goal, cost, irreversible"
             ),
             log_entries=[
                 _entry(
@@ -624,6 +655,24 @@ def decide_admission(
                     {
                         "reason": BounceReason.NO_LABEL.value,
                         "label": None,
+                        "retry_uuid": bounce_uuid,
+                    },
+                )
+            ],
+        )
+
+    if label == MERGE_LABEL:
+        return AdmissionDecision(
+            verdict=AdmissionVerdict.BOUNCE,
+            rule="R1-merge-not-tier-c",
+            bounce_reason=BounceReason.MERGE_IS_NOT_TIER_C,
+            bounce_hint=MERGE_NOT_TIER_C_HINT,
+            log_entries=[
+                _entry(
+                    LogKind.BOUNCED,
+                    {
+                        "reason": BounceReason.MERGE_IS_NOT_TIER_C.value,
+                        "label": label,
                         "retry_uuid": bounce_uuid,
                     },
                 )
@@ -657,8 +706,8 @@ def decide_admission(
             bounce_reason=BounceReason.OTHER_NOT_ADMITTED,
             bounce_hint=(
                 "`other:<reason>` is a calibration escape hatch, not an "
-                "admission ticket; pick one of goal / cost / irreversible / "
-                "merge-protected, or decide it yourself"
+                "admission ticket; pick one of goal / cost / irreversible, "
+                "or decide it yourself"
             ),
             log_entries=[
                 _entry(
@@ -714,8 +763,8 @@ def decide_admission(
         rule="R1-unknown-label",
         bounce_reason=BounceReason.UNKNOWN_LABEL,
         bounce_hint=(
-            "unknown Tier-C label; pick one of goal / cost / irreversible / "
-            "merge-protected (or `unsure:goal?` if genuinely unsure)"
+            "unknown Tier-C label; pick one of goal / cost / irreversible "
+            "(or `unsure:goal?` if genuinely unsure)"
         ),
         log_entries=[
             _entry(

@@ -58,6 +58,7 @@ Enumerated by grepping every `chatroom_post_message` and `chatroom_open_thread` 
 | `orchestrator`         | `PrReviewOrchestrator._open_thread` (thread `owner`, not a post `author`) | `_DEFAULT_OWNER = "orchestrator"` (line 30)                  |
 | `pr-gate-relay`        | `Conductor._post_pr_gate_relay` (`conductor/core.py`)                     | `_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"` (line 136)         |
 | `conductor-relay`      | `Conductor._post_as_conductor_relay` (`conductor/core.py`)                | `CONDUCTOR_RELAY_AUTHOR = "conductor-relay"` (module-level)  |
+| `pr-event-relay`       | `pr_event_advance.runner._post` (1b, T-pr-event-advances-thread)          | `PR_EVENT_RELAY_AUTHOR = "pr-event-relay"` (`pr_event_advance/decide.py`) |
 | `spirrowgames-ops`     | `NaysayerPrReviewDriver` — GitHub review submission, not a chatroom post  | `naysayer_github_token` docstring, `pr_review.py`            |
 
 `spirrowgames-ops` is a **GitHub identity**, not a magickit chatroom author, so it is out of scope
@@ -225,6 +226,21 @@ would fabricate exactly the evidence the invariant exists to make meaningful).
 terminal-overuse before its first post, so `residual` starts empty; the first `identity_findings`
 run after the landing will confirm that (or surface unexpected earlier writes, which would be a
 live-corpus finding not a spec change).
+
+### `pr-event-relay` — **machine**, `legitimate = ∅`
+
+**Primary source**: `src/spirrow_mindwire/pr_event_advance/decide.py::PR_EVENT_RELAY_AUTHOR`
+(T-pr-event-advances-thread, 1b; Bohr msg-5901 → msg-5912, Einstein msg-5911 go).
+
+1b writes one GitHub fact into a work thread whose tail is a PR-gate verdict relay: the PR was
+merged (with its merge sha), the PR was closed without being merged, or CI reached a terminal state
+on the head a CI-pending hold named, so the gate is re-fired once. The body restates GitHub state
+and nothing else, so no role spoke it: `kind = machine`, `legitimate = ∅`, and no
+`independence_class` in the yaml (registration derives it from kind). It is a separate author from
+`pr-gate-relay` for the same reason `conductor-relay` is: the gate-records readers narrow to
+`pr-gate-relay`, and a 1b post must never be read as a gate record. 1b's `NEXT: none` is a handoff
+token, not a `chatroom_close_thread` status change, so this identity needs no closeable role
+(msg-5906; R10 pins that the module never calls the close API).
 
 ## What this classification does NOT decide
 

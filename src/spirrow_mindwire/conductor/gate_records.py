@@ -39,6 +39,29 @@ the same reason. Author filtering is not authentication — the chatroom accepts
 (see ``_is_human``'s statement of the same trust model) — it is noise rejection, and the two
 facts it feeds only ever make the conductor do *less*: R6 suppresses a re-fire and R5 stops a
 re-dispatch. A forged marker cannot make the loop act, only make it stop and ask a human.
+
+The one exception: the ci-hold marker (T-pr-event-advances-thread R2 / R11)
+---------------------------------------------------------------------------
+
+1b (:mod:`spirrow_mindwire.pr_event_advance`) re-fires the gate ONCE when a CI-pending
+``COMMENT`` relay is the thread's tail and CI has since reached a terminal state on the same
+head. Two consequences live here:
+
+* :func:`render_ci_hold_marker` / :func:`ci_hold_head` are the writer and reader of the marker
+  that says "this relay is a CI-pending hold on head H". The writer is called by
+  ``orchestrator._post_design_relay`` ONLY when the L1 CI-gate short-circuited on ``PENDING``
+  (never ``UNKNOWN``, never ``FAILURE``: re-firing either would reproduce the same answer). It
+  adds no new record — it annotates a relay the conductor already posts (design §5.2A.5 shape).
+* :func:`verdict_heads` does NOT count a relay that carries the marker. A CI-pending hold is a
+  short-circuit in L1; no opinion on the diff was ever produced, so R6 (``ALREADY_REVIEWED``,
+  "do not buy a second opinion on the same diff") must not treat it as a verdict. Counting it
+  would make every 1b re-fire stop at R6 without waking the model.
+
+This is the one place the trust model above loosens: a forged ci-hold marker under the relay
+author can make the loop do *more*, not less — at most ONE extra gate firing on that head,
+because the real verdict the re-fire produces carries no marker and is counted by R6 from then
+on. The author restriction is unchanged, so the forger would already have to post as
+``pr-gate-relay``.
 """
 
 from __future__ import annotations
@@ -51,7 +74,6 @@ from enum import StrEnum
 from ..github.client import ReviewEvent
 from ..github.reviews import parse_verdict_footer
 from ..naysayer.pr_review import ObjectionParse, parse_objections
-from ..tier_c_admission_gate import require_admitted
 
 #: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
 #: admission posts) are written. Both readers below are restricted to messages authored under
@@ -140,6 +162,94 @@ def ci_route_heads(bodies: Iterable[str]) -> frozenset[str]:
     return frozenset(heads)
 
 
+#: The ci-hold marker (T-pr-event-advances-thread design §4 / R2). Same envelope shape as the
+#: ci-route marker so both are recognisable as mindwire records at a glance.
+_CI_HOLD_OPEN = "<!-- mindwire:ci-hold v1 "
+_CI_HOLD_CLOSE = " -->"
+_CI_HOLD_RE = re.compile(r"<!--\s*mindwire:ci-hold\s+v1\s+(\{.*?\})\s*-->", re.DOTALL)
+
+
+def render_ci_hold_marker(*, head: str) -> str:
+    """The marker a CI-pending ``COMMENT`` relay carries, naming the head CI was pending on.
+
+    Only ``head`` is written; the payload holds no free text, so there is nothing that could
+    close the comment early (contrast :func:`render_ci_route_marker`'s ``>`` escape).
+    """
+    payload = json.dumps({"head": normalize_sha(head)}, separators=(",", ":"), ensure_ascii=True)
+    return f"{_CI_HOLD_OPEN}{payload}{_CI_HOLD_CLOSE}"
+
+
+def ci_hold_head(body: str) -> str | None:
+    """The head named by the LAST well-formed ci-hold marker in ``body``, or ``None``.
+
+    Tolerant on read (the same rule as :func:`ci_route_heads`): a malformed marker contributes
+    nothing rather than raising. Callers must restrict ``body`` to :data:`RELAY_AUTHOR` messages
+    — a critique quoting this marker must not read as a hold.
+    """
+    found: str | None = None
+    for raw in _CI_HOLD_RE.findall(body):
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        head = payload.get("head")
+        if isinstance(head, str) and head.strip():
+            found = normalize_sha(head)
+    return found
+
+
+def render_admission_heading(pr_ref: str) -> str:
+    """The first line of both conductor admission posts (R3/R5 escalation and R4 ci-route).
+
+    One writer for the string, so the 1b reader (:mod:`spirrow_mindwire.pr_event_advance`) and
+    the two writers in ``conductor.core`` cannot drift apart silently — the #244 lesson that
+    :func:`render_relay_heading` documents (T-pr-event-advances-thread v0.6 R14). The
+    parenthetical is a fixed label, not a reason: the rule is on the ``ADMISSION:`` line below.
+    Nothing in this module reads this heading; R5 / R6 key only on markers and verdict headings.
+    """
+    return f"{_ADMISSION_HEADING_PREFIX}{pr_ref}"
+
+
+#: The fixed prefixes of the two headings above. One constant per heading, read by both the
+#: writer and the reader below, so a reworded heading cannot leave the reader matching nothing.
+_ADMISSION_HEADING_PREFIX = "PR-gate admission (pre-gate CI wait) — "
+_RELAY_HEADING_PREFIX = "PR-gate (Tier B independent naysayer) — "
+
+
+def _first_line(body: str) -> str:
+    stripped = body.strip()
+    return stripped.splitlines()[0].strip() if stripped else ""
+
+
+def admission_heading_pr_ref(body: str) -> str | None:
+    """The PR ref named on an admission post's heading (:func:`render_admission_heading`).
+
+    ``None`` when the first line is not that heading. Reads the first line only, for the same
+    reason :func:`verdict_heads` does: a critique quoting a heading must not read as one. The
+    returned ref is raw; the caller normalises it with ``parse_pr_ref``.
+    """
+    line = _first_line(body)
+    if not line.startswith(_ADMISSION_HEADING_PREFIX):
+        return None
+    ref = line[len(_ADMISSION_HEADING_PREFIX) :].strip()
+    return ref or None
+
+
+def relay_heading_pr_ref(body: str) -> str | None:
+    """The PR ref named on a verdict relay's heading (:func:`render_relay_heading`).
+
+    The optional `` @ <sha>`` suffix is dropped. ``None`` when the first line is not the relay
+    heading. First line only (see :func:`admission_heading_pr_ref`).
+    """
+    line = _first_line(body)
+    if not line.startswith(_RELAY_HEADING_PREFIX):
+        return None
+    ref = _RELAY_HEAD_RE.sub("", line[len(_RELAY_HEADING_PREFIX) :]).strip()
+    return ref or None
+
+
 def render_relay_heading(pr_ref: str, head: str | None) -> str:
     """The verdict relay's first line, naming the head when one is known.
 
@@ -149,14 +259,21 @@ def render_relay_heading(pr_ref: str, head: str | None) -> str:
     That is the correct outcome, not a gap to paper over: R6 must dedupe a re-review only when
     it can name the head the first verdict was about.
     """
-    heading = f"PR-gate (Tier B independent naysayer) — {pr_ref}"
+    heading = f"{_RELAY_HEADING_PREFIX}{pr_ref}"
     return f"{heading} @ {normalize_sha(head)}" if head else heading
 
 
 def verdict_heads(bodies: Iterable[str]) -> frozenset[str]:
-    """Every head named by a verdict relay heading in ``bodies`` — ``gate_admission``'s R6 input."""
+    """Every head named by a verdict relay heading in ``bodies`` — ``gate_admission``'s R6 input.
+
+    A relay carrying a ci-hold marker is skipped (T-pr-event-advances-thread R11): it is the L1
+    CI-gate's pending hold, not a review of the diff, so it must not make R6 refuse the one
+    re-fire 1b sends once CI ends. See the module docstring for the trust-model note.
+    """
     heads: set[str] = set()
     for body in bodies:
+        if ci_hold_head(body) is not None:
+            continue
         first_line = body.strip().splitlines()[0] if body.strip() else ""
         match = _RELAY_HEAD_RE.search(first_line)
         if match:
@@ -189,14 +306,31 @@ class RelayRoute(StrEnum):
     HUMAN = "human"
 
 
-#: The label an APPROVE → human relay carries on the line above its ``NEXT: human``: every such
-#: hand-off is a merge request, i.e. the ``merge-protected`` Tier-C type (msg-4772 / msg-4774).
-#: Resolved through :func:`~spirrow_mindwire.tier_c_admission_gate.require_admitted`, so if the
-#: gate ever renames or drops the label this module fails at import instead of the relay quietly
-#: emitting a label the gate no longer admits (PR #365 PR-gate advisory, msg-4850). The line and
-#: the implementer instruction below are both built from this one value.
-MERGE_REQUEST_TIER_C_LABEL = require_admitted("merge-protected", where="gate_records")
-MERGE_REQUEST_TIER_C_LINE = f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}"
+#: The line an APPROVE → human relay carries above its ``NEXT: human``. Such a hand-off is a merge
+#: WAIT, not a Tier-C decision: opening a PR whose merge is the human's already asked for the merge,
+#: and the merge-wait PR list carries it (Takahito, T-decider-tierc-v2-all-escalations msg-4361
+#: "main へのマージは判断点から外す ... PR 作成時点で既にエスカレーションになっている";
+#: restated 2026-10-03). U3' (msg-4772 / msg-4774) labelled it ``TIER-C: merge-protected``, which
+#: put every merge wait on the to-do board as a decision. ``NEXT: human`` stays so head_skip parks
+#: the thread and 1b (:mod:`~spirrow_mindwire.pr_event_advance`) resumes it on merge / close; the
+#: conductor stops with ``StopReason.MERGE_WAIT``, which neither notifies nor pushes a card, and
+#: :func:`~spirrow_mindwire.conductor.parked_lane.classify_parked` files it in the merge-wait
+#: lane. The line is column-zero and starts with :data:`MERGE_WAIT_MARK`, the one thing
+#: :func:`is_merge_wait_relay` reads.
+MERGE_WAIT_MARK = "MERGE-WAIT:"
+MERGE_WAIT_LINE = (
+    f"{MERGE_WAIT_MARK} この PR は merge 待ち一覧に載っています (Tier-C の判断依頼ではありません)。"
+    "merge か close を検知したら自動で再開します。"
+)
+
+
+def is_merge_wait_relay(body: str) -> bool:
+    """Does ``body`` carry the column-zero :data:`MERGE_WAIT_MARK` line a merge-wait relay writes?
+
+    Same trust model as the rest of this module: a forged line can only file a head in the
+    merge-wait lane, and the PR it names is on the merge-wait list anyway."""
+    return any(line.startswith(MERGE_WAIT_MARK) for line in body.splitlines())
+
 
 #: Appended (above the ``NEXT:`` line) ONLY on the first-advisory → implementer route, so the
 #: implementer knows on the spot what to do with an advisory-only APPROVE without its global
@@ -207,8 +341,9 @@ MERGE_REQUEST_TIER_C_LINE = f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}"
 ADVISORY_SELF_TRIAGE_INSTRUCTION = (
     "Advisory のみの APPROVE。human に「直すか」を聞かずに、自分で裁くこと: 安く直せるなら同じ "
     "PR で直して push する (再ゲートになる)。見送る advisory は `DECIDED: <どれを> — <理由>` を "
-    "1 行ずつ書く。見送りだけで終える場合は、最後に "
-    f"`{MERGE_REQUEST_TIER_C_LINE}` と `NEXT: human` を書いて merge を依頼する。"
+    "1 行ずつ書く。見送りだけで終える場合は、最後に `NEXT: pr-review <この PR>` を書いて gate に"
+    "戻す (head が同じなら前回の APPROVE が再掲され、merge 待ちになる)。merge は PR を出した時点で"
+    "依頼済みなので、`TIER-C:` 行や `NEXT: human` で merge を頼まないこと。"
 )
 
 #: Objection-parse statuses that mean "no advisory to triage". ``MISSING`` is here on purpose:
@@ -288,15 +423,21 @@ def decide_relay_route(
 
 __all__ = [
     "ADVISORY_SELF_TRIAGE_INSTRUCTION",
-    "MERGE_REQUEST_TIER_C_LABEL",
-    "MERGE_REQUEST_TIER_C_LINE",
+    "MERGE_WAIT_LINE",
+    "MERGE_WAIT_MARK",
     "RELAY_AUTHOR",
     "RelayRoute",
+    "admission_heading_pr_ref",
     "carries_advisory",
+    "ci_hold_head",
     "ci_route_heads",
     "decide_relay_route",
+    "is_merge_wait_relay",
     "normalize_sha",
     "prior_advisory_approvals",
+    "relay_heading_pr_ref",
+    "render_admission_heading",
+    "render_ci_hold_marker",
     "render_ci_route_marker",
     "render_relay_heading",
     "verdict_heads",

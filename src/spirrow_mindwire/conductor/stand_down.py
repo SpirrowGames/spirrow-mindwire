@@ -105,6 +105,13 @@ class StandDownReason(StrEnum):
     # The head names an identity whose embodiment has no adapter (ADR-2026-09-14-21 D-3, e.g.
     # Fermi = web_ai_chat).
     IDENTITY_NOT_SPAWNABLE = "identity_not_spawnable"
+    # The structured ``next_participant`` field and the body's ``NEXT:`` line disagree, so the
+    # conductor stopped on the field while head_skip (which reads only the body) keeps launching
+    # the head (T-role-body-field-divergence-relaunch D3 N1, Bohr msg-5855/5859). The values equal
+    # those of :class:`.handoff.MismatchReason`, and a test pins that, so the resolver's verdict and
+    # the event's reason are one vocabulary.
+    FIELD_BODY_DIVERGENCE = "target_divergence"
+    FIELD_UNRESOLVABLE = "field_unresolvable"
 
 
 class StandDownError(SystemExit):

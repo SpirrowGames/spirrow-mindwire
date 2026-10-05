@@ -24,8 +24,41 @@ before the write half can supply values to ``upsert_identity``:
      this check existed the script never read the store, so such a record went undetected
      (measured when PR-B started).
 
+  6. Per-identity registration cut (PR-C, msg-5676 §1/§4 + msg-5678 §2 + msg-5680 §2-§3).
+     For every author in the scanned corpus, plus every critical-path identity, the store
+     record (``get_identity``) supplies the cut: max(that identity's own ``created_at``,
+     the #153 deploy :data:`_PR153_DEPLOY_CUT`), per msg-6019 §1 (a). ``cut_basis`` names
+     the side of the max that won (``registration`` / ``pr153_deploy``). Posts
+     are split into before / after the cut, and each registered participant
+     (``independence_class != "machine"``) gets exactly one state:
+
+       * ``violated``  — at least one post after the cut has a null role
+       * ``evidenced`` — at least one post after the cut, none with a null role
+       * ``silent``    — no posts after the cut
+       * ``undetermined`` — the cut could not be computed (lookup failed, or a
+         ``created_at`` that does not parse). This is not one of the three design states. It
+         is the honest value when the measurement itself failed, and it fails start
+         condition 1 instead of passing it by omission.
+
+     Unregistered authors get no cut (``cut_reason: "unregistered"``) and no state.
+     Phase 2's rule never resolves an identity for them (msg-5678 §1).
+
+     ``phase2_start`` then evaluates the start condition literally:
+       1. no participant is ``violated`` (nor ``undetermined``);
+       2. every critical-path identity (:data:`_CRITICAL_PATH`, fixed in msg-5680 §2) is
+          ``evidenced``;
+       3. other participants may be ``silent``.
+
+     The cut is the store's value floored at #153's deploy, not a date picked per run
+     (msg-5674 §2, msg-6019 §1 (a)). So the
+     cut block reads EVERY scanned message and ignores ``--since-created-at`` /
+     ``--since-msg-id`` (those still scope sections 1-4). For ``human``, the post-cut
+     null posts are further split by whether the body carries the delegation record
+     (operator posting on Takahito's behalf, msg-5222 / msg-5692).
+
 The script is READ-ONLY. It never posts, never marks read, and never writes the identity
-store (``get_identity`` is its only store call). It is the "測る" half of msg-1491 §4's
+store (``get_identity`` is its only store call, made at most once per identity per run
+through :class:`_IdentityLookups`). It is the "測る" half of msg-1491 §4's
 read/write split. It can always run and does not depend on the readiness lock.
 
 Output shape (stdout JSON):
@@ -63,6 +96,26 @@ Output shape (stdout JSON):
         {"identity_name": "pr-gate-relay", "kind": "machine", "status": "found",
          "independence_class": "machine", "allowed_roles": [], "violations": []}
       ],
+      "identity_cut": [
+        {"identity_name": "human", "store_status": "found", "independence_class": "human",
+         "participant": true, "critical_path": true,
+         "created_at": "2026-05-29T23:44:46.084011",
+         "registered_at": "2026-05-29T14:44:46.084011Z", "cut": "2026-08-16T15:09:16Z",
+         "cut_basis": "pr153_deploy", "cut_reason": null,
+         "first_post_at": "...", "last_post_at": "...",
+         "pre_cut": {"posts": 0, "null_role": 0}, "post_cut": {"posts": 453, "null_role": 418},
+         "undated": {"posts": 0, "null_role": 0}, "state": "violated",
+         "last_post_cut_null_at": "2026-10-02T00:27:53Z",
+         "delegation": {"post_cut_null_role": 418, "delegated": 3, "not_delegated": 415,
+                        "post_cut_with_role_delegated": 0}}
+      ],
+      "phase2_start": {
+        "critical_path": ["naysayer-pr-review", "Bohr", "Einstein", "Heisenberg", "human"],
+        "condition_1_no_violated": {"pass": false, "violated": ["human"], "undetermined": []},
+        "condition_2_critical_path_evidenced": {"pass": false,
+          "not_evidenced": [{"identity_name": "human", "state": "violated"}]},
+        "pass": false
+      },
       "collisions": {"foo-bar": ["foo-bar", "Foo_Bar"]},
       "errors": [],
       "totals": {
@@ -111,11 +164,12 @@ import json
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.identity import (
+    MACHINE_INDEPENDENCE_CLASS,
     ClassificationError,
     IdentityCollisionError,
     LegitimateRolesFile,
@@ -138,6 +192,53 @@ from spirrow_mindwire.magickit.client import (
 # "履歴は null のまま残す" carry-forward.
 _DEFAULT_SINCE = "2026-08-17T00:00:00+00:00"
 _DEFAULT_PROJECTS = ("spirrow-mindwire", "spirrow-voxelworld")
+
+# The #153 floor for the per-identity cut (msg-6019 §1 (a)): an identity's cut is
+# max(its store `created_at`, this instant). msg-1179 §7 scopes the start condition to posts
+# made AFTER the #153 deploy. A registration-time cut only agrees with that for identities
+# registered after #153. Bohr, Einstein and Heisenberg were registered on 2026-05-29, so their
+# pre-#153 nulls (written before the conductor supplied any role) counted against them, and
+# condition 1 could never pass for Einstein or Heisenberg (msg-5819 §3 finding 1). The max
+# keeps the registration cut for identities registered later (naysayer-pr-review, 2026-09-30)
+# and floors everyone else at #153.
+#
+# Source: the committer time of 13618e9b773e4929d85cdcf09372c28ae0fe6828 ("feat: conductor
+# supplies role, per-verdict attestation, and thread ground truth (#153)"), the merge commit
+# msg-1179 §1 names as the daemon checkout: 2026-08-17T00:09:16+09:00. GitHub reports the
+# same instant as the PR's mergedAt (2026-08-16T15:09:16Z). The deploy instant itself (the
+# daemon restarting onto that checkout) is not recorded anywhere this repo can read, so this
+# is the merge time, as msg-6019 §1 (a) directs when the deploy time cannot be found. A real
+# deploy can only be later than the merge, so this floor can at most count a few post-merge,
+# pre-restart nulls against an identity. It cannot hide one.
+#
+# Deliberately NOT `_DEFAULT_SINCE` below. That value is the decision date
+# (2026-08-17T00:00Z), nine hours after the merge, and it only scopes sections 1-4.
+_PR153_DEPLOY_CUT = datetime(2026, 8, 16, 15, 9, 16, tzinfo=UTC)
+
+# Start condition 2's critical path, fixed in the design thread (msg-5678 §2, extended with
+# `human` in msg-5680 §2): the identities whose rejection would stop the loop. They carry the
+# Tier-B verdict, the proposer, the naysayer, the implementer, and the human's Tier-C decide
+# (carve-out ①). The list's source of truth is that thread; this tuple only lets the script
+# check it.
+_CRITICAL_PATH = ("naysayer-pr-review", "Bohr", "Einstein", "Heisenberg", "human")
+
+# Identities whose post-cut null posts are split by delegation (msg-5680 §2: "for `human`").
+_DELEGATION_BREAKDOWN_IDENTITIES = frozenset({"human"})
+
+# The delegation record an operator writes when posting under `human` on Takahito's behalf
+# (msg-5222 and msg-5692 both carry `**代行の記録**`). A post that only paraphrases delegation
+# without this record is NOT counted as delegated. The breakdown is evidence for the later
+# supply-path fix, and a loose match would blur exactly the split it exists to make.
+_DELEGATION_MARKERS = ("代行の記録",)
+
+# The identity store returns `created_at` WITHOUT an offset (e.g. "2026-09-30T16:52:37").
+# Checked against the thread, those values are JST. `naysayer-pr-review.updated_at`
+# 2026-10-01T14:25:03 is the live registration msg-5363 reports, posted at 05:26:49Z. Its
+# `created_at` 2026-09-30T16:52 falls inside the implementer turn that msg-4953 says timed
+# out at 17:06 JST. Read as UTC, neither value lands on any turn. Reading a JST value as UTC
+# would move every cut 9 hours LATE and silently file post-registration nulls as history.
+# So the offset is explicit and overridable, never assumed to be UTC.
+_DEFAULT_STORE_NAIVE_TZ = "+09:00"
 
 
 async def _list_threads(mcp: StreamableHttpChatroomMcp, project: str) -> list[dict[str, Any]]:
@@ -234,18 +335,257 @@ def _in_scope(msg: dict[str, Any], cutoff: datetime, since_msg_id: str | None) -
         this_id = str(msg.get("msg_id") or "")
         if this_id and this_id < since_msg_id:
             return False
+    parsed = _message_time(msg)
+    if parsed is None:
+        return True
+    return parsed >= cutoff
+
+
+def _message_time(msg: dict[str, Any]) -> datetime | None:
+    """The message's ``created_at`` (or live ``timestamp``) as an aware datetime, else None.
+
+    Chatroom timestamps carry a ``Z`` suffix. A naive one is read as UTC, as before.
+    """
     created_at = msg.get("created_at") or msg.get("timestamp")
     if not isinstance(created_at, str) or not created_at:
-        return True
+        return None
     try:
         # chatroom timestamps are ISO 8601 with a `Z` suffix; ``fromisoformat`` accepts
         # `+00:00` but not `Z` on Python <3.11, so normalise first.
         parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     except ValueError:
-        return True
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed >= cutoff
+    return parsed
+
+
+def _parse_tz_offset(offset: str) -> timezone:
+    """Parse ``+HH:MM`` / ``-HH:MM`` / ``Z`` into a :class:`timezone`. Raises ValueError."""
+    if not isinstance(offset, str) or not offset:
+        raise ValueError(f"offset must be a non-empty str, got {offset!r}")
+    probe = datetime.fromisoformat("2000-01-01T00:00:00" + offset.replace("Z", "+00:00"))
+    delta = probe.utcoffset()
+    if delta is None:
+        raise ValueError(f"not a UTC offset: {offset!r}")
+    return timezone(delta)
+
+
+def _parse_store_time(raw: Any, naive_tz: timezone) -> datetime | None:
+    """Parse a store ``created_at``. A naive value is read in ``naive_tz``. Junk gives None."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=naive_tz)
+    return parsed
+
+
+def _iso_z(when: datetime | None) -> str | None:
+    if when is None:
+        return None
+    return when.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _is_delegated(msg: dict[str, Any]) -> bool:
+    body = msg.get("content")
+    if not isinstance(body, str):
+        body = msg.get("body")
+    return isinstance(body, str) and any(marker in body for marker in _DELEGATION_MARKERS)
+
+
+# One observed post, as the cut block needs it: (time or None, role or None, delegated).
+_Post = tuple[datetime | None, str | None, bool]
+
+
+def _counts(group: list[_Post]) -> dict[str, int]:
+    return {"posts": len(group), "null_role": sum(1 for _, r, _ in group if r is None)}
+
+
+def _cut_row(
+    name: str,
+    lookup: dict[str, Any] | None,
+    posts: list[_Post],
+    naive_tz: timezone,
+) -> dict[str, Any]:
+    """Fold one author's posts and store record into a PR-C cut row.
+
+    ``lookup`` is the raw ``get_identity`` response, or None when the call itself failed.
+    """
+    status = "lookup_failed" if lookup is None else str(lookup.get("status") or "unknown")
+    record = lookup.get("identity") if lookup is not None else None
+    dated = sorted(t for t, _, _ in posts if t is not None)
+    row: dict[str, Any] = {
+        "identity_name": name,
+        "store_status": status,
+        "independence_class": None,
+        "participant": None,
+        "critical_path": name in _CRITICAL_PATH,
+        "created_at": None,
+        "registered_at": None,
+        "cut": None,
+        "cut_basis": None,
+        "cut_reason": None,
+        "first_post_at": _iso_z(dated[0]) if dated else None,
+        "last_post_at": _iso_z(dated[-1]) if dated else None,
+    }
+
+    cut: datetime | None = None
+    if status == "found" and isinstance(record, dict):
+        ic = record.get("independence_class")
+        row["independence_class"] = ic
+        # The Phase 2 rule verbatim (msg-5678 §1): participant iff class != "machine".
+        row["participant"] = ic != MACHINE_INDEPENDENCE_CLASS
+        row["created_at"] = record.get("created_at")
+        registered = _parse_store_time(record.get("created_at"), naive_tz)
+        if registered is None:
+            # Unchanged: no usable registration time is a failed measurement. The #153 floor
+            # is NOT substituted for it, because that would turn a broken record into a cut
+            # that looks computed.
+            row["cut_reason"] = "created_at_unparseable"
+        else:
+            row["registered_at"] = _iso_z(registered)
+            # msg-6019 §1 (a): cut = max(store created_at, #153 deploy).
+            if registered >= _PR153_DEPLOY_CUT:
+                cut, row["cut_basis"] = registered, "registration"
+            else:
+                cut, row["cut_basis"] = _PR153_DEPLOY_CUT, "pr153_deploy"
+    elif status == "not_found":
+        row["cut_reason"] = "unregistered"
+    else:
+        row["cut_reason"] = f"store_status:{status}"
+    row["cut"] = _iso_z(cut)
+
+    if cut is None:
+        row["all_posts"] = _counts(posts)
+        # Unregistered: Phase 2 never resolves an identity, so there is no state. Anything
+        # else means the measurement failed (we cannot tell whether this is a participant,
+        # or a participant has no usable cut), and that must not read as "not violated".
+        row["state"] = None if row["cut_reason"] == "unregistered" else "undetermined"
+        return row
+
+    pre = [p for p in posts if p[0] is not None and p[0] < cut]
+    post = [p for p in posts if p[0] is not None and p[0] >= cut]
+    undated = [p for p in posts if p[0] is None]
+    row["pre_cut"] = _counts(pre)
+    row["post_cut"] = _counts(post)
+    # An undated post cannot be shown to predate registration, so its null counts against
+    # the identity (fail-closed). It cannot count as evidence either.
+    row["undated"] = _counts(undated)
+    # Diagnostic only, never an input to `state`: when did a post-cut null last happen?
+    # An identity registered long before its role supply was fixed is "violated" by old
+    # posts, and this field is how a reader tells that apart from a live supply break.
+    post_nulls = sorted(t for t, r, _ in post if r is None and t is not None)
+    row["last_post_cut_null_at"] = _iso_z(post_nulls[-1]) if post_nulls else None
+
+    if not row["participant"]:
+        row["state"] = None
+    elif row["post_cut"]["null_role"] or row["undated"]["null_role"]:
+        row["state"] = "violated"
+    elif row["post_cut"]["posts"]:
+        row["state"] = "evidenced"
+    else:
+        row["state"] = "silent"
+
+    if name in _DELEGATION_BREAKDOWN_IDENTITIES:
+        post_null = [p for p in post if p[1] is None]
+        delegated = sum(1 for p in post_null if p[2])
+        row["delegation"] = {
+            "post_cut_null_role": len(post_null),
+            "delegated": delegated,
+            "not_delegated": len(post_null) - delegated,
+            "post_cut_with_role_delegated": sum(1 for p in post if p[1] is not None and p[2]),
+        }
+    return row
+
+
+def _phase2_start(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Evaluate the Phase 2 start condition (msg-5678 §2 as revised by msg-5680 §2).
+
+    ``rows`` must hold a row for every critical-path identity. :func:`_identity_cut`
+    guarantees that (it iterates ``authors | _CRITICAL_PATH`` and emits an
+    ``undetermined`` row when a lookup fails), so a missing row is a caller bug,
+    not a measurement outcome: raise :class:`ValueError` rather than invent a state.
+    """
+    by_name = {r["identity_name"]: r for r in rows}
+    missing = [name for name in _CRITICAL_PATH if name not in by_name]
+    if missing:
+        raise ValueError(f"no cut row for critical-path identities: {missing}")
+    violated = sorted(r["identity_name"] for r in rows if r["state"] == "violated")
+    undetermined = sorted(r["identity_name"] for r in rows if r["state"] == "undetermined")
+    not_evidenced = [
+        {"identity_name": name, "state": by_name[name]["state"]}
+        for name in _CRITICAL_PATH
+        if by_name[name]["state"] != "evidenced"
+    ]
+    cond1 = not violated and not undetermined
+    cond2 = not not_evidenced
+    return {
+        "critical_path": list(_CRITICAL_PATH),
+        "condition_1_no_violated": {
+            "pass": cond1,
+            "violated": violated,
+            "undetermined": undetermined,
+        },
+        "condition_2_critical_path_evidenced": {"pass": cond2, "not_evidenced": not_evidenced},
+        "pass": cond1 and cond2,
+    }
+
+
+class _IdentityLookups:
+    """One ``get_identity`` call per identity name per run, shared by every store reader.
+
+    :func:`_check_store` and :func:`_identity_cut` need the same records. They used to fetch
+    them independently (the msg-5831 advisory). Both now read through this cache.
+
+    A FAILED call is cached as the failure. It is not dropped and not converted: :meth:`get`
+    re-raises the same :class:`MagickitMcpError` to every reader without calling the store
+    again. So each reader keeps its own failure behaviour exactly as before (msg-6019
+    §1 (c)). ``_check_store`` records an error and a ``lookup_failed`` row, and
+    ``_identity_cut`` records an error and an ``undetermined`` row. A cached failure can
+    never surface as a ``not_found`` ("unregistered") response, because the cache only holds
+    what the call actually returned or raised.
+    """
+
+    def __init__(self, mcp: McpToolCaller) -> None:
+        self._mcp = mcp
+        self._results: dict[str, Any] = {}
+        self._failures: dict[str, MagickitMcpError] = {}
+
+    async def get(self, name: str) -> Any:
+        """The raw ``get_identity`` response for ``name``. Raises the cached failure."""
+        if name in self._failures:
+            raise self._failures[name]
+        if name not in self._results:
+            try:
+                self._results[name] = await self._mcp.call_tool(
+                    "get_identity", {"identity_name": name}
+                )
+            except MagickitMcpError as exc:
+                self._failures[name] = exc
+                raise
+        return self._results[name]
+
+
+async def _identity_cut(
+    lookups: _IdentityLookups, author_posts: dict[str, list[_Post]], naive_tz: timezone
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Look every corpus author (plus the critical path) up in the store and build cut rows."""
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for name in sorted(set(author_posts) | set(_CRITICAL_PATH)):
+        lookup: dict[str, Any] | None
+        try:
+            got: Any = await lookups.get(name)
+            lookup = got if isinstance(got, dict) else {"status": "malformed_response"}
+        except MagickitMcpError as exc:
+            errors.append({"identity_name": name, "reason": f"get_identity failed: {exc}"})
+            lookup = None
+        rows.append(_cut_row(name, lookup, author_posts.get(name, []), naive_tz))
+    return rows, errors
 
 
 def _summarise(
@@ -316,7 +656,7 @@ def _summarise(
 
 
 async def _check_store(
-    mcp: McpToolCaller, classification: LegitimateRolesFile
+    lookups: _IdentityLookups, classification: LegitimateRolesFile
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Read each classified identity's store record and run the write-path guard on it.
 
@@ -327,7 +667,7 @@ async def _check_store(
     errors: list[dict[str, str]] = []
     for entry in classification.entries:
         try:
-            got: Any = await mcp.call_tool("get_identity", {"identity_name": entry.name})
+            got: Any = await lookups.get(entry.name)
         except MagickitMcpError as exc:
             errors.append({"identity_name": entry.name, "reason": f"get_identity failed: {exc}"})
             rows.append(
@@ -351,6 +691,7 @@ async def _measure(
     url: str | None,
     classification: LegitimateRolesFile,
     classification_path: Path,
+    store_naive_tz: str = _DEFAULT_STORE_NAIVE_TZ,
 ) -> dict[str, Any]:
     """Measure the corpus and emit the findings JSON.
 
@@ -364,9 +705,15 @@ async def _measure(
     artifact name the default tree path even on a ``--classification`` override run,
     i.e. the JSON would misreport the input its own numbers came from and the finding
     would not be reproducible from what it claims to have read.
+
+    ``store_naive_tz`` is the offset a naive store ``created_at`` is read in (see
+    :data:`_DEFAULT_STORE_NAIVE_TZ`). ``main()`` validates it before any network I/O.
     """
+    naive_tz = _parse_tz_offset(store_naive_tz)
     mcp = StreamableHttpChatroomMcp(url)
     author_role_counts: dict[str, dict[str | None, int]] = defaultdict(lambda: defaultdict(int))
+    # Every scanned post per author, regardless of --since-*: the cut block's own scope.
+    author_posts: dict[str, list[_Post]] = defaultdict(list)
     threads_scanned = 0
     messages_scanned = 0
     messages_in_scope = 0
@@ -392,18 +739,30 @@ async def _measure(
                 continue
             for message in messages:
                 messages_scanned += 1
+                author = message.get("author")
+                has_author = isinstance(author, str) and bool(author.strip())
+                role_raw = message.get("role")
+                role_key: str | None = role_raw if isinstance(role_raw, str) and role_raw else None
+                if has_author:
+                    assert isinstance(author, str)
+                    author_posts[author].append(
+                        (_message_time(message), role_key, _is_delegated(message))
+                    )
                 if not _in_scope(message, since_cutoff, since_msg_id):
                     continue
                 messages_in_scope += 1
-                author = message.get("author")
-                if not isinstance(author, str) or not author.strip():
+                if not has_author:
                     continue
-                role_raw = message.get("role")
-                role_key: str | None = role_raw if isinstance(role_raw, str) and role_raw else None
+                assert isinstance(author, str)
                 author_role_counts[author][role_key] += 1
 
-    store_rows, store_errors = await _check_store(mcp, classification)
+    # One shared cache, so an identity both readers need is fetched once (msg-6019 §1 (c)).
+    lookups = _IdentityLookups(mcp)
+    store_rows, store_errors = await _check_store(lookups, classification)
     errors.extend(store_errors)
+    cut_rows, cut_errors = await _identity_cut(lookups, dict(author_posts), naive_tz)
+    errors.extend(cut_errors)
+    phase2 = _phase2_start(cut_rows)
 
     plain_counts = {a: dict(rc) for a, rc in author_role_counts.items()}
     entries, unclassified, residual_count, unused_count = _summarise(plain_counts, classification)
@@ -415,10 +774,14 @@ async def _measure(
             "since_created_at": since_iso,
             "since_msg_id": since_msg_id,
             "classification_path": str(classification_path),
+            "store_naive_tz": store_naive_tz,
+            "cut_scope": "all scanned messages (ignores --since-created-at / --since-msg-id)",
         },
         "authors": entries,
         "unclassified_authors": unclassified,
         "store": store_rows,
+        "identity_cut": cut_rows,
+        "phase2_start": phase2,
         "collisions": collisions,
         "errors": errors,
         "totals": {
@@ -438,6 +801,7 @@ async def _measure(
             "collision_groups": len(collisions),
             "store_unregistered": sum(1 for r in store_rows if r["status"] != "found"),
             "store_violations": sum(1 for r in store_rows if r["violations"]),
+            "phase2_start_pass": phase2["pass"],
         },
     }
 
@@ -479,6 +843,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--store-naive-tz",
+        default=_DEFAULT_STORE_NAIVE_TZ,
+        help=(
+            "UTC offset a naive identity-store created_at is read in, for the per-identity "
+            f"cut. Default: {_DEFAULT_STORE_NAIVE_TZ} (measured; see _DEFAULT_STORE_NAIVE_TZ)."
+        ),
+    )
+    parser.add_argument(
         "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
     )
     args = parser.parse_args()
@@ -505,6 +877,16 @@ def main() -> int:
         )
         return 2
 
+    try:
+        _parse_tz_offset(args.store_naive_tz)
+    except ValueError as exc:
+        print(
+            f"identity_findings: --store-naive-tz is not a UTC offset: "
+            f"{args.store_naive_tz!r} ({exc})",
+            file=sys.stderr,
+        )
+        return 2
+
     projects = tuple(args.project) if args.project else _DEFAULT_PROJECTS
     try:
         result = asyncio.run(
@@ -516,6 +898,7 @@ def main() -> int:
                 url=args.url,
                 classification=classification,
                 classification_path=classification_path,
+                store_naive_tz=args.store_naive_tz,
             )
         )
     except Exception as exc:

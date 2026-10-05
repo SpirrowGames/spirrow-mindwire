@@ -83,7 +83,15 @@ msg-954 §3). ``source:`` re-states configuration and is a pure tautology.
 :class:`~spirrow_mindwire.value_objects.AttestationRecord` reports a
 server-side *observation* and can be absent or wrong:
 
-    <!-- attest: tier=<t> · backend=<b> · expected=<e> · route=<r> · probe=<p> · at=<iso> -->
+    <!-- attest: tier=<t> · backend=<b> · expected=<e> · route=<r> · probe=<p>
+         · scope=<s> · at=<iso> -->
+
+(one line in a post; wrapped here only for width).
+
+``scope`` says what the ``probe`` rows are rows of: ``turn`` (the verdict's own
+requests, joined by a per-turn trace id) or ``probe`` (a separate preflight
+request before the turn). Stamps written before the field existed omit it and
+read back as ``probe``.
 
 Merging the two would dilute exactly the property that makes ``source:``
 trustworthy — that it promises nothing. Keep them on separate lines with
@@ -98,7 +106,7 @@ from typing import Any
 
 from .route_authority import ROUTE_REDACTED as _ROUTE_REDACTED
 from .route_authority import route_authority as _route_authority
-from .value_objects import AttestationRecord
+from .value_objects import AttestationRecord, AttestationScope
 
 # Marker form is stable and machine-readable. HTML comment wrap so the line
 # renders invisibly in markdown viewers while remaining greppable in the raw
@@ -133,7 +141,15 @@ _FIELD_SEP = " · "
 # makes ``test_parse_round_trips_a_rendered_marker`` the drift guard: add a field
 # to the renderer without adding it here and the round-trip reds immediately,
 # rather than every live stamp silently becoming unparseable.
-_ATTESTATION_FIELDS = ("tier", "backend", "expected", "route", "probe", "at")
+#
+# Exactly two key sets are accepted (T-per-turn-backend-attestation §3): the
+# current seven-field form, and the six-field form every post stamped before
+# ``scope`` existed carries. Those older stamps were all probe-scope in fact, so
+# the parser reads them as ``scope=probe`` — the default states what they
+# evidenced, it does not upgrade them. Anything else is still ``None``.
+_ATTESTATION_FIELDS = ("tier", "backend", "expected", "route", "probe", "scope", "at")
+_LEGACY_ATTESTATION_FIELDS = ("tier", "backend", "expected", "route", "probe", "at")
+_LEGACY_SCOPE: AttestationScope = "probe"
 _AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -263,6 +279,7 @@ def render_attestation_marker(record: AttestationRecord) -> str:
         f"expected={record.expected}",
         f"route={record.route}",
         f"probe={record.probe}",
+        f"scope={record.scope}",
         f"at={record.at.astimezone(UTC).strftime(_AT_FORMAT)}",
     )
     return f"{ATTESTATION_MARKER_PREFIX} {_FIELD_SEP.join(parts)} {ATTESTATION_MARKER_SUFFIX}"
@@ -286,7 +303,10 @@ def parse_attestation_marker(body: str) -> AttestationRecord | None:
     Strict about form, deliberately. Every field the renderer emits must be
     present, non-empty, and parseable, or the answer is ``None`` — a lenient
     parser would accept lines the renderer could never have produced, which is
-    the fail-open half of a gate.
+    the fail-open half of a gate. The one tolerance is the six-field form the
+    renderer produced before ``scope`` existed: it is read as ``scope=probe``,
+    which is what those stamps evidenced. A seven-field line whose ``scope`` is
+    neither ``turn`` nor ``probe`` is ``None``.
 
     **Not authentication.** A chatroom body is a text field: a hand-written line
     in this shape parses exactly like a harness stamp. Callers must treat a
@@ -316,7 +336,20 @@ def parse_attestation_marker(body: str) -> AttestationRecord | None:
         if not sep:
             return None
         fields[key.strip()] = value.strip()
-    if set(fields) != set(_ATTESTATION_FIELDS) or not all(fields.values()):
+    if not all(fields.values()):
+        return None
+    scope: AttestationScope
+    if set(fields) == set(_ATTESTATION_FIELDS):
+        raw_scope = fields["scope"]
+        if raw_scope == "turn":
+            scope = "turn"
+        elif raw_scope == "probe":
+            scope = "probe"
+        else:
+            return None
+    elif set(fields) == set(_LEGACY_ATTESTATION_FIELDS):
+        scope = _LEGACY_SCOPE
+    else:
         return None
     try:
         at = datetime.strptime(fields["at"], _AT_FORMAT).replace(tzinfo=UTC)
@@ -328,6 +361,7 @@ def parse_attestation_marker(body: str) -> AttestationRecord | None:
         expected=fields["expected"],
         route=fields["route"],
         probe=fields["probe"],
+        scope=scope,
         at=at,
     )
 

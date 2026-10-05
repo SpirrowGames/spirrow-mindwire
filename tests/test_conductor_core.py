@@ -23,6 +23,7 @@ from spirrow_mindwire.conductor.core import (
     StopReason,
 )
 from spirrow_mindwire.conductor.gate_records import (
+    MERGE_WAIT_LINE,
     RelayRoute,
     ci_route_heads,
     decide_relay_route,
@@ -95,6 +96,7 @@ def _attested(body: str, *, backend: str = "gemini", expected: str = "gemini") -
             expected=expected,
             route="{{IP_SERVICES}}:8110",
             probe="cost-row#6032",
+            scope="turn",
             at=_TS,
         ),
     )
@@ -314,11 +316,15 @@ class _ScriptedPrGate:
             verdict, parse_objections(outcome.body).status, 0, implementer
         )
         nxt = implementer if route is RelayRoute.IMPLEMENTER and implementer else "human"
+        # As production: an APPROVE that stops at the human is a merge wait (msg-4361).
+        merge_wait = (
+            f"{MERGE_WAIT_LINE}\n" if verdict is ReviewEvent.APPROVE and nxt == "human" else ""
+        )
         content = (
             f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
             f"VERDICT: {verdict.value} (ci={outcome.ci_state.value})\n\n"
             f"{outcome.body}\n\n"
-            f"NEXT: {nxt}"
+            f"{merge_wait}NEXT: {nxt}"
         )
         relay: dict[str, Any] = {
             "msg_id": "",
@@ -1698,16 +1704,18 @@ async def test_control_state_is_reread_every_round() -> None:
 
 
 @pytest.mark.anyio
-async def test_pr_gate_approve_stops_at_human() -> None:
-    # NEXT: pr-review <ref> fires the gate; APPROVE → stop at the human (Tier-C merge). The verdict
-    # relay is posted under the reserved author, and the implementer is NOT dispatched.
+async def test_pr_gate_approve_stops_as_merge_wait() -> None:
+    # NEXT: pr-review <ref> fires the gate; APPROVE → the thread parks as a merge WAIT (msg-4361:
+    # the open PR already asks for the merge, so it is not a Tier-C stop and the sweep neither
+    # notifies nor pushes a decision card). The verdict relay is posted under the reserved
+    # author, and the implementer is NOT dispatched.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
     gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
     assert disp.dispatches == []  # no implementer dispatch on APPROVE
     assert mcp.posts[-1]["author"] == "pr-gate-relay"  # the verdict relay
     assert "VERDICT: APPROVE" in mcp.posts[-1]["content"]
@@ -1756,7 +1764,7 @@ async def test_pr_gate_head_unchanged_approve_stops_at_human_without_dispatch() 
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
     assert disp.dispatches == []
 
 
@@ -1775,7 +1783,7 @@ async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -
     assert gate.fired == ["acme/widgets#7", "acme/widgets#7"]
     assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
     assert outcome.forced_naysayer_turns == 0  # the PR-gate IS the naysayer; none forced
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
     # the implementer is woken on the RC relay (verdict + critique), not its own pr-review trigger
     assert "VERDICT: REQUEST_CHANGES" in disp.events[0].payload.body
     assert "critique body" in disp.events[0].payload.body
@@ -1909,7 +1917,7 @@ async def test_pr_gate_normalizes_url_ref_to_slug_before_firing() -> None:
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]  # normalized from the URL
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
 
 
 def test_ctor_rejects_bad_args() -> None:
@@ -2454,7 +2462,7 @@ async def test_admission_invokes_on_green_ci_and_the_relay_names_the_head() -> N
     source = _ScriptedRollupSource(_rollup(*_GREEN))
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
     relay = mcp.posts[-1]["content"]
     # _pr_outcome pins head_sha="abc123"; the head the GATE read is recorded, not the one
     # admission observed a moment earlier, so a push landing between the two is attributed to
@@ -2578,7 +2586,7 @@ async def test_a_human_authored_handoff_overrides_admission() -> None:
     source = _ScriptedRollupSource(_rollup(*_PENDING))  # would DEFER under self-nomination
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
 
 
 @pytest.mark.anyio
@@ -2595,7 +2603,7 @@ async def test_an_unread_rollup_keeps_the_pre_wiring_behaviour() -> None:
         mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(None)
     ).run()
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
 
 
 @pytest.mark.anyio
@@ -2608,7 +2616,7 @@ async def test_no_rollup_source_is_byte_for_byte_the_pre_wiring_path() -> None:
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()  # rollup_source=None
     assert gate.fired == ["acme/widgets#7"]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
 
 
 @pytest.mark.anyio
@@ -2660,3 +2668,72 @@ async def test_admission_reads_heads_only_off_relay_authored_messages() -> None:
     # R4, not R5: the quoted marker was ignored, so this still counts as the FIRST red.
     assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
     assert outcome.stop_reason is StopReason.NO_PROGRESS
+
+
+# --------------------------------------------------------------------------- #
+# T-pr-event-advances-thread R12: 1b's re-fire goes through R1-R7, and R6 lets it through.
+#
+# The tail before 1b writes is a CI-pending COMMENT relay carrying a ci-hold marker on _HEAD;
+# 1b (author ``pr-event-relay``, not the human) then writes ``NEXT: pr-review <ref>``. Because
+# the author is not the human, admission runs the R1-R7 table (no R0-OVERRIDE). Without R11 the
+# hold's heading would put _HEAD into verdict_heads and R6 would answer ALREADY_REVIEWED.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_hold_then_refire(mcp: _FakeChatroomMcp) -> None:
+    from spirrow_mindwire.conductor.gate_records import render_ci_hold_marker
+
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    mcp.seed(
+        author="pr-gate-relay",
+        content=(
+            f"{render_relay_heading('acme/widgets#7', _HEAD)}\n\n"
+            "VERDICT: comment (ci=pending)\n\nCI is still running\n\nNEXT: human\n\n"
+            f"{render_ci_hold_marker(head=_HEAD)}"
+        ),
+    )
+    mcp.seed(
+        author="pr-event-relay",
+        content=(
+            "PR event (1b, pr-event-relay) — acme/widgets#7\n\nCI ended\n\n"
+            "NEXT: pr-review acme/widgets#7"
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_invokes_the_gate_on_green() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == ["acme/widgets#7"]  # INVOKE, not R6 ALREADY_REVIEWED
+    assert outcome.stop_reason is StopReason.MERGE_WAIT
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_routes_the_implementer_on_red() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]  # R4
+    assert ci_route_heads([mcp.posts[-1]["content"]]) == frozenset({_HEAD})
+
+
+@pytest.mark.anyio
+async def test_r12_refire_after_a_ci_hold_defers_when_ci_is_pending_again() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_hold_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_PENDING))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert mcp.posts == []  # R2 DEFER writes nothing; the tail still says pr-review
+    assert outcome.stop_reason is StopReason.CI_WAIT

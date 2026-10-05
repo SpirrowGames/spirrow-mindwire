@@ -62,9 +62,13 @@ identities:
     legitimate: []
     primary_source: "src/spirrow_mindwire/orchestrator.py::_DEFAULT_OWNER"
     reason: >-
-      Used only as the thread-metadata `owner` on chatroom_open_thread calls, never as an
-      `author` on any chatroom_post_message. No LLM speaks under this name; it is a label
-      for who opened the ledger, not who authored anything.
+      Passed as the `owner` on the PR-review ledger's chatroom_open_thread call
+      (PrReviewOrchestrator._open_thread). The thread's opening message, the fixed
+      "naysayer review request" text in fire_pr_review, is recorded with this name as its
+      author. So it IS a post author: 675 posts in the live corpus (msg-5819 §3, corrected
+      in msg-6019 §1 (b)). It never calls chatroom_post_message itself, and no LLM speaks
+      under this name. Every post under it is template text written by the harness, so it
+      carries no role because it is a machine. A participant's role is never omitted here.
 
   - name: pr-gate-relay
     kind: machine
@@ -97,3 +101,33 @@ identities:
       author). msg-2540 §1-4 pins the loader constraint (kind=machine + legitimate=[]);
       giving this identity a role would violate the I-6 invariant the pr-gate-relay entry
       already documents.
+
+  - name: pr-event-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/pr_event_advance/decide.py::PR_EVENT_RELAY_AUTHOR"
+    reason: >-
+      T-pr-event-advances-thread (1b, Bohr msg-5901..msg-5912, Einstein msg-5911 go). Writes one
+      GitHub fact into a work thread whose tail is a PR-gate relay: the PR was merged (sha), the
+      PR was closed without merging, or CI ended on a CI-pending hold so the gate is re-fired
+      once. The body restates GitHub state; no role spoke it, so `legitimate = []` (I-6, the
+      loader's kind=machine invariant) and `independence_class` is not written (derived from
+      kind by registration). Distinct from `pr-gate-relay` so the gate-records readers
+      (verdict_heads / ci_route_heads / prior_advisory_approvals), which narrow to that author,
+      never read a 1b post as a gate record. 1b never calls chatroom_close_thread: its
+      `NEXT: none` is a handoff token, not a status close (msg-5906, R10).
+
+  - name: park-wake-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/park_wake/decide.py::PARK_WAKE_RELAY_AUTHOR"
+    reason: >-
+      T-next-line-carries-who-not-why Slice 3 (D-7, Bohr msg-2142 / msg-4716 §2 / msg-5175 §3).
+      When a thread parked with `STOP: blocked-on <trigger> wake:<persona>` above `NEXT: none`
+      has its trigger fire (a thread resolved, a PR merged or closed, a deploy request ended, a
+      project's queue emptied), the park-wake tick posts one message restating that fact and
+      ending in `NEXT: <persona>` — the handoff the park deferred. The body restates a sweep
+      observation; no role spoke it, so `legitimate = []` (I-6, the loader's kind=machine
+      invariant). A distinct author from `pr-event-relay` / `conductor-relay` so no reader that
+      narrows to those authors reads a wake as one of their records. The conductor routes the
+      wake like any handoff, guard (i) included, so a park cannot launder a gated handoff.

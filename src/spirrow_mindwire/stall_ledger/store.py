@@ -28,7 +28,9 @@ case this module refuses to write:
 
 Preservation (msg-4687 §3-1): every record is kept as the dict it was read. D-16ab
 changes only ``klass`` / ``class_history`` on a record that stays open; it adds new
-records and removes closed ones. Unknown record keys and unknown top-level keys survive
+records and removes closed ones. D-16c adds one more change, :meth:`LoadedStore.settle_marker`:
+``flags`` and ``evidence.marker_pending`` / ``evidence.marker_reason`` when an owed marker
+fetch settles (msg-5746 §2). Unknown record keys and unknown top-level keys survive
 untouched, and so do ``remedy_attempts`` and ``ladder_stage``.
 
 Writes are temp file + ``os.replace`` (atomic rename). The single-writer rule (msg-4703
@@ -210,8 +212,13 @@ def new_record_json(
     klass: str,
     flags: list[str],
     motion_at_open: datetime,
+    evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The JSON of a record D-16ab opens (msg-4685 §4-2)."""
+    """The JSON of a record D-16ab opens (msg-4685 §4-2).
+
+    ``evidence`` adds keys next to ``motion_at_open`` (D-16c: ``marker_reason``,
+    ``marker_pending``; msg-5746 §2 A2').
+    """
     return {
         "unit": {"kind": unit.kind.value, "identifier": unit.identifier},
         "stall_epoch_start": utc_iso(now),
@@ -221,7 +228,7 @@ def new_record_json(
         "remedy_attempts": [],
         "ladder_stage": "initial",
         "flags": list(flags),
-        "evidence": {"motion_at_open": utc_iso(motion_at_open)},
+        "evidence": {**(evidence or {}), "motion_at_open": utc_iso(motion_at_open)},
     }
 
 
@@ -281,6 +288,22 @@ class LoadedStore:
         raw["class_history"].append({"at": utc_iso(now), "klass": klass})
         self.records[key] = record_from_json(key, raw)
         return True
+
+    def settle_marker(self, key: str, flags: list[str], marker_reason: str | None) -> None:
+        """Settle an owed marker fetch (D-16c A5, msg-5746 §2).
+
+        Sets ``flags``, clears ``evidence.marker_pending``, and sets or removes
+        ``evidence.marker_reason``. Changes nothing else on the record.
+        """
+        raw = self.records_raw[key]
+        raw["flags"] = list(flags)
+        evidence = raw["evidence"]
+        evidence.pop("marker_pending", None)
+        if marker_reason is None:
+            evidence.pop("marker_reason", None)
+        else:
+            evidence["marker_reason"] = marker_reason
+        self.records[key] = record_from_json(key, raw)
 
     def close_record(self, key: str) -> None:
         del self.records_raw[key]

@@ -41,7 +41,8 @@ Contract with the wrapper:
           "polled": 2,
           "parked": [
             {"thread_id": "T-a", "head_msg_id": "msg-2242", "token": "human",
-             "lane": "decision", "operator_task": "", "protocol_violation": false}
+             "lane": "decision", "operator_task": "", "protocol_violation": false,
+             "last_msg_at": "2026-10-01T06:59:29Z"}
           ],
           "errors": [
             {"thread_id": "T-c", "reason": "chatroom_get_thread failed: ..."}
@@ -57,6 +58,18 @@ Contract with the wrapper:
     ``operator_work`` / ``misroute``); ``operator_task`` is the work on a valid ``NEXT: operator``
     (``""`` otherwise); ``protocol_violation`` is ``true`` only on the Tier-C-plus-operator
     stand-down, which stays in the ``decision`` lane (D7 supplement, msg-5428).
+
+    ``last_msg_at`` is the ``timestamp`` of the thread's last message (the one whose ``NEXT:`` line
+    parked it), normalised to ISO-8601 UTC with a ``Z`` suffix. The wrapper computes "how long has
+    this thread sat on ``NEXT: human``" from it, fresh every tick and never persisted (the
+    "``NEXT: human`` で N 時間以上停止" digest item, T-sweep-intake-and-quarantine-stalls
+    msg-5889 D-1; Operator Board §F.1 row 3 / RES-A-GAP). When the timestamp is missing, carries no
+    timezone, or does not parse, the entry STAYS in ``parked`` with ``last_msg_at: null`` and one
+    ``errors`` row with reason ``timestamp unreadable: ...`` is added. Parking is decided from the
+    body, which we did read, so the row is kept; its age is not known, and that is said out loud
+    rather than replaced with a guess. Unlike the ``chatroom_get_thread`` readers in the conductor,
+    this reader never falls back to ``now()``: that fallback would report a thread stuck for weeks
+    as zero hours old, which is exactly the silent stall this item exists to surface.
 
 Fail direction — the opposite of head_skip's cache, on purpose. head_skip fails OPEN into a
 launch (one cheap MCP call beats a silent park). This poll fails CLOSED on the parked side:
@@ -86,6 +99,7 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
@@ -93,10 +107,32 @@ from spirrow_mindwire.conductor.parked_lane import classify_parked
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 
+def _normalise_timestamp(value: object) -> tuple[str | None, str]:
+    """Return ``(iso_z, "")`` for a usable chatroom timestamp, else ``(None, reason)``.
+
+    Usable means a string that :meth:`datetime.fromisoformat` parses AND that carries a timezone.
+    A naive timestamp is refused rather than assumed to be UTC: guessing the zone would misstate
+    the age by hours without anyone noticing, and a refused timestamp is visible in ``errors``.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, "timestamp unreadable: missing"
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None, f"timestamp unreadable: unparseable {value!r}"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, f"timestamp unreadable: no timezone in {value!r}"
+    return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), ""
+
+
 async def _fetch_last_message(
     mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
-) -> tuple[str, str] | None:
-    """Return ``(last_msg_id, last_body)`` for a thread, or ``None`` when the shape is unusable.
+) -> tuple[str, str, object] | None:
+    """Return ``(last_msg_id, last_body, raw_timestamp)``, or ``None`` when the shape is unusable.
+
+    ``raw_timestamp`` is the message's ``timestamp`` field as returned (possibly absent → ``None``);
+    validating it is :func:`_normalise_timestamp`'s job, because an unreadable timestamp must not
+    turn a readable park into an unusable shape.
 
     ``chatroom_get_thread`` with ``mode="full"`` is what ``head_skip_decide.py`` also uses; keeping
     the two on the same tool avoids a per-tick divergence in what "the thread" means. Errors from
@@ -119,7 +155,7 @@ async def _fetch_last_message(
         return None
     msg_id = str(last.get("msg_id") or "")
     body = str(last.get("content") or "")
-    return (msg_id, body) if msg_id else None
+    return (msg_id, body, last.get("timestamp")) if msg_id else None
 
 
 async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None) -> dict[str, Any]:
@@ -156,7 +192,7 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
         if fetched is None:
             errors.append({"thread_id": thread_id, "reason": "no messages / malformed response"})
             continue
-        actual_msg_id, body = fetched
+        actual_msg_id, body, raw_timestamp = fetched
         # Head cross-check. When the probe reported a head, it must still match the fetched
         # thread's actual last-message id; a drift means either the head moved between the
         # probe and this call (a live thread we cannot claim parking on) or the probe was
@@ -169,6 +205,9 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
             # D7 (T-next-role-name-stands-down-to-human): which board lane this park belongs in.
             # Decided by the grammar owner's modules, never re-spelled here or in the wrapper.
             lane = classify_parked(body)
+            last_msg_at, ts_reason = _normalise_timestamp(raw_timestamp)
+            if last_msg_at is None:
+                errors.append({"thread_id": thread_id, "reason": ts_reason})
             parked.append(
                 {
                     "thread_id": thread_id,
@@ -177,6 +216,7 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
                     "lane": lane.lane.value,
                     "operator_task": lane.operator_task or "",
                     "protocol_violation": lane.protocol_violation,
+                    "last_msg_at": last_msg_at,
                 }
             )
     return {

@@ -49,6 +49,10 @@ def _load_cli_module() -> object:
 _MODULE = _load_cli_module()
 
 
+_DEFAULT_TIMESTAMP = "2026-10-01T00:00:00.000000+00:00"
+_NO_TIMESTAMP = object()
+
+
 class _FakeMcp:
     """Stand-in for :class:`StreamableHttpChatroomMcp` — returns canned bodies per thread.
 
@@ -68,11 +72,21 @@ class _FakeMcp:
             raise result
         if result is None:
             return {"messages": []}
-        # By construction the fixture stores (msg_id, body) tuples in the non-None / non-Exception
-        # slots; help mypy narrow past the ``object`` element type of the invariant Mapping.
+        # By construction the fixture stores (msg_id, body) or (msg_id, body, timestamp) tuples in
+        # the non-None / non-Exception slots; help mypy narrow past the ``object`` element type of
+        # the invariant Mapping. A 2-tuple gets a well-formed default timestamp, so tests that are
+        # not about the timestamp see no ``timestamp unreadable`` error row. A 3-tuple whose third
+        # element is ``_NO_TIMESTAMP`` omits the field from the message entirely.
         assert isinstance(result, tuple)
-        msg_id, body = result
-        return {"messages": [{"msg_id": msg_id, "content": body}]}
+        if len(result) == 2:
+            msg_id, body = result
+            timestamp: object = _DEFAULT_TIMESTAMP
+        else:
+            msg_id, body, timestamp = result
+        message: dict[str, object] = {"msg_id": msg_id, "content": body}
+        if timestamp is not _NO_TIMESTAMP:
+            message["timestamp"] = timestamp
+        return {"messages": [message]}
 
 
 def _patch_mcp(monkeypatch: pytest.MonkeyPatch, bodies: Mapping[str, object]) -> None:
@@ -669,3 +683,77 @@ def test_cli_stdout_is_ascii_only_pins_d33(
         "the digest's 取得失敗 rows to display gibberish for real outages. First 200 "
         f"chars of the offending output: {emitted[:200]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# last_msg_at (T-sweep-intake-and-quarantine-stalls msg-5889 D-1 / RES-A-GAP)
+# ---------------------------------------------------------------------------
+
+
+def _poll_one(thread_id: str) -> dict[str, object]:
+    result: dict[str, object] = asyncio.run(
+        _MODULE._poll(  # type: ignore[attr-defined]
+            project="test", candidates=[{"thread_id": thread_id, "head_msg_id": ""}], url=None
+        )
+    )
+    return result
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-09-09T08:45:35.230522Z", "2026-09-09T08:45:35Z"),
+        ("2026-09-09T08:45:35.230522+00:00", "2026-09-09T08:45:35Z"),
+        # A non-UTC offset is converted, not copied: the wrapper subtracts it from UTC now.
+        ("2026-09-09T17:45:35+09:00", "2026-09-09T08:45:35Z"),
+    ],
+)
+def test_parked_entry_carries_last_msg_at_normalised_to_utc_z(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    _patch_mcp(monkeypatch, {"T-a": ("msg-a1", "body\n\nNEXT: human", raw)})
+    result = _poll_one("T-a")
+    parked = result["parked"]
+    assert isinstance(parked, list) and len(parked) == 1
+    assert parked[0]["last_msg_at"] == expected
+    assert result["errors"] == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason_fragment"),
+    [
+        (_NO_TIMESTAMP, "missing"),
+        ("", "missing"),
+        (None, "missing"),
+        (1727000000, "missing"),
+        ("yesterday", "unparseable"),
+        # Naive: refused, not assumed UTC — a guessed zone misstates the age silently.
+        ("2026-09-09T08:45:35", "no timezone"),
+    ],
+)
+def test_unreadable_timestamp_keeps_the_park_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, raw: object, reason_fragment: str
+) -> None:
+    """Fail direction (msg-5889 D-1, endorsed msg-5891): the row stays, the age is null, and an
+    error row names the cause. Never a ``now()`` fallback that would read as "0 hours stuck"."""
+    _patch_mcp(monkeypatch, {"T-a": ("msg-a1", "body\n\nNEXT: human", raw)})
+    result = _poll_one("T-a")
+    parked = result["parked"]
+    assert isinstance(parked, list) and len(parked) == 1
+    assert parked[0]["thread_id"] == "T-a"
+    assert parked[0]["last_msg_at"] is None
+    errors = result["errors"]
+    assert isinstance(errors, list) and len(errors) == 1
+    assert errors[0]["thread_id"] == "T-a"
+    assert errors[0]["reason"].startswith("timestamp unreadable: ")
+    assert reason_fragment in errors[0]["reason"]
+
+
+def test_unreadable_timestamp_on_a_non_parked_thread_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a parked row needs an age; a live thread with a bad timestamp is not reported."""
+    _patch_mcp(monkeypatch, {"T-a": ("msg-a1", "body\n\nNEXT: Bohr", _NO_TIMESTAMP)})
+    result = _poll_one("T-a")
+    assert result["parked"] == []
+    assert result["errors"] == []

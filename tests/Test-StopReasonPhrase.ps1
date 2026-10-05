@@ -92,11 +92,13 @@ $map = Get-StopReasonPhraseMap
 #
 # 2026-09-30 (T42): grew from six to seven with 'stalled_to_human' (the stall watchdog exits 0
 # after posting STALLED, so this notification is the operator's signal).
-$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'round_cap', 'empty_thread')
+# 2026-10-03 (T-next-operator-is-silent D3): grew to eight with 'operator_work_to_human' — a valid
+# `NEXT: operator` is work a person must do, so it is heard; its phrase is not 判断待ち.
+$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'operator_work_to_human', 'round_cap', 'empty_thread')
 foreach ($k in $expectedKeys) {
     CheckTrue "map has key '$k'" ($map.ContainsKey($k))
 }
-Check 'map has exactly 7 keys (narrowing = notification loss, §4 §W-4)' 7 $map.Count
+Check 'map has exactly 8 keys (narrowing = notification loss, §4 §W-4)' 8 $map.Count
 
 Write-Host 'Get-StopReasonPhraseMap — returns a fresh hashtable each call (no shared state)'
 $m1 = Get-StopReasonPhraseMap
@@ -248,6 +250,9 @@ $unnotified = @(
     'none'           # thread settled: the normal end, the sweep just moves on
     'hold'           # the operator asked for the stop, so telling them is not news
     'ci_wait'        # pre-gate CI-wait DEFER (design v0.3.1 §5.2A); past the cap it becomes 'human'
+    'merge_wait'     # PR-gate APPROVE on a human-merged PR: the merge-wait PR list carries it (msg-4361)
+    'resume_retry'   # gate resume could not read GitHub / head moved: silent retry, bounded by the stall watchdog
+    'slice_end'      # gate-lane run handed its relay / ci-route head to the role lane (msg-6313 §1′)
     'adapter_error'  # adapter raised; exit!=0 -> quarantine, where the K alert sounds
 )
 

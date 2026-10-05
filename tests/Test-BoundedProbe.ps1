@@ -16,6 +16,11 @@
 #        plus one REAL end-to-end run through uv against scripts/resolve_resource.py.
 #   T  — temp-file hygiene: a locked file yields a WARN line and no exception; the startup sweep
 #        removes only `mindwire-probe-*.json` older than the age bound.
+#   U  — -UvOptions (Bohr msg-5611 §2): inserted between `uv run` and `python`; without it the
+#        command line is exactly what it was, and only Get-FailureClass passes it.
+#   F  — Get-FailureClass (msg-5611 §3): `-m spirrow_mindwire.stall_ledger --input <tmp>` through
+#        the helper; label on success; 'unknown' — never an exception — on timeout / non-zero exit /
+#        no non-empty stdout line; TIMEOUT label=failure-class logged; temp file gone on every path.
 #
 # Same lift-from-AST pattern as Test-SweepHeadCache.ps1 (dot-sourcing would launch the sweep).
 
@@ -65,30 +70,34 @@ function CheckTrue { param([string]$Name, [bool]$Cond) Check $Name $true $Cond }
 
 Write-Host 'Settings — every probe has a bound, and parked-humans defaults to 120 s'
 foreach ($n in 'HeadSkipProbeTimeoutSeconds', 'HeadProbeTimeoutSeconds', 'ParkedHumansProbeTimeoutSeconds',
-               'ControlProbeTimeoutSeconds', 'PredictedResourceProbeTimeoutSeconds', 'GateBootstrapProbeTimeoutSeconds') {
+               'ControlProbeTimeoutSeconds', 'PredictedResourceProbeTimeoutSeconds', 'GateBootstrapProbeTimeoutSeconds',
+               'FailureClassProbeTimeoutSeconds') {
     $v = Get-TopLevelValue $n
     CheckTrue "$n is a positive bound ($v)" ($v -is [int] -and $v -gt 0)
 }
 Check 'ParkedHumansProbeTimeoutSeconds = 120' 120 (Get-TopLevelValue 'ParkedHumansProbeTimeoutSeconds')
+Check 'FailureClassProbeTimeoutSeconds = 120' 120 (Get-TopLevelValue 'FailureClassProbeTimeoutSeconds')
 Check 'ProbeKillGraceMs = 5000' 5000 (Get-TopLevelValue 'ProbeKillGraceMs')
 Check "ProbeInputFilePrefix = 'mindwire-probe-'" 'mindwire-probe-' (Get-TopLevelValue 'ProbeInputFilePrefix')
 Check 'ProbeInputFileMaxAgeMinutes = 60' 60 (Get-TopLevelValue 'ProbeInputFileMaxAgeMinutes')
 
 Write-Host 'Census — no unbounded `& uv` and no `$payload |` stdin feed left in the sweep script'
-# DECLARED GAP, not hidden: Get-FailureClass feeds the session-log tail to `uv run ... -m
-# spirrow_mindwire.stall_ledger` on stdin with no bound. It was not in the agreed scope (Bohr
-# msg-5414 §3 lists eight call sites) and is reported back to the thread for a decision; it is the
-# ONE allowed `uv` command here so that a NEW unbounded call still reds this census.
-$uvAllowed = @('Get-FailureClass')
+# NO allowance (Bohr msg-5611 §4): the last unbounded call — Get-FailureClass feeding the session-log
+# tail to `uv run ... -m spirrow_mindwire.stall_ledger` on stdin — now goes through
+# Invoke-BoundedUvProbe. Every `uv` launch in the sweep script must go through the helper, so the
+# count of direct `uv` commands is ZERO, with no function exempt.
 $uvCalls = $ast.FindAll({
         param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
         $n.GetCommandName() -eq 'uv' }, $true)
-$uvUnexpected = @($uvCalls | Where-Object {
-        $p = $_.Parent
-        while ($p -and $p -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $p = $p.Parent }
-        -not ($p -and $uvAllowed -contains $p.Name) })
-Check 'no direct `uv` command invocations outside the declared gap' 0 $uvUnexpected.Count
-Check 'the declared gap is still exactly one call (remove the allowance when it is fixed)' 1 (@($uvCalls).Count - $uvUnexpected.Count)
+Check 'no direct `uv` command invocations anywhere (no allowance)' 0 @($uvCalls).Count
+# Any pipeline that feeds a command started with `&` or `uv` is a stdin feed of a child process —
+# the shape that hung in msg-5322, whatever the variable on the left is called.
+$childStdinFeeds = $ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and
+        @($n.PipelineElements | Select-Object -Skip 1 | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandAst] -and
+                ($_.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand -or $_.GetCommandName() -eq 'uv') }).Count -gt 0 }, $true)
+Check 'no pipeline feeds stdin into `& ...` or `uv ...`' 0 @($childStdinFeeds).Count
 $stdinFeeds = $ast.FindAll({
         param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and
         $n.PipelineElements.Count -ge 2 -and
@@ -110,7 +119,7 @@ $ProbeInputFilePrefix = 'mindwire-probe-'
 $ProbeInputFileMaxAgeMinutes = 60
 $ProbeInputDirectory = $probeDir
 
-foreach ($name in 'Invoke-BoundedUvProbe', 'Get-ProbeOutputLines', 'Get-ProbeJsonLine',
+foreach ($name in 'Get-BoundedProbeCommandLine', 'Invoke-BoundedUvProbe', 'Get-ProbeOutputLines', 'Get-ProbeJsonLine',
                   'New-ProbeInputFile', 'Remove-ProbeInputFile', 'Remove-StaleProbeInputFiles') {
     Import-SweepFunction $name
 }
@@ -183,7 +192,7 @@ exit 0
     $script:probeMode = 'ok'
     $script:probeStdout = ''
     function Invoke-BoundedUvProbe {
-        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher)
+        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
         $fileArg = $null
         foreach ($flag in '--input', '--candidates', '--payload-file') {
             $i = [array]::IndexOf($Arguments, $flag)
@@ -338,6 +347,136 @@ exit 0
     }
     Check 'temp file removed (real run)' 0 (Get-ProbeInputLeftovers).Count
 
+    # --- U: -UvOptions ---------------------------------------------------------------------------
+    Write-Host 'U1 — Get-BoundedProbeCommandLine: UvOptions go between `uv run` and `python`; absent = unchanged'
+    $default = @('uv', 'run', 'python')
+    $argvIn = @('scripts\x.py', '--input', 'C:\t m p\f.json')
+    Check 'no UvOptions -> Launcher + Arguments, element for element' (($default + $argvIn) -join '|') ((Get-BoundedProbeCommandLine -Launcher $default -Arguments $argvIn) -join '|')
+    Check 'empty UvOptions -> the same' (($default + $argvIn) -join '|') ((Get-BoundedProbeCommandLine -Launcher $default -UvOptions @() -Arguments $argvIn) -join '|')
+    Check 'UvOptions inserted after `uv run`, before `python`' 'uv|run|--directory|C:\r o o t|--quiet|python|-m|mod|--input|f' `
+        ((Get-BoundedProbeCommandLine -Launcher $default -UvOptions @('--directory', 'C:\r o o t', '--quiet') -Arguments @('-m', 'mod', '--input', 'f')) -join '|')
+    $threw = $false
+    try { $null = Get-BoundedProbeCommandLine -Launcher @('pwsh', '-File') -UvOptions @('--quiet') -Arguments @('x') } catch { $threw = $true }
+    CheckTrue 'UvOptions with a launcher too short to hold them is refused, not silently misplaced' $threw
+    foreach ($bad in @(@('pwsh', '-NoProfile', '-File'), @('uv', 'tool', 'python'), @('uvx', 'run', 'python'))) {
+        $threw = $false
+        try { $null = Get-BoundedProbeCommandLine -Launcher $bad -UvOptions @('--quiet') -Arguments @('x') } catch { $threw = $true }
+        CheckTrue "UvOptions with a non-'uv run' launcher ($($bad -join ' ')) is refused, not injected at index 2" $threw
+    }
+    Check 'a path-qualified uv.exe launcher is accepted' 'C:\bin\uv.exe|run|--quiet|python|x' `
+        ((Get-BoundedProbeCommandLine -Launcher @('C:\bin\uv.exe', 'run', 'python') -UvOptions @('--quiet') -Arguments @('x')) -join '|')
+    # Both separators, on every OS: CI runs on Linux, where System.IO.Path does not split on `\`.
+    Check 'a POSIX path-qualified uv launcher is accepted' '/usr/local/bin/uv|run|--quiet|python|x' `
+        ((Get-BoundedProbeCommandLine -Launcher @('/usr/local/bin/uv', 'run', 'python') -UvOptions @('--quiet') -Arguments @('x')) -join '|')
+    $r = Invoke-BoundedUvProbe -Launcher @('pwsh', '-File') -UvOptions @('--quiet') -Arguments @('x') -TimeoutSeconds 5 -Label 'u1'
+    Check 'the helper turns that refusal into an error result (ok = $false)' $false $r.ok
+    CheckTrue 'error names the invalid command line' ($r.error -like 'invalid command line:*')
+
+    Write-Host 'U2 — only Get-FailureClass passes -UvOptions; the eight msg-5414 call sites and 1b do not'
+    $helperCalls = @($ast.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                $n.GetCommandName() -eq 'Invoke-BoundedUvProbe' }, $true))
+    # +1 for Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b): no -UvOptions, like the eight.
+    # +2 for Invoke-HeadSkipRevertLaunch and Invoke-CloneCheck (T-clone-guard-pin-ignored-only-in-
+    # mindwire D-3a / D-3c): no -UvOptions either.
+    # +1 for Invoke-ParkWakeTick (T-next-line-carries-who-not-why Slice 3, D-7): no -UvOptions, like 1b.
+    # +1 for Invoke-UnregisteredThreadsProbe (T-sweep-intake-and-quarantine-stalls msg-5889 D-2):
+    # no -UvOptions either.
+    Check 'fourteen helper call sites in the sweep script' 14 $helperCalls.Count
+    $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
+    Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
+    if ($withUvOptions.Count -eq 1) {
+        $p = $withUvOptions[0].Parent
+        while ($p -and $p -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $p = $p.Parent }
+        Check '... and it is Get-FailureClass' 'Get-FailureClass' $p.Name
+    }
+
+    # --- F: Get-FailureClass ---------------------------------------------------------------------
+    $realHelper = (Get-Item function:Invoke-BoundedUvProbe).ScriptBlock
+    Set-Item -Path function:script:Invoke-RealBoundedUvProbe -Value $realHelper
+    Import-SweepFunction 'Get-FailureClass'
+    $FailureClassProbeTimeoutSeconds = 117
+    $fcRoot = Join-Path $scratch 'fc root'
+    New-Item -ItemType Directory -Path $fcRoot | Out-Null
+    $fcTail = @('first line', 'ClaudeCodeSdkDeliveryError: subtype=''error_during_execution''', '日本語 `tick` "q"')
+
+    # Stub: records what Get-FailureClass handed the helper, and the temp file's bytes while it exists.
+    $script:fcCalls = [System.Collections.Generic.List[object]]::new()
+    $script:fcResult = $null
+    function script:Invoke-BoundedUvProbe {
+        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
+        $i = [array]::IndexOf($Arguments, '--input')
+        $f = if ($i -ge 0) { $Arguments[$i + 1] } else { $null }
+        $bytes = if ($f -and (Test-Path -LiteralPath $f)) { [System.IO.File]::ReadAllBytes($f) } else { $null }
+        $script:fcCalls.Add(@{ Arguments = $Arguments; TimeoutSeconds = $TimeoutSeconds; Label = $Label
+                WorkingDirectory = $WorkingDirectory; UvOptions = $UvOptions; File = $f; Bytes = $bytes })
+        return $script:fcResult
+    }
+    function New-FcResult {
+        param([bool]$Ok = $true, $Code = 0, [string]$Stdout = '')
+        return @{ ok = $Ok; timedOut = $false; killConfirmed = $false; code = $Code; stdout = $Stdout; stderr = 'noise on stderr'
+            elapsedSec = 0.1; pid = 4242; error = $(if ($Ok) { $null } else { 'x' }) }
+    }
+
+    Write-Host 'F1 — normal path: -m stall_ledger --input <tmp>, uv options, bound, label returned, temp file removed'
+    $script:fcCalls.Clear(); $script:fcResult = New-FcResult -Stdout "`r`n   `nsdk-error-during-execution  `r`nsurplus line`n"
+    $label = Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot
+    Check 'returns the first non-empty stdout line, trimmed' 'sdk-error-during-execution' $label
+    Check 'one helper call' 1 $script:fcCalls.Count
+    $c = $script:fcCalls[0]
+    Check "label = 'failure-class'" 'failure-class' $c.Label
+    Check 'bound = $FailureClassProbeTimeoutSeconds' 117 $c.TimeoutSeconds
+    Check 'argv = -m spirrow_mindwire.stall_ledger --input <tmp>' "-m|spirrow_mindwire.stall_ledger|--input|$($c.File)" ($c.Arguments -join '|')
+    Check 'uv options = --directory <RepoRoot> --quiet' "--directory|$fcRoot|--quiet" ($c.UvOptions -join '|')
+    Check 'working directory pinned to RepoRoot' $fcRoot $c.WorkingDirectory
+    CheckTrue 'temp file named mindwire-probe-failure-class-*.json' ((Split-Path -Leaf $c.File) -like 'mindwire-probe-failure-class-*.json')
+    Check 'temp file holds the tail joined by LF, UTF-8 without BOM' ($fcTail -join "`n") ([System.Text.UTF8Encoding]::new($false, $true).GetString($c.Bytes))
+    CheckTrue 'no tail text in argv' (-not ($c.Arguments | Where-Object { $_ -like '*ClaudeCodeSdk*' }))
+    Check 'temp file removed (normal)' 0 (Get-ProbeInputLeftovers).Count
+
+    Write-Host 'F2 — non-zero exit / no non-empty stdout line / not ok: unknown, temp file removed'
+    $script:fcResult = New-FcResult -Code 2 -Stdout "sdk-error-during-execution`n"
+    Check 'exit 2 -> unknown (stdout ignored)' 'unknown' (Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot)
+    $script:fcResult = New-FcResult -Stdout ''
+    Check 'empty stdout -> unknown' 'unknown' (Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot)
+    $script:fcResult = New-FcResult -Stdout " `r`n`t`n "
+    Check 'whitespace-only stdout -> unknown' 'unknown' (Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot)
+    $script:fcResult = New-FcResult -Ok $false -Code $null -Stdout 'sdk-error-during-execution'
+    Check 'ok = $false (start failure / unclosed streams) -> unknown' 'unknown' (Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot)
+    Check 'temp file removed (all of the above)' 0 (Get-ProbeInputLeftovers).Count
+
+    Write-Host 'F3 — a helper that throws: unknown, no exception, temp file removed'
+    function script:Invoke-BoundedUvProbe { throw 'boom' }
+    $threw = $false
+    try { $label = Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot } catch { $threw = $true }
+    Check 'no exception' $false $threw
+    Check 'unknown' 'unknown' $label
+    Check 'temp file removed (throw)' 0 (Get-ProbeInputLeftovers).Count
+
+    Write-Host 'F4 — timeout through the REAL helper: unknown, no exception, TIMEOUT label=failure-class logged, temp file removed'
+    # The real helper with only the launcher swapped for a probe that hangs, so the bound, the tree
+    # kill and the TIMEOUT log line are the production code paths. The -UvOptions Get-FailureClass
+    # passes are dropped here only because the fake launcher is not uv.
+    $fcHang = Join-Path $scratch 'fc-hang.ps1'
+    Set-Content -LiteralPath $fcHang -Encoding utf8 -Value 'Start-Sleep 600'
+    $script:fcSeen = $null
+    function script:Invoke-BoundedUvProbe {
+        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
+        $script:fcSeen = @{ Label = $Label; TimeoutSeconds = $TimeoutSeconds }
+        return Invoke-RealBoundedUvProbe -Launcher $fakeLauncher -Arguments @($fcHang) -TimeoutSeconds 3 -Label $Label -WorkingDirectory $WorkingDirectory
+    }
+    $script:logLines.Clear()
+    $threw = $false
+    $label = $null
+    try { $label = Get-FailureClass -SessionLogTail $fcTail -RepoRoot $fcRoot } catch { $threw = $true }
+    Check 'no exception' $false $threw
+    Check 'unknown' 'unknown' $label
+    Check 'the production bound was requested' 117 $script:fcSeen.TimeoutSeconds
+    CheckTrue "TIMEOUT label=failure-class logged (log: $($script:logLines -join ' / '))" (@($script:logLines | Where-Object { $_ -match '^TIMEOUT label=failure-class elapsed=[\d.]+s pid=\d+' }).Count -eq 1)
+    Check 'temp file removed (timeout)' 0 (Get-ProbeInputLeftovers).Count
+    Set-Item -Path function:script:Invoke-BoundedUvProbe -Value $realHelper
+
     # --- T: temp-file hygiene --------------------------------------------------------------------
     Write-Host 'T1 — an undeletable temp file: WARN logged, no exception escapes'
     # The delete failure is injected by shadowing Remove-Item, not by holding a FileShare.None
@@ -383,6 +522,45 @@ exit 0
     CheckTrue 'recent mindwire-probe-*.json kept' (Test-Path -LiteralPath $new)
     CheckTrue 'old file with another prefix kept' (Test-Path -LiteralPath $otherOld)
     CheckTrue 'old mindwire-probe-* with another extension kept' (Test-Path -LiteralPath $oldTxt)
+
+    # --- P: Invoke-PrEventAdvanceTick (T-pr-event-advances-thread 1b) — fail-open on the sweep ---
+    Write-Host 'P — 1b tick: argv / bound / label, and every failure returns instead of throwing'
+    Import-SweepFunction 'Get-ProbeJsonLine'
+    Import-SweepFunction 'Invoke-PrEventAdvanceTick'
+    $PrEventAdvanceProbeTimeoutSeconds = 311
+    $sweepConfigPath = 'C:\cfg\sweep.json'
+    $script:peCalls = [System.Collections.Generic.List[object]]::new()
+    $script:peResult = $null
+    $script:peThrow = $false
+    function script:Invoke-BoundedUvProbe {
+        param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
+        if ($script:peThrow) { throw 'boom' }
+        $script:peCalls.Add(@{ Arguments = $Arguments; TimeoutSeconds = $TimeoutSeconds; Label = $Label; UvOptions = $UvOptions })
+        return $script:peResult
+    }
+    $script:logLines.Clear()
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":1,"outcomes":[{"thread_id":"T-a"}],"noop_counts":{}}' }
+    $o = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'posted count parsed' 1 $o.posted
+    $c = $script:peCalls[0]
+    Check 'argv = -m spirrow_mindwire.pr_event_advance --project p --sweep-config <path>' '-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json' ($c.Arguments -join '|')
+    Check 'bound = $PrEventAdvanceProbeTimeoutSeconds' 311 $c.TimeoutSeconds
+    Check "label = 'pr-event-advance-p'" 'pr-event-advance-p' $c.Label
+    CheckTrue 'a post is logged' (@($script:logLines | Where-Object { $_ -like 'pr-event-advance `[p`]: {*' }).Count -eq 1)
+    $script:logLines.Clear()
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":0,"outcomes":[],"noop_counts":{"not-relay-tail":3}}' }
+    $null = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'a quiet all-noop tick logs nothing' 0 $script:logLines.Count
+    $script:peResult = @{ ok = $false; code = $null; stdout = ''; error = 'timeout' }
+    Check 'probe not ok -> $null' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peResult = @{ ok = $true; code = 1; stdout = '{"project":"p","error":"listing failed"}' }
+    $o = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'exit 1 -> the error object is returned' 'listing failed' $o.error
+    $script:peResult = @{ ok = $true; code = 0; stdout = 'not json' }
+    Check 'no JSON -> $null' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peThrow = $true
+    Check 'a throw inside -> $null, not an exception' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peThrow = $false
 
     Write-Host 'T3 — the sweep calls the startup cleanup before reading the sweep list'
     $text = Get-Content -LiteralPath $sweepScript -Raw

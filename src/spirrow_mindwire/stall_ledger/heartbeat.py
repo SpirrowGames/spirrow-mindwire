@@ -93,6 +93,13 @@ class FetchOutcome(StrEnum):
                              (kept separate from ``http_error`` because a
                              human fixes it differently — rotate a token, not
                              wait it out).
+    * ``auth_missing``     — no credential was configured at all, so the source
+                             made no request (T-stalled-pr-has-no-detector
+                             msg-6415 Q2). Kept apart from ``auth_failure``:
+                             nothing was rejected, the fix is to provision the
+                             token, and running unauthenticated instead was
+                             measured to exhaust the 60/h per-IP limit
+                             (msg-6414) — a silent failure, not a degraded mode.
     * ``file_missing``     — a filesystem-backed source (e.g. quarantine.json)
                              was not there or unreadable.
     * ``parse_error``      — the transport succeeded but the payload did not
@@ -103,6 +110,7 @@ class FetchOutcome(StrEnum):
     HTTP_ERROR = "http_error"
     TIMEOUT = "timeout"
     AUTH_FAILURE = "auth_failure"
+    AUTH_MISSING = "auth_missing"
     FILE_MISSING = "file_missing"
     PARSE_ERROR = "parse_error"
 

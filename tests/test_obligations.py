@@ -13,6 +13,10 @@ enforce the invariants the Tier-C GO msg-737 nailed down:
   well-meaning "cleanup" that shortens or reflows the moved body reds this canary
   rather than silently drifting the loop's actual instruction away from what was
   reviewed.
+- **net-new sha256** pin: every obligation *without* ``origin`` carries ``body_sha256``,
+  and the loader rejects a body whose SHA-256 disagrees with it (or a malformed pin).
+  The net-new counterpart of two-double-prime (T-net-new-obligation-drift-detection,
+  design msg-5731).
 - **INV-C** (consumer-visible placement, msg-2387 §3): a conditional obligation's
   antecedent and the landing site of the change it prescribes both reach the
   *rendered* implementer prompt, and the meta-commentary round 1 stripped stays
@@ -47,9 +51,11 @@ puts the imperative in the destination (`spec/process/README.md`).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
@@ -59,6 +65,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
 )
 from spirrow_mindwire.naysayer.pr_review import _build_messages, _build_pass2_messages
 from spirrow_mindwire.obligations import (
+    ObligationsError,
     ObligationsManifest,
     default_manifest_path,
     load_manifest,
@@ -155,6 +162,80 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
             f"verbatim text moved from {obligation.origin.moved_from!r}, or bump the "
             "recorded length in the same commit and expect it to be discussed in PR review"
         )
+
+
+# --------------------------------------------------------------------------- #
+# canary net-new sha256 — net-new bodies are pinned by hash
+# --------------------------------------------------------------------------- #
+
+
+def test_canary_net_new_bodies_match_pinned_sha256() -> None:
+    """Every obligation without ``origin`` carries a ``body_sha256`` pin.
+
+    The value itself is checked by the loader (``load_manifest()`` raising is the
+    red), so this canary's own job is the part the loader deliberately leaves
+    out: the key must be present on every net-new entry of the real manifest. A
+    new entry added without a pin reds here.
+    """
+    manifest = load_manifest()
+    net_new = [o for o in manifest.obligations if o.origin is None]
+    assert net_new, "spec/process/obligations.yaml contains no net-new obligations"
+    unpinned = [o.id for o in net_new if o.body_sha256 is None]
+    assert not unpinned, (
+        f"net-new obligations without body_sha256: {unpinned} — add "
+        "`body_sha256: <sha256 of the body after rstrip('\n'), UTF-8, lowercase hex>`"
+    )
+    for obligation in net_new:
+        assert obligation.body_sha256 == hashlib.sha256(obligation.body.encode()).hexdigest()
+
+
+def _write_single_entry_manifest(tmp_path: Path, body_sha256: str) -> Path:
+    path = tmp_path / "obligations.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "obligations": [
+                    {
+                        "id": "OBL-FIXTURE",
+                        "role": "implementer",
+                        "body_sha256": body_sha256,
+                        "body": "fixture body",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_loader_accepts_matching_body_sha256(tmp_path: Path) -> None:
+    pin = hashlib.sha256(b"fixture body").hexdigest()
+    (entry,) = load_manifest(_write_single_entry_manifest(tmp_path, pin)).obligations
+    assert entry.body_sha256 == pin
+
+
+def test_loader_rejects_body_sha256_mismatch(tmp_path: Path) -> None:
+    stale = hashlib.sha256(b"the body as it was reviewed").hexdigest()
+    actual = hashlib.sha256(b"fixture body").hexdigest()
+    with pytest.raises(ObligationsError, match="does not match body_sha256") as excinfo:
+        load_manifest(_write_single_entry_manifest(tmp_path, stale))
+    assert actual in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        hashlib.sha256(b"fixture body").hexdigest().upper(),
+        hashlib.sha256(b"fixture body").hexdigest()[:63],
+        hashlib.sha256(b"fixture body").hexdigest() + "0",
+    ],
+    ids=["uppercase", "63-digits", "65-digits"],
+)
+def test_loader_rejects_malformed_body_sha256(tmp_path: Path, malformed: str) -> None:
+    with pytest.raises(ObligationsError, match="64 lowercase hex digits"):
+        load_manifest(_write_single_entry_manifest(tmp_path, malformed))
 
 
 # --------------------------------------------------------------------------- #

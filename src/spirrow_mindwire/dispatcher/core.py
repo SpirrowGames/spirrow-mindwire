@@ -19,6 +19,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from ..clone_guard import CloneGuard
+from ..pin_ignore import ensure_pin_ignored
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..source_marker import append_markers
 from ..spec_pin import SpecPinWriter
@@ -69,6 +71,7 @@ class Dispatcher:
         event_sink: EventSink | None = None,
         dedup_size: int = DEFAULT_DEDUP_SET_SIZE,
         spec_pin_writer: SpecPinWriter | None = None,
+        clone_guard: CloneGuard | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -84,6 +87,12 @@ class Dispatcher:
         # `loop_runner.build_conductor`) always inject a writer. See the note on
         # concurrency in ``spec_pin.SpecPinWriter``.
         self._spec_pin_writer = spec_pin_writer
+        # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-1): checked before
+        # EVERY dispatch, all roles, ahead of the pin write (and preceded by ensure_pin_ignored on
+        # the same repo_dir — T-clone-guard-pin-ignored-only-in-mindwire D-1). ``None`` = caller
+        # opted out (tests); the composition root injects one whenever it knows
+        # ``[loop].repo_dir``.
+        self._clone_guard = clone_guard
 
     async def spawn_instance(
         self, thread_ref: ThreadRef, role: Role, instance_id: str
@@ -160,6 +169,21 @@ class Dispatcher:
         # returns only after the write has completed, preserving the
         # "直前に" invariant — the pin is on disk before ``deliver_event``
         # runs.
+        # Dirty-clone guard (design v4 D-1) — BEFORE the pin write, so a refused dispatch leaves
+        # the clone byte-for-byte as it found it. Every role runs in the same ``repo_dir``, so every
+        # role is checked. A :class:`~spirrow_mindwire.clone_guard.DirtyCloneError` propagates
+        # unchanged: ``loop_runner.main`` routes it by type to the dirty-clone exit code, and the
+        # sweep wrapper does not quarantine on it. The git calls (and the up-to-5 s index.lock
+        # wait) block, so they run on the default executor like the pin write below.
+        #
+        # T-clone-guard-pin-ignored-only-in-mindwire (design v2.1 D-1): ahead of the guard, keep
+        # ``/.mindwire/`` in the clone's ``info/exclude`` so the pin the previous dispatch wrote is
+        # ignored in every repo, not only in the one whose ``.gitignore`` lists it. Order is
+        # ensure → guard → pin write; a failure raises the same ``DirtyCloneError``
+        # (``pin_not_ignored``), so it exits 8 like any other refusal.
+        if self._clone_guard is not None:
+            await asyncio.to_thread(ensure_pin_ignored, self._clone_guard.repo_dir)
+            await asyncio.to_thread(self._clone_guard.check)
         if self._spec_pin_writer is not None:
             await self._spec_pin_writer.write_before_dispatch_async(
                 handle.role, handle.thread_ref.thread_id

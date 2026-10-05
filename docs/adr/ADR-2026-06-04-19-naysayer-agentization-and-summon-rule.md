@@ -120,3 +120,23 @@ ADR-19 の実装 3 step がすべて merge され、本 ADR の Decision は実�
 - **N-4 relay/bundle 撤去** = PR #95(2633d07)。`design_review.py` / `context_bundle.py` 削除、`principles.py` KEEP。Tier B 誤前提 RC を Tier C override。詳細は §3 N-4 実装確定 note。
 
 **未了 follow-up**: **T33**(summon naysayer の doc 本文 context-provisioning = N-2 fetch 段)/ **N-3**(mindwire 側 verdict-tag 書き)/ **N-5 = ADR-18 reconcile**(loop magickit 到達性、MVP 稼働の本丸)/ fast-follow(naysayer PR-gate driver の input/output cap 引き上げ・script-aclose 整合)。
+
+---
+
+## Amendment (2026-10-03): D-3 — naysayer の backend に codex（ChatGPT Pro サブスク）を加える
+
+- **Status**: Proposed（chatroom `T-D8-codex-backend-adr14-15-amendment`）。main に merge されることを、Takahito による承認とします。
+- **SOT は ADR-14 §7 です。**
+
+D-3 は「backend は Lexora-Gemini 従量 API を維持する」と決めていました。これを次のように変えます。
+
+- **naysayer ティアの構成**
+  - 正は Lexora の codex backend です（`codex exec`、ChatGPT Pro サブスク）。
+  - 予備は gemini-fallback です。
+  - この構成は、fallback wrapper で組みます（ADR-14 §7.6）。
+- **D-3 が park した「flat-rate CLI」の条件との対応**
+  - (a)「公式 CLI を headless で起動すること」：公式の Codex CLI を、Takahito 本人のアカウントで、自分のホストから使います。OAuth のトークンを第三者のソフトに流用することはしません（ADR-14 §7.3）。
+- **有効にする前提と、それまでの扱い**
+  - 有効にする前提は、ADR-14 §7.9 のとおりです。
+  - 前提がそろうまでは、Gemini が正のままです。
+  - attestation（`expected`）を切り替えるのも、それと同じ時点です。

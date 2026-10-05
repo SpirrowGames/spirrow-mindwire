@@ -48,4 +48,7 @@ spirrow-mindwire-data/
 # D-5 / item I-4). The dispatcher writes `.mindwire/pin` into the working tree
 # and it must never be committed. Per OBL-SPEC-PIN, ignoring the directory does
 # not touch the pin file itself on disk (A-27 of that spec).
+# Kept although the dispatcher now writes `/.mindwire/` into every clone's info/exclude
+# (pin_ignore.ensure_pin_ignored): this line covers checkouts the loop never dispatches into —
+# developer clones, CI, test worktrees (T-clone-guard-pin-ignored-only-in-mindwire D-1).
 .mindwire/

@@ -67,6 +67,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,9 +78,26 @@ from .adapters.decider_lexora import build_decider
 from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
+from .clone_guard import (
+    DIRTY_CLONE_EXIT_CODE,
+    CloneGuard,
+    DirtyCloneError,
+    emit_dirty_clone_payload,
+)
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
-from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
+from .conductor.core import (
+    CONDUCTOR_RELAY_AUTHOR,
+    ConductorStopSlot,
+    ConductorStopSnapshot,
+    StopReason,
+)
 from .conductor.retry_notice import RetryOf, parse_retry_of
+from .conductor.run_budget import (
+    RunPhase,
+    post_run_timeout_notice,
+    run_with_budget,
+    validate_budgets,
+)
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
 from .conductor.tierc_gate import TierCGate
 from .config import (
@@ -104,10 +122,12 @@ from .github.client import (
     EnvironmentTerminalError,
     GitHubClient,
     PrRef,
+    ReviewInfo,
     naysayer_github_token,
 )
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
+from .magickit.ledger_notes import JOURNAL_DIR_NAME, LedgerJournal
 from .magickit.watcher import ChatroomWatcher, WatchSpec
 from .naysayer.pr_review import NaysayerPrReviewDriver
 from .obligations import ObligationsError, ObligationsManifest, load_manifest
@@ -376,6 +396,7 @@ def build_implementer(
     model: str | None = None,
     cli_path: Path | None = None,
     ledger_mcp: McpToolCaller | None = None,
+    ledger_journal_dir: Path | None = None,
 ) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
@@ -404,6 +425,10 @@ def build_implementer(
     ``T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down`` Bohr msg-5296 / msg-5300).
     :func:`_build_dispatcher` passes the loop's own client, so every implementer session gets the
     two ledger tools and nothing else from Magickit. Proposer and naysayer get none.
+
+    ``ledger_journal_dir`` is where each append's recovery record is written before Magickit is
+    (Bohr msg-5884 / msg-5886): ``<logs_dir>/ledger``. It is required whenever ``ledger_mcp`` is
+    given; the adapter refuses a ledger without it.
     """
     from .adapters import _sdk_job_hook
 
@@ -414,6 +439,7 @@ def build_implementer(
         model=model,
         cli_path=cli_path,
         ledger_mcp=ledger_mcp,
+        ledger_journal=None if ledger_journal_dir is None else LedgerJournal(ledger_journal_dir),
     )
 
 
@@ -542,6 +568,11 @@ def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
     )
 
 
+_LEDGER_EVENT_PREFIX = "ledger."
+# Optional fields rendered on a ledger event's log line, in this order (Bohr msg-5884 item 4).
+_LEDGER_LOG_FIELDS = ("prior_notes_sha256", "reason", "journal_event_id")
+
+
 async def _log_event_sink(event: Event) -> None:
     """Observational event-log sink (I7): log reply.sent / delivery.failed.
 
@@ -551,7 +582,22 @@ async def _log_event_sink(event: Event) -> None:
     session halts (``spec/design/T-denial-detail-and-overdeny.md``).
     """
     author = event.fields.get(EVENT_FIELD_AUTHOR, "?")
-    if event.kind == EVENT_KIND_DELIVERY_FAILED:
+    if event.kind.startswith(_LEDGER_EVENT_PREFIX):
+        # Ledger events carry no author. Put the keys that match a line to its recovery record
+        # (``<logs_dir>/ledger/<project>/<task>/<event_id>.json``) on the line; never the notes.
+        logger.info(
+            "loop event %s event_id=%s project_id=%s task_id=%s%s",
+            event.kind,
+            event.event_id,
+            event.fields.get("project_id", "?"),
+            event.fields.get("task_id", "?"),
+            "".join(
+                f" {key}={event.fields[key]}"
+                for key in _LEDGER_LOG_FIELDS
+                if event.fields.get(key) is not None
+            ),
+        )
+    elif event.kind == EVENT_KIND_DELIVERY_FAILED:
         logger.warning(
             "loop event %s author=%s error=%s",
             event.kind,
@@ -569,6 +615,7 @@ def _build_dispatcher(
     proposer: RoleAdapter | None,
     implementer: RoleAdapter | None,
     naysayer: RoleAdapter | None,
+    roster: Mapping[str, Role] | None = None,
 ) -> tuple[McpToolCaller, InMemoryAdapterRegistry, Dispatcher]:
     """Shared composition root for the watcher loop and the conductor.
 
@@ -579,6 +626,10 @@ def _build_dispatcher(
     the intake differs (a ``ChatroomWatcher`` vs the serial
     :class:`~spirrow_mindwire.conductor.core.Conductor`). Raises ``SystemExit`` if ``loop.repo_dir``
     is unset and an SDK adapter must be built from config.
+
+    ``roster`` reaches the gateway, which needs it to send a ``STOP:`` line's ``disposition``
+    (T-next-line-carries-who-not-why Slice 3): the wake is resolved on the roster. The conductor
+    passes its roster; the watcher loop passes none and so never sends a disposition.
     """
     cfg = settings.loop
     if mcp is None:
@@ -610,6 +661,7 @@ def _build_dispatcher(
                 model=cfg.role_model,
                 cli_path=role_cli_path,
                 ledger_mcp=mcp,
+                ledger_journal_dir=settings.paths.logs_dir / JOURNAL_DIR_NAME,
             )
         if naysayer is None:
             # No model / cli_path here, by design: the naysayer's independence is
@@ -618,7 +670,7 @@ def _build_dispatcher(
             naysayer = build_naysayer(repo_dir, obligations=obligations)
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
-    gateway = MagickitChatroomGateway(mcp)
+    gateway = MagickitChatroomGateway(mcp, roster=roster)
     # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32 / D-39: the
     # dispatcher writes `.mindwire/pin` before every implementer / naysayer
     # dispatch. The pin lives at ``<repo_root>/.mindwire/pin``, so the writer
@@ -641,11 +693,18 @@ def _build_dispatcher(
         # unset (PR-review #335 round-2: the two must not be conflated).
         repo = Path(cfg.repo_dir)
         pin_writer = SpecPinWriter(pin_target_dir=repo, spec_source_root=repo)
+    # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-1): refuse to dispatch
+    # any role onto ``loop.repo_dir`` while it is dirty, mid-operation, or off its default branch.
+    # Same condition as the pin writer: no repo_dir = adapters were injected by a test.
+    clone_guard: CloneGuard | None = None
+    if cfg.repo_dir is not None:
+        clone_guard = CloneGuard(Path(cfg.repo_dir))
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,
         event_sink=_log_event_sink,
         spec_pin_writer=pin_writer,
+        clone_guard=clone_guard,
     )
     return mcp, registry, dispatcher
 
@@ -762,6 +821,27 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
+class _PerCallReviewSource:
+    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+
+    Same shape and token as :class:`_PerCallCheckRollupSource`: the resume compares the reviews
+    against the rollup, so both must be read through the credential the gate itself uses.
+
+    Unlike the rollup source this one RAISES on a failed read (``fetch_pr_reviews_strict``):
+    the resume must tell "no gate review on the head" (CONTRADICTED → the human) apart from
+    "GitHub could not be asked" (UNAVAILABLE → retry next tick), and the fail-soft read
+    collapses the two into ``[]`` (Bohr msg-6318).
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_reviews_strict(pr)
+
+
 def build_conductor(
     settings: MindwireSettings,
     *,
@@ -774,6 +854,8 @@ def build_conductor(
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
+    run_phase: RunPhase | None = None,
+    gate_only: bool = False,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -809,7 +891,12 @@ def build_conductor(
         )
 
     mcp, registry, dispatcher = _build_dispatcher(
-        settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+        settings,
+        mcp=mcp,
+        proposer=proposer,
+        implementer=implementer,
+        naysayer=naysayer,
+        roster=dict(cond_cfg.roster),
     )
     if pr_review_driver is None:
         pr_review_driver = build_pr_review_driver(settings.naysayer_gating)
@@ -846,6 +933,11 @@ def build_conductor(
     # One INFO line each, on every start, whatever the value (DECIDED 2e-1b, the msg-4748
     # recurrence fix): the Decider sat at backend=off for days with nothing in the log to say so.
     # ``built`` is whether a Decider object exists — the only fact the hook acts on.
+    if dec_cfg.tierc.mode == "bounce" and settings.tierc_gate.mode != "enforce":
+        logger.warning(
+            'decider: tierc=bounce has no effect without [tierc_gate] mode = "enforce" '
+            "(the Jev bounce shares the gate's RETRY store); acting as shadow"
+        )
     logger.info(
         "decider: backend=%s tierc=%s questions=%s built=%s",
         resolve_decider_backend(dec_cfg.backend),
@@ -885,6 +977,12 @@ def build_conductor(
             # already a structural off-switch that does not need a flag — an unreadable rollup
             # degrades to the pre-wiring path (fire the gate) inside ``Conductor._admit``.
             rollup_source=_PerCallCheckRollupSource(),
+            # Gate resume (T-sweep-starves-deep-candidates, Bohr msg-6316 / msg-6318): what
+            # checks an RC relay left at the head against GitHub before the implementer is
+            # resumed from it. Wired unconditionally like the rollup; an unreadable answer is
+            # UNAVAILABLE (retry next tick), never VERIFIED.
+            review_source=_PerCallReviewSource(),
+            review_login=settings.naysayer_gating.review_login,
             decider=decider,
             # Adapter-error side channel (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
@@ -898,6 +996,14 @@ def build_conductor(
             retry_of=retry_of,
             # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
             tierc_gate=tierc_gate,
+            # §2.6 decision log extraction (T-tier-c-admission-gate U4a): always wired, in every
+            # [tierc_gate] mode — it records proposer / implementer choices, not gate decisions.
+            decisions_log_path=resolve_tier_c_decisions_log_path(settings),
+            # Wall-clock budget (msg-5498 W-1): the phase the run_timeout event reports.
+            run_phase=run_phase,
+            # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1'): ``--gate-only``
+            # from the sweep's gate-lane launch. ``False`` for a hand run and a role-lane launch.
+            gate_only=gate_only,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -927,6 +1033,7 @@ async def run_conductor(
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
+    gate_only: bool = False,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -956,17 +1063,97 @@ async def run_conductor(
 
     T-retry-once-before-quarantine D-4: ``retry_of`` is the parsed ``--retry-of`` value, the failed
     launch this run re-fires. Handed to the Conductor unchanged; ``None`` changes no prompt.
+
+    T-sweep-starves-deep-candidates PR-B: ``gate_only`` is ``--gate-only``, passed by the sweep on
+    gate-lane launches only. The Conductor then stops (``slice_end``) right before spawning the
+    implementer on an RC relay / R4 ci-route, leaving that post for the role lane.
+
+    Wall-clock budget (msg-5496 / msg-5498 W-1): everything above runs inside
+    :func:`~spirrow_mindwire.conductor.run_budget.run_with_budget`, bounded by
+    ``[conductor].run_budget_s``. On expiry the ``conductor.run_timeout`` line is written, the run
+    is cancelled, and a stop notice is posted (exit 0) or, if it cannot be posted within
+    ``RELAY_POST_BUDGET_S``, :class:`~spirrow_mindwire.conductor.run_budget.RunTimeoutError` is
+    raised (exit 5). The budgets are checked first, before anything is read or spawned.
     """
+    cond_cfg = settings.conductor
+    validate_budgets(
+        run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
+    )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
+    run_phase = RunPhase()
+    project = settings.loop.project
+    thread_id = cond_cfg.task_thread_id
+    chatroom = mcp
+
+    async def _body() -> ConductorOutcome:
+        return await _run_conductor_once(
+            settings,
+            mcp=chatroom,
+            stop_slot=stop_slot,
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
+            retry_of=retry_of,
+            run_phase=run_phase,
+            gate_only=gate_only,
+        )
+
+    outcome, timed_out = await run_with_budget(
+        _body,
+        budget_s=cond_cfg.run_budget_s,
+        run_phase=run_phase,
+        project=project,
+        thread=thread_id,
+    )
+    if timed_out is None:
+        assert outcome is not None
+        return outcome
+    # The ``conductor.run_timeout`` line is already in the log (run_with_budget wrote it at the
+    # deadline). Producer declaration: see ``post_run_timeout_notice`` — reader = the thread's
+    # human; fallback = disposition (3), exit 5 via RunTimeoutError.
+    posted = await post_run_timeout_notice(
+        mcp, project=project, thread_id=thread_id, event=timed_out, author=CONDUCTOR_RELAY_AUTHOR
+    )
+    # Same ``conductor stopped:`` line shape as ``Conductor._stop``; HUMAN for the same reason the
+    # spawn-timeout give-up uses it (a person has to act; Stage 1 SKIPs the ``NEXT: human`` head).
+    # ``rounds`` counts the round that was cut off: see ``RunPhase.rounds_started``.
+    stopped = ConductorOutcome(
+        rounds=run_phase.rounds_started,
+        stop_reason=StopReason.HUMAN,
+        last_msg_id=posted,
+        forced_naysayer_turns=0,
+    )
+    logger.info(
+        "conductor stopped: reason=%s rounds=%d forced_naysayer=0 "
+        "forced_naysayer_saveable=0 last_msg=%s",
+        stopped.stop_reason.value,
+        stopped.rounds,
+        posted,
+    )
+    return stopped
+
+
+async def _run_conductor_once(
+    settings: MindwireSettings,
+    *,
+    mcp: McpToolCaller,
+    stop_slot: ConductorStopSlot | None,
+    launches_same_head: int,
+    launch_head_msg_id: str | None,
+    retry_of: RetryOf | None,
+    run_phase: RunPhase,
+    gate_only: bool = False,
+) -> ConductorOutcome:
+    """The body :func:`run_conductor` bounds: resolve, preflight, build, run, tear down."""
     project = settings.loop.project
     thread_id = settings.conductor.task_thread_id
-    resolution = await resolve_launch(
-        mcp=mcp,
-        project=project,
-        thread_id=thread_id,
-        repo_dir=settings.loop.repo_dir,
-    )
+    with run_phase.enter("launch.resolve"):
+        resolution = await resolve_launch(
+            mcp=mcp,
+            project=project,
+            thread_id=thread_id,
+            repo_dir=settings.loop.repo_dir,
+        )
     if resolution.stand_down is not None:
         posted = await post_stand_down_notice(
             mcp, project=project, thread_id=thread_id, event=resolution.stand_down
@@ -996,6 +1183,8 @@ async def run_conductor(
         launches_same_head=launches_same_head,
         launch_head_msg_id=launch_head_msg_id,
         retry_of=retry_of,
+        run_phase=run_phase,
+        gate_only=gate_only,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1017,7 +1206,8 @@ async def run_conductor(
         )
         return outcome
     finally:
-        await cond.aclose()
+        with run_phase.enter("teardown"):
+            await cond.aclose()
 
 
 def _preflight(cfg: Stage3LoopConfig) -> None:
@@ -1166,6 +1356,17 @@ def main() -> None:
             "roles in RETRY_NOTICE_ROLES get a check-before-acting notice on round 0"
         ),
     )
+    # T-sweep-starves-deep-candidates PR-B (Bohr msg-6313 §1' / msg-6316). Written by the sweep on
+    # gate-lane launches only. Absent = the run goes as far as it always did, so a hand-run
+    # conductor and a role-lane launch are unchanged.
+    parser.add_argument(
+        "--gate-only",
+        action="store_true",
+        help=(
+            "conductor: gate-lane run — stop (slice_end) before spawning the implementer on a "
+            "REQUEST_CHANGES relay or R4 ci-route; the next tick resumes it in the role lane"
+        ),
+    )
     args = parser.parse_args()
     settings = load_settings()
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
@@ -1180,6 +1381,7 @@ def main() -> None:
                     launches_same_head=args.launches_same_head,
                     launch_head_msg_id=args.launch_head_msg_id or None,
                     retry_of=parse_retry_of(args.retry_of),
+                    gate_only=args.gate_only,
                 )
             )
         else:
@@ -1215,6 +1417,22 @@ def main() -> None:
             env_exc.status_code,
         )
         sys.exit(2)
+    except DirtyCloneError as dirty_exc:
+        # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
+        # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
+        # reach the exit-1 path below (whose stop line the wrapper turns into retry → quarantine).
+        # A dedicated exit code — not 2, which the wrapper reads as a GitHub credential fault even
+        # when the payload row is unreadable (Einstein msg-5776 #2). The payload row only enriches
+        # the notification; the wrapper's do-not-quarantine decision rides on the exit code.
+        emit_dirty_clone_payload(dirty_exc)
+        logger.warning(
+            "dirty-clone exit=%d: repo_dir=%s reason=%s head=%s",
+            DIRTY_CLONE_EXIT_CODE,
+            dirty_exc.repo_dir,
+            dirty_exc.reason.value,
+            dirty_exc.head,
+        )
+        sys.exit(DIRTY_CLONE_EXIT_CODE)
     except BaseException as exc:
         # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
         # second copy). Sequenced carefully because Python's default
@@ -1289,3 +1507,12 @@ __all__ = [
     "run_conductor",
     "run_loop",
 ]
+
+
+# `python -m spirrow_mindwire.loop_runner` is how deploy/run-conductor.ps1 launches the daemon
+# (T-composer-entrypoint-missing-drops-decision-cards D-1'). Going through the venv's python.exe
+# instead of `.venv\Scripts\mindwire-loop.exe` means a running conductor no longer holds the
+# package's console-script exe open, so `uv sync --reinstall-package spirrow-mindwire` cannot stop
+# part-way on `os error 32` against it and leave other entry points missing.
+if __name__ == "__main__":  # pragma: no cover
+    main()

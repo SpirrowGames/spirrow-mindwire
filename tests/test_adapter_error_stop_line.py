@@ -265,6 +265,8 @@ def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
         launch_head_msg_id: str | None = None,
         # T-retry-once-before-quarantine D-4: and the sweep's --retry-of (None = not a retry).
         retry_of: RetryOf | None = None,
+        # T-sweep-starves-deep-candidates PR-B: and --gate-only (False = not a gate-lane run).
+        gate_only: bool = False,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)

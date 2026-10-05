@@ -98,7 +98,7 @@ $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
-                  'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
+                  'Format-DurationDigest', 'Get-ParkedRowTag', 'Get-StarvedKeys', 'New-DailyDigest',
                   'ConvertTo-UtcInstant',
                   'Test-DigestDelivered', 'Test-DigestFullSuccess',
                   'Get-DigestPeriod', 'Test-DigestDeliveryDue',
@@ -107,7 +107,11 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   # For the PR-gate regression block below (alert-path spam-loop pin,
                   # degraded-fallback class-propagation pin).
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged',
-                  'Resolve-DigestSendResult') {
+                  'Resolve-DigestSendResult',
+                  # T-next-line-carries-who-not-why Slice 3: the stop-reason line.
+                  'Get-StopClassDigestLines',
+                  # Slice 3b S3b-1: sweep.json `projects` and the declared-only park-wake scan.
+                  'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -434,12 +438,14 @@ Write-Host "F-1 — every non-empty row section keeps a floor of one row (msg-24
 # attaches to a quarantine row (it is part of the row above it, not a row of its own).
 function Get-DigestRowCounts {
     param([string]$Digest)
-    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; starved = 0; launchwait = 0 }
+    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; stalehuman = 0; starved = 0; launchwait = 0 }
     $sec = $null
     foreach ($l in ($Digest -split "`n")) {
         if ($l -match '^隔離中: ')       { $sec = 'quarantine'; continue }
         if ($l -match '^判断待ち: ')     { $sec = 'parked'; continue }
         if ($l -match '^\s+取得失敗: ')  { $sec = 'fetcherr'; continue }
+        # msg-5889 D-1: the 停止中 section sits between 取得失敗 and 飢餓.
+        if ($l -match '^停止中（')        { $sec = 'stalehuman'; continue }
         if ($l -match '^飢餓 ')           { $sec = 'starved'; continue }
         # T-sweep-starves-deep-candidates: the section after 飢餓. Its rows are not 飢餓 rows.
         if ($l -match '^起動待ち飢餓 ')   { $sec = 'launchwait'; continue }
@@ -833,6 +839,208 @@ CheckTrue "100-entry ParkedPollErrors spike still fits within budget" ($digest_e
 CheckTrue "count line still names the true total (100)" ($digest_errspike -match '取得失敗: 100 件') $digest_errspike.Substring(0, [Math]::Min(400, $digest_errspike.Length))
 CheckTrue "budget-forced truncation surfaces via `+N 件（省略）` under the fetch-error section" `
     ($digest_errspike -match '\+\d+ 件（省略）') $digest_errspike
+
+# =============================================================================================
+# 停止中 section — T-sweep-intake-and-quarantine-stalls msg-5889 D-1 (Operator Board §F.1 row 3,
+# RES-A-GAP): threads whose last message still ends in NEXT: human and has not moved for N hours,
+# oldest first, age derived from $Now every render, unreadable timestamps listed as 経過不明.
+# =============================================================================================
+Write-Host ""
+Write-Host "New-DailyDigest — 停止中 (末尾 NEXT: human のまま N h 以上) section (msg-5889 D-1)"
+
+$shNow = [datetime]::Parse('2026-10-02T00:00:00Z').ToUniversalTime()
+function New-ShRow {
+    param([string]$Tid, $At, [string]$Lane = 'decision', [string]$Task = '', [switch]$NoProperty)
+    $h = [ordered]@{ key = "p/$Tid"; project = 'p'; thread_id = $Tid; head_msg_id = "msg-$Tid";
+                     token = 'human'; lane = $Lane; operator_task = $Task; protocol_violation = $false }
+    if (-not $NoProperty) { $h['last_msg_at'] = $At }
+    return [PSCustomObject]$h
+}
+function Get-ShSection {
+    param([string]$Digest)
+    $out = @(); $in = $false
+    foreach ($l in ($Digest -split "`n")) {
+        if ($l -match '^停止中（') { $in = $true; $out += $l; continue }
+        if ($in -and ($l -eq '' -or $l -match '^飢餓 ')) { break }
+        if ($in) { $out += $l }
+    }
+    return ,$out
+}
+
+# 0 件: the header is still emitted, with (該当なし), and it names the threshold.
+$shEmpty = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked @()
+$sec0 = Get-ShSection $shEmpty
+Check "0 件 still emits the header with the default 24h threshold" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 0 件' $sec0[0]
+Check "0 件 says (該当なし)" '  (該当なし)' $sec0[1]
+CheckTrue "the header line does not start with 'NEXT:' (would read as a handoff)" `
+    (-not (($shEmpty -split "`n") | Where-Object { $_ -match '^\s*NEXT:' })) $shEmpty
+
+# Threshold, ordering, unknown age, legacy rows.
+$shParked = @(
+    (New-ShRow -Tid 'T-young'   -At '2026-10-01T14:00:00Z')                 # 10h  → not listed
+    (New-ShRow -Tid 'T-30h'     -At '2026-09-30T18:00:00Z')                 # 30h
+    (New-ShRow -Tid 'T-495h'    -At '2026-09-11T09:00:00Z')                 # 495h → oldest dated
+    (New-ShRow -Tid 'T-exact'   -At '2026-10-01T00:00:00Z')                 # exactly 24h → listed (≥)
+    (New-ShRow -Tid 'T-null'    -At $null)                                  # unknown → listed first
+    (New-ShRow -Tid 'T-garbage' -At 'not a time')                           # unknown → listed first
+    (New-ShRow -Tid 'T-legacy'  -At $null -NoProperty)                      # no property → not considered
+    (New-ShRow -Tid 'T-op'      -At '2026-09-29T00:00:00Z' -Lane 'operator_work' -Task 'clear quarantine')
+    (New-ShRow -Tid 'T-mis'     -At '2026-09-28T00:00:00Z' -Lane 'misroute')
+)
+$shDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked $shParked
+$sec = Get-ShSection $shDigest
+Check "header counts only rows at or past N (and unknown-age rows)" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 7 件' $sec[0]
+$rowKeys = @($sec | Select-Object -Skip 1 | ForEach-Object { ($_.Trim() -split '\s+')[0] })
+Check "rows are unknown-age first, then oldest first" `
+    'p/T-garbage,p/T-null,p/T-495h,p/T-mis,p/T-op,p/T-30h,p/T-exact' ($rowKeys -join ',')
+CheckTrue "a 10h-old park is not listed under a 24h threshold" (-not ($sec -match 'T-young')) ($sec -join "`n")
+CheckTrue "a row without a last_msg_at property is not considered" (-not ($sec -match 'T-legacy')) ($sec -join "`n")
+CheckTrue "unknown age is said out loud" (@($sec -match 'p/T-null .*経過不明').Count -eq 1) ($sec -join "`n")
+CheckTrue "dated rows carry the age derived from Now (495h → 20d 15h)" (@($sec -match 'p/T-495h .*20d 15h').Count -eq 1) ($sec -join "`n")
+CheckTrue "operator lane is tagged as in 判断待ち" (@($sec -match 'p/T-op .*\[operator 作業\] clear quarantine').Count -eq 1) ($sec -join "`n")
+CheckTrue "misroute lane is tagged as in 判断待ち" (@($sec -match 'p/T-mis .*\[宛先誤り').Count -eq 1) ($sec -join "`n")
+CheckTrue "判断待ち is unchanged by the new section (7 decisions + 1 operator + 1 misroute)" `
+    ($shDigest -match '判断待ち: 7 件（ほか operator 作業 1 件 / 宛先誤り 1 件）') $shDigest
+
+# The age is derived from $Now on every render (nothing is persisted): the same input rendered a
+# day earlier drops the rows that were not yet N hours old then.
+$shEarlier = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow.AddHours(-24) -LiveKeys @() -HumanParked $shParked
+Check "a render 24h earlier lists fewer rows (T-30h and T-exact were under 24h then)" `
+    '停止中（末尾 NEXT: human のまま 24h 以上、古い順）: 5 件' (Get-ShSection $shEarlier)[0]
+
+# The threshold is a parameter, and the header names it.
+$sh72 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @() -HumanParked $shParked -StaleHumanThreshold ([TimeSpan]::FromHours(72))
+Check "a 72h threshold is named in the header and filters accordingly" `
+    '停止中（末尾 NEXT: human のまま 72h 以上、古い順）: 5 件' (Get-ShSection $sh72)[0]
+
+# The section has a floor in the reserve ladder like every other row-emitting section: a large
+# 停止中 list plus a large 判断待ち list and a 飢餓 list must all fit, each with at least one row.
+$shMany = @()
+for ($i = 0; $i -lt 60; $i++) {
+    $shMany += New-ShRow -Tid ("T-stale-human-with-a-realistically-long-thread-name-{0:D3}" -f $i) -At $shNow.AddHours(-30 - $i).ToString('o')
+}
+$shStarvedState = @{}
+for ($i = 0; $i -lt 10; $i++) {
+    $shStarvedState["p/T-starved-$i"] = @{ last_evaluated_at = $shNow.AddDays(-3).ToString('o'); first_seen_at = $shNow.AddDays(-9).ToString('o') }
+}
+$shBudgeted = New-DailyDigest -QuarantineState @{} -EvaluatedState $shStarvedState -HeadsByProject @{} -ControlByProject @{} `
+    -Now $shNow -LiveKeys @($shStarvedState.Keys) -HumanParked $shMany -Budget $script:DigestBudget
+CheckTrue "60 parked + 60 停止中 + 10 飢餓 fit the shipped budget" ($shBudgeted.Length -le $script:DigestBudget) $shBudgeted.Length
+$shRows = Get-DigestRowCounts -Digest $shBudgeted
+CheckTrue "判断待ち keeps its floor" ($shRows.parked -ge 1) ($shRows | Out-String)
+CheckTrue "停止中 keeps its floor" ($shRows.stalehuman -ge 1) ($shRows | Out-String)
+CheckTrue "飢餓 keeps its floor after 停止中" ($shRows.starved -ge 1) ($shRows | Out-String)
+CheckTrue "停止中 header keeps the true total (60) when rows are dropped" ($shBudgeted -match '停止中（[^）]*）: 60 件') $shBudgeted
+
+# =============================================================================================
+# T-next-line-carries-who-not-why Slice 3 — the stop-reason line (magickit msg-1015 v11 §1).
+# =============================================================================================
+Write-Host ""
+Write-Host "Get-StopClassDigestLines — why each open NEXT: none thread stopped"
+
+# Captured the way the caller binds it (a [string[]] parameter / a variable), which unrolls the
+# `, @()` the function returns; wrapping the call in @() would count the wrapper itself.
+$scNone = Get-StopClassDigestLines -ByProject @{}
+Check "no project reported and none failed -> no lines (digest unchanged)" 0 $scNone.Count
+$scA = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 2; blocked_on = 1; unclassified = 2; human_close = 1 }; unclassified = @('T-a', 'T-b') }
+$scB = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 1; human_close = 0 }; unclassified = @('T-c') }
+$scLines = Get-StopClassDigestLines -ByProject @{ 'p1' = $scA; 'p2' = $scB }
+Check "counts are summed over projects" `
+    '停止理由（NEXT: none）: 決着 2 / 着手条件待ち 1 / 未分類 3 / 人の close 1' $scLines[0]
+Check "unclassified threads are named project/thread" '  未分類: p1/T-a, p1/T-b, p2/T-c' $scLines[1]
+Check "the block ends with a blank separator" '' $scLines[2]
+$scFailed = Get-StopClassDigestLines -ByProject @{ 'p1' = $scB } -Failed @('p9')
+CheckTrue "a project whose tick failed is named, not counted as zero" ($scFailed[0] -match '取得失敗: p9') $scFailed[0]
+$scLong = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 40; human_close = 0 }; unclassified = @(0..39 | ForEach-Object { "T-a-long-thread-name-$_" }) }
+$scLongLines = Get-StopClassDigestLines -ByProject @{ 'p' = $scLong }
+CheckTrue "the unclassified list is capped at 300 chars" ($scLongLines[1].Length -le 300) $scLongLines[1].Length
+$scDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @() -StopClassLines $scLines
+CheckTrue "New-DailyDigest renders the stop-reason line" ($scDigest -match '停止理由（NEXT: none）: 決着 2') $scDigest
+$scPlain = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @()
+CheckTrue "without -StopClassLines the digest has no stop-reason line" (-not ($scPlain -match '停止理由')) $scPlain
+
+# =============================================================================================
+# Slice 3b S3b-1 (Bohr msg-6525) — projects declared in sweep.json are scanned with no sweep entry.
+# =============================================================================================
+Write-Host ""
+Write-Host "Get-SweepDeclaredProjects / Invoke-DeclaredProjectsParkWake — the sweep.json projects key"
+
+function Invoke-DeclaredRead {
+    param([string]$Json)
+    $tmp = New-TemporaryFile
+    try {
+        [System.IO.File]::WriteAllText($tmp.FullName, $Json)
+        return Get-SweepDeclaredProjects -Path $tmp.FullName
+    }
+    finally { Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue }
+}
+$cand = '"candidates": [ { "project": "p-cand", "thread_id": "t", "repo_dir": "C:/x" } ]'
+
+$dpAbsent = Invoke-DeclaredRead "{ $cand }"
+Check "no projects key -> no declared project" 0 @($dpAbsent.projects).Count
+Check "no projects key -> no error (behaviour unchanged)" $null $dpAbsent.error
+$dpArrayRoot = Invoke-DeclaredRead '[ { "project": "p", "thread_id": "t", "repo_dir": "C:/x" } ]'
+Check "a legacy array root reads as no projects" 0 @($dpArrayRoot.projects).Count
+Check "a legacy array root is not an error" $null $dpArrayRoot.error
+$dpOk = Invoke-DeclaredRead "{ ""projects"": [ ""spirrow-magickit"", "" p-cand "", ""spirrow-magickit"" ], $cand }"
+Check "projects are read, trimmed and de-duplicated" 'p-cand,spirrow-magickit' ((@($dpOk.projects)) -join ',')
+Check "a well-formed projects key has no error" $null $dpOk.error
+$dpOne = Invoke-DeclaredRead "{ ""projects"": [ ""spirrow-magickit"" ], $cand }"
+Check "a one-element projects array is read (not unrolled into a string)" 'spirrow-magickit' ((@($dpOne.projects)) -join ',')
+Check "a one-element projects array has no error" $null $dpOne.error
+$dpEmpty = Invoke-DeclaredRead "{ ""projects"": [], $cand }"
+Check "an empty projects array is not an error" $null $dpEmpty.error
+foreach ($bad in @('"spirrow-magickit"', '{ "a": 1 }', 'null', '[ "ok", "" ]', '[ "ok", 3 ]')) {
+    $dpBad = Invoke-DeclaredRead "{ ""projects"": $bad, $cand }"
+    CheckTrue "a malformed projects key ($bad) is reported, not read as empty" ($null -ne $dpBad.error) ($dpBad | Out-String)
+    Check "a malformed projects key ($bad) scans nothing" 0 @($dpBad.projects).Count
+}
+$dpDeep = Invoke-DeclaredRead "{ ""projects"": [ ""ok"", { ""a"": { ""b"": { ""c"": { ""d"": { ""e"": ""deep-leaf"" } } } } } ], $cand }"
+CheckTrue "a nested non-string entry is shown in full in the error (no depth-2 truncation)" `
+    (($dpDeep.error -match 'deep-leaf') -and ($dpDeep.error -notmatch 'System\.Collections')) $dpDeep.error
+
+# The scan, with the three probes it calls stubbed. Each tick JSON has the shape park_wake prints.
+$script:parkWakeCalls = @()
+$script:controlFor = @{ 'p-held' = [PSCustomObject]@{ desired_state = 'hold'; observed_state = 'hold' } }
+function Invoke-ControlProbe { param([string]$Project) return $script:controlFor[$Project] }
+function Invoke-ParkWakeTick {
+    param([string]$Project)
+    $script:parkWakeCalls += $Project
+    if ($Project -eq 'p-broken') { return $null }   # listing unreadable -> the wrapper returns $null
+    return [PSCustomObject]@{
+        counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 1; human_close = 0 }
+        unclassified = @('T-none-without-stop')
+    }
+}
+$scan = Invoke-DeclaredProjectsParkWake `
+    -Declared @{ projects = @('p-cand', 'p-broken', 'p-declared', 'p-held'); error = $null } `
+    -CandidateProjects @('p-cand')
+Check "only declared projects no candidate names are ticked, held ones skipped" `
+    'p-broken,p-declared' (($script:parkWakeCalls | Sort-Object) -join ',')
+$scanLines = Get-StopClassDigestLines -ByProject $scan.byProject -Failed $scan.failed
+CheckTrue "a STOP-less NEXT: none in a declared-only project is counted unclassified" `
+    ($scanLines[0] -match '未分類 1') $scanLines[0]
+Check "and named by project/thread" '  未分類: p-declared/T-none-without-stop' $scanLines[1]
+CheckTrue "a declared project whose listing failed is named as not scanned" `
+    ($scanLines[0] -match '取得失敗: p-broken') $scanLines[0]
+$script:parkWakeCalls = @()
+$scanBad = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error = 'bad' } -CandidateProjects @('p-cand')
+Check "a malformed projects key ticks nothing" 0 $script:parkWakeCalls.Count
+CheckTrue "a malformed projects key is named in the digest" `
+    ((Get-StopClassDigestLines -ByProject $scanBad.byProject -Failed $scanBad.failed)[0] -match '取得失敗: sweep.json:projects') ''
+$script:parkWakeCalls = @()
+$scanNone = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error = $null } -CandidateProjects @('p-cand')
+Check "no declared project -> nothing ticked" 0 $script:parkWakeCalls.Count
+Check "no declared project -> nothing failed" 0 @($scanNone.failed).Count
+Check "no declared project -> digest unchanged" 0 (Get-StopClassDigestLines -ByProject $scanNone.byProject -Failed $scanNone.failed).Count
 
 if ($script:failures -gt 0) {
     Write-Host ""

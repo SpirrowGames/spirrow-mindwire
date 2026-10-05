@@ -35,9 +35,10 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    ``state_wire`` — the exact ``state`` string sent to Lexora — so an evaluation weeks later reads
    what Jev saw instead of rebuilding it from a thread that has since grown;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
-   ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
-   refused at build time, so in shadow it never runs. ``forced_naysayer`` and ``spawn_blocked``
-   rows are record-only in every mode.
+   ``dr.actionable_verdict`` only (msg-4184). ``annotate`` is refused at build time. ``bounce`` is
+   acted on by the Conductor (``_enforce_tierc_gate``) from the result this hook returns; the hook
+   itself never acts. ``forced_naysayer`` and ``spawn_blocked`` rows are record-only in every
+   mode.
 
 **Fail loud, not fail open (Einstein msg-4240 advisory; PR-gate observation on #348).** A routing
 combination the mapping does not name raises :class:`RoutingInvariantError` (an
@@ -49,7 +50,9 @@ the thread.
 
 **Monotonicity (D20).** Nothing here returns a new stop, and the gate's admit / bounce is never
 used for stop, notification or routing — only as Decider input and a log column. The hook returns
-the result only so a caller/test can observe it; the Conductor discards it. Any exception is
+the result; the Conductor reads it only under ``[decider.tierc] mode = "bounce"`` with the gate
+enforced, and only to bounce a label-admitted turn once to its author (a ``RETRY:`` always reaches
+the human). Any exception is
 caught and logged — it must never reach the stop decision.
 
 **Reader of the log line.** The payload is a structured ``logger.info`` record under the logger
@@ -539,12 +542,13 @@ async def run_tierc_hook(
     # turn ``_route`` stopped at the human (``routed == "stop"``) may be acted on; a forced
     # consult row, and a spawn-blocked dead end (msg-4280 DECIDED 2c-4), is record-only in every
     # mode (acting before the forced consult is a
-    # separate Takahito decision, like ``skip_naysayer_when_confirmed``). annotate / bounce are
-    # refused at build time, so under shadow this branch is structurally dead. Before bounce is
-    # enabled on tierc-v2 its entry condition must be redefined (v2 has no ``fired_reason``,
-    # msg-4380 Δ4).
+    # separate Takahito decision, like ``skip_naysayer_when_confirmed``). ``bounce`` is acted on by
+    # the Conductor, not here: it needs the enforced gate's RETRY store and its notice/dispatch
+    # path (``Conductor._enforce_tierc_gate``), and this hook stays an observer (D20). Its tierc-v2
+    # entry condition (msg-4380 Δ4) is: label-admitted by the gate, not a RETRY admission, and an
+    # actionable ``LIKELY_NOT``. ``annotate`` is refused at build time and has no acting half.
     av = dr.actionable_verdict
-    if routed == ROUTED_STOP and decider.tierc_mode in ACTING_TIERC_MODES and av is not None:
+    if routed == ROUTED_STOP and decider.tierc_mode == "annotate" and av is not None:
         logger.warning(
             "decider tierc mode %r has no acting implementation yet; verdict %s not acted on",
             decider.tierc_mode,

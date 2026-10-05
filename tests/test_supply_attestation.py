@@ -80,6 +80,7 @@ def _record(probe: str) -> AttestationRecord:
         expected="gemini",
         route="host:8110",
         probe=probe,
+        scope="probe",
         at=datetime.now(UTC),
     )
 
@@ -88,14 +89,23 @@ def _record(probe: str) -> AttestationRecord:
 async def test_consecutive_naysayer_turns_carry_different_probes(
     tmp_path: Path, obligations: ObligationsManifest
 ) -> None:
-    """D-2's own acceptance criterion, stated verbatim by the proposer."""
+    """D-2's own acceptance criterion, stated verbatim by the proposer.
+
+    Strengthened by T-per-turn-backend-attestation: what each verdict carries is
+    now the turn's OWN rows (``scope=turn``), never the preflight probe's — so the
+    stamped ids are the turn rows 101/102, not the probes 1/2/3.
+    """
     from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
 
     probes = iter([_record("cost-row#1"), _record("cost-row#2"), _record("cost-row#3")])
-    seen: list[str | None] = []
+    turn_row_ids = iter([101, 102])
+    seen: list[tuple[str, str] | None] = []
 
     async def _preflight() -> AttestationRecord:
         return next(probes)
+
+    async def _turn_rows(trace_id: str) -> list[dict[str, Any]]:
+        return [{"id": next(turn_row_ids), "trace_id": trace_id, "backend": "gemini"}]
 
     adapter = NaysayerSdkAdapter(
         cwd=tmp_path,
@@ -103,11 +113,12 @@ async def test_consecutive_naysayer_turns_carry_different_probes(
         inference_base_url="http://lexora.local:8110",
         client_factory=lambda options: _FakeSdkClient(),
         preflight=_preflight,
+        turn_rows=_turn_rows,
     )
 
     async def _on_reply(draft: ReplyDraft) -> None:
         record = adapter.attestation_record(handle)
-        seen.append(None if record is None else record.probe)
+        seen.append(None if record is None else (record.probe, record.scope))
 
     async def _on_log(event: Any) -> None: ...
 
@@ -121,8 +132,8 @@ async def test_consecutive_naysayer_turns_carry_different_probes(
     for i in (1, 2):
         await adapter.deliver_event(handle, _new_message(f"msg-{i}"))
 
-    assert seen == ["cost-row#2", "cost-row#3"], (
-        "each verdict must carry the probe taken for it, not the spawn's"
+    assert seen == [("cost-row#101", "turn"), ("cost-row#102", "turn")], (
+        "each verdict must carry its own turn's rows, not a probe's or the spawn's"
     )
     assert seen[0] != seen[1]
 

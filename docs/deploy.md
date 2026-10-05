@@ -270,7 +270,7 @@ the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
-**Merging is not deploying.** The task runs `uv run mindwire-loop` from this checkout — the venv holds
+**Merging is not deploying.** The task runs the loop (`uv run --no-sync python -m spirrow_mindwire.loop_runner`) from this checkout — the venv holds
 an *editable* install, so the working tree IS the running module — and nothing pulled it. A merged fix
 could therefore sit undeployed indefinitely, with GitHub showing it merged and the task history
 showing exit 0. The only way to notice was to compare `git log` against `origin/main` by hand.
@@ -298,6 +298,15 @@ Three rules are load-bearing:
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
   and a fast-forward cannot conflict with them.
+- **The venv is synced by `sync-repo.ps1` and nowhere else** (T-composer-entrypoint-missing-drops-
+  decision-cards D-2'). The loop and the decision composer both launch as
+  `uv run --no-sync python -m <module>`, so nothing syncs mid-tick, and no `.venv\Scripts\mindwire-*.exe`
+  is either needed or held open. `sync-repo.ps1` runs `uv sync --locked` whenever the SHA-256 over
+  `pyproject.toml` + `uv.lock` differs from the one recorded by the last *successful* sync
+  (`<data_dir>/state/venv-sync.json`), and counts a sync as successful only if the two launched
+  modules then import. A failed sync records nothing, so every tick retries it. It reports
+  `status=failed` with `deps_hash`, and the alert is deduplicated on that hash. `--locked` never
+  rewrites `uv.lock`: a stale lock fails loudly and is fixed by committing a regenerated lock.
 - **A sync failure is not a sweep failure.** One unreachable GitHub must not stop the loop; it keeps
   running the code it has, which is known-good and merely possibly old.
 
@@ -481,6 +490,18 @@ The code is in `deploy/lib/SweepFairness.ps1`, and the tests are in `tests/Test-
   and a gate that did work does not stop the sweep. After the gate lane, role turns run as before:
   the first one that did work ends the sweep. Gate failures count toward the same K-budget, and
   reaching K stops both lanes.
+- **Gate-only slice.** A gate-lane launch passes `--gate-only` to the conductor (role-lane launches
+  and hand runs do not). When the gate returns REQUEST_CHANGES, or CI is red on the head (R4), the
+  conductor posts the relay (or the ci-route) and stops on `slice_end` instead of starting the
+  implementer. The post stays the head, so the next tick decides it LAUNCH in the role lane and the
+  gate resume restarts the implementer from it, after checking GitHub. The trade-off is deliberate:
+  a CI-red fix or a REQUEST_CHANGES fix no longer jumps ahead of other threads. It waits its turn in
+  the role queue, because only the cheap part (firing the gate) gets priority. In the §0 measurement
+  (msg-6312), 88% of gate-lane time was the implementer's turn riding the priority lane. The slice
+  is skipped when the conductor has no rollup or review source wired
+  (`conductor.gate_only.ignored reason=resume_unavailable`). It is also skipped for a relay the
+  resume would not pick up (`reason=not_resumable`, for example the first advisory APPROVE). Both of
+  those run inline as before. `slice_end` is not terminal and sends no notification.
 - **Budgets — two clocks, checked before every launch.**
 
   | Admission of | Condition |
@@ -597,6 +618,16 @@ might be worthwhile, the head id knows.
 thread with no recorded head all launch the conductor anyway: a gap must cost one cheap run rather
 than silently parking a live thread forever.
 
+**A head with no `NEXT:` line and no handoff field is launched once, then parked**
+(T-no-field-no-next-handoff-silent-park). The conductor ends that run on `no_handoff_to_human`.
+Because that stop is decided by the head alone, `no_handoff_to_human` is one of the
+`TERMINAL_STOP_REASONS` in `head_skip.py`. As long as the head stays the same, the log shows
+`terminal-stop:no_handoff_to_human` (SKIP) every tick instead of a new launch, and the Discord
+alert fires once. Adding a `NEXT:` line by **editing** the parked message works, but only when the
+cached parse ages out (`HEAD_CACHE_TTL`, up to 60 min). Until then the edit is not seen. To resume
+right away, post a **new** comment with a `NEXT:` line. A new message moves the head, so the next
+tick launches it. The same edit rule applies to every terminal stop reason.
+
 > **2026-09-30 (T-unread-correlated-count-scale)**: the probe used to call `chatroom_my_unread` as a
 > dedicated never-reads identity (`conductor-probe`), so that every thread stayed unread and hence
 > listed. That inbox evaluates a per-thread unread count for every thread in conclair — a cursorless
@@ -640,6 +671,60 @@ shortcut. Truncating it (blank / whitespace / `[]`) does NOT bypass this: the wr
 shapes as `verdict='unreadable'` fail-closed, not as valid-with-no-holder, so the next tick defers
 rather than granting — but repairing then requires following the same Recovery path. Follow §
 Migration boundary Recovery in either case.
+
+## Stall ledger tick (D-16c)
+
+The stall ledger (`src/spirrow_mindwire/stall_ledger/`, T-stalled-pr-has-no-detector) runs as its
+**own** Task Scheduler task, separate from the conductor sweep. Each run is one heartbeat: it
+evaluates open PRs, chatroom threads and `quarantine.json`, updates
+`<data_dir>/state/stall-ledger.json`, and appends JSON lines to
+`<data_dir>/logs/stall-ledger-YYYY-MM-DD.jsonl` (stderr goes to `…-YYYY-MM-DD.err.log`).
+It is **log-only**: it sends no Discord message and posts nothing anywhere. Alerts come with D-16d.
+
+Timing (`src/spirrow_mindwire/stall_ledger/timing.py`; a test fails if these stop holding):
+
+| Value | Setting | Why |
+|---|---|---|
+| `HEARTBEAT_INTERVAL` = 15 min | task `RepetitionInterval` | one tick per interval |
+| `T_TICK_MAX` = 10 min | `--t-tick-max-seconds` default | a tick past this saves nothing |
+| `T_LOCK_STALE` = 14 min | task `ExecutionTimeLimit` | the scheduler kills a hung tick, and the OS frees its lock, before the next tick fires |
+| `FETCH_TIMEOUT` = 30 s | `--fetch-timeout-seconds` default | per request |
+| `FETCH_MARGIN` = 2 min | — | body fetches stop starting so the tick can still save |
+
+Register it once, on the loop host, from the daemon checkout. This is an operator step: nothing in
+the loop registers it.
+
+```pwsh
+cd C:\Users\tomtar\spirrow-mindwire-daemon
+# check what will be registered
+pwsh -NoProfile -File deploy\Register-StallLedgerTask.ps1 -Checkout (Get-Location) `
+    -Repo SpirrowGames/spirrow-mindwire -Project spirrow-mindwire -DryRun
+# register
+pwsh -NoProfile -File deploy\Register-StallLedgerTask.ps1 -Checkout (Get-Location) `
+    -Repo SpirrowGames/spirrow-mindwire -Project spirrow-mindwire
+```
+
+Run it as the same user as the sweep task, so the tick sees the same data dir. The task's action is
+the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`): Task Scheduler
+does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
+without writing a line. Registration stops if no absolute path can be resolved.
+
+**GitHub token.** Set `MINDWIRE_STALL_LEDGER_GITHUB_TOKEN` in that user's **User** environment to
+the implementer PAT (`takahito-spirrowgames`; the ledger only reads). Never use the naysayer token.
+`run-stall-ledger-tick.ps1` hands it to the tick process only, as `MINDWIRE_GITHUB_TOKEN`, and drops
+any inherited `MINDWIRE_GITHUB_TOKEN` / `GITHUB_TOKEN`. It is a separate variable so that it does
+not also reach the conductor. Do not put the token in the task definition or its arguments. If it
+is unset or blank, the github source makes no request and reports `fetch_outcome: auth_missing`
+(heartbeat `ingest_failure`, plus a line in the `.err.log`). Without a token the tick would
+otherwise read unauthenticated and run into GitHub's 60/hour per-IP limit.
+`-Repo` / `-Project` repeat as comma lists. Check that it is working: after one interval, the
+newest line of the day's `stall-ledger-*.jsonl` is a `heartbeat`. In that line,
+`budget_exhausted: true` together with a `pending_markers` count that keeps growing means body
+fetches are falling behind (see `deferred_fetches`).
+
+To stop it, disable the `mindwire-stall-ledger` task. The store survives a stop; quarantined
+ledger records are listed and cleared with `scripts/stall_ledger_tick.py --list-quarantined` /
+`--clear-quarantined`.
 
 ## Quarantine and daily digest
 

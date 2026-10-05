@@ -333,6 +333,9 @@ def test_the_composition_root_routes_config_to_the_two_anthropic_roles(tmp_path:
     assert proposer._cli_path == cli.resolve()  # type: ignore[attr-defined]
     assert implementer._model == "claude-opus-5-5"  # type: ignore[attr-defined]
     assert implementer._cli_path == cli.resolve()  # type: ignore[attr-defined]
+    # The ledger's recovery record lives under the daemon's logs dir (Bohr msg-5884 / msg-5886).
+    journal = implementer._ledger_journal  # type: ignore[attr-defined]
+    assert journal.root == settings.paths.logs_dir / "ledger"
     # Not "the naysayer got None" — it has nowhere to put one, and its model is
     # the tier that makes it a different distribution from the two above.
     assert not hasattr(naysayer, "_cli_path")
