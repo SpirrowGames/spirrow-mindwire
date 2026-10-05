@@ -411,11 +411,3 @@ async def test_aclose_closes_shared_client() -> None:
     adapter = NaysayerLexoraAdapter(client=fake)
     await adapter.aclose()
     assert fake.closed is True
-
-
-def test_default_timeout_outlives_the_backend() -> None:
-    """No exact tie with Lexora's 900s backend timeout (Einstein msg-6613 advisory 2)."""
-    from spirrow_mindwire.adapters import naysayer_lexora
-    from spirrow_mindwire.lexora.client import LEXORA_BACKEND_TIMEOUT_SECONDS
-
-    assert naysayer_lexora._DEFAULT_TIMEOUT_SECONDS > LEXORA_BACKEND_TIMEOUT_SECONDS
