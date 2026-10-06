@@ -94,6 +94,10 @@ plus headroom so Lexora's fallback-to-Null answer arrives before we cut the conn
 HUMAN_NEXT = "human"
 _BACKEND_ENV = "MINDWIRE_DECIDER_BACKEND"
 _URL_ENV = "MINDWIRE_LEXORA_URL"
+# Every accepted [decider.tierc].mode. "off" is a valid setting, handled by build_decider's early
+# return (no Decider is built), so it never reaches the unknown-mode check; it is listed here so
+# the error message names the whole set a config may carry (#465 PR-gate review of ba7b45e).
+_TIERC_MODES = ("off", "shadow", "annotate", "bounce")
 _ALL_TIERC_KEYS: tuple[str, ...] = TIER_C_GENUINE_KEYS + TIER_C_SPURIOUS_KEYS
 
 MATCHED_RULE_SOURCE_CHOICE = "choice"
@@ -601,14 +605,16 @@ def build_decider(
     missing / malformed rules file — the evaluation's own input — refuses startup.
     """
     backend = resolve_backend(config_backend)
+    # mode "off" returns here, before any check below: it is valid under every backend and
+    # builds no Decider, so the unknown-mode error further down can never fire for it.
     if backend == "off" or tierc_mode == "off":
         return None
     if backend != "lexora":
         raise ValueError(f"unknown decider backend {backend!r} (expected 'off' or 'lexora')")
-    if tierc_mode not in ("shadow", "annotate", "bounce"):
+    if tierc_mode not in _TIERC_MODES:
         raise ValueError(
-            f"unknown [decider.tierc].mode={tierc_mode!r} (expected 'off', 'shadow', "
-            "'annotate' or 'bounce')"
+            f"unknown [decider.tierc].mode={tierc_mode!r} "
+            f"(expected one of {', '.join(repr(m) for m in _TIERC_MODES)})"
         )
     if questions not in ("tierc-v1", "tierc-v2"):
         raise ValueError(f"unknown [decider.tierc].questions {questions!r}")

@@ -428,6 +428,28 @@ def test_build_decider_off_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build_decider(config_backend="lexora", tierc_mode="off") is None
 
 
+def test_build_decider_lexora_with_tierc_off_is_none_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#465 PR-gate: backend lexora + [decider.tierc] mode "off" (its default) builds no
+    Decider and raises nothing — not the unknown-mode error, not the missing-URL error."""
+    monkeypatch.setenv("MINDWIRE_DECIDER_BACKEND", "lexora")
+    monkeypatch.delenv("MINDWIRE_LEXORA_URL", raising=False)
+    assert build_decider(config_backend="lexora", tierc_mode="off") is None
+
+
+def test_build_decider_unknown_tierc_mode_names_every_accepted_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
+    monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
+    with pytest.raises(ValueError) as ei:
+        build_decider(config_backend="lexora", tierc_mode="anotate")
+    msg = str(ei.value)
+    assert "unknown [decider.tierc].mode='anotate'" in msg
+    assert "expected one of 'off', 'shadow', 'annotate', 'bounce'" in msg
+
+
 def test_build_decider_env_backend_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINDWIRE_DECIDER_BACKEND", "lexora")
     monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
