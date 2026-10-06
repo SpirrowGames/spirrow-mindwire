@@ -188,6 +188,10 @@ $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $retryPendingStatePath = Join-Path $dataDir "state\retry-pending.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
+# T-decider-conductor-hook DECIDED 2e-2: the Conductor's Jev annotations (written under
+# [decider.tierc] mode = "annotate" | "bounce"; spirrow_mindwire.config.resolve_tierc_annotations_path).
+# Read by scripts/parked_humans.py; a missing file means "nothing annotated".
+$tiercAnnotationsPath = Join-Path $dataDir "state\tierc_annotations.jsonl"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
 # derive the ⚠ line ("full digest is X periods overdue") from period-typed fields —
 # last_full_success_period and first_attempt_period. Two, not one: a success record alone cannot
@@ -2354,13 +2358,39 @@ function New-DailyDigest {
     # changes no row content; it only moves construction ahead of the first budget decision.
 
     # 判断待ち rows — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
-    # grammar-ownership rule). Row order is preserved (msg-1370's caller-owned order — this
-    # renderer does not resort human-parked; only quarantine sections are sorted oldest-first).
+    # grammar-ownership rule). Row order is the caller's (msg-1370), with one exception: since
+    # DECIDED 2e-2 rows Jev annotated are re-ordered by should_ask_human (see below).
     # The count and the row order come from $HumanParked, which is itself the output of
     # scripts/parked_humans.py — so this section restores fully from a wiped pending-decisions.json
     # (A-14); the cache only enriches the row with the composer's question.
+    #
+    # T-decider-conductor-hook DECIDED 2e-1c (msg-5141): a merge wait (lane merge_wait — a PR-gate
+    # APPROVE whose merge is Takahito's) is not a question, so its row goes to its own section
+    # below instead of this list. DECIDED 2e-2: rows Jev annotated are ordered by should_ask_human,
+    # lowest last; rows without an annotation keep their order ahead of them (an unjudged row is
+    # never pushed under a judged one). Display only — nothing here changes what reaches the human.
+    $laneOfRow = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
+    $jevScoreOf = {
+        param($x)
+        if (($x.PSObject.Properties.Name -contains 'jev_ask_score') -and ($null -ne $x.jev_ask_score)) { return [double]$x.jev_ask_score }
+        return $null
+    }
+    $ordered = @()
+    $mergeWaitEntries = @()
+    for ($i = 0; $i -lt $HumanParked.Count; $i++) {
+        $row = $HumanParked[$i]
+        if ((& $laneOfRow $row) -eq 'merge_wait') {
+            $mergeWaitEntries += [PSCustomObject]@{ Line = "  $($row.key)   [$($row.head_msg_id)]"; AgeSeconds = 0 }
+            continue
+        }
+        $score = & $jevScoreOf $row
+        # Unannotated rows sort as 2.0 — above every possible p in [0, 1].
+        $ordered += [PSCustomObject]@{ Row = $row; Index = $i; Score = $(if ($null -eq $score) { 2.0 } else { $score }) }
+    }
+    $ordered = @($ordered | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = 'Index'; Descending = $false })
     $parkedEntries = @()
-    foreach ($p in $HumanParked) {
+    foreach ($o in $ordered) {
+        $p = $o.Row
         $key = $p.key
         $head = $p.head_msg_id
         # Look up the composer question by (key, signature = "human:<head>"). Any other
@@ -2391,7 +2421,13 @@ function New-DailyDigest {
         $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
         # D7: the lane tag (operator 作業 / 宛先誤り / merge 待ち / protocol 違反) — see Get-ParkedRowTag.
         $suffix = Get-ParkedRowTag -Row $p -Default $suffix
-        $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
+        # DECIDED 2e-2: Jev's line, spelled by spirrow_mindwire.decider.annotation (via
+        # parked_humans.py), placed under its row as part of the same entry so the budget ladder
+        # keeps or drops the two together.
+        $jevLine = if ($p.PSObject.Properties.Name -contains 'jev_line') { "$($p.jev_line)" } else { '' }
+        $rowLine = "  $key   [$head]$suffix"
+        if ($jevLine) { $rowLine += "`n    $jevLine" }
+        $parkedEntries += [PSCustomObject]@{ Line = $rowLine; AgeSeconds = 0 }
     }
 
     # 取得失敗 rows (I-2 "黙って劣化しない").
@@ -2462,11 +2498,16 @@ function New-DailyDigest {
     if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
         $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"
     }
-    if ($mergeWaitCount -gt 0) {
-        $parkedHeader += "（merge 待ち $mergeWaitCount 件は PR 一覧）"
-    }
     $parkedHeadLines = @("", $parkedHeader)
-    if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+    if ($parkedEntries.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+
+    # merge 待ち (DECIDED 2e-1c, msg-5141): APPROVE 済みで merge を待つだけの PR。判断の一覧の外に
+    # 置く。表示だけで routing は変えない。Emitted only when there is one — the merge-wait PR list
+    # (/dashboard/prs) is where they are worked, so a 0 line here would only spend budget.
+    $mergeWaitHeadLines = @()
+    if ($mergeWaitEntries.Count -gt 0) {
+        $mergeWaitHeadLines = @("", "merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: $mergeWaitCount 件")
+    }
 
     # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
     # to see "取得失敗: N" even when the individual rows had to be dropped for budget.
@@ -2516,8 +2557,10 @@ function New-DailyDigest {
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
     $reserveAfterStaleHuman = (_LinesCost $unregHeadLines) +
                             (_SectionFloorCost -Entries $unregEntries -Indent '  ') + $reserveAfterUnreg
-    $reserveAfterFetchErr = (_LinesCost $staleHumanHeadLines) +
+    $reserveAfterMergeWait = (_LinesCost $staleHumanHeadLines) +
                             (_SectionFloorCost -Entries $staleHumanList -Indent '  ') + $reserveAfterStaleHuman
+    $reserveAfterFetchErr = (_LinesCost $mergeWaitHeadLines) +
+                            (_SectionFloorCost -Entries $mergeWaitEntries -Indent '  ') + $reserveAfterMergeWait
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
     $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
@@ -2634,7 +2677,7 @@ function New-DailyDigest {
     # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
     # (msg-814 §5). Rows were built above; only the emission happens here.
     $lines += $parkedHeadLines
-    if ($HumanParked.Count -gt 0) {
+    if ($parkedEntries.Count -gt 0) {
         $runLen = [ref]($lines -join "`n").Length
         $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve $reserveAfterParked -RunningLen $runLen
         $lines += $result.Emitted
@@ -2653,6 +2696,15 @@ function New-DailyDigest {
         $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '    '
+    }
+
+    # merge 待ち (DECIDED 2e-1c). Rows were built above; same floor discipline as every other section.
+    if ($mergeWaitEntries.Count -gt 0) {
+        $lines += $mergeWaitHeadLines
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $mergeWaitEntries -MaxLen $Budget -Reserve $reserveAfterMergeWait -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
     # 停止中 (msg-5889 D-1). Rows were built above; same floor discipline as every other section.
@@ -4421,8 +4473,14 @@ function Invoke-ParkedHumansProbe {
     $tmp = $null
     try {
         $tmp = New-ProbeInputFile -Json $payload -Label "parked-humans-$Project"
+        # DECIDED 2e-2: the Conductor's Jev annotations (display only). A harness that loads this
+        # function without the script's path block has no $tiercAnnotationsPath; it gets a path
+        # that does not exist, which parked_humans.py reads as "nothing annotated". Never an empty
+        # value: an empty argv slot could vanish and leave '--annotations' without its argument.
+        $annPath = Get-Variable -Name tiercAnnotationsPath -ValueOnly -ErrorAction SilentlyContinue
+        if (-not $annPath) { $annPath = 'tierc_annotations.absent.jsonl' }
         $r = Invoke-BoundedUvProbe -Label "parked-humans-$Project" -TimeoutSeconds $ParkedHumansProbeTimeoutSeconds `
-            -Arguments @($probe, '--project', $Project, '--input', $tmp)
+            -Arguments @($probe, '--project', $Project, '--input', $tmp, '--annotations', "$annPath")
     }
     catch {
         Write-Log "parked-humans probe [$Project] threw ($($_.Exception.Message)) — treating as no-parked (fail-closed)"
@@ -4486,6 +4544,10 @@ function Invoke-ParkedHumansProbe {
             # present on probe output, so New-DailyDigest's 停止中 section considers every row; the
             # renderer turns it into an age fresh each tick and nothing persists it.
             last_msg_at        = if ($p.PSObject.Properties.Name -contains 'last_msg_at') { $p.last_msg_at } else { $null }
+            # DECIDED 2e-2: Jev's should_ask_human and its display line for this exact head, from
+            # the Conductor's tierc_annotations.jsonl ($null / '' when there is none). Display only.
+            jev_ask_score      = if ($p.PSObject.Properties.Name -contains 'jev_ask_score') { $p.jev_ask_score } else { $null }
+            jev_line           = if ($p.PSObject.Properties.Name -contains 'jev_line') { "$($p.jev_line)" } else { '' }
         }
     }
     $errorsOut = @()

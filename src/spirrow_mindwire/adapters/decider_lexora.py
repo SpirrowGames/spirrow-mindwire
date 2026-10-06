@@ -583,9 +583,10 @@ def build_decider(
     """Composition-root factory. ``None`` = Decider off (no HTTP will ever be made).
 
     Raises ``ValueError`` for configurations that would be silently wrong: an unknown backend,
-    ``lexora`` without ``MINDWIRE_LEXORA_URL``, or a Tier-C mode whose acting half is not built
-    yet (``annotate`` — accepting it would log as if annotating while annotating nothing).
-    ``bounce`` is acted on by the Conductor under ``[tierc_gate] mode = "enforce"``
+    ``lexora`` without ``MINDWIRE_LEXORA_URL``, or an unknown Tier-C mode. ``annotate``
+    (DECIDED 2e-2) writes the digest's Jev line for a ``NEXT: human`` that reaches the human
+    (:mod:`spirrow_mindwire.decider.annotation`); ``bounce`` does the same and, under
+    ``[tierc_gate] mode = "enforce"``, is also acted on by the Conductor
     (:meth:`~spirrow_mindwire.conductor.core.Conductor._enforce_tierc_gate`).
 
     ``questions="tierc-v2"`` reads the rules file at ``rules_path`` **once, here** (msg-4384: no
@@ -604,10 +605,10 @@ def build_decider(
         return None
     if backend != "lexora":
         raise ValueError(f"unknown decider backend {backend!r} (expected 'off' or 'lexora')")
-    if tierc_mode not in ("shadow", "bounce"):
+    if tierc_mode not in ("shadow", "annotate", "bounce"):
         raise ValueError(
-            f"[decider.tierc].mode={tierc_mode!r} is not implemented yet: 'shadow' and "
-            "'bounce' are wired ('annotate' lands in a later step)"
+            f"unknown [decider.tierc].mode={tierc_mode!r} (expected 'off', 'shadow', "
+            "'annotate' or 'bounce')"
         )
     if questions not in ("tierc-v1", "tierc-v2"):
         raise ValueError(f"unknown [decider.tierc].questions {questions!r}")

@@ -447,11 +447,13 @@ def test_build_decider_lexora_requires_url(monkeypatch: pytest.MonkeyPatch) -> N
         build_decider(config_backend="lexora", tierc_mode="shadow")
 
 
-def test_build_decider_refuses_unimplemented_annotate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_decider_accepts_annotate_since_2e_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DECIDED 2e-2 (msg-5141): ``annotate`` has its acting half now (the digest's Jev line,
+    ``tests/test_tierc_annotation.py``), so it is no longer refused at build time."""
     monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
     monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
-    with pytest.raises(ValueError, match="not implemented"):
-        build_decider(config_backend="lexora", tierc_mode="annotate")
+    built = build_decider(config_backend="lexora", tierc_mode="annotate", questions="tierc-v1")
+    assert built is not None and built.tierc_mode == "annotate"
 
 
 def test_build_decider_accepts_bounce(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -940,7 +942,7 @@ async def test_hook_proposer_forced_consult_is_entered_and_record_only(
     """msg-4237 2c-1 / 2c-2 at hook level: ``stop=None`` + forced to the naysayer is entered
     (one ``routed=forced_naysayer`` line) and, even under annotate, the acting branch is not."""
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
-    stub.tierc_mode = "annotate"  # injected; build_decider refuses it
+    stub.tierc_mode = "annotate"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         got = await _hook(stub, stop=None, is_forced=True, target_role=Role.NAYSAYER)
     assert got is not None and len(stub.states) == 1
@@ -1017,14 +1019,16 @@ def test_adapter_is_target() -> None:
 async def test_hook_annotate_branch_entered_on_proposer_human_stop(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Test 9 (msg-4203): proposer ``NEXT: human`` + HUMAN stop + injected annotate → the acting
-    branch is reached (the old ``stop is None`` condition would have skipped it)."""
+    """Test 9 (msg-4203): proposer ``NEXT: human`` + HUMAN stop + annotate → the result is
+    returned for the Conductor to act on (the old ``stop is None`` condition would have skipped
+    it). Since 2e-2 the acting half lives in the Conductor (``_annotate_tierc``), so the hook no
+    longer warns that it has none."""
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
-    stub.tierc_mode = "annotate"  # build_decider refuses annotate; injected for this test only
+    stub.tierc_mode = "annotate"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         got = await _hook(stub)
     assert got is not None
-    assert any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+    assert not any("has no acting implementation" in r.getMessage() for r in caplog.records)
     (line,) = _decider_lines(caplog)
     assert line["routed"] == "stop"
 
@@ -1244,18 +1248,26 @@ async def test_conductor_forced_consult_then_second_escalation_leaves_two_lines(
 
 @pytest.mark.anyio
 async def test_conductor_forced_line_under_annotate_changes_nothing(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test 12 (msg-4237): a ``routed=forced_naysayer`` row changes neither the stop nor any
-    post / dispatch even with tierc mode ``annotate`` (injected; build_decider refuses it).
-    Since tierc-v2 the naysayer's closing ``NEXT: human`` adds a ``routed=stop`` row; only that
-    row reaches the (unbuilt) acting branch, and it changes nothing either."""
+    post / dispatch even with tierc mode ``annotate``. Since tierc-v2 the naysayer's closing
+    ``NEXT: human`` adds a ``routed=stop`` row; only that row reaches the acting branch (since
+    2e-2 the Conductor's ``_annotate_tierc``, display only), and it changes nothing either."""
+    reached: list[str] = []
+    real = Conductor._annotate_tierc
+
+    def spy(self: Conductor, handoff: Any, latest: dict[str, Any], dr: Any) -> None:
+        reached.append(str(latest.get("msg_id")))
+        real(self, handoff, latest, dr)
+
     seed = ("Bohr", "design\n\nNEXT: human")
 
     def replies() -> dict[Role, list[str]]:
         return {Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
 
     baseline, bdisp, bmcp = await _run(None, seed=seed, replies=replies())
+    monkeypatch.setattr(Conductor, "_annotate_tierc", spy)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     stub.tierc_mode = "annotate"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
@@ -1264,8 +1276,8 @@ async def test_conductor_forced_line_under_annotate_changes_nothing(
     assert disp.dispatches == bdisp.dispatches
     assert mcp.posts == bmcp.posts
     assert [ln["routed"] for ln in _decider_lines(caplog)] == ["forced_naysayer", "stop"]
-    acting = [r for r in caplog.records if "has no acting implementation yet" in r.getMessage()]
-    assert len(acting) == 1  # the routed=stop row only; the forced row never acts
+    # The routed=stop head only (m2, the naysayer's closing NEXT: human); the forced row never acts.
+    assert reached == ["m2"]
 
 
 @pytest.mark.anyio
@@ -1331,7 +1343,7 @@ async def test_conductor_spawn_blocked_human_leaves_one_spawn_blocked_line(
     one ``routed=spawn_blocked`` row, no forced consult / saveable count added, no ERROR, and —
     under an injected annotate — the acting branch is not entered (record-only)."""
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
-    stub.tierc_mode = "annotate"  # injected; build_decider refuses it
+    stub.tierc_mode = "annotate"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         outcome, disp, _ = await _run(
             stub,
