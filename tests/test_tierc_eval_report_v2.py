@@ -208,23 +208,32 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
 
-def _v2_export(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+def _v2_export(
+    tmp_path: Path, recs: list[dict[str, Any]] | None = None
+) -> tuple[Path, Path, Path, Path, Path]:
     """A v2 export written by the exporter's own ``write_outputs``: (out_dir, replay, fixture,
-    export.json, labels)."""
+    export.json, labels). ``export.json`` carries ``questions_version`` as the real exporter
+    writes it (``REGISTERED_QUESTIONS_VERSION``, msg-5753 DECIDED 2d-15)."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "RUBRIC-v2.md").write_text("rubric v2\n", encoding="utf-8")
     (src / "label_prompt-v2.md").write_text("prompt v2\n", encoding="utf-8")
     out = tmp_path / "lab"
     replay = tmp_path / "jev" / "replay.jsonl"
-    keys = [("G", 1), ("S", 1)]
+    if recs is None:
+        recs = [_rec(("G", 1), 0.9), _rec(("S", 1), 0.1)]
+    keys = [(str(r["thread_id"]), int(r["round_index"])) for r in recs]
     exporter.write_outputs(
         out,
         replay,
         [{"thread_id": t, "round_index": r, "body": "b"} for t, r in keys],
         [_fx(k) for k in keys],
-        [_rec(("G", 1), 0.9), _rec(("S", 1), 0.1)],
-        {"as_of": "2026-10-15T00:00:00+00:00", "counted": 2},
+        recs,
+        {
+            "as_of": "2026-10-15T00:00:00+00:00",
+            "questions_version": exporter.REGISTERED_QUESTIONS_VERSION,
+            "counted": len(recs),
+        },
         sources={"rubric": src / "RUBRIC-v2.md", "label_prompt": src / "label_prompt-v2.md"},
     )
     labels = tmp_path / "labels.jsonl"
@@ -292,7 +301,8 @@ def test_v1_run_with_manifest_is_an_error(
     _write_jsonl(rp, [_v1_rec(("V", 1))])
     _write_jsonl(fp, [{**_fx(("V", 1)), "eval_set": "body"}])
     assert _cli(rp, fp, labels, "--export-manifest", str(manifest)) == 2
-    assert "v1 run" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "outside the v2 structure" in err and "tierc-v1" in err
 
 
 def test_valid_v2_run_prints_the_export_lock(tmp_path: Path) -> None:
@@ -328,3 +338,136 @@ def test_render_refuses_mixed_rows() -> None:
     rows = report.join([_v1_rec(("V", 1)), _rec(("W", 1), 0.9)], [_fx(("V", 1)), _fx(("W", 1))])
     with pytest.raises(report.InputError, match="v1 only or v2 only"):
         report.render(rows, {}, report.TierCThresholds())
+
+
+# --------------------------------------------------------------------------- 2d-16
+
+
+def _with_version(rec: dict[str, Any], version: str) -> dict[str, Any]:
+    return {**rec, "questions_version": version}
+
+
+def _set_manifest_version(manifest: Path, version: str | None) -> None:
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    if version is None:
+        del raw["questions_version"]
+    else:
+        raw["questions_version"] = version
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+
+def test_empty_export_with_manifest_renders_v2_with_zero_rows(tmp_path: Path) -> None:
+    """msg-6009 DECIDED 2d-16 (i): the manifest picks the v2 structure even with 0 rows; exit 0.
+
+    Mutation: put back count-based selection under a manifest and 0 rows fall to ``"v1"``, which
+    refuses the manifest (exit 2) — this test fails."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path, recs=[])
+    assert replay.read_bytes() == b""
+    out = tmp_path / "o.md"
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest), "--out", str(out)) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith("# Tier-C evaluation — Jev, tierc-v2")
+    assert "## Export lock" in text
+    validity = text.split("## Validity", 1)[1]
+    assert "- rows: 0" in validity and "no counted rows" in validity
+    assert "## Headline" not in text
+
+
+def test_empty_replay_without_manifest_is_the_v1_path_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2d-16 (ii): without a manifest path selection is unchanged — 0 rows count as ``"v1"`` and
+    reach the v1 renderer, never the v2 one. The v1 bytes stay pinned by
+    ``test_v1_report_md_is_unchanged_byte_for_byte``. (What the v1 renderer itself does with 0
+    rows is untouched by 2d-16, so it is stubbed here, not asserted.)"""
+    rp, fp, lp = tmp_path / "r.jsonl", tmp_path / "f.jsonl", tmp_path / "l.jsonl"
+    for p in (rp, fp, lp):
+        _write_jsonl(p, [])
+    assert report.run_version([]) == "v1"
+    seen: list[str] = []
+
+    def v1(rows: Any, *_: Any) -> str:
+        seen.append(f"v1:{len(rows)}")
+        return "v1"
+
+    def v2(*_: Any, **__: Any) -> str:
+        seen.append("v2")
+        return "v2"
+
+    monkeypatch.setattr(report, "_render_v1", v1)
+    monkeypatch.setattr(report, "render_v2", v2)
+    out = tmp_path / "o.md"
+    assert _cli(rp, fp, lp, "--out", str(out)) == 0
+    assert seen == ["v1:0"]
+    assert out.read_text(encoding="utf-8") == "v1\n"
+
+
+def test_v1_row_under_v3_manifest_is_refused_naming_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """2d-16 (iii-a). The export is self-consistent (its lock would pass), so only the row check
+    can refuse it. Mutation: remove the row check — this test fails."""
+    recs = [_rec(("G", 1), 0.9), _with_version(_rec(("S", 1), 0.1), "tierc-v1")]
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path, recs=recs)
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    err = capsys.readouterr().err
+    assert "tierc-v1" in err and "outside the v2 structure" in err
+    assert "changed after" not in err
+
+
+def test_mixed_v2_and_v3_rows_under_v3_manifest_render(tmp_path: Path) -> None:
+    """2d-16 (iii-b): set membership, not equality — ``tierc-v2`` rows under a ``tierc-v3``
+    manifest render (2d-15 item 3). Mutation: ``row_version == manifest_version`` — this test
+    fails."""
+    recs = [_with_version(_rec(("G", 1), 0.9), "tierc-v3"), _rec(("S", 1), 0.1)]
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path, recs=recs)
+    assert json.loads(manifest.read_text(encoding="utf-8"))["questions_version"] == "tierc-v3"
+    out = tmp_path / "o.md"
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest), "--out", str(out)) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "- questions_version: {'tierc-v2': 1, 'tierc-v3': 1}" in text
+    assert "**valid**" in text
+
+
+@pytest.mark.parametrize("registered", ["tierc-v1", "tierc-v9", ""])
+def test_manifest_registering_a_non_v2_version_is_refused(
+    tmp_path: Path, registered: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """2d-16 (iii-c): the manifest's version must be in ``V2_STRUCTURE_VERSIONS``."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    _set_manifest_version(manifest, registered)
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    err = capsys.readouterr().err
+    assert repr(registered) in err and "not a v2-structure version" in err
+
+
+def test_manifest_without_a_version_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing version reaches the version check (PR #416 gate advisory), not the parse
+    error."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    _set_manifest_version(manifest, None)
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    err = capsys.readouterr().err
+    assert "registers questions_version None" in err and "not a v2-structure version" in err
+    assert "not an export.json" not in err
+
+
+@pytest.mark.parametrize("content", ["[]", '"tierc-v3"', "{not json"])
+def test_manifest_that_is_not_a_json_object_is_not_an_export(
+    tmp_path: Path, content: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    manifest.write_text(content, encoding="utf-8")
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    assert "not an export.json" in capsys.readouterr().err
+
+
+def test_one_shared_v2_structure_set() -> None:
+    """2d-16: the set is defined once, in the report; the exporter's registered version is in
+    it."""
+    assert frozenset({"tierc-v2", "tierc-v3"}) == report.V2_STRUCTURE_VERSIONS
+    assert exporter.REGISTERED_QUESTIONS_VERSION in report.V2_STRUCTURE_VERSIONS
+    src = (ROOT / "scripts" / "tierc_eval_report.py").read_text(encoding="utf-8")
+    assert src.count('"tierc-v2", "tierc-v3"') == 1

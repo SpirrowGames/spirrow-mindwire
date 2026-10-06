@@ -28,10 +28,10 @@ from dataclasses import asdict
 from typing import Any
 
 from spirrow_mindwire.decider.questions import (
+    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
-    TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     tierc_v2_questions,
 )
@@ -136,7 +136,7 @@ def build_decide_request(
         "state": state_to_wire(state),
         "questions": tierc_v2_questions(rules),
         "policy": policy,
-        "questions_version": TIERC_V2_QUESTIONS_VERSION,
+        "questions_version": TIERC_ESCALATION_QUESTIONS_VERSION,
     }
 
 

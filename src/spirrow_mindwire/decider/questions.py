@@ -132,7 +132,7 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # **何がどこにあるか (msg-4382 / msg-4384).** ルールの文言は Takahito が編集する 1 ファイル
 # (``<data_dir>/config/tierc_rules.toml``、雛形は同梱の ``tierc_rules.default.toml``) にあり、その
 # sha256 が ``rules_sha256`` として記録される。問いの枠の文はここ (コード) にあり、
-# ``TIERC_V2_QUESTIONS_VERSION`` に含まれる。枠の文を変えたら version を上げる。
+# ``TIERC_ESCALATION_QUESTIONS_VERSION`` に含まれる。枠の文を変えたら version を上げる。
 
 # ``tierc-v3`` (T-fix-now-vs-followup-is-mechanical, Bohr msg-5234 §3 / msg-5241): 下の
 # ``_V2_SHOULD_ASK_QUESTION`` に「今直すか follow-up か」の除外文を足したので上げた。key と
@@ -141,10 +141,12 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # とは別物なので動かさない。proceed 用 (``tierc-v2-proceed``) は枠の文が不変なので動かさない。
 # ``matched_rule`` の ``criteria`` を配列から map に直したときも上げていない。選択肢と説明は
 # 不変で、配列の形の問いは Jev に一度も届いていない (全件 422) ∴ 読み方が変わる記録が無い。
-TIERC_V2_QUESTIONS_VERSION = "tierc-v3"
+TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v3"
 """v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
 問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
 
+名前に version 番号を入れない (T-decider-conductor-hook msg-5754 advisory): 旧名
+``TIERC_V2_QUESTIONS_VERSION`` は値 ``"tierc-v3"`` と食い違って読めたため改名した。
 ``eval/tierc/shadow-prereg.md`` の登録値と exporter の登録値は、この値と一致することを
 ``tests/test_tierc_registered_version.py`` が検査する (DECIDED 2d-15) — 枠の文を変えて version を
 上げたら、その PR で gate が赤になり、事前登録の扱いを明示的に決めることになる。"""
@@ -344,11 +346,11 @@ __all__ = [
     "MATCHED_RULE_KEY",
     "MATCHED_RULE_NONE",
     "SHOULD_ASK_HUMAN_KEY",
+    "TIERC_ESCALATION_QUESTIONS_VERSION",
     "TIERC_QUESTIONS_V1",
     "TIERC_QUESTIONS_VERSION",
     "TIERC_RULES_TEMPLATE_NAME",
     "TIERC_V2_PROCEED_QUESTIONS_VERSION",
-    "TIERC_V2_QUESTIONS_VERSION",
     "TIERC_V2_SHOULD_ASK_CRITERIA",
     "TierCQuestion",
     "TierCQuestionKind",

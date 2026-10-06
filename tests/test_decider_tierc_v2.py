@@ -40,8 +40,8 @@ from spirrow_mindwire.decider.hook import (
 from spirrow_mindwire.decider.questions import (
     MATCHED_RULE_KEY,
     SHOULD_ASK_HUMAN_KEY,
+    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
-    TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     TierCRulesError,
     load_tierc_rules,
@@ -226,7 +226,7 @@ def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
 
 def test_v2_request_body() -> None:
     body = build_decide_request(_state(), policy=POLICY_LIVE_TIERC, rules=RULES)
-    assert body["questions_version"] == TIERC_V2_QUESTIONS_VERSION == "tierc-v3"
+    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v3"
     assert body["questions"] == tierc_v2_questions(RULES)
     v1 = build_decide_request(_state(), policy=POLICY_LIVE_TIERC)
     assert v1["questions_version"] == "tierc-v1"
