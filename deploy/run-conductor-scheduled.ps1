@@ -2488,12 +2488,15 @@ function New-DailyDigest {
     }
 
     # D7: the header counts decisions only; operator work and misroutes are named next to it.
-    $laneOf = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
-    $operatorCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'operator_work' }).Count
-    $misrouteCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'misroute' }).Count
+    # #465 PR-gate (msg-6631, upheld by the human): the header is counted from the SAME split that
+    # built the lists above — $parkedEntries for 判断待ち, $mergeWaitEntries for merge 待ち, with the
+    # one lane classifier $laneOfRow — never re-derived from $HumanParked. A header whose count
+    # comes from a second derivation can drift from the list it heads; this one cannot.
+    $operatorCount = @($ordered | Where-Object { (& $laneOfRow $_.Row) -eq 'operator_work' }).Count
+    $misrouteCount = @($ordered | Where-Object { (& $laneOfRow $_.Row) -eq 'misroute' }).Count
     # msg-4361: a merge wait is not a decision; the merge-wait PR list carries it.
-    $mergeWaitCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'merge_wait' }).Count
-    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount - $mergeWaitCount
+    $mergeWaitCount = $mergeWaitEntries.Count
+    $decisionCount = $parkedEntries.Count - $operatorCount - $misrouteCount
     $parkedHeader = "判断待ち: $decisionCount 件"
     if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
         $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"

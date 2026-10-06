@@ -1111,6 +1111,30 @@ Check "merge waits only -> 判断待ち: 0 件" '判断待ち: 0 件' $omSec[0]
 Check "merge waits only -> (該当なし)" '  (該当なし)' $omSec[1]
 CheckTrue "merge waits only -> the merge-wait section carries it" ($onlyMw -match 'merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: 1 件') $onlyMw
 
+# #465 PR-gate (msg-6631, upheld by the human): each header counts exactly the rows listed under
+# it. Every lane at once — 2 decisions, 1 operator, 1 misroute, 3 merge waits — and the counts are
+# checked against the rows actually emitted, not against a second tally of the input.
+$mixed = @(
+    (New-JvRow -Tid 'T-d1')
+    (New-JvRow -Tid 'T-mw1' -Lane 'merge_wait')
+    (New-JvRow -Tid 'T-op'  -Lane 'operator_work')
+    (New-JvRow -Tid 'T-mw2' -Lane 'merge_wait')
+    (New-JvRow -Tid 'T-mis' -Lane 'misroute')
+    (New-JvRow -Tid 'T-d2')
+    (New-JvRow -Tid 'T-mw3' -Lane 'merge_wait')
+)
+$mxDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked $mixed -Budget $script:DigestBudget
+$mxSec = Get-SectionLines $mxDigest '^判断待ち: '
+Check "mixed lanes -> header counts decisions, names operator / misroute, excludes merge waits" `
+    '判断待ち: 2 件（ほか operator 作業 1 件 / 宛先誤り 1 件）' $mxSec[0]
+$mxRows = @($mxSec | Select-Object -Skip 1 | Where-Object { $_ -match '^  p/' })
+Check "mixed lanes -> 判断待ち lists decisions + operator + misroute rows (no merge wait)" 4 $mxRows.Count
+CheckTrue "mixed lanes -> no merge-wait row under 判断待ち" (-not ($mxSec -match 'T-mw')) ($mxSec -join "`n")
+$mxMw = Get-SectionLines $mxDigest '^merge 待ち（'
+Check "mixed lanes -> merge-wait header count" 'merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: 3 件' $mxMw[0]
+Check "mixed lanes -> merge-wait header count equals its rows" 3 @($mxMw | Select-Object -Skip 1 | Where-Object { $_ -match '^  p/T-mw' }).Count
+
 # Many merge waits under the shipped budget: the section keeps its floor and the total fits.
 $manyMw = @()
 for ($i = 0; $i -lt 40; $i++) { $manyMw += (New-JvRow -Tid ("T-merge-wait-pr-{0:D2}-approved-and-waiting" -f $i) -Lane 'merge_wait') }
