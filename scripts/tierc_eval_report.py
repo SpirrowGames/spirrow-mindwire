@@ -152,6 +152,12 @@ def record_version(rec: Mapping[str, Any]) -> str:
     return str(rec.get("questions_version") or d.get("questions_version") or "")
 
 
+EMPTY_REPLAY_NO_MANIFEST = (
+    "no replay rows and no --export-manifest: the report structure cannot be determined"
+)
+"""DECIDED 2e-0b (msg-6626) — the refusal for an empty ``--replay`` given without a manifest."""
+
+
 def run_version(replay: Sequence[Mapping[str, Any]]) -> str:
     """``"v2"`` when every record has the v2 structure (:data:`V2_STRUCTURE_VERSIONS`), ``"v1"``
     when none does; a mix is an :class:`InputError` (msg-4650: one evaluation is v1 only or v2
@@ -1158,6 +1164,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest_version(args.export_manifest)
             check_rows_under_manifest(replay_records, args.export_manifest)
             version = "v2"
+        elif not replay_records:
+            # DECIDED 2e-0b (msg-6626): with no manifest the rows are the only evidence of the
+            # structure, and with no rows there is none — refuse rather than guess v1.
+            raise InputError(EMPTY_REPLAY_NO_MANIFEST)
         else:
             version = run_version(replay_records)
         if version == "v2":

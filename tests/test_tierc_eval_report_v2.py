@@ -373,33 +373,35 @@ def test_empty_export_with_manifest_renders_v2_with_zero_rows(tmp_path: Path) ->
     assert "## Headline" not in text
 
 
-def test_empty_replay_without_manifest_is_the_v1_path_as_before(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_empty_replay_without_manifest_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """2d-16 (ii): without a manifest path selection is unchanged — 0 rows count as ``"v1"`` and
-    reach the v1 renderer, never the v2 one. The v1 bytes stay pinned by
-    ``test_v1_report_md_is_unchanged_byte_for_byte``. (What the v1 renderer itself does with 0
-    rows is untouched by 2d-16, so it is stubbed here, not asserted.)"""
+    """DECIDED 2e-0b (iv-a), replacing 2d-16 (ii) (msg-6626): with no manifest and no rows the
+    structure cannot be determined, so the run is refused with exit 2 and a message — no traceback.
+
+    Mutation: remove the guard in ``main`` and 0 rows reach ``_render_v1``, which raises
+    ``KeyError: 'all'`` — this test fails."""
     rp, fp, lp = tmp_path / "r.jsonl", tmp_path / "f.jsonl", tmp_path / "l.jsonl"
     for p in (rp, fp, lp):
         _write_jsonl(p, [])
-    assert report.run_version([]) == "v1"
-    seen: list[str] = []
-
-    def v1(rows: Any, *_: Any) -> str:
-        seen.append(f"v1:{len(rows)}")
-        return "v1"
-
-    def v2(*_: Any, **__: Any) -> str:
-        seen.append("v2")
-        return "v2"
-
-    monkeypatch.setattr(report, "_render_v1", v1)
-    monkeypatch.setattr(report, "render_v2", v2)
     out = tmp_path / "o.md"
-    assert _cli(rp, fp, lp, "--out", str(out)) == 0
-    assert seen == ["v1:0"]
-    assert out.read_text(encoding="utf-8") == "v1\n"
+    assert _cli(rp, fp, lp, "--out", str(out)) == 2
+    err = capsys.readouterr().err
+    assert report.EMPTY_REPLAY_NO_MANIFEST in err
+    assert "Traceback" not in err and "KeyError" not in err
+    assert not out.exists()
+
+
+def test_empty_replay_with_v3_manifest_is_still_the_zero_row_v2_report(tmp_path: Path) -> None:
+    """DECIDED 2e-0b (iv-b): the guard is for the no-manifest path only. An empty replay with a
+    ``tierc-v3`` manifest keeps the 2d-16 (i) behaviour: v2 structure, "no counted rows", exit 0."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path, recs=[])
+    _set_manifest_version(manifest, "tierc-v3")
+    out = tmp_path / "o.md"
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest), "--out", str(out)) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith("# Tier-C evaluation — Jev, tierc-v2")
+    assert "no counted rows" in text.split("## Validity", 1)[1]
 
 
 def test_v1_row_under_v3_manifest_is_refused_naming_it(
