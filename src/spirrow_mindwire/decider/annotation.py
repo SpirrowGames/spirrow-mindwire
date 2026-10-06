@@ -17,7 +17,9 @@ into a decision.
 :func:`spirrow_mindwire.config.resolve_tierc_annotations_path`). Only an *actionable*
 tierc-v2 verdict is annotated (msg-4184: acting and displaying code read ``actionable_verdict``
 only), whatever its kind — ``CONFIRMED`` / ``UNSURE`` / ``LIKELY_NOT`` all show their ``p``. A
-write failure is a WARNING and changes nothing: the row is simply shown without the line.
+write failure is a WARNING and changes nothing: the row is simply shown without the line. The
+file is bounded: an append that leaves it over :data:`COMPACT_AT_BYTES` rewrites it to its newest
+:data:`KEEP_LINES` lines (:func:`compact_annotations`).
 
 **Read side.** ``scripts/parked_humans.py --annotations <path>`` joins the file on
 ``(project, thread_id, head_msg_id)`` and hands the sweep the rendered line
@@ -32,7 +34,9 @@ chatroom thread, so no chatroom fallback surface is involved.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -41,6 +45,18 @@ from typing import Any
 
 from spirrow_mindwire.decider.result import DecisionResult
 from spirrow_mindwire.decider.verdict import TierCV2Verdict
+
+logger = logging.getLogger(__name__)
+
+COMPACT_AT_BYTES = 1024 * 1024
+"""After an append leaves the annotations file larger than this, it is compacted (#465 PR-gate
+advisory on 224d068: the file was append-only and is read whole on every sweep)."""
+
+KEEP_LINES = 2000
+"""How many of the newest lines a compaction keeps. The digest needs the annotation of a head
+parked on a human *now*; 2000 escalations is months of the loop's traffic. If a still-parked
+head's line were ever the one dropped, its row shows without the Jev line — the same fail-open
+state as a missing file."""
 
 ANNOTATING_TIERC_MODES: frozenset[str] = frozenset({"annotate", "bounce"})
 """``[decider.tierc].mode`` values that write annotations. ``bounce`` acts on ``LIKELY_NOT`` by
@@ -103,6 +119,27 @@ def append_annotation(path: Path, annotation: TierCAnnotation) -> None:
     line = json.dumps(asdict(annotation), ensure_ascii=False, sort_keys=True)
     with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(line + "\n")
+    try:
+        if path.stat().st_size > COMPACT_AT_BYTES:
+            compact_annotations(path, KEEP_LINES)
+    except OSError as exc:
+        # The append above already succeeded; a failed compaction only leaves the file longer.
+        logger.warning("tierc annotations: compaction of %s failed (%s); left as is", path, exc)
+
+
+def compact_annotations(path: Path, keep_lines: int = KEEP_LINES) -> None:
+    """Rewrite ``path`` to its newest ``keep_lines`` lines, by atomic replace.
+
+    Keeping a suffix preserves the reader's "last row per key wins" (:func:`read_annotations`).
+    Raises ``OSError``; :func:`append_annotation` turns that into a WARNING."""
+    with path.open(encoding="utf-8", newline="") as f:
+        lines = f.readlines()
+    if len(lines) <= keep_lines:
+        return
+    tmp = path.with_name(path.name + ".compact.tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        f.writelines(lines[-keep_lines:])
+    os.replace(tmp, path)
 
 
 def _parse(raw: Any) -> TierCAnnotation | None:
@@ -172,10 +209,13 @@ def annotation_line(annotation: TierCAnnotation) -> str:
 
 __all__ = [
     "ANNOTATING_TIERC_MODES",
+    "COMPACT_AT_BYTES",
+    "KEEP_LINES",
     "NO_RULE_TEXT",
     "TierCAnnotation",
     "annotation_from_result",
     "annotation_line",
     "append_annotation",
+    "compact_annotations",
     "read_annotations",
 ]

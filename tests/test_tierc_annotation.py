@@ -32,12 +32,14 @@ from spirrow_mindwire.adapters.decider_lexora import build_decider
 from spirrow_mindwire.conductor import core as core_mod
 from spirrow_mindwire.conductor.core import Conductor, StopReason
 from spirrow_mindwire.conductor.tierc_gate import TierCGate
+from spirrow_mindwire.decider import annotation as ann_mod
 from spirrow_mindwire.decider.annotation import (
     NO_RULE_TEXT,
     TierCAnnotation,
     annotation_from_result,
     annotation_line,
     append_annotation,
+    compact_annotations,
     read_annotations,
 )
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
@@ -179,6 +181,59 @@ def test_append_then_read_round_trips_and_last_row_per_key_wins(tmp_path: Path) 
     found, skipped = read_annotations(path)
     assert skipped == 0
     assert found == {first.key(): second, other.key(): other}
+
+
+def _ann(i: int, score: float = 0.5) -> TierCAnnotation:
+    return TierCAnnotation(PROJECT, THREAD, f"m{i}", score, "R1", "tierc-v3", f"d{i}", "t")
+
+
+def test_append_compacts_to_the_newest_lines_once_over_the_size_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#465 PR-gate advisory (224d068): the file is bounded. Over the cap, an append keeps only
+    the newest KEEP_LINES lines; the newest row (and last-row-per-key-wins) survive."""
+    monkeypatch.setattr(ann_mod, "COMPACT_AT_BYTES", 2000)
+    monkeypatch.setattr(ann_mod, "KEEP_LINES", 5)
+    path = _ann_path(tmp_path)
+    for i in range(40):
+        append_annotation(path, _ann(i))
+    append_annotation(path, _ann(39, score=0.1))
+    rows = _ann_rows(path)
+    assert path.stat().st_size <= 2000 + 400  # one append past the cap at most
+    assert len(rows) <= 5 + 2000 // 100
+    assert rows[-1]["msg_id"] == "m39" and rows[-1]["ask_score"] == 0.1
+    assert all(r["msg_id"] != "m0" for r in rows)
+    found, skipped = read_annotations(path)
+    assert skipped == 0
+    assert found[(PROJECT, THREAD, "m39")].ask_score == 0.1
+    assert b"\r\n" not in path.read_bytes()
+    assert not path.with_name(path.name + ".compact.tmp").exists()
+
+
+def test_compact_keeps_exactly_the_suffix(tmp_path: Path) -> None:
+    path = _ann_path(tmp_path)
+    for i in range(10):
+        append_annotation(path, _ann(i))
+    compact_annotations(path, keep_lines=3)
+    assert [r["msg_id"] for r in _ann_rows(path)] == ["m7", "m8", "m9"]
+    compact_annotations(path, keep_lines=3)  # at or under the limit: unchanged
+    assert [r["msg_id"] for r in _ann_rows(path)] == ["m7", "m8", "m9"]
+
+
+def test_a_failed_compaction_is_a_warning_and_keeps_the_appended_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ann_mod, "COMPACT_AT_BYTES", 0)
+
+    def boom(_path: Path, keep_lines: int = 0) -> None:
+        raise PermissionError("file in use")
+
+    monkeypatch.setattr(ann_mod, "compact_annotations", boom)
+    path = _ann_path(tmp_path)
+    with caplog.at_level("WARNING", logger=ann_mod.__name__):
+        append_annotation(path, _ann(1))
+    assert [r["msg_id"] for r in _ann_rows(path)] == ["m1"]
+    assert "compaction" in caplog.text
 
 
 def test_missing_file_is_nothing_annotated(tmp_path: Path) -> None:
