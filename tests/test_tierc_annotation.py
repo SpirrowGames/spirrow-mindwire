@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -207,7 +208,7 @@ def test_append_compacts_to_the_newest_lines_once_over_the_size_cap(
     assert skipped == 0
     assert found[(PROJECT, THREAD, "m39")].ask_score == 0.1
     assert b"\r\n" not in path.read_bytes()
-    assert not path.with_name(path.name + ".compact.tmp").exists()
+    assert not list(path.parent.glob("*.compact.tmp"))
 
 
 def test_compact_keeps_exactly_the_suffix(tmp_path: Path) -> None:
@@ -234,6 +235,52 @@ def test_a_failed_compaction_is_a_warning_and_keeps_the_appended_row(
         append_annotation(path, _ann(1))
     assert [r["msg_id"] for r in _ann_rows(path)] == ["m1"]
     assert "compaction" in caplog.text
+
+
+def test_overlapping_compactions_use_their_own_temp_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#465 PR-gate on c7a8343: two Conductors compacting at once must not share a temp file.
+    The first compaction's swap is held open while a second compaction runs to completion;
+    both must prepare distinct temp files, both swaps succeed, and the result is well-formed."""
+    path = _ann_path(tmp_path)
+    for i in range(10):
+        append_annotation(path, _ann(i))
+    real_replace = os.replace
+    sources: list[str] = []
+
+    def overlapping_replace(src: Any, dst: Any) -> None:
+        sources.append(str(src))
+        if len(sources) == 1:
+            append_annotation(path, _ann(10))
+            compact_annotations(path, keep_lines=4)  # a second "Conductor", mid-swap
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", overlapping_replace)
+    compact_annotations(path, keep_lines=3)
+    assert len(sources) == 2 and sources[0] != sources[1]
+    found, skipped = read_annotations(path)
+    assert skipped == 0
+    assert sorted(k[2] for k in found) == ["m7", "m8", "m9"]
+    assert not list(path.parent.glob("*.compact.tmp"))
+
+
+def test_a_compaction_that_fails_to_swap_leaves_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _ann_path(tmp_path)
+    for i in range(10):
+        append_annotation(path, _ann(i))
+    before = path.read_bytes()
+
+    def refuse(_src: Any, _dst: Any) -> None:
+        raise PermissionError("file in use")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(PermissionError):
+        compact_annotations(path, keep_lines=3)
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob("*.compact.tmp"))
 
 
 def test_missing_file_is_nothing_annotated(tmp_path: Path) -> None:

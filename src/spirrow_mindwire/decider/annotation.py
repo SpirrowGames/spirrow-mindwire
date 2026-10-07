@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -131,15 +132,26 @@ def compact_annotations(path: Path, keep_lines: int = KEEP_LINES) -> None:
     """Rewrite ``path`` to its newest ``keep_lines`` lines, by atomic replace.
 
     Keeping a suffix preserves the reader's "last row per key wins" (:func:`read_annotations`).
-    Raises ``OSError``; :func:`append_annotation` turns that into a WARNING."""
+    Raises ``OSError``; :func:`append_annotation` turns that into a WARNING.
+
+    The replacement is prepared in a temp file **unique to this call** (``tempfile.mkstemp`` in
+    the same directory, created with ``O_EXCL``), never a fixed name: several Conductors share
+    this file, and two compactions writing one fixed ``.tmp`` would interleave and swap a
+    corrupted file into place (#465 PR-gate on c7a8343). Each compaction swaps in a whole file
+    of its own; a temp file that is not swapped in is removed."""
     with path.open(encoding="utf-8", newline="") as f:
         lines = f.readlines()
     if len(lines) <= keep_lines:
         return
-    tmp = path.with_name(path.name + ".compact.tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        f.writelines(lines[-keep_lines:])
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".compact.tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines[-keep_lines:])
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _parse(raw: Any) -> TierCAnnotation | None:
