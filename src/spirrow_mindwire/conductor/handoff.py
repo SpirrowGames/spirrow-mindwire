@@ -989,11 +989,16 @@ _TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
 }
 
 
-def _check_label_definitions(definitions: dict[str, str], admitted: frozenset[str]) -> None:
+def _check_label_definitions(
+    definitions: dict[str, str],
+    admitted: frozenset[str],
+    *,
+    name: str = "_TIER_C_LABEL_DEFINITIONS",
+) -> None:
     """Fail loudly when the prompt's label definitions and the gate's admitted set diverge."""
     if frozenset(definitions) != admitted:
         raise RuntimeError(
-            f"handoff._TIER_C_LABEL_DEFINITIONS keys {sorted(definitions)} != "
+            f"handoff.{name} keys {sorted(definitions)} != "
             f"tier_c_admission_gate.ADMIT_LABELS {sorted(admitted)}: define every admitted "
             "label (and only those) before the handoff prompt can teach it"
         )
@@ -1017,6 +1022,22 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
 
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
 _TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
+
+# T-naysayer-omits-tierc-label D2'-b (Bohr msg-6656 / msg-6658, endorsed by Einstein msg-6657): the
+# naysayer's ``TIER-C-CHECK`` conditions are exactly the Tier-C types, one condition per admitted
+# label and named by it — the same key-set check as above runs at import, so the checklist can
+# neither ask about something the gate does not admit as Tier-C nor miss a type it does.
+_NAYSAYER_CHECK_CONDITIONS: dict[str, str] = {
+    "goal": "no addition / removal / change to a spec already decided for the project",
+    "cost": "no increase in money spent",
+    "irreversible": "nothing irreversible or externally published",
+}
+_check_label_definitions(
+    _NAYSAYER_CHECK_CONDITIONS, ADMIT_LABELS, name="_NAYSAYER_CHECK_CONDITIONS"
+)
+_NAYSAYER_CHECK_PROSE = "; ".join(
+    f"{_NAYSAYER_CHECK_CONDITIONS[label]} (`{label}`)" for label in TIER_C_LABELS
+)
 
 # D4'-a: the one written example of the operator form. The protocol text quotes it, the stand-down
 # notices quote it, and a test feeds it through :func:`resolve_handoff` and requires
@@ -1165,10 +1186,16 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # implementer receives the same TIER-C: <label> emission guidance the proposer already has (A
     # msg-890 §3 shipped the calibration tag ONLY on the proposer side; the parser reads it on
     # every human-terminal path, so 25/25 implementer human terminals recorded a null label in the
-    # 08-24..09-04 window purely because the emitter was never told). Naysayer is deliberately NOT
-    # given this guidance — msg-2540 §3 / Einstein Obj-3: a naysayer's ``NEXT: human`` is an
-    # escalation of a design concern, not a Tier-C decision request, and forcing a Tier-C label
-    # onto that surface would push two distinct concepts into one field (hybrid complexity).
+    # 08-24..09-04 window purely because the emitter was never told).
+    #
+    # SUPERSEDED for the naysayer (T-naysayer-omits-tierc-label, Bohr msg-6654 D1/D3, revised
+    # msg-6656, endorsed by Einstein msg-6655 / msg-6657): Obj-3 kept the label guidance away from
+    # the naysayer on the premise that an unlabelled naysayer ``NEXT: human`` — "an escalation of a
+    # design concern" — still reaches the human. Since ``[tierc_gate] mode = "enforce"``
+    # (2026-10-03) that premise is false: R1 bounces every unlabelled ``NEXT: human`` whatever the
+    # author's role, and the 10-03..10-08 audit (operator msg-6652) found 5 of 6 R1 bounces were
+    # naysayer posts that were genuinely Tier-C and re-posted unchanged plus a label line. So the
+    # naysayer now gets the same label guidance; do not read Obj-3 as a reason to remove it.
     Role.IMPLEMENTER: (
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
@@ -1181,21 +1208,32 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"    TIER-C: {require_admitted('cost', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
+    # T-naysayer-omits-tierc-label (Bohr msg-6658 spec, Einstein msg-6657 / go): D1 — `human` only
+    # for a Tier-C type, labelled, with the shared label guidance; D2'-b — the TIER-C-CHECK is the
+    # Tier-C types and nothing else (manual work goes to `NEXT: operator`, an unsettled conflict is
+    # no longer a human condition); D2'-a / D2'-c — a non-Tier-C objection still unsettled after two
+    # hand-backs is recorded as `Unresolved objection:` and the design goes to the implementer, so
+    # an advisory role cannot stall the thread by handing back forever (Einstein msg-6655).
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
         "disposition (`NEXT: <proposer persona>`); if the design is sound and ready to build, hand "
         "to the implementer (`NEXT: <implementer persona>`) — while this project's loop is running "
         "autonomously the conductor builds it directly, otherwise it routes your go to the human "
-        f"for the Tier-C decision; or hand to `{HUMAN_TOKEN}` to escalate a concern that needs the "
-        "human now. You are advisory, not a veto — but your escalation pulls the human back in "
-        "however autonomously the loop is running. When you hand to the implementer, put exactly "
-        f"`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your `NEXT:` "
-        "line, and only after checking that what you approve to build needs no human decision: "
-        "no increase in money spent, no addition / removal / change to a spec already decided for "
-        "the project, nothing irreversible or externally published, no task only the human can "
-        "do, and no proposer-naysayer conflict you could not settle. If any of those applies, "
-        "hand to the human instead. Without the check line the conductor "
-        "does not build autonomously — it routes your go to the human."
+        "for the Tier-C decision. You are advisory, not a veto: if the same objection is still "
+        "unsettled after you have handed it back to the proposer twice, do not hand it back again "
+        "— record it in your reply under an `Unresolved objection:` heading with its class and "
+        "evidence, then hand to the implementer as below. The PR gate (where the code is reviewed) "
+        "and the merge policy decide whether it merges. When you hand to the implementer, put "
+        f"exactly `{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your "
+        "`NEXT:` line, and only after checking that what you approve to build needs no Tier-C "
+        f"decision: {_NAYSAYER_CHECK_PROSE}. If any of those applies, hand to the human instead, "
+        "with that type as the label. Without the check line the conductor does not build "
+        "autonomously — it routes your go to the human. Work that only a person can do by hand is "
+        f"not Tier-C: use the `NEXT: {OPERATOR_TOKEN}` form above for it. Hand to `{HUMAN_TOKEN}` "
+        f"only when the matter is one of the {_TIER_C_COUNT_WORD} Tier-C types, and name the type "
+        "on the line directly above your handoff, e.g.:\n\n"
+        f"    TIER-C: {require_admitted('irreversible', where='handoff example')}\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
 }
 
