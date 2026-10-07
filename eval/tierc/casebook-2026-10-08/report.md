@@ -72,3 +72,17 @@ Calls recorded: 42; with a score: 42; providers: ['jev'].
 - Set (iii) is read from the chatroom (every roster message whose last `NEXT:` is human), not from the conductor log, so it includes turns the label gate bounced.
 - msg-754 (false premise) is out of Jev's scope by design (msg-6664 §3): its score is recorded, no detection is expected, and no decision uses it.
 - Committed texts are redacted (`redact_infra`: IPv4 addresses and the Windows user-profile name), because this repository is public; each keeps the sha256 of its original. Measurement A ran on the redacted texts (none of the patterns involve those values). Measurement B sent the original logged `state_wire`, re-read from the conductor log and checked against `jev_input_sha256`.
+
+## Inputs this report was generated from (sha256)
+
+The build outputs were checked against `build.json` before this report was written.
+
+| file | sha256 |
+|---|---|
+| `build.json` | `3c999bafa16c1d417080a8b657ddbd460004e19e24bc810eb2fb7b31c62f616b` |
+| `truth.json` | `7347e61d47a061fc7735fa7dbd2ddbcc6bb24ffba11ca95a0411a4a16018d774` |
+| `casebook.jsonl` | `020786daed888d2b83f617e12ad1002361257cab135d64202d579885c26a38cc` |
+| `genuine_fulltext.jsonl` | `2447efb05459a7c0d4988e6ead9e323c55c1bea33c982de6285f07ed19f50092` |
+| `next_human.jsonl` | `b188f74ee2354e80653f88aa61b15f3f177d0db15d22be1c65240a8da0525727` |
+| `selfneg.jsonl` | `03fb5243517c4bebbf2b9a58991ba57d0175dadbb366e0ea243b7824952811d3` |
+| `jev.jsonl` | `41711be3036882ac51edee06428699beb5d8e00b39e00a879849aa338eb70ab2` |
