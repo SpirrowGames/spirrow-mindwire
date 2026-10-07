@@ -525,9 +525,11 @@ class DeciderTierCConfig(_StrictModel):
       ままなので、 default 設定では Decider は構築されず HTTP も飛ばない
       (``adapters.decider_lexora.build_decider`` が ``None`` を返す)。
       有効化は ``MINDWIRE_DECIDER_BACKEND=lexora`` + ``MINDWIRE_LEXORA_URL``。
-    * ``annotate`` — LIKELY_NOT に対して escalation 通知に注釈 1 行を
-      付ける。 §6-C 制約 1 (genuine 見逃し 0 件) を満たしたときのみ
-      投入 (D15)。
+    * ``annotate`` — DECIDED 2e-2 (msg-5141): 人に届いた ``NEXT: human`` に、digest で
+      ``Jev: should_ask_human=p (未検証、AUC 未確立) — <該当ルール>`` を 1 行付け、p の低い
+      ものを下に並べる。 届く・止まる・routing は変えない (D20)。 書き先は
+      ``<data_dir>/state/tierc_annotations.jsonl`` (:mod:`.decider.annotation`)。
+      ``bounce`` も同じ注釈を書く (差し戻さずに人へ届いたものに付く)。
     * ``bounce`` — tierc-v2: label gate が通した (``RETRY:`` / ``unsure:goal?``
       以外の) ``NEXT: human`` に Jev が actionable な ``LIKELY_NOT`` を出したとき、
       書いた本人へ 1 回だけ差し戻す。 ``RETRY:`` は必ず人へ届く。 ``[tierc_gate]
@@ -693,6 +695,16 @@ def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
     return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
 
 
+TIERC_ANNOTATIONS_FILENAME = "tierc_annotations.jsonl"
+"""The Jev annotation log under ``<data_dir>/state/`` (2e-2). The sweep reads the same path."""
+
+
+def resolve_tierc_annotations_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/tierc_annotations.jsonl`` — the Jev annotation lines the digest shows
+    under ``[decider.tierc] mode = "annotate" | "bounce"`` (T-decider-conductor-hook 2e-2)."""
+    return settings.paths.data_dir / "state" / TIERC_ANNOTATIONS_FILENAME
+
+
 TIERC_RULES_FILENAME = "tierc_rules.toml"
 """The canonical Tier-C rules file name under ``<data_dir>/config/`` (msg-4382 Objection 3)."""
 
@@ -779,6 +791,7 @@ def load_settings(config_path: Path | None = None) -> MindwireSettings:
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
+    "TIERC_ANNOTATIONS_FILENAME",
     "TIERC_RULES_FILENAME",
     "TIER_C_DECISIONS_LOG_FILENAME",
     "ClaudeCodeConfig",
@@ -799,6 +812,7 @@ __all__ = [
     "WatcherConfig",
     "load_settings",
     "resolve_tier_c_decisions_log_path",
+    "resolve_tierc_annotations_path",
     "resolve_tierc_rules_path",
     "resolve_tierc_rules_snapshot_dir",
 ]

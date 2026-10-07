@@ -438,12 +438,14 @@ Write-Host "F-1 — every non-empty row section keeps a floor of one row (msg-24
 # attaches to a quarantine row (it is part of the row above it, not a row of its own).
 function Get-DigestRowCounts {
     param([string]$Digest)
-    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; stalehuman = 0; starved = 0; launchwait = 0 }
+    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; mergewait = 0; stalehuman = 0; starved = 0; launchwait = 0 }
     $sec = $null
     foreach ($l in ($Digest -split "`n")) {
         if ($l -match '^隔離中: ')       { $sec = 'quarantine'; continue }
         if ($l -match '^判断待ち: ')     { $sec = 'parked'; continue }
         if ($l -match '^\s+取得失敗: ')  { $sec = 'fetcherr'; continue }
+        # DECIDED 2e-1c: merge waits have their own section after 取得失敗; they are not 判断待ち rows.
+        if ($l -match '^merge 待ち（')   { $sec = 'mergewait'; continue }
         # msg-5889 D-1: the 停止中 section sits between 取得失敗 and 飢餓.
         if ($l -match '^停止中（')        { $sec = 'stalehuman'; continue }
         if ($l -match '^飢餓 ')           { $sec = 'starved'; continue }
@@ -1041,6 +1043,109 @@ $scanNone = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error =
 Check "no declared project -> nothing ticked" 0 $script:parkWakeCalls.Count
 Check "no declared project -> nothing failed" 0 @($scanNone.failed).Count
 Check "no declared project -> digest unchanged" 0 (Get-StopClassDigestLines -ByProject $scanNone.byProject -Failed $scanNone.failed).Count
+
+# =============================================================================================
+# T-decider-conductor-hook DECIDED 2e-1c / 2e-2 (Bohr msg-5141, Einstein msg-5142 / msg-5144):
+# merge waits leave the 判断待ち list for their own section, and a row Jev annotated carries one
+# "Jev: should_ask_human=p …" line, lower p listed lower. Display only.
+# =============================================================================================
+Write-Host ""
+Write-Host "New-DailyDigest — merge 待ち section (2e-1c) and Jev annotation (2e-2)"
+
+function New-JvRow {
+    param([string]$Tid, [string]$Lane = 'decision', $Score = $null, [string]$Line = '')
+    $h = [ordered]@{ key = "p/$Tid"; project = 'p'; thread_id = $Tid; head_msg_id = "msg-$Tid";
+                     token = 'human'; lane = $Lane; operator_task = ''; protocol_violation = $false }
+    if ($null -ne $Score) { $h['jev_ask_score'] = $Score; $h['jev_line'] = $Line }
+    return [PSCustomObject]$h
+}
+function Get-SectionLines {
+    param([string]$Digest, [string]$HeadPattern)
+    $out = @(); $in = $false
+    foreach ($l in ($Digest -split "`n")) {
+        if ($l -match $HeadPattern) { $in = $true; $out += $l; continue }
+        if ($in -and $l -eq '') { break }
+        if ($in) { $out += $l }
+    }
+    return ,$out
+}
+$jvLow  = 'Jev: should_ask_human=0.05（未検証、AUC 未確立）— R2'
+$jvMid  = 'Jev: should_ask_human=0.40（未検証、AUC 未確立）— R4'
+$jvHigh = 'Jev: should_ask_human=0.90（未検証、AUC 未確立）— 該当ルールなし'
+$jvParked = @(
+    (New-JvRow -Tid 'T-low'   -Score 0.05 -Line $jvLow)
+    (New-JvRow -Tid 'T-merge' -Lane 'merge_wait')
+    (New-JvRow -Tid 'T-plain')
+    (New-JvRow -Tid 'T-high'  -Score 0.9 -Line $jvHigh)
+    (New-JvRow -Tid 'T-mid'   -Score 0.4 -Line $jvMid)
+    (New-JvRow -Tid 'T-plain2')
+)
+$jvDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked $jvParked -Budget $script:DigestBudget
+$jvSec = Get-SectionLines $jvDigest '^判断待ち: '
+Check "判断待ち counts decisions only (merge wait excluded)" '判断待ち: 5 件' $jvSec[0]
+CheckTrue "the merge-wait count is no longer appended to the 判断待ち header" (-not ($jvSec[0] -match 'merge')) $jvSec[0]
+CheckTrue "no merge-wait row in 判断待ち" (-not ($jvSec -match 'T-merge')) ($jvSec -join "`n")
+$jvRowKeys = @($jvSec | Select-Object -Skip 1 | Where-Object { $_ -match '^  p/' } | ForEach-Object { ($_.Trim() -split '\s+')[0] })
+Check "unannotated rows first in their order, then by should_ask_human, lowest last" `
+    'p/T-plain,p/T-plain2,p/T-high,p/T-mid,p/T-low' ($jvRowKeys -join ',')
+$lowAt = [array]::IndexOf($jvSec, ($jvSec | Where-Object { $_ -match '^  p/T-low ' } | Select-Object -First 1))
+Check "the Jev line sits directly under its row, indented as a continuation" "    $jvLow" $jvSec[$lowAt + 1]
+Check "one Jev line per annotated row and none for the others" 3 @($jvSec | Where-Object { $_ -match '^    Jev: ' }).Count
+$mwSec = Get-SectionLines $jvDigest '^merge 待ち（'
+Check "merge waits get their own section" 'merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: 1 件' $mwSec[0]
+Check "and its row" '  p/T-merge   [msg-T-merge]' $mwSec[1]
+$jvCounts = Get-DigestRowCounts $jvDigest
+Check "the row counter sees 5 判断待ち rows (Jev lines are continuations)" 5 $jvCounts.parked
+Check "the row counter sees 1 merge-wait row" 1 $jvCounts.mergewait
+CheckTrue "digest with Jev lines fits the budget" ($jvDigest.Length -le $script:DigestBudget) $jvDigest.Length
+
+# No merge wait → no section (budget), and a merge-wait-only day says 判断待ち: 0 件 (該当なし).
+$noMw = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked @((New-JvRow -Tid 'T-plain'))
+CheckTrue "no merge wait -> no merge-wait section" (-not ($noMw -match 'merge 待ち（')) $noMw
+$onlyMw = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked @((New-JvRow -Tid 'T-merge' -Lane 'merge_wait'))
+$omSec = Get-SectionLines $onlyMw '^判断待ち: '
+Check "merge waits only -> 判断待ち: 0 件" '判断待ち: 0 件' $omSec[0]
+Check "merge waits only -> (該当なし)" '  (該当なし)' $omSec[1]
+CheckTrue "merge waits only -> the merge-wait section carries it" ($onlyMw -match 'merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: 1 件') $onlyMw
+
+# #465 PR-gate (msg-6631, upheld by the human): each header counts exactly the rows listed under
+# it. Every lane at once — 2 decisions, 1 operator, 1 misroute, 3 merge waits — and the counts are
+# checked against the rows actually emitted, not against a second tally of the input.
+$mixed = @(
+    (New-JvRow -Tid 'T-d1')
+    (New-JvRow -Tid 'T-mw1' -Lane 'merge_wait')
+    (New-JvRow -Tid 'T-op'  -Lane 'operator_work')
+    (New-JvRow -Tid 'T-mw2' -Lane 'merge_wait')
+    (New-JvRow -Tid 'T-mis' -Lane 'misroute')
+    (New-JvRow -Tid 'T-d2')
+    (New-JvRow -Tid 'T-mw3' -Lane 'merge_wait')
+)
+$mxDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked $mixed -Budget $script:DigestBudget
+$mxSec = Get-SectionLines $mxDigest '^判断待ち: '
+Check "mixed lanes -> header counts decisions, names operator / misroute, excludes merge waits" `
+    '判断待ち: 2 件（ほか operator 作業 1 件 / 宛先誤り 1 件）' $mxSec[0]
+$mxRows = @($mxSec | Select-Object -Skip 1 | Where-Object { $_ -match '^  p/' })
+Check "mixed lanes -> 判断待ち lists decisions + operator + misroute rows (no merge wait)" 4 $mxRows.Count
+CheckTrue "mixed lanes -> no merge-wait row under 判断待ち" (-not ($mxSec -match 'T-mw')) ($mxSec -join "`n")
+$mxMw = Get-SectionLines $mxDigest '^merge 待ち（'
+Check "mixed lanes -> merge-wait header count" 'merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: 3 件' $mxMw[0]
+Check "mixed lanes -> merge-wait header count equals its rows" 3 @($mxMw | Select-Object -Skip 1 | Where-Object { $_ -match '^  p/T-mw' }).Count
+
+# Many merge waits under the shipped budget: the section keeps its floor and the total fits.
+$manyMw = @()
+for ($i = 0; $i -lt 40; $i++) { $manyMw += (New-JvRow -Tid ("T-merge-wait-pr-{0:D2}-approved-and-waiting" -f $i) -Lane 'merge_wait') }
+$manyMw += (New-JvRow -Tid 'T-decision' -Score 0.3 -Line $jvMid)
+$mwBig = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -HumanParked $manyMw -Budget $script:DigestBudget
+CheckTrue "40 merge waits fit the budget" ($mwBig.Length -le $script:DigestBudget) $mwBig.Length
+$mwBigCounts = Get-DigestRowCounts $mwBig
+Check "the decision row survives 40 merge waits" 1 $mwBigCounts.parked
+CheckTrue "the merge-wait section keeps a floor of one row" ($mwBigCounts.mergewait -ge 1) $mwBigCounts.mergewait
+CheckTrue "truncated merge waits are reported" ($mwBig -match '\+\d+ 件（省略）') $mwBig
 
 if ($script:failures -gt 0) {
     Write-Host ""

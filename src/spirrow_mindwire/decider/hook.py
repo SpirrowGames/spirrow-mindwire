@@ -35,10 +35,11 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    ``state_wire`` — the exact ``state`` string sent to Lexora — so an evaluation weeks later reads
    what Jev saw instead of rebuilding it from a thread that has since grown;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
-   ``dr.actionable_verdict`` only (msg-4184). ``annotate`` is refused at build time. ``bounce`` is
-   acted on by the Conductor (``_enforce_tierc_gate``) from the result this hook returns; the hook
-   itself never acts. ``forced_naysayer`` and ``spawn_blocked`` rows are record-only in every
-   mode.
+   ``dr.actionable_verdict`` only (msg-4184). Both acting modes act in the Conductor from the result
+   this hook returns, never here: ``bounce`` in ``_enforce_tierc_gate``, and ``annotate`` /
+   ``bounce`` write the digest's Jev line for a head that reaches the human (``_annotate_tierc``,
+   DECIDED 2e-2 — display only). ``forced_naysayer`` and ``spawn_blocked`` rows are record-only
+   in every mode.
 
 **Fail loud, not fail open (Einstein msg-4240 advisory; PR-gate observation on #348).** A routing
 combination the mapping does not name raises :class:`RoutingInvariantError` (an
@@ -50,9 +51,10 @@ the thread.
 
 **Monotonicity (D20).** Nothing here returns a new stop, and the gate's admit / bounce is never
 used for stop, notification or routing — only as Decider input and a log column. The hook returns
-the result; the Conductor reads it only under ``[decider.tierc] mode = "bounce"`` with the gate
-enforced, and only to bounce a label-admitted turn once to its author (a ``RETRY:`` always reaches
-the human). Any exception is
+the result; the Conductor reads it under ``[decider.tierc] mode = "bounce"`` with the gate
+enforced, only to bounce a label-admitted turn once to its author (a ``RETRY:`` always reaches
+the human), and under ``annotate`` / ``bounce`` to write the digest's Jev line for a head that
+reaches the human (2e-2, display only). Any exception is
 caught and logged — it must never reach the stop decision.
 
 **Reader of the log line.** The payload is a structured ``logger.info`` record under the logger
@@ -546,14 +548,8 @@ async def run_tierc_hook(
     # the Conductor, not here: it needs the enforced gate's RETRY store and its notice/dispatch
     # path (``Conductor._enforce_tierc_gate``), and this hook stays an observer (D20). Its tierc-v2
     # entry condition (msg-4380 Δ4) is: label-admitted by the gate, not a RETRY admission, and an
-    # actionable ``LIKELY_NOT``. ``annotate`` is refused at build time and has no acting half.
-    av = dr.actionable_verdict
-    if routed == ROUTED_STOP and decider.tierc_mode == "annotate" and av is not None:
-        logger.warning(
-            "decider tierc mode %r has no acting implementation yet; verdict %s not acted on",
-            decider.tierc_mode,
-            av.kind.value,
-        )
+    # actionable ``LIKELY_NOT``. ``annotate`` (DECIDED 2e-2) is likewise the Conductor's
+    # (``_annotate_tierc``): a display line written after the stop is decided, never routing.
     return dr
 
 

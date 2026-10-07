@@ -81,6 +81,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS, NaysayerGatingConfig
+from ..decider.annotation import (
+    ANNOTATING_TIERC_MODES,
+    annotation_from_result,
+    append_annotation,
+)
 from ..decider.hook import (
     Decider,
     ThreadMessage,
@@ -489,6 +494,7 @@ class Conductor:
         launches_same_head: int = 0,
         launch_head_msg_id: str | None = None,
         tierc_gate: TierCGate | None = None,
+        tierc_annotations_path: Path | None = None,
         retry_of: RetryOf | None = None,
         decisions_log_path: Path | None = None,
         run_phase: RunPhase | None = None,
@@ -560,6 +566,10 @@ class Conductor:
         # gate bounces goes back to its author (``_enforce_tierc_gate``) — the one sanctioned
         # exception to D20 monotonicity, bounded by RETRY / fail-open (see :mod:`.tierc_gate`).
         self._tierc_gate = tierc_gate
+        # Jev annotation (DECIDED 2e-2). ``None`` = nothing written (a bare Conductor, or a Decider
+        # that is off / shadow). Written by ``_annotate_tierc`` only for a head that stops at the
+        # human; display only — nothing reads it back into a stop, notice or route (D20).
+        self._tierc_annotations_path = tierc_annotations_path
         # §2.6 decision log extraction (T-tier-c-admission-gate U4a, msg-5655 / msg-5657). ``None``
         # = no extraction (a bare Conductor, e.g. in unit tests). Independent of ``tierc_gate`` on
         # purpose: the log records what the proposer / implementer chose, which is a different
@@ -977,6 +987,9 @@ class Conductor:
                     # A silent author leaves the notice as the next latest → NO_PROGRESS.
                     processed_msg_id = _msg_id(bounce_msg)
                     continue
+            # DECIDED 2e-2: the head reaches the human (not bounced above) → the digest's Jev line.
+            if target_role is None and stop_reason is StopReason.HUMAN and not spawn_blocked:
+                self._annotate_tierc(handoff, latest, decider_result)
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -1126,8 +1139,9 @@ class Conductor:
         turn goes to Lexora whether or not the gate produced a result (msg-4380 Δ2). Every
         value passed is read only, never modified.
 
-        Returns the hook's result (``None`` when the Decider was off or not called). Only
-        :meth:`_enforce_tierc_gate` reads it, under ``[decider.tierc] mode = "bounce"``.
+        Returns the hook's result (``None`` when the Decider was off or not called). Read by
+        :meth:`_enforce_tierc_gate` under ``[decider.tierc] mode = "bounce"`` and by
+        :meth:`_annotate_tierc` under ``annotate`` / ``bounce`` (2e-2, display only).
         """
         if self._decider is None:
             return None
@@ -1271,6 +1285,59 @@ class Conductor:
             )
             return None
         return posted
+
+    def _annotate_tierc(
+        self,
+        handoff: Handoff,
+        latest: dict[str, Any],
+        decider_result: DecisionResult | None,
+    ) -> None:
+        """Write the digest's Jev line for a head that stops at the human (DECIDED 2e-2).
+
+        Called after ``_route`` and the enforced gate have decided, only when the head stops at
+        the human. Entered for an author-written ``NEXT: human`` by a proposer / implementer /
+        naysayer (the hook's entry rule), with the Decider in ``annotate`` or ``bounce`` and an
+        actionable tierc-v2 verdict of any kind
+        (:func:`..decider.annotation.annotation_from_result`).
+
+        **Display only (D20).** Returns nothing and nothing reads the file back into a stop, a
+        notice or a route. A write failure is a WARNING: the human still gets the escalation,
+        just without the line. Reader: Takahito, through the daily digest
+        (``scripts/parked_humans.py --annotations``); no chatroom post, so no fallback surface.
+        """
+        path = self._tierc_annotations_path
+        if path is None or self._decider is None:
+            return
+        if self._decider.tierc_mode not in ANNOTATING_TIERC_MODES:
+            return
+        if handoff.kind is not HandoffKind.HUMAN or not handoff.author_requested_human:
+            return
+        author = _author(latest)
+        if not is_tierc_entry(author_requested_human=True, author_role=self._roster_role(author)):
+            return
+        try:
+            annotation = annotation_from_result(
+                decider_result,
+                project=self._thread_ref.project_id,
+                thread_id=self._thread_ref.thread_id,
+                msg_id=_msg_id(latest),
+                now=datetime.now(UTC),
+            )
+            if annotation is None:
+                return
+            append_annotation(path, annotation)
+            logger.info(
+                "tierc annotation: msg=%s ask_score=%.3f rule=%s",
+                annotation.msg_id,
+                annotation.ask_score,
+                annotation.matched_rule,
+            )
+        except Exception:
+            logger.warning(
+                "tierc annotation for msg=%s not written; the escalation is unaffected",
+                _msg_id(latest),
+                exc_info=True,
+            )
 
     def _jev_bounce_score(
         self, decision: AdmissionDecision, decider_result: DecisionResult | None

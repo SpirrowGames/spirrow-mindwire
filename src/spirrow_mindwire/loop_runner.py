@@ -106,9 +106,11 @@ from .config import (
     Stage3LoopConfig,
     load_settings,
     resolve_tier_c_decisions_log_path,
+    resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
     resolve_tierc_rules_snapshot_dir,
 )
+from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
@@ -936,8 +938,14 @@ def build_conductor(
     if dec_cfg.tierc.mode == "bounce" and settings.tierc_gate.mode != "enforce":
         logger.warning(
             'decider: tierc=bounce has no effect without [tierc_gate] mode = "enforce" '
-            "(the Jev bounce shares the gate's RETRY store); acting as shadow"
+            "(the Jev bounce shares the gate's RETRY store); bouncing nothing, annotating only"
         )
+    # DECIDED 2e-2: the digest's Jev line. Written under annotate / bounce only; ``None`` = none.
+    tierc_annotations_path = (
+        resolve_tierc_annotations_path(settings)
+        if decider is not None and dec_cfg.tierc.mode in ANNOTATING_TIERC_MODES
+        else None
+    )
     logger.info(
         "decider: backend=%s tierc=%s questions=%s built=%s",
         resolve_decider_backend(dec_cfg.backend),
@@ -984,6 +992,7 @@ def build_conductor(
             review_source=_PerCallReviewSource(),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
+            tierc_annotations_path=tierc_annotations_path,
             # Adapter-error side channel (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
             # line when a dispatch raised. ``None`` = no reader (tests, library callers).
