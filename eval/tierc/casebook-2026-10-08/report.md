@@ -31,6 +31,8 @@ Thresholds unchanged: not_ask_max = 0.4, ask_min = 0.6.
 
 Inputs: (i) casebook 7; (ii) fulltext-2026-09-28 consensus genuine* 37; (iii) every roster `NEXT: human` from 2026-10-03T00:00:00+09:00 to 2026-10-07T21:00:48+00:00: 29.
 
+Set (ii) projects (inherited from the fulltext fixture): ['spirrow-magickit', 'spirrow-mindwire', 'spirrow-playproof', 'spirrow-voxelworld']. Set (iii) projects (`--project`): ['spirrow-mindwire', 'spirrow-lexora', 'spirrow-magickit', 'spirrow-prismind', 'spirrow-verimend', 'spirrow-voxelworld', 'spirrow-playproof'].
+
 | set | rows | rows with ≥1 hit |
 |---|---|---|
 | i | 7 | 1 |

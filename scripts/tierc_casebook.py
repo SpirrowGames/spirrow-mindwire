@@ -6,7 +6,13 @@ Spec: Bohr msg-6664 (design), msg-6666 (Einstein's two objections taken: whole-b
 mutually exclusive B → A → observe rule), summarised in msg-6668; approved by Einstein
 msg-6667 / msg-6669 and the hand-off to the implementer. Operator audit: msg-6653.
 
-Four sub-commands, run in this order. Only ``build`` and ``measure-b`` touch the network.
+Four sub-commands, run in this order. ``build`` and ``measure-a`` make read-only chatroom
+calls; ``measure-b`` calls ``/v1/decide``; ``report`` is offline.
+
+**No message body is written into this (public) repository.** The set files carry keys and the
+sha256 of each original body; ``measure-a`` fetches every body again and stops on a hash
+mismatch. ``casebook.jsonl`` carries ``jev_input`` (msg-6664 §1), redacted by
+:func:`redact_infra`.
 
 ``build`` (read-only chatroom calls + conductor logs → files)
     * ``casebook.jsonl`` — the 7 audited escalations. ``jev_input`` is the ``state_wire`` string
@@ -18,13 +24,16 @@ Four sub-commands, run in this order. Only ``build`` and ``measure-b`` touch the
       Jev was given (msg-6664 §1 "additional measurement").
     * ``genuine_fulltext.jsonl`` — set (ii): the rows of ``eval/tierc/fulltext-2026-09-28`` whose
       consensus (both labellers agree, as ``tierc_eval_report.consensus``) is genuine,
-      genuine-merge or genuine-action, with the full body fetched from the chatroom.
-    * ``next_human.jsonl`` — set (iii): every message by a ``[conductor.roster]`` identity, posted
-      in ``[--since, --as-of]``, whose last ``NEXT:`` token (``parse_next_token``, the
-      conductor's own parser) is ``human``. Bounced or not — the label gate is not consulted.
+      genuine-merge or genuine-action. Its projects are whatever that fixture holds
+      (``build.json`` ``set_ii_projects``); ``--project`` does not filter it.
+    * ``next_human.jsonl`` — set (iii), over the ``--project`` list only
+      (``build.json`` ``set_iii_projects``): every message by a ``[conductor.roster]``
+      identity, posted in ``[--since, --as-of]``, whose last ``NEXT:`` token
+      (``parse_next_token``, the conductor's own parser) is ``human``. Bounced or not — the
+      label gate is not consulted.
     * ``build.json`` — the inputs, counts and the sha256 of every file written.
 
-``measure-a`` (offline) — runs :func:`tierc_selfneg.detect_self_negation` on the three sets and
+``measure-a`` — runs :func:`tierc_selfneg.detect_self_negation` on the three sets and
 writes ``selfneg.jsonl`` (one line per row, hits included).
 
 ``measure-b`` (``/v1/decide``) — the 7 casebook rows x ``--runs`` (3) x two question sets:
@@ -259,7 +268,6 @@ def casebook_row(
         "failure_type": truth["failure_type"],
         "evidence": list(truth["evidence"]),
         "evidence_note": truth.get("evidence_note"),
-        "body": redact_infra(body),
         "body_sha256": sha256_text(body),
         "body_chars": len(body),
         "jev_head_chars": len(head),
@@ -353,7 +361,6 @@ async def build(
                 "msg_id": r["msg_id"],
                 "author": msg.get("author"),
                 "consensus": c,
-                "body": redact_infra(str(msg.get("content", ""))),
                 "body_sha256": sha256_text(str(msg.get("content", ""))),
             }
         )
@@ -378,7 +385,6 @@ async def build(
                             "msg_id": m["msg_id"],
                             "author": m.get("author"),
                             "posted_at": m["timestamp"],
-                            "body": redact_infra(body),
                             "body_sha256": sha256_text(body),
                         }
                     )
@@ -390,7 +396,8 @@ async def build(
     meta = {
         "as_of": as_of.isoformat(),
         "since": since.isoformat(),
-        "projects": list(projects),
+        "set_iii_projects": list(projects),
+        "set_ii_projects": sorted({str(r["project"]) for r in gen}),
         "roster": list(roster_names),
         "logs": [p.name for p in logs],
         "counts": {CASEBOOK: len(cb), GENUINE_FULLTEXT: len(gen), NEXT_HUMAN: len(nh)},
@@ -413,8 +420,9 @@ async def build(
 # ---------------------------------------------------------------------------
 
 
-def selfneg_record(set_name: str, row: Mapping[str, Any], truth: str) -> dict[str, Any]:
-    body = str(row["body"])
+def selfneg_record(set_name: str, row: Mapping[str, Any], truth: str, body: str) -> dict[str, Any]:
+    """Run the detector on ``body`` (already redacted) and keep only the hits — the bodies
+    themselves are never written into the repository (PR-gate msg on #467: diff size)."""
     lines = body.splitlines()
     hits = []
     for h in detect_self_negation(body):
@@ -440,17 +448,37 @@ def selfneg_record(set_name: str, row: Mapping[str, Any], truth: str) -> dict[st
     }
 
 
-def measure_a(out_dir: Path) -> list[dict[str, Any]]:
+def checked_body(row: Mapping[str, Any], msgs: Sequence[Mapping[str, Any]]) -> str:
+    """The message body for a committed key row, fetched again, checked against
+    ``body_sha256`` (a changed or missing message stops the run), then redacted."""
+    msg = _msg(msgs, str(row["msg_id"]), str(row["thread"]))
+    body = str(msg.get("content", ""))
+    if sha256_text(body) != row["body_sha256"]:
+        raise CasebookError(f"{row['thread']}/{row['msg_id']}: body does not match body_sha256")
+    return redact_infra(body)
+
+
+async def measure_a(out_dir: Path) -> list[dict[str, Any]]:
+    """Read-only chatroom calls: every body is fetched and hash-checked, never stored."""
+    from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
+
+    mcp = StreamableHttpChatroomMcp()
+    cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    async def body_of(row: Mapping[str, Any]) -> str:
+        key = (str(row["project"]), str(row["thread"]))
+        if key not in cache:
+            cache[key] = await _get_thread(mcp, *key)
+        return checked_body(row, cache[key])
+
     cb = read_jsonl(out_dir / CASEBOOK)
     known = {(r["project"], r["msg_id"]): r["truth"] for r in cb}
-    recs = [selfneg_record("i", r, str(r["truth"])) for r in cb]
-    recs += [
-        selfneg_record("ii", r, str(r["consensus"])) for r in read_jsonl(out_dir / GENUINE_FULLTEXT)
-    ]
-    recs += [
-        selfneg_record("iii", r, known.get((r["project"], r["msg_id"]), "unlabelled"))
-        for r in read_jsonl(out_dir / NEXT_HUMAN)
-    ]
+    recs = [selfneg_record("i", r, str(r["truth"]), await body_of(r)) for r in cb]
+    for r in read_jsonl(out_dir / GENUINE_FULLTEXT):
+        recs.append(selfneg_record("ii", r, str(r["consensus"]), await body_of(r)))
+    for r in read_jsonl(out_dir / NEXT_HUMAN):
+        truth = known.get((r["project"], r["msg_id"]), "unlabelled")
+        recs.append(selfneg_record("iii", r, truth, await body_of(r)))
     write_jsonl(out_dir / SELFNEG, recs)
     return recs
 
@@ -755,6 +783,9 @@ def render_report(out_dir: Path, runs: int) -> str:
         f"genuine* {meta['counts'][GENUINE_FULLTEXT]}; (iii) every roster `NEXT: human` from "
         f"{meta['since']} to {meta['as_of']}: {meta['counts'][NEXT_HUMAN]}.",
         "",
+        f"Set (ii) projects (inherited from the fulltext fixture): {meta['set_ii_projects']}. "
+        f"Set (iii) projects (`--project`): {meta['set_iii_projects']}.",
+        "",
         "| set | rows | rows with ≥1 hit |",
         "|---|---|---|",
     ]
@@ -862,7 +893,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(meta["counts"]))
     elif args.cmd == "measure-a":
-        recs = measure_a(args.dir)
+        recs = asyncio.run(measure_a(args.dir))
         print(f"{len(recs)} rows, {sum(1 for x in recs if x['hits'])} with hits")
     elif args.cmd == "measure-b":
         n = asyncio.run(

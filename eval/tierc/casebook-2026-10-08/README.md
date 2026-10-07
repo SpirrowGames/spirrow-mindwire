@@ -18,15 +18,17 @@ All the numbers are in `report.md`, which is generated and not edited by hand.
 | file | rows | what |
 |---|---|---|
 | `truth.json` | 7 | the audit table (msg-6653), transcribed: truth, failure type, evidence messages; msg-6606's negating sentence |
-| `casebook.jsonl` | 7 | per row: `msg_id` / `project` / `thread` / `author` / `label` / `jev_input` / `ask_score` / `truth` / `failure_type` / `evidence`, plus the full body. `jev_input` is the logged `state_wire` string, copied, not rebuilt. msg-6606 also records `negation_offset` / `negation_in_jev_input` |
-| `genuine_fulltext.jsonl` | 37 | set (ii): the `fulltext-2026-09-28` rows whose consensus is genuine / genuine-merge / genuine-action, full body from the chatroom |
-| `next_human.jsonl` | 29 | set (iii): every message by a `[conductor.roster]` identity, 2026-10-03 00:00 JST → `as_of`, whose last `NEXT:` is `human`. Bounced ones are included: the set is read from the chatroom, not from the gate |
-| `build.json` | — | `since` / `as_of`, projects, roster, log files, counts, sha256 of the build outputs |
+| `casebook.jsonl` | 7 | per row: `msg_id` / `project` / `thread` / `author` / `label` / `jev_input` / `ask_score` / `truth` / `failure_type` / `evidence`, plus `body_sha256` / `body_chars` (the body itself is not committed). `jev_input` is the logged `state_wire` string, copied, not rebuilt. msg-6606 also records `negation_offset` / `negation_in_jev_input` |
+| `genuine_fulltext.jsonl` | 37 | set (ii): the `fulltext-2026-09-28` rows whose consensus is genuine / genuine-merge / genuine-action: keys + `body_sha256`. Its projects are those of the fulltext fixture, including spirrow-playproof (`build.json` `set_ii_projects`); `--project` does not filter it |
+| `next_human.jsonl` | 29 | set (iii): every message by a `[conductor.roster]` identity, 2026-10-03 00:00 JST → `as_of`, whose last `NEXT:` is `human`, over the `--project` list (`set_iii_projects`): keys + `body_sha256`. Bounced ones are included: the set is read from the chatroom, not from the gate |
+| `build.json` | — | `since` / `as_of`, `set_ii_projects` / `set_iii_projects`, roster, log files, counts, sha256 of the build outputs |
 | `selfneg.jsonl` | 73 | measurement A: per row, every hit with the line before and after and the display-only `looks` column |
 | `jev.jsonl` | 42 | measurement B: 3 runs × 7 rows × (`tierc-v3`, `tierc-v4-candidate`), each with `request_sha256` and `decision_id` |
 | `report.md` | — | the decision rule applied, and every table |
 
-## Redaction (public repository)
+## Bodies and redaction (public repository)
+
+No message body is committed. The set files carry keys and the sha256 of each original body. `measure-a` fetches every body again from the chatroom (read-only) and stops on any hash mismatch. Only the hit lines and the lines around them reach `selfneg.jsonl`. This also keeps the PR under the PR-gate's review cap.
 
 This repository is public. Before any text is written here, `redact_infra` replaces:
 - every IPv4 address with `<ipv4>`;
@@ -34,7 +36,7 @@ This repository is public. Before any text is written here, `redact_infra` repla
 
 This follows the C-42 convention of `T-real-infra-values-egress-from-agent-context`: report placeholders, not values. Every redacted text keeps the sha256 of its original (`jev_input_sha256`, `body_sha256`).
 
-Measurement A ran on the redacted texts. Its hits are identical to an unredacted run, because no pattern involves these values. Measurement B sent the **original** logged `state_wire`: `measure-b` re-reads it from the conductor log and stops unless it matches `jev_input_sha256`. All 42 `request_sha256` values reproduce from the log.
+Measurement A runs on the fetched bodies after redaction. Its hits are identical to an unredacted run, because no pattern involves these values. Measurement B sent the **original** logged `state_wire`: `measure-b` re-reads it from the conductor log and stops unless it matches `jev_input_sha256`. All 42 `request_sha256` values reproduce from the log.
 
 ## How it was produced
 
@@ -43,8 +45,9 @@ uv run python scripts/tierc_casebook.py build --dir eval/tierc/casebook-2026-10-
   --log <data_dir>/logs/conductor-2026-*.log ... \
   --project spirrow-mindwire --project spirrow-lexora --project spirrow-magickit \
   --project spirrow-prismind --project spirrow-verimend --project spirrow-voxelworld \
+  --project spirrow-playproof \
   --since 2026-10-03T00:00:00+09:00 --as-of 2026-10-07T21:00:48+00:00
-uv run python scripts/tierc_casebook.py measure-a --dir eval/tierc/casebook-2026-10-08
+uv run python scripts/tierc_casebook.py measure-a --dir eval/tierc/casebook-2026-10-08   # read-only chatroom
 uv run python scripts/tierc_casebook.py measure-b --dir eval/tierc/casebook-2026-10-08 \
   --rules <data_dir>/config/tierc_rules.toml \
   --log <data_dir>/logs/conductor-2026-*.log ...
@@ -52,7 +55,7 @@ uv run python scripts/tierc_casebook.py measure-b --dir eval/tierc/casebook-2026
 uv run python scripts/tierc_casebook.py report --dir eval/tierc/casebook-2026-10-08
 ```
 
-The projects are the 6 in `sweep.json`. `measure-b` uses the default seed (`20261008`) and policy `mindwire.replay.tierc`, the replay policy, so these calls do not mix into the live tally.
+The set (iii) projects are the 6 in `sweep.json`, plus spirrow-playproof, which appears in the fulltext fixture. The chatroom has no project-listing tool, so this is every project known to either source. Adding playproof added no rows. `measure-b` uses the default seed (`20261008`) and policy `mindwire.replay.tierc`, the replay policy, so these calls do not mix into the live tally.
 
 ## Observations — not decisions
 

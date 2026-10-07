@@ -1,12 +1,19 @@
 {
   "as_of": "2026-10-07T21:00:48+00:00",
   "since": "2026-10-03T00:00:00+09:00",
-  "projects": [
+  "set_iii_projects": [
     "spirrow-mindwire",
     "spirrow-lexora",
     "spirrow-magickit",
     "spirrow-prismind",
     "spirrow-verimend",
+    "spirrow-voxelworld",
+    "spirrow-playproof"
+  ],
+  "set_ii_projects": [
+    "spirrow-magickit",
+    "spirrow-mindwire",
+    "spirrow-playproof",
     "spirrow-voxelworld"
   ],
   "roster": [
@@ -90,9 +97,9 @@
   },
   "sha256": {
     "truth.json": "7347e61d47a061fc7735fa7dbd2ddbcc6bb24ffba11ca95a0411a4a16018d774",
-    "casebook.jsonl": "592f3a851d048c8519bf03fcd2be75e5c033d13e317e77cdbc34254c5384e580",
-    "genuine_fulltext.jsonl": "e40d676e8a0db85b2712ce7c4a2f23b3cc6a6dd7293866816139c59e25d4a61c",
-    "next_human.jsonl": "0698ac1b4f790d1ed9dbed2dead1525ba86967f79348498022283756c5b6d12d"
+    "casebook.jsonl": "020786daed888d2b83f617e12ad1002361257cab135d64202d579885c26a38cc",
+    "genuine_fulltext.jsonl": "2447efb05459a7c0d4988e6ead9e323c55c1bea33c982de6285f07ed19f50092",
+    "next_human.jsonl": "b188f74ee2354e80653f88aa61b15f3f177d0db15d22be1c65240a8da0525727"
   },
   "body_head_m": 500,
   "redaction": "IPv4 -> <ipv4>, C:/Users/<name> -> <user> (redact_infra); *_sha256 = sha256 of the original"

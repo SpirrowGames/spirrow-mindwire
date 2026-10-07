@@ -431,7 +431,7 @@ def test_casebook_row_redacts_but_keeps_original_hash() -> None:
     wire = _state(body)
     row = cb.casebook_row(_truth(), {"state_wire": wire}, {"content": body})
     assert "10.0.0.9" not in row["jev_input"]
-    assert "10.0.0.9" not in row["body"]
+    assert "body" not in row  # bodies are never committed
     assert row["jev_input_sha256"] == cb.sha256_text(wire)
     assert row["body_sha256"] == cb.sha256_text(body)
 
@@ -445,3 +445,14 @@ def test_original_state_round_trip_and_mismatch() -> None:
         cb.original_state(row | {"jev_input_sha256": "0" * 64}, logged)
     with pytest.raises(cb.CasebookError):
         cb.original_state(row | {"jev_input": wire}, logged)
+
+
+def test_checked_body_verifies_hash_then_redacts() -> None:
+    body = "x 10.0.0.9 y"
+    msgs = [{"msg_id": "msg-9", "content": body}]
+    row = {"thread": "T", "msg_id": "msg-9", "body_sha256": cb.sha256_text(body)}
+    assert cb.checked_body(row, msgs) == "x <ipv4> y"
+    with pytest.raises(cb.CasebookError):
+        cb.checked_body(row | {"body_sha256": "0" * 64}, msgs)
+    with pytest.raises(cb.CasebookError):
+        cb.checked_body(row | {"msg_id": "msg-8"}, msgs)
