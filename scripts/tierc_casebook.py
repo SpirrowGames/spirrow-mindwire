@@ -728,6 +728,7 @@ def _cell(s: str) -> str:
 
 def render_report(out_dir: Path, runs: int) -> str:
     meta = json.loads((out_dir / BUILD).read_text(encoding="utf-8"))
+    digests = input_digests(out_dir, meta)
     cb = read_jsonl(out_dir / CASEBOOK)
     sn = read_jsonl(out_dir / SELFNEG)
     jev = read_jsonl(out_dir / JEV) if (out_dir / JEV).is_file() else []
@@ -851,8 +852,28 @@ def render_report(out_dir: Path, runs: int) -> str:
         "original. Measurement A ran on the redacted texts (none of the patterns involve those "
         "values). Measurement B sent the original logged `state_wire`, re-read from the conductor "
         "log and checked against `jev_input_sha256`.",
+        "",
+        "## Inputs this report was generated from (sha256)",
+        "",
+        "The build outputs were checked against `build.json` before this report was written.",
+        "",
+        "| file | sha256 |",
+        "|---|---|",
     ]
+    md += [f"| `{name}` | `{digest}` |" for name, digest in digests.items()]
     return "\n".join(md) + "\n"
+
+
+def input_digests(out_dir: Path, meta: Mapping[str, Any]) -> dict[str, str]:
+    """sha256 of every file :func:`render_report` reads, so the measurement outputs
+    (``selfneg.jsonl``, ``jev.jsonl``) are pinned too (PR-gate advisory on #467). The build
+    outputs must still match the hashes ``build.json`` recorded; a mismatch stops the report."""
+    recorded = meta.get("sha256") or {}
+    for name, digest in recorded.items():
+        if sha256_file(out_dir / name) != digest:
+            raise CasebookError(f"{name} no longer matches the sha256 recorded in {BUILD}")
+    names = [BUILD, *recorded, SELFNEG, JEV]
+    return {n: sha256_file(out_dir / n) for n in names if (out_dir / n).is_file()}
 
 
 # ---------------------------------------------------------------------------

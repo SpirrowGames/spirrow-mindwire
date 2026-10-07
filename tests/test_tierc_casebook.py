@@ -456,3 +456,20 @@ def test_checked_body_verifies_hash_then_redacts() -> None:
         cb.checked_body(row | {"body_sha256": "0" * 64}, msgs)
     with pytest.raises(cb.CasebookError):
         cb.checked_body(row | {"msg_id": "msg-8"}, msgs)
+
+
+def test_input_digests_pin_measurements_and_check_build(tmp_path: Path) -> None:
+    for name, text in {
+        "build.json": "{}",
+        "truth.json": "t",
+        "selfneg.jsonl": "s",
+        "jev.jsonl": "j",
+    }.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    meta = {"sha256": {"truth.json": cb.sha256_file(tmp_path / "truth.json")}}
+    got = cb.input_digests(tmp_path, meta)
+    assert list(got) == ["build.json", "truth.json", "selfneg.jsonl", "jev.jsonl"]
+    assert got["jev.jsonl"] == cb.sha256_file(tmp_path / "jev.jsonl")
+    (tmp_path / "truth.json").write_text("changed", encoding="utf-8")
+    with pytest.raises(cb.CasebookError):
+        cb.input_digests(tmp_path, meta)
