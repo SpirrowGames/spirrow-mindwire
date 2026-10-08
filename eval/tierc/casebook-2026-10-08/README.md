@@ -36,7 +36,7 @@ This repository is public. Before any text is written here, `redact_infra` repla
 
 This follows the C-42 convention of `T-real-infra-values-egress-from-agent-context`: report placeholders, not values. Every redacted text keeps the sha256 of its original (`jev_input_sha256`, `body_sha256`).
 
-Measurement A runs on the fetched bodies after redaction. Its hits are identical to an unredacted run, because no pattern involves these values. Measurement B sent the **original** logged `state_wire`: `measure-b` re-reads it from the conductor log and stops unless it matches `jev_input_sha256`. All 42 `request_sha256` values reproduce from the log.
+Measurement A runs on the fetched bodies after redaction. Its hits are identical to an unredacted run, because no pattern involves these values. Measurement B sent the **original** logged `state_wire`: `measure-b` re-reads it from the conductor log and stops unless it matches `jev_input_sha256`. Only that `state_wire` comes from the log. Each `request_sha256` is the sha256 of the request this measurement built and sent: the log-restored `state_wire` plus the variant's question set, built from the registered `tierc_rules.toml`. The log does not contain these requests. The 21 `tierc-v4-candidate` requests were never sent live; the 21 `tierc-v3` requests were sent for this measurement under the replay policy and are not compared with any live request. What reproduces is the recomputation: rebuilding all 42 requests from the log-restored `state_wire` and the two question sets gives every recorded `request_sha256` (checked 2026-10-08: 21/21 `tierc-v3`, 21/21 `tierc-v4-candidate`).
 
 ## How it was produced
 
