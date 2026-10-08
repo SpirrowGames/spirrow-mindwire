@@ -199,7 +199,13 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 - ADR-15 C-2 の「この部分集合は ZDR 必須」は外しません。
 - そのため、naysayer ティアを決める関数は、この部分集合では codex を返しません。
 - これを mindwire 側の実装で強制します。名前がずれたことを検知する構造テストも置きます。
-- この部分集合を codex に広げるかどうかは、goal の判断です。広げる場合は、別に改訂します。
+- **この部分集合の見分け方**（収束: chatroom `T-D8-codex-backend-adr14-15-amendment` の Bohr msg-6471〜6479、Einstein msg-6472〜6482）。次のどれか 1 つに当たる要求は Gemini のティアに送ります。
+  - marker `n3-sensitive` が付いている（PR-gate では PR のラベル、design-time ではスレッドのタグ）。marker を読めなかった場合も、付いているものとして扱います。
+  - HOST_REPO ごとの設定ファイル（N-3 のパスの一覧を持つファイル）そのものに触れている。glob の内容にかかわらず送ります。
+  - 変更されたファイル（PR-gate）や参照されたファイル（design-time）が、その設定ファイルのパスの glob に当たる。glob は、信頼する側（PR の base／リモートの既定ブランチ）と作業側（PR の head／プロンプトを組む元）の和集合を使います。作業側は glob を足すことしかできません。
+  - 設定を解決できない（信頼する側でファイルやキーが無い、読めない、どちらかの側が壊れている）。キーを書き忘れても codex には送りません。
+- **受け入れる残りのリスク**（Takahito の goal 判断。このスレッドで Einstein msg-6482 の Tier-C に答えたもの）。marker も glob も当たらないパスで、レビューそのものが初めて脆弱性を見つける場合は、事前に分類できません。この場合の内容は codex（ZDR なし）に送られます。上の 4 つで見分けられる要求については、codex を返さないという規則がそのまま有効です。
+- これ以上この部分集合を codex に広げるかどうかは、goal の判断です。広げる場合は、別に改訂します。
 
 **個人のサブスクを headless で使うことの運用上のもろさ**
 - レート制限やセッションの失効が起きると、codex は失敗します。その場合は gemini-fallback に切り替わります（7.4）。レビューは止まりませんが、その間は定額の利点がありません。
@@ -325,6 +331,6 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
      - 呼ばれた経路に合わせて frontmatter を実行時に書き換えることはしません。principles の SOT は preamble に verbatim で注入するものだからです。
      - 呼び出しごとに実際にどの backend が答えたかは、attestation の `backend=`（7.6）だけが記録します。この事実を frontmatter には書きません。
      - SOT の 8000 バイトの上限（`tests/test_naysayer_principles.py`）に収まっていること。上の例の値で約 7976 バイトになり、余裕は小さいので、値を変えるときはサイズを確かめます。
-   - **この更新は principles の改訂として扱い、同じ変更で frontmatter の `version:` を上げていること**（あわせて、`naysayer/principles.py` の `EXPECTED_PRINCIPLES_VERSION` も同じ値に上げます。片方だけ上げると起動時にエラーになります）。principles の SOT は、改訂のたびに `version:` を上げることを定めています。naysayer の出力はそれぞれ、判定に使った `principles_version` を記録します。version を上げずに `independent_model` だけを書き換えると、codex のレビューと Gemini のレビューが同じ `principles_version` で記録され、どちらの構成で判定したかを後からたどれなくなります。principles の改訂なので、SOT が定める手続き（proposer / implementer / naysayer の協議と Takahito の承認）にも従います。
+   - **この更新は principles の改訂として扱い、同じ変更で frontmatter の `version:` を上げていること**（あわせて、`naysayer/principles.py` の `EXPECTED_PRINCIPLES_VERSION` も同じ値に上げます。片方だけ上げると起動時にエラーになります）。principles の SOT は、改訂のたびに `version:` を上げることを定めています。naysayer の出力はそれぞれ、判定に使った `principles_version` を記録します。version を上げることで分かれるのは、**切り替え前のティアの構成（Gemini だけ）と、切り替え後の構成（codex を正とするもの）**です。version を上げずに `independent_model` だけを書き換えると、切り替えの前と後のレビューが同じ `principles_version` で記録され、どちらの構成のもとで判定したかを後からたどれなくなります。切り替え後は codex と Gemini のどちらが答えても同じ `principles_version` が記録されます。呼び出しごとにどの backend が答えたかを区別するのは、上に書いたとおり attestation の `backend=` だけで、version の役割ではありません。principles の改訂なので、SOT が定める手続き（proposer / implementer / naysayer の協議と Takahito の承認）にも従います。
    - ティアを決める関数のテストがあること。N-3 の部分集合（7.3）の要求と、codex の上限に収まらない要求（7.5）が、それぞれ Gemini のティアに送られることを確かめます。判定関数の誤りは、attestation の照合（7.6）では検知できないため、このテストで防ぎます。
 5. shadow 比較のあとで primary に上げること。
