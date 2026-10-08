@@ -430,6 +430,36 @@ def test_naysayer_block_bounds_unsettled_objections() -> None:
     assert "PR gate" in block
 
 
+def test_naysayer_unresolved_objection_bound_is_non_tier_c_only() -> None:
+    # D6-a / D6-b' / D6-c' (Bohr msg-6684, revised msg-6694 after PR-gate's blocking finding on
+    # #469): a Tier-C objection may go back to the proposer at most once, then to the human with a
+    # label (straight away when no redesign can remove it), never to the implementer; the
+    # two-hand-back `Unresolved objection:` → implementer path is for non-Tier-C objections only.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    slash = " / ".join(TIER_C_LABELS)
+    assert slash == handoff_mod._TIER_C_SLASH_LIST
+    opening = block.index("hand back to the proposer if your objections need a disposition")
+    tier_c_start = block.index("That hand-back for a disposition also covers")
+    bound = block.index("handed it back to the proposer twice")
+    unresolved = block.index("`Unresolved objection:`")
+    assert opening < tier_c_start < bound < unresolved
+    tier_c_part = block[tier_c_start : block.rindex("Only when", 0, bound)]
+    # the opening hand-back explicitly covers Tier-C objections, capped at one
+    assert f"itself a Tier-C type ({slash}), but at most once" in tier_c_part
+    # after that one hand-back (or at once, when no redesign can remove it): labelled human
+    assert (
+        f"hand to the human (`NEXT: {HUMAN_TOKEN}`) with that type as the `TIER-C:` label"
+        in tier_c_part
+    )
+    assert "hand it to the human with the label straight away" in tier_c_part
+    assert "never goes to the implementer, however many times" in tier_c_part
+    assert "twice" not in tier_c_part
+    # the two-hand-back bound and its implementer route are conditioned on non-Tier-C
+    bound_part = block[block.rindex("Only when", 0, bound) : unresolved + 200]
+    assert f"the objection is not one of {slash}" in bound_part
+    assert "then hand to the implementer" in bound_part
+
+
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
