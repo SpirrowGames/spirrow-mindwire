@@ -1035,6 +1035,10 @@ _NAYSAYER_CHECK_CONDITIONS: dict[str, str] = {
 _check_label_definitions(
     _NAYSAYER_CHECK_CONDITIONS, ADMIT_LABELS, name="_NAYSAYER_CHECK_CONDITIONS"
 )
+# D6-a (Bohr msg-6684, endorsed by Einstein): the naysayer text names the Tier-C types inline to
+# scope the two-hand-back bound to non-Tier-C objections; derived from the gate's set,
+# never re-spelled.
+_TIER_C_SLASH_LIST = " / ".join(TIER_C_LABELS)
 _NAYSAYER_CHECK_PROSE = "; ".join(
     f"{_NAYSAYER_CHECK_CONDITIONS[label]} (`{label}`)" for label in TIER_C_LABELS
 )
@@ -1214,16 +1218,24 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # no longer a human condition); D2'-a / D2'-c — a non-Tier-C objection still unsettled after two
     # hand-backs is recorded as `Unresolved objection:` and the design goes to the implementer, so
     # an advisory role cannot stall the thread by handing back forever (Einstein msg-6655).
+    # D6-a / D6-b (Bohr msg-6684 after PR-gate msg-6663's weakest point, endorsed by Einstein): that
+    # bound applies only to a NON-Tier-C objection; a Tier-C objection goes to the human, labelled,
+    # whatever the hand-back count, so the paragraph no longer says "to the implementer" for a case
+    # the check below says "to the human" for.
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
         "disposition (`NEXT: <proposer persona>`); if the design is sound and ready to build, hand "
         "to the implementer (`NEXT: <implementer persona>`) — while this project's loop is running "
         "autonomously the conductor builds it directly, otherwise it routes your go to the human "
-        "for the Tier-C decision. You are advisory, not a veto: if the same objection is still "
-        "unsettled after you have handed it back to the proposer twice, do not hand it back again "
-        "— record it in your reply under an `Unresolved objection:` heading with its class and "
-        "evidence, then hand to the implementer as below. The PR gate (where the code is reviewed) "
-        "and the merge policy decide whether it merges. When you hand to the implementer, put "
+        "for the Tier-C decision. You are advisory, not a veto. An objection whose substance is "
+        f"itself a Tier-C type ({_TIER_C_SLASH_LIST}) goes to the human however many times it has "
+        f"been handed back: hand to `{HUMAN_TOKEN}` with that type as the `TIER-C:` label (form "
+        "below) — the hand-back limit never sends a Tier-C matter to the implementer. Only when "
+        f"the objection is not itself {_TIER_C_SLASH_LIST} and is still unsettled after you have "
+        "handed it back to the proposer twice: do not hand it back again — record it in your reply "
+        "under an `Unresolved objection:` heading with its class and evidence, then hand to the "
+        "implementer as below. The PR gate (where the code is reviewed) and the merge policy "
+        "decide whether it merges. When you hand to the implementer, put "
         f"exactly `{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your "
         "`NEXT:` line, and only after checking that what you approve to build needs no Tier-C "
         f"decision: {_NAYSAYER_CHECK_PROSE}. If any of those applies, hand to the human instead, "

@@ -430,6 +430,28 @@ def test_naysayer_block_bounds_unsettled_objections() -> None:
     assert "PR gate" in block
 
 
+def test_naysayer_unresolved_objection_bound_is_non_tier_c_only() -> None:
+    # D6-a / D6-b / D6-c (Bohr msg-6684, after PR-gate msg-6663): the `Unresolved objection:` →
+    # implementer path is scoped to objections that are NOT themselves Tier-C, and a Tier-C
+    # objection goes to the human with a label regardless of the hand-back count — so the text no
+    # longer gives two conflicting routes for a Tier-C objection.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    slash = " / ".join(TIER_C_LABELS)
+    assert slash == handoff_mod._TIER_C_SLASH_LIST
+    tier_c_route = block.index("however many times it has been handed back")
+    bound = block.index("handed it back to the proposer twice")
+    unresolved = block.index("`Unresolved objection:`")
+    # the Tier-C route is stated first, labelled, and goes to the human
+    assert tier_c_route < bound < unresolved
+    tier_c_sentence = block[block.rindex(". ", 0, tier_c_route) : bound]
+    assert f"itself a Tier-C type ({slash})" in tier_c_sentence
+    assert f"hand to `{HUMAN_TOKEN}` with that type as the `TIER-C:` label" in tier_c_sentence
+    assert "never sends a Tier-C matter to the implementer" in tier_c_sentence
+    # the bound itself is conditioned on the objection being non-Tier-C
+    bound_sentence = block[block.rindex("Only when", 0, bound) : unresolved]
+    assert f"the objection is not itself {slash}" in bound_sentence
+
+
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
