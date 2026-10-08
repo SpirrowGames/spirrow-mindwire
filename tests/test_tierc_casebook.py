@@ -473,3 +473,25 @@ def test_input_digests_pin_measurements_and_check_build(tmp_path: Path) -> None:
     (tmp_path / "truth.json").write_text("changed", encoding="utf-8")
     with pytest.raises(cb.CasebookError):
         cb.input_digests(tmp_path, meta)
+
+
+def test_hit_row_keeps_long_lines_whole() -> None:
+    line = "**Not Tier-C.** " + "word " * 80 + "END"
+    row = {
+        "set": "ii",
+        "project": "p",
+        "thread": "T",
+        "msg_id": "msg-1",
+        "author": "A",
+        "truth": "genuine-action",
+    }
+    hit = {
+        "pattern": "en_not_tier_c",
+        "before": "b " * 100 + "B_END",
+        "line": line,
+        "after": "a|z " * 60 + "A_END",
+        "looks": "",
+    }
+    out = cb.hit_row(row, hit)
+    assert line.strip() in out
+    assert "B_END" in out and "A_END" in out and r"a\|z" in out
