@@ -516,3 +516,21 @@ def test_hit_row_keeps_long_lines_whole() -> None:
     out = cb.hit_row(row, hit)
     assert line.strip() in out
     assert "B_END" in out and "A_END" in out and r"a\|z" in out
+
+
+@pytest.mark.parametrize(
+    ("line", "excluded"),
+    [
+        ("<!-- source: tools=3 -->", True),
+        ("  <!-- a --> <!-- b -->  ", True),
+        ("<!-- a --> This escalation is premature <!-- b -->", False),
+        ("<!-- a --> trailing text", False),
+    ],
+)
+def test_comment_only_line_needs_nothing_but_comments(line: str, excluded: bool) -> None:
+    assert sn.is_excluded_line(line) is excluded
+
+
+def test_text_between_two_comments_is_searched() -> None:
+    hits = sn.detect_self_negation("<!-- a --> This escalation is premature. <!-- b -->")
+    assert hits

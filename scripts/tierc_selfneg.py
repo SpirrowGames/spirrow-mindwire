@@ -58,7 +58,9 @@ _COMPILED: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 EXCLUDED_LINE_PREFIXES: tuple[str, ...] = ("NEXT:", "TIER-C:", "RETRY:", "TIER-C-CHECK:")
 """msg-6666 Objection 1: lines starting with these (column 0) are not searched."""
 
-_COMMENT_ONLY = re.compile(r"^\s*<!--.*-->\s*$")
+_COMMENT_ONLY = re.compile(r"^\s*(?:<!--(?:(?!-->).)*-->\s*)+$")
+"""A line made only of one or more complete HTML comments. Each comment stops at its own
+``-->``, so text between two comments (``<!-- a --> text <!-- b -->``) keeps the line searched."""
 
 
 @dataclass(frozen=True)
