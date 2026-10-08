@@ -1218,22 +1218,30 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # no longer a human condition); D2'-a / D2'-c — a non-Tier-C objection still unsettled after two
     # hand-backs is recorded as `Unresolved objection:` and the design goes to the implementer, so
     # an advisory role cannot stall the thread by handing back forever (Einstein msg-6655).
-    # D6-a / D6-b (Bohr msg-6684 after PR-gate msg-6663's weakest point, endorsed by Einstein): that
-    # bound applies only to a NON-Tier-C objection; a Tier-C objection goes to the human, labelled,
-    # whatever the hand-back count, so the paragraph no longer says "to the implementer" for a case
-    # the check below says "to the human" for.
+    # D6-a (Bohr msg-6684 after PR-gate msg-6663's weakest point, endorsed by Einstein msg-6685):
+    # that bound applies only to a NON-Tier-C objection. D6-b' (Bohr msg-6694, replacing D6-b after
+    # PR-gate's blocking finding on #469; endorsed by Einstein): a Tier-C objection may be handed
+    # back to the proposer AT MOST ONCE (to drop the element or hand it to the human itself), then
+    # goes to the human, labelled; straight to the human when no redesign can remove it; never to
+    # the implementer at any count.
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
         "disposition (`NEXT: <proposer persona>`); if the design is sound and ready to build, hand "
         "to the implementer (`NEXT: <implementer persona>`) — while this project's loop is running "
         "autonomously the conductor builds it directly, otherwise it routes your go to the human "
-        "for the Tier-C decision. You are advisory, not a veto. An objection whose substance is "
-        f"itself a Tier-C type ({_TIER_C_SLASH_LIST}) goes to the human however many times it has "
-        f"been handed back: hand to the human (`NEXT: {HUMAN_TOKEN}`) with that type as the "
-        "`TIER-C:` label (form below) — the hand-back limit never sends a Tier-C matter to the "
-        f"implementer. Only when the objection is not one of {_TIER_C_SLASH_LIST} and is still "
-        "unsettled after you have "
-        "handed it back to the proposer twice: do not hand it back again — record it in your reply "
+        "for the Tier-C decision. You are advisory, not a veto. That hand-back for a disposition "
+        "also covers an objection whose substance is itself a Tier-C type "
+        f"({_TIER_C_SLASH_LIST}), but at most once: name the type in your reply, so the proposer "
+        "can either drop that element from the design and re-post it, or accept that it needs a "
+        "human decision and hand it to the human with the label itself. If the re-posted design "
+        "still carries that element and the proposer has not handed it to the human, hand to the "
+        f"human (`NEXT: {HUMAN_TOKEN}`) with that type as the `TIER-C:` label (form below). If no "
+        "revision of the design can remove the Tier-C element — an external side effect that has "
+        "already happened, or a thread whose purpose is itself Tier-C — hand it to the human with "
+        "the label straight away. A Tier-C objection never goes to the implementer, however many "
+        "times it has been handed back. Only when the objection is not one of "
+        f"{_TIER_C_SLASH_LIST} and is still unsettled after you have handed it back to the "
+        "proposer twice: do not hand it back again — record it in your reply "
         "under an `Unresolved objection:` heading with its class and evidence, then hand to the "
         "implementer as below. The PR gate (where the code is reviewed) and the merge policy "
         "decide whether it merges. When you hand to the implementer, put "
