@@ -726,6 +726,16 @@ def _cell(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ").strip()
 
 
+def hit_row(r: Mapping[str, Any], h: Mapping[str, Any]) -> str:
+    """One row of the measurement-A hit table. Lines are written whole (only ``|`` escaped
+    and newlines folded) — no fixed-width slice, so a hit line is never cut mid-word."""
+    return (
+        f"| {r['set']} | {r['project']}/{r['thread']}/{r['msg_id']} | {r['author']} | "
+        f"{r['truth']} | {h['pattern']} | {_cell(h['before'])} | "
+        f"{_cell(h['line'])} | {_cell(h['after'])} | {h['looks']} |"
+    )
+
+
 def render_report(out_dir: Path, runs: int) -> str:
     meta = json.loads((out_dir / BUILD).read_text(encoding="utf-8"))
     digests = input_digests(out_dir, meta)
@@ -802,11 +812,7 @@ def render_report(out_dir: Path, runs: int) -> str:
     ]
     for r in sn:
         for h in r["hits"]:
-            md.append(
-                f"| {r['set']} | {r['project']}/{r['thread']}/{r['msg_id']} | {r['author']} | "
-                f"{r['truth']} | {h['pattern']} | {_cell(h['before'])[:120]} | "
-                f"{_cell(h['line'])[:200]} | {_cell(h['after'])[:120]} | {h['looks']} |"
-            )
+            md.append(hit_row(r, h))
     md += [
         "",
         f"## Measurement B — Jev, {runs} runs x 7 rows x ({V3}, {V4_CANDIDATE})",
