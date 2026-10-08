@@ -18,7 +18,7 @@ All the numbers are in `report.md`, which is generated and not edited by hand.
 | file | rows | what |
 |---|---|---|
 | `truth.json` | 7 | the audit table (msg-6653), transcribed: truth, failure type, evidence messages; msg-6606's negating sentence |
-| `casebook.jsonl` | 7 | per row: `msg_id` / `project` / `thread` / `author` / `label` / `jev_input` / `ask_score` / `truth` / `failure_type` / `evidence`, plus `body_sha256` / `body_chars` (the body itself is not committed). `jev_input` is the logged `state_wire` string, copied, not rebuilt. msg-6606 also records `negation_offset` / `negation_in_jev_input` |
+| `casebook.jsonl` | 7 | per row: `msg_id` / `project` / `thread` / `author` / `label` / `jev_input` / `ask_score` / `truth` / `failure_type` / `evidence`, plus `body_sha256` / `body_chars` (the full body is not committed as its own field). `jev_input` is the logged `state_wire` string, copied, not rebuilt; it carries body extracts (see below). msg-6606 also records `negation_offset` / `negation_in_jev_input` |
 | `genuine_fulltext.jsonl` | 37 | set (ii): the `fulltext-2026-09-28` rows whose consensus is genuine / genuine-merge / genuine-action: keys + `body_sha256`. Its projects are those of the fulltext fixture, including spirrow-playproof (`build.json` `set_ii_projects`); `--project` does not filter it |
 | `next_human.jsonl` | 29 | set (iii): every message by a `[conductor.roster]` identity, 2026-10-03 00:00 JST → `as_of`, whose last `NEXT:` is `human`, over the `--project` list (`set_iii_projects`): keys + `body_sha256`. Bounced ones are included: the set is read from the chatroom, not from the gate |
 | `build.json` | — | `since` / `as_of`, `set_ii_projects` / `set_iii_projects`, roster, log files, counts, sha256 of the build outputs |
@@ -28,7 +28,11 @@ All the numbers are in `report.md`, which is generated and not edited by hand.
 
 ## Bodies and redaction (public repository)
 
-No message body is committed. The set files carry keys and the sha256 of each original body. `measure-a` fetches every body again from the chatroom (read-only) and stops on any hash mismatch. Only the hit lines and the lines around them reach `selfneg.jsonl`. This also keeps the PR under the PR-gate's review cap.
+No message body is committed as its own field, but **message text is committed in two places**:
+- `casebook.jsonl` `jev_input`: the logged `state_wire` holds `head_summary` and up to 5 `recent_events[].body_head`, each the first 500 characters of a message (`BODY_HEAD_M`, `src/spirrow_mindwire/decider/hook.py`). A message of 500 characters or fewer is therefore committed in full; a longer one, its first 500 characters. This is what Jev was given, so it is kept verbatim (after `redact_infra`, below).
+- `selfneg.jsonl`: the hit lines and the lines around them (next paragraph).
+
+Otherwise the set files carry keys and the sha256 of each original body. `measure-a` fetches every body again from the chatroom (read-only) and stops on any hash mismatch. Only the hit lines and the lines around them reach `selfneg.jsonl`. This also keeps the PR under the PR-gate's review cap.
 
 This repository is public. Before any text is written here, `redact_infra` replaces:
 - every IPv4 address with `<ipv4>`;
