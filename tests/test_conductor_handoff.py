@@ -445,11 +445,14 @@ def test_naysayer_unresolved_objection_bound_is_non_tier_c_only() -> None:
     assert tier_c_route < bound < unresolved
     tier_c_sentence = block[block.rindex(". ", 0, tier_c_route) : bound]
     assert f"itself a Tier-C type ({slash})" in tier_c_sentence
-    assert f"hand to `{HUMAN_TOKEN}` with that type as the `TIER-C:` label" in tier_c_sentence
+    assert (
+        f"hand to the human (`NEXT: {HUMAN_TOKEN}`) with that type as the `TIER-C:` label"
+        in tier_c_sentence
+    )
     assert "never sends a Tier-C matter to the implementer" in tier_c_sentence
     # the bound itself is conditioned on the objection being non-Tier-C
     bound_sentence = block[block.rindex("Only when", 0, bound) : unresolved]
-    assert f"the objection is not itself {slash}" in bound_sentence
+    assert f"the objection is not one of {slash}" in bound_sentence
 
 
 def test_naysayer_block_is_advisory() -> None:
