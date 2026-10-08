@@ -32,7 +32,7 @@ No message body is committed. The set files carry keys and the sha256 of each or
 
 This repository is public. Before any text is written here, `redact_infra` replaces:
 - every IPv4 address with `<ipv4>`;
-- the user name in a Windows `C:\Users\<name>` path with `<user>`.
+- the user name in a Windows profile path with `<user>`. `redact_infra` matches either separator, single or doubled (`C:\Users\<name>`, `C:/Users/<name>`, and JSON-escaped `C:\\Users\\<name>`); `build.json` records the rule as `C:/Users/<name>`.
 
 This follows the C-42 convention of `T-real-infra-values-egress-from-agent-context`: report placeholders, not values. Every redacted text keeps the sha256 of its original (`jev_input_sha256`, `body_sha256`).
 
