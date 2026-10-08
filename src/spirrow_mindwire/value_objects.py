@@ -278,6 +278,24 @@ AttestationScope: TypeAlias = Literal["turn", "probe"]
 """What an :class:`AttestationRecord`'s rows are rows of — see its ``scope`` field."""
 
 
+# How a SET of backend names is written into one ``AttestationRecord.backend`` / ``.expected``
+# value (ADR-14 §7.6: the codex tier accepts ``codex|gemini-fallback``). Sorted, so one set has
+# one spelling; ``|`` collides with neither the marker's field separator nor ``=``. Lives here,
+# beside the record, so the preflight can write it without importing the marker builder
+# (msg-834 §2 (c)).
+_BACKEND_SET_SEP = "|"
+
+
+def join_backends(backends: frozenset[str]) -> str:
+    """Render a backend set as one record field value (sorted, ``|``-joined)."""
+    return _BACKEND_SET_SEP.join(sorted(backends))
+
+
+def split_backends(value: str) -> frozenset[str]:
+    """Inverse of :func:`join_backends`. Empty members are dropped."""
+    return frozenset(part.strip() for part in value.split(_BACKEND_SET_SEP) if part.strip())
+
+
 @dataclass(frozen=True)
 class AttestationRecord:
     """A server-side **observation** of where a session's inference resolved.
@@ -429,5 +447,7 @@ __all__ = [
     "ThreadContext",
     "ThreadContextMessage",
     "ThreadRef",
+    "join_backends",
     "mint_instance_id",
+    "split_backends",
 ]

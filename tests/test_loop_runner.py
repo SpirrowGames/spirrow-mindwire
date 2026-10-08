@@ -279,6 +279,15 @@ class _FakeGitHub:
     async def probe_identity(self) -> int:
         raise AssertionError("not called")
 
+    async def fetch_pr_files(self, pr: Any) -> Any:
+        # ADR-14 §7.3 Protocol compliance (never reached: routing facts already raise).
+        raise NotImplementedError
+
+    async def fetch_pr_routing_facts(self, pr: Any) -> Any:
+        # ADR-14 §7.3 Protocol compliance. Raising reads as "could not read the PR's labels",
+        # which the driver routes fail-safe to the Gemini tier.
+        raise NotImplementedError
+
     async def fetch_file_at(self, pr: Any, *, path: str, ref: str) -> str | None:
         # T-gate-blocks-on-miscounted-line-numbers Protocol compliance. Never called in
         # loop-runner tests.

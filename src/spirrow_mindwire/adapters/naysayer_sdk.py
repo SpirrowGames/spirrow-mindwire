@@ -94,6 +94,7 @@ from ..exceptions import (
 )
 from ..lexora.client import LexoraClient
 from ..naysayer.adr_index import build_adr_index_block
+from ..naysayer.n3_routing import GlobLoad, N3Request, TierDecision, route_tier
 from ..naysayer.preflight import (
     CUSTOM_HEADERS_ENV,
     PREFLIGHT_TIMEOUT_SECONDS,
@@ -104,11 +105,7 @@ from ..naysayer.preflight import (
     attest_turn,
     custom_headers_env_value,
 )
-from ..naysayer.principles import (
-    NAYSAYER_EXPECTED_BACKEND,
-    NAYSAYER_MODEL_TIER,
-    build_preamble,
-)
+from ..naysayer.principles import allowed_backends, build_preamble
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -160,6 +157,33 @@ a concrete basis (principle 3), and never stay silent about a real concern \
 (principle 5). Your entire response is posted verbatim to the thread as your \
 reply, so reply directly with the critique — no preamble, no meta-commentary.
 """
+
+
+class _Routed:
+    """Sentinel type: "no tier pinned by the caller — let :func:`route_tier` decide"."""
+
+
+_ROUTED = _Routed()
+
+
+def design_time_tier_decision() -> TierDecision:
+    """The design-time naysayer's tier, decided by :func:`route_tier` (ADR-14 §7.3 / §7.6).
+
+    **Fail-safe until the design-time inputs are wired.** The thread's
+    ``n3-sensitive`` tag, the referenced files and the §7.5 prompt are not read
+    yet, so the request is presented with ``marker=None`` ("could not read"), and
+    the decision is the Gemini-only tier. That keeps the §7.3 invariant (N-3 never
+    reaches codex) in the merged state; the codex tier opens for design-time only
+    when a caller can pass a marker it actually read.
+    """
+    return route_tier(
+        N3Request(
+            marker=None,
+            paths=(),
+            globs=GlobLoad(None, "design-time routing inputs not wired"),
+            prompt_chars=0,
+        )
+    )
 
 
 class NaysayerSdkSpawnError(AdapterSpawnError):
@@ -442,13 +466,12 @@ class NaysayerSdkAdapter:
         cwd: Path,
         obligations: ObligationsManifest,
         inference_base_url: str | None = None,
-        model: str | None = NAYSAYER_MODEL_TIER,
+        model: str | None | _Routed = _ROUTED,
         system_prompt: str | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         extra_env: dict[str, str] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
-        expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
         turn_rows: TurnRowReader | None = None,
         shutdown_grace: timedelta = timedelta(seconds=5),
@@ -479,7 +502,12 @@ class NaysayerSdkAdapter:
             if inference_base_url is not None
             else os.environ.get(_ENV_BASE_URL, "")
         )
-        self._model = model
+        # ADR-14 §7.6: the tier is chosen by ``route_tier`` (the one decision point) unless a
+        # caller pins one; the accepted backends are ALWAYS derived from the chosen tier through
+        # the same table, never passed in separately.
+        self._model: str | None = (
+            design_time_tier_decision().tier if isinstance(model, _Routed) else model
+        )
         # Loop-readable obligations are injected — the manifest passed in is the
         # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
         # adapter never reaches for a module-global path itself. The verdict-
@@ -497,7 +525,6 @@ class NaysayerSdkAdapter:
         self._mcp_servers = mcp_servers or {}
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
-        self._expected_backend = expected_backend
         # Injectable so tests never touch the network. Unset, the default runs
         # the real probe against **this adapter's own** inference base URL — not
         # ``MINDWIRE_LEXORA_URL``, which is a different variable pointing at a
@@ -526,7 +553,7 @@ class NaysayerSdkAdapter:
         return await attest_backend(
             base_url=self._inference_base_url,
             tier=self._model,
-            expected=self._expected_backend,
+            allowed=allowed_backends(self._model),
         )
 
     async def _read_turn_rows(self, trace_id: str) -> list[dict[str, Any]]:
@@ -1002,7 +1029,7 @@ class NaysayerSdkAdapter:
             turn_record = await attest_turn(
                 route=probe_record.route,
                 tier=probe_record.tier,
-                expected=self._expected_backend,
+                allowed=allowed_backends(probe_record.tier),
                 trace_id=turn_trace_id,
                 read_rows=self._read_turn_rows,
             )

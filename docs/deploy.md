@@ -199,6 +199,64 @@ behaviour or coverage** — the full review still runs:
   and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
   review — so Item 2's saving is measured before you enforce it.
 
+## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6)
+
+The naysayer answers through one of two Lexora tiers, chosen per request by
+`naysayer/n3_routing.py::route_tier` (the only place that decides):
+
+| tier | answered by | the attestation accepts |
+|---|---|---|
+| `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
+| `naysayer-gemini` | Gemini only | `gemini` |
+
+A request goes to `naysayer-gemini` when **any** of these holds:
+
+- it carries the marker `n3-sensitive`: a PR **label** at the PR-gate, a thread **tag** at design time.
+  Labels or tags that couldn't be read count as marked. The conductor passes the tags it got from
+  `chatroom_get_thread`; the watcher path doesn't read them, so it always counts as marked;
+- a path is outside the repository:
+  - at the PR-gate, GitHub's file list is checked **lexically**, with no disk access: an absolute path,
+    a drive letter or a `..` segment counts as outside. A deleted file is just a path;
+  - at design time, each referenced path is resolved first: `~` is expanded, the path is made absolute
+    against the summon directory, and `realpath` follows symlinks. It must exist and lie under the
+    `realpath` of `git rev-parse --show-toplevel`;
+- the PR-gate's changed-file list may be incomplete: the files endpoint can't be read, its count differs
+  from the PR's `changed_files`, or it hit GitHub's 3000-file cap. On a rename **or** copy, both
+  `filename` and `previous_filename` are matched;
+- it touches `.mindwire-n3.toml`, the per-repo config file at the repository **root**, whatever the
+  globs say;
+- a changed or referenced file matches a glob in that file's `n3_sensitive_paths` list. The globs are the
+  union of a trusted side, which is always enforced, and a working side, which may only add globs:
+  - PR-gate: the PR's **base** ref is trusted; its **head** is the working side;
+  - design time: the HOST_REPO's remote **default branch** is trusted, read through the contents API;
+    the working side is `.mindwire-n3.toml` at the local repository root, never the current directory;
+- the config can't be resolved: file or key missing on the trusted side, either side unreadable or
+  malformed, or no repository root. **Leaving the key out sends everything to Gemini.** Writing
+  `n3_sensitive_paths = []` explicitly is the only way to say "no sensitive paths";
+- the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5). The value is
+  provisional until Lexora pins its `model_catalog_json` / `context_window`.
+
+Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
+glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
+be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
+notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+
+**Design time is wired by the PR stacked on #463.** Until that PR lands, every design-time turn goes to
+`naysayer-gemini` (fail-safe), and the design-time bullets above describe what that PR adds.
+
+**Design time carries no file contents today.** The design-time prompt is the thread plus the
+principles, so the list of referenced files is empty. When the §7.5 prompt builder starts including
+files, it must pass the adapter the list of what it includes (`referenced_files`).
+
+**Residual risk, authorised by Takahito as a TIER-C goal decision on thread
+T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a vulnerability, on a path
+no glob lists and with no marker set. That request can't be classified in advance, and it reaches the
+codex tier.
+
+**Merge order (§7.6):** this routing and the per-tier attestation take effect together with Lexora's
+codex path. Lexora must serve both `naysayer` (the fallback wrapper) and `naysayer-gemini` before this
+is deployed. Otherwise every naysayer attestation fails closed.
+
 ## Run
 
 ```powershell
