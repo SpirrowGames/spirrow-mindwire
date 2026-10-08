@@ -618,6 +618,25 @@ async def measure_b(
 # ---------------------------------------------------------------------------
 
 
+def run_scores(
+    jev: Sequence[Mapping[str, Any]], msg_id: str, variant: str, runs: int
+) -> list[float | None]:
+    """One score per run ``1..runs`` for ``(msg_id, variant)``.
+
+    ``measure-b`` appends: an errored call leaves a ``score: None`` row, and a restart retries
+    it and appends a second row for the same run. So a run resolves to its last row that has a
+    numeric score, or ``None`` if it has none (missing or only errored). Rows for runs outside
+    ``1..runs`` are ignored. The result always has exactly ``runs`` entries."""
+    best: dict[int, float] = {}
+    for r in jev:
+        if r.get("msg_id") != msg_id or r.get("variant") != variant:
+            continue
+        run, score = r.get("run"), r.get("score")
+        if isinstance(run, int) and isinstance(score, int | float) and not isinstance(score, bool):
+            best[run] = float(score)
+    return [best.get(run) for run in range(1, runs + 1)]
+
+
 @dataclass
 class Decision:
     outcome: str  # "B" | "A" | "observe"
@@ -651,10 +670,7 @@ def decide(
     sn = selfneg_rows[0]
 
     def scores(msg_id: str) -> list[float | None]:
-        got = [
-            r.get("score") for r in jev if r["msg_id"] == msg_id and r["variant"] == V4_CANDIDATE
-        ]
-        return [float(s) if isinstance(s, int | float) else None for s in got]
+        return run_scores(jev, msg_id, V4_CANDIDATE, runs)
 
     b_holds = True
     if not sn.get("negation_in_jev_input", False):
@@ -664,7 +680,7 @@ def decide(
             f", outside Jev's {BODY_HEAD_M}-char input — B cannot hold (cause: input range)"
         )
     sn_scores = scores(str(sn["msg_id"]))
-    if len(sn_scores) != runs or any(s is None or s >= DEFAULT_V2_NOT_ASK_MAX for s in sn_scores):
+    if any(s is None or s >= DEFAULT_V2_NOT_ASK_MAX for s in sn_scores):
         b_holds = False
         reasons.append(
             f"B: {sn['msg_id']} on {V4_CANDIDATE} = {sn_scores}; "
@@ -672,7 +688,7 @@ def decide(
         )
     for g in genuine_rows:
         gs = scores(str(g["msg_id"]))
-        if len(gs) != runs or any(s is None or s < DEFAULT_V2_NOT_ASK_MAX for s in gs):
+        if any(s is None or s < DEFAULT_V2_NOT_ASK_MAX for s in gs):
             b_holds = False
             reasons.append(
                 f"B: genuine {g['msg_id']} on {V4_CANDIDATE} = {gs}; "
@@ -827,10 +843,7 @@ def render_report(out_dir: Path, runs: int) -> str:
     for r in cb:
 
         def sc(v: str, mid: str = str(r["msg_id"])) -> list[float | None]:
-            got = sorted(
-                (x for x in jev if x["msg_id"] == mid and x["variant"] == v), key=lambda x: x["run"]
-            )
-            return [x.get("score") for x in got]
+            return run_scores(jev, mid, v, runs)
 
         md.append(
             f"| {r['msg_id']} | {r['truth']} | {r['ask_score']} | {_fmt(sc(V3))} "

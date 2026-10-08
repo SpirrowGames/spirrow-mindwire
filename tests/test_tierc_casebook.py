@@ -382,6 +382,27 @@ def test_b_fails_on_any_run(change: dict[str, list[float | None]]) -> None:
     assert d.outcome == "A" and d.b_holds is False and d.a_holds is True
 
 
+def test_b_resolves_a_retried_run_to_its_scored_row() -> None:
+    """measure-b appends: an errored call (score None) retried after a restart leaves two rows
+    for one run. The run resolves to its scored row, so B is judged on exactly ``runs`` scores."""
+    jev = _jev(B_OK)
+    jev.insert(0, {"msg_id": "s", "variant": "tierc-v4-candidate", "run": 1, "score": None})
+    jev.insert(0, {"msg_id": "g1", "variant": "tierc-v4-candidate", "run": 2, "score": None})
+    d = cb.decide(CASEBOOK, jev, _sn(s=True))
+    assert (d.outcome, d.b_holds) == ("B", True)
+
+
+def test_run_scores_one_entry_per_run() -> None:
+    rows = [
+        {"msg_id": "m", "variant": "v", "run": 1, "score": None, "error": "LexoraError: x"},
+        {"msg_id": "m", "variant": "v", "run": 1, "score": 0.3},
+        {"msg_id": "m", "variant": "v", "run": 3, "score": None},
+        {"msg_id": "m", "variant": "v", "run": 4, "score": 0.1},  # outside 1..runs
+        {"msg_id": "m", "variant": "w", "run": 2, "score": 0.9},  # other variant
+    ]
+    assert cb.run_scores(rows, "m", "v", 3) == [0.3, None, None]
+
+
 def test_b_cannot_hold_when_negation_outside_input() -> None:
     book = [dict(r) for r in CASEBOOK]
     book[2]["negation_in_jev_input"] = False
