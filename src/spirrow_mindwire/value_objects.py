@@ -247,6 +247,10 @@ class ChatroomEvent:
     payload: EventPayload  # union by event_type
     thread_context: ThreadContext | None = None
     retry_notice: str | None = None
+    # ADR-2026-10-09-23 unit 1 (design v1.2 B-3 step 6): the thread branch the git-sync hook put
+    # the clone on, set by the dispatcher after ``pre_turn``. Information for the role session,
+    # not a rule it must follow (D7). ``None`` (sync off) leaves the prompt byte-for-byte as before.
+    git_branch: str | None = None
 
 
 # --------------------------------------------------------------------------- #

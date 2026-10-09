@@ -216,6 +216,14 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     # closing, so it is never mistaken for part of the author's message. Absent → no block.
     if event.retry_notice:
         blocks.append(event.retry_notice)
+    # ADR-2026-10-09-23 unit 1: the branch the git-sync hook checked out. Its own block, like the
+    # retry notice; absent → no block, so a sync-off prompt is unchanged.
+    if event.git_branch:
+        blocks.append(
+            f"Git sync: this turn runs on branch `{event.git_branch}`, checked out and "
+            f"fast-forwarded by the loop before the turn. After the turn the loop pushes it if it "
+            f"has new commits and switches the clone back to the default branch."
+        )
     blocks.append(closing)
     return "\n\n".join(blocks)
 

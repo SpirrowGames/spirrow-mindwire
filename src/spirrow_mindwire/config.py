@@ -647,6 +647,28 @@ class NaysayerGatingConfig(_StrictModel):
     the logs before enforcing. Env: ``MINDWIRE_NAYSAYER_GATING__SHADOW=true``."""
 
 
+class TurnGitConfig(_StrictModel):
+    """``[turn.git]`` — the git-sync hook around a dispatched turn (ADR-2026-10-09-23 D7 / D8).
+
+    ``sync = false`` (the default) builds no hook at all: the dispatcher runs exactly the git it
+    ran before this table existed (INV-0). ``remote`` is the remote fetched from and pushed to;
+    ``lfs = true`` adds ``git lfs pull`` on the thread branch. ``branch_override`` maps a
+    thread id to the branch it already uses, so an in-flight thread keeps its name (D8); an
+    override is still refused when it names the default branch or a protected branch.
+    """
+
+    sync: bool = False
+    remote: str = Field(default="origin", min_length=1)
+    lfs: bool = False
+    branch_override: dict[str, str] = Field(default_factory=dict)
+
+
+class TurnConfig(_StrictModel):
+    """``[turn]`` — per-turn hooks. Only ``[turn.git]`` exists."""
+
+    git: TurnGitConfig = Field(default_factory=TurnGitConfig)
+
+
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.
 
@@ -672,6 +694,7 @@ class MindwireSettings(BaseSettings):
     naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
     tierc_gate: TierCGateConfig = Field(default_factory=TierCGateConfig)
+    turn: TurnConfig = Field(default_factory=TurnConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -809,6 +832,8 @@ __all__ = [
     "PhanthandConfig",
     "Stage3LoopConfig",
     "TierCGateConfig",
+    "TurnConfig",
+    "TurnGitConfig",
     "WatcherConfig",
     "load_settings",
     "resolve_tier_c_decisions_log_path",

@@ -98,6 +98,8 @@ from ..decider.result import DecisionResult
 from ..decider.verdict import TierCV2Verdict, TierCVerdictKind
 from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
+from ..git_sync import GitSyncDeferredError, GitSyncParkError
+from ..git_sync.notice import git_sync_park_event, render_git_sync_park_notice
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
@@ -975,7 +977,7 @@ class Conductor:
                             )
                         handle = spawned
                         sessions[author_identity] = handle
-                    await self._dispatch_recording(
+                    parked = await self._dispatch_recording(
                         handle,
                         bounce_msg,
                         [*messages, bounce_msg],
@@ -984,6 +986,10 @@ class Conductor:
                         forced=forced,
                         forced_saveable=forced_saveable,
                     )
+                    if parked is not None:
+                        return self._stop(
+                            round_index, StopReason.HUMAN, parked, forced, forced_saveable
+                        )
                     # A silent author leaves the notice as the next latest → NO_PROGRESS.
                     processed_msg_id = _msg_id(bounce_msg)
                     continue
@@ -1095,7 +1101,7 @@ class Conductor:
                 # always; read it with the lever off to size the potential saving.
                 if is_saveable:
                     forced_saveable += 1
-            await self._dispatch_recording(
+            parked = await self._dispatch_recording(
                 handle,
                 latest,
                 messages,
@@ -1104,6 +1110,8 @@ class Conductor:
                 forced=forced,
                 forced_saveable=forced_saveable,
             )
+            if parked is not None:
+                return self._stop(round_index, StopReason.HUMAN, parked, forced, forced_saveable)
             processed_msg_id = latest_msg_id
         return self._stop(
             self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
@@ -2909,8 +2917,14 @@ class Conductor:
         rounds: int,
         forced: int,
         forced_saveable: int,
-    ) -> None:
+    ) -> str | None:
         """Dispatch ``msg``; if the adapter raises, record a snapshot and re-raise unchanged.
+
+        Returns ``None`` when the turn ran. Returns the posted park notice's ``msg_id`` when the
+        git-sync hook parked the thread (ADR-2026-10-09-23 unit 1): the caller then stops the run
+        on ``StopReason.HUMAN`` with that id. A :class:`GitSyncDeferredError` (transient GitHub
+        failure) propagates without a snapshot: it is not an adapter error, and
+        ``loop_runner.main`` routes it by type to its own exit code.
 
         Bohr msg-4440 D-1'': the ONLY place the conductor observes an adapter delivery failure.
         It writes :class:`ConductorStopSlot` and does a bare ``raise`` — the exception's identity,
@@ -2941,6 +2955,10 @@ class Conductor:
             # adapter failure. Recording a snapshot here would make ``loop_runner.main`` print an
             # ``adapter_error`` stop line and exit 1 over the run_timeout's own exit code.
             raise
+        except GitSyncDeferredError:
+            raise
+        except GitSyncParkError as park:
+            return await self._post_git_sync_park(park)
         except BaseException as exc:
             if self._stop_slot is not None:
                 self._stop_slot.snapshot = ConductorStopSnapshot(
@@ -2951,6 +2969,39 @@ class Conductor:
                     error_code=adapter_error_code(exc),
                 )
             raise
+        return None
+
+    async def _post_git_sync_park(self, park: GitSyncParkError) -> str:
+        """Post the git-sync park notice into this thread; return its ``msg_id``.
+
+        Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE):
+
+        - Intended reader: the human who owns this thread. The notice's first line is
+          ``git.<code>: <thread_id> <branch> <要約>`` (design v1.2 B-6) and it ends ``NEXT: human``
+          so head_skip parks the thread.
+        - Fallback surface when the thread is gone: disposition (3), fail loudly. A post that
+          raised, was refused (``_post_as_conductor_relay`` turns a ThreadResolvedError into an
+          empty ``msg_id``) or returned no ``msg_id`` raises :class:`StandDownError` carrying the
+          ``git_sync.park`` event → non-zero exit → the wrapper's quarantine and Discord alert,
+          with the ERROR line below in the log tail. Never posted into another thread.
+        """
+        event = git_sync_park_event(park, project=self._thread_ref.project_id)
+        logger.error("git sync park: %s", park.reason_line)
+        body = _with_stop_marker(render_git_sync_park_notice(park), event)
+        try:
+            posted = await self._post_as_conductor_relay(body)
+        except Exception as post_exc:
+            logger.warning(
+                "git sync park notice could not be posted in thread %r (%s: %s)",
+                self._thread_ref.thread_id,
+                type(post_exc).__name__,
+                post_exc,
+            )
+            raise StandDownError(event) from post_exc
+        posted_id = _msg_id(posted)
+        if not posted_id:
+            raise StandDownError(event)
+        return posted_id
 
     def _none_stop_class(
         self, handoff: Handoff, latest: dict[str, Any], stop_reason: StopReason | None
@@ -3068,8 +3119,8 @@ class Conductor:
 
         Shared by the REQUEST_CHANGES relay, the R4 ci-route and the gate resume (msg-6316: "the
         same helper"), so a resumed implementer turn behaves exactly like one dispatched in the
-        run that fired the gate. Returns a stop outcome only when the spawn gave up; ``None``
-        means the turn was dispatched.
+        run that fired the gate. Returns a stop outcome when the spawn gave up or the git-sync
+        hook parked the thread; ``None`` means the turn was dispatched.
         """
         handle = sessions.get(implementer_identity)
         if handle is None:
@@ -3080,7 +3131,7 @@ class Conductor:
                 )
             handle = spawned
             sessions[implementer_identity] = handle
-        await self._dispatch_recording(
+        parked = await self._dispatch_recording(
             handle,
             trigger,
             thread,
@@ -3089,6 +3140,8 @@ class Conductor:
             forced=forced,
             forced_saveable=forced_saveable,
         )
+        if parked is not None:
+            return self._stop(round_index, StopReason.HUMAN, parked, forced, forced_saveable)
         return None
 
     def _stop(

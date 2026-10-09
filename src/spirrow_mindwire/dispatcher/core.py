@@ -17,9 +17,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..clone_guard import CloneGuard
+from ..git_sync import GitSyncHook, GitSyncParkError, ThreadBranch
 from ..pin_ignore import ensure_pin_ignored
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..source_marker import append_markers
@@ -72,6 +73,7 @@ class Dispatcher:
         dedup_size: int = DEFAULT_DEDUP_SET_SIZE,
         spec_pin_writer: SpecPinWriter | None = None,
         clone_guard: CloneGuard | None = None,
+        git_sync: GitSyncHook | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -93,6 +95,10 @@ class Dispatcher:
         # opted out (tests); the composition root injects one whenever it knows
         # ``[loop].repo_dir``.
         self._clone_guard = clone_guard
+        # ADR-2026-10-09-23 unit 1 (design v1.2): ``None`` unless ``[turn.git] sync = true`` — then
+        # no git runs here beyond the clone guard's (INV-0). Pre-turn runs after the guard, so a
+        # clone an earlier turn left dirty is exit 8, never this thread's park (B-3).
+        self._git_sync = git_sync
 
     async def spawn_instance(
         self, thread_ref: ThreadRef, role: Role, instance_id: str
@@ -184,22 +190,58 @@ class Dispatcher:
         if self._clone_guard is not None:
             await asyncio.to_thread(ensure_pin_ignored, self._clone_guard.repo_dir)
             await asyncio.to_thread(self._clone_guard.check)
+        # Git sync, pre-turn (ADR-2026-10-09-23 unit 1, B-3): after the guard, before the pin
+        # write. A park / defer raises out of here with the clone back on the default branch
+        # whenever it is clean; the role never sees the event.
+        thread_branch: ThreadBranch | None = None
+        if self._git_sync is not None:
+            thread_branch = await self._git_sync.pre_turn(handle.thread_ref.thread_id)
+            event = replace(event, git_branch=thread_branch.name)
         if self._spec_pin_writer is not None:
             await self._spec_pin_writer.write_before_dispatch_async(
                 handle.role, handle.thread_ref.thread_id
             )
-        # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
-        # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
-        async with session.lock:
-            try:
-                await session.adapter.deliver_event(handle, event)
-            except asyncio.CancelledError:
-                raise  # let cancellation propagate immediately (no FAILED noise)
-            except Exception as exc:
-                # §8: record a FAILED event before re-raising (fail-loud).
-                # _on_event_log isolates sink errors (I7).
-                await self._on_event_log(delivery_failed_event(handle, event, exc))
-                raise
+        delivered = False
+        try:
+            # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
+            # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
+            async with session.lock:
+                try:
+                    await session.adapter.deliver_event(handle, event)
+                except asyncio.CancelledError:
+                    raise  # let cancellation propagate immediately (no FAILED noise)
+                except Exception as exc:
+                    # §8: record a FAILED event before re-raising (fail-loud).
+                    # _on_event_log isolates sink errors (I7).
+                    await self._on_event_log(delivery_failed_event(handle, event, exc))
+                    raise
+            delivered = True
+        finally:
+            if self._git_sync is not None and thread_branch is not None:
+                await self._post_turn(handle, thread_branch, delivered=delivered)
+
+    async def _post_turn(
+        self, handle: SessionHandle, branch: ThreadBranch, *, delivered: bool
+    ) -> None:
+        """Git sync, post-turn (B-4): runs whether the turn returned, raised or was cancelled.
+
+        After a turn that returned, a :class:`~spirrow_mindwire.git_sync.GitSyncParkError`
+        propagates: the conductor turns it into the park notice. After a turn that raised, the
+        turn's own exception keeps its routing (``loop_runner.main`` dispatches on its type — exit
+        2, the wall-clock budget, quarantine), so the park finding is logged at ERROR and the
+        exception in flight continues; the clone is left as found and the next dispatch's clone
+        guard refuses it loudly (exit 8) if it is dirty.
+        """
+        assert self._git_sync is not None
+        if delivered:
+            await self._git_sync.post_turn(handle.thread_ref.thread_id, branch)
+            return
+        try:
+            await self._git_sync.post_turn(handle.thread_ref.thread_id, branch)
+        except GitSyncParkError as park:
+            logger.error("git sync post-turn after a failed turn: %s", park.reason_line)
+        except Exception:
+            logger.exception("git sync post-turn after a failed turn raised; continuing")
 
     async def halt(self, handle: SessionHandle) -> None:
         """Halt a spawned session via its adapter (idempotent per I8)."""
