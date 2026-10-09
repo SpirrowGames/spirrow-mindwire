@@ -104,3 +104,6 @@ adrs:
   - id: ADR-2026-09-18-22
     title: "decision-material-push dashboard URL の default behavior contract（env 必須、fail-fast）"
     body: repo:docs/adr/ADR-2026-09-18-22-decision-dashboard-default-behavior-contract.md
+  - id: ADR-2026-10-09-23
+    title: "中央 1 Conductor ＋ 実行機プール（executor pool under one conductor）"
+    body: repo:docs/adr/ADR-2026-10-09-23-executor-pool-under-one-conductor.md
