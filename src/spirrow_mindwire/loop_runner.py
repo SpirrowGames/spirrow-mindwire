@@ -99,6 +99,7 @@ from .conductor.run_budget import (
     validate_budgets,
 )
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
+from .conductor.summon import ResumeNotice, parse_resume_notice
 from .conductor.tierc_gate import TierCGate
 from .config import (
     MindwireSettings,
@@ -858,6 +859,8 @@ def build_conductor(
     retry_of: RetryOf | None = None,
     run_phase: RunPhase | None = None,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -959,6 +962,12 @@ def build_conductor(
         logger.info("tierc_gate: enforce (log=%s)", tierc_gate.log_path)
     else:
         logger.info("tierc_gate: off")
+    # Summon: the owning project is in scope only when it is not this thread's own project.
+    owner_project = (
+        summon_owner_project.strip()
+        if summon_owner_project and summon_owner_project.strip() != loop_cfg.project
+        else None
+    )
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -1013,6 +1022,13 @@ def build_conductor(
             # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1'): ``--gate-only``
             # from the sweep's gate-lane launch. ``False`` for a hand run and a role-lane launch.
             gate_only=gate_only,
+            # Summon (T-human-call-priority-interrupt PR-2, v1.6 §4): the owning project's
+            # Summon is read only when the sweep named a project other than this one.
+            summon_owner_project=owner_project,
+            summon_owner_control=(
+                LoopControlReader(mcp, project=owner_project) if owner_project else None
+            ),
+            resume_notice=resume_notice,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -1031,6 +1047,7 @@ def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
         f"conductor stopped: reason={StopReason.ADAPTER_ERROR.value} rounds={snapshot.rounds} "
         f"forced_naysayer={snapshot.forced} forced_naysayer_saveable={snapshot.forced_saveable} "
         f"last_msg={snapshot.last_msg_id} error_code={snapshot.error_code}"
+        + (" resume_notice=delivered" if snapshot.resume_notice_delivered else "")
     )
 
 
@@ -1043,6 +1060,8 @@ async def run_conductor(
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -1105,6 +1124,8 @@ async def run_conductor(
             retry_of=retry_of,
             run_phase=run_phase,
             gate_only=gate_only,
+            summon_owner_project=summon_owner_project,
+            resume_notice=resume_notice,
         )
 
     outcome, timed_out = await run_with_budget(
@@ -1152,6 +1173,8 @@ async def _run_conductor_once(
     retry_of: RetryOf | None,
     run_phase: RunPhase,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> ConductorOutcome:
     """The body :func:`run_conductor` bounds: resolve, preflight, build, run, tear down."""
     project = settings.loop.project
@@ -1194,6 +1217,8 @@ async def _run_conductor_once(
         retry_of=retry_of,
         run_phase=run_phase,
         gate_only=gate_only,
+        summon_owner_project=summon_owner_project,
+        resume_notice=resume_notice,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1368,6 +1393,25 @@ def main() -> None:
     # T-sweep-starves-deep-candidates PR-B (Bohr msg-6313 §1' / msg-6316). Written by the sweep on
     # gate-lane launches only. Absent = the run goes as far as it always did, so a hand-run
     # conductor and a role-lane launch are unchanged.
+    # T-human-call-priority-interrupt PR-2 (Bohr msg-6755 v1.6 §4 / msg-6751 v1.4). Written by the
+    # sweep only: the project owning the repository this candidate writes to, when it is not the
+    # thread's own (its Summon is in scope too), and the resume notice of a thread that had yielded
+    # to a Summon. Absent = own project only / not yielded, so a hand run is unchanged.
+    parser.add_argument(
+        "--summon-owner-project",
+        default=None,
+        help="conductor: the project owning this run's repository (its Summon is in scope too)",
+    )
+    parser.add_argument(
+        "--resume-notice-summons",
+        default=None,
+        help="conductor: comma-separated Summon thread ids this thread had yielded to",
+    )
+    parser.add_argument(
+        "--resume-notice-main-range",
+        default=None,
+        help="conductor: <a>..<b> — main when the thread first yielded, and at this launch",
+    )
     parser.add_argument(
         "--gate-only",
         action="store_true",
@@ -1391,6 +1435,10 @@ def main() -> None:
                     launch_head_msg_id=args.launch_head_msg_id or None,
                     retry_of=parse_retry_of(args.retry_of),
                     gate_only=args.gate_only,
+                    summon_owner_project=args.summon_owner_project or None,
+                    resume_notice=parse_resume_notice(
+                        args.resume_notice_summons, args.resume_notice_main_range
+                    ),
                 )
             )
         else:
