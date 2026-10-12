@@ -1,8 +1,10 @@
 {
   "_comment": [
     "Copy to <data_dir>/config/sweep.json and edit. Read by deploy/run-conductor-scheduled.ps1.",
-    "Order is priority: the sweep walks this list head-first and stops at the first candidate that",
-    "actually ran rounds. A thread NOT listed here is never picked up at all — silently.",
+    "Order is priority for the threads listed here: the sweep walks this list head-first and stops",
+    "at the first candidate that actually ran rounds. A live thread NOT listed here is",
+    "auto-registered for the tick when its project's clone can be determined, and is otherwise",
+    "shown with the reason in the digest's 未登録（登録不可） section — it is not silently ignored.",
     "",
     "Each candidate needs all three fields. repo_dir is the implementer's own CLONE for that",
     "project (not a linked worktree, and never the checkout the daemon itself is running from —",
@@ -20,7 +22,8 @@
     "projects is OPTIONAL: chatroom projects whose open threads the park-wake tick reads and",
     "classifies (the digest's 停止理由 line) even when no candidate below names them, so a thread",
     "outside the sweep is not left unseen. The scan is the union of these and the candidates'",
-    "projects; nothing is launched for a project listed only here. Missing projects = the",
+    "projects; nothing is launched for a project listed only here. The scan for live threads NOT",
+    "listed below (the auto-registration above) covers the same union. Missing projects = the",
     "candidates' projects only (behaviour before the key existed). A malformed value is named in",
     "the digest as 'sweep.json:projects' and scans nothing extra; it does not stop the sweep.",
     "",
