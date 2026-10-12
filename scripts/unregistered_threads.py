@@ -14,20 +14,24 @@ to model "cannot be swept" as a ``parked`` state, so nothing waits on P-1
 any more. Every tick, ``deploy/run-conductor-scheduled.ps1`` runs this
 script and hands its report to ``deploy/lib/UnregisteredIntake.ps1``:
 
-* A listed thread whose project passes the environment probe (exactly one
-  distinct ``repo_dir`` among that project's sweep candidates, fully
-  qualified, existing) joins **that tick's** candidate array, in memory.
-  ``sweep.json`` is never written; this script stays write-zero.
+* A listed thread joins **that tick's** candidate array, in memory, only
+  when ``intake.mode`` is ``on``, its project has a usable ``clones``
+  entry, its ``updated_at`` is within ``intake.max_idle_days`` and it is
+  not in ``exclude`` (T-sweep-intake-discovery-by-default D-2.5, msg-6776).
+  The repo_dir is ``clones[project]``; it is never inferred from other
+  candidates any more (msg-6770 §2). ``sweep.json`` is never written; this
+  script stays write-zero.
 * From then on it is an ordinary candidate (D-2.2): a failure is retried
   once and then quarantined, exactly as for a ``sweep.json`` entry. There
   is no bypass. The append happens before the quarantine / retry-pending /
   head-skip filters (D-2.3), so a quarantined auto-registered thread is
   not launched.
-* A thread whose project fails the probe is **not** registered. The
-  reason is derived again every tick and shown in the daily digest's
-  "unregistered (refused)" section; it is never persisted, and the thread gets
-  no ``parked`` state and no ``state/quarantine.json`` entry (§F.1,
-  msg-4900 §2 — the scope of that rule is the refused thread, D-2.1).
+* Every other listed thread is **not** registered: shadow (登録予定),
+  idle (放置), excluded (除外), refused (clones 未登録・登録不可) or time
+  unknown (時刻不明). The reason is derived again every tick and shown in
+  the daily digest; it is never persisted, and the thread gets no
+  ``parked`` state and no ``state/quarantine.json`` entry (§F.1,
+  msg-4900 §2 — D-2.1).
 
 Read-only: every chatroom tool this script may call is wrapped in
 :class:`ReadOnlyMcp` (a two-entry read allowlist). A future edit that
@@ -39,10 +43,10 @@ Input
 -----
 
 The one required argument is the ``sweep.json`` path — the projects list
-and the "already-registered" set both come from there. Distinct projects
-appearing in ``sweep.json``'s ``candidates`` array are enumerated in the
-order they first appear in the file, so the output is stable across
-runs.
+and the "already-registered" set both come from there. The projects
+enumerated are the union of the candidates' projects, the ``clones`` keys
+and the ``projects`` key, in that order and in file order within each,
+so the output is stable across runs.
 
 ::
 
@@ -60,6 +64,13 @@ Output (stdout, JSON, ASCII-only per D-33)
           "project": "spirrow-mindwire",
           "unregistered_count": 3,
           "unregistered": ["T-a", "T-b", "T-c"],
+          "threads": [
+            {"thread_id": "T-a", "time_state": "ok",
+             "updated_at": "2026-10-01T00:00:00+00:00", "idle_days": 2.5},
+            {"thread_id": "T-b", "time_state": "missing",
+             "updated_at": null, "idle_days": null},
+            ...
+          ],
           "error": null,
           "malformed_count": 0
         },
@@ -146,9 +157,11 @@ from spirrow_mindwire.magickit.read_only import ReadOnlyViolationError
 from spirrow_mindwire.unregistered_threads import (
     LIVE_STATUSES,
     EnumerateReport,
+    ListedThread,
     ProjectReport,
     RegisteredIndex,
     UnregisteredThreadsError,
+    classify_updated_at,
     enumerate_project,
     load_registered,
     project_error_report,
@@ -190,7 +203,7 @@ def _as_dict(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[dict[str, Any]], int]:
+async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[ListedThread], int]:
     """Every live thread in a project, paged, filtered server-side to :data:`LIVE_STATUSES`.
 
     Passing ``status_filter`` at the tool boundary keeps the request
@@ -199,8 +212,14 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[dict[s
     The same trim also documents intent — the client asks for exactly
     the set it plans to consume.
 
-    Returns the list of dict-shaped items and the count of non-dict
-    items dropped (the msg-2648 §3 third state). The offset increment
+    Returns the list of dict-shaped items — each with its ``updated_at``
+    classified by :func:`classify_updated_at`, the only call of it
+    (msg-6770 §1: the time is interpreted at this one boundary) — and the
+    count of non-dict items dropped (the msg-2648 §3 third state). The
+    classification never drops an item (msg-6778): a thread with no or a
+    garbled ``updated_at`` is returned like any other, labelled. The time
+    comes from the listing itself; no per-thread read is made (Einstein
+    msg-6769, the N+1 boundary). The offset increment
     is deliberately ``len(items)`` and not ``len(dropped-filtered
     items)``: the offset is a **server-side** cursor and must match the
     server's own idea of what it just handed us. Correcting it locally
@@ -211,7 +230,7 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[dict[s
     therefore to *observe* the drop count, not to change the arithmetic.
     """
     statuses = sorted(LIVE_STATUSES)
-    out: list[dict[str, Any]] = []
+    out: list[ListedThread] = []
     malformed = 0
     offset = 0
     while True:
@@ -233,7 +252,7 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[dict[s
             break
         for item in items:
             if isinstance(item, dict):
-                out.append(item)
+                out.append(ListedThread(item, classify_updated_at(item.get("updated_at"))))
             else:
                 malformed += 1
         # Offset advances by the raw page length (server-side cursor
@@ -311,8 +330,9 @@ def main() -> int:
         return 2
 
     if not registered.projects:
-        # A sweep.json with no candidates is a valid file but produces no
-        # projects to enumerate. Report an empty run rather than exit
+        # A sweep.json naming no project (no candidates, no clones, no
+        # projects key) is a valid file but produces no projects to
+        # enumerate. Report an empty run rather than exit
         # non-zero: the operator has already been warned by the sweep
         # wrapper (which throws on an empty candidate list), and D-2 is
         # not the right place to re-litigate that decision.

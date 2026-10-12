@@ -10,6 +10,7 @@ is exercised here.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,9 +19,12 @@ from spirrow_mindwire.unregistered_threads import (
     LIVE_STATUSES,
     PR_REVIEW_PREFIX,
     EnumerateReport,
+    ListedThread,
     ProjectReport,
     RegisteredIndex,
+    ThreadTime,
     UnregisteredThreadsError,
+    classify_updated_at,
     enumerate_project,
     is_unregistered_live,
     load_registered,
@@ -33,6 +37,11 @@ def _thread(**kw: object) -> dict[str, object]:
     kw.setdefault("thread_id", "T-x")
     kw.setdefault("status", "active")
     return dict(kw)
+
+
+def _listed(threads: list[dict[str, object]]) -> list[ListedThread]:
+    """Wrap plain dicts as the boundary would, with no ``updated_at`` (``missing``)."""
+    return [ListedThread(dict(t), ThreadTime("missing")) for t in threads]
 
 
 def _index(*pairs: tuple[str, str], projects: tuple[str, ...] | None = None) -> RegisteredIndex:
@@ -147,7 +156,7 @@ def test_non_string_truthy_thread_id_is_coerced_not_ignored(raw_id: object, coer
     """
     registered = _index(projects=("p",))
     threads = [{"thread_id": raw_id, "status": "active"}]
-    report = enumerate_project("p", threads, registered)
+    report = enumerate_project("p", _listed(threads), registered)
     assert report.unregistered == (coerced,)
     assert report.unregistered_count == 1
     # Coercion is not a "malformed" event — the item was a dict with an
@@ -181,7 +190,7 @@ def test_falsy_thread_id_is_ignored(raw_id: object) -> None:
     """
     registered = _index(projects=("p",))
     threads = [{"thread_id": raw_id, "status": "active"}]
-    report = enumerate_project("p", threads, registered)
+    report = enumerate_project("p", _listed(threads), registered)
     assert report.unregistered == ()
     assert report.unregistered_count == 0
     assert report.malformed_count == 0
@@ -203,7 +212,7 @@ def test_enumerate_carries_upstream_malformed_count_through_unchanged() -> None:
     """
     registered = _index(projects=("p",))
     threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
-    report = enumerate_project("p", threads, registered, malformed_count=5)
+    report = enumerate_project("p", _listed(threads), registered, malformed_count=5)
     assert report.unregistered_count == 2
     assert report.unregistered == ("T-a", "T-b")
     assert report.malformed_count == 5
@@ -218,7 +227,7 @@ def test_enumerate_default_malformed_count_is_zero_when_boundary_saw_nothing_bad
     """
     registered = _index(("p", "T-a"))
     threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
-    report = enumerate_project("p", threads, registered)
+    report = enumerate_project("p", _listed(threads), registered)
     assert report.unregistered_count == 1
     assert report.unregistered == ("T-b",)
     assert report.malformed_count == 0
@@ -228,7 +237,7 @@ def test_enumerate_preserves_thread_order() -> None:
     """Digest wiring depends on stable output — pin the ordering explicitly."""
     registered = _index(projects=("p",))
     threads = [_thread(thread_id=f"T-{c}") for c in "abcde"]
-    report = enumerate_project("p", threads, registered)
+    report = enumerate_project("p", _listed(threads), registered)
     assert report.unregistered == ("T-a", "T-b", "T-c", "T-d", "T-e")
 
 
@@ -330,6 +339,7 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "project": "p",
                 "unregistered_count": 1,
                 "unregistered": ["T-a"],
+                "threads": [],
                 "error": None,
                 "malformed_count": 2,
             },
@@ -337,6 +347,7 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "project": "q",
                 "unregistered_count": None,
                 "unregistered": [],
+                "threads": [],
                 "error": "network",
                 "malformed_count": None,
             },
@@ -455,3 +466,113 @@ def test_powershell_pr_review_prefix_matches_python() -> None:
         flags=re.MULTILINE,
     )
     assert found == [PR_REVIEW_PREFIX]
+
+
+# ----------------------- T-sweep-intake-discovery-by-default (msg-6776 / msg-6778)
+
+
+@pytest.mark.parametrize(
+    "raw, state",
+    [
+        (None, "missing"),
+        ("", "missing"),
+        ("   ", "missing"),
+        ("2026-10-01T00:00:00Z", "ok"),
+        ("2026-10-01T09:00:00+09:00", "ok"),
+        ("2026-10-01T00:00:00.123456+00:00", "ok"),
+        ("2026-10-01T00:00:00", "unparseable"),  # no offset: ambiguous, not comparable
+        ("yesterday", "unparseable"),
+        (1727740800, "unparseable"),
+        ({"at": "x"}, "unparseable"),
+    ],
+)
+def test_classify_updated_at_has_three_unmixed_states(raw: object, state: str) -> None:
+    """msg-6770 §1: 時刻あり / 時刻なし / 解釈不能 are reported as three distinct states."""
+    t = classify_updated_at(raw)
+    assert t.state == state
+    assert (t.at is not None) == (state == "ok")
+
+
+def test_classify_updated_at_normalises_to_utc() -> None:
+    t = classify_updated_at("2026-10-01T09:00:00+09:00")
+    assert t.at == datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
+
+
+def test_enumerate_reports_idle_days_and_keeps_unknown_times() -> None:
+    """Classifying is not dropping (msg-6778): a thread with no usable time is still listed."""
+    now = datetime(2026, 10, 11, 0, 0, tzinfo=UTC)
+    registered = _index(projects=("p",))
+    threads = [
+        ListedThread(_thread(thread_id="T-ok"), classify_updated_at("2026-10-01T00:00:00Z")),
+        ListedThread(_thread(thread_id="T-none"), classify_updated_at(None)),
+        ListedThread(_thread(thread_id="T-bad"), classify_updated_at("garbage")),
+    ]
+    report = enumerate_project("p", threads, registered, now=now)
+    assert report.unregistered == ("T-ok", "T-none", "T-bad")
+    assert [t.as_json() for t in report.threads] == [
+        {
+            "thread_id": "T-ok",
+            "time_state": "ok",
+            "updated_at": "2026-10-01T00:00:00+00:00",
+            "idle_days": 10.0,
+        },
+        {"thread_id": "T-none", "time_state": "missing", "updated_at": None, "idle_days": None},
+        {"thread_id": "T-bad", "time_state": "unparseable", "updated_at": None, "idle_days": None},
+    ]
+
+
+@pytest.mark.parametrize("raw", [None, "garbage", "2020-01-01T00:00:00Z"])
+def test_an_explicit_candidate_never_reaches_the_report_whatever_its_time(raw: object) -> None:
+    """msg-6778 regression: missing / unparseable / over-limit time cannot touch a listed thread.
+
+    The listed pair is removed by filter 3 before any time is looked at, so
+    the wrapper's time and idle rules never see it.
+    """
+    registered = _index(("p", "T-listed"))
+    threads = [ListedThread(_thread(thread_id="T-listed"), classify_updated_at(raw))]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered == ()
+    assert report.threads == ()
+
+
+def test_parse_registered_scans_the_union_of_candidates_clones_and_projects() -> None:
+    """穴 3: clones keys and the projects key widen the scan; candidates come first, deduped."""
+    payload = {
+        "candidates": [{"project": "p1", "thread_id": "T-a", "repo_dir": "/x"}],
+        "clones": {"p2": "/c2", "p1": "/c1"},
+        "projects": ["p3", "p2"],
+    }
+    index = parse_registered(payload)
+    assert index.projects == ("p1", "p2", "p3")
+    assert index.pairs == frozenset({("p1", "T-a")})
+
+
+def test_parse_registered_accepts_a_config_without_candidates() -> None:
+    index = parse_registered({"clones": {"p": "/c"}})
+    assert index.projects == ("p",)
+    assert index.pairs == frozenset()
+
+
+@pytest.mark.parametrize(
+    "clones",
+    [["p"], "p", {"p": ""}, {"p": "  "}, {"p": 3}, {"  ": "/c"}],
+)
+def test_parse_registered_rejects_malformed_clones(clones: object) -> None:
+    """A shape error in clones is a config error: loud, like the wrapper's throw."""
+    with pytest.raises(UnregisteredThreadsError, match="clones"):
+        parse_registered({"candidates": [], "clones": clones})
+
+
+@pytest.mark.parametrize("projects", ["p", [""], [3], {"p": 1}])
+def test_parse_registered_ignores_a_malformed_projects_key(projects: object) -> None:
+    """A malformed projects key widens nothing; the park-wake tick names it in the digest."""
+    index = parse_registered({"candidates": [], "projects": projects})
+    assert index.projects == ()
+
+
+def test_parse_registered_ignores_intake_and_exclude() -> None:
+    """intake / exclude are the wrapper's to read; the enumerator lists, it does not decide."""
+    index = parse_registered(
+        {"clones": {"p": "/c"}, "intake": {"mode": "on"}, "exclude": ["p/T-a"]}
+    )
+    assert index.projects == ("p",)

@@ -118,7 +118,7 @@ def test_list_live_threads_forwards_the_status_filter() -> None:
     assert args["project"] == "p"
     assert args["status_filter"] == sorted(LIVE_STATUSES)
     assert args["limit"] == 200
-    assert threads == [{"thread_id": "T-a", "status": "active"}]
+    assert [t.thread for t in threads] == [{"thread_id": "T-a", "status": "active"}]
     assert malformed == 0
 
 
@@ -151,7 +151,7 @@ def test_list_live_threads_counts_non_dict_items() -> None:
 
     inner = _Mixed()
     threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
-    assert threads == [{"thread_id": "T-a", "status": "active"}]
+    assert [t.thread for t in threads] == [{"thread_id": "T-a", "status": "active"}]
     assert malformed == 2
 
 
@@ -195,7 +195,7 @@ def test_list_live_threads_advances_offset_by_raw_page_length() -> None:
     threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
     # Offset advanced by RAW length (3) after page 1, not by dict-only (2).
     assert [c["offset"] for c in inner.calls] == [0, 3]
-    assert [t["thread_id"] for t in threads] == ["T-a", "T-b", "T-c", "T-d"]
+    assert [t.thread["thread_id"] for t in threads] == ["T-a", "T-b", "T-c", "T-d"]
     assert malformed == 1
 
 
@@ -461,3 +461,96 @@ def test_main_end_to_end_with_stubbed_mcp(
     # test payload gains any non-ASCII character; we approximate that
     # here by checking the current payload round-trips as ASCII.
     assert stdout.encode("ascii", errors="strict")
+
+
+# ----------------------- T-sweep-intake-discovery-by-default (msg-6770 §1 / msg-6778)
+
+
+def test_list_live_threads_classifies_time_without_dropping() -> None:
+    """The boundary labels each item's updated_at; it never drops an item for its time."""
+    inner = _RecordingMcp(
+        {
+            "p": [
+                {"thread_id": "T-ok", "status": "active", "updated_at": "2026-10-01T00:00:00Z"},
+                {"thread_id": "T-none", "status": "active"},
+                {"thread_id": "T-bad", "status": "active", "updated_at": "not-a-time"},
+            ]
+        }
+    )
+    threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    assert [(t.thread["thread_id"], t.time.state) for t in threads] == [
+        ("T-ok", "ok"),
+        ("T-none", "missing"),
+        ("T-bad", "unparseable"),
+    ]
+    assert malformed == 0
+
+
+def test_no_per_thread_read_is_possible() -> None:
+    """Einstein msg-6769 (N+1): the listing is the only tool this script may call.
+
+    The time comes from the listing's ``updated_at``; a per-thread read
+    (chatroom_get_thread) would be refused by ReadOnlyMcp before it left
+    the process.
+    """
+    assert frozenset({"chatroom_list_threads"}) == _MODULE.READ_ONLY_TOOLS
+
+
+def test_the_timestamp_is_parsed_in_exactly_one_place() -> None:
+    """msg-6770 §1: classify_updated_at is called only from _list_live_threads."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    callers: list[str] = []
+    for base in ("src", "scripts", "deploy"):
+        for path in (root / base).rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                    continue
+                for node in ast.walk(fn):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "classify_updated_at"
+                    ):
+                        callers.append(f"{path.relative_to(root).as_posix()}::{fn.name}")
+    assert callers == ["scripts/unregistered_threads.py::_list_live_threads"]
+
+
+def test_main_scans_a_project_named_only_in_clones(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """穴 1 / 穴 3: a project with no candidate is scanned once its clone is declared."""
+    path = tmp_path / "sweep.json"
+    path.write_text(json.dumps({"clones": {"pnew": "/c/new"}}), encoding="utf-8")
+
+    class _Stub:
+        def __init__(self, url: str | None = None) -> None:
+            pass
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            if int(arguments.get("offset") or 0) > 0 or arguments.get("project") != "pnew":
+                return {"items": [], "total": 1}
+            return {
+                "items": [
+                    {"thread_id": "T-n", "status": "active", "updated_at": "2026-10-01T00:00:00Z"}
+                ],
+                "total": 1,
+            }
+
+    monkeypatch.setattr(_MODULE, "StreamableHttpChatroomMcp", _Stub)
+    old = sys.argv
+    try:
+        sys.argv = ["prog", "--sweep-config", str(path)]
+        rc = _MODULE.main()
+    finally:
+        sys.argv = old
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [p["project"] for p in payload["projects"]] == ["pnew"]
+    (row,) = payload["projects"][0]["threads"]
+    assert row["thread_id"] == "T-n"
+    assert row["time_state"] == "ok"
+    assert row["updated_at"] == "2026-10-01T00:00:00+00:00"
+    assert isinstance(row["idle_days"], float)

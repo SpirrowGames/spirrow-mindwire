@@ -39,6 +39,28 @@ digest. See ``scripts/unregistered_threads.py`` and
 auto-registered thread (an ordinary candidate, quarantinable) and a
 refused one (never in any state file).
 
+**Discovery by default** (T-sweep-intake-discovery-by-default, Bohr
+msg-6776 as amended by msg-6778). The scanned projects are the union of
+``sweep.json``'s ``clones`` keys, the candidates' projects and the
+``projects`` key (穴 3: a project named nowhere used to be neither
+scanned nor shown). Every unregistered thread now also carries how long
+it has been idle, read from the listing's own ``updated_at`` — never from
+a per-thread read (Einstein msg-6769: no N+1 calls per tick). The
+timestamp is interpreted in exactly one place, :func:`classify_updated_at`,
+which only the CLI's ``_list_live_threads`` calls. That boundary
+CLASSIFIES (ok / missing / unparseable) and drops nothing: whether a
+thread is admitted is decided later, by the wrapper's
+``Resolve-UnregisteredIntake``, and only for threads ``sweep.json`` does
+not list. An explicitly listed candidate never reaches this module's
+report at all (:func:`is_unregistered_live` filter 3), so neither a
+missing timestamp nor ``max_idle_days`` can touch it (msg-6778).
+
+``updated_at`` moves on every posted message and also on lifecycle
+transitions such as a ``retry_count`` update. A retry only ever happens to
+a thread that already ran as a candidate, so a long-idle thread cannot be
+made to look fresh by one (msg-6770 §1); "idle" here therefore means "no
+message and no lifecycle change", which is the conservative reading.
+
 Fail direction: this module makes **no** MCP calls of its own — the CLI
 around it does. What it does with an MCP failure is separated from what
 it does with a well-shaped answer, on purpose (msg-2531 §2 invariants):
@@ -73,8 +95,9 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 #: Chatroom statuses that count as "live work in flight" for D-2.
 #: Kept string-value-identical to
@@ -93,6 +116,80 @@ LIVE_STATUSES: frozenset[str] = frozenset({"active", "awaiting_reply"})
 #: Here we match the class as a whole, so the un-templated prefix is what
 #: we want.
 PR_REVIEW_PREFIX: str = "T-pr-review-"
+
+#: The three states of a listing item's ``updated_at`` (msg-6770 §1). They
+#: are never mixed: "had a time", "had none" and "had something that is
+#: not a time" are reported as such, so the wrapper can fail closed on the
+#: last two without confusing them with each other.
+TimeState = Literal["ok", "missing", "unparseable"]
+
+
+@dataclass(frozen=True)
+class ThreadTime:
+    """The classified ``updated_at`` of one listing item.
+
+    ``at`` is set (timezone-aware, UTC) only when ``state == "ok"``.
+    """
+
+    state: TimeState
+    at: datetime | None = None
+
+
+def classify_updated_at(raw: object) -> ThreadTime:
+    """Classify a listing item's raw ``updated_at`` value. The ONE timestamp parser.
+
+    Called only by the CLI's ``_list_live_threads`` (pinned by
+    ``tests/test_unregistered_threads_cli.py``), so there is a single
+    place where wire data becomes a time. Absent / ``None`` / blank is
+    ``missing``; a non-string, a string ``datetime.fromisoformat`` rejects,
+    or a time with no UTC offset (ambiguous, so not a time we can compare)
+    is ``unparseable``.
+    """
+    if raw is None:
+        return ThreadTime("missing")
+    if not isinstance(raw, str):
+        return ThreadTime("unparseable")
+    text = raw.strip()
+    if not text:
+        return ThreadTime("missing")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return ThreadTime("unparseable")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return ThreadTime("unparseable")
+    return ThreadTime("ok", parsed.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class ListedThread:
+    """One dict-shaped listing item plus its classified ``updated_at``."""
+
+    thread: dict[str, Any]
+    time: ThreadTime
+
+
+@dataclass(frozen=True)
+class UnregisteredThread:
+    """One unregistered live thread as the wrapper sees it.
+
+    ``idle_days`` is the time since ``updated_at`` in days (``None`` unless
+    ``time_state == "ok"``). The wrapper compares it against
+    ``intake.max_idle_days`` and never parses a timestamp itself.
+    """
+
+    thread_id: str
+    time_state: TimeState
+    updated_at: str | None = None
+    idle_days: float | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "thread_id": self.thread_id,
+            "time_state": self.time_state,
+            "updated_at": self.updated_at,
+            "idle_days": self.idle_days,
+        }
 
 
 class UnregisteredThreadsError(ValueError):
@@ -155,12 +252,16 @@ class ProjectReport:
     unregistered: tuple[str, ...] = ()
     error: str | None = None
     malformed_count: int | None = 0
+    #: Per-thread detail for ``unregistered``, same order. Carries the
+    #: time classification the wrapper's intake decision needs.
+    threads: tuple[UnregisteredThread, ...] = ()
 
     def as_json(self) -> dict[str, Any]:
         return {
             "project": self.project,
             "unregistered_count": self.unregistered_count,
             "unregistered": list(self.unregistered),
+            "threads": [t.as_json() for t in self.threads],
             "error": self.error,
             "malformed_count": self.malformed_count,
         }
@@ -219,28 +320,44 @@ class EnumerateReport:
 
 
 def parse_registered(payload: Any) -> RegisteredIndex:
-    """Parse the ``candidates`` array of ``sweep.json`` into a :class:`RegisteredIndex`.
+    """Parse ``sweep.json`` into a :class:`RegisteredIndex`.
 
-    Only the two fields D-2 needs (``project``, ``thread_id``) are
-    validated here — ``repo_dir`` is not, because a missing repo_dir is
-    a real defect but not one this script exists to catch (the sweep
-    wrapper already refuses to run on it, ``run-conductor-scheduled.ps1``
-    L2341-2345). A candidate with a missing or blank ``project`` /
-    ``thread_id`` is rejected at load time rather than silently dropped:
-    a candidate that vanished from the registered set would be
-    indistinguishable from an unregistered thread and would inflate the
-    D-2 count.
+    ``pairs`` comes from the ``candidates`` array. Only the two fields D-2
+    needs (``project``, ``thread_id``) are validated here — ``repo_dir``
+    is not, because a missing repo_dir is a real defect but not one this
+    script exists to catch (the sweep wrapper already refuses to run on
+    it, ``Get-SweepCandidates``). A candidate with a missing or blank
+    ``project`` / ``thread_id`` is rejected at load time rather than
+    silently dropped: a candidate that vanished from the registered set
+    would be indistinguishable from an unregistered thread and would
+    inflate the D-2 count. A missing ``candidates`` key is an empty list;
+    a present non-array one is rejected.
+
+    ``projects`` (the scan range) is the union, in this order, of the
+    candidates' projects, the ``clones`` keys and the ``projects`` key
+    (msg-6776 走査と受け付け). ``clones`` is validated for shape and
+    rejected loudly (an object of non-blank project -> non-blank string),
+    matching the wrapper, which throws on the same error. A malformed
+    ``projects`` key widens nothing and is not an error here: the
+    park-wake tick already names it in the digest as
+    ``sweep.json:projects`` (``Get-SweepDeclaredProjects``).
     """
     if not isinstance(payload, dict):
         raise UnregisteredThreadsError("sweep.json root must be a JSON object")
 
-    raw_candidates = payload.get("candidates")
+    raw_candidates = payload.get("candidates", [])
     if not isinstance(raw_candidates, list):
         raise UnregisteredThreadsError("sweep.json 'candidates' must be a JSON array")
 
     pairs: set[tuple[str, str]] = set()
     projects: list[str] = []
     seen_projects: set[str] = set()
+
+    def _add_project(name: str) -> None:
+        if name not in seen_projects:
+            seen_projects.add(name)
+            projects.append(name)
+
     for index, raw in enumerate(raw_candidates):
         where = f"candidates[{index}]"
         if not isinstance(raw, dict):
@@ -258,9 +375,25 @@ def parse_registered(payload: Any) -> RegisteredIndex:
         project_s = project.strip()
         thread_id_s = thread_id.strip()
         pairs.add((project_s, thread_id_s))
-        if project_s not in seen_projects:
-            seen_projects.add(project_s)
-            projects.append(project_s)
+        _add_project(project_s)
+
+    if "clones" in payload:
+        clones = payload["clones"]
+        if not isinstance(clones, dict):
+            raise UnregisteredThreadsError(
+                "sweep.json 'clones' must be a JSON object (project -> clone path)"
+            )
+        for key, value in clones.items():
+            if not str(key).strip() or not isinstance(value, str) or not value.strip():
+                raise UnregisteredThreadsError(
+                    f"sweep.json 'clones' has a blank key or value: {key!r} => {value!r}"
+                )
+            _add_project(str(key).strip())
+
+    declared = payload.get("projects")
+    if isinstance(declared, list) and all(isinstance(p, str) and p.strip() for p in declared):
+        for p in declared:
+            _add_project(p.strip())
 
     return RegisteredIndex(pairs=frozenset(pairs), projects=tuple(projects))
 
@@ -299,21 +432,24 @@ def is_unregistered_live(project: str, thread: dict[str, Any], registered: Regis
 
 def enumerate_project(
     project: str,
-    threads: Iterable[dict[str, Any]],
+    threads: Iterable[ListedThread],
     registered: RegisteredIndex,
     *,
     malformed_count: int = 0,
+    now: datetime | None = None,
 ) -> ProjectReport:
     """Apply :func:`is_unregistered_live` over ``threads`` and produce a report.
 
-    ``threads`` is a well-shaped iterable of thread dicts. Callers are
-    responsible for filtering out non-object items *before* handing the
-    list here; the CLI's ``_list_live_threads`` does exactly that at the
-    tool boundary and passes the count of what it dropped through
-    ``malformed_count``. This function does not re-filter: the type
-    signature declares ``Iterable[dict[str, Any]]`` and the shape check
-    lives at the one boundary that actually meets untrusted input
-    (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management).
+    ``threads`` is a well-shaped iterable of :class:`ListedThread` — a
+    dict plus its already-classified ``updated_at``. Callers are
+    responsible for filtering out non-object items and for classifying
+    the time *before* handing the list here; the CLI's
+    ``_list_live_threads`` does both at the tool boundary and passes the
+    count of what it dropped through ``malformed_count``. This function
+    neither re-filters nor parses a timestamp: the shape check and the
+    time parse live at the one boundary that actually meets untrusted
+    input (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management;
+    msg-6770 §1 — one place interprets the time).
 
     A thread whose ``thread_id`` is missing, empty, or a falsy non-string
     value (e.g., ``0``, ``[]``, ``{}``) is ignored — the coercion below
@@ -324,25 +460,47 @@ def enumerate_project(
     expects ``thread_id`` to be a string, so any such coercion reflects a
     schema violation upstream.
 
+    ``now`` (default: the current UTC time) is what ``idle_days`` is
+    measured against. A thread whose time is not ``ok`` is still listed,
+    with ``idle_days = None``: classifying is not dropping (msg-6778).
+
     ``malformed_count`` is the count of non-object items the caller
     already dropped upstream (msg-2648 §3 — the CLI's ``_list_live_threads``
     filters non-dicts before handing the accumulated list here). It flows
     through unchanged onto :attr:`ProjectReport.malformed_count` and is
     **never** merged into ``unregistered_count``.
     """
+    reference = now if now is not None else datetime.now(UTC)
     unregistered: list[str] = []
-    for thread in threads:
+    details: list[UnregisteredThread] = []
+    for listed in threads:
+        thread = listed.thread
         if not is_unregistered_live(project, thread, registered):
             continue
         thread_id = str(thread.get("thread_id") or "").strip()
-        if thread_id:
-            unregistered.append(thread_id)
+        if not thread_id:
+            continue
+        unregistered.append(thread_id)
+        at = listed.time.at
+        if listed.time.state == "ok" and at is not None:
+            idle = max(0.0, (reference - at).total_seconds() / 86400.0)
+            details.append(
+                UnregisteredThread(
+                    thread_id=thread_id,
+                    time_state="ok",
+                    updated_at=at.isoformat(),
+                    idle_days=round(idle, 3),
+                )
+            )
+        else:
+            details.append(UnregisteredThread(thread_id=thread_id, time_state=listed.time.state))
     return ProjectReport(
         project=project,
         unregistered_count=len(unregistered),
         unregistered=tuple(unregistered),
         error=None,
         malformed_count=malformed_count,
+        threads=tuple(details),
     )
 
 
@@ -372,9 +530,14 @@ __all__ = [
     "LIVE_STATUSES",
     "PR_REVIEW_PREFIX",
     "EnumerateReport",
+    "ListedThread",
     "ProjectReport",
     "RegisteredIndex",
+    "ThreadTime",
+    "TimeState",
+    "UnregisteredThread",
     "UnregisteredThreadsError",
+    "classify_updated_at",
     "enumerate_project",
     "is_unregistered_live",
     "load_registered",

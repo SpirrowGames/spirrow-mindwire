@@ -4686,6 +4686,19 @@ function Invoke-PredictedResourceProbe {
     return $map
 }
 
+# --- sweep.json discovery keys reader (T-sweep-intake-discovery-by-default, Bohr msg-6776) --------
+# Returns ConvertFrom-SweepIntakeConfig's view of sweep.json's `clones` / `intake` / `exclude`
+# (lib/UnregisteredIntake.ps1). Throws on a shape error, like Get-SweepOwnerMap: a malformed config
+# stops the tick. A per-project environment problem in `clones` does not throw; it makes only that
+# project 登録不可 in Resolve-UnregisteredIntake.
+function Get-SweepIntakeConfig {
+    param([string]$Path)
+    # Get-SweepCandidates already threw on a missing file; defaults keep this reader from adding noise.
+    if (-not (Test-Path -LiteralPath $Path)) { return (ConvertFrom-SweepIntakeConfig -Raw $null) }
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    return (ConvertFrom-SweepIntakeConfig -Raw $raw -Source $Path)
+}
+
 # --- sweep.json owner_map reader (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) --
 # Returns @{ <predicted_resource> = <owning_project> } from sweep.json's top-level `owner_map`
 # field, or @{} when the file has no such field. Missing = OFF (fully backward compatible):
@@ -5100,15 +5113,19 @@ try {
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
 
-    # Auto-registration (msg-5889 D-2 / msg-5893 D-2.1-D-2.4, lib/UnregisteredIntake.ps1). Live threads
-    # that sweep.json does not list join THIS tick's candidates — in memory only, sweep.json is not
-    # written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
+    # Discovery intake (T-sweep-intake-discovery-by-default msg-6776/msg-6778 D-2.5, on top of msg-5889
+    # D-2 / msg-5893 D-2.1-D-2.4; lib/UnregisteredIntake.ps1). A live thread sweep.json does not list
+    # joins THIS tick's candidates only with intake.mode=on, a usable clones[project], an updated_at
+    # within intake.max_idle_days and no exclude entry — in memory only, sweep.json is not written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
     # head-skip code below (D-2.3): every filter has to see the added threads, or a quarantined one
     # would launch on every tick. Added threads are ordinary candidates from here on (D-2.2). Refused
     # ones never join, so no state file can get their key (D-2.1); they are carried only to the
     # parked-humans poll and the digest. tests/Test-UnregisteredIntake.ps1 pins the order.
+    $sweepIntakeConfig = Get-SweepIntakeConfig -Path $sweepConfigPath
+    foreach ($w in @(Get-CloneCandidateMismatches -Candidates $candidates -Clones $sweepIntakeConfig.clones)) { Write-Log $w }
     $unregProbe = Invoke-UnregisteredThreadsProbe -SweepConfigPath $sweepConfigPath
-    $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error
+    $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error `
+        -IntakeConfig $sweepIntakeConfig -DaemonRoot $repoRoot
     $candidates = Join-UnregisteredCandidates -Candidates $candidates -Intake $unregisteredIntake
     if ($unregisteredIntake.probe_error) {
         Write-Log "unregistered intake: ? — $($unregisteredIntake.probe_error) (nothing auto-registered this tick)"
@@ -5116,12 +5133,22 @@ try {
     foreach ($u in @($unregisteredIntake.unmeasured)) {
         Write-Log "unregistered intake [$($u.project)]: ? — not measured ($($u.reason))"
     }
-    if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0) {
+    if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0 -or
+        @($unregisteredIntake.shadow).Count -gt 0 -or @($unregisteredIntake.idle).Count -gt 0 -or
+        @($unregisteredIntake.time_unknown).Count -gt 0 -or $unregisteredIntake.excluded_count -gt 0) {
         Confirm-LogWorthKeeping
+        # The "auto-registered N [...]" prefix is kept verbatim: the PR-2 migration runbook greps it.
         Write-Log ("unregistered intake: auto-registered $(@($unregisteredIntake.added).Count) " +
                    "[$((@($unregisteredIntake.added) | ForEach-Object { $_.key }) -join ', ')], " +
                    "refused $(@($unregisteredIntake.refused).Count) " +
-                   "[$((@($unregisteredIntake.refused) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')]")
+                   "[$((@($unregisteredIntake.refused) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')], " +
+                   "shadow($($unregisteredIntake.mode)) $(@($unregisteredIntake.shadow).Count) " +
+                   "[$((@($unregisteredIntake.shadow) | ForEach-Object { $_.key }) -join ', ')], " +
+                   "idle>$($unregisteredIntake.max_idle_days)d $(@($unregisteredIntake.idle).Count) " +
+                   "[$((@($unregisteredIntake.idle) | ForEach-Object { $_.key }) -join ', ')], " +
+                   "time-unknown $(@($unregisteredIntake.time_unknown).Count) " +
+                   "[$((@($unregisteredIntake.time_unknown) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')], " +
+                   "excluded $($unregisteredIntake.excluded_count)")
     }
 
     # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the
