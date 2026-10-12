@@ -32,9 +32,9 @@ earlier "log-only until P-1 ∧ P-2 hold" rule (msg-2531 §1) no longer
 applies: Operator Board §F.1 / msg-4900 §2 dropped the plan to express
 "cannot be swept" as a ``parked`` state. The sweep wrapper now adds
 every thread this predicate reports to the current tick's candidates
-(in memory; ``sweep.json`` is never written) when its project passes the
-environment probe, and lists the rest with their reason in the daily
-digest. See ``scripts/unregistered_threads.py`` and
+(in memory; ``sweep.json`` is never written) when the discovery rule
+below admits it (D-2.5), and lists the rest with their reason in the
+daily digest. See ``scripts/unregistered_threads.py`` and
 ``deploy/lib/UnregisteredIntake.ps1`` for the split between an
 auto-registered thread (an ordinary candidate, quarantinable) and a
 refused one (never in any state file).

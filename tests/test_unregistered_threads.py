@@ -576,3 +576,11 @@ def test_parse_registered_ignores_intake_and_exclude() -> None:
         {"clones": {"p": "/c"}, "intake": {"mode": "on"}, "exclude": ["p/T-a"]}
     )
     assert index.projects == ("p",)
+
+
+def test_the_shipped_example_parses_and_scans_its_clones() -> None:
+    """deploy/sweep.json.example documents clones / intake / exclude; it must stay loadable."""
+    example = Path(__file__).resolve().parents[1] / "deploy" / "sweep.json.example"
+    index = load_registered(example)
+    payload = json.loads(example.read_text(encoding="utf-8"))
+    assert set(payload["clones"]) <= set(index.projects)

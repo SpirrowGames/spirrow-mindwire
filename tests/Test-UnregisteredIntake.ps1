@@ -1,12 +1,16 @@
-# Regression guard for the sweep's auto-registration of unregistered live threads
-# (T-sweep-intake-and-quarantine-stalls, Bohr msg-5889 D-2, amended by msg-5893 D-2.1-D-2.4, cleared
-# by Einstein msg-5894). Code under test: deploy/lib/UnregisteredIntake.ps1 and its call sites in
-# deploy/run-conductor-scheduled.ps1.
+# Regression guard for the sweep's discovery intake of unregistered live threads
+# (T-sweep-intake-discovery-by-default, Bohr msg-6776 + msg-6778, cleared by Einstein msg-6779; on top
+# of T-sweep-intake-and-quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Code under test:
+# deploy/lib/UnregisteredIntake.ps1 and its call sites in deploy/run-conductor-scheduled.ps1.
 #
 # What is pinned, and how:
-#   R  Resolve-UnregisteredIntake — the environment probe (one distinct repo_dir, fully qualified,
-#      existing), the "?" for an unmeasured project or a failed probe, and the PR-review refusal.
-#   D-2.1  A refused thread never joins the candidate array, so none of the three state files the
+#   C  ConvertFrom-SweepIntakeConfig — defaults (shadow / 14) and a throw on every shape error.
+#   R  Resolve-UnregisteredIntake — the repo_dir comes from clones only (no #448 inference), the clone
+#      probe (absolute, existing, not the daemon checkout, not a linked worktree), D-2.5 (mode /
+#      max_idle_days / exclude / time fail-closed), explicit candidates never classified (msg-6778),
+#      ordering, the candidate-vs-clones WARN, the "?" for an unmeasured project or a failed probe, and
+#      the PR-review refusal.
+#   D-2.1  A thread that is not added (shadow, idle, excluded, refused, time-unknown) never joins the candidate array, so none of the three state files the
 #      sweep writes (quarantine.json, retry-pending.json, evaluated.json) can get its key. The state
 #      writers are inline in the wrapper and there is no whole-tick harness, so this is pinned in two
 #      parts: (a) functionally, the refused key is absent from the joined candidates and from the live
@@ -107,6 +111,10 @@ foreach ($bad in @(
     try { $null = ConvertFrom-SweepIntakeConfig -Raw ($bad | ConvertFrom-Json) } catch { $threw = $true }
     CheckTrue "shape error throws: $bad" $threw
 }
+
+$ex = ConvertFrom-SweepIntakeConfig -Raw (Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/sweep.json.example') -Raw -Encoding utf8 | ConvertFrom-Json)
+Check "the shipped sweep.json.example parses, and documents the shadow default" 'shadow' $ex.mode
+CheckTrue "…and declares at least one clone" ($ex.clones.Count -gt 0)
 
 Write-Host "R — Resolve-UnregisteredIntake: the clone comes from clones only (no inference)"
 $i = Resolve (Rep (Proj 'mw' @('T-new1', 'T-new2')))
