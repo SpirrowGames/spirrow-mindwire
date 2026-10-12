@@ -59,6 +59,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.HUMAN: None,  # R-HUMAN → ready_for_human (or R-RELAY-STOP via its marker)
     StopReason.SETTLED: None,  # R-NONE-*
     StopReason.HOLD: None,  # waiting
+    # Not in §6.3 (T-human-call-priority-interrupt). Yielded to a Summon: waiting, like HOLD; the
+    # sweep relaunches the thread once the Summon is gone.
+    StopReason.SUMMON_YIELD: None,
     # Not in §6.3 (added after it). A DEFER, not a stop; the next tick re-derives admission.
     StopReason.CI_WAIT: None,
     # Not in §6.3. Like CI_WAIT: a silent retry of the same head, posting nothing; when it does

@@ -267,6 +267,9 @@ def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
         retry_of: RetryOf | None = None,
         # T-sweep-starves-deep-candidates PR-B: and --gate-only (False = not a gate-lane run).
         gate_only: bool = False,
+        # T-human-call-priority-interrupt PR-2: and the Summon owner project / resume notice.
+        summon_owner_project: str | None = None,
+        resume_notice: object = None,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)

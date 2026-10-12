@@ -33,6 +33,13 @@
 #   * Invariant: if a tick has gate candidates and a role turn was admitted, at least one gate
 #     candidate was attempted before it.
 #
+# Lane 0 — Summon (T-human-call-priority-interrupt PR-2, Bohr msg-6743 §2 / msg-6755 v1.6 §2). A
+# LAUNCH candidate that is the active Summon of its project (Get-SummonDisposition kind 'summoned',
+# deploy/lib/Summon.ps1) goes before the gate lane, oldest `since` first. It is admitted on the
+# tick budget alone (like the first gate), it does not use up the first-gate exception, the
+# gate-before-role invariant does not apply to it, and it never breaks the sweep. A LAUNCH
+# candidate held by a Summon (kind 'yield' / 'malformed') is not a launch: it joins block 1.
+#
 # This file is PURE: no I/O, no clock reads except Get-SweepNowUtc, no Write-Log. The wrapper calls
 # these functions from inside its dispatch loop, and tests/Test-SweepFairness.ps1 drives the same
 # functions. Keep the decisions here and keep the loop a thin skeleton around them, so the tests
@@ -103,12 +110,19 @@ function Resolve-SweepBudgets {
     }
 }
 
-# Which lane a decide verdict belongs to: 'gate' (LAUNCH, token pr-review), 'role' (any other
-# LAUNCH), or 'none' (SKIP / DEFER / missing verdict; not a launch, so position does not matter).
+# Which lane a decide verdict belongs to: 'summon' (LAUNCH, and the candidate is the active Summon),
+# 'gate' (LAUNCH, token pr-review), 'role' (any other LAUNCH), or 'none' (SKIP / DEFER / missing
+# verdict, or a LAUNCH held by a Summon; not a launch, so position does not matter). $Summon is the
+# candidate's Get-SummonDisposition result, or $null (no Summon read: the lanes are as before).
+# A Summon whose head is `pr-review` still goes to lane 0 (msg-6743 §2), and so is not --gate-only.
 function Get-SweepLane {
-    param($Verdict)
+    param($Verdict, $Summon = $null)
     if ($null -eq $Verdict) { return 'none' }
     if ("$($Verdict.decision)" -ne 'launch') { return 'none' }
+    if ($null -ne $Summon) {
+        if ($Summon.kind -eq 'summoned') { return 'summon' }
+        if ($Summon.kind -eq 'yield' -or $Summon.kind -eq 'malformed') { return 'none' }
+    }
     if ("$($Verdict.token)" -eq $script:SweepGateToken) { return 'gate' }
     return 'role'
 }
@@ -184,13 +198,20 @@ function Update-LaunchWaitFromVerdicts {
 # Ties (and a missing wait value, read as $Now) fall back to sweep.json order. The sort is made
 # stable by sorting on (wait, index) explicitly; Sort-Object alone is not guaranteed stable.
 function Get-OrderedSweepCandidates {
-    param([array]$Candidates, [hashtable]$Verdicts, [hashtable]$EvaluatedState, [datetime]$Now)
-    $others = @(); $gates = @(); $roles = @()
+    param([array]$Candidates, [hashtable]$Verdicts, [hashtable]$EvaluatedState, [datetime]$Now,
+          [hashtable]$SummonByKey = @{})
+    $others = @(); $gates = @(); $roles = @(); $summons = @()
     for ($i = 0; $i -lt $Candidates.Count; $i++) {
         $c = $Candidates[$i]
         $v = if ($Verdicts.ContainsKey($c.key)) { $Verdicts[$c.key] } else { $null }
-        $lane = Get-SweepLane -Verdict $v
+        $sd = if ($SummonByKey.ContainsKey($c.key)) { $SummonByKey[$c.key] } else { $null }
+        $lane = Get-SweepLane -Verdict $v -Summon $sd
         if ($lane -eq 'none') { $others += $c; continue }
+        if ($lane -eq 'summon') {
+            # Lane 0: oldest Summon first, thread id then sweep.json order as tie-breaks.
+            $summons += [PSCustomObject]@{ Cand = $c; SinceTicks = $sd.since.Ticks; Tid = "$($c.thread_id)"; Index = $i }
+            continue
+        }
         $wait = Get-LaunchWaitSince -EvaluatedState $EvaluatedState -Key $c.key
         # A missing value reads as $Now, and $Now goes through the same 'o' round trip that a stored
         # value has been through (Set-LaunchWaitPending writes 'o', Get-LaunchWaitSince parses it).
@@ -206,7 +227,18 @@ function Get-OrderedSweepCandidates {
     }
     $gatesSorted = @($gates | Sort-Object -Property WaitTicks, Index | ForEach-Object { $_.Cand })
     $rolesSorted = @($roles | Sort-Object -Property WaitTicks, Index | ForEach-Object { $_.Cand })
-    return @($others) + $gatesSorted + $rolesSorted
+    # Ordinal thread-id comparison, as in Compare-SummonOrder (Sort-Object compares strings by culture).
+    $summonList = [System.Collections.Generic.List[object]]::new()
+    foreach ($x in $summons) { $summonList.Add($x) }
+    $summonList.Sort([Comparison[object]] {
+        param($a, $b)
+        $c = $a.SinceTicks.CompareTo($b.SinceTicks)
+        if ($c -eq 0) { $c = [string]::CompareOrdinal($a.Tid, $b.Tid) }
+        if ($c -eq 0) { $c = $a.Index.CompareTo($b.Index) }
+        return $c
+    })
+    $summonsSorted = @($summonList | ForEach-Object { $_.Cand })
+    return @($others) + $summonsSorted + $gatesSorted + $rolesSorted
 }
 
 # --- admission -----------------------------------------------------------------------------------
@@ -222,6 +254,7 @@ function New-LaunchScheduler {
         first_gate_evaluated = $false
         gate_launched = 0
         role_launched = 0
+        summon_launched = 0
         gate_closed_reason = $null
         attempts = [System.Collections.ArrayList]::new()
     }
@@ -240,6 +273,10 @@ function Request-LaunchAdmission {
     $exception = $false
     if ($TickElapsed -ge $Scheduler.launch_budget) {
         $r = @{ admit = $false; reason = 'time-budget'; scope = 'break'; exception = $false }
+    }
+    elseif ($Lane -eq 'summon') {
+        # Lane 0 (Summon): the tick budget alone. It does not touch the first-gate exception.
+        $r = @{ admit = $true; reason = 'summon'; scope = $null; exception = $false }
     }
     elseif ($Lane -eq 'gate' -and -not $Scheduler.first_gate_evaluated) {
         $exception = $true
@@ -271,7 +308,9 @@ function Complete-LaunchAttempt {
     $last = $Scheduler.attempts[$Scheduler.attempts.Count - 1]
     $last.outcome = $Outcome
     if ($Outcome -eq 'launched') {
-        if ($Lane -eq 'gate') { $Scheduler.gate_launched++ } else { $Scheduler.role_launched++ }
+        if ($Lane -eq 'gate') { $Scheduler.gate_launched++ }
+        elseif ($Lane -eq 'summon') { $Scheduler.summon_launched++ }
+        else { $Scheduler.role_launched++ }
     }
 }
 
@@ -280,6 +319,8 @@ function Complete-LaunchAttempt {
 function Get-PostRunAction {
     param([string]$Lane, [int]$Rounds)
     if ($Lane -eq 'gate') { return 'continue' }
+    # Lane 0 never breaks either: whatever room the tick budget has left goes to the other lanes.
+    if ($Lane -eq 'summon') { return 'continue' }
     if ($Rounds -gt 0) { return 'break' }
     return 'continue'
 }

@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.conductor.control import ControlState
+from spirrow_mindwire.conductor.control import ControlSnapshot, ControlState
 from spirrow_mindwire.conductor.core import (
     CONDUCTOR_RELAY_AUTHOR,
     Conductor,
@@ -207,6 +207,9 @@ class _FakeControl:
         state = self._states[min(self.reads, len(self._states) - 1)]
         self.reads += 1
         return state
+
+    async def read_snapshot(self) -> ControlSnapshot:
+        return ControlSnapshot(state=await self.read())
 
     async def report_observed(self, state: ControlState) -> None:
         self.observed.append(state)

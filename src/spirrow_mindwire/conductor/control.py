@@ -43,10 +43,12 @@ one mistake that matters here:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
 from ..magickit.client import MagickitMcpError, McpToolCaller
+from .summon import ActiveSummon, SummonReadKind, parse_active_summon
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +102,26 @@ loop turns but never self-authorises code); the latter stops the loop outright.
 """
 
 
+@dataclass(frozen=True)
+class ControlSnapshot:
+    """One ``loop_control_get`` read: the state, plus the project's active Summon if any.
+
+    T-human-call-priority-interrupt (Bohr msg-6755 v1.6 §1 / msg-6800 v1.7): ``active_summon``
+    rides on the same response, so reading it costs no extra MCP call. ``summon`` is ``None``
+    when there is none — and also whenever ``state`` is the fail-safe HOLD, because a payload we
+    could not read tells us nothing about a Summon either.
+    """
+
+    state: ControlState
+    summon: ActiveSummon | None = None
+
+
 class LoopControl(Protocol):
     """The control-plane slice the conductor drives. :class:`LoopControlReader` satisfies it."""
 
     async def read(self) -> ControlState: ...
+
+    async def read_snapshot(self) -> ControlSnapshot: ...
 
     async def report_observed(self, state: ControlState) -> None: ...
 
@@ -144,6 +162,25 @@ def parse_control_payload(payload: Any) -> ControlState:
         return FAILSAFE_CONTROL_STATE
 
 
+def parse_control_snapshot(payload: Any) -> ControlSnapshot:
+    """:func:`parse_control_payload` plus the ``active_summon`` contract (v1.7).
+
+    A malformed ``active_summon`` fails safe to HOLD with no Summon (v1, msg-6744 Q2): the loop
+    cannot tell which thread is meant to run, so it runs none of them rather than guess.
+    """
+    state = parse_control_payload(payload)
+    read = parse_active_summon(payload)
+    if read.kind is SummonReadKind.MALFORMED:
+        logger.warning(
+            "loop control: %s has a malformed active_summon (%r) — failing safe to %s",
+            _TOOL_GET,
+            payload.get("active_summon") if isinstance(payload, dict) else None,
+            FAILSAFE_CONTROL_STATE.value,
+        )
+        return ControlSnapshot(state=FAILSAFE_CONTROL_STATE)
+    return ControlSnapshot(state=state, summon=read.summon)
+
+
 class LoopControlReader:
     """Reads one project's control state over magickit MCP and reports back what it acted on."""
 
@@ -166,8 +203,19 @@ class LoopControlReader:
         — would stop the daemon with a traceback rather than with a recorded ``hold``, which is both
         less safe to reason about and invisible to the operator's dashboard.
         """
+        return (await self.read_snapshot()).state
+
+    async def read_snapshot(self) -> ControlSnapshot:
+        """:meth:`read` plus the project's active Summon, from the same single MCP call."""
+        payload = await self.fetch()
+        if payload is None:
+            return ControlSnapshot(state=FAILSAFE_CONTROL_STATE)
+        return parse_control_snapshot(payload)
+
+    async def fetch(self) -> Any | None:
+        """The raw ``loop_control_get`` payload, or ``None`` when the call itself failed."""
         try:
-            payload = await self._mcp.call_tool(_TOOL_GET, {"project": self._project})
+            return await self._mcp.call_tool(_TOOL_GET, {"project": self._project})
         except Exception as exc:
             logger.warning(
                 "loop control: %s failed for project %r (%s) — failing safe to %s",
@@ -176,8 +224,7 @@ class LoopControlReader:
                 exc,
                 FAILSAFE_CONTROL_STATE.value,
             )
-            return FAILSAFE_CONTROL_STATE
-        return parse_control_payload(payload)
+            return None
 
     async def report_observed(self, state: ControlState) -> None:
         """Record that the loop read ``state`` and is acting on it — **only when it changes**.
@@ -224,8 +271,10 @@ __all__ = [
     "BASELINE_CONTROL_STATE",
     "DEFAULT_CONTROL_ACTOR",
     "FAILSAFE_CONTROL_STATE",
+    "ControlSnapshot",
     "ControlState",
     "LoopControl",
     "LoopControlReader",
     "parse_control_payload",
+    "parse_control_snapshot",
 ]
