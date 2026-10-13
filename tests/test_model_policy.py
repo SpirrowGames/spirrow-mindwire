@@ -231,6 +231,8 @@ def test_blank_acceptance_does_not_count() -> None:
         "TURN-KIND: mechanical\nFILES: C:/x/y.md\n",
         "TURN-KIND: mechanical\nFILES: docs/a.md,,docs/b.md\n",
         "TURN-KIND: mechanical\nFILES: `docs/a.md`\n",
+        "TURN-KIND: mechanical\nFILES: docs/\n",
+        "TURN-KIND: mechanical\nFILES: docs/a.md/\n",
         "",
     ],
 )
@@ -241,6 +243,28 @@ def test_missing_or_malformed_fields_return_opus_with_no_turn_kind(text: str) ->
     assert c1.startswith("C1:fail:no-turn-kind")
     c3 = next(r for r in reasons if r.startswith("C3:"))
     assert c3 == "C3:fail:files-unknown"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "src/spirrow_mindwire/conductor/handoff.py/",
+        "src/spirrow_mindwire/conductor/handoff.py//",
+        "./src/spirrow_mindwire/conductor/handoff.py/",
+        "src\\spirrow_mindwire\\conductor\\handoff.py\\",
+        "src/spirrow_mindwire/conductor/",
+    ],
+)
+def test_trailing_slash_on_a_files_entry_cannot_bypass_c3(entry: str) -> None:
+    # PR #480 review: "handoff.py/" used to survive normalisation and miss the end-anchored
+    # forbidden-path glob, so C3 passed. A trailing slash is now a malformed entry -> Opus.
+    text = f"TURN-KIND: local-fix\nFILES: {entry}\nACCEPTANCE: done\n"
+    fields = parse_handoff_fields(text)
+    assert not fields.usable
+    assert any(p.startswith("files-entry-invalid=") for p in fields.problems)
+    model, reasons = _choose(text)
+    assert model == OPUS
+    assert "C3:fail:files-unknown" in reasons
 
 
 def test_parse_reads_fields_and_normalises_paths() -> None:

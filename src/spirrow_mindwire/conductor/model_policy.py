@@ -79,7 +79,11 @@ def _normalise_path(raw: str) -> str | None:
         return None
     if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
         return None
-    if any(seg in ("", "..", ".") for seg in path.rstrip("/").split("/")):
+    # No trailing-slash forgiveness: an entry ending in "/" names a directory (or a file with a
+    # stray slash), and either way the C3 globs, anchored at end of string, would not match it,
+    # so a forbidden file could slip through as "handoff.py/". FILES entries must be plain file
+    # paths; anything else is untrusted and sends the turn to Opus (PR #480 review).
+    if any(seg in ("", "..", ".") for seg in path.split("/")):
         return None
     return path
 
