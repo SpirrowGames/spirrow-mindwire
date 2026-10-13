@@ -459,4 +459,187 @@ async def test_reap_reports_rm_failures() -> None:
     adapter, _, _, _ = await _setup(cli)
     report = await adapter.reap_orphans(frozenset())
     assert report.reaped == ()
-    assert report.failed == (("aaaaaaa1", "rm refused"),)
+    assert report.failed == (("aaaaaaa1", "`claude rm` exited 1: rm refused"),)
+
+
+# --------------------------------------------------------------------------- #
+# Confirmed cleanup (PR-gate msg on #481 @ 8a1f614, finding 1)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_reap_does_not_report_an_agent_rm_left_listed() -> None:
+    cli = FakeCli(rm_keeps=True)
+    cli.agents = [_agent("aaaaaaa1", "T-x-r1-abcdef")]
+    adapter, _, _, _ = await _setup(cli)
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == ()
+    assert report.failed == (("aaaaaaa1", "still listed after `claude rm`"),)
+
+
+@pytest.mark.anyio
+async def test_reap_cannot_confirm_when_the_list_fails_after_rm() -> None:
+    cli = FakeCli()
+    cli.agents = [_agent("aaaaaaa1", "T-x-r1-abcdef")]
+    adapter, _, _, _ = await _setup(cli)
+    original = cli.run
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        if list(argv[1:2]) == ["rm"]:
+            cli.list_fails = True
+        return await original(argv, cwd=cwd)
+
+    cli.run = run  # type: ignore[method-assign]
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == ()
+    assert len(report.failed) == 1 and "could not confirm removal" in report.failed[0][1]
+
+
+@pytest.mark.parametrize("mode", ["rm_fails", "rm_keeps"])
+@pytest.mark.anyio
+async def test_double_spawn_cleanup_failure_is_reported_and_retried_by_halt(mode: str) -> None:
+    cli = FakeCli(on_bg=lambda name: [_agent("11111111", name), _agent("22222222", name)])
+    setattr(cli, mode, True)
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError) as info:
+        await adapter.deliver_event(handle, _event())
+    assert info.value.reason == REASON_DOUBLE_SPAWN
+    assert "all were stopped and removed" not in info.value.detail
+    assert "NOT all could be confirmed removed" in info.value.detail
+    assert "11111111" in info.value.detail and "22222222" in info.value.detail
+    # The launch is not forgotten: halt() reconciles it by name.
+    name = adapter.pending_launch(handle)
+    assert name is not None and {a["name"] for a in cli.agents} == {name}
+    with pytest.raises(AdapterHaltError, match="not cleaned up"):
+        await adapter.halt(handle)
+    setattr(cli, mode, False)
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert adapter.pending_launch(handle) is None
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_double_spawn_partial_cleanup_names_what_was_removed() -> None:
+    cli = FakeCli(on_bg=lambda name: [_agent("11111111", name), _agent("22222222", name)])
+    adapter, handle, _, _ = await _setup(cli)
+    original = cli.run
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        if list(argv[1:3]) == ["rm", "22222222"]:
+            return CommandResult(1, "", "rm refused")
+        return await original(argv, cwd=cwd)
+
+    cli.run = run  # type: ignore[method-assign]
+    with pytest.raises(ClaudeBgSpawnError) as info:
+        await adapter.deliver_event(handle, _event())
+    detail = info.value.detail
+    assert "22222222 (`claude rm` exited 1: rm refused)" in detail
+    assert "removed: 11111111" in detail
+    assert [a["id"] for a in cli.agents] == ["22222222"]
+
+
+@pytest.mark.anyio
+async def test_fully_removed_double_spawn_leaves_nothing_pending() -> None:
+    cli = FakeCli(on_bg=lambda name: [_agent("11111111", name), _agent("22222222", name)])
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError):
+        await adapter.deliver_event(handle, _event())
+    assert adapter.pending_launch(handle) is None
+
+
+# --------------------------------------------------------------------------- #
+# Cancellation (PR-gate msg on #481 @ 8a1f614, finding 2)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_subprocess_runner_kills_the_child_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import asyncio
+    import sys
+
+    from spirrow_mindwire.adapters import claude_bg
+
+    spawned: list[asyncio.subprocess.Process] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def capture(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        proc = await real_exec(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture)
+    runner = claude_bg.SubprocessRunner(timeout_s=60)
+    task = asyncio.create_task(
+        runner.run([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(tmp_path))
+    )
+    while not spawned:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert spawned[0].returncode is not None  # killed and reaped, not left running
+
+
+@pytest.mark.anyio
+async def test_cancelled_launch_is_reconciled_by_name_on_halt() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    original = cli.run
+    entered = asyncio.Event()
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        if list(argv[1:2]) == ["--bg"]:
+            # The CLI detaches the session, then the caller is cancelled before it returns.
+            await original(argv, cwd=cwd)
+            entered.set()
+            await asyncio.Event().wait()
+        return await original(argv, cwd=cwd)
+
+    cli.run = run  # type: ignore[method-assign]
+    task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert adapter.last_launch(handle) is None
+    name = adapter.pending_launch(handle)
+    assert name is not None and [a["name"] for a in cli.agents] == [name]
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert cli.count("stop") == 1 and cli.count("rm") == 1
+    assert adapter.pending_launch(handle) is None
+
+
+@pytest.mark.anyio
+async def test_pending_launch_is_reconciled_before_the_next_turn() -> None:
+    cli = FakeCli(on_bg=lambda name: [])
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError) as info:
+        await adapter.deliver_event(handle, _event())
+    assert info.value.reason == REASON_NOT_LISTED
+    late = adapter.pending_launch(handle)
+    assert late is not None
+    cli.agents.append(_agent("abababab", late))  # it shows up after the deadline
+    cli.on_bg = None
+    await adapter.deliver_event(handle, _event())
+    rec = adapter.last_launch(handle)
+    assert rec is not None and rec.name != late
+    assert [a["id"] for a in cli.agents] == [rec.id]
+
+
+@pytest.mark.anyio
+async def test_unreconcilable_pending_launch_blocks_the_next_turn() -> None:
+    cli = FakeCli(on_bg=lambda name: [])
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError):
+        await adapter.deliver_event(handle, _event())
+    cli.list_fails = True
+    bg_before = cli.count("--bg")
+    with pytest.raises(AdapterHaltError, match="could not reconcile pending launch"):
+        await adapter.deliver_event(handle, _event())
+    assert cli.count("--bg") == bg_before

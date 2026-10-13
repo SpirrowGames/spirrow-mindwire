@@ -30,14 +30,25 @@ background elements whose ``name`` equals the launch name:
 - exactly one: adopt its ``id`` and ``sessionId``; a differing stdout id is logged as
   ``bg-id-mismatch`` and is not fatal;
 - none by the deadline: ``bg-session-not-listed``;
-- two or more: every one of them is stopped and removed, then ``bg-double-spawn``.
+- two or more: every one of them is stopped and removed, then ``bg-double-spawn``; the
+  stand-down names each session that could not be confirmed removed.
 
 Ending a session is always ``stop`` then ``rm`` (V-2), and ``rm`` is confirmed by the id
-being absent from the list afterwards. A recorded session that has vanished from the list
-is ``bg-session-lost`` (V-3, no ``respawn``). The state table (V-4): ``done`` is finished;
-a live session with ``status=idle`` is waiting; anything else is running, and a ``state``
-value outside :data:`KNOWN_BG_STATES` is logged once per value as ``bg-unknown-state`` and
-still treated as running so the no-progress timer covers it.
+being absent from a fresh listing afterwards -- on every path (turn end, ``halt``, the
+double-spawn cleanup and the orphan sweep). A zero exit from ``rm`` alone is never
+reported as a removal.
+
+Pending launches. The launch name is recorded on the session before ``claude --bg`` runs
+and cleared only once the session is adopted (one match) or every match is confirmed
+removed. If the launch is cancelled, fails, or is not listed in time, the name stays
+pending; the next ``deliver_event`` and ``halt`` reconcile it by name (stop -> rm ->
+confirm), so a ``--bg`` that detached after its caller gave up is still cleaned up.
+
+A recorded session that has vanished from the list is ``bg-session-lost`` (V-3, no
+``respawn``). The state table (V-4): ``done`` is finished; a live session with
+``status=idle`` is waiting; anything else is running, and a ``state`` value outside
+:data:`KNOWN_BG_STATES` is logged once per value as ``bg-unknown-state`` and still
+treated as running so the no-progress timer covers it.
 
 What the launch records (msg-6888, Bohr msg-6935): ``start_head`` and whether the work
 tree was clean at launch (the C6 input) -- the two facts the post-turn check needs. The
@@ -158,14 +169,25 @@ class SubprocessRunner:
         try:
             out, err = await asyncio.wait_for(proc.communicate(), self._timeout_s)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await _terminate(proc)
             return CommandResult(124, "", f"timed out after {self._timeout_s}s: {argv[0]}")
+        except asyncio.CancelledError:
+            # Cancelling communicate() does not end the child: kill and reap it, then let
+            # the cancellation through. A session the CLI already detached survives this;
+            # the adapter's pending launch name is what cleans that one up.
+            await _terminate(proc)
+            raise
         return CommandResult(
             proc.returncode if proc.returncode is not None else -1,
             out.decode("utf-8", "replace"),
             err.decode("utf-8", "replace"),
         )
+
+
+async def _terminate(proc: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    await proc.wait()
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +368,7 @@ class ReapReport:
 class _Session:
     ctx: SpawnContext
     launch: BgLaunchRecord | None = None
+    pending_name: str | None = None
     removed: bool = False
     halted: bool = False
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -426,6 +449,7 @@ class ClaudeBgAdapter:
         sess = self._session(handle)
         if sess.halted:
             raise AdapterDeliveryError(f"session {handle.session_id} is halted")
+        await self._reconcile_pending(sess)
         if sess.launch is not None and not sess.removed:
             await self._end(sess, sess.launch.id)
         sess.launch, sess.removed = None, False
@@ -439,6 +463,7 @@ class ClaudeBgAdapter:
         sess = self._sessions.get(handle)
         if sess is None or sess.halted:
             return
+        await self._reconcile_pending(sess)
         if sess.launch is not None and not sess.removed:
             await self._end(sess, sess.launch.id)
         sess.halted = True
@@ -469,6 +494,10 @@ class ClaudeBgAdapter:
     def last_launch(self, handle: SessionHandle) -> BgLaunchRecord | None:
         return self._session(handle).launch
 
+    def pending_launch(self, handle: SessionHandle) -> str | None:
+        """The name of a launch not yet adopted or confirmed gone (``None`` when settled)."""
+        return self._session(handle).pending_name
+
     async def observe(self, handle: SessionHandle) -> BgObservation:
         """Where the turn's session is now. Raises :class:`AgentListError` if the list fails."""
         sess = self._session(handle)
@@ -488,20 +517,16 @@ class ClaudeBgAdapter:
         pending. Only names this adapter mints (``T-*-r*-*``) whose ``cwd`` is ``repo_dir``
         are touched; anyone else's sessions are left alone.
         """
-        reaped: list[str] = []
-        failed: list[tuple[str, str]] = []
-        for agent in await self._list():
-            if agent.id in live_ids or not agent.name or not MANAGED_NAME.match(agent.name):
-                continue
-            if not _same_dir(agent.cwd, self._repo_dir):
-                continue
-            await self._run_claude("stop", agent.id)
-            rm = await self._run_claude("rm", agent.id)
-            if rm.returncode == 0:
-                reaped.append(agent.id)
-            else:
-                failed.append((agent.id, rm.stderr.strip()[:STDERR_HEAD_CHARS]))
-        return ReapReport(tuple(reaped), tuple(failed))
+        targets = [
+            agent.id
+            for agent in await self._list()
+            if agent.id not in live_ids
+            and agent.name
+            and MANAGED_NAME.match(agent.name)
+            and _same_dir(agent.cwd, self._repo_dir)
+        ]
+        reaped, failed = await self._remove_confirmed(None, targets)
+        return ReapReport(reaped, failed)
 
     # -- internals -------------------------------------------------------- #
 
@@ -551,6 +576,7 @@ class ClaudeBgAdapter:
     ) -> BgLaunchRecord:
         name = mint_name(thread_ref.thread_id, plan.round)
         start_ts = self._now()
+        sess.pending_name = name  # before the CLI runs: a cancelled launch may still detach
         res = await self._run_claude(
             "--bg",
             "--agent",
@@ -573,6 +599,7 @@ class ClaudeBgAdapter:
                 stderr=res.stderr,
             )
         agent = await self._resolve(sess, name)
+        sess.pending_name = None  # adopted: the launch record owns it from here
         stdout_id = _STDOUT_ID.search(res.stdout)
         if stdout_id is not None and stdout_id.group(1) != agent.id:
             await self._log(
@@ -604,12 +631,20 @@ class ClaudeBgAdapter:
                 return matches[0]
             if len(matches) > 1:
                 ids = tuple(a.id for a in matches)
-                for agent_id in ids:
-                    await self._run_claude("stop", agent_id)
-                    await self._run_claude("rm", agent_id)
+                removed, failed = await self._remove_confirmed(sess, ids)
+                if not failed:
+                    sess.pending_name = None
+                    outcome = "all were stopped and removed"
+                else:
+                    # The name stays pending so the next turn or halt() retries by name.
+                    outcome = "NOT all could be confirmed removed: " + "; ".join(
+                        f"{i} ({why})" for i, why in failed
+                    )
+                    if removed:
+                        outcome += "; removed: " + ", ".join(removed)
                 raise ClaudeBgSpawnError(
                     REASON_DOUBLE_SPAWN,
-                    f"{len(ids)} sessions are named {name}; all were stopped and removed",
+                    f"{len(ids)} sessions are named {name}; {outcome}",
                     session_ids=ids,
                 )
             if self._clock() >= deadline:
@@ -620,22 +655,59 @@ class ClaudeBgAdapter:
             await self._sleep(self._poll_interval_s)
 
     async def _end(self, sess: _Session, agent_id: str) -> None:
-        stop = await self._run_claude("stop", agent_id)
-        if stop.returncode != 0:
-            await self._log(sess, EVENT_STOP_FAILED, id=agent_id, stderr=stop.stderr[:200])
-        rm = await self._run_claude("rm", agent_id)
-        if rm.returncode != 0:
-            raise AdapterHaltError(
-                f"`claude rm {agent_id}` exited {rm.returncode}: "
-                f"{rm.stderr.strip()[:STDERR_HEAD_CHARS]}"
-            )
-        try:
-            still = any(a.id == agent_id for a in await self._list())
-        except AgentListError as exc:
-            raise AdapterHaltError(f"could not confirm {agent_id} was removed: {exc}") from exc
-        if still:
-            raise AdapterHaltError(f"{agent_id} is still listed after `claude rm`")
+        _, failed = await self._remove_confirmed(sess, [agent_id])
+        if failed:
+            raise AdapterHaltError(f"{agent_id}: {failed[0][1]}")
         sess.removed = True
+
+    async def _remove_confirmed(
+        self, sess: _Session | None, ids: Sequence[str]
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+        """``stop`` -> ``rm`` each id, then one fresh listing decides what was removed.
+
+        Returns ``(removed, failed)``. An id counts as removed only when ``rm`` exited 0
+        AND the id is absent from the listing taken afterwards; every other id is in
+        ``failed`` with its reason, so no caller can report an unconfirmed removal.
+        """
+        failed: list[tuple[str, str]] = []
+        attempted: list[str] = []
+        for agent_id in ids:
+            stop = await self._run_claude("stop", agent_id)
+            if stop.returncode != 0 and sess is not None:
+                await self._log(sess, EVENT_STOP_FAILED, id=agent_id, stderr=stop.stderr[:200])
+            rm = await self._run_claude("rm", agent_id)
+            if rm.returncode != 0:
+                head = rm.stderr.strip()[:STDERR_HEAD_CHARS]
+                failed.append((agent_id, f"`claude rm` exited {rm.returncode}: {head}"))
+            else:
+                attempted.append(agent_id)
+        if not attempted:
+            return (), tuple(failed)
+        try:
+            listed = {a.id for a in await self._list()}
+        except AgentListError as exc:
+            failed += [(i, f"could not confirm removal: {exc}") for i in attempted]
+            return (), tuple(failed)
+        removed = tuple(i for i in attempted if i not in listed)
+        failed += [(i, "still listed after `claude rm`") for i in attempted if i in listed]
+        return removed, tuple(failed)
+
+    async def _reconcile_pending(self, sess: _Session) -> None:
+        """Cleans up an unsettled launch by name; raises if that cannot be confirmed."""
+        name = sess.pending_name
+        if name is None:
+            return
+        try:
+            ids = [a.id for a in await self._list() if a.name == name]
+        except AgentListError as exc:
+            raise AdapterHaltError(f"could not reconcile pending launch {name}: {exc}") from exc
+        _, failed = await self._remove_confirmed(sess, ids)
+        if failed:
+            raise AdapterHaltError(
+                f"pending launch {name} not cleaned up: "
+                + "; ".join(f"{i} ({why})" for i, why in failed)
+            )
+        sess.pending_name = None
 
     async def _note_state(self, sess: _Session, agent: BgAgent) -> None:
         value = agent.state if agent.state is not None else "<absent>"
