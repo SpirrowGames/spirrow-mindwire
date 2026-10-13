@@ -821,7 +821,7 @@ function Invoke-BoundedUvProbe {
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
     foreach ($k in $Environment.Keys) { $psi.Environment[[string]$k] = [string]$Environment[$k] }
 
-    $sw =[System.Diagnostics.Stopwatch]::StartNew()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
