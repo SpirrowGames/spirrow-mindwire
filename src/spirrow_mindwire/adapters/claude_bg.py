@@ -97,6 +97,13 @@ ADAPTER_ID = "claude-bg"
 DEFAULT_EFFORT = "high"
 DEFAULT_RESOLVE_TIMEOUT_S = 10.0
 DEFAULT_POLL_INTERVAL_S = 0.5
+# How long an unsettled launch name is kept while it is NOT listed. One empty listing
+# cannot prove a detached launch will never appear (it may surface after the resolve
+# deadline), so the name is held, and the next turn / halt() refused, until this much
+# time has passed since the launch began. After that it is dropped with a logged
+# event; a session that surfaces later still is a managed orphan, and reap_orphans()
+# removes it.
+DEFAULT_SETTLE_S = 120.0
 
 # Reason codes. Spelled once here; stand-down posts and tests use these names.
 REASON_WORKSPACE_UNTRUSTED = "workspace-untrusted"
@@ -108,6 +115,7 @@ REASON_SESSION_LOST = "bg-session-lost"
 EVENT_ID_MISMATCH = "bg-id-mismatch"
 EVENT_UNKNOWN_STATE = "bg-unknown-state"
 EVENT_STOP_FAILED = "bg-stop-failed"
+EVENT_PENDING_EXPIRED = "bg-pending-expired"
 
 UNTRUSTED_STDERR_MARKER = "Workspace not trusted"
 # The single place the "model name refused" wording lives (Bohr msg-6937 step 2).
@@ -369,6 +377,7 @@ class _Session:
     ctx: SpawnContext
     launch: BgLaunchRecord | None = None
     pending_name: str | None = None
+    pending_since: float = 0.0  # self._clock() when pending_name was set
     removed: bool = False
     halted: bool = False
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -408,6 +417,7 @@ class ClaudeBgAdapter:
         effort: str = DEFAULT_EFFORT,
         resolve_timeout_s: float = DEFAULT_RESOLVE_TIMEOUT_S,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+        settle_s: float = DEFAULT_SETTLE_S,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -422,6 +432,7 @@ class ClaudeBgAdapter:
         self._effort = effort
         self._resolve_timeout_s = resolve_timeout_s
         self._poll_interval_s = poll_interval_s
+        self._settle_s = settle_s
         self._sleep = sleep
         self._clock = clock
         self._now = now
@@ -455,22 +466,32 @@ class ClaudeBgAdapter:
         sess.launch, sess.removed = None, False
         start_head, worktree_clean = await self._git_start_state()
         plan = await self._planner(handle, event, worktree_clean)
-        sess.launch = await self._launch(sess, handle.thread_ref, plan, start_head, worktree_clean)
+        # _launch installs sess.launch itself, before anything else is awaited.
+        await self._launch(sess, handle.thread_ref, plan, start_head, worktree_clean)
         sess.last_active_at = self._now()
 
     async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
-        """``stop`` -> ``rm`` -> confirm absent. Idempotent once halted."""
+        """``stop`` -> ``rm`` -> confirm absent.
+
+        The handle refuses further turns from the first call on. It is idempotent only
+        once nothing is left unsettled: while a launch name is still pending (not yet
+        listed, within the settle window) every call reconciles again and raises
+        :class:`AdapterHaltError`, and health() reports HALTING rather than HALTED.
+        """
         sess = self._sessions.get(handle)
-        if sess is None or sess.halted:
+        if sess is None or (sess.halted and sess.pending_name is None):
             return
+        sess.halted = True
         await self._reconcile_pending(sess)
         if sess.launch is not None and not sess.removed:
             await self._end(sess, sess.launch.id)
-        sess.halted = True
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
         sess = self._session_for_health(handle)
         if sess.halted:
+            if sess.pending_name is not None:
+                details = {"pending": sess.pending_name}
+                return HealthStatus(SessionState.HALTING, sess.last_active_at, None, details)
             return HealthStatus(SessionState.HALTED, sess.last_active_at, None, {})
         if sess.launch is None or sess.removed:
             return HealthStatus(SessionState.IDLE, sess.last_active_at, None, {})
@@ -573,10 +594,17 @@ class ClaudeBgAdapter:
         plan: BgTurnPlan,
         start_head: str | None,
         worktree_clean: bool | None,
-    ) -> BgLaunchRecord:
+    ) -> None:
+        """Launches and resolves one turn; on success ``sess.launch`` owns the session.
+
+        Ownership is handed over with no await in between: the record is installed and
+        only then is the pending name cleared, so a cancellation at any await leaves at
+        least one of the two pointing at the live session for halt() to clean up.
+        """
         name = mint_name(thread_ref.thread_id, plan.round)
         start_ts = self._now()
-        sess.pending_name = name  # before the CLI runs: a cancelled launch may still detach
+        # Before the CLI runs: a cancelled launch may still detach.
+        sess.pending_name, sess.pending_since = name, self._clock()
         res = await self._run_claude(
             "--bg",
             "--agent",
@@ -599,13 +627,7 @@ class ClaudeBgAdapter:
                 stderr=res.stderr,
             )
         agent = await self._resolve(sess, name)
-        sess.pending_name = None  # adopted: the launch record owns it from here
-        stdout_id = _STDOUT_ID.search(res.stdout)
-        if stdout_id is not None and stdout_id.group(1) != agent.id:
-            await self._log(
-                sess, EVENT_ID_MISMATCH, name=name, stdout_id=stdout_id.group(1), id=agent.id
-            )
-        return BgLaunchRecord(
+        sess.launch = BgLaunchRecord(
             thread_id=thread_ref.thread_id,
             round=plan.round,
             name=name,
@@ -618,6 +640,13 @@ class ClaudeBgAdapter:
             start_worktree_clean=worktree_clean,
             start_ts=start_ts,
         )
+        sess.removed = False
+        sess.pending_name = None  # adopted: the installed launch record owns it now
+        stdout_id = _STDOUT_ID.search(res.stdout)
+        if stdout_id is not None and stdout_id.group(1) != agent.id:
+            await self._log(
+                sess, EVENT_ID_MISMATCH, name=name, stdout_id=stdout_id.group(1), id=agent.id
+            )
 
     async def _resolve(self, sess: _Session, name: str) -> BgAgent:
         deadline = self._clock() + self._resolve_timeout_s
@@ -693,7 +722,13 @@ class ClaudeBgAdapter:
         return removed, tuple(failed)
 
     async def _reconcile_pending(self, sess: _Session) -> None:
-        """Cleans up an unsettled launch by name; raises if that cannot be confirmed."""
+        """Cleans up an unsettled launch by name; raises if that cannot be confirmed.
+
+        The name is cleared only on positive evidence: every listed match confirmed
+        removed, or no match for longer than the settle window. An empty listing inside
+        the window settles nothing (the launch may surface later), so the name is kept
+        and this raises, which refuses the next turn and keeps halt() retrying.
+        """
         name = sess.pending_name
         if name is None:
             return
@@ -701,6 +736,16 @@ class ClaudeBgAdapter:
             ids = [a.id for a in await self._list() if a.name == name]
         except AgentListError as exc:
             raise AdapterHaltError(f"could not reconcile pending launch {name}: {exc}") from exc
+        if not ids:
+            waited = self._clock() - sess.pending_since
+            if waited < self._settle_s:
+                raise AdapterHaltError(
+                    f"pending launch {name} is not listed yet; cannot confirm it never "
+                    f"started ({waited:g}s of a {self._settle_s:g}s settle window)"
+                )
+            sess.pending_name = None
+            await self._log(sess, EVENT_PENDING_EXPIRED, name=name, waited_s=waited)
+            return
         _, failed = await self._remove_confirmed(sess, ids)
         if failed:
             raise AdapterHaltError(

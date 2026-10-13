@@ -16,6 +16,7 @@ import pytest
 
 from spirrow_mindwire.adapters.claude_bg import (
     EVENT_ID_MISMATCH,
+    EVENT_PENDING_EXPIRED,
     EVENT_UNKNOWN_STATE,
     REASON_DOUBLE_SPAWN,
     REASON_MODEL_UNAVAILABLE,
@@ -136,11 +137,14 @@ class Clock:
 
 
 async def _setup(
-    cli: FakeCli, choice: ModelChoice = OPUS
+    cli: FakeCli,
+    choice: ModelChoice = OPUS,
+    clock: Clock | None = None,
+    on_event_hook: Callable[[Event], Any] | None = None,
 ) -> tuple[ClaudeBgAdapter, SessionHandle, list[Event], list[bool | None]]:
     events: list[Event] = []
     seen_clean: list[bool | None] = []
-    clock = Clock()
+    clock = clock or Clock()
 
     async def planner(h: SessionHandle, e: ChatroomEvent, clean: bool | None) -> BgTurnPlan:
         seen_clean.append(clean)
@@ -151,6 +155,8 @@ async def _setup(
 
     async def on_event(e: Event) -> None:
         events.append(e)
+        if on_event_hook is not None:
+            await on_event_hook(e)
 
     adapter = ClaudeBgAdapter(
         repo_dir=REPO, planner=planner, runner=cli, sleep=clock.sleep, clock=clock
@@ -643,3 +649,98 @@ async def test_unreconcilable_pending_launch_blocks_the_next_turn() -> None:
     with pytest.raises(AdapterHaltError, match="could not reconcile pending launch"):
         await adapter.deliver_event(handle, _event())
     assert cli.count("--bg") == bg_before
+
+
+# --------------------------------------------------------------------------- #
+# Launch ownership and settlement (PR-gate on #481 @ aab123b)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_cancel_inside_mismatch_logging_still_lets_halt_remove_the_session() -> None:
+    import asyncio
+
+    async def hang_on_mismatch(e: Event) -> None:
+        if e.kind == EVENT_ID_MISMATCH:
+            await asyncio.Event().wait()
+
+    stdout = "backgrounded · e8284921" + chr(10)
+    cli = FakeCli(bg_result=CommandResult(0, stdout, ""))
+    adapter, handle, events, _ = await _setup(cli, on_event_hook=hang_on_mismatch)
+    task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    while not any(e.kind == EVENT_ID_MISMATCH for e in events):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    rec = adapter.last_launch(handle)
+    assert rec is not None and rec.id == "d6390382"  # owned before the log was awaited
+    assert [a["id"] for a in cli.agents] == ["d6390382"]
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_unlisted_pending_launch_survives_halt_until_it_appears() -> None:
+    cli = FakeCli(on_bg=lambda name: [])
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError) as info:
+        await adapter.deliver_event(handle, _event())
+    assert info.value.reason == REASON_NOT_LISTED
+    late = adapter.pending_launch(handle)
+    assert late is not None
+    # First reconciliation sees nothing: the name is NOT forgotten and halt is not HALTED.
+    with pytest.raises(AdapterHaltError, match="not listed yet"):
+        await adapter.halt(handle)
+    assert adapter.pending_launch(handle) == late
+    health = await adapter.health(handle)
+    assert health.state is SessionState.HALTING and health.details == {"pending": late}
+    with pytest.raises(AdapterDeliveryError, match="halted"):
+        await adapter.deliver_event(handle, _event())
+    # The detached session surfaces afterwards; the next halt() reconciles it.
+    cli.agents.append(_agent("abababab", late))
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert adapter.pending_launch(handle) is None
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+    await adapter.halt(handle)  # idempotent once settled
+    assert cli.count("rm") == 1
+
+
+@pytest.mark.anyio
+async def test_unlisted_pending_launch_refuses_the_next_turn_until_it_appears() -> None:
+    cli = FakeCli(on_bg=lambda name: [])
+    adapter, handle, _, _ = await _setup(cli)
+    with pytest.raises(ClaudeBgSpawnError):
+        await adapter.deliver_event(handle, _event())
+    late = adapter.pending_launch(handle)
+    assert late is not None
+    cli.on_bg = None
+    bg_before = cli.count("--bg")
+    with pytest.raises(AdapterHaltError, match="not listed yet"):
+        await adapter.deliver_event(handle, _event())
+    assert cli.count("--bg") == bg_before  # no second session beside the unsettled one
+    assert adapter.pending_launch(handle) == late
+    cli.agents.append(_agent("abababab", late))
+    await adapter.deliver_event(handle, _event())
+    rec = adapter.last_launch(handle)
+    assert rec is not None and rec.name != late
+    assert [a["id"] for a in cli.agents] == [rec.id]
+
+
+@pytest.mark.anyio
+async def test_pending_launch_never_listed_expires_after_the_settle_window() -> None:
+    clock = Clock()
+    cli = FakeCli(on_bg=lambda name: [])
+    adapter, handle, events, _ = await _setup(cli, clock=clock)
+    with pytest.raises(ClaudeBgSpawnError):
+        await adapter.deliver_event(handle, _event())
+    late = adapter.pending_launch(handle)
+    clock.t += 120.0
+    cli.on_bg = None
+    await adapter.deliver_event(handle, _event())
+    expired = [e for e in events if e.kind == EVENT_PENDING_EXPIRED]
+    assert len(expired) == 1 and expired[0].fields["name"] == late
+    rec = adapter.last_launch(handle)
+    assert rec is not None and adapter.pending_launch(handle) is None
