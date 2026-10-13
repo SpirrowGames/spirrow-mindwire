@@ -102,6 +102,50 @@ BODY_HEAD_M = 500
 
 ACTING_TIERC_MODES: frozenset[str] = frozenset({"annotate", "bounce"})
 
+HEAD_WINDOW = "tail-v1"
+"""Which part of the head message ``head_summary`` carries (T-jev-tierc-audit-2026-10-12 F2, Bohr
+msg-6860). Written as ``head_window`` on every ``decider_decision`` / ``decider_proceed_clearance``
+row so rows from before the change (no column: the first ``BODY_HEAD_M`` chars) and after it are
+told apart."""
+
+_TRAILER_LINE_RE = re.compile(
+    r"^\s*(?:(?:NEXT|STOP|OPERATOR-TASK|TIER-C-CHECK):.*|<!--\s*(?:source|attest):.*-->\s*)?$"
+)
+"""A line of the message's closing block: a handoff line (``NEXT:`` / ``STOP:`` /
+``OPERATOR-TASK:`` / ``TIER-C-CHECK:``), a source / attestation marker the runner appends after the
+handoff (``source_marker``), or a blank line. ``TIER-C:`` is **not** one — it is part of the ask."""
+
+_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n\s*")
+
+
+def head_window(content: str, m: int = BODY_HEAD_M) -> str:
+    """The part of the head message Jev reads as ``head_summary`` (F2, ``tail-v1``).
+
+    Roles write "endorsement → the ask → ``TIER-C:`` → ``NEXT:``", so the first ``m`` chars often
+    end before the ask (msg-6804 F2: msg-6286 reached Jev as its endorsement only). ``m`` is not
+    widened (cost-neutral); the range moves to the end:
+
+    1. a body of at most ``m`` chars is passed whole, as before;
+    2. otherwise the closing block (:data:`_TRAILER_LINE_RE` lines at the end) is dropped; if
+       what is left fits in ``m``, it is passed whole;
+    3. otherwise the longest run of whole trailing paragraphs that fits in ``m`` is passed; if the
+       last paragraph alone is longer than ``m``, its last ``m`` chars are.
+    """
+    if len(content) <= m:
+        return content
+    lines = content.split("\n")
+    while lines and _TRAILER_LINE_RE.match(lines[-1]):
+        lines.pop()
+    body = "\n".join(lines).rstrip()
+    if not body:
+        return content[-m:]
+    if len(body) <= m:
+        return body
+    for brk in _PARAGRAPH_BREAK_RE.finditer(body):
+        if len(body) - brk.end() <= m:
+            return body[brk.end() :]
+    return body[-m:]
+
 
 class Decider(Protocol):
     """What the Conductor needs from a Decider (satisfied by ``DeciderLexoraAdapter``)."""
@@ -139,8 +183,10 @@ def turn_from_messages(
 ) -> SimpleTurn:
     """Thread (oldest → newest) → ``SimpleTurn`` for ``state_builder``.
 
-    ``recent_events`` newest → oldest, capped at N; bodies capped at M; ``head_summary`` is the
-    latest body head; ``prev_next`` is the handoff of the message before the latest;
+    ``recent_events`` newest → oldest, capped at N; bodies capped at M (their **first** M chars —
+    context only, unchanged by F2); ``head_summary`` is the latest body's ask window
+    (:func:`head_window`, :data:`HEAD_WINDOW` = ``tail-v1``); ``prev_next`` is the handoff of
+    the message before the latest;
     ``diff_stat`` is ``None`` (Tier-C does not use it). ``parsed_next`` is lower-cased so the
     reserved ``human`` token compares exactly.
     """
@@ -160,7 +206,7 @@ def turn_from_messages(
         thread_id=thread_id,
         round_index=round_index,
         roster=dict(roster),
-        head_summary=latest.content[:BODY_HEAD_M] if latest is not None else "",
+        head_summary=head_window(latest.content) if latest is not None else "",
         recent_events=recent,
         parsed_next=parsed_next.lower() if parsed_next is not None else None,
         prev_next=prev.parsed_next if prev is not None else None,
@@ -175,14 +221,29 @@ _VERDICT_APPROVE_RE = re.compile(r"^[\s>*_`]*VERDICT:\s*APPROVE\b", re.MULTILINE
 
 
 def count_dispute_rounds(roster: Mapping[str, Role], messages: Sequence[ThreadMessage]) -> int:
-    """The rule_5 feature ``dispute_rounds`` (msg-4380 Δ5): proposer↔naysayer rounds since the
-    last naysayer ``VERDICT: APPROVE``, over the **whole** thread (not the N=5 ``recent_events``).
+    """The rule_5 feature ``dispute_rounds`` (msg-4380 Δ5; recounted by T-jev-tierc-audit-2026-10-12
+    F1, Bohr msg-6866 / msg-6868, endorsed by Einstein): proposer↔naysayer rounds since the design
+    was last let through, over the **whole** thread (not the N=5 ``recent_events``).
 
     Walking oldest → newest, only messages whose author's roster role is ``proposer`` or
-    ``naysayer`` count. A round is a naysayer message without ``VERDICT: APPROVE`` whose
-    preceding counted message is the proposer's — i.e. the naysayer pushed back on a proposer
-    submission. A naysayer ``VERDICT: APPROVE`` resets the count to 0. Other authors
-    (implementer, the human, off-roster relays) neither count nor reset.
+    ``naysayer`` are looked at. The naysayer's **handoff target** decides — the body is never
+    parsed for prose such as "blocking" (msg-6866: three rounds of regex exceptions did not close):
+
+    * **+1** — a naysayer message whose ``parsed_next`` resolves to the ``proposer`` role and whose
+      preceding proposer/naysayer message is the proposer's. Only the naysayer can let a design
+      through, and it does so by handing to the implementer, so handing back to the proposer means
+      the design was not let through on that round.
+    * **reset to 0** — a naysayer ``VERDICT: APPROVE`` line, or a naysayer proceed handoff
+      (``parsed_next`` resolves to the ``implementer`` role). The proceed includes the
+      ``Unresolved objection:`` escape hatch: that dispute is settled by procedure, not by the
+      human, so it is not a rule_5 case and must not carry into later, unrelated escalations
+      (msg-6868 — the msg-6169 failure, where design-time rounds reached a merge request).
+    * **neither** — any other naysayer handoff (``human`` / ``none`` / an off-roster name): the
+      count is kept as is, so a dispute the naysayer itself sends to the human reaches the Decider.
+
+    Other authors (implementer, the human, off-roster relays) neither count nor reset. Before F1
+    the count reset only on ``VERDICT: APPROVE``, which design threads never write, so it grew for
+    the thread's lifetime (msg-6804 F1: 18-37 observed).
 
     A feature only: nothing escalates on it (automatic escalation after N rounds would change
     the routing — D20 — and is out of scope, msg-4380 Δ5). The rule_5 note in the rules file
@@ -193,9 +254,10 @@ def count_dispute_rounds(roster: Mapping[str, Role], messages: Sequence[ThreadMe
     for m in messages:
         role = _roster_role(roster, m.author)
         if role is Role.NAYSAYER:
-            if _VERDICT_APPROVE_RE.search(m.content):
+            target = _roster_role(roster, m.parsed_next) if m.parsed_next else None
+            if _VERDICT_APPROVE_RE.search(m.content) or target is Role.IMPLEMENTER:
                 rounds = 0
-            elif last is Role.PROPOSER:
+            elif target is Role.PROPOSER and last is Role.PROPOSER:
                 rounds += 1
             last = role
         elif role is Role.PROPOSER:
@@ -235,6 +297,10 @@ def log_decision(
     (D20). ``export_shadow_eval_set.py`` reads them instead of rebuilding the state, and a row
     without them is outside the pre-registered evaluation (2d-3).
 
+    ``head_window`` (T-jev-tierc-audit-2026-10-12 F2) names the range of the head message that
+    ``head_summary`` carries (:data:`HEAD_WINDOW`); a row without it carries the first
+    ``BODY_HEAD_M`` chars.
+
     ``logged_at`` (msg-4643 DECIDED 2d-8) is the time of the decision, timezone-aware ISO 8601.
     The exporter drops every row with ``logged_at > --as-of`` before anything else; the conductor
     log itself carries no timestamp (``basicConfig`` default format), so the row has to.
@@ -256,6 +322,7 @@ def log_decision(
         "logged_at": logged_at.isoformat(),
         "roster": {identity: role.value for identity, role in roster.items()},
         "state_wire": state_wire,
+        "head_window": HEAD_WINDOW,
         **decision_result_to_dict(dr),
     }
     logger.info("decider_decision %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
@@ -642,6 +709,7 @@ async def run_proceed_veto(
             "head_msg_id": messages[-1].msg_id,
             "vetoed": vetoed,
             "ask_score": ask_score,
+            "head_window": HEAD_WINDOW,
             **decision_result_to_dict(dr),
         }
         logger.info(
@@ -652,6 +720,7 @@ async def run_proceed_veto(
 
 __all__ = [
     "BODY_HEAD_M",
+    "HEAD_WINDOW",
     "RECENT_EVENTS_N",
     "ROUTED_FORCED_NAYSAYER",
     "ROUTED_SPAWN_BLOCKED",
@@ -663,6 +732,7 @@ __all__ = [
     "compute_gate_result",
     "count_dispute_rounds",
     "gate_result_from_decision",
+    "head_window",
     "is_tierc_entry",
     "log_decision",
     "never_retry",

@@ -417,17 +417,18 @@ def test_v1_row_under_v3_manifest_is_refused_naming_it(
     assert "changed after" not in err
 
 
-def test_mixed_v2_and_v3_rows_under_v3_manifest_render(tmp_path: Path) -> None:
-    """2d-16 (iii-b): set membership, not equality — ``tierc-v2`` rows under a ``tierc-v3``
-    manifest render (2d-15 item 3). Mutation: ``row_version == manifest_version`` — this test
+def test_mixed_v2_and_v4_rows_under_v4_manifest_render(tmp_path: Path) -> None:
+    """2d-16 (iii-b): set membership, not equality — ``tierc-v2`` rows under a ``tierc-v4``
+    manifest render (2d-15 item 3; the registered version is ``tierc-v4`` since
+    T-jev-tierc-audit-2026-10-12). Mutation: ``row_version == manifest_version`` — this test
     fails."""
-    recs = [_with_version(_rec(("G", 1), 0.9), "tierc-v3"), _rec(("S", 1), 0.1)]
+    recs = [_with_version(_rec(("G", 1), 0.9), "tierc-v4"), _rec(("S", 1), 0.1)]
     _, replay, fixture, manifest, labels = _v2_export(tmp_path, recs=recs)
-    assert json.loads(manifest.read_text(encoding="utf-8"))["questions_version"] == "tierc-v3"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["questions_version"] == "tierc-v4"
     out = tmp_path / "o.md"
     assert _cli(replay, fixture, labels, "--export-manifest", str(manifest), "--out", str(out)) == 0
     text = out.read_text(encoding="utf-8")
-    assert "- questions_version: {'tierc-v2': 1, 'tierc-v3': 1}" in text
+    assert "- questions_version: {'tierc-v2': 1, 'tierc-v4': 1}" in text
     assert "**valid**" in text
 
 
@@ -469,7 +470,7 @@ def test_manifest_that_is_not_a_json_object_is_not_an_export(
 def test_one_shared_v2_structure_set() -> None:
     """2d-16: the set is defined once, in the report; the exporter's registered version is in
     it."""
-    assert frozenset({"tierc-v2", "tierc-v3"}) == report.V2_STRUCTURE_VERSIONS
+    assert frozenset({"tierc-v2", "tierc-v3", "tierc-v4"}) == report.V2_STRUCTURE_VERSIONS
     assert exporter.REGISTERED_QUESTIONS_VERSION in report.V2_STRUCTURE_VERSIONS
     src = (ROOT / "scripts" / "tierc_eval_report.py").read_text(encoding="utf-8")
-    assert src.count('"tierc-v2", "tierc-v3"') == 1
+    assert src.count('"tierc-v2", "tierc-v3", "tierc-v4"') == 1

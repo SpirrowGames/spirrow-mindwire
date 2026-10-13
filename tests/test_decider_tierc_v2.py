@@ -226,7 +226,7 @@ def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
 
 def test_v2_request_body() -> None:
     body = build_decide_request(_state(), policy=POLICY_LIVE_TIERC, rules=RULES)
-    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v3"
+    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v4"
     assert body["questions"] == tierc_v2_questions(RULES)
     v1 = build_decide_request(_state(), policy=POLICY_LIVE_TIERC)
     assert v1["questions_version"] == "tierc-v1"
@@ -243,7 +243,7 @@ def test_fix_now_vs_follow_up_exclusion_is_in_the_should_ask_frame_only() -> Non
     )
     q = tierc_v2_questions(RULES)
     instructions = q[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert instructions.endswith(exclusion)
+    assert exclusion in instructions
     assert exclusion not in TEMPLATE.read_text(encoding="utf-8")
     proceed = tierc_v2_questions(RULES, proceed=True)
     assert "follow-up" not in proceed[SHOULD_ASK_HUMAN_KEY]["instructions"]
@@ -284,7 +284,7 @@ def test_evaluate_tierc_v2_boundaries(p: float, kind: TierCVerdictKind) -> None:
     v = evaluate_tierc_v2(p)
     assert v.kind is kind and v.ask_score == p
     assert v.scope is TierCScope.IN_GATE and v.fired_reason is None
-    assert v.questions_version == "tierc-v3"
+    assert v.questions_version == "tierc-v4"
 
 
 def test_v2_threshold_defaults_are_the_preregistered_values() -> None:
@@ -330,7 +330,7 @@ async def test_v2_every_gate_result_is_sent_and_in_gate(gate: AdmissionGateResul
     assert dr.matched_rule_source == MATCHED_RULE_SOURCE_CHOICE == "choice"
     assert dr.matched_rule_error is None
     assert dr.rules_sha256 == RULES.sha256
-    assert dr.questions_version == "tierc-v3"
+    assert dr.questions_version == "tierc-v4"
 
 
 @pytest.mark.anyio
@@ -347,7 +347,7 @@ async def test_v2_bad_should_ask_human_is_malformed(payload: dict[str, Any]) -> 
     dr = await decide_once(_state(), client=FakeClient(payload), policy="p", rules=RULES)
     assert dr.outcome is DecisionOutcome.NO_VERDICT_MALFORMED
     assert dr.verdict is None and dr.error is not None
-    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v3"
+    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v4"
 
 
 @pytest.mark.anyio
@@ -390,7 +390,7 @@ async def test_v2_null_provider_and_transport_error_keep_version_fields() -> Non
         _state(), client=FakeClient(exc=LexoraTimeoutError("t")), policy="p", rules=RULES
     )
     assert te.outcome is DecisionOutcome.TRANSPORT_ERROR
-    assert te.questions_version == "tierc-v3" and te.rules_sha256 == RULES.sha256
+    assert te.questions_version == "tierc-v4" and te.rules_sha256 == RULES.sha256
     assert te.matched_rule is None and te.matched_rule_source is None
 
 
@@ -515,51 +515,139 @@ def test_entry_roles_are_exactly_the_three_roles() -> None:
     assert TIERC_ENTRY_ROLES == {Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER} == set(Role)
 
 
-def _m(i: int, author: str, body: str) -> ThreadMessage:
-    return ThreadMessage(f"m{i}", author, body, None)
+def _m(i: int, author: str, body: str, nxt: str | None = None) -> ThreadMessage:
+    return ThreadMessage(f"m{i}", author, body, nxt)
+
+
+_REJECT = "Class `correctness`, blocking: the design is wrong."
+_ENDORSE = "I explicitly endorse the design."
 
 
 @pytest.mark.parametrize(
     ("seq", "expected"),
     [
         ([], 0),
-        ([("Bohr", "design")], 0),
-        ([("Bohr", "d"), ("Einstein", "Objection 1")], 1),
-        ([("Bohr", "d"), ("Einstein", "o"), ("Bohr", "r"), ("Einstein", "o")], 2),
+        ([("Bohr", "design", "Einstein")], 0),
+        # T-jev-tierc-audit-2026-10-12 F1 (Bohr msg-6866): the naysayer's handoff target decides,
+        # never the body. Handing back to the proposer is +1, whatever the body says.
+        ([("Bohr", "d", "Einstein"), ("Einstein", _REJECT, "Bohr")], 1),
+        ([("Bohr", "d", "Einstein"), ("Einstein", _ENDORSE, "Bohr")], 1),
+        ([("Bohr", "d", "Einstein"), ("Einstein", "no blocking objections", "Bohr")], 1),
+        ([("Bohr", "d", "Einstein"), ("Einstein", "Objection 1", "bohr")], 1),  # case-folded
         (
             [
-                ("Bohr", "d"),
-                ("Einstein", "o"),
-                ("Bohr", "r"),
-                ("Einstein", "o"),
-                ("Bohr", "r"),
-                ("Einstein", "o"),
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
             ],
             3,
         ),
-        # an APPROVE resets; later rounds count from 0
+        # the body alone never counts: a "blocking" message without a handoff to the proposer
+        ([("Bohr", "d", "Einstein"), ("Einstein", _REJECT, None)], 0),
+        # a proceed handoff to the implementer resets
         (
             [
-                ("Bohr", "d"),
-                ("Einstein", "o"),
-                ("Bohr", "r"),
-                ("Einstein", "VERDICT: APPROVE"),
-                ("Bohr", "d2"),
-                ("Einstein", "o"),
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _ENDORSE, "Heisenberg"),
+            ],
+            0,
+        ),
+        # ... even with a blocking class line in it
+        ([("Bohr", "d", "Einstein"), ("Einstein", _REJECT, "Heisenberg")], 0),
+        # ... and the "Unresolved objection:" escape hatch resets too (msg-6868: settled by
+        # procedure, so not a rule_5 case)
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _REJECT, "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "Unresolved objection: class `correctness`, blocking.", "Heisenberg"),
+            ],
+            0,
+        ),
+        # a VERDICT: APPROVE line resets; later rounds count from 0
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "VERDICT: APPROVE", "Bohr"),
+                ("Bohr", "d2", "Einstein"),
+                ("Einstein", "o", "Bohr"),
             ],
             1,
         ),
         (
-            [("Bohr", "d"), ("Einstein", "o"), ("Bohr", "r"), ("Einstein", "**VERDICT: APPROVE**")],
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "**VERDICT: APPROVE**", None),
+            ],
             0,
         ),
-        # two naysayer messages in a row are one push-back; other authors are ignored
-        ([("Bohr", "d"), ("Einstein", "o"), ("Einstein", "o2")], 1),
-        ([("Bohr", "d"), ("Heisenberg", "impl"), ("Fermi", "x"), ("Einstein", "o")], 1),
+        # NEXT: human / none neither count nor reset — the count reaches the Decider
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "o", "human"),
+            ],
+            1,
+        ),
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "o", "none"),
+            ],
+            1,
+        ),
+        # two naysayer messages in a row are one push-back ((a) not met by the second)
+        ([("Bohr", "d", "Einstein"), ("Einstein", "o", "Bohr"), ("Einstein", "o2", "Bohr")], 1),
+        # implementer / human / off-roster posts neither count nor reset
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Heisenberg", "impl", "Bohr"),
+                ("Fermi", "x", "Bohr"),
+                ("Takahito", "B", "Bohr"),
+            ],
+            1,
+        ),
+        ([("Bohr", "d", "Einstein"), ("Heisenberg", "i", None), ("Einstein", "o", "Bohr")], 1),
+        # msg-6169 shape: design-time rounds, a proceed, then an unrelated merge request
+        (
+            [
+                ("Bohr", "d", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", "o", "Bohr"),
+                ("Bohr", "r", "Einstein"),
+                ("Einstein", _ENDORSE, "Heisenberg"),
+                ("Heisenberg", "PR opened", "Bohr"),
+                ("Bohr", "merge please", "human"),
+            ],
+            0,
+        ),
     ],
 )
-def test_count_dispute_rounds(seq: list[tuple[str, str]], expected: int) -> None:
-    msgs = [_m(i, a, b) for i, (a, b) in enumerate(seq)]
+def test_count_dispute_rounds(seq: list[tuple[str, str, str | None]], expected: int) -> None:
+    msgs = [_m(i, a, b, n) for i, (a, b, n) in enumerate(seq)]
     assert count_dispute_rounds(ROSTER, msgs) == expected
 
 
@@ -580,7 +668,7 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
     adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c, rules=RULES)
     msgs = [
         _m(1, "Bohr", "design\n\nNEXT: Einstein"),
-        _m(2, "Einstein", "Objection 1\n\nNEXT: Bohr"),
+        _m(2, "Einstein", "Objection 1\n\nNEXT: Bohr", "Bohr"),
         ThreadMessage("m3", author, "x\nTIER-C: goal\nNEXT: human", "human"),
     ]
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
@@ -601,7 +689,8 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
     (line,) = _decider_lines(caplog)
     assert line["matched_rule"] == "rule_2" and line["matched_rule_source"] == "choice"
     assert line["rules_sha256"] == RULES.sha256
-    assert line["questions_version"] == "tierc-v3"
+    assert line["questions_version"] == "tierc-v4"
+    assert line["head_window"] == "tail-v1"  # T-jev-tierc-audit-2026-10-12 F2
     assert line["verdict"]["scope"] == "in_gate"
     assert line["gate_kind"] is None and line["gate_is_grey_zone"] is False  # labelled ADMIT
     sent_state = json.loads(c.bodies[0]["state"])
@@ -719,7 +808,7 @@ def test_replay_v2_dry_run_keeps_gateless_rows_in_gate(tmp_path: Path) -> None:
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(recs) == 2  # the gate_result-less row is not skipped under v2
     assert {r["scope"] for r in recs} == {"in_gate"}
-    assert {r["questions_version"] for r in recs} == {"tierc-v3"}
+    assert {r["questions_version"] for r in recs} == {"tierc-v4"}
     assert {r["rules_sha256"] for r in recs} == {RULES.sha256}
     assert recs[0]["state"]["dispute_rounds"] == 2
     assert "dispute_rounds" not in recs[1]["state"]
@@ -765,7 +854,7 @@ def test_replay_v2_endpoint_snapshots_rules_and_records_sha(
         ]
     )  # fmt: skip
     assert rc == 0
-    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v3"}
+    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v4"}
     assert (snap / f"{RULES.sha256}.toml").read_bytes() == TEMPLATE.read_bytes()
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     for r in recs:

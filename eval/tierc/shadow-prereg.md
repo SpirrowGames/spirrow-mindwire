@@ -1,4 +1,4 @@
-# Tier-C production shadow — pre-registration (tierc-v3)
+# Tier-C production shadow — pre-registration (tierc-v4)
 
 Thread: `T-decider-conductor-hook`, step 2d. Decisions: Bohr msg-4634 (2d-1 / 2d-2), msg-4636 (2d-3), msg-4639 (2d-4 / 2d-5 / 2d-6), msg-4641 (2d-7), msg-4643 (2d-8), msg-4646 (2d-9 / 2d-10), msg-4648 + msg-4650 (2d-11), msg-4652, msg-4654 (2d-12), msg-4656 (2d-13), msg-5578 + msg-5580 + msg-5582 (2d-14), msg-5753 (2d-15); each approved by Einstein.
 
@@ -11,7 +11,7 @@ A `decider_decision` row from the conductor log is **counted** when all of the f
 0. **Time cut:** after the `--as-of` cut (§5), the row's `logged_at <= as_of` (2d-8).
 1. **Point-in-time columns:** the row carries `state_wire`, `latest_msg_id` and `logged_at` (2d-3, 2d-8).
 2. **Routing:** `routed == "stop"` (2d-1). `forced_naysayer` and `spawn_blocked` rows are only counted by number, in a table of their own.
-3. **Questions version:** `questions_version == "tierc-v3"` (2d-4, 2d-15). Rows of any other version are counted under `questions_version_not_registered`.
+3. **Questions version:** `questions_version == "tierc-v4"` (2d-4, 2d-15; v4 below). Rows of any other version are counted under `questions_version_not_registered`.
 4. **Rules file:** `rules_sha256` equals the registered value (§2).
 5. **Following messages:** the thread has 3 messages after `latest_msg_id`, or fewer and one of these holds (2d-7):
    - the thread's last message is `NEXT: none`;
@@ -33,7 +33,7 @@ A row that fails any condition appears only as a count, per reason, in `export.j
 
 | Item | Value | Source |
 |---|---|---|
-| Questions version | `tierc-v3` | `decider/questions.py` `TIERC_ESCALATION_QUESTIONS_VERSION` — the version the live hook logs (2d-15). The config selector `[decider.tierc].questions = "tierc-v2"` names the question-set *kind* and is not this value. `tests/test_tierc_registered_version.py` fails the gate if the code, the exporter and this row drift apart |
+| Questions version | `tierc-v4` | `decider/questions.py` `TIERC_ESCALATION_QUESTIONS_VERSION` — the version the live hook logs (2d-15; v4 from T-jev-tierc-audit-2026-10-12). The config selector `[decider.tierc].questions = "tierc-v2"` names the question-set *kind* and is not this value. `tests/test_tierc_registered_version.py` fails the gate if the code, the exporter and this row drift apart |
 | `ask_min` | **0.60** | `verdict.py:371` `DEFAULT_V2_ASK_MIN`. Fixed before the replay; cited here, not chosen here (2d-4) |
 | `not_ask_max` | **0.40** | `verdict.py:374` `DEFAULT_V2_NOT_ASK_MAX`, same |
 | `RUBRIC-v2.md` sha256 | `c99ce23c7bad069e0d419d9bd18d2764959f037b61f3f7907ac99fba3f65376c` | `eval/tierc/RUBRIC-v2.md` at this commit (2d-10) |
@@ -41,6 +41,10 @@ A row that fails any condition appears only as a count, per reason, in `export.j
 | `rules_sha256` | `159979a7ff2193b1ce8425a1f2b7501960a8d24885547922ee017664a72ccb1b` | production: the daemon's start-up log line `decider tierc-v2 rules loaded from … (rules_sha256=…)` (`decider_lexora.py:624`), harvested by the operator (msg-5438 onward) and matching the file's sha256sum; registered in Bohr msg-5574 |
 
 **What v3 is (2d-15).** `tierc-v3` is `tierc-v2` with one sentence added to the end of the `should_ask_human` question frame (main `b224540`, T-fix-now-vs-followup-is-mechanical, Bohr msg-5234 §3): 「ただし、指摘を今の PR で直すか follow-up PR で直すかの順序・タイミングだけを問うハンドオフは、どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。」 The keys (`should_ask_human`, `matched_rule`), the criteria, the rules file and the thresholds are unchanged. v2 and v3 rows are never pooled in the count: this registration counts v3 only. It was changed from v2 before any counted row existed.
+
+**What v4 is (T-jev-tierc-audit-2026-10-12, Bohr msg-6860 F3; endorsed by Einstein).** `tierc-v4` is `tierc-v3` with two more sentences at the end of the same `should_ask_human` question frame:「main への merge や gate の再発火を依頼するだけのハンドオフは、それだけではどの条にも当たらない(merge される中身が仕様を変える場合は、その中身で判断する)。」「role の権限や道具が足りないこと(指名できない、コマンドが無い、guard に止められた等)を理由に人を呼ぶハンドオフは、どの条にも当たらない。」 The keys, the criteria, the rules file and the thresholds are unchanged. The same PR changes the input Jev reads, which the version does not name but the row does: `head_summary` is the tail of the head message (`head_window = "tail-v1"` on the row, F2), and `dispute_rounds` counts by handoff target (F1). This is a **new registration**, appended to v3, not a rewrite of it:
+- v3 rows are read as v3. They are never pooled with v4 rows and are counted under `questions_version_not_registered` by this registration. The 27 v3 rows of 2026-10-03..07 were used to design v4, so they can never evaluate it.
+- Every other rule in this file (§1, §3, §4, §5, §6) applies to v4 unchanged. §7's "2 weeks after this registration reaches `main`" runs from the commit that registers v4.
 
 The report recomputes every verdict from `raw_answers["should_ask_human"]` using the registered thresholds. A different `[decider].tierc_v2_*` value in the production config therefore does not change what is measured.
 
@@ -50,7 +54,7 @@ The report recomputes every verdict from `raw_answers["should_ask_human"]` using
 
 ## 3. Primary hypothesis (one)
 
-Under tierc-v3 with `ask_min = 0.60` and `not_ask_max = 0.40`, Jev's verdict:
+Under tierc-v4 with `ask_min = 0.60` and `not_ask_max = 0.40`, Jev's verdict:
 - `p >= 0.60` → CONFIRMED
 - `p < 0.40` → LIKELY_NOT
 - otherwise UNSURE
