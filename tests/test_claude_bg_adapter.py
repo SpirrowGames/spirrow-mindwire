@@ -24,6 +24,7 @@ from spirrow_mindwire.adapters.claude_bg import (
     REASON_SESSION_LOST,
     REASON_SPAWN_FAILED,
     REASON_WORKSPACE_UNTRUSTED,
+    BgObservationSupersededError,
     BgPhase,
     BgTurnPlan,
     ClaudeBgAdapter,
@@ -897,3 +898,132 @@ async def test_sweep_still_reaps_a_managed_session_nobody_owns() -> None:
     report = await adapter.reap_orphans(frozenset())
     assert report.reaped == ("cdcdcdcd",)
     assert [a["id"] for a in cli.agents] == [rec.id]
+
+
+# --------------------------------------------------------------------------- #
+# Interrupted confirmation and observation races (PR-gate on #481 @ 254e674)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_halt_retry_settles_when_rm_took_effect_but_confirmation_was_cancelled() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    await adapter.deliver_event(handle, _event())
+    original = cli.run
+    entered = asyncio.Event()
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        if list(argv[1:2]) == ["rm"] and argv[2] not in {a["id"] for a in cli.agents}:
+            cli.calls.append(list(argv))
+            return CommandResult(1, "", f"no session {argv[2]}")  # retry: "not found"
+        if list(argv[1:2]) == ["agents"] and not cli.agents and not entered.is_set():
+            entered.set()  # the confirmation listing after a successful rm
+            await asyncio.Event().wait()
+        return await original(argv, cwd=cwd)
+
+    cli.run = run  # type: ignore[method-assign]
+    task = asyncio.create_task(adapter.halt(handle))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cli.agents == []  # rm took effect
+    assert (await adapter.health(handle)).state is SessionState.HALTING
+    await adapter.halt(handle)  # the retry's rm says "not found"; absence settles it
+    assert cli.count("rm") == 2
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+    await adapter.halt(handle)
+    assert cli.count("rm") == 2
+
+
+@pytest.mark.anyio
+async def test_rm_error_on_an_id_still_listed_is_still_a_failure() -> None:
+    cli = FakeCli(rm_fails=True)
+    adapter, handle, _, _ = await _setup(cli)
+    await adapter.deliver_event(handle, _event())
+    with pytest.raises(AdapterHaltError, match="rm refused"):
+        await adapter.halt(handle)
+    assert (await adapter.health(handle)).state is SessionState.HALTING
+
+
+async def _setup_with_listing_gate(
+    cli: FakeCli,
+) -> tuple[ClaudeBgAdapter, SessionHandle, Any, Any]:
+    """Pauses the first `agents` listing issued by health()/observe() on demand."""
+    import asyncio
+
+    adapter, handle, _, _ = await _setup(cli)
+    await adapter.deliver_event(handle, _event())
+    original = cli.run
+    paused, release = asyncio.Event(), asyncio.Event()
+    armed = {"on": True}
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        res = await original(argv, cwd=cwd)
+        if list(argv[1:2]) == ["agents"] and armed["on"]:
+            armed["on"] = False
+            paused.set()
+            await release.wait()
+        return res
+
+    cli.run = run  # type: ignore[method-assign]
+    return adapter, handle, paused, release
+
+
+@pytest.mark.anyio
+async def test_health_during_the_gap_between_ending_and_replacing_a_launch() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, paused, release = await _setup_with_listing_gate(cli)
+    health = asyncio.create_task(adapter.health(handle))
+    await paused.wait()
+    # A delivery ends the observed launch and clears sess.launch, then waits in the planner.
+    sess = adapter._sessions[handle]
+    await adapter._end(sess, sess.launch.id)  # type: ignore[union-attr]
+    sess.launch, sess.removed = None, False
+    release.set()
+    status = await health
+    assert status.state is SessionState.IDLE and status.error is None
+
+
+@pytest.mark.anyio
+async def test_health_after_replacement_reports_the_new_launch_not_lost() -> None:
+    import asyncio
+
+    cli = FakeCli(
+        on_bg=lambda name: [_agent("d6390382" if cli.count("--bg") <= 1 else "e8284921", name)]
+    )
+    adapter, handle, paused, release = await _setup_with_listing_gate(cli)
+    health = asyncio.create_task(adapter.health(handle))
+    await paused.wait()  # its listing still shows d6390382
+    delivery = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    await delivery
+    assert adapter.last_launch(handle).id == "e8284921"  # type: ignore[union-attr]
+    release.set()
+    status = await health
+    assert status.state is SessionState.PROCESSING
+    assert status.details["bg_id"] == "e8284921"
+
+
+@pytest.mark.anyio
+async def test_observe_superseded_mid_listing_raises_instead_of_lost() -> None:
+    import asyncio
+
+    cli = FakeCli(
+        on_bg=lambda name: [_agent("d6390382" if cli.count("--bg") <= 1 else "e8284921", name)]
+    )
+    adapter, handle, paused, release = await _setup_with_listing_gate(cli)
+    observing = asyncio.create_task(adapter.observe(handle))
+    await paused.wait()
+    await adapter.deliver_event(handle, _event())
+    release.set()
+    with pytest.raises(BgObservationSupersededError):
+        await observing
+    obs = await adapter.observe(handle)
+    assert obs.bg_id == "e8284921" and obs.phase is BgPhase.RUNNING

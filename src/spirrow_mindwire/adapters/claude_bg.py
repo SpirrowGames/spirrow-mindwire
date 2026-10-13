@@ -128,6 +128,9 @@ MODEL_UNAVAILABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 STDERR_HEAD_CHARS = 500
+# health() recomputes against the current launch when an observation is superseded
+# mid-await; this bounds the retries so a hot delivery loop cannot spin it.
+_HEALTH_ATTEMPTS = 3
 
 # `state` values whose meaning is measured (V-4). Others are logged once and run on.
 KNOWN_BG_STATES: frozenset[str] = frozenset({"done"})
@@ -328,6 +331,15 @@ class BgObservation:
     phase: BgPhase
     agent: BgAgent | None
     reason: str | None  # REASON_SESSION_LOST when phase is LOST
+    bg_id: str | None = None  # the launch this observation is about
+
+
+class BgObservationSupersededError(AdapterHealthError):
+    """The observed launch was ended or replaced while its listing was awaited.
+
+    The listing describes a launch that is no longer current, so no phase (least of
+    all LOST) may be published for it; observe again against the current launch.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -505,32 +517,48 @@ class ClaudeBgAdapter:
                 await self._end(sess, sess.launch.id)
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
+        """Status of the handle, computed against ONE launch record.
+
+        health() does not take the delivery lock (it must answer while a turn is being
+        delivered), so the launch it observes can be ended or replaced during the
+        listing await. The record is captured once, every detail is taken from that
+        capture, and an observation superseded mid-await is discarded and recomputed
+        from the current state (a few times at most) rather than published.
+        """
         sess = self._session_for_health(handle)
-        if sess.halted:
-            if _unsettled(sess):
-                owed: dict[str, str] = {}
-                if sess.pending_name is not None:
-                    owed["pending"] = sess.pending_name
-                if sess.launch is not None and not sess.removed:
-                    owed["bg_id"] = sess.launch.id
-                return HealthStatus(SessionState.HALTING, sess.last_active_at, None, owed)
-            return HealthStatus(SessionState.HALTED, sess.last_active_at, None, {})
-        if sess.launch is None or sess.removed:
-            return HealthStatus(SessionState.IDLE, sess.last_active_at, None, {})
-        try:
-            obs = await self.observe(handle)
-        except AgentListError as exc:
-            raise AdapterHealthError(str(exc)) from exc
-        details = {"bg_id": sess.launch.id, "phase": obs.phase.value}
-        if obs.phase is BgPhase.LOST:
-            err = ErrorInfo(
-                code="adapter.bg_session_lost",
-                message=f"{REASON_SESSION_LOST}: {sess.launch.id} is no longer listed",
-                raised_at=self._now(),
-            )
-            return HealthStatus(SessionState.FAILED, sess.last_active_at, err, details)
-        state = SessionState.PROCESSING if obs.phase is BgPhase.RUNNING else SessionState.IDLE
-        return HealthStatus(state, sess.last_active_at, None, details)
+        for _ in range(_HEALTH_ATTEMPTS):
+            launch = sess.launch
+            if sess.halted:
+                if _unsettled(sess):
+                    owed: dict[str, str] = {}
+                    if sess.pending_name is not None:
+                        owed["pending"] = sess.pending_name
+                    if launch is not None and not sess.removed:
+                        owed["bg_id"] = launch.id
+                    return HealthStatus(SessionState.HALTING, sess.last_active_at, None, owed)
+                return HealthStatus(SessionState.HALTED, sess.last_active_at, None, {})
+            if launch is None or sess.removed:
+                return HealthStatus(SessionState.IDLE, sess.last_active_at, None, {})
+            try:
+                obs = await self._observe(sess, launch)
+            except BgObservationSupersededError:
+                continue
+            except AgentListError as exc:
+                raise AdapterHealthError(str(exc)) from exc
+            details = {"bg_id": launch.id, "phase": obs.phase.value}
+            if obs.phase is BgPhase.LOST:
+                err = ErrorInfo(
+                    code="adapter.bg_session_lost",
+                    message=f"{REASON_SESSION_LOST}: {launch.id} is no longer listed",
+                    raised_at=self._now(),
+                )
+                return HealthStatus(SessionState.FAILED, sess.last_active_at, err, details)
+            state = SessionState.PROCESSING if obs.phase is BgPhase.RUNNING else SessionState.IDLE
+            return HealthStatus(state, sess.last_active_at, None, details)
+        raise AdapterHealthError(
+            f"session {handle.session_id}: launch changed during every one of "
+            f"{_HEALTH_ATTEMPTS} observations"
+        )
 
     # -- conductor-facing (PR-C) ------------------------------------------ #
 
@@ -542,16 +570,27 @@ class ClaudeBgAdapter:
         return self._session(handle).pending_name
 
     async def observe(self, handle: SessionHandle) -> BgObservation:
-        """Where the turn's session is now. Raises :class:`AgentListError` if the list fails."""
+        """Where the turn's session is now. Raises :class:`AgentListError` if the list fails,
+        and :class:`BgObservationSupersededError` if the launch was ended or replaced meanwhile."""
         sess = self._session(handle)
-        if sess.launch is None:
+        launch = sess.launch
+        if launch is None:
             raise AdapterHealthError(f"session {handle.session_id} has no launched turn")
+        return await self._observe(sess, launch)
+
+    async def _observe(self, sess: _Session, launch: BgLaunchRecord) -> BgObservation:
+        was_removed = sess.removed
         agents = await self._list()
-        match = next((a for a in agents if a.id == sess.launch.id), None)
+        if sess.launch is not launch or sess.removed != was_removed:
+            raise BgObservationSupersededError(
+                f"launch {launch.id} was ended or replaced while it was being observed"
+            )
+        match = next((a for a in agents if a.id == launch.id), None)
         if match is not None:
             await self._note_state(sess, match)
         phase = phase_of(match)
-        return BgObservation(phase, match, REASON_SESSION_LOST if phase is BgPhase.LOST else None)
+        reason = REASON_SESSION_LOST if phase is BgPhase.LOST else None
+        return BgObservation(phase, match, reason, launch.id)
 
     async def reap_orphans(self, live_ids: frozenset[str]) -> ReapReport:
         """Stops and removes managed sessions in ``repo_dir`` that are not in ``live_ids``.
@@ -746,12 +785,15 @@ class ClaudeBgAdapter:
     ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
         """``stop`` -> ``rm`` each id, then one fresh listing decides what was removed.
 
-        Returns ``(removed, failed)``. An id counts as removed only when ``rm`` exited 0
-        AND the id is absent from the listing taken afterwards; every other id is in
-        ``failed`` with its reason, so no caller can report an unconfirmed removal.
+        Returns ``(removed, failed)``. Absence from the listing taken afterwards is the
+        only evidence of removal; ``rm``'s exit status is diagnostic, never decisive.
+        An id still listed is in ``failed`` (with ``rm``'s error when it had one), and
+        an id that is absent counts as removed even if this ``rm`` exited non-zero: an
+        earlier attempt may already have removed it (e.g. its confirmation listing was
+        cancelled), and a retry's "not found" must settle it rather than fail forever.
+        If the listing itself fails, nothing is confirmed and every id is in ``failed``.
         """
-        failed: list[tuple[str, str]] = []
-        attempted: list[str] = []
+        rm_errors: dict[str, str] = {}
         for agent_id in ids:
             stop = await self._run_claude("stop", agent_id)
             if stop.returncode != 0 and sess is not None:
@@ -759,19 +801,19 @@ class ClaudeBgAdapter:
             rm = await self._run_claude("rm", agent_id)
             if rm.returncode != 0:
                 head = rm.stderr.strip()[:STDERR_HEAD_CHARS]
-                failed.append((agent_id, f"`claude rm` exited {rm.returncode}: {head}"))
-            else:
-                attempted.append(agent_id)
-        if not attempted:
-            return (), tuple(failed)
+                rm_errors[agent_id] = f"`claude rm` exited {rm.returncode}: {head}"
+        if not ids:
+            return (), ()
         try:
             listed = {a.id for a in await self._list()}
         except AgentListError as exc:
-            failed += [(i, f"could not confirm removal: {exc}") for i in attempted]
-            return (), tuple(failed)
-        removed = tuple(i for i in attempted if i not in listed)
-        failed += [(i, "still listed after `claude rm`") for i in attempted if i in listed]
-        return removed, tuple(failed)
+            why = f"could not confirm removal: {exc}"
+            return (), tuple((i, f"{rm_errors[i]}; {why}" if i in rm_errors else why) for i in ids)
+        removed = tuple(i for i in ids if i not in listed)
+        failed = tuple(
+            (i, rm_errors.get(i, "still listed after `claude rm`")) for i in ids if i in listed
+        )
+        return removed, failed
 
     async def _reconcile_pending(self, sess: _Session) -> None:
         """Cleans up an unsettled launch by name; raises if that cannot be confirmed.
@@ -828,6 +870,7 @@ __all__ = [
     "BgAgent",
     "BgLaunchRecord",
     "BgObservation",
+    "BgObservationSupersededError",
     "BgPhase",
     "BgTurnPlan",
     "ClaudeBgAdapter",
