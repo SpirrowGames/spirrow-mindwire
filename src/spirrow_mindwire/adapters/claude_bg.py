@@ -579,15 +579,32 @@ class ClaudeBgAdapter:
         return await self._observe(sess, launch)
 
     async def _observe(self, sess: _Session, launch: BgLaunchRecord) -> BgObservation:
-        was_removed = sess.removed
+        """Observe ``launch``; raise if it stopped being current at ANY await in here.
+
+        Two awaits can suspend this: the listing and the unknown-state event log. The
+        launch can be ended, replaced or halted during either, so currency is checked
+        after each, and the result is built only after the last check with no await
+        in between. A halt that began mid-observation counts as superseding it, so
+        health() recomputes and reports HALTING/HALTED rather than a stale phase.
+        """
+        was_removed, was_halted = sess.removed, sess.halted
+
+        def ensure_current() -> None:
+            if (
+                sess.launch is not launch
+                or sess.removed != was_removed
+                or sess.halted != was_halted
+            ):
+                raise BgObservationSupersededError(
+                    f"launch {launch.id} was ended, replaced or halted while it was being observed"
+                )
+
         agents = await self._list()
-        if sess.launch is not launch or sess.removed != was_removed:
-            raise BgObservationSupersededError(
-                f"launch {launch.id} was ended or replaced while it was being observed"
-            )
+        ensure_current()
         match = next((a for a in agents if a.id == launch.id), None)
         if match is not None:
             await self._note_state(sess, match)
+            ensure_current()
         phase = phase_of(match)
         reason = REASON_SESSION_LOST if phase is BgPhase.LOST else None
         return BgObservation(phase, match, reason, launch.id)

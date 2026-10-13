@@ -1027,3 +1027,77 @@ async def test_observe_superseded_mid_listing_raises_instead_of_lost() -> None:
         await observing
     obs = await adapter.observe(handle)
     assert obs.bg_id == "e8284921" and obs.phase is BgPhase.RUNNING
+
+
+async def _setup_with_unknown_state_log_gate(
+    cli: FakeCli,
+) -> tuple[ClaudeBgAdapter, SessionHandle, Any, Any]:
+    """Pauses inside the unknown-state event-log callback, i.e. AFTER the listing returned
+    and the first currency check passed (the second suspension point in _observe)."""
+    import asyncio
+
+    paused, release = asyncio.Event(), asyncio.Event()
+
+    async def hook(e: Event) -> None:
+        if e.kind == EVENT_UNKNOWN_STATE and not paused.is_set():
+            paused.set()
+            await release.wait()
+
+    adapter, handle, _, _ = await _setup(cli, on_event_hook=hook)
+    await adapter.deliver_event(handle, _event())
+    return adapter, handle, paused, release
+
+
+@pytest.mark.anyio
+async def test_halt_during_unknown_state_logging_is_not_reported_as_processing() -> None:
+    import asyncio
+
+    cli = FakeCli(on_bg=lambda name: [_agent("d6390382", name, state="weird")])
+    adapter, handle, paused, release = await _setup_with_unknown_state_log_gate(cli)
+    health = asyncio.create_task(adapter.health(handle))
+    await paused.wait()
+    await adapter.halt(handle)  # removes d6390382 while health sits in the log callback
+    assert not cli.agents
+    release.set()
+    status = await health
+    assert status.state is SessionState.HALTED
+    assert "bg_id" not in status.details
+
+
+@pytest.mark.anyio
+async def test_observe_superseded_during_unknown_state_logging_raises() -> None:
+    import asyncio
+
+    cli = FakeCli(
+        on_bg=lambda name: [
+            _agent("d6390382" if cli.count("--bg") <= 1 else "e8284921", name, state="weird")
+        ]
+    )
+    adapter, handle, paused, release = await _setup_with_unknown_state_log_gate(cli)
+    observing = asyncio.create_task(adapter.observe(handle))
+    await paused.wait()
+    await adapter.deliver_event(handle, _event())  # replaces d6390382 with e8284921
+    release.set()
+    with pytest.raises(BgObservationSupersededError):
+        await observing
+    obs = await adapter.observe(handle)
+    assert obs.bg_id == "e8284921" and obs.phase is BgPhase.RUNNING
+
+
+@pytest.mark.anyio
+async def test_health_replaced_during_unknown_state_logging_reports_the_new_launch() -> None:
+    import asyncio
+
+    cli = FakeCli(
+        on_bg=lambda name: [
+            _agent("d6390382" if cli.count("--bg") <= 1 else "e8284921", name, state="weird")
+        ]
+    )
+    adapter, handle, paused, release = await _setup_with_unknown_state_log_gate(cli)
+    health = asyncio.create_task(adapter.health(handle))
+    await paused.wait()
+    await adapter.deliver_event(handle, _event())
+    release.set()
+    status = await health
+    assert status.state is SessionState.PROCESSING
+    assert status.details["bg_id"] == "e8284921"
