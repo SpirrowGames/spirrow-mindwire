@@ -195,6 +195,22 @@ async def test_16_working_side_removing_a_trusted_glob_still_matches() -> None:
 
 
 @pytest.mark.anyio
+async def test_16b_working_side_negation_pattern_cannot_cancel_a_trusted_match() -> None:
+    """PR-gate on #456 (security): the union is of MATCHED PATH SETS, not a pattern list.
+
+    A gitignore-style ``!pattern`` appended on the working side (design time: the
+    config file itself is not referenced, so rule 2 does not fire) must not strip a
+    trusted match. ADR-14 §7.3 pins: no exclusion syntax; ``!`` is a literal.
+    """
+    globs = await _globs(trusted=_toml("keys/*"), working=_toml("keys/*", "!keys/secret.pem"))
+    assert _route(globs, "keys/secret.pem") == _GEMINI
+    # the `!` pattern is a literal: it only ever ADDS a match, for a path spelt with `!`
+    globs = await _globs(trusted=_toml(), working=_toml("!keys/secret.pem"))
+    assert _route(globs, "keys/secret.pem") == _CODEX
+    assert _route(globs, "!keys/secret.pem") == _GEMINI
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "working",
     [
