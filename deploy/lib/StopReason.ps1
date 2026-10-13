@@ -51,6 +51,11 @@
 #               stopped before spawning the implementer (T-sweep-starves-deep-candidates PR-B,
 #               Bohr msg-6313 §1′). The post stays the head; the next tick launches it in the role
 #               lane and the gate resume picks it up. Routine hand-off, not a stop anyone waits on.
+#   'summon_yield' — the thread yielded to an active Summon (T-human-call-priority-interrupt, Bohr
+#               msg-6743 §3 / msg-6755 v1.6): a person called the loop to another thread on purpose,
+#               so each bystander's stop is not news. Where a forgotten Summon is heard is the
+#               Summon line at the top of the digest (no automatic release, msg-6742) — PR-3 of the
+#               same thread; this PR (PR-2) only makes the stop itself.
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1

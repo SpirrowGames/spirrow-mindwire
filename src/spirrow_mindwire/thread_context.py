@@ -216,6 +216,9 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     # closing, so it is never mistaken for part of the author's message. Absent → no block.
     if event.retry_notice:
         blocks.append(event.retry_notice)
+    # T-human-call-priority-interrupt (v1.4): the Summon resume notice, its own block likewise.
+    if event.resume_notice:
+        blocks.append(event.resume_notice)
     blocks.append(closing)
     return "\n\n".join(blocks)
 
