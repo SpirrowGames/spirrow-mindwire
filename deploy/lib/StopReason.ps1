@@ -153,3 +153,25 @@ function New-NotificationHeader {
     $phrase = Get-StopReasonPhrase -StopReason $StopReason
     return "MindWire: **$ThreadId** ($Project) — $phrase (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
 }
+
+function Get-SummonStopFields {
+    # The Summon fields of the conductor's LAST `conductor stopped:` line (T-human-call-priority-
+    # interrupt, Bohr msg-6749 v1.3: "停止行の解析は StopReason.ps1 に追加します"; v1.6 converts
+    # them to Update-SummonYield's -Delivered / -YieldTo, and this is the only place that reads
+    # them off the line). Returns @{ delivered = [bool]; yield_to = <thread id or $null> }.
+    #   resume_notice=delivered — the run sent the first role turn carrying (or, for an empty
+    #                             range, standing in for) the resume notice;
+    #   yield_to=<S>            — only on reason=summon_yield: the Summon the run yielded to.
+    # Both may be on one line (delivered, then yielded later in the same run — I-SY5). No stop line
+    # (the run died before printing one) reads as neither, which keeps the record (at least once).
+    param([string[]]$Output)
+
+    $fields = @{ delivered = $false; yield_to = $null }
+    $line = @($Output | Where-Object { "$_" -match 'conductor stopped:' }) | Select-Object -Last 1
+    if (-not $line) { return $fields }
+    if ("$line" -match '(^|\s)resume_notice=delivered(\s|$)') { $fields.delivered = $true }
+    if ("$line" -match 'reason=summon_yield(\s|$)' -and "$line" -match '(^|\s)yield_to=(\S+)') {
+        $fields.yield_to = $Matches[2]
+    }
+    return $fields
+}

@@ -224,6 +224,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # Launch fairness (T-sweep-starves-deep-candidates): dispatch order, launch_wait_since, gate lane,
 # and the two-clock admission rule. Pure helpers; the dispatch loop below is a skeleton around them.
 . (Join-Path $PSScriptRoot 'lib/SweepFairness.ps1')
+# Summon (T-human-call-priority-interrupt PR-2, Bohr msg-6755 v1.6): the active_summon contract, the
+# yield decision, lane 0 and the summon_yield record of evaluated.json. Pure helpers; the probe reads
+# and the git reads live in the run section below. Uses ConvertTo-EvaluatedRow from SweepFairness.ps1.
+. (Join-Path $PSScriptRoot 'lib/Summon.ps1')
 # Auto-registration of unregistered live threads into this tick's candidates (T-sweep-intake-and-
 # quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Pure helpers; the probe call and the
 # append live in the run section below.
@@ -785,7 +789,10 @@ function Invoke-BoundedUvProbe {
         [string[]]$Launcher = @('uv', 'run', 'python'),
         # uv's own options, inserted between `uv run` and `python` (see Get-BoundedProbeCommandLine).
         # Empty by default: a caller that does not pass it gets exactly the argv it got before.
-        [string[]]$UvOptions = @()
+        [string[]]$UvOptions = @(),
+        # Extra environment variables for the child (name -> value). Empty by default, so every
+        # existing caller's environment is unchanged.
+        [hashtable]$Environment = @{}
     )
 
     $result = @{
@@ -812,6 +819,7 @@ function Invoke-BoundedUvProbe {
     # The streams are decoded as UTF-8 above; have python encode them that way too instead of the
     # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+    foreach ($k in $Environment.Keys) { $psi.Environment[[string]$k] = [string]$Environment[$k] }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
@@ -4826,6 +4834,52 @@ function Invoke-DeclaredProjectsParkWake {
     return @{ byProject = $byProject; failed = $failed }
 }
 
+# --- Summon: origin/main of a candidate's clone (I-SY4, Bohr msg-6747) ------------------------------
+# The summon_yield record compares origin/main when a thread first yielded with origin/main when it
+# is launched again, so the turn can be told that main moved meanwhile. The sweep does not otherwise
+# sync a candidate's clone, so this fetches `main` itself — only when the answer is used (a record is
+# created, or a thread with a record is launched), at most once per clone per tick (plus a refresh
+# right after a run and right before a launch). Bounded: a hung fetch is killed, never waited on
+# (the T-parked-humans-probe-has-no-timeout lesson). Any failure answers 'unknown', which the
+# conductor always shows (a range with an unknown end is never "empty") — never a stale SHA, which
+# could hide that main moved.
+$SummonGitTimeoutSeconds = 60
+$script:SummonMainShaCache = @{}
+
+# Runs through Invoke-BoundedUvProbe, the one helper whose bound is regression-tested
+# (Test-BoundedProbe.ps1 H1-H4 and SG): on timeout the whole tree is killed and the kill is
+# CONFIRMED (KILL-UNCONFIRMED is logged when it is not), an output pipe still held after exit is a
+# failure rather than an empty success, and nothing is left running when it returns. A private
+# copy of that logic previously swallowed a failed Kill() and still reported "(killed)".
+# -Launcher exists for tests only; production always runs `git`.
+function Invoke-SummonGit {
+    param([string]$RepoDir, [string[]]$GitArgs, [int]$TimeoutSeconds = $SummonGitTimeoutSeconds,
+        [string[]]$Launcher = @('git'))
+    return Invoke-BoundedUvProbe -Launcher $Launcher -Arguments (@('-C', $RepoDir) + $GitArgs) `
+        -TimeoutSeconds $TimeoutSeconds -Label "summon-git-$($GitArgs[0])" -WorkingDirectory $RepoDir `
+        -Environment @{ GIT_TERMINAL_PROMPT = '0' }
+}
+
+function Get-SummonMainSha {
+    param([string]$RepoDir, [switch]$Refresh)
+    $key = ConvertTo-DirtyCloneRepoKey $RepoDir
+    if (-not $Refresh -and $script:SummonMainShaCache.ContainsKey($key)) { return $script:SummonMainShaCache[$key] }
+    $sha = $script:SummonUnknownSha
+    $fetch = Invoke-SummonGit -RepoDir $RepoDir -GitArgs @('fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main')
+    if (-not $fetch.ok -or $fetch.code -ne 0) {
+        $why = if (-not $fetch.ok) { $fetch.error } else { "exit $($fetch.code): $(("$($fetch.stderr)" -split "`n")[0])" }
+        Write-Log "WARN summon: origin/main of $RepoDir unreadable ($why) — recorded as '$sha'"
+    }
+    else {
+        $rev = Invoke-SummonGit -RepoDir $RepoDir -GitArgs @('rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main')
+        $text = "$($rev.stdout)".Trim()
+        if ($rev.ok -and $rev.code -eq 0 -and $text -match '^[0-9a-f]{7,64}$') { $sha = $text }
+        else { Write-Log "WARN summon: rev-parse origin/main failed in $RepoDir — recorded as '$sha'" }
+    }
+    $script:SummonMainShaCache[$key] = $sha
+    return $sha
+}
+
 # --- deploy probe ---------------------------------------------------------------------------------
 # Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
 # verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
@@ -5284,6 +5338,20 @@ try {
             }
         }
     }
+    # Summon (Bohr msg-6745 v1.1 指摘 3 (b)): the owning projects of owner_map that no candidate names
+    # are read too, so a Summon in such a project holds the candidates writing to its repository on
+    # this tick instead of being found by their conductor one launch later. The rows go into
+    # $controlByProject, which the resource-axis HOLD gate also reads: a HOLD on such an owner now
+    # holds those candidates here as well (before, its row was missing and the gate failed open).
+    foreach ($ownerProj in @($sweepOwnerMap.Values | Sort-Object -Unique)) {
+        if ($controlByProject.ContainsKey($ownerProj)) { continue }
+        $oc = Invoke-ControlProbe -Project $ownerProj
+        $controlByProject[$ownerProj] = $oc
+        if ($null -ne $oc) {
+            Write-Log ("control probe [{0}] (owner_map owner): desired={1} observed={2}" -f $ownerProj, $oc.desired_state, $oc.observed_state)
+        }
+    }
+
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
@@ -5434,11 +5502,31 @@ try {
     # list is put in that variable for the loop and the sweep.json order is restored right after it.
     # Everything after the loop that walks $candidates (the not-reached pass, the parked-humans poll)
     # keeps sweep.json order.
+    # Summon (T-human-call-priority-interrupt PR-2, v1.6 §2): what each candidate is this tick —
+    # the Summon itself (lane 0), held by one, held because a Summon read was malformed, or not
+    # affected — from the control rows already read above. No extra MCP call.
+    $summonByKey = @{}
+    foreach ($c in $candidates) {
+        $summonByKey[$c.key] = Get-SummonDisposition -Candidate $c -ControlByProject $controlByProject `
+            -PredictedResourceByRepoDir $predictedResourceByRepoDir -OwnerMap $sweepOwnerMap
+    }
+    foreach ($proj in @($controlByProject.Keys | Sort-Object)) {
+        $ps = Get-ProjectSummon -ControlByProject $controlByProject -Project $proj
+        if ($ps.kind -eq 'valid') {
+            Confirm-LogWorthKeeping
+            Write-Log "SUMMON ACTIVE [$proj]: thread=$($ps.thread_id) since=$($ps.since.ToString('o')) by=$($ps.by)"
+        }
+        elseif ($ps.kind -eq 'malformed') {
+            Confirm-LogWorthKeeping
+            Write-Log "WARN SUMMON MALFORMED [$proj]: active_summon does not match the contract — every candidate in its scope is HELD (fail-safe)"
+        }
+    }
     $sweepOrderCandidates = $candidates
     $candidates = Get-OrderedSweepCandidates -Candidates $sweepOrderCandidates -Verdicts $decideVerdicts `
-        -EvaluatedState $evaluatedState -Now $nowUtc
+        -EvaluatedState $evaluatedState -Now $nowUtc -SummonByKey $summonByKey
     $gateCandidateCount = @($candidates | Where-Object {
-        $decideVerdicts.ContainsKey($_.key) -and (Get-SweepLane -Verdict $decideVerdicts[$_.key]) -eq 'gate' }).Count
+        $decideVerdicts.ContainsKey($_.key) -and
+        (Get-SweepLane -Verdict $decideVerdicts[$_.key] -Summon $summonByKey[$_.key]) -eq 'gate' }).Count
     $launchScheduler = New-LaunchScheduler -LaunchBudgetSeconds $sweepBudgets.launch -GateBudgetSeconds $sweepBudgets.gate
     # loopElapsed's origin: decide time is excluded, so a slow decide cannot close the gate lane
     # (Einstein msg-5589). The tick budget (tickElapsed) still includes it.
@@ -5633,6 +5721,30 @@ try {
         if ($decision -ne 'launch') {
             throw "head_skip decide returned unexpected decision '$decision' for $($cand.key)"
         }
+        # Summon (v1.6 §2). After HOLD and quarantine (HOLD -> quarantine -> Summon): a LAUNCH that a
+        # Summon holds is not launched, and keeps its launch_wait_since, so it rejoins its lane at its
+        # old place once the Summon is gone. Path (b) of the summon_yield record (I-SY1 / I-SY2): the
+        # one Update-SummonYield, with -Delivered $false. Report mode writes nothing.
+        $summonDisp = $summonByKey[$cand.key]
+        if ($null -ne $summonDisp -and $summonDisp.kind -eq 'malformed') {
+            $held++
+            $dispositions[$cand.key] = 'held'
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — Summon read malformed for project $($summonDisp.malformed_project), HELD (fail-safe), not launching (launch_wait_since kept)"
+            continue
+        }
+        if ($null -ne $summonDisp -and $summonDisp.kind -eq 'yield') {
+            $held++
+            $dispositions[$cand.key] = "held-by-summon:$($summonDisp.yield_to)"
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — held-by-summon:$($summonDisp.yield_to), not launching (launch_wait_since kept)"
+            if ($headSkipMode -ne 'report') {
+                $syEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+                $sySha = if (Test-SummonYieldNeedsSha -Entry $syEntry -Delivered $false -YieldTo $summonDisp.yield_to) {
+                    Get-SummonMainSha -RepoDir $cand.repo_dir } else { $null }
+                Set-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key -Entry (
+                    Update-SummonYield -Entry $syEntry -Delivered $false -YieldTo $summonDisp.yield_to -MainSha $sySha -Now $nowUtc)
+            }
+            continue
+        }
         # Report mode: dry-run. The CLI touched no state, so we must not commit-launch or spawn.
         # This is how an operator measures "what would come out of a wire commit" per msg-1430 §W-5.
         if ($headSkipMode -eq 'report') {
@@ -5721,9 +5833,33 @@ try {
         # apart from $stallArgs (the T42 / retry arguments) and re-assigned on every candidate, so
         # nothing can accumulate across iterations (PR #458 gate advisory).
         $laneArgs = @(Get-ConductorLaneArgs -Lane $lane)
-        $output = (& $inner @stallArgs @laneArgs *>&1) | ForEach-Object { "$_" }
+        # Summon (v1.6 §4 / v1.4): the owning project whose Summon is also in scope, and — whenever
+        # this thread has a summon_yield record — the resume notice, with origin/main read now.
+        # Re-assigned on every candidate like $laneArgs.
+        $summonArgs = @(Get-SummonOwnerArgs -Disposition $summonDisp)
+        $resumeEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+        if ($null -ne $resumeEntry) {
+            $summonArgs += @(Get-ResumeNoticeArgs -Entry $resumeEntry -MainSha (Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh))
+            Write-Log "resume-notice $($cand.key): $($summonArgs -join ' ')"
+        }
+        $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
+        # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
+        # -Delivered / -YieldTo (Get-SummonStopFields, StopReason.ps1) and the one Update-SummonYield.
+        # Before any exit-code branch, so every way a run can end is covered; no stop line = neither,
+        # which keeps the record and re-delivers on the next launch (at least once).
+        $summonStop = Get-SummonStopFields -Output $output
+        if ($summonStop.delivered -or $summonStop.yield_to) {
+            $syBefore = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+            $sySha = if (Test-SummonYieldNeedsSha -Entry $syBefore -Delivered $summonStop.delivered -YieldTo $summonStop.yield_to) {
+                Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh } else { $null }
+            $syAfter = Update-SummonYield -Entry $syBefore -Delivered $summonStop.delivered -YieldTo $summonStop.yield_to `
+                -MainSha $sySha -Now $nowUtc
+            Set-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key -Entry $syAfter
+            $syDesc = if ($null -eq $syAfter) { 'removed' } else { "$($syAfter.main_sha_at_yield) [$($syAfter.summon_threads -join ',')]" }
+            Write-Log "summon-yield $($cand.key): delivered=$($summonStop.delivered) yield_to=$($summonStop.yield_to) -> record $syDesc"
+        }
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
         # fully described by the summary line below.
         #
