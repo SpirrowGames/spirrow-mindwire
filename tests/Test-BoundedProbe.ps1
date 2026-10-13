@@ -187,6 +187,37 @@ exit 0
     Check 'ok = $false' $false $r.ok
     CheckTrue 'error names the start failure' ($r.error -like 'cannot start*')
 
+    # --- SG: Invoke-SummonGit goes through the bounded helper (PR #475 review) -------------------
+    # It used to carry a private copy of the bound that swallowed a failed Kill() and still said
+    # "(killed)". Now it is a thin call into the helper above; these pin that it inherits the bound,
+    # the tree kill, the exit-code pass-through and the no-prompt environment.
+    Import-SweepFunction 'Invoke-SummonGit'
+    $sgRepo = Join-Path $scratch 'sg-repo'
+    New-Item -ItemType Directory -Path $sgRepo | Out-Null
+
+    Write-Host 'SG1 — a hung git is bounded and killed (killConfirmed), never reported as a success'
+    $sgHang = Join-Path $scratch 'sg-hang.ps1'
+    Set-Content -LiteralPath $sgHang -Encoding utf8 -Value 'Start-Sleep 600'
+    $script:logLines.Clear()
+    $r = Invoke-SummonGit -RepoDir $sgRepo -GitArgs @('fetch', 'origin') -TimeoutSeconds 3 -Launcher ($fakeLauncher + @($sgHang))
+    Check 'ok = $false' $false $r.ok
+    CheckTrue 'timedOut = $true' $r.timedOut
+    CheckTrue 'killConfirmed = $true' $r.killConfirmed
+    CheckTrue 'root PID is dead on return' (-not (Test-ProcessAlive $r.pid))
+    CheckTrue 'error says timed out' ($r.error -like 'timed out after 3s*')
+    CheckTrue 'TIMEOUT line names the git subcommand' (@($script:logLines | Where-Object { $_ -match '^TIMEOUT label=summon-git-fetch ' }).Count -eq 1)
+
+    Write-Host 'SG2 — argv is `-C <repo> <args>`, GIT_TERMINAL_PROMPT=0, exit code and stdout pass through'
+    $sgEcho = Join-Path $scratch 'sg-echo.ps1'
+    Set-Content -LiteralPath $sgEcho -Encoding utf8 -Value @'
+Write-Output (($args -join '|') + '#' + $env:GIT_TERMINAL_PROMPT)
+exit 3
+'@
+    $r = Invoke-SummonGit -RepoDir $sgRepo -GitArgs @('rev-parse', '--verify') -TimeoutSeconds 30 -Launcher ($fakeLauncher + @($sgEcho))
+    Check 'ok = $true' $true $r.ok
+    Check 'code = 3' 3 $r.code
+    Check 'argv and env seen by the child' "-C|$sgRepo|rev-parse|--verify#0" "$($r.stdout)".Trim()
+
     # --- caller tests: stub the helper, record what it was handed ---------------------------------
     $script:probeCalls = [System.Collections.Generic.List[object]]::new()
     $script:probeMode = 'ok'
@@ -382,7 +413,9 @@ exit 0
     # +1 for Invoke-ParkWakeTick (T-next-line-carries-who-not-why Slice 3, D-7): no -UvOptions, like 1b.
     # +1 for Invoke-UnregisteredThreadsProbe (T-sweep-intake-and-quarantine-stalls msg-5889 D-2):
     # no -UvOptions either.
-    Check 'fourteen helper call sites in the sweep script' 14 $helperCalls.Count
+    # +1 for Invoke-SummonGit (T-human-call-priority-interrupt, PR #475 review): a git launcher, so
+    # no -UvOptions (it passes -Environment instead).
+    Check 'fifteen helper call sites in the sweep script' 15 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

@@ -789,7 +789,10 @@ function Invoke-BoundedUvProbe {
         [string[]]$Launcher = @('uv', 'run', 'python'),
         # uv's own options, inserted between `uv run` and `python` (see Get-BoundedProbeCommandLine).
         # Empty by default: a caller that does not pass it gets exactly the argv it got before.
-        [string[]]$UvOptions = @()
+        [string[]]$UvOptions = @(),
+        # Extra environment variables for the child (name -> value). Empty by default, so every
+        # existing caller's environment is unchanged.
+        [hashtable]$Environment = @{}
     )
 
     $result = @{
@@ -816,8 +819,9 @@ function Invoke-BoundedUvProbe {
     # The streams are decoded as UTF-8 above; have python encode them that way too instead of the
     # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+    foreach ($k in $Environment.Keys) { $psi.Environment[[string]$k] = [string]$Environment[$k] }
 
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $sw =[System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -4842,28 +4846,18 @@ function Invoke-DeclaredProjectsParkWake {
 $SummonGitTimeoutSeconds = 60
 $script:SummonMainShaCache = @{}
 
+# Runs through Invoke-BoundedUvProbe, the one helper whose bound is regression-tested
+# (Test-BoundedProbe.ps1 H1-H4 and SG): on timeout the whole tree is killed and the kill is
+# CONFIRMED (KILL-UNCONFIRMED is logged when it is not), an output pipe still held after exit is a
+# failure rather than an empty success, and nothing is left running when it returns. A private
+# copy of that logic previously swallowed a failed Kill() and still reported "(killed)".
+# -Launcher exists for tests only; production always runs `git`.
 function Invoke-SummonGit {
-    param([string]$RepoDir, [string[]]$GitArgs, [int]$TimeoutSeconds = $SummonGitTimeoutSeconds)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    foreach ($a in @('-C', $RepoDir) + $GitArgs) { $psi.ArgumentList.Add($a) }
-    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
-    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-    $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
-    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ ok = $false; error = "git start failed: $($_.Exception.Message)" } }
-    try {
-        $proc.StandardInput.Close()
-        $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
-        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $proc.Kill($true) } catch { }
-            [void]$proc.WaitForExit($ProbeKillGraceMs)
-            return @{ ok = $false; error = "git $($GitArgs[0]) timed out after ${TimeoutSeconds}s (killed)" }
-        }
-        [void]$outTask.Wait($ProbeKillGraceMs); [void]$errTask.Wait($ProbeKillGraceMs)
-        $out = if ($outTask.IsCompleted) { $outTask.Result } else { '' }
-        $err = if ($errTask.IsCompleted) { $errTask.Result } else { '' }
-        return @{ ok = $true; code = $proc.ExitCode; stdout = $out; stderr = $err }
-    }
-    finally { $proc.Dispose() }
+    param([string]$RepoDir, [string[]]$GitArgs, [int]$TimeoutSeconds = $SummonGitTimeoutSeconds,
+        [string[]]$Launcher = @('git'))
+    return Invoke-BoundedUvProbe -Launcher $Launcher -Arguments (@('-C', $RepoDir) + $GitArgs) `
+        -TimeoutSeconds $TimeoutSeconds -Label "summon-git-$($GitArgs[0])" -WorkingDirectory $RepoDir `
+        -Environment @{ GIT_TERMINAL_PROMPT = '0' }
 }
 
 function Get-SummonMainSha {
