@@ -690,11 +690,47 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
     assert line["matched_rule"] == "rule_2" and line["matched_rule_source"] == "choice"
     assert line["rules_sha256"] == RULES.sha256
     assert line["questions_version"] == "tierc-v4"
-    assert line["head_window"] == "tail-v1"  # T-jev-tierc-audit-2026-10-12 F2
+    assert line["ask_line"] is False  # T-jev-tierc-audit-2026-10-12 F2'': no ASK: line
     assert line["verdict"]["scope"] == "in_gate"
     assert line["gate_kind"] is None and line["gate_is_grey_zone"] is False  # labelled ADMIT
     sent_state = json.loads(c.bodies[0]["state"])
     assert sent_state["dispute_rounds"] == 1
+
+
+@pytest.mark.anyio
+async def test_hook_ask_line_leads_head_summary_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-jev-tierc-audit-2026-10-12 F2'' (Bohr msg-6873): the role's ``ASK:`` line, written last,
+    is what Jev reads first; the row records ``ask_line: true``; the label gate still admits."""
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c, rules=RULES)
+    body = (
+        "I explicitly endorse the approach. " * 30
+        + "\n\nASK: ceiling を戻すか ruleset で作り直すか\nTIER-C: goal\nNEXT: human"
+    )
+    msgs = [ThreadMessage("m1", "Einstein", body, "human")]
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        dr = await run_tierc_hook(
+            adapter,
+            thread_id="T",
+            round_index=1,
+            roster=ROSTER,
+            messages=msgs,
+            stop="human",
+            is_forced=False,
+            target_role=None,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
+            author_requested_human=True,
+        )
+    assert dr is not None
+    (line,) = _decider_lines(caplog)
+    assert line["ask_line"] is True
+    assert line["gate_kind"] is None and line["gate_is_grey_zone"] is False  # labelled ADMIT
+    head = json.loads(c.bodies[0]["state"])["head_summary"]
+    assert head.startswith("ASK: ceiling を戻すか ruleset で作り直すか\nI explicitly endorse")
+    assert len(head) == 500
 
 
 @pytest.mark.anyio

@@ -1,21 +1,38 @@
-"""T-jev-tierc-audit-2026-10-12 F2 / F3 (Bohr msg-6860, endorsed by Einstein msg-6861 onward).
+"""T-jev-tierc-audit-2026-10-12 F2'' / F3 (Bohr msg-6871 / msg-6873 / msg-6875 / msg-6877, endorsed
+by Einstein).
 
-* F2 — ``head_summary`` is the head message's ask window (``tail-v1``): ``M`` stays 500, the
-  closing block is dropped and the tail is taken on a paragraph boundary; ``recent_events``
-  keep the first ``M`` chars; the log rows carry ``head_window``.
-* F3 — the ``should_ask_human`` frame carries the two standing-policy exclusions after the
-  fix-now one, the rules template does not, the proceed frame is untouched, and the version is
-  ``tierc-v4``.
+* F2'' — the role writes ``ASK: <one line>`` directly above ``TIER-C:`` (the handoff guidance);
+  the decider moves the **last** such line to the front of ``head_summary``, 500 chars in total;
+  without one the summary is ``content[:500]`` as before. ``recent_events`` are unchanged.
+* F3 — the ``should_ask_human`` frame carries the merge-request exclusion after the fix-now one,
+  and nothing else (the permission sentence was dropped, msg-6871 §3); the version is
+  ``tierc-v4``; ``scripts/tierc_casebook.py`` keeps asking the pinned v3 frame.
 
-F1 (``count_dispute_rounds``) is tested next to the old cases in ``test_decider_tierc_v2.py``.
+F1 (``count_dispute_rounds``) is tested next to the old cases in ``test_decider_tierc_v2.py``;
+the ``ask_line`` log column in ``test_decider_tierc_v2.py`` / ``test_d4_guardrails.py``.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from spirrow_mindwire.conductor.handoff import (
+    _tier_c_label_above_last_next,
+    build_handoff_protocol_block,
+)
 from spirrow_mindwire.decider.hook import (
+    ASK_LINE_MAX,
     BODY_HEAD_M,
     ThreadMessage,
-    head_window,
+    compute_gate_result,
+    extract_ask,
+    head_summary_for,
     turn_from_messages,
 )
 from spirrow_mindwire.decider.questions import (
@@ -26,19 +43,20 @@ from spirrow_mindwire.decider.questions import (
     tierc_rules_template_path,
     tierc_v2_questions,
 )
+from spirrow_mindwire.tier_c_admission_gate import AdmissionVerdict
 from spirrow_mindwire.value_objects import Role
 
+ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = tierc_rules_template_path()
 RULES = load_tierc_rules(TEMPLATE)
 ROSTER = {"Bohr": Role.PROPOSER, "Einstein": Role.NAYSAYER, "Heisenberg": Role.IMPLEMENTER}
 
+LONG = "I explicitly endorse the approach. " * 30  # ~1050 chars before the ask
+TRAILER = "\nTIER-C: goal\nNEXT: human"
+
 MERGE_EXCLUSION = (
     "main への merge や gate の再発火を依頼するだけのハンドオフは、"
     "それだけではどの条にも当たらない(merge される中身が仕様を変える場合は、その中身で判断する)。"
-)
-CAPABILITY_EXCLUSION = (
-    "role の権限や道具が足りないこと(指名できない、コマンドが無い、guard に止められた等)を"
-    "理由に人を呼ぶハンドオフは、どの条にも当たらない。"
 )
 FIX_NOW_EXCLUSION = (
     "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
@@ -46,84 +64,134 @@ FIX_NOW_EXCLUSION = (
     "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
 )
 
-ENDORSE = "I explicitly endorse the approach. " * 30  # ~1050 chars, one paragraph
-ASK = "## 裁定のお願い\n\nceiling を戻すか、ruleset で作り直すかを決めてください。A / B。"
-TRAILER = (
-    "TIER-C: goal\nNEXT: human\n\n"
-    "<!-- source: tools=3 · mcp=0 · setting_sources=empty · route=unset · tier=x -->\n"
-    "<!-- attest: tier=naysayer · backend=gemini · expected=gemini · route=r · probe=p -->"
+
+# --- F2'': the ASK: line ------------------------------------------------------------------------
+
+
+def test_ask_line_near_the_end_of_a_long_body_leads_the_summary() -> None:
+    """msg-6873 row 1 / msg-6875: red without ``re.MULTILINE`` (the line is not the body start)."""
+    content = f"{LONG}\n\nASK: B と C のどちらにするか{TRAILER}"
+    summary, ask_line = head_summary_for(content)
+    prefix = "ASK: B と C のどちらにするか\n"
+    assert ask_line is True
+    assert summary == prefix + content[: BODY_HEAD_M - len(prefix)]
+    assert len(summary) == BODY_HEAD_M
+
+
+def test_the_last_ask_line_wins() -> None:
+    content = f"ASK: first\n{LONG}\nASK: second{TRAILER}"
+    assert extract_ask(content) == "second"
+    assert head_summary_for(content)[0].startswith("ASK: second\nASK: first\n")
+
+
+def test_an_overlong_ask_line_is_capped_and_the_total_stays_500() -> None:
+    content = f"{LONG}\nASK: {'x' * 450}{TRAILER}"
+    ask = extract_ask(content)
+    assert ask == "x" * ASK_LINE_MAX
+    summary, _ = head_summary_for(content)
+    assert len(summary) <= BODY_HEAD_M
+    assert summary.startswith(f"ASK: {'x' * ASK_LINE_MAX}\n")
+
+
+def test_no_ask_line_is_the_old_input_and_never_raises() -> None:
+    """msg-6873 row 4 / msg-6877 (Einstein msg-6876: ``findall(...)[-1]`` on ``[]``)."""
+    content = f"{LONG}{TRAILER}"
+    assert extract_ask(content) is None
+    assert head_summary_for(content) == (content[:BODY_HEAD_M], False)
+    assert head_summary_for("") == ("", False)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("ASK: B と C のどちらにするか", "B と C のどちらにするか"),
+        ("ASK:　B と C のどちらにするか", "B と C のどちらにするか"),  # U+3000 (msg-6877)
+        ("ASK:B と C", "B と C"),  # no space
+        ("ASK:  B と C  \t", "B と C"),  # trailing whitespace dropped
+        ("ASK:   ", None),  # empty (msg-6875)
+        ("ASK:", None),
+        ("ASK\uff1aB と C", None),  # U+FF1A full-width colon — not the fixed form (msg-6877)
+        ("> ASK: B と C", None),  # quoted (msg-6875)
+        ("**ASK:** B と C", None),  # emphasised (msg-6875)
+        ("the reply mentions `ASK:` inline", None),  # not at line start (msg-6873)
+        ("  ASK: indented", None),
+    ],
 )
+def test_only_the_fixed_form_line_matches(line: str, expected: str | None) -> None:
+    content = f"{LONG}\n{line}{TRAILER}"
+    assert extract_ask(content) == expected
+    assert head_summary_for(content)[1] is (expected is not None)
 
 
-# --- F2: head_window ---------------------------------------------------------------------------
+def test_an_empty_ask_line_does_not_swallow_the_next_line() -> None:
+    """``[^\\S\\n]`` excludes the newline, so an empty ``ASK:`` never reads ``TIER-C: goal``."""
+    assert extract_ask(f"{LONG}\nASK:\nTIER-C: goal\nNEXT: human") is None
 
 
-def test_short_body_is_passed_whole_as_before() -> None:
-    body = "short ask\nTIER-C: cost\nNEXT: human"
-    assert head_window(body) == body
-
-
-def test_ask_after_a_long_endorsement_reaches_the_window() -> None:
-    """msg-6286 shape: endorsement first, then the ask — the first 500 chars held no ask."""
-    content = f"{ENDORSE}\n\n{ASK}\n{TRAILER}"
-    assert ASK not in content[:BODY_HEAD_M]
-    got = head_window(content)
-    assert len(got) <= BODY_HEAD_M
-    assert got.startswith("## 裁定のお願い")  # whole trailing paragraphs, boundary-aligned
-    assert "A / B" in got
-    assert "TIER-C: goal" in got  # TIER-C: is part of the ask
-    assert "NEXT:" not in got and "<!--" not in got
-
-
-def test_closing_block_is_dropped_and_the_rest_passed_whole_when_it_fits() -> None:
-    body = "x" * 300
-    content = body + "\n\nNEXT: human\nSTOP: done\nOPERATOR-TASK: t\nTIER-C-CHECK: none\n\n"
-    content += "<!-- source: a -->\n" * 20
-    assert len(content) > BODY_HEAD_M
-    assert head_window(content) == body
-
-
-def test_longest_run_of_whole_trailing_paragraphs() -> None:
-    paras = [f"p{i} " + "y" * 150 for i in range(6)]  # ~155 chars each
-    content = "\n\n".join(paras) + "\n\nNEXT: human"
-    got = head_window(content)
-    assert got == "\n\n".join(paras[-3:])  # 3 * 155 + 4 <= 500 < 4 * 155 + 6
-
-
-def test_one_overlong_last_paragraph_gives_its_last_m_chars() -> None:
-    last = "z" * 400 + "THE ASK"
-    content = "a" * 200 + "\n\n" + "b" * 100 + last + "\nNEXT: human"
-    got = head_window(content)
-    assert len(got) == BODY_HEAD_M and got.endswith("THE ASK")
-
-
-def test_a_next_line_mid_body_is_not_the_closing_block() -> None:
-    content = "NEXT: earlier quote\n" + "w" * 600
-    assert head_window(content) == content[-BODY_HEAD_M:]
-
-
-def test_turn_uses_the_window_for_head_summary_only() -> None:
-    content = f"{ENDORSE}\n\n{ASK}\n{TRAILER}"
+def test_turn_uses_the_ask_for_head_summary_only() -> None:
+    content = f"{LONG}\n\nASK: B か C か{TRAILER}"
     msgs = [
         ThreadMessage("m1", "Bohr", "design", "Einstein"),
-        ThreadMessage("m2", "Bohr", content, "human"),
+        ThreadMessage("m2", "Einstein", content, "human"),
     ]
     turn = turn_from_messages(thread_id="T", round_index=2, roster=ROSTER, messages=msgs)
-    assert turn.head_summary == head_window(content)
-    # recent_events stay the first M chars (context only, msg-6860 F2)
-    assert turn.recent_events[0].body_head == content[:BODY_HEAD_M]
+    assert turn.head_summary == head_summary_for(content)[0]
+    assert turn.recent_events[0].body_head == content[:BODY_HEAD_M]  # unchanged
     assert turn.recent_events[1].body_head == "design"
 
 
-# --- F3: frame sentences and version -------------------------------------------------------------
+# --- F2'': the writer side ----------------------------------------------------------------------
 
 
-def test_v4_frame_carries_both_standing_policy_exclusions_after_fix_now() -> None:
+@pytest.mark.parametrize("role", [Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER])
+def test_every_escalating_role_is_told_to_write_the_ask_line(role: Role) -> None:
+    block = build_handoff_protocol_block(role)
+    assert "write `ASK: <what you need the human to decide, in one line>`" in block
+    assert "directly above the `TIER-C:` line" in block
+
+
+def test_a_reply_written_as_instructed_keeps_its_label_and_passes_the_gate() -> None:
+    """The ``ASK:`` line sits above ``TIER-C:``, so the label reader (line above the last
+    ``NEXT:``) and the admission gate see the same body as before."""
+    body = f"{LONG}\n\nASK: B か C か{TRAILER}"
+    assert _tier_c_label_above_last_next(body) == "goal"
+    gate = compute_gate_result(body=body, author="Einstein", now=datetime(2026, 10, 13, tzinfo=UTC))
+    assert gate is not None and gate.verdict is AdmissionVerdict.ADMIT
+    assert extract_ask(body) == "B か C か"
+
+
+# --- F3: frame and version ----------------------------------------------------------------------
+
+
+def test_v4_frame_is_v3_plus_the_merge_exclusion_only() -> None:
     instructions = tierc_v2_questions(RULES)[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert instructions.endswith(FIX_NOW_EXCLUSION + MERGE_EXCLUSION + CAPABILITY_EXCLUSION)
-    template = TEMPLATE.read_text(encoding="utf-8")
-    assert MERGE_EXCLUSION not in template and CAPABILITY_EXCLUSION not in template
+    assert instructions.endswith(FIX_NOW_EXCLUSION + MERGE_EXCLUSION)
+    assert "権限" not in instructions and "guard" not in instructions  # dropped (msg-6871 §3)
+    assert MERGE_EXCLUSION not in TEMPLATE.read_text(encoding="utf-8")
     proceed = tierc_v2_questions(RULES, proceed=True)[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert "merge" not in proceed and "guard" not in proceed
+    assert "merge" not in proceed
     assert TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v4"
     assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v2-proceed"
+
+
+def _casebook() -> Any:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location(
+        "tierc_casebook_f3", ROOT / "scripts" / "tierc_casebook.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_casebook_keeps_asking_the_pinned_v3_frame() -> None:
+    """msg-6871 §4: the casebook's v3 no longer follows the live frame."""
+    cb = _casebook()
+    assert cb.V3 == "tierc-v3"
+    v3 = cb.questions_for(cb.V3, RULES)[SHOULD_ASK_HUMAN_KEY]["instructions"]
+    assert v3.endswith(FIX_NOW_EXCLUSION)
+    assert MERGE_EXCLUSION not in v3
+    live = tierc_v2_questions(RULES)[SHOULD_ASK_HUMAN_KEY]["instructions"]
+    assert live == v3 + MERGE_EXCLUSION  # v4 differs from v3 by that sentence only

@@ -102,49 +102,38 @@ BODY_HEAD_M = 500
 
 ACTING_TIERC_MODES: frozenset[str] = frozenset({"annotate", "bounce"})
 
-HEAD_WINDOW = "tail-v1"
-"""Which part of the head message ``head_summary`` carries (T-jev-tierc-audit-2026-10-12 F2, Bohr
-msg-6860). Written as ``head_window`` on every ``decider_decision`` / ``decider_proceed_clearance``
-row so rows from before the change (no column: the first ``BODY_HEAD_M`` chars) and after it are
-told apart."""
+ASK_LINE_MAX = 300
+"""Cap on the ``ASK:`` line moved to the front of ``head_summary`` (F2'', Bohr msg-6873)."""
 
-_TRAILER_LINE_RE = re.compile(
-    r"^\s*(?:(?:NEXT|STOP|OPERATOR-TASK|TIER-C-CHECK):.*|<!--\s*(?:source|attest):.*-->\s*)?$"
-)
-"""A line of the message's closing block: a handoff line (``NEXT:`` / ``STOP:`` /
-``OPERATOR-TASK:`` / ``TIER-C-CHECK:``), a source / attestation marker the runner appends after the
-handoff (``source_marker``), or a blank line. ``TIER-C:`` is **not** one — it is part of the ask."""
-
-_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n\s*")
+_ASK_LINE_RE = re.compile(r"^ASK:[^\S\n]*(\S[^\n]*?)[^\S\n]*$", re.MULTILINE)
+"""The writer-side ``ASK: <what the human is asked to decide>`` line (T-jev-tierc-audit-2026-10-12
+F2'', Bohr msg-6873 / msg-6875 / msg-6877, endorsed by Einstein). A fixed-form line like
+``TIER-C:`` / ``NEXT:``: ``ASK:`` (ASCII colon) at the very start of a line — no quote or markdown
+emphasis before it — then the non-empty text. ``[^\\S\\n]`` is any whitespace except a newline,
+so U+3000 between the colon and the text is accepted. ``re.MULTILINE`` is load-bearing: the line
+is written near the end of the reply, and without it ``^`` would only match the body's start."""
 
 
-def head_window(content: str, m: int = BODY_HEAD_M) -> str:
-    """The part of the head message Jev reads as ``head_summary`` (F2, ``tail-v1``).
+def extract_ask(content: str) -> str | None:
+    """The text of the **last** ``ASK:`` line in ``content``, capped at :data:`ASK_LINE_MAX`, or
+    ``None`` when there is none (every pre-F2'' post) — never raises (Einstein msg-6876)."""
+    matches = _ASK_LINE_RE.findall(content)
+    return matches[-1][:ASK_LINE_MAX] if matches else None
 
-    Roles write "endorsement → the ask → ``TIER-C:`` → ``NEXT:``", so the first ``m`` chars often
-    end before the ask (msg-6804 F2: msg-6286 reached Jev as its endorsement only). ``m`` is not
-    widened (cost-neutral); the range moves to the end:
 
-    1. a body of at most ``m`` chars is passed whole, as before;
-    2. otherwise the closing block (:data:`_TRAILER_LINE_RE` lines at the end) is dropped; if
-       what is left fits in ``m``, it is passed whole;
-    3. otherwise the longest run of whole trailing paragraphs that fits in ``m`` is passed; if the
-       last paragraph alone is longer than ``m``, its last ``m`` chars are.
-    """
-    if len(content) <= m:
-        return content
-    lines = content.split("\n")
-    while lines and _TRAILER_LINE_RE.match(lines[-1]):
-        lines.pop()
-    body = "\n".join(lines).rstrip()
-    if not body:
-        return content[-m:]
-    if len(body) <= m:
-        return body
-    for brk in _PARAGRAPH_BREAK_RE.finditer(body):
-        if len(body) - brk.end() <= m:
-            return body[brk.end() :]
-    return body[-m:]
+def head_summary_for(content: str) -> tuple[str, bool]:
+    """``(head_summary, ask_line)`` for the head message (F2'', Bohr msg-6873).
+
+    The role writes the ``ASK:`` line at the end, after its reasoning (directly above
+    ``TIER-C:``); the reader, not the writer, moves it to the front so the first-``BODY_HEAD_M``
+    window Jev reads starts with it: ``"ASK: <line>\\n" + content[: BODY_HEAD_M - len(prefix)]``.
+    The total stays at most ``BODY_HEAD_M`` chars, so Jev's input size (and cost) is unchanged.
+    Without an ``ASK:`` line the summary is ``content[:BODY_HEAD_M]`` exactly as before."""
+    ask = extract_ask(content)
+    if ask is None:
+        return content[:BODY_HEAD_M], False
+    prefix = f"ASK: {ask}\n"
+    return prefix + content[: BODY_HEAD_M - len(prefix)], True
 
 
 class Decider(Protocol):
@@ -183,10 +172,10 @@ def turn_from_messages(
 ) -> SimpleTurn:
     """Thread (oldest → newest) → ``SimpleTurn`` for ``state_builder``.
 
-    ``recent_events`` newest → oldest, capped at N; bodies capped at M (their **first** M chars —
-    context only, unchanged by F2); ``head_summary`` is the latest body's ask window
-    (:func:`head_window`, :data:`HEAD_WINDOW` = ``tail-v1``); ``prev_next`` is the handoff of
-    the message before the latest;
+    ``recent_events`` newest → oldest, capped at N; bodies capped at M (their first M chars);
+    ``head_summary`` is the latest body's first M chars, led by its ``ASK:`` line when it has one
+    (:func:`head_summary_for`, F2''); ``prev_next`` is the handoff of the message before the
+    latest;
     ``diff_stat`` is ``None`` (Tier-C does not use it). ``parsed_next`` is lower-cased so the
     reserved ``human`` token compares exactly.
     """
@@ -206,7 +195,7 @@ def turn_from_messages(
         thread_id=thread_id,
         round_index=round_index,
         roster=dict(roster),
-        head_summary=head_window(latest.content) if latest is not None else "",
+        head_summary=head_summary_for(latest.content)[0] if latest is not None else "",
         recent_events=recent,
         parsed_next=parsed_next.lower() if parsed_next is not None else None,
         prev_next=prev.parsed_next if prev is not None else None,
@@ -277,6 +266,7 @@ def log_decision(
     roster: Mapping[str, Role],
     state_wire: str,
     logged_at: datetime,
+    ask_line: bool | None = None,
 ) -> dict[str, Any]:
     """Write one decision record to the conductor log and return it (msg-4182).
 
@@ -297,9 +287,9 @@ def log_decision(
     (D20). ``export_shadow_eval_set.py`` reads them instead of rebuilding the state, and a row
     without them is outside the pre-registered evaluation (2d-3).
 
-    ``head_window`` (T-jev-tierc-audit-2026-10-12 F2) names the range of the head message that
-    ``head_summary`` carries (:data:`HEAD_WINDOW`); a row without it carries the first
-    ``BODY_HEAD_M`` chars.
+    ``ask_line`` (T-jev-tierc-audit-2026-10-12 F2'', Bohr msg-6873) records whether the head
+    message carried an ``ASK:`` line that :func:`head_summary_for` moved to the front of
+    ``head_summary``. Record-only; ``None`` when the caller did not compute it.
 
     ``logged_at`` (msg-4643 DECIDED 2d-8) is the time of the decision, timezone-aware ISO 8601.
     The exporter drops every row with ``logged_at > --as-of`` before anything else; the conductor
@@ -322,7 +312,7 @@ def log_decision(
         "logged_at": logged_at.isoformat(),
         "roster": {identity: role.value for identity, role in roster.items()},
         "state_wire": state_wire,
-        "head_window": HEAD_WINDOW,
+        "ask_line": ask_line,
         **decision_result_to_dict(dr),
     }
     logger.info("decider_decision %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
@@ -605,6 +595,7 @@ async def run_tierc_hook(
         roster=roster,
         state_wire=state_to_wire(state),
         logged_at=at,
+        ask_line=head_summary_for(head.content)[1],
     )
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a
@@ -709,7 +700,7 @@ async def run_proceed_veto(
             "head_msg_id": messages[-1].msg_id,
             "vetoed": vetoed,
             "ask_score": ask_score,
-            "head_window": HEAD_WINDOW,
+            "ask_line": head_summary_for(messages[-1].content)[1],
             **decision_result_to_dict(dr),
         }
         logger.info(
@@ -719,8 +710,8 @@ async def run_proceed_veto(
 
 
 __all__ = [
+    "ASK_LINE_MAX",
     "BODY_HEAD_M",
-    "HEAD_WINDOW",
     "RECENT_EVENTS_N",
     "ROUTED_FORCED_NAYSAYER",
     "ROUTED_SPAWN_BLOCKED",
@@ -731,8 +722,9 @@ __all__ = [
     "ThreadMessage",
     "compute_gate_result",
     "count_dispute_rounds",
+    "extract_ask",
     "gate_result_from_decision",
-    "head_window",
+    "head_summary_for",
     "is_tierc_entry",
     "log_decision",
     "never_retry",

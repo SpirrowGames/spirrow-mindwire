@@ -142,10 +142,12 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # ``matched_rule`` の ``criteria`` を配列から map に直したときも上げていない。選択肢と説明は
 # 不変で、配列の形の問いは Jev に一度も届いていない (全件 422) ∴ 読み方が変わる記録が無い。
 #
-# ``tierc-v4`` (T-jev-tierc-audit-2026-10-12 F3, Bohr msg-6860): 同じ問いに除外文を 2 つ
-# (``_V2_MERGE_REQUEST_EXCLUSION`` / ``_V2_ROLE_CAPABILITY_EXCLUSION``) 足したので上げた。key /
-# criteria / 五ヶ条 / 閾値は不変。v3 の記録は v3 のまま読む。``scripts/tierc_casebook.py`` の
-# ``tierc-v4-candidate`` は記録専用の別の候補 set で、この値とは無関係。
+# ``tierc-v4`` (T-jev-tierc-audit-2026-10-12 F3, Bohr msg-6860 / msg-6871): 同じ問いに merge 依頼の
+# 除外文 (``_V2_MERGE_REQUEST_EXCLUSION``) を足したので上げた。権限・道具の不足の除外文は、本物の
+# 6286 / 一部本物の 6605 を下げたので落とした (msg-6871 §3: その依頼は ``NEXT: operator`` で渡す
+# 経路が既にある)。key / criteria / 五ヶ条 / 閾値は不変。v3 の記録は v3 のまま読む。
+# ``scripts/tierc_casebook.py`` の ``tierc-v4-candidate`` は記録専用の別の候補 set で、
+# この値とは無関係。
 TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v4"
 """v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
 問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
@@ -184,18 +186,10 @@ _V2_MERGE_REQUEST_EXCLUSION = (
 """Takahito の常設方針「main への merge 依頼はそれだけでは Tier-C ではない」を枠の文にしたもの
 (T-jev-tierc-audit-2026-10-12 F3、逐語は Bohr msg-6860)。``_V2_FIX_NOW_EXCLUSION`` と同じく、
 五ヶ条本文ではなく枠の文に置く。``tierc-v4``。"""
-_V2_ROLE_CAPABILITY_EXCLUSION = (
-    "role の権限や道具が足りないこと(指名できない、コマンドが無い、guard に止められた等)を"
-    "理由に人を呼ぶハンドオフは、どの条にも当たらない。"
-)
-"""Takahito の常設方針「role の権限・道具の不足は Tier-C ではない」を枠の文にしたもの
-(T-jev-tierc-audit-2026-10-12 F3、逐語は Bohr msg-6860)。rule_4 の文言は言い直さない。
-``tierc-v4``。"""
 _V2_SHOULD_ASK_QUESTION = (
     "このハンドオフ(NEXT: human)は、五ヶ条のいずれかに当たり、人間に問うべきものか。"
     + _V2_FIX_NOW_EXCLUSION
     + _V2_MERGE_REQUEST_EXCLUSION
-    + _V2_ROLE_CAPABILITY_EXCLUSION
 )
 _V2_MATCHED_RULE_INSTRUCTIONS = (
     "このハンドオフ(NEXT: human)が当たる五ヶ条のルールを 1 つ選べ。"

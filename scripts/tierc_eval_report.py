@@ -837,7 +837,7 @@ def _render_v1(
 
 V2_STRUCTURE_VERSIONS: frozenset[str] = frozenset({"tierc-v2", "tierc-v3", "tierc-v4"})
 """msg-5753 DECIDED 2d-15 item 3: every version of the single-``should_ask_human`` structure goes
-to the v2 report. v3 only added one sentence to the question frame (main ``b224540``); v4 added two
+to the v2 report. v3 only added one sentence to the question frame (main ``b224540``); v4 added one
 more (T-jev-tierc-audit-2026-10-12 F3). The report
 describes rows and counts nothing, so it may hold both; which version is *counted* is the
 exporter's registered version, not this set. Each row's version is shown."""
