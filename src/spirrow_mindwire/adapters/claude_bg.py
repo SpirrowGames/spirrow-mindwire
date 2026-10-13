@@ -380,6 +380,9 @@ class _Session:
     pending_since: float = 0.0  # self._clock() when pending_name was set
     removed: bool = False
     halted: bool = False
+    # Serializes deliver_event and halt on this handle: a halt waits for an in-flight
+    # delivery, so whatever that delivery launched is settled by the halt.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -464,17 +467,21 @@ class ClaudeBgAdapter:
     async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
         """Launches the turn as a new ``--bg`` session (after ending the previous one)."""
         sess = self._session(handle)
-        if sess.halted:
-            raise AdapterDeliveryError(f"session {handle.session_id} is halted")
-        await self._reconcile_pending(sess)
-        if sess.launch is not None and not sess.removed:
-            await self._end(sess, sess.launch.id)
-        sess.launch, sess.removed = None, False
-        start_head, worktree_clean = await self._git_start_state()
-        plan = await self._planner(handle, event, worktree_clean)
-        # _launch installs sess.launch itself, before anything else is awaited.
-        await self._launch(sess, handle.thread_ref, plan, start_head, worktree_clean)
-        sess.last_active_at = self._now()
+        async with sess.lock:
+            self._refuse_if_halted(handle, sess)
+            await self._reconcile_pending(sess)
+            if sess.launch is not None and not sess.removed:
+                await self._end(sess, sess.launch.id)
+            sess.launch, sess.removed = None, False
+            start_head, worktree_clean = await self._git_start_state()
+            plan = await self._planner(handle, event, worktree_clean)
+            # halt() sets `halted` without the lock, so a halt that arrived during any
+            # await above is seen here; _launch sets the pending name with no await
+            # after this check, so the launch is either refused or owed to the halt.
+            self._refuse_if_halted(handle, sess)
+            # _launch installs sess.launch itself, before anything else is awaited.
+            await self._launch(sess, handle.thread_ref, plan, start_head, worktree_clean)
+            sess.last_active_at = self._now()
 
     async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
         """``stop`` -> ``rm`` -> confirm absent.
@@ -487,12 +494,15 @@ class ClaudeBgAdapter:
         confirmed, and health() reports HALTING rather than HALTED.
         """
         sess = self._sessions.get(handle)
-        if sess is None or (sess.halted and not _unsettled(sess)):
+        if sess is None or (sess.halted and not _unsettled(sess) and not sess.lock.locked()):
             return
+        # Set before waiting for the lock: an in-flight delivery re-checks it before it
+        # launches, so it either refuses the launch or leaves one that is cleaned up below.
         sess.halted = True
-        await self._reconcile_pending(sess)
-        if sess.launch is not None and not sess.removed:
-            await self._end(sess, sess.launch.id)
+        async with sess.lock:
+            await self._reconcile_pending(sess)
+            if sess.launch is not None and not sess.removed:
+                await self._end(sess, sess.launch.id)
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
         sess = self._session_for_health(handle)
@@ -549,17 +559,42 @@ class ClaudeBgAdapter:
         ``live_ids`` is the conductor's set of recorded sessions whose handoff is still
         pending. Only names this adapter mints (``T-*-r*-*``) whose ``cwd`` is ``repo_dir``
         are touched; anyone else's sessions are left alone.
+
+        Sessions this adapter itself still owns are never targets, whatever ``live_ids``
+        says: a pending launch name (detached but not yet adopted, or owed to a halt)
+        and an adopted session not yet confirmed removed. That protection is read from
+        memory after the listing returns, with no await before selection, and it covers
+        removal too: a launch name is set pending before ``claude --bg`` runs, so any
+        session the listing shows was already protected by then, and a protected name
+        stays protected until the adapter itself settles it (adopt keeps it protected
+        under ``launch.name``; only confirmed removal or the settle-window expiry drops it).
         """
+        agents = await self._list()
+        own_names, own_ids = self._owned()
         targets = [
             agent.id
-            for agent in await self._list()
+            for agent in agents
             if agent.id not in live_ids
+            and agent.id not in own_ids
             and agent.name
+            and agent.name not in own_names
             and MANAGED_NAME.match(agent.name)
             and _same_dir(agent.cwd, self._repo_dir)
         ]
         reaped, failed = await self._remove_confirmed(None, targets)
         return ReapReport(reaped, failed)
+
+    def _owned(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Names and ids of sessions this adapter still owns (never orphan-sweep targets)."""
+        names: set[str] = set()
+        ids: set[str] = set()
+        for sess in self._sessions.values():
+            if sess.pending_name is not None:
+                names.add(sess.pending_name)
+            if sess.launch is not None and not sess.removed:
+                names.add(sess.launch.name)
+                ids.add(sess.launch.id)
+        return frozenset(names), frozenset(ids)
 
     # -- internals -------------------------------------------------------- #
 
@@ -568,6 +603,11 @@ class ClaudeBgAdapter:
         if sess is None:
             raise AdapterDeliveryError(f"unknown session {handle.session_id}")
         return sess
+
+    @staticmethod
+    def _refuse_if_halted(handle: SessionHandle, sess: _Session) -> None:
+        if sess.halted:
+            raise AdapterDeliveryError(f"session {handle.session_id} is halted")
 
     def _session_for_health(self, handle: SessionHandle) -> _Session:
         sess = self._sessions.get(handle)

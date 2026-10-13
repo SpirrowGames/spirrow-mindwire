@@ -784,3 +784,116 @@ async def test_pending_launch_never_listed_expires_after_the_settle_window() -> 
     assert len(expired) == 1 and expired[0].fields["name"] == late
     rec = adapter.last_launch(handle)
     assert rec is not None and adapter.pending_launch(handle) is None
+
+
+# --------------------------------------------------------------------------- #
+# Delivery/halt serialization and sweep protection (PR-gate on #481 @ 6d418ea)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_halt_during_planning_refuses_the_launch() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    entered, release = asyncio.Event(), asyncio.Event()
+    inner = adapter._planner
+
+    async def slow_planner(h: SessionHandle, e: ChatroomEvent, clean: bool | None) -> BgTurnPlan:
+        entered.set()
+        await release.wait()
+        return await inner(h, e, clean)
+
+    adapter._planner = slow_planner
+    delivery = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await entered.wait()
+    first = asyncio.create_task(adapter.halt(handle))
+    second = asyncio.create_task(adapter.halt(handle))
+    await asyncio.sleep(0)
+    # Neither halt may report success while the delivery is still in flight.
+    assert not first.done() and not second.done()
+    release.set()
+    with pytest.raises(AdapterDeliveryError, match="halted"):
+        await delivery
+    await first
+    await second
+    assert cli.count("--bg") == 0 and cli.agents == []
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_halt_during_launch_removes_what_the_launch_started() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    original = cli.run
+    detached, release = asyncio.Event(), asyncio.Event()
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        res = await original(argv, cwd=cwd)
+        if list(argv[1:2]) == ["--bg"]:
+            detached.set()
+            await release.wait()
+        return res
+
+    cli.run = run  # type: ignore[method-assign]
+    delivery = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await detached.wait()
+    halting = asyncio.create_task(adapter.halt(handle))
+    await asyncio.sleep(0)
+    assert not halting.done()
+    release.set()
+    await delivery  # the launch was already under way; the halt owns its cleanup
+    await halting
+    assert cli.agents == []
+    assert cli.count("stop") == 1 and cli.count("rm") == 1
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_sweep_before_adoption_leaves_the_pending_launch_alone() -> None:
+    import asyncio
+
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    original = cli.run
+    detached, release = asyncio.Event(), asyncio.Event()
+
+    async def run(argv: Sequence[str], *, cwd: str) -> CommandResult:
+        res = await original(argv, cwd=cwd)
+        if list(argv[1:2]) == ["--bg"]:
+            detached.set()
+            await release.wait()
+        return res
+
+    cli.run = run  # type: ignore[method-assign]
+    delivery = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await detached.wait()
+    name = adapter.pending_launch(handle)
+    assert name is not None
+    # The conductor has not recorded this launch yet, so live_ids does not name it.
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == () and report.failed == ()
+    assert cli.count("stop") == 0 and [a["name"] for a in cli.agents] == [name]
+    release.set()
+    await delivery
+    rec = adapter.last_launch(handle)
+    assert rec is not None and rec.name == name
+    # Adopted but still not in live_ids: still the adapter's, still not an orphan.
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == () and [a["id"] for a in cli.agents] == [rec.id]
+
+
+@pytest.mark.anyio
+async def test_sweep_still_reaps_a_managed_session_nobody_owns() -> None:
+    cli = FakeCli()
+    adapter, handle, _, _ = await _setup(cli)
+    await adapter.deliver_event(handle, _event())
+    rec = adapter.last_launch(handle)
+    assert rec is not None
+    cli.agents.append(_agent("cdcdcdcd", "T-other-r1-abcdef"))
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == ("cdcdcdcd",)
+    assert [a["id"] for a in cli.agents] == [rec.id]
