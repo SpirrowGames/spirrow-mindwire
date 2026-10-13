@@ -322,6 +322,34 @@ def test_example_config_model_policy_section_matches_defaults() -> None:
     assert ModelPolicyConfig(**data["model_policy"]) == ModelPolicyConfig()
 
 
+_DEFAULTED_LISTS = ("sonnet_forbidden_paths", "docs_config_globs", "revision_markers")
+
+
+def test_example_config_leaves_policy_lists_to_code_defaults() -> None:
+    """The lists stay commented out so a copied example cannot pin stale values (#480 advisory),
+    yet the commented text must still mirror the code defaults when uncommented."""
+    import tomllib
+
+    example = Path(__file__).resolve().parents[1] / "deploy" / "mindwire.toml.example"
+    text = example.read_text(encoding="utf-8")
+    data = tomllib.loads(text)
+    for key in _DEFAULTED_LISTS:
+        assert key not in data["model_policy"]
+    section = text[text.index("[model_policy]") :]
+    section = section[: section.index("\nrecent_window")]
+    # Uncomment only the TOML lines of the defaulted lists: the key line, its items, the closer.
+    toml_lines = [
+        line[2:]
+        for line in section.splitlines()
+        if line.startswith(tuple(f"# {k} =" for k in _DEFAULTED_LISTS))
+        or line.startswith(("#   ", "# ]"))
+    ]
+    parsed = tomllib.loads("\n".join(toml_lines))
+    defaults = ModelPolicyConfig()
+    for key in _DEFAULTED_LISTS:
+        assert tuple(parsed[key]) == getattr(defaults, key)
+
+
 @pytest.mark.parametrize(
     "bad",
     [

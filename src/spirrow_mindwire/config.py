@@ -668,11 +668,11 @@ class ModelPolicyConfig(_StrictModel):
         "scripts/head_skip_decide.py",
         "scripts/parked_humans.py",
         "scripts/pr_review_sweep_*",
-        "deploy/**/*Sweep*",
         "deploy/**/*sweep*",
     )
     """C3: a planned file matching any of these forces Opus (Conductor state-transition code:
-    head_skip / handoff / sweep / stand_down / parked — msg-6788 condition 3, msg-6810 C3)."""
+    head_skip / handoff / sweep / stand_down / parked — msg-6788 condition 3, msg-6810 C3).
+    C3 matches case-insensitively, so ``*sweep*`` also covers ``SweepFairness.ps1``."""
 
     docs_config_globs: tuple[str, ...] = (
         "docs/**",
