@@ -130,7 +130,7 @@ def test_every_actionable_v2_kind_is_annotated_with_its_p(kind: TierCVerdictKind
     )
     assert ann is not None
     assert (ann.ask_score, ann.matched_rule, ann.msg_id, ann.decision_id) == (0.42, "R2", "m3", "d")
-    assert ann.questions_version == "tierc-v3"
+    assert ann.questions_version == "tierc-v4"
 
 
 def _null_result() -> DecisionResult:

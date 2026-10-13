@@ -3,7 +3,8 @@
 Spec: Bohr msg-4634 DECIDED 2d-2 (no Jev column in the labellers' files — checked column by
 column; out-of-scope rows excluded), msg-4636 DECIDED 2d-3 (tests 19 / 21: no state rebuild, rows
 without the point-in-time columns excluded), msg-4639 DECIDED 2d-4 / 2d-6
-(one registered version only, ``tierc-v3`` since 2d-15; ``following`` = 3, constants from
+(one registered version only, ``tierc-v4`` since T-jev-tierc-audit-2026-10-12 F3;
+``following`` = 3, constants from
 ``build_tierc_eval_fixture``), msg-4641 DECIDED 2d-7 (tests 20, 22a-22d: terminated / quiet
 threads, the 72-hour boundary, determinism) and msg-4643 DECIDED 2d-8
 (tests 22e-22g: the ``--as-of`` cut comes first). Test 18 lives in ``test_decider_step2.py``.
@@ -76,7 +77,7 @@ def _row(
     latest: str | None = "msg-6",
     routed: str = "stop",
     sha: str | None = SHA,
-    version: str = "tierc-v3",
+    version: str = "tierc-v4",
     logged_at: str | None = None,
     wire: bool = True,
 ) -> dict[str, Any]:
@@ -421,7 +422,7 @@ def test_outputs_join_in_tierc_eval_report() -> None:
         (("T-b", 2), "msg-2", "Bohr", "q"),
     ]
     assert all(r.live_entry and r.roster_source == "logged" for r in joined)
-    assert all(r.questions_version == "tierc-v3" and r.ask_score == 0.3 for r in joined)
+    assert all(r.questions_version == "tierc-v4" and r.ask_score == 0.3 for r in joined)
     assert [r.following_n for r in joined] == [3, 3]
     assert {(m["thread_id"], m["round_index"]) for m in materials} == {r.key for r in joined}
     assert [f["conductor_round_index"] for f in fixture] == [1, 1]

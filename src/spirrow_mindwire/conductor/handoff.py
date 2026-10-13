@@ -1155,6 +1155,12 @@ _TIER_C_LABEL_GUIDANCE = (
     "`other:<reason>` or a missing label is not a Tier-C admission: if none of the "
     f"{_TIER_C_COUNT_WORD} applies, it is not Tier-C, "
     "so decide it yourself and proceed."
+    # T-jev-tierc-audit-2026-10-12 F2'' (Bohr msg-6873, endorsed by Einstein msg-6874): written at
+    # the end, after the reasoning — never "conclusion first" (Einstein msg-6872) — and moved to
+    # the front of the Tier-C Decider's 500-char head by ``decider.hook.head_summary_for``. Its own
+    # line, so the ``TIER-C:`` line format (and the label gate parsing it) is untouched.
+    f" When you hand to `{HUMAN_TOKEN}`, write `ASK: <what you need the human to decide, in one "
+    "line>` on the line directly above the `TIER-C:` line."
 )
 
 _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
