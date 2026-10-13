@@ -7,7 +7,7 @@ operator check on that host (Bohr msg-6937), not something a CI runner can prove
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -71,6 +71,7 @@ class FakeCli:
     list_fails: bool = False
     rm_fails: bool = False
     rm_keeps: bool = False
+    before_rm: Callable[[], Awaitable[None]] | None = None
     git_dirty: bool = False
     calls: list[list[str]] = field(default_factory=list)
 
@@ -98,6 +99,8 @@ class FakeCli:
         if sub == "stop":
             return CommandResult(0, "", "")
         if sub == "rm":
+            if self.before_rm is not None:
+                await self.before_rm()
             if self.rm_fails:
                 return CommandResult(1, "", "rm refused")
             if not self.rm_keeps:
@@ -409,23 +412,60 @@ async def test_halt_stops_then_removes_and_is_idempotent() -> None:
     assert (await adapter.health(handle)).state is SessionState.HALTED
 
 
+@pytest.mark.parametrize(
+    ("mode", "match"), [("rm_fails", "rm refused"), ("rm_keeps", "still listed")]
+)
 @pytest.mark.anyio
-async def test_rm_failure_is_halt_error() -> None:
+async def test_failed_halt_cleanup_stays_halting_and_is_retried(mode: str, match: str) -> None:
     cli = FakeCli()
     adapter, handle, _, _ = await _setup(cli)
     await adapter.deliver_event(handle, _event())
-    cli.rm_fails = True
-    with pytest.raises(AdapterHaltError):
+    setattr(cli, mode, True)
+    with pytest.raises(AdapterHaltError, match=match):
         await adapter.halt(handle)
+    status = await adapter.health(handle)
+    assert status.state is SessionState.HALTING
+    assert status.details == {"bg_id": "d6390382"}
+    # Still failing: the retry runs (not a silent no-op) and raises again.
+    with pytest.raises(AdapterHaltError, match=match):
+        await adapter.halt(handle)
+    assert cli.count("rm") == 2
+    # Cleanup becomes possible: the next halt removes it and confirms absence.
+    setattr(cli, mode, False)
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert cli.count("rm") == 3
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+    await adapter.halt(handle)  # settled: idempotent from here
+    assert cli.count("rm") == 3
 
 
 @pytest.mark.anyio
-async def test_rm_that_leaves_the_session_listed_is_halt_error() -> None:
-    cli = FakeCli(rm_keeps=True)
+async def test_halt_cancelled_during_cleanup_is_retried_by_the_next_halt() -> None:
+    import asyncio
+
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def hang() -> None:
+        entered.set()
+        await gate.wait()
+
+    cli = FakeCli()
     adapter, handle, _, _ = await _setup(cli)
     await adapter.deliver_event(handle, _event())
-    with pytest.raises(AdapterHaltError, match="still listed"):
-        await adapter.halt(handle)
+    cli.before_rm = hang
+    task = asyncio.create_task(adapter.halt(handle))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [a["id"] for a in cli.agents] == ["d6390382"]
+    assert (await adapter.health(handle)).state is SessionState.HALTING
+    cli.before_rm = None
+    await adapter.halt(handle)
+    assert cli.agents == []
+    assert (await adapter.health(handle)).state is SessionState.HALTED
 
 
 @pytest.mark.anyio

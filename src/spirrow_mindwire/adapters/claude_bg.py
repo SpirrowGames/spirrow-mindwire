@@ -383,6 +383,12 @@ class _Session:
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+def _unsettled(sess: _Session) -> bool:
+    """True while halt() still owes cleanup: a pending launch name, or an adopted
+    session whose removal has not been confirmed."""
+    return sess.pending_name is not None or (sess.launch is not None and not sess.removed)
+
+
 def mint_name(thread_id: str, round_: int, nonce: str | None = None) -> str:
     return f"{thread_id}-r{round_}-{nonce or secrets.token_hex(3)}"
 
@@ -475,11 +481,13 @@ class ClaudeBgAdapter:
 
         The handle refuses further turns from the first call on. It is idempotent only
         once nothing is left unsettled: while a launch name is still pending (not yet
-        listed, within the settle window) every call reconciles again and raises
-        :class:`AdapterHaltError`, and health() reports HALTING rather than HALTED.
+        listed, within the settle window) or an adopted session is not yet confirmed
+        removed (``rm`` failed, the id stayed listed, or the cleanup was cancelled),
+        every call retries and raises :class:`AdapterHaltError` until cleanup is
+        confirmed, and health() reports HALTING rather than HALTED.
         """
         sess = self._sessions.get(handle)
-        if sess is None or (sess.halted and sess.pending_name is None):
+        if sess is None or (sess.halted and not _unsettled(sess)):
             return
         sess.halted = True
         await self._reconcile_pending(sess)
@@ -489,9 +497,13 @@ class ClaudeBgAdapter:
     async def health(self, handle: SessionHandle) -> HealthStatus:
         sess = self._session_for_health(handle)
         if sess.halted:
-            if sess.pending_name is not None:
-                details = {"pending": sess.pending_name}
-                return HealthStatus(SessionState.HALTING, sess.last_active_at, None, details)
+            if _unsettled(sess):
+                owed: dict[str, str] = {}
+                if sess.pending_name is not None:
+                    owed["pending"] = sess.pending_name
+                if sess.launch is not None and not sess.removed:
+                    owed["bg_id"] = sess.launch.id
+                return HealthStatus(SessionState.HALTING, sess.last_active_at, None, owed)
             return HealthStatus(SessionState.HALTED, sess.last_active_at, None, {})
         if sess.launch is None or sess.removed:
             return HealthStatus(SessionState.IDLE, sess.last_active_at, None, {})
