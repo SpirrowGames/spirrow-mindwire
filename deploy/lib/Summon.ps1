@@ -63,8 +63,11 @@ function ConvertFrom-ActiveSummonJson {
         $kind = "$($root.ValueKind)"
         if ($kind -eq 'Null') { return $none }
         if ($kind -ne 'Object') { return $bad }
-        # Last occurrence wins on a duplicated key, as in Python's json.
-        $props = @{}
+        # Last occurrence wins on a duplicated key, as in Python's json. Keys are matched ORDINALLY
+        # (case-sensitive), as Python's dict does: a PowerShell @{} is case-insensitive, which made
+        # {"THREAD_ID": ...} valid here while Python reads it as missing thread_id (malformed), and
+        # let a case-variant duplicate overwrite the exact key (PR #475 review).
+        $props = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
         foreach ($p in $root.EnumerateObject()) { $props[$p.Name] = $p.Value }
         $fields = @{}
         foreach ($name in 'thread_id', 'since', 'by') {

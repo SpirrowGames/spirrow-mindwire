@@ -609,8 +609,9 @@ foreach ($case in $contractDoc.RootElement.GetProperty('cases').EnumerateArray()
     $kind = $expect.GetProperty('kind').GetString()
     $ok = $r.kind -eq $kind
     if ($ok -and $kind -eq 'valid') {
-        $ok = $r.thread_id -eq $expect.GetProperty('thread_id').GetString() -and
-              $r.by -eq $expect.GetProperty('by').GetString() -and
+        # -ceq: PowerShell's -eq ignores case, which would hide a case-folding parser.
+        $ok = $r.thread_id -ceq $expect.GetProperty('thread_id').GetString() -and
+              $r.by -ceq $expect.GetProperty('by').GetString() -and
               $r.since -eq (ConvertFrom-SummonSince -Value $expect.GetProperty('since').GetString())
     }
     Check "contract: $name -> $kind" $ok "got kind=$($r.kind) thread=$($r.thread_id) since=$($r.since)"
