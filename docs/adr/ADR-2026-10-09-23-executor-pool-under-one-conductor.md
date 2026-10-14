@@ -2,7 +2,7 @@
 
 > **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。msg-6739 からの逐語転記のうち、ホスト名だけはこの規約に従って置き換えている。
 
-- **Status**: Accepted（決定 D1〜D17 は takahito 承認済み — Fermi `T-executor-pool-under-one-conductor` msg-6739。設計 v1.2 は Einstein msg-6765 で go、確定版は Bohr msg-6766）。**2026-10-13 改訂:** D6 を takahito の指示（msg-6854「mindwireに関する事をconclairに依存させるべきじゃない。どうしてもMindwireに閉じることが出来ないのであればオーケストレーターのmagickitにすべき」）により改訂。改訂案は Bohr msg-6890・msg-6892、設計レビューは Einstein（msg-6891 の指摘を msg-6892 で反映し、その後 go）。**2026-10-14 改訂（PR-gate レビュー待ち）:** D12 の本文を D6 に合わせて改訂（takahito 指示「B: D12 の本文を D6 に合わせて書き換え、新しいコミットを push し、そのコミットのレビュー後に ADR を受け入れる」）。この改訂の受け入れは、改訂コミットのレビュー後とする
+- **Status**: Accepted（決定 D1〜D17 は takahito 承認済み — Fermi `T-executor-pool-under-one-conductor` msg-6739。設計 v1.2 は Einstein msg-6765 で go、確定版は Bohr msg-6766）。**2026-10-13 改訂:** D6 を takahito の指示（msg-6854「mindwireに関する事をconclairに依存させるべきじゃない。どうしてもMindwireに閉じることが出来ないのであればオーケストレーターのmagickitにすべき」）により改訂。改訂案は Bohr msg-6890・msg-6892、設計レビューは Einstein（msg-6891 の指摘を msg-6892 で反映し、その後 go）。**2026-10-14 改訂:** D12 の本文を D6 に合わせて改訂（takahito 指示「B: D12 の本文を D6 に合わせて書き換え、新しいコミットを push し、そのコミットのレビュー後に ADR を受け入れる」）。この改訂の受け入れは、改訂コミットのレビュー後とする。**2026-10-15 受け入れ:** 改訂コミット 7eef793 の PR-gate 判定は COMMENT（msg-6970）。内容への指摘はなく、レビュー回数の上限による人への差し戻しだけだった。takahito の指示（msg-6970 への返信「B: COMMENT 判定が挙げる懸念を追加のコミットで直し、そのコミットで ADR-23 を受け入れる」）により、直すべき懸念がないことを確認し、このコミットで D6・D12 の改訂を含めて受け入れる
 - **Date**: 2026-10-09
 - **Scope**: 開発機の拡張（実行機を複数台にする）に伴う、ループの実行トポロジ。中央の Conductor 1 本が、能力を宣言した実行機のプールにターンを振り分ける。本 ADR は決定事項・段階表・未決の数値・単位間の要件を記録する。各単位の詳細 spec は単位ごとのスレッドで確定する（単位 1 = 本スレッド msg-6766）。
 - **Author**: Heisenberg (implementer) — 起票 chatroom thread `T-executor-pool-under-one-conductor`
