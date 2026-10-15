@@ -126,7 +126,7 @@ from ..value_objects import (
     SessionHandle,
     ThreadRef,
 )
-from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
+from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
     RELAY_AUTHOR,
@@ -181,6 +181,14 @@ from .stand_down import (
     stand_down_event,
 )
 from .stop_marker import render_stop_marker
+from .summon import (
+    ActiveSummon,
+    ResumeNotice,
+    SummonReadKind,
+    parse_active_summon,
+    render_resume_notice,
+    summon_yield_decision,
+)
 from .tierc_gate import (
     TierCGate,
     bounced_msg_id,
@@ -378,6 +386,24 @@ class StopReason(StrEnum):
     # that prints the ``conductor stopped: reason=adapter_error …`` line, reading the state the
     # conductor left in :class:`ConductorStopSlot`.
     ADAPTER_ERROR = "adapter_error"
+    # T-human-call-priority-interrupt (Bohr msg-6743 §3 / msg-6755 v1.6 §4): an active Summon
+    # covers this thread (same project, or its project owns the repository this run writes to) and
+    # this thread is not that Summon — or is a later one in the ``(since, thread_id)`` order. Read
+    # at the round boundary, after the handoff of the previous round was posted, so stopping here
+    # is safe. Not terminal: like ``hold`` the head is still live, nothing is posted, nobody is
+    # notified, and the sweep relaunches the thread once the Summon is gone. The stop line carries
+    # ``yield_to=<thread_id>`` so the sweep can record whom it yielded to (I-SY1 / I-SY2).
+    SUMMON_YIELD = "summon_yield"
+
+
+class SummonOwnerSource(Protocol):
+    """The owning project's ``loop_control_get``, raw (:meth:`.control.LoopControlReader.fetch`).
+
+    Raw, because the owner read fails differently from the own read: unreachable is fail-open
+    (``None`` here), and only a malformed ``active_summon`` stops the run (v1 / v1.1).
+    """
+
+    async def fetch(self) -> Any | None: ...
 
 
 @dataclass(frozen=True)
@@ -409,6 +435,9 @@ class ConductorStopSnapshot:
     forced: int
     forced_saveable: int
     error_code: str
+    # Summon (v1.4): a resume notice already sent earlier in this run is still reported on the
+    # adapter-error stop line, so the sweep does not deliver it twice.
+    resume_notice_delivered: bool = False
 
 
 @dataclass
@@ -501,6 +530,9 @@ class Conductor:
         decisions_log_path: Path | None = None,
         run_phase: RunPhase | None = None,
         gate_only: bool = False,
+        summon_owner_project: str | None = None,
+        summon_owner_control: SummonOwnerSource | None = None,
+        resume_notice: ResumeNotice | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -611,6 +643,21 @@ class Conductor:
         # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
+        # Summon (T-human-call-priority-interrupt, v1.6 §4). The project owning the repository this
+        # run writes to, handed down by the sweep (``--summon-owner-project``) only when it differs
+        # from this thread's project, and the reader for its ``loop_control_get``. ``None`` = only
+        # the own project's Summon is in scope. ``_summon_yield_to`` is set by ``_read_control``
+        # each round: the Summon thread this run must yield to, or ``None``.
+        self._summon_owner_project = summon_owner_project
+        self._summon_owner_control = summon_owner_control
+        self._summon_yield_to: str | None = None
+        # Resume notice (v1.4 single lifecycle). Set when the sweep passed ``--resume-notice-*``:
+        # this thread had yielded to a Summon. Attached to the FIRST role turn this run sends (only
+        # when ``main`` moved), and ``_resume_notice_delivered`` is raised once that turn was sent —
+        # empty range or not — so the stop line says ``resume_notice=delivered`` and the sweep
+        # clears its record. The conductor reads and writes no file for this (I-SY3).
+        self._resume_notice = resume_notice
+        self._resume_notice_delivered = False
         # D-4' G3 (veto form, msg-5219 / Bohr msg-5229 R3'): the Decider's veto answer for ONE
         # head, keyed by that head's msg id (``_prefetch_proceed_veto``) as
         # ``(head_id, vetoed, ask_score)``. ``_route`` is synchronous and the Decider is not, so
@@ -666,6 +713,23 @@ class Conductor:
             if await self._read_control() is ControlState.HOLD:
                 return self._stop(
                     round_index, StopReason.HOLD, processed_msg_id, forced, forced_saveable
+                )
+            # Summon (v1.6 §4): read off the same control response(s), after HOLD (HOLD → quarantine
+            # → Summon). A round boundary is after the previous round's handoff was posted.
+            if self._summon_yield_to is not None:
+                logger.info(
+                    "conductor.summon_yield thread=%s yield_to=%s round=%d",
+                    self._thread_ref.thread_id,
+                    self._summon_yield_to,
+                    round_index,
+                )
+                return self._stop(
+                    round_index,
+                    StopReason.SUMMON_YIELD,
+                    processed_msg_id,
+                    forced,
+                    forced_saveable,
+                    yield_to=self._summon_yield_to,
                 )
             messages = await self._fetch_messages()
             if not messages:
@@ -2119,12 +2183,47 @@ class Conductor:
         control source is unreachable": the former is the pre-inversion behaviour, the latter stops
         the loop.
         """
+        self._summon_yield_to = None
         if self._control is None:
             return self._control_state
-        state = await self._control.read()
+        snapshot = await self._control.read_snapshot()
+        state = snapshot.state
+        owner_summon: ActiveSummon | None = None
+        if state is not ControlState.HOLD and self._summon_owner_project:
+            # The owning project's Summon (v1.1 指摘 2, msg-6745). Its transport failing is
+            # fail-open — this run then sees only its own project's Summon (msg-6743 §3) — but a
+            # malformed ``active_summon`` fails safe to HOLD, as the own project's does.
+            malformed, owner_summon = await self._read_owner_summon()
+            if malformed:
+                state = FAILSAFE_CONTROL_STATE
         self._control_state = state
         await self._control.report_observed(state)
+        if state is not ControlState.HOLD:
+            self._summon_yield_to = summon_yield_decision(
+                project=self._thread_ref.project_id,
+                thread_id=self._thread_ref.thread_id,
+                own_summon=snapshot.summon,
+                owner_project=self._summon_owner_project,
+                owner_summon=owner_summon,
+            )
         return state
+
+    async def _read_owner_summon(self) -> tuple[bool, ActiveSummon | None]:
+        """``(malformed, summon)`` for the owning project. Unreadable = ``(False, None)``."""
+        if self._summon_owner_control is None:
+            return False, None
+        payload = await self._summon_owner_control.fetch()
+        if payload is None:
+            return False, None
+        read = parse_active_summon(payload)
+        if read.kind is SummonReadKind.MALFORMED:
+            logger.warning(
+                "loop control: owner project %r has a malformed active_summon — failing safe to %s",
+                self._summon_owner_project,
+                FAILSAFE_CONTROL_STATE.value,
+            )
+            return True, None
+        return False, read.summon
 
     def _segment_declares_tier_c(self, messages: list[dict[str, Any]]) -> bool:
         """D-4' G1: has anyone declared a Tier-C since the human last spoke?
@@ -2817,6 +2916,7 @@ class Conductor:
         messages: list[dict[str, Any]],
         *,
         retry_notice: str | None = None,
+        resume_notice: str | None = None,
     ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
@@ -2848,6 +2948,7 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
             retry_notice=retry_notice,
+            resume_notice=resume_notice,
         )
 
     async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
@@ -2937,6 +3038,20 @@ class Conductor:
         T-retry-once-before-quarantine notice: see :func:`.retry_notice.retry_notice_for`.
         """
         notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
+        # Resume notice (v1.4): only on the first role turn this run sends, and only once.
+        resume_text: str | None = None
+        first_resume_dispatch = False
+        if self._resume_notice is not None and not self._resume_notice_delivered:
+            first_resume_dispatch = True
+            resume_text = render_resume_notice(self._resume_notice)
+            logger.info(
+                "resume-notice summons=%s range=%s..%s: dispatching role=%s, notice=%s",
+                ",".join(self._resume_notice.summons),
+                self._resume_notice.main_from,
+                self._resume_notice.main_to,
+                role.value,
+                "attached" if resume_text is not None else "none (main did not move)",
+            )
         if self._retry_of is not None and rounds == 0:
             logger.info(
                 "retry-of %s@%s: dispatching role=%s, notice=%s",
@@ -2948,7 +3063,8 @@ class Conductor:
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
                 await self._dispatcher.dispatch(
-                    handle, self._to_event(msg, messages, retry_notice=notice)
+                    handle,
+                    self._to_event(msg, messages, retry_notice=notice, resume_notice=resume_text),
                 )
         except asyncio.CancelledError:
             # A cancellation is the wall-clock budget taking the run back (msg-5498 W-1), not an
@@ -2967,8 +3083,12 @@ class Conductor:
                     forced=forced,
                     forced_saveable=forced_saveable,
                     error_code=adapter_error_code(exc),
+                    resume_notice_delivered=self._resume_notice_delivered,
                 )
             raise
+        if first_resume_dispatch:
+            # The turn was sent (the dispatch returned): the sweep may now clear its record.
+            self._resume_notice_delivered = True
         return None
 
     async def _post_git_sync_park(self, park: GitSyncParkError) -> str:
@@ -3153,19 +3273,24 @@ class Conductor:
         forced_saveable: int = 0,
         *,
         stop_class: StopClass | None = None,
+        yield_to: str | None = None,
     ) -> ConductorOutcome:
         # ``stop_class=`` is appended only on a ``NEXT: none`` settle (see ``_none_stop_class``),
         # after ``last_msg=``: the wrapper reads each ``key=`` with its own match
-        # (Get-ConductorVerdict), so a field it does not know is ignored.
+        # (Get-ConductorVerdict), so a field it does not know is ignored. Summon (v1.5 / v1.6):
+        # ``yield_to=`` only on SUMMON_YIELD, and ``resume_notice=delivered`` whenever this run sent
+        # the turn carrying the resume notice — both can appear on one line (I-SY5).
         logger.info(
             "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
-            "forced_naysayer_saveable=%d last_msg=%s%s",
+            "forced_naysayer_saveable=%d last_msg=%s%s%s%s",
             reason.value,
             rounds,
             forced,
             forced_saveable,
             last_msg_id,
             f" stop_class={stop_class.value}" if stop_class is not None else "",
+            f" yield_to={yield_to}" if yield_to else "",
+            " resume_notice=delivered" if self._resume_notice_delivered else "",
         )
         return ConductorOutcome(
             rounds=rounds,

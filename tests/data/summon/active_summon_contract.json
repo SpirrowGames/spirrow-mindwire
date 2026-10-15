@@ -1,0 +1,27 @@
+{
+  "_canonical": "CANONICAL COPY: SpirrowGames/spirrow-mindwire tests/data/summon/active_summon_contract.json (T-human-call-priority-interrupt, Bohr msg-6800 v1.7 / msg-6802 v1.8). Change this file FIRST, then copy it byte-for-byte to every copy listed in _copies.",
+  "_copies": [
+    "magickit / conclair server tests (the Summon server-side thread): a byte-identical copy, checked against the loop_control_get response"
+  ],
+  "_contract": "loop_control_get carries active_summon. Key absent or null: no Summon. {thread_id: non-blank string, since: ISO 8601 with an explicit offset (Z or +hh:mm), at most 6 fractional digits, by: non-blank string}: a Summon (extra keys are ignored; key names match case-sensitively, so a case-variant key is an extra key). Anything else: malformed, which fails safe to HOLD. Read by spirrow_mindwire.conductor.summon.parse_active_summon (Python) and ConvertFrom-ActiveSummon in deploy/lib/Summon.ps1 (PowerShell).",
+  "cases": [
+    {"name": "key absent", "payload": {"project": "p", "desired_state": "run"}, "expect": {"kind": "none"}},
+    {"name": "null", "payload": {"project": "p", "desired_state": "run", "active_summon": null}, "expect": {"kind": "none"}},
+    {"name": "valid Z", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03Z", "by": "takahito"}}, "expect": {"kind": "valid", "thread_id": "T-a", "since": "2026-10-09T01:02:03Z", "by": "takahito"}},
+    {"name": "valid fraction and offset", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-b", "since": "2026-10-09T10:02:03.123456+09:00", "by": "Fermi"}}, "expect": {"kind": "valid", "thread_id": "T-b", "since": "2026-10-09T01:02:03.123456Z", "by": "Fermi"}},
+    {"name": "valid with extra key", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-c", "since": "2026-10-09T01:02:03Z", "by": "takahito", "note": "x"}}, "expect": {"kind": "valid", "thread_id": "T-c", "since": "2026-10-09T01:02:03Z", "by": "takahito"}},
+    {"name": "not an object", "payload": {"project": "p", "desired_state": "run", "active_summon": "T-a"}, "expect": {"kind": "malformed"}},
+    {"name": "array", "payload": {"project": "p", "desired_state": "run", "active_summon": [{"thread_id": "T-a"}]}, "expect": {"kind": "malformed"}},
+    {"name": "missing thread_id", "payload": {"project": "p", "desired_state": "run", "active_summon": {"since": "2026-10-09T01:02:03Z", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "blank thread_id", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": " ", "since": "2026-10-09T01:02:03Z", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "numeric thread_id", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": 7, "since": "2026-10-09T01:02:03Z", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "missing since", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "since without offset", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "since not a timestamp", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "yesterday", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "since with 7 fractional digits", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03.1234567Z", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "missing by", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03Z"}}, "expect": {"kind": "malformed"}},
+    {"name": "blank by", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03Z", "by": ""}}, "expect": {"kind": "malformed"}},
+    {"name": "key names are case-sensitive", "payload": {"project": "p", "desired_state": "run", "active_summon": {"THREAD_ID": "T-a", "since": "2026-10-09T01:02:03Z", "by": "takahito"}}, "expect": {"kind": "malformed"}},
+    {"name": "a case-variant key is an extra key, not the field", "payload": {"project": "p", "desired_state": "run", "active_summon": {"thread_id": "T-a", "since": "2026-10-09T01:02:03Z", "By": "x", "by": "takahito", "Thread_Id": "T-z"}}, "expect": {"kind": "valid", "thread_id": "T-a", "since": "2026-10-09T01:02:03Z", "by": "takahito"}}
+  ]
+}

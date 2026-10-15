@@ -669,6 +669,69 @@ class TurnConfig(_StrictModel):
     git: TurnGitConfig = Field(default_factory=TurnGitConfig)
 
 
+class ModelPolicyConfig(_StrictModel):
+    """``[model_policy]`` — the per-turn ``--model`` allow-list (T-spawn-via-claude-bg PR-A).
+
+    Read by :func:`spirrow_mindwire.conductor.model_policy.choose_model`. Opus is the default; the
+    lists below only ever *narrow* when Sonnet may be used (msg-6788: the Sonnet conditions are a
+    closed allow-list). Every glob is matched against a repo-relative, ``/``-separated path; ``**``
+    spans directories, ``*`` and ``?`` do not.
+    """
+
+    opus_model: str = "claude-opus-5-5"
+    sonnet_model: str = "claude-sonnet-5-5"
+
+    sonnet_forbidden_paths: tuple[str, ...] = (
+        "src/spirrow_mindwire/conductor/head_skip.py",
+        "src/spirrow_mindwire/conductor/handoff.py",
+        "src/spirrow_mindwire/conductor/stand_down.py",
+        "src/spirrow_mindwire/conductor/parked_lane.py",
+        "src/spirrow_mindwire/pr_review_sweep/**",
+        "scripts/head_skip_decide.py",
+        "scripts/parked_humans.py",
+        "scripts/pr_review_sweep_*",
+        "deploy/**/*sweep*",
+    )
+    """C3: a planned file matching any of these forces Opus (Conductor state-transition code:
+    head_skip / handoff / sweep / stand_down / parked — msg-6788 condition 3, msg-6810 C3).
+    C3 matches case-insensitively, so ``*sweep*`` also covers ``SweepFairness.ps1``."""
+
+    docs_config_globs: tuple[str, ...] = (
+        "docs/**",
+        "spec/**",
+        "tests/**",
+        "**/*.md",
+        "**/*.toml",
+        "**/*.toml.example",
+        "**/*.json.example",
+        "**/*.yaml",
+        "**/*.yml",
+    )
+    """C1 ``docs-config``: every planned file must match one of these (docs / config / tests)."""
+
+    revision_markers: tuple[str, ...] = ("仕様の誤り", "訂正", "revised", "supersede")
+    """C5: fixed substrings (case-insensitive) that mark a design whose instructions were
+    revised. A hit only ever pushes the turn to Opus."""
+
+    recent_window: int = Field(default=10, ge=1)
+    """C4a: how many of the thread's most recent messages the caller scans for REQUEST_CHANGES /
+    no-progress / malformed handoff."""
+
+    @field_validator(
+        "opus_model",
+        "sonnet_model",
+        "sonnet_forbidden_paths",
+        "docs_config_globs",
+        "revision_markers",
+    )
+    @classmethod
+    def _no_blank_entries(cls, v: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        entries = (v,) if isinstance(v, str) else v
+        if any(not e.strip() for e in entries):
+            raise ValueError("blank entries are not allowed")
+        return v
+
+
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.
 
@@ -695,6 +758,7 @@ class MindwireSettings(BaseSettings):
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
     tierc_gate: TierCGateConfig = Field(default_factory=TierCGateConfig)
     turn: TurnConfig = Field(default_factory=TurnConfig)
+    model_policy: ModelPolicyConfig = Field(default_factory=ModelPolicyConfig)
 
     @field_validator("schema_version")
     @classmethod

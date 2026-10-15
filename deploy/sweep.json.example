@@ -1,8 +1,34 @@
 {
   "_comment": [
     "Copy to <data_dir>/config/sweep.json and edit. Read by deploy/run-conductor-scheduled.ps1.",
-    "Order is priority: the sweep walks this list head-first and stops at the first candidate that",
-    "actually ran rounds. A thread NOT listed here is never picked up at all — silently.",
+    "This file holds the EXCEPTIONS; discovery is the default. Every live thread of a project in",
+    "clones is found each tick, whether or not it is listed below.",
+    "",
+    "clones (project -> the implementer's own absolute CLONE path) is the one place a discovered",
+    "thread's repo_dir comes from — it is never guessed from other candidates. Declare every",
+    "project you want discovery to work for, including ones that already have candidates (a",
+    "candidate's repo_dir applies only to that one thread). A shape error (not an object, a blank",
+    "key or value) stops the tick. A per-project environment problem (relative path, missing",
+    "directory, the daemon's own checkout, a linked worktree) does not: only that project's",
+    "threads are refused, with the reason, in the digest. A project with no clones entry is still",
+    "scanned and shown as 'clones 未登録'.",
+    "",
+    "intake is OPTIONAL: { mode: 'shadow' | 'on', max_idle_days: <positive number> }, default",
+    "shadow / 14. A live thread NOT listed below joins the tick's candidates only when ALL hold:",
+    "mode is 'on', its project's clone is usable, its last update (the listing's updated_at) is",
+    "at most max_idle_days old, and it is not in exclude. Otherwise it appears in the digest's",
+    "未登録（登録不可） section as 登録予定（shadow）, 放置, 時刻不明 (updated_at missing or",
+    "unparseable) or 登録不可 with the reason, or only as a count for 除外 — never silently",
+    "ignored, and never in any state file. Switch to 'on' only after a human has read the shadow",
+    "list; it is not the switch for keeping already-running threads alive (list those below).",
+    "",
+    "exclude is OPTIONAL: [\"<project>/<thread_id>\", ...] — discovered threads never to pick up.",
+    "",
+    "candidates: order is priority for the threads listed here — the sweep walks this list",
+    "head-first and stops at the first candidate that actually ran rounds; discovered threads come",
+    "after them (by clones order, then oldest update first). A listed thread is always a",
+    "candidate: mode, exclude, max_idle_days and the time checks never apply to it. A candidate's",
+    "repo_dir that differs from clones[project] gets a WARN in the tick log and is used as given.",
     "",
     "Each candidate needs all three fields. repo_dir is the implementer's own CLONE for that",
     "project (not a linked worktree, and never the checkout the daemon itself is running from —",
@@ -20,7 +46,8 @@
     "projects is OPTIONAL: chatroom projects whose open threads the park-wake tick reads and",
     "classifies (the digest's 停止理由 line) even when no candidate below names them, so a thread",
     "outside the sweep is not left unseen. The scan is the union of these and the candidates'",
-    "projects; nothing is launched for a project listed only here. Missing projects = the",
+    "projects; nothing is launched for a project listed only here. The scan for live threads NOT",
+    "listed below (discovery above) covers this union plus the clones keys. Missing projects = the",
     "candidates' projects only (behaviour before the key existed). A malformed value is named in",
     "the digest as 'sweep.json:projects' and scans nothing extra; it does not stop the sweep.",
     "",
@@ -30,6 +57,17 @@
   ],
   "projects": [
     "spirrow-magickit"
+  ],
+  "clones": {
+    "spirrow-mindwire": "C:/workspace/sandbox/mindwire-impl",
+    "spirrow-voxelworld": "C:/workspace/sandbox/voxelworld-impl"
+  },
+  "intake": {
+    "mode": "shadow",
+    "max_idle_days": 14
+  },
+  "exclude": [
+    "spirrow-mindwire/T-example-thread-not-to-discover"
   ],
   "owner_map": {
     "github.com/spirrowgames/spirrow-mindwire": "spirrow-mindwire",

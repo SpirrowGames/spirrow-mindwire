@@ -251,6 +251,10 @@ class ChatroomEvent:
     # the clone on, set by the dispatcher after ``pre_turn``. Information for the role session,
     # not a rule it must follow (D7). ``None`` (sync off) leaves the prompt byte-for-byte as before.
     git_branch: str | None = None
+    # T-human-call-priority-interrupt (v1.4): "this thread yielded to a Summon and main moved
+    # meanwhile". Same placement rules as ``retry_notice``; set only by the conductor
+    # (:mod:`spirrow_mindwire.conductor.summon`). ``None`` leaves the prompt unchanged.
+    resume_notice: str | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -141,7 +141,14 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # とは別物なので動かさない。proceed 用 (``tierc-v2-proceed``) は枠の文が不変なので動かさない。
 # ``matched_rule`` の ``criteria`` を配列から map に直したときも上げていない。選択肢と説明は
 # 不変で、配列の形の問いは Jev に一度も届いていない (全件 422) ∴ 読み方が変わる記録が無い。
-TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v3"
+#
+# ``tierc-v4`` (T-jev-tierc-audit-2026-10-12 F3, Bohr msg-6860 / msg-6871): 同じ問いに merge 依頼の
+# 除外文 (``_V2_MERGE_REQUEST_EXCLUSION``) を足したので上げた。権限・道具の不足の除外文は、本物の
+# 6286 / 一部本物の 6605 を下げたので落とした (msg-6871 §3: その依頼は ``NEXT: operator`` で渡す
+# 経路が既にある)。key / criteria / 五ヶ条 / 閾値は不変。v3 の記録は v3 のまま読む。
+# ``scripts/tierc_casebook.py`` の ``tierc-v4-candidate`` は記録専用の別の候補 set で、
+# この値とは無関係。
+TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v4"
 """v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
 問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
 
@@ -172,9 +179,17 @@ _V2_FIX_NOW_EXCLUSION = (
 
 五ヶ条本文 (Takahito 確定、実行時の正本は上書きされない toml) ではなく枠の文に置く
 — msg-5234 §3 (a)(b)。"""
+_V2_MERGE_REQUEST_EXCLUSION = (
+    "main への merge や gate の再発火を依頼するだけのハンドオフは、"
+    "それだけではどの条にも当たらない(merge される中身が仕様を変える場合は、その中身で判断する)。"
+)
+"""Takahito の常設方針「main への merge 依頼はそれだけでは Tier-C ではない」を枠の文にしたもの
+(T-jev-tierc-audit-2026-10-12 F3、逐語は Bohr msg-6860)。``_V2_FIX_NOW_EXCLUSION`` と同じく、
+五ヶ条本文ではなく枠の文に置く。``tierc-v4``。"""
 _V2_SHOULD_ASK_QUESTION = (
     "このハンドオフ(NEXT: human)は、五ヶ条のいずれかに当たり、人間に問うべきものか。"
     + _V2_FIX_NOW_EXCLUSION
+    + _V2_MERGE_REQUEST_EXCLUSION
 )
 _V2_MATCHED_RULE_INSTRUCTIONS = (
     "このハンドオフ(NEXT: human)が当たる五ヶ条のルールを 1 つ選べ。"

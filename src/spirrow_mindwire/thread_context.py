@@ -224,6 +224,9 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
             f"fast-forwarded by the loop before the turn. After the turn the loop pushes it if it "
             f"has new commits and switches the clone back to the default branch."
         )
+    # T-human-call-priority-interrupt (v1.4): the Summon resume notice, its own block likewise.
+    if event.resume_notice:
+        blocks.append(event.resume_notice)
     blocks.append(closing)
     return "\n\n".join(blocks)
 

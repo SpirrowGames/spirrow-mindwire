@@ -69,9 +69,9 @@ from tierc_selfneg import detect_self_negation, looks_quoted_or_fenced
 from spirrow_mindwire.decider.hook import BODY_HEAD_M
 from spirrow_mindwire.decider.questions import (
     SHOULD_ASK_HUMAN_KEY,
-    TIERC_ESCALATION_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
+    render_rules_bullets,
     tierc_v2_questions,
 )
 from spirrow_mindwire.decider.verdict import DEFAULT_V2_ASK_MIN, DEFAULT_V2_NOT_ASK_MAX
@@ -81,7 +81,18 @@ LOG_PREFIX = "decider_decision "
 REGISTERED_RULES_SHA256 = "159979a7ff2193b1ce8425a1f2b7501960a8d24885547922ee017664a72ccb1b"
 """``eval/tierc/shadow-prereg.md`` §2 — the rules file the live rows were asked under."""
 
-V3 = TIERC_ESCALATION_QUESTIONS_VERSION
+V3 = "tierc-v3"
+"""The question set the casebook rows were logged under. A literal, not the live
+``TIERC_ESCALATION_QUESTIONS_VERSION``: the live frame moved to ``tierc-v4``
+(T-jev-tierc-audit-2026-10-12 F3, Bohr msg-6871 §4) and measurement B must keep asking v3."""
+V3_RULES_HEADER = "次の五ヶ条は、AI エージェントが人間(Takahito)に問うべきものを定めている。"
+V3_SHOULD_ASK_QUESTION = (
+    "このハンドオフ(NEXT: human)は、五ヶ条のいずれかに当たり、人間に問うべきものか。"
+    "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
+    "順序・タイミングだけを問うハンドオフは、"
+    "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
+)
+"""The ``tierc-v3`` ``should_ask_human`` frame, pinned verbatim (main ``b224540``, msg-5234 §3)."""
 V4_CANDIDATE = "tierc-v4-candidate"
 V4_CANDIDATE_SENTENCE = (
     "本文自身が人の判断は不要・時期尚早と述べているハンドオフは、どの条にも当たらない。"
@@ -489,9 +500,16 @@ async def measure_a(out_dir: Path) -> list[dict[str, Any]]:
 
 
 def questions_for(variant: str, rules: TierCRules) -> dict[str, dict[str, Any]]:
-    """The live v3 set, or v3 with :data:`V4_CANDIDATE_SENTENCE` appended to the
-    ``should_ask_human`` frame. Nothing else differs."""
+    """The pinned v3 set (:data:`V3_SHOULD_ASK_QUESTION`), or v3 with
+    :data:`V4_CANDIDATE_SENTENCE` appended to the ``should_ask_human`` frame. Nothing else
+    differs. ``matched_rule`` is still built by the live ``tierc_v2_questions``; its frame did not
+    change in v4."""
     q = tierc_v2_questions(rules)
+    sa = dict(q[SHOULD_ASK_HUMAN_KEY])
+    sa["instructions"] = (
+        f"{V3_RULES_HEADER}\n{render_rules_bullets(rules)}\n\n{V3_SHOULD_ASK_QUESTION}"
+    )
+    q[SHOULD_ASK_HUMAN_KEY] = sa
     if variant == V3:
         return q
     if variant == V4_CANDIDATE:
@@ -857,7 +875,7 @@ def render_report(out_dir: Path, runs: int) -> str:
         "`tierc_casebook.decide` before any measurement was run.",
         "- Detector patterns: msg-6664 §2, verbatim. Implementer's choices made before the run: "
         "case-insensitive; one line at a time; the excluded-line prefixes are matched at column 0.",
-        f"- `{V4_CANDIDATE}` = the live `{V3}` set with this sentence appended to the "
+        f"- `{V4_CANDIDATE}` = the pinned `{V3}` set with this sentence appended to the "
         f"`should_ask_human` frame: 「{V4_CANDIDATE_SENTENCE}」",
         "- Set (ii) takes all three genuine classes (genuine / genuine-merge / genuine-action), "
         "the `genuine*` of `report.fulltext.md`.",
