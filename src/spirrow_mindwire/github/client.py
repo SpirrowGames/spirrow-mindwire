@@ -241,6 +241,20 @@ class OpenPrListingError(Exception):
 
 
 @dataclass(frozen=True)
+class PrHeadRow:
+    """One PR whose head branch is a given name (``GET /repos/{o}/{r}/pulls?head=...``).
+
+    Only what the git-sync hook's generation search reads (ADR-2026-10-09-23 D8, design v1.2
+    B-2): ``merged_at`` is set exactly when the PR was merged, so a squash merge (which leaves
+    no ancestry in git) is still seen as "this name is used".
+    """
+
+    number: int
+    state: str
+    merged_at: str | None
+
+
+@dataclass(frozen=True)
 class OpenPrListing:
     """A complete open-PR listing: the rows that parsed, and how many did not."""
 
@@ -478,6 +492,16 @@ class GitHubHTTPError(GitHubError):
         self.status_code = status_code
         self.retry_after = retry_after
         self.rate_limited = rate_limited
+
+
+class PrHeadListingShapeError(GitHubError):
+    """The head-filtered PR listing answered 2xx with a body this client cannot read.
+
+    Kept apart from :class:`GitHubHTTPError` on purpose: :func:`classify_http_error` reads a
+    ``status_code`` of ``None`` as a transport fault (retryable), and a malformed body is the
+    opposite — the same request will produce it again (design v1.2: レスポンス形式の不一致 =
+    恒久的なエラー).
+    """
 
 
 class GitHubReviewClient(Protocol):
@@ -997,6 +1021,62 @@ class GitHubClient:
                 break
             page += 1
         return OpenPrListing(prs=tuple(prs), examined=examined, unrecognized=unrecognized)
+
+    async def list_prs_by_head(self, owner: str, repo: str, branch: str) -> list[PrHeadRow]:
+        """Every PR (open, closed or merged) whose head is exactly ``{owner}:{branch}``.
+
+        ``GET /repos/{owner}/{repo}/pulls?state=all&head={owner}:{branch}&per_page=100``. The
+        ``head`` filter is an exact match (it takes no prefix), so the caller asks once per
+        candidate name (ADR-2026-10-09-23 D8, design v1.2 B-2). The head owner is the repository
+        owner: PRs from forks are out of scope, because the loop only pushes to its own
+        repository. One page is read: a hundred PRs on one head name does not happen.
+
+        Fail-loud, and the caller classifies: a transport failure or non-2xx raises
+        :class:`GitHubHTTPError` with the status and rate-limit hints filled in (so
+        :func:`classify_http_error` can tell a throttle from a refusal); a 2xx body that is not
+        a list of PR objects raises :class:`PrHeadListingShapeError`.
+        """
+        path = f"/repos/{owner}/{repo}/pulls"
+        params: dict[str, str | int] = {
+            "state": "all",
+            "head": f"{owner}:{branch}",
+            "per_page": 100,
+        }
+        try:
+            resp = await self._client.get(path, params=params)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path} (head={owner}:{branch}): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} (head={owner}:{branch}) -> {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
+            )
+        try:
+            rows = resp.json()
+        except ValueError as exc:
+            raise PrHeadListingShapeError(f"GET {path}: malformed JSON: {exc}") from exc
+        if not isinstance(rows, list):
+            raise PrHeadListingShapeError(f"GET {path}: expected a list, got {type(rows).__name__}")
+        out: list[PrHeadRow] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PrHeadListingShapeError(f"GET {path}: row is {type(row).__name__}")
+            number = row.get("number")
+            state = row.get("state")
+            merged_at = row.get("merged_at")
+            if (
+                not isinstance(number, int)
+                or isinstance(number, bool)
+                or not isinstance(state, str)
+                or not (merged_at is None or isinstance(merged_at, str))
+            ):
+                raise PrHeadListingShapeError(
+                    f"GET {path}: row lacks number/state/merged_at in the expected types"
+                )
+            out.append(PrHeadRow(number=number, state=state, merged_at=merged_at))
+        return out
 
     async def fetch_review_body(self, pr: PrRef, review_id: str) -> str | None:
         """``GET /repos/{o}/{r}/pulls/{n}/reviews/{id}`` -> the review's body.
@@ -2081,6 +2161,8 @@ __all__ = [
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
+    "PrHeadListingShapeError",
+    "PrHeadRow",
     "PrRef",
     "PrResolution",
     "PrState",
