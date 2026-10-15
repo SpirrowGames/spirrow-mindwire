@@ -1744,7 +1744,9 @@ def _turn_adapter(
     opts: list[Any],
     client: _FakeClient | None = None,
     turn_rows: Callable[[str], Any] | None = None,
+    model: str | None = None,
 ) -> NaysayerSdkAdapter:
+    pinned: dict[str, Any] = {} if model is None else {"model": model}
     return NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
@@ -1752,6 +1754,7 @@ def _turn_adapter(
         client_factory=_factory(client or _FakeClient([_assistant("x"), _result()]), opts),
         preflight=_preflight_ok(),
         turn_rows=turn_rows if turn_rows is not None else _turn_rows_ok(),
+        **pinned,
     )
 
 
@@ -1774,12 +1777,31 @@ async def test_the_turn_is_read_back_by_the_trace_id_its_own_subprocess_sent(
     await adapter.deliver_event(handle, _event())
 
     assert len(asked) == 1
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == custom_headers_env_value(asked[0])
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == f"X-Mindwire-Trace: {asked[0]}"
+    # The default adapter's tier comes from ``route_tier``, so the turn also carries the
+    # ADR-14 §7.3 routing declaration as a second line (thread msg-6982).
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == custom_headers_env_value(asked[0], n3_routed=True)
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == (
+        f"X-Mindwire-Trace: {asked[0]}\nX-Mindwire-N3-Route: v1"
+    )
     record = adapter.attestation_record(handle)
     assert record is not None
     assert record.scope == "turn"
     assert record.probe == "cost-row#7001"  # the turn's row, not the probe's 6032
+
+
+@pytest.mark.anyio
+async def test_a_pinned_tier_turn_carries_no_n3_route_declaration(tmp_path: Path) -> None:
+    """ADR-14 §7.3 (msg-6982): a pinned ``model`` was not classified by ``route_tier``.
+
+    So the turn sends the trace header only; Lexora then serves a codex-backed tier from its
+    unrouted backend instead of codex.
+    """
+    opts: list[Any] = []
+    asked: list[str] = []
+    adapter = _turn_adapter(tmp_path, opts=opts, turn_rows=_turn_rows_ok(asked), model="naysayer")
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    await adapter.deliver_event(handle, _event())
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == f"X-Mindwire-Trace: {asked[0]}"
 
 
 @pytest.mark.anyio

@@ -84,6 +84,8 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from ..lexora.client import (
+    N3_ROUTE_HEADER,
+    N3_ROUTE_VALUE,
     TRACE_HEADER,
     ChatCompletion,
     ChatMessage,
@@ -147,9 +149,21 @@ TURN_ROW_REREADS = 3
 TURN_ROW_REREAD_INTERVAL_SECONDS = 2.0
 
 
-def custom_headers_env_value(trace_id: str) -> str:
-    """The ``ANTHROPIC_CUSTOM_HEADERS`` value that makes a turn carry ``trace_id``."""
-    return f"{TRACE_HEADER}: {trace_id}"
+def custom_headers_env_value(trace_id: str, *, n3_routed: bool = False) -> str:
+    """The ``ANTHROPIC_CUSTOM_HEADERS`` value that makes a turn carry ``trace_id``.
+
+    ``n3_routed=True`` adds the ADR-14 §7.3 routing declaration
+    (``X-Mindwire-N3-Route: v1``, :data:`~spirrow_mindwire.lexora.client.N3_ROUTE_HEADER`) as a
+    second ``Name: Value`` line. **The two-line form is not measured** the way the one-line form
+    above was (D-0a): if the CLI rejects it the turn fails loudly, and if it drops the second line
+    Lexora serves the codex tier from its unrouted backend (Gemini), which the per-turn
+    attestation then reports as a mismatch — both fail closed, neither sends content to codex
+    without the declaration. Confirm at cutover from Lexora's ``n3_route`` log.
+    """
+    lines = [f"{TRACE_HEADER}: {trace_id}"]
+    if n3_routed:
+        lines.append(f"{N3_ROUTE_HEADER}: {N3_ROUTE_VALUE}")
+    return "\n".join(lines)
 
 
 class PreflightError(RuntimeError):
@@ -200,6 +214,7 @@ class LexoraPreflightClient(Protocol):
         messages: list[ChatMessage],
         max_tokens: int,
         trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion: ...
 
     async def stats_costs_recent(
@@ -333,6 +348,11 @@ async def _attempt(
         messages=[ChatMessage(role="user", content=PREFLIGHT_PROMPT)],
         max_tokens=PREFLIGHT_MAX_TOKENS,
         trace_id=trace_id,
+        # The probe is a fixed prompt with no repository content, so its §7.3 classification
+        # is decided in advance: it declares itself routed (thread msg-6982). Without the
+        # declaration a probe on the codex-backed ``naysayer`` tier would be served by Gemini
+        # and could never attest the tier it is asked about.
+        n3_routed=True,
     )
     rows = await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
     return _judge(

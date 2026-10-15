@@ -508,6 +508,10 @@ class NaysayerSdkAdapter:
         self._model: str | None = (
             design_time_tier_decision().tier if isinstance(model, _Routed) else model
         )
+        # ADR-14 §7.3 routing declaration (thread msg-6982): sent on a turn only when the tier
+        # came out of ``route_tier``. A pinned ``model`` was not classified here, so it carries
+        # no declaration and Lexora serves a codex-backed tier from its unrouted backend.
+        self._n3_routed = isinstance(model, _Routed)
         # Loop-readable obligations are injected — the manifest passed in is the
         # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
         # adapter never reaches for a module-global path itself. The verdict-
@@ -564,17 +568,18 @@ class NaysayerSdkAdapter:
         ) as client:
             return await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
 
-    @staticmethod
-    def _turn_options(options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
+    def _turn_options(self, options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
         """Copy the session's ``options`` so its subprocess tags every request with ``trace_id``.
 
         The spawn-time ``options`` object is not modified: it is what the
         ``source:`` marker is rendered from, and the only field that differs here
-        is the trace header, which the marker does not describe. The header lives
+        is the request headers (the trace id, plus the §7.3 routing declaration when
+        the tier was routed), which the marker does not describe. The headers live
         in the subprocess **env** — the SDK subprocess is per turn
         (1-turn-1-session), so an env value is scoped to exactly one turn.
         """
-        env = {**options.env, CUSTOM_HEADERS_ENV: custom_headers_env_value(trace_id)}
+        headers = custom_headers_env_value(trace_id, n3_routed=self._n3_routed)
+        env = {**options.env, CUSTOM_HEADERS_ENV: headers}
         return replace(options, env=env)
 
     def _make_options(self) -> ClaudeAgentOptions:
