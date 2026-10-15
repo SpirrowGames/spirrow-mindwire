@@ -31,13 +31,14 @@ explicit refspec and no ``--force`` (failure → ``git.push_failed``); then swit
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from ..clone_guard import FALLBACK_DEFAULT_BRANCH, OP_IN_PROGRESS_MARKERS, GitResult
 from ..github.client import PrHeadRow
@@ -56,6 +57,38 @@ _GITHUB_REMOTE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$"
 
 GitRunner = Callable[[Path, Sequence[str], float], GitResult]
 """``git -C repo <args>`` with a timeout. Raises ``subprocess.TimeoutExpired`` / ``OSError``."""
+
+_T = TypeVar("_T")
+
+
+async def run_to_completion(fn: Callable[..., _T], /, *args: object) -> _T:
+    """Run blocking ``fn(*args)`` in a worker thread and return its result, cancellation or not.
+
+    A git step that has started cannot be interrupted from Python: ``asyncio.to_thread`` would let
+    a cancelled caller unwind while the worker keeps switching / pushing in the clone, so cleanup
+    code racing it, or the process exiting under it, could leave the clone on the thread branch
+    (PR #473 review, objection on cancellation). Here, when the awaiting task is cancelled — once
+    (asyncio) or level-triggered (an anyio scope re-raising at every await) — the caller blocks
+    the event loop on the worker until it finishes, then re-raises the cancellation. A worker
+    exception on that path is logged and dropped: the cancellation is what propagates. The block
+    is bounded by the step's own git timeout (``GIT_NETWORK_TIMEOUT_S`` / ``GIT_LFS_TIMEOUT_S``).
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="git-sync") as ex:
+        cf = ex.submit(fn, *args)
+        try:
+            return await asyncio.wrap_future(cf)
+        except asyncio.CancelledError:
+            if not cf.cancelled():
+                try:
+                    cf.result()
+                except BaseException as exc:  # the cancellation wins; record this
+                    logger.error(
+                        "git sync: %s finished with %s after the turn was cancelled: %s",
+                        getattr(fn, "__name__", fn),
+                        type(exc).__name__,
+                        exc,
+                    )
+            raise
 
 
 def _subprocess_git(repo_dir: Path, args: Sequence[str], timeout: float) -> GitResult:
@@ -144,13 +177,22 @@ class GitSyncHook:
             raise park(GitParkCode.FETCH_FAILED, None, exc.detail) from None
         default = await asyncio.to_thread(self._default_branch)
         branch = await self._resolve(thread_id, default, park)
-        await asyncio.to_thread(self._checkout, thread_id, branch, default, park)
-        if self._lfs:
-            try:
-                await asyncio.to_thread(self._lfs_pull, branch, park)
-            except GitSyncParkError:
-                await asyncio.to_thread(self._switch_back_if_clean, default)
-                raise
+        # From the checkout on, the clone may be on the thread branch while the dispatcher does
+        # not yet hold it (``pre_turn`` has not returned), so the dispatcher's ``finally`` cannot
+        # undo it. A cancellation here therefore waits for the git step in flight
+        # (:func:`run_to_completion`), puts HEAD back on the default branch when the tree is
+        # clean — synchronously, because a cancelled task must not await again — and re-raises.
+        try:
+            await run_to_completion(self._checkout, thread_id, branch, default, park)
+            if self._lfs:
+                try:
+                    await run_to_completion(self._lfs_pull, branch, park)
+                except GitSyncParkError:
+                    await run_to_completion(self._switch_back_if_clean, default)
+                    raise
+        except asyncio.CancelledError:
+            self._switch_back_if_clean(default)
+            raise
         return branch
 
     async def _resolve(
@@ -268,8 +310,12 @@ class GitSyncHook:
     # -- post-turn ------------------------------------------------------------------------------
 
     async def post_turn(self, thread_id: str, branch: ThreadBranch) -> None:
-        """Verify, push and switch back after the turn. Raises :class:`GitSyncParkError`."""
-        await asyncio.to_thread(self._post_turn, thread_id, branch)
+        """Verify, push and switch back after the turn. Raises :class:`GitSyncParkError`.
+
+        Runs to completion even when the calling task is cancelled (:func:`run_to_completion`):
+        the dispatcher calls this from a ``finally`` that a cancelled turn also reaches.
+        """
+        await run_to_completion(self._post_turn, thread_id, branch)
 
     def _post_turn(self, thread_id: str, branch: ThreadBranch) -> None:
         def park(code: GitParkCode, summary: str) -> GitSyncParkError:
@@ -390,4 +436,10 @@ class GitSyncHook:
             logger.warning("git sync: could not switch %s back to %s", self._repo_dir, default)
 
 
-__all__ = ["GitRunner", "GitSyncHook", "PrHeadClient", "parse_github_remote"]
+__all__ = [
+    "GitRunner",
+    "GitSyncHook",
+    "PrHeadClient",
+    "parse_github_remote",
+    "run_to_completion",
+]

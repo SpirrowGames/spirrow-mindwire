@@ -200,8 +200,12 @@ class Dispatcher:
         delivered = False
         # Everything after ``pre_turn`` put the clone on the thread branch sits inside this
         # ``try``, so the ``finally`` below runs ``post_turn`` (B-4: "whether the turn returned,
-        # raised or was cancelled") even when the pin write raises or is cancelled — the clone is
-        # never left on ``loop/<thread>`` (PR #473 review, REQUEST_CHANGES objection 1).
+        # raised or was cancelled") even when the pin write raises or is cancelled (PR #473
+        # review, REQUEST_CHANGES objection 1). ``post_turn`` itself runs its git to completion
+        # under cancellation, and ``pre_turn`` undoes its own checkout when cancelled before it
+        # returns (:func:`~spirrow_mindwire.git_sync.hook.run_to_completion`). What ``post_turn``
+        # then does is B-4's: switch back when clean, leave a dirty tree as found (next dispatch's
+        # clone guard refuses it, exit 8).
         try:
             if self._spec_pin_writer is not None:
                 await self._spec_pin_writer.write_before_dispatch_async(

@@ -8,9 +8,12 @@ The clone's ``remote.origin.url`` is a GitHub URL rewritten to the local bare re
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,7 +23,7 @@ import httpx
 import pytest
 
 from spirrow_mindwire import loop_runner
-from spirrow_mindwire.clone_guard import DIRTY_CLONE_EXIT_CODE
+from spirrow_mindwire.clone_guard import DIRTY_CLONE_EXIT_CODE, GitResult
 from spirrow_mindwire.conductor.stop_marker import parse_stop_marker
 from spirrow_mindwire.config import MindwireSettings, load_settings
 from spirrow_mindwire.dispatcher.core import Dispatcher
@@ -41,6 +44,7 @@ from spirrow_mindwire.git_sync import (
     parse_github_remote,
     resolve_generation,
 )
+from spirrow_mindwire.git_sync.hook import run_to_completion
 from spirrow_mindwire.git_sync.notice import git_sync_park_event, render_git_sync_park_notice
 from spirrow_mindwire.github.client import (
     GitHubClient,
@@ -732,6 +736,87 @@ async def test_push_never_forces(env: Env) -> None:
     pushes = [a for a in seen if a and a[0] == "push"]
     assert pushes == [("push", "origin", f"refs/heads/{BRANCH}:refs/heads/{BRANCH}")]
     assert not any(a for a in seen if "--force" in a or "-f" in a)
+
+
+# ============================================================ cancellation (PR #473 review)
+
+
+def _slow_git(gate: threading.Event, slow: str, delay: float) -> Any:
+    """The real git runner, except that the first ``git <slow> ...`` signals ``gate`` and then
+    takes ``delay`` seconds — long enough for the test to cancel the awaiting task mid-step."""
+    from spirrow_mindwire.git_sync.hook import _subprocess_git
+
+    def run(repo: Path, args: Sequence[str], timeout: float) -> GitResult:
+        if args and args[0] == slow and not gate.is_set():
+            gate.set()
+            time.sleep(delay)
+            if slow == "lfs":
+                return GitResult(returncode=0, stdout="", stderr="")
+        return _subprocess_git(repo, args, timeout)
+
+    return run
+
+
+async def _cancel_once(gate: threading.Event, coro: Any) -> None:
+    task = asyncio.ensure_future(coro)
+    while not gate.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.anyio
+async def test_run_to_completion_waits_for_the_worker_when_cancelled() -> None:
+    gate = threading.Event()
+    done: list[str] = []
+
+    def step() -> str:
+        gate.set()
+        time.sleep(0.3)
+        done.append("finished")
+        return "ok"
+
+    await _cancel_once(gate, run_to_completion(step))
+    assert done == ["finished"]
+    assert await run_to_completion(lambda: 7) == 7
+
+
+@pytest.mark.anyio
+async def test_pre_turn_cancelled_after_checkout_returns_to_default(env: Env) -> None:
+    gate = threading.Event()
+    hook, _ = _hook(env, lfs=True, git=_slow_git(gate, "lfs", 0.3))
+    await _cancel_once(gate, hook.pre_turn(THREAD))
+    assert env.head() == "main"
+
+
+@pytest.mark.anyio
+async def test_post_turn_cancelled_mid_push_still_pushes_and_switches_back(env: Env) -> None:
+    hook, branch = await _on_thread_branch(env)
+    sha = _commit(env.clone, "work.txt")
+    gate = threading.Event()
+    hook._git = _slow_git(gate, "push", 0.3)
+    await _cancel_once(gate, hook.post_turn(THREAD, branch))
+    assert env.remote_sha(BRANCH) == sha
+    assert env.head() == "main"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_runs_post_turn_when_the_turn_is_cancelled(env: Env) -> None:
+    gate = threading.Event()
+
+    class _HangingAdapter(_Adapter):
+        async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+            _commit(env.clone, "work.txt")
+            gate.set()
+            await asyncio.sleep(3600)
+
+    hook, _ = _hook(env)
+    disp = _dispatcher(_HangingAdapter(), hook)
+    handle = await disp.spawn_instance(_event().thread_ref, Role.IMPLEMENTER, "implementer-1")
+    await _cancel_once(gate, disp.dispatch(handle, _event()))
+    assert env.head() == "main"
+    assert env.remote_sha("loop/t-x") != ""
 
 
 # ===================================================================== dispatcher wiring
