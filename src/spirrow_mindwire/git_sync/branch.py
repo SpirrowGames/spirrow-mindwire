@@ -5,7 +5,8 @@ Two pure pieces, kept apart from the hook so they can be tested without git:
 - :func:`normalize_stem` / :func:`generation_name` — the mechanical name ``loop/<thread_id>``
   (D8). Lowercase; every character outside ``[a-z0-9._-]`` becomes ``-``; runs of ``-`` collapse
   to one; leading / trailing ``-`` and ``.`` are stripped. A stem longer than
-  :data:`STEM_MAX_LEN` keeps its first :data:`STEM_KEEP_LEN` characters, then ``-`` and the first
+  :data:`STEM_MAX_LEN` keeps its first :data:`STEM_KEEP_LEN` characters (minus any trailing ``-``,
+  so the single-``-`` rule still holds), then ``-`` and the first
   :data:`HASH_LEN` hex digits of the sha256 of the thread id (the original, so two ids that
   normalise to the same long prefix still get different names). Generation ``n >= 2`` appends
   ``-n``. Whether the result is a legal ref is decided by ``git check-ref-format``, by the hook,
@@ -44,7 +45,8 @@ def normalize_stem(thread_id: str) -> str:
     stem = _DASH_RUN.sub("-", stem).strip("-.")
     if len(stem) > STEM_MAX_LEN:
         digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:HASH_LEN]
-        stem = f"{stem[:STEM_KEEP_LEN]}-{digest}"
+        # rstrip: a cut that lands on a ``-`` must not leave ``--`` before the digest.
+        stem = f"{stem[:STEM_KEEP_LEN].rstrip('-')}-{digest}"
     return stem
 
 

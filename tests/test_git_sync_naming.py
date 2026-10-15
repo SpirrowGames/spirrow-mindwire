@@ -82,6 +82,15 @@ def test_long_stem_is_cut_and_hashed() -> None:
     assert normalize_stem("T-" + "a" * 62) == "t-" + "a" * 62  # 64 exactly: untouched
 
 
+def test_long_stem_cut_on_a_dash_leaves_no_double_dash() -> None:
+    """PR #484 review advisory: a cut landing on ``-`` must not produce ``--`` before the digest."""
+    long_id = "a" * 54 + "-b" * 10  # normalised char 55 is a "-"
+    stem = normalize_stem(long_id)
+    assert "--" not in stem
+    assert stem.startswith("a" * 54 + "-")
+    assert re.fullmatch(r"[0-9a-f]{8}", stem[-8:])
+
+
 def test_generation_name() -> None:
     assert generation_name("x", 1) == "loop/x"
     assert generation_name("x", 2) == "loop/x-2"
