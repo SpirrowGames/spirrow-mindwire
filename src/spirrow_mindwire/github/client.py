@@ -480,6 +480,40 @@ class GitHubHTTPError(GitHubError):
         self.rate_limited = rate_limited
 
 
+@dataclass(frozen=True)
+class PrRoutingFacts:
+    """What the naysayer tier routing reads off one PR (ADR-14 §7.3).
+
+    ``changed_files`` is GitHub's own count of the PR's changed files. The routing compares
+    it with the number of entries the files endpoint actually listed, so an incomplete list
+    is detected rather than assumed complete (msg-6573 (b)).
+    """
+
+    base_ref: str
+    head_sha: str
+    labels: frozenset[str]
+    changed_files: int
+
+
+# GitHub's ``GET /pulls/{n}/files`` returns at most this many files in total, however it is
+# paginated (REST docs: "Responses include a maximum of 3000 files"). Reaching it means the
+# list may be cut off.
+PR_FILES_LIST_CAP = 3000
+
+
+@dataclass(frozen=True)
+class PrFileList:
+    """The paths ``GET /pulls/{n}/files`` named, and how many file entries it returned.
+
+    ``paths`` holds every ``filename`` AND every ``previous_filename``, whatever the entry's
+    ``status`` (``renamed`` or ``copied``): a file renamed or copied OUT of a protected glob
+    still carries protected content (msg-6579, Einstein's advisory on the next message).
+    """
+
+    paths: tuple[str, ...]
+    entries: int
+
+
 class GitHubReviewClient(Protocol):
     """Structural view of the GitHub methods the naysayer adapter drives."""
 
@@ -502,6 +536,10 @@ class GitHubReviewClient(Protocol):
     ) -> list[CrossPrApproveCoverage]: ...
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None: ...
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts: ...
+
+    async def fetch_pr_files(self, pr: PrRef) -> PrFileList: ...
 
     async def aclose(self) -> None: ...
 
@@ -614,6 +652,102 @@ class GitHubClient:
         if not base_ref or not head_sha:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
         return base_ref, head_sha
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> PrRoutingFacts:
+        """``GET /repos/{owner}/{repo}/pulls/{n}`` → base ref, head sha and label names, fail-loud.
+
+        Feeds the naysayer tier routing (ADR-14 §7.3). The caller treats ANY failure here as
+        "could not read" and routes to the Gemini tier, so this raises rather than guessing an
+        empty label set — an empty set would read as "no ``n3-sensitive`` marker".
+        """
+        meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        try:
+            resp = await self._client.get(meta_path)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {meta_path} (routing facts): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {meta_path} (routing facts) returned {resp.status_code}: "
+                f"{_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            payload = resp.json()
+            base_ref = str(payload["base"]["ref"])
+            head_sha = str(payload["head"]["sha"])
+            labels = frozenset(str(label["name"]) for label in payload["labels"])
+            changed_files = payload["changed_files"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubHTTPError(
+                f"GET {meta_path} (routing facts): malformed response: {exc}"
+            ) from exc
+        if not base_ref or not head_sha:
+            raise GitHubHTTPError(f"GET {meta_path} (routing facts): missing base.ref or head.sha")
+        if isinstance(changed_files, bool) or not isinstance(changed_files, int):
+            raise GitHubHTTPError(f"GET {meta_path} (routing facts): no integer changed_files")
+        return PrRoutingFacts(
+            base_ref=base_ref, head_sha=head_sha, labels=labels, changed_files=changed_files
+        )
+
+    async def fetch_pr_files(self, pr: PrRef) -> PrFileList:
+        """``GET /repos/{owner}/{repo}/pulls/{n}/files`` (paginated), fail-loud.
+
+        Feeds the naysayer tier routing (ADR-14 §7.3). The caller routes to Gemini on any
+        failure, and also when ``entries`` differs from the PR's ``changed_files`` or reaches
+        :data:`PR_FILES_LIST_CAP`, so this never has to guess at completeness itself.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/files"
+        paths: list[str] = []
+        entries = 0
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                raise GitHubHTTPError(f"GET {path} (pr files): {exc}") from exc
+            if resp.status_code >= 400:
+                raise GitHubHTTPError(
+                    f"GET {path} (pr files) returned {resp.status_code}: {_error_detail(resp)}",
+                    status_code=resp.status_code,
+                )
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                raise GitHubHTTPError(f"GET {path} (pr files): malformed JSON: {exc}") from exc
+            if not isinstance(rows, list):
+                raise GitHubHTTPError(f"GET {path} (pr files): not a list")
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("filename"), str):
+                    raise GitHubHTTPError(f"GET {path} (pr files): entry without filename")
+                entries += 1
+                for key in ("filename", "previous_filename"):
+                    value = row.get(key)
+                    if isinstance(value, str) and value and value not in paths:
+                        paths.append(value)
+            if len(rows) < 100 or entries >= PR_FILES_LIST_CAP:
+                break
+            page += 1
+        return PrFileList(paths=tuple(paths), entries=entries)
+
+    async def fetch_default_branch(self, owner: str, repo: str) -> str:
+        """``GET /repos/{owner}/{repo}`` → ``default_branch``, fail-loud (design-time trusted)."""
+        path = f"/repos/{owner}/{repo}"
+        try:
+            resp = await self._client.get(path)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path} (default branch): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} (default branch) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            branch = resp.json()["default_branch"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubHTTPError(f"GET {path} (default branch): malformed: {exc}") from exc
+        if not isinstance(branch, str) or not branch:
+            raise GitHubHTTPError(f"GET {path} (default branch): empty default_branch")
+        return branch
 
     async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         """Step 2 of :meth:`fetch_pr_diff`: the three-dot ``compare`` diff, fail-loud.
@@ -2073,6 +2207,7 @@ class TargetTerminalError(GitHubHTTPError):
 
 
 __all__ = [
+    "PR_FILES_LIST_CAP",
     "CiState",
     "CiStatus",
     "CrossPrApproveCoverage",
@@ -2081,8 +2216,10 @@ __all__ = [
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
+    "PrFileList",
     "PrRef",
     "PrResolution",
+    "PrRoutingFacts",
     "PrState",
     "Retryability",
     "ReviewEvent",

@@ -106,7 +106,7 @@ from typing import Any
 
 from .route_authority import ROUTE_REDACTED as _ROUTE_REDACTED
 from .route_authority import route_authority as _route_authority
-from .value_objects import AttestationRecord, AttestationScope
+from .value_objects import AttestationRecord, AttestationScope, split_backends
 
 # Marker form is stable and machine-readable. HTML comment wrap so the line
 # renders invisibly in markdown viewers while remaining greppable in the raw
@@ -285,6 +285,18 @@ def render_attestation_marker(record: AttestationRecord) -> str:
     return f"{ATTESTATION_MARKER_PREFIX} {_FIELD_SEP.join(parts)} {ATTESTATION_MARKER_SUFFIX}"
 
 
+def attestation_agrees(record: AttestationRecord) -> bool:
+    """True iff every observed ``backend`` is within ``expected`` (both possibly sets).
+
+    For the single-backend form this is exactly the old ``backend == expected``; for the
+    codex tier (``expected=codex|gemini-fallback``) a turn answered by either passes, and a
+    turn whose rows named both still passes (each row was allowed). An empty observed set
+    never agrees.
+    """
+    observed = split_backends(record.backend)
+    return bool(observed) and observed <= split_backends(record.expected)
+
+
 def parse_attestation_marker(body: str) -> AttestationRecord | None:
     """Read a harness ``attest:`` stamp back off a posted body, or ``None``.
 
@@ -454,6 +466,7 @@ __all__ = [
     "SOURCE_MARKER_SUFFIX",
     "append_markers",
     "append_source_marker",
+    "attestation_agrees",
     "parse_attestation_marker",
     "render_attestation_marker",
     "render_source_marker",

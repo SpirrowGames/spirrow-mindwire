@@ -262,7 +262,9 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     stored_opts = adapter.source_marker_options(handle)
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
     assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
-    assert stored_opts.model == "naysayer"
+    # ADR-14 §7.3 / §7.6: decided by route_tier — the Gemini-only tier while the design-time
+    # marker is not read (fail-safe), so N-3 cannot reach the codex tier.
+    assert stored_opts.model == "naysayer-gemini"
     assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
     # The per-turn factory receives a COPY of the stored options that differs in
     # exactly one place — the trace header env (T-per-turn-backend-attestation) —
@@ -406,8 +408,9 @@ async def test_self_post_is_filtered(tmp_path: Path) -> None:
 
 
 def _attestation(*, backend: str = "gemini") -> AttestationRecord:
+    # ADR-14 §7.3: design-time routes to the Gemini-only tier until its inputs are wired.
     return AttestationRecord(
-        tier="naysayer",
+        tier="naysayer-gemini",
         backend=backend,
         expected="gemini",
         route="lexora.local:8110",
@@ -796,12 +799,12 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
-        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer-gemini -->"
     )
     # The stamp is the TURN's attestation: its own row (7001, from the trace-id
     # read-back), ``scope=turn`` — not the preflight probe's row 6032.
     assert re.fullmatch(
-        r"<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        r"<!-- attest: tier=naysayer-gemini · backend=gemini · expected=gemini "
         r"· route=lexora\.local:8110 · probe=cost-row#7001 · scope=turn "
         r"· at=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -->",
         lines[-1],
@@ -1741,7 +1744,9 @@ def _turn_adapter(
     opts: list[Any],
     client: _FakeClient | None = None,
     turn_rows: Callable[[str], Any] | None = None,
+    model: str | None = None,
 ) -> NaysayerSdkAdapter:
+    pinned: dict[str, Any] = {} if model is None else {"model": model}
     return NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
@@ -1749,6 +1754,7 @@ def _turn_adapter(
         client_factory=_factory(client or _FakeClient([_assistant("x"), _result()]), opts),
         preflight=_preflight_ok(),
         turn_rows=turn_rows if turn_rows is not None else _turn_rows_ok(),
+        **pinned,
     )
 
 
@@ -1771,12 +1777,31 @@ async def test_the_turn_is_read_back_by_the_trace_id_its_own_subprocess_sent(
     await adapter.deliver_event(handle, _event())
 
     assert len(asked) == 1
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == custom_headers_env_value(asked[0])
-    assert opts[0].env[CUSTOM_HEADERS_ENV] == f"X-Mindwire-Trace: {asked[0]}"
+    # The default adapter's tier comes from ``route_tier``, so the turn also carries the
+    # ADR-14 §7.3 routing declaration as a second line (thread msg-6982).
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == custom_headers_env_value(asked[0], n3_routed=True)
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == (
+        f"X-Mindwire-Trace: {asked[0]}\nX-Mindwire-N3-Route: v1"
+    )
     record = adapter.attestation_record(handle)
     assert record is not None
     assert record.scope == "turn"
     assert record.probe == "cost-row#7001"  # the turn's row, not the probe's 6032
+
+
+@pytest.mark.anyio
+async def test_a_pinned_tier_turn_carries_no_n3_route_declaration(tmp_path: Path) -> None:
+    """ADR-14 §7.3 (msg-6982): a pinned ``model`` was not classified by ``route_tier``.
+
+    So the turn sends the trace header only; Lexora then serves a codex-backed tier from its
+    unrouted backend instead of codex.
+    """
+    opts: list[Any] = []
+    asked: list[str] = []
+    adapter = _turn_adapter(tmp_path, opts=opts, turn_rows=_turn_rows_ok(asked), model="naysayer")
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    await adapter.deliver_event(handle, _event())
+    assert opts[0].env[CUSTOM_HEADERS_ENV] == f"X-Mindwire-Trace: {asked[0]}"
 
 
 @pytest.mark.anyio

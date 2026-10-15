@@ -35,14 +35,13 @@ from spirrow_mindwire.adapters.implementer import (
     ImplementerSdkAdapter,
     _default_sdk_executable_path,
 )
-from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
+from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter, design_time_tier_decision
 from spirrow_mindwire.config import MindwireSettings, Stage3LoopConfig
 from spirrow_mindwire.loop_runner import (
     _resolve_role_cli_path_or_exit,
     build_implementer,
     build_proposer,
 )
-from spirrow_mindwire.naysayer.principles import NAYSAYER_MODEL_TIER
 from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.value_objects import Role
 
@@ -272,7 +271,8 @@ def test_the_naysayer_keeps_its_own_tier(tmp_path: Path) -> None:
         obligations=_OBLIGATIONS,
         inference_base_url="http://lexora.invalid:8110",
     )
-    assert adapter._model == NAYSAYER_MODEL_TIER
+    # ADR-14 §7.6: the naysayer's tier is the one route_tier decides for design time.
+    assert adapter._model == design_time_tier_decision().tier
 
 
 # --------------------------------------------------------------------------- #
@@ -339,7 +339,7 @@ def test_the_composition_root_routes_config_to_the_two_anthropic_roles(tmp_path:
     # Not "the naysayer got None" — it has nowhere to put one, and its model is
     # the tier that makes it a different distribution from the two above.
     assert not hasattr(naysayer, "_cli_path")
-    assert naysayer._model == NAYSAYER_MODEL_TIER  # type: ignore[attr-defined]
+    assert naysayer._model == design_time_tier_decision().tier  # type: ignore[attr-defined]
 
 
 def test_a_configured_binary_that_is_not_there_stops_the_daemon(tmp_path: Path) -> None:
