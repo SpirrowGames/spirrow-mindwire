@@ -197,12 +197,16 @@ class Dispatcher:
         if self._git_sync is not None:
             thread_branch = await self._git_sync.pre_turn(handle.thread_ref.thread_id)
             event = replace(event, git_branch=thread_branch.name)
-        if self._spec_pin_writer is not None:
-            await self._spec_pin_writer.write_before_dispatch_async(
-                handle.role, handle.thread_ref.thread_id
-            )
         delivered = False
+        # Everything after ``pre_turn`` put the clone on the thread branch sits inside this
+        # ``try``, so the ``finally`` below runs ``post_turn`` (B-4: "whether the turn returned,
+        # raised or was cancelled") even when the pin write raises or is cancelled — the clone is
+        # never left on ``loop/<thread>`` (PR #473 review, REQUEST_CHANGES objection 1).
         try:
+            if self._spec_pin_writer is not None:
+                await self._spec_pin_writer.write_before_dispatch_async(
+                    handle.role, handle.thread_ref.thread_id
+                )
             # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
             # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
             async with session.lock:

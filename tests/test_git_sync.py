@@ -841,6 +841,35 @@ async def test_post_turn_runs_after_a_failed_turn_and_keeps_its_exception() -> N
 
 
 @pytest.mark.anyio
+async def test_post_turn_runs_when_the_pin_write_raises() -> None:
+    """PR #473 review objection 1: a pin-write failure after ``pre_turn`` must still run
+    ``post_turn`` (B-4), so the clone is not left on the thread branch; the pin error keeps its
+    routing and the role never sees the event."""
+
+    class _FailingPinWriter:
+        async def write_before_dispatch_async(self, role: Role, thread_id: str) -> None:
+            log.append("pin")
+            raise OSError("disk full")
+
+    log: list[str] = []
+    adapter = _Adapter()
+    adapter.log = log
+    reg = InMemoryAdapterRegistry()
+    reg.register(adapter)
+    disp = Dispatcher(
+        registry=reg,
+        gateway=_Gateway(),
+        git_sync=_RecordingHook(log, post_park=True),  # type: ignore[arg-type]
+        spec_pin_writer=_FailingPinWriter(),  # type: ignore[arg-type]
+    )
+    handle = await disp.spawn_instance(_event().thread_ref, Role.IMPLEMENTER, "implementer-1")
+    with pytest.raises(OSError, match="disk full"):
+        await disp.dispatch(handle, _event())
+    assert log == ["pre:T-x", "pin", "post:loop/t-x"]
+    assert adapter.events == []
+
+
+@pytest.mark.anyio
 async def test_post_turn_park_after_a_good_turn_propagates() -> None:
     log: list[str] = []
     disp = _dispatcher(_Adapter(), _RecordingHook(log, post_park=True))
