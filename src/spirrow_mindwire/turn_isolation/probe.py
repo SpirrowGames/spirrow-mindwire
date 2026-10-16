@@ -108,9 +108,22 @@ class LauncherOps:
 
     The launcher's own stop (a missing credential, a refused logon) is not a clone fault: it is
     re-raised with the launcher's reason instead of being misread as ``safe.directory`` / ACL.
+
+    ``user`` is the turn user the caller resolved from its own config; it is handed to the
+    launcher as ``--user`` so the launcher never falls back to a different config file. Every
+    call also names the child's working directory (``--cwd``): the clone for ``rev-parse``, the
+    probed directory for the write probe. Both are places the probe requires the turn user to
+    reach anyway, so the ambient directory the check was started from never matters
+    (PR #485 review round 3).
     """
 
-    def __init__(self, launcher: Sequence[str] | None = None, timeout_s: float = 120.0) -> None:
+    def __init__(
+        self,
+        user: str | None = None,
+        launcher: Sequence[str] | None = None,
+        timeout_s: float = 120.0,
+    ) -> None:
+        self._user = user
         self._launcher = list(
             launcher
             if launcher is not None
@@ -118,9 +131,13 @@ class LauncherOps:
         )
         self._timeout_s = timeout_s
 
-    def _run(self, argv: Sequence[str]) -> RunResult:
+    def launcher_argv(self, cwd: Path, argv: Sequence[str]) -> list[str]:
+        opts = ["--user", self._user] if self._user else []
+        return [*self._launcher, *opts, "--cwd", str(cwd), "--", *argv]
+
+    def _run(self, cwd: Path, argv: Sequence[str]) -> RunResult:
         proc = subprocess.run(
-            [*self._launcher, *argv],
+            self.launcher_argv(cwd, argv),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -136,17 +153,19 @@ class LauncherOps:
 
     def rev_parse(self, clone: Path) -> RunResult:
         return self._run(
-            ["git", "-C", str(clone), "rev-parse", "--absolute-git-dir", "--git-common-dir"]
+            clone,
+            ["git", "-C", str(clone), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
         )
 
     def probe_write(self, directory: Path, pid: int) -> RunResult:
         encoded = base64.b64encode(probe_write_script(directory, pid).encode("utf-16-le"))
         return self._run(
+            directory,
             [
                 "powershell.exe",
                 "-NoProfile",
                 "-NonInteractive",
                 "-EncodedCommand",
                 encoded.decode("ascii"),
-            ]
+            ],
         )

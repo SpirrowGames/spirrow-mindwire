@@ -29,12 +29,17 @@ from .probe import LauncherOps, TurnUserOps, probe_clones
 from .win32 import CredentialReader, default_api
 
 
+def launcher_ops(user: str) -> TurnUserOps:
+    """Production ops: the real launcher, told which user the caller resolved."""
+    return LauncherOps(user=user)
+
+
 def check_turn_isolation(
     user: str | None,
     clones: Sequence[Path],
     *,
     api_factory: Callable[[], CredentialReader] = default_api,
-    ops_factory: Callable[[], TurnUserOps] = LauncherOps,
+    ops_factory: Callable[[str], TurnUserOps] = launcher_ops,
 ) -> bool:
     """Return ``False`` when isolation is off, ``True`` when every check passed; else raise."""
     if not user:
@@ -45,7 +50,7 @@ def check_turn_isolation(
         (IMPLEMENTER_PAT_CREDENTIAL, IMPLEMENTER_PAT_CREDENTIAL_MISSING),
     ):
         read_secret(api, target, reason).wipe()
-    probe_clones(clones, ops_factory())
+    probe_clones(clones, ops_factory(user))
     return True
 
 
@@ -54,7 +59,7 @@ def run(
     clones: Sequence[Path],
     *,
     api_factory: Callable[[], CredentialReader] = default_api,
-    ops_factory: Callable[[], TurnUserOps] = LauncherOps,
+    ops_factory: Callable[[str], TurnUserOps] = launcher_ops,
 ) -> int:
     try:
         isolated = check_turn_isolation(

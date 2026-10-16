@@ -252,16 +252,50 @@ def main(
     api_factory: Callable[[], Win32Api] = default_api,
     configured_user: Callable[[], str | None] | None = None,
 ) -> int:
-    """``mindwire-turn-launcher <program> [args...]``; returns the child's exit code."""
-    args = list(sys.argv[1:] if argv is None else argv)
+    """``mindwire-turn-launcher [--user U] [--cwd DIR] [--] <program> [args...]``.
+
+    Returns the child's exit code. ``--user`` is the turn user a caller has already resolved
+    (``mindwire turn-isolation-check --config X`` passes the user from ``X``, so the launcher
+    never reads a different config than its caller did, PR #485 review round 3). Without it the
+    launcher falls back to ``[turn.isolation] user`` in the default config. ``--cwd`` is the
+    child's working directory; without it, the launcher's own.
+    """
+    raw = list(sys.argv[1:] if argv is None else argv)
     try:
-        user = (configured_user or _configured_user)()
+        options, args = parse_launcher_args(raw)
+        user = options.get("--user") or (configured_user or _configured_user)()
         if not user:
             raise TurnIsolationStop("turn launcher: [turn.isolation] user is not set")
-        return launch(args, TurnUser.parse(user), api=api_factory(), current_directory=os.getcwd())
+        cwd = options.get("--cwd") or os.getcwd()
+        return launch(args, TurnUser.parse(user), api=api_factory(), current_directory=cwd)
     except TurnIsolationStop as stop:
         print(stop.stop_line(), file=sys.stderr, flush=True)
         return stop.exit_code
+
+
+LAUNCHER_OPTIONS = ("--user", "--cwd")
+
+
+def parse_launcher_args(raw: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+    """Split the launcher's own leading options from the program and its arguments.
+
+    Only leading ``--user`` / ``--cwd`` (each with a value) are the launcher's; ``--`` ends them
+    and anything else starts the program, so a program's own ``--cwd`` is passed through.
+    """
+    options: dict[str, str] = {}
+    i = 0
+    while i < len(raw):
+        token = raw[i]
+        if token == "--":
+            i += 1
+            break
+        if token not in LAUNCHER_OPTIONS:
+            break
+        if i + 1 >= len(raw) or not raw[i + 1]:
+            raise TurnIsolationStop(f"turn launcher: {token} needs a value")
+        options[token] = raw[i + 1]
+        i += 2
+    return options, list(raw[i:])
 
 
 def _configured_user() -> str | None:

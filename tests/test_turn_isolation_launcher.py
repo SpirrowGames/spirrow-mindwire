@@ -419,3 +419,52 @@ def test_from_blob_utf16_round_trip() -> None:
     sb = SecretBuffer.from_blob(ctypes.addressof(blob), len(raw))
     if ctypes.sizeof(ctypes.c_wchar) == 2:  # Windows: the blob is the text
         assert sb.reveal() == "pa55-word"
+
+
+# --- launcher options (PR #485 review round 3) -------------------------------------------------
+
+
+def _main_ok(api: FakeApi, argv: list[str], configured: str | None = "default-turn") -> int:
+    def configured_user() -> str | None:
+        api.calls.append("configured_user")
+        return configured
+
+    return main(argv, api_factory=lambda: api, configured_user=configured_user)
+
+
+def test_user_option_overrides_and_skips_the_config() -> None:
+    api = FakeApi()
+    assert _main_ok(api, ["--user", r"HOST\custom-turn", "--", "claude"]) == 0
+    assert "configured_user" not in api.calls
+    assert api.spawn_kwargs is not None and api.spawn_kwargs["command_line"] == "claude"
+
+
+def test_cwd_option_sets_the_child_directory() -> None:
+    api = FakeApi()
+    _main_ok(api, ["--cwd", r"C:\clones\x", "git", "status"])
+    assert api.spawn_kwargs is not None
+    assert api.spawn_kwargs["current_directory"] == r"C:\clones\x"
+    assert api.spawn_kwargs["command_line"] == "git status"
+
+
+def test_without_options_the_config_user_is_used() -> None:
+    api = FakeApi()
+    _main_ok(api, ["claude"])
+    assert "configured_user" in api.calls
+
+
+def test_program_options_after_the_program_are_passed_through() -> None:
+    api = FakeApi()
+    _main_ok(api, ["--user", "u", "tool", "--cwd", "x"])
+    assert api.spawn_kwargs is not None
+    assert api.spawn_kwargs["command_line"] == "tool --cwd x"
+
+
+def test_option_without_value_stops() -> None:
+    api = FakeApi()
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = _main_ok(api, ["--user"])
+    assert rc == SECRETS_STOP_EXIT_CODE
+    assert parse_stop_line(err.getvalue()) == "turn launcher: --user needs a value"
+    assert "spawn" not in api.calls

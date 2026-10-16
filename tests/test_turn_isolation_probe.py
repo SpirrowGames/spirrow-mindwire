@@ -234,7 +234,7 @@ class CredApi:
 
 
 def test_isolation_off_does_nothing(tmp_path: Path) -> None:
-    def boom() -> NoReturn:
+    def boom(*_args: object) -> NoReturn:
         raise AssertionError("must not be called when isolation is off")
 
     assert check_turn_isolation(None, [tmp_path], api_factory=boom, ops_factory=boom) is False
@@ -247,7 +247,7 @@ def test_check_passes_and_wipes(tmp_path: Path) -> None:
         "mindwire-turn",
         [repo],
         api_factory=lambda: api,
-        ops_factory=LocalOps,
+        ops_factory=lambda _user: LocalOps(),
     )
     assert len(api.read) == 2 and all(sb.wiped for sb in api.read)
 
@@ -256,6 +256,46 @@ def test_check_missing_credential_is_stop_code(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     api = CredApi({IMPLEMENTER_PAT_CREDENTIAL: "pat"})
-    rc = run("mindwire-turn", [tmp_path], api_factory=lambda: api, ops_factory=LocalOps)
+    rc = run(
+        "mindwire-turn", [tmp_path], api_factory=lambda: api, ops_factory=lambda _u: LocalOps()
+    )
     assert rc == SECRETS_STOP_EXIT_CODE
     assert "turn-isolation: STOP turn user credential missing" in capsys.readouterr().err
+
+
+# --- PR #485 review round 3: the caller's user and an explicit cwd reach the launcher ----------
+
+
+def test_launcher_ops_passes_user_and_cwd(tmp_path: Path) -> None:
+    import json
+    import sys
+
+    script = tmp_path / "argv_launcher.py"
+    script.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    ops = LauncherOps(user=r"HOST\custom-turn", launcher=[sys.executable, str(script)])
+    clone = tmp_path / "clone"
+    argv = json.loads(ops.rev_parse(clone).stdout)
+    assert argv[:5] == ["--user", r"HOST\custom-turn", "--cwd", str(clone), "--"]
+    assert argv[5:7] == ["git", "-C"]
+    gitdir = tmp_path / "gitdir"
+    argv = json.loads(ops.probe_write(gitdir, PID).stdout)
+    assert argv[:5] == ["--user", r"HOST\custom-turn", "--cwd", str(gitdir), "--"]
+
+
+def test_check_hands_its_user_to_the_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default ops factory passes the caller-resolved user; nothing re-reads a config."""
+    import subprocess
+
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, "", "fatal: not a git repository")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)  # probe.py calls subprocess.run
+    api = CredApi({TURN_USER_CREDENTIAL: "pw", IMPLEMENTER_PAT_CREDENTIAL: "pat"})
+    rc = run("custom-turn", [tmp_path], api_factory=lambda: api)
+    assert rc == SECRETS_STOP_EXIT_CODE  # the fake git refused; the stop is a clone fault
+    assert seen and seen[0][3:7] == ["--user", "custom-turn", "--cwd", str(tmp_path)]
