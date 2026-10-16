@@ -38,6 +38,7 @@ from spirrow_mindwire.turn_isolation.win32 import (
     SecretBuffer,
     SpawnedProcess,
     Win32Error,
+    parse_environment_block,
 )
 
 PASSWORD = "turn-user-pa55word-SENTINEL"
@@ -468,3 +469,42 @@ def test_option_without_value_stops() -> None:
     assert rc == SECRETS_STOP_EXIT_CODE
     assert parse_stop_line(err.getvalue()) == "turn launcher: --user needs a value"
     assert "spawn" not in api.calls
+
+
+# --- UTF-16 environment blocks (PR #485 review round 4) ----------------------------------------
+
+NON_BMP = "x\U0001f600y"  # an emoji: one code point, two UTF-16 units
+
+
+def _utf16_block(entries: list[str]) -> ctypes.Array[ctypes.c_char]:
+    raw = ("\0".join(entries) + "\0\0").encode("utf-16-le")
+    return ctypes.create_string_buffer(raw, len(raw))
+
+
+def test_parse_environment_block_keeps_alignment_after_a_non_bmp_character() -> None:
+    buf = _utf16_block([f"A={NON_BMP}", "B=z", "=C:=C:\\x", "Path=C:\\Windows"])
+    env = parse_environment_block(ctypes.addressof(buf))
+    assert env == {"A": NON_BMP, "B": "z", "Path": "C:\\Windows"}
+
+
+def test_parse_environment_block_empty() -> None:
+    buf = _utf16_block([])
+    assert parse_environment_block(ctypes.addressof(buf)) == {}
+
+
+def test_environment_block_round_trips_a_non_bmp_value() -> None:
+    sb = SecretBuffer.environment_block({"B": "z", "A": NON_BMP})
+    assert sb.raw().rstrip("\0") == f"A={NON_BMP}\0B=z"
+    if ctypes.sizeof(ctypes.c_wchar) == 2:  # Windows: the buffer is the UTF-16 block itself
+        assert parse_environment_block(ctypes.addressof(sb.buffer)) == {"A": NON_BMP, "B": "z"}
+
+
+def test_launch_passes_a_non_bmp_turn_variable_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = FakeApi()
+    profile = f"C:\\Users\\{NON_BMP}"
+    monkeypatch.setattr(
+        api, "create_environment_block", lambda token: {**TURN_DEFAULT_ENV, "USERPROFILE": profile}
+    )
+    _launch(api)
+    assert api.spawn_env_raw is not None
+    assert _env_of(api.spawn_env_raw)["USERPROFILE"] == profile

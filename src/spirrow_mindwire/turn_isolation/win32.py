@@ -89,9 +89,19 @@ class SecretBuffer:
 
     @classmethod
     def environment_block(cls, env: Mapping[str, str]) -> SecretBuffer:
-        """``K=V\\0K=V\\0\\0`` in sorted, case-insensitive order (CreateProcess's rule)."""
+        """``K=V\\0K=V\\0\\0`` in sorted, case-insensitive order (CreateProcess's rule).
+
+        Where ``wchar_t`` is UTF-16 (Windows) the block is laid out in UTF-16 code units, so a
+        character outside the BMP takes its two-unit surrogate pair (PR #485 review round 4). A
+        one-element-per-code-point copy raises ``TypeError`` on such a character.
+        """
         parts = [f"{k}={env[k]}" for k in sorted(env, key=str.upper)]
         body = "\0".join(parts) + "\0\0"
+        if ctypes.sizeof(ctypes.c_wchar) == 2:
+            units = body.encode("utf-16-le", "surrogatepass")
+            sb = cls(len(units) // 2)
+            ctypes.memmove(sb._buf, units, len(units))
+            return sb
         sb = cls(len(body))
         sb._buf[: len(body)] = list(body)
         return sb
@@ -116,8 +126,8 @@ class SecretBuffer:
         return self._buf.value
 
     def raw(self) -> str:
-        """Every character, NULs included (an environment block)."""
-        return "".join(self._buf[: len(self._buf)])
+        """Every character, NULs included (an environment block); surrogate pairs decoded."""
+        return ctypes.wstring_at(ctypes.addressof(self._buf), len(self._buf))
 
     def wipe(self) -> None:
         ctypes.memset(self._buf, 0, ctypes.sizeof(self._buf))
@@ -127,6 +137,31 @@ class SecretBuffer:
         return "SecretBuffer(<redacted>)"
 
     __str__ = __repr__
+
+
+def parse_environment_block(address: int) -> dict[str, str]:
+    """Read a UTF-16 ``K=V\\0...\\0\\0`` block (``CreateEnvironmentBlock``'s output).
+
+    Walks UTF-16 code units, not decoded characters. A character outside the BMP is one Python
+    code point but two units in the block, so advancing by ``len(str)`` would land inside the
+    current entry and misparse everything after it (PR #485 review round 4). Entries without a
+    name (the ``=C:=C:\\...`` drive entries) are skipped.
+    """
+    units = ctypes.cast(address, ctypes.POINTER(ctypes.c_uint16))
+    env: dict[str, str] = {}
+    start = i = 0
+    while True:
+        if units[i] == 0:
+            if i == start:
+                return env
+            entry = ctypes.string_at(address + start * 2, (i - start) * 2).decode(
+                "utf-16-le", "surrogatepass"
+            )
+            key, sep, value = entry.partition("=")
+            if sep and key:
+                env[key] = value
+            start = i + 1
+        i += 1
 
 
 @dataclass(frozen=True)
@@ -364,18 +399,7 @@ if sys.platform == "win32":
             if not _uenv.CreateEnvironmentBlock(ctypes.byref(block), wintypes.HANDLE(token), False):
                 raise _fail("CreateEnvironmentBlock")
             try:
-                env: dict[str, str] = {}
-                addr = int(block.value or 0)
-                width = ctypes.sizeof(ctypes.c_wchar)
-                while True:
-                    entry = ctypes.wstring_at(addr)
-                    if not entry:
-                        break
-                    key, sep, value = entry.partition("=")
-                    if sep and key:  # skips the "=C:=C:\\..." drive entries
-                        env[key] = value
-                    addr += (len(entry) + 1) * width
-                return env
+                return parse_environment_block(int(block.value or 0))
             finally:
                 _uenv.DestroyEnvironmentBlock(block)
 
