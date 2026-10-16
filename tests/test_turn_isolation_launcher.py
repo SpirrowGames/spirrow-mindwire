@@ -524,10 +524,13 @@ def test_real_std_handle_passes_through() -> None:
     assert usable_std_handle(0x1234) == 0x1234
 
 
-@pytest.mark.skipif(not hasattr(ctypes, "WinDLL"), reason="real HANDLE restype needs Windows")
 def test_handle_restype_returns_int_and_minus_one_is_caught() -> None:
     """The review's premise, checked on the real binding: a ``HANDLE``-restype call returns a
     plain ``int``, and a (HANDLE)-1 result is recognised. ``GetCurrentProcess`` returns -1."""
+    import sys
+
+    if sys.platform != "win32":  # a sys.platform check, so mypy --platform linux narrows it
+        pytest.skip("real HANDLE restype needs Windows")
     from ctypes import wintypes
 
     k32 = ctypes.WinDLL("kernel32")
