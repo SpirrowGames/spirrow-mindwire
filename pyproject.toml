@@ -52,6 +52,7 @@ mindwire-mcp-server = "spirrow_mindwire.mcp_write_server.http:main"
 mindwire = "spirrow_mindwire.cli:main"
 mindwire-migrate-v1-to-v2 = "spirrow_mindwire.migration.v1_to_v2:main"
 mindwire-compose-decision = "spirrow_mindwire.decision_request.cli:main"
+mindwire-turn-launcher = "spirrow_mindwire.turn_isolation.launcher:entrypoint"
 
 [build-system]
 requires = ["hatchling"]
