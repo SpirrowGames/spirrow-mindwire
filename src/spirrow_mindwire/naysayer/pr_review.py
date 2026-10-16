@@ -2343,7 +2343,7 @@ class NaysayerPrReviewDriver:
             else (await self._route(pr, view=view, coverage=coverage)).tier
         )
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
-            view, pr.slug, coverage=coverage, tier=tier
+            view, pr.slug, coverage=coverage, tier=tier, n3_routed=self._model is None
         )
 
         if isinstance(pass1_result, LexoraTimeoutError):
@@ -2545,6 +2545,7 @@ class NaysayerPrReviewDriver:
         *,
         coverage: list[CrossPrApproveCoverage] | None = None,
         tier: str,
+        n3_routed: bool,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -2570,13 +2571,19 @@ class NaysayerPrReviewDriver:
           selection so the marker is always well-defined (fail-open).
         * ``pass2_raw`` — the raw ``content`` string pass 2 returned (empty string on
           failure). Retained for the M5' log line (msg-701 §2, msg-703 M5').
+
+        ``n3_routed`` is True only when ``tier`` came out of :meth:`_route` for this PR — never
+        when an operator/test pinned ``model`` — and is sent on BOTH passes as the
+        ``X-Mindwire-N3-Route: v1`` declaration (ADR-14 §7.3, thread msg-6982): the two passes
+        carry the same diff, so they carry the same classification.
         """
         pass1_task = self._lexora.chat_completion(
             model=tier,
             messages=_build_messages(view.text, pr_slug, coverage=coverage),
             max_tokens=self._max_tokens,
+            n3_routed=n3_routed,
         )
-        pass2_task = self._collect_adr_pointers(view.text, pr_slug, tier=tier)
+        pass2_task = self._collect_adr_pointers(view.text, pr_slug, tier=tier, n3_routed=n3_routed)
         # ``return_exceptions=True`` isolates the two passes: pass 2's exception must never
         # reach the caller (fail-open), and pass 1's exception is inspected below so the
         # LexoraTimeoutError → degrade path is preserved while other exceptions still
@@ -2592,7 +2599,7 @@ class NaysayerPrReviewDriver:
         return pass1_outcome, pass2_selection, pass2_raw
 
     async def _collect_adr_pointers(
-        self, text: str, pr_slug: str, *, tier: str
+        self, text: str, pr_slug: str, *, tier: str, n3_routed: bool
     ) -> tuple[AdrPointerSelection, str]:
         """Run pass 2 → M1'/M2 pipeline. Returns (selection, raw_content).
 
@@ -2611,6 +2618,7 @@ class NaysayerPrReviewDriver:
                     model=tier,
                     messages=_build_pass2_messages(text, pr_slug),
                     max_tokens=_ADR_POINTER_MAX_TOKENS,
+                    n3_routed=n3_routed,
                 ),
                 timeout=_ADR_POINTER_TIMEOUT_SECONDS,
             )

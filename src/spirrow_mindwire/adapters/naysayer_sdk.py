@@ -566,6 +566,13 @@ class NaysayerSdkAdapter:
         self._repo_root_finder = repo_root_finder or find_repo_root
         self._trusted_reader = trusted_reader or remote_default_branch_reader
         self._n3_notifier = n3_notifier
+        # ADR-14 §7.3 routing declaration (thread msg-6982; msg-7068, human decision B):
+        # the v1 header goes through ANTHROPIC_CUSTOM_HEADERS on every turn of a routed
+        # adapter, whatever tier route_tier picks for that turn (Lexora ignores it on a
+        # tier without codex, msg-6984). A pinned ``model`` was never classified here,
+        # so it never carries the declaration. It is fixed for the adapter's lifetime,
+        # never toggled per turn.
+        self._n3_routed = self._routed
         # Loop-readable obligations are injected — the manifest passed in is the
         # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
         # adapter never reaches for a module-global path itself. The verdict-
@@ -672,17 +679,18 @@ class NaysayerSdkAdapter:
         ) as client:
             return await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
 
-    @staticmethod
-    def _turn_options(options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
+    def _turn_options(self, options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
         """Copy the session's ``options`` so its subprocess tags every request with ``trace_id``.
 
         The spawn-time ``options`` object is not modified: it is what the
         ``source:`` marker is rendered from, and the only field that differs here
-        is the trace header, which the marker does not describe. The header lives
+        is the request headers (the trace id, plus the §7.3 routing declaration on every
+        turn of a routed adapter), which the marker does not describe. The headers live
         in the subprocess **env** — the SDK subprocess is per turn
         (1-turn-1-session), so an env value is scoped to exactly one turn.
         """
-        env = {**options.env, CUSTOM_HEADERS_ENV: custom_headers_env_value(trace_id)}
+        headers = custom_headers_env_value(trace_id, n3_routed=self._n3_routed)
+        env = {**options.env, CUSTOM_HEADERS_ENV: headers}
         return replace(options, env=env)
 
     def _make_options(self) -> ClaudeAgentOptions:

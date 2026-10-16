@@ -19,6 +19,8 @@ from spirrow_mindwire.lexora.client import (
     _DEFAULT_LEXORA_URL,
     _DEFAULT_TIMEOUT_SECONDS,
     LEXORA_BACKEND_TIMEOUT_SECONDS,
+    N3_ROUTE_HEADER,
+    N3_ROUTE_VALUE,
     TRACE_HEADER,
     ChatMessage,
     LexoraAPIError,
@@ -289,3 +291,45 @@ async def test_stats_costs_recent_passes_the_trace_filter_only_when_given() -> N
         await client.stats_costs_recent(limit=5)
         await client.stats_costs_recent(limit=200, trace_id="01TRACE")
     assert seen == [{"limit": "5"}, {"limit": "200", "trace_id": "01TRACE"}]
+
+
+# ---------- ADR-14 §7.3 routing declaration (thread msg-6982) --------------
+
+
+@pytest.mark.anyio
+async def test_chat_completion_sends_the_n3_route_declaration_only_when_asked() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(N3_ROUTE_HEADER))
+        return _completion()
+
+    async with _client(handler) as client:
+        # Off by default: a caller that did not route this payload declares nothing.
+        await client.chat_completion(model="naysayer", messages=_msgs(), max_tokens=8)
+        await client.chat_completion(
+            model="naysayer", messages=_msgs(), max_tokens=8, n3_routed=True
+        )
+        await client.chat_completion(
+            model="naysayer", messages=_msgs(), max_tokens=8, trace_id="01T", n3_routed=True
+        )
+    assert seen == [None, "v1", "v1"]
+
+
+def test_n3_route_declaration_has_no_parameters() -> None:
+    # msg-6981/6982: the tier is named only by ``model``; the header carries nothing else.
+    assert N3_ROUTE_HEADER == "X-Mindwire-N3-Route"
+    assert N3_ROUTE_VALUE == "v1"
+
+
+@pytest.mark.anyio
+async def test_decide_never_sends_the_n3_route_declaration() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(N3_ROUTE_HEADER))
+        return httpx.Response(200, json={"provider": "x", "decision_id": "d", "answers": []})
+
+    async with _client(handler) as client:
+        await client.decide({"q": 1})
+    assert seen == [None]

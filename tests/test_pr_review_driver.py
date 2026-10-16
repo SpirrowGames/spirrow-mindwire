@@ -96,10 +96,18 @@ class _FakeLexora:
         self._fr = finish_reason
         self._raise = raise_exc
         self.calls: list[tuple[str, list[ChatMessage], int]] = []
+        # ADR-14 §7.3 routing declaration per call (thread msg-6982).
+        self.n3_routed: list[bool] = []
 
     async def chat_completion(
-        self, *, model: str, messages: list[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         self.calls.append((model, messages, max_tokens))
         if self._raise is not None:
             raise self._raise
@@ -5342,3 +5350,23 @@ async def test_pinned_model_bypasses_routing() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub(), model="pinned")
     await driver.review(_pr(), post_critique=post)
     assert {call[0] for call in lexora.calls} == {"pinned"}
+    # Not classified here, so no §7.3 routing declaration (thread msg-6982).
+    assert lexora.n3_routed == [False, False]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("labels", "tier"),
+    [(frozenset(), "naysayer"), (frozenset({"n3-sensitive"}), "naysayer-gemini")],
+)
+async def test_routed_review_declares_n3_route_on_both_passes(
+    labels: frozenset[str], tier: str
+) -> None:
+    # ADR-14 §7.3 / msg-6982: the declaration follows ``route_tier`` having run for this PR,
+    # whichever tier it chose; Lexora only acts on it for a codex-backed tier.
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=_routed_github(labels=labels))
+    await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {tier}
+    assert lexora.n3_routed == [True, True]

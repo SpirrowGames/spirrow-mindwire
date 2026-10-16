@@ -150,6 +150,8 @@ class _FakeGateway:
         self._honours = honours_trace_filter
         self.calls: list[dict[str, Any]] = []
         self.stats_reads: list[dict[str, Any]] = []
+        # ADR-14 §7.3 routing declaration per probe (thread msg-6982).
+        self.n3_routed: list[bool] = []
 
     async def chat_completion(
         self,
@@ -158,7 +160,9 @@ class _FakeGateway:
         messages: list[ChatMessage],
         max_tokens: int,
         trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         index = len(self.calls)
         self.calls.append(
             {"model": model, "messages": messages, "max_tokens": max_tokens, "trace_id": trace_id}
@@ -228,6 +232,16 @@ async def test_the_probe_sends_a_trace_id_and_reads_back_by_the_same_one() -> No
     sent = gateway.calls[0]["trace_id"]
     assert isinstance(sent, str) and len(sent) == 26  # a ULID
     assert gateway.stats_reads == [{"limit": TRACE_READ_LIMIT, "trace_id": sent}]
+
+
+@pytest.mark.anyio
+async def test_the_probe_declares_n3_route() -> None:
+    """ADR-14 §7.3 (msg-6982): the fixed probe carries no repository content, so its
+    classification is decided in advance and it sends the ``v1`` declaration — otherwise a
+    probe of the codex-backed tier would be served by Gemini and never attest that tier."""
+    gateway = _FakeGateway()
+    await _attest(gateway)
+    assert gateway.n3_routed == [True]
 
 
 @pytest.mark.anyio
@@ -832,6 +846,11 @@ def test_the_custom_headers_value_is_the_measured_name_colon_value_form() -> Non
     """D-0a (2026-10-02): CLI 2.1.133 sends ``Name: Value``; it rejects the JSON form."""
     assert TRACE_HEADER == "X-Mindwire-Trace"
     assert custom_headers_env_value("01ABC") == "X-Mindwire-Trace: 01ABC"
+    # ADR-14 §7.3 routing declaration as a second ``Name: Value`` line (thread msg-6982).
+    assert (
+        custom_headers_env_value("01ABC", n3_routed=True)
+        == "X-Mindwire-Trace: 01ABC\nX-Mindwire-N3-Route: v1"
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -93,10 +93,18 @@ class _FakeLexora:
         self.pass1_exc = pass1_exc
         self.pass2_exc = pass2_exc
         self.calls: list[tuple[str, list[ChatMessage], int]] = []
+        # ADR-14 §7.3 routing declaration per call (thread msg-6982).
+        self.n3_routed: list[bool] = []
 
     async def chat_completion(
-        self, *, model: str, messages: list[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         self.calls.append((model, list(messages), max_tokens))
         # Route on max_tokens: pass 1 uses the reasoning-model budget (>= 8000); pass 2
         # uses the smaller ADR-pointer budget. See _ADR_POINTER_MAX_TOKENS in the driver.
