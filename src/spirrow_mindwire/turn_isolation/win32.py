@@ -139,6 +139,22 @@ class SecretBuffer:
     __str__ = __repr__
 
 
+INVALID_HANDLE_VALUE: int = ctypes.c_void_p(-1).value or 0  # (HANDLE)-1 as ctypes returns it
+
+
+def usable_std_handle(raw: int | None) -> int:
+    """``GetStdHandle``'s result as a handle worth duplicating, or 0.
+
+    With ``restype = wintypes.HANDLE`` ctypes hands back a plain ``int`` (or ``None`` for
+    NULL), never a ``HANDLE`` object, and ``(HANDLE)-1`` arrives as the unsigned pointer value
+    :data:`INVALID_HANDLE_VALUE`. Both NULL (no handle) and that value (the call failed) mean
+    "nothing to give the child" (PR #485 review round 5; pinned by tests on the real restype).
+    """
+    if not raw or raw == INVALID_HANDLE_VALUE:
+        return 0
+    return int(raw)
+
+
 def parse_environment_block(address: int) -> dict[str, str]:
     """Read a UTF-16 ``K=V\\0...\\0\\0`` block (``CreateEnvironmentBlock``'s output).
 
@@ -358,7 +374,6 @@ if sys.platform == "win32":
     _TOKEN_QUERY = 0x0008
     _SE_PRIVILEGE_ENABLED = 0x00000002
     _ERROR_NOT_ALL_ASSIGNED = 1300
-    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
     def _fail(api: str) -> Win32Error:
         return Win32Error(api, ctypes.get_last_error())
@@ -451,8 +466,8 @@ if sys.platform == "win32":
             out: list[int] = []
             try:
                 for n in _STD_HANDLES:
-                    src = _k32.GetStdHandle(n)
-                    if not src or src == _INVALID_HANDLE_VALUE:
+                    src = usable_std_handle(_k32.GetStdHandle(n))
+                    if not src:
                         out.append(0)
                         continue
                     dup = wintypes.HANDLE()

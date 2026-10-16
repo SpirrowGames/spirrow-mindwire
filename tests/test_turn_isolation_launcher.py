@@ -32,6 +32,7 @@ from spirrow_mindwire.turn_isolation.launcher import (
 from spirrow_mindwire.turn_isolation.win32 import (
     CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
+    INVALID_HANDLE_VALUE,
     LOGON32_LOGON_INTERACTIVE,
     SPAWN_PRIVILEGES,
     STARTF_USESTDHANDLES,
@@ -39,6 +40,7 @@ from spirrow_mindwire.turn_isolation.win32 import (
     SpawnedProcess,
     Win32Error,
     parse_environment_block,
+    usable_std_handle,
 )
 
 PASSWORD = "turn-user-pa55word-SENTINEL"
@@ -508,3 +510,36 @@ def test_launch_passes_a_non_bmp_turn_variable_through(monkeypatch: pytest.Monke
     _launch(api)
     assert api.spawn_env_raw is not None
     assert _env_of(api.spawn_env_raw)["USERPROFILE"] == profile
+
+
+# --- std handle boundary and case-insensitive merge (PR #485 review round 5) -------------------
+
+
+@pytest.mark.parametrize("raw", [None, 0, INVALID_HANDLE_VALUE])
+def test_missing_or_invalid_std_handle_becomes_zero(raw: int | None) -> None:
+    assert usable_std_handle(raw) == 0
+
+
+def test_real_std_handle_passes_through() -> None:
+    assert usable_std_handle(0x1234) == 0x1234
+
+
+@pytest.mark.skipif(not hasattr(ctypes, "WinDLL"), reason="real HANDLE restype needs Windows")
+def test_handle_restype_returns_int_and_minus_one_is_caught() -> None:
+    """The review's premise, checked on the real binding: a ``HANDLE``-restype call returns a
+    plain ``int``, and a (HANDLE)-1 result is recognised. ``GetCurrentProcess`` returns -1."""
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    pseudo = k32.GetCurrentProcess()
+    assert type(pseudo) is int
+    assert pseudo == INVALID_HANDLE_VALUE
+    assert usable_std_handle(pseudo) == 0
+
+
+def test_overlay_replaces_a_default_entry_of_any_casing() -> None:
+    env = launcher_mod.build_turn_environment(
+        {"gh_token": "stale", "Path": "C:\\Windows"}, {"GH_TOKEN": PAT}
+    )
+    assert env == {"Path": "C:\\Windows", "GH_TOKEN": PAT}

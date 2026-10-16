@@ -147,8 +147,13 @@ def read_secret(api: CredentialReader, target: str, missing_reason: str) -> Secr
 def build_turn_environment(
     default_env: Mapping[str, str], overlay: Mapping[str, str]
 ) -> dict[str, str]:
-    """The turn user's default environment plus the allow-list. Nothing from ``os.environ``."""
-    env = dict(default_env)
+    """The turn user's default environment plus the allow-list. Nothing from ``os.environ``.
+
+    Windows variable names are case-insensitive, so an overlay name replaces a default entry
+    of any casing instead of sitting next to it as a duplicate (PR #485 review round 5).
+    """
+    names = {name.upper() for name in overlay}
+    env = {k: v for k, v in default_env.items() if k.upper() not in names}
     env.update(overlay)
     return env
 
