@@ -3069,8 +3069,28 @@ function Get-DirtyCloneNotice {
 # branch because the GitHub API stayed transiently unavailable (5xx / timeout / rate limit) through
 # its retries. Not the thread's fault and not the clone's: nobody is quarantined, put on
 # retry-pending or parked, and other candidates keep going. The notification rides the same
-# Send-NotificationIfChanged channel as the dirty clone, on a per-repo key; an unreadable payload
-# still notifies (signature 'git-sync-deferred:parse-failed') and never borrows a GitHub key.
+# Send-NotificationIfChanged channel as the dirty clone, but on a per-CANDIDATE key (repo + thread):
+# unlike a dirty clone, a deferral parks nothing, so several threads on one repo can defer in the
+# same sweep, and on a shared per-repo key their differing signatures would overwrite each other
+# and re-alert on every launch (PR #473 review, 3f026f8). Each candidate's key is dropped again as
+# soon as that candidate gets past git-sync (Clear-GitSyncDeferredNotice), so the debounce means
+# "once per outage episode per thread", not "once ever". An unreadable payload still notifies
+# (signature 'git-sync-deferred:parse-failed') and never borrows a GitHub key.
+function Get-GitSyncDeferredNoticeKey {
+    param([string]$RepoDir, [string]$CandidateKey)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    return "__git_sync_deferred__/$repoKey/$CandidateKey"
+}
+
+# Drops a candidate's deferral notice key once its launch ended any way other than a deferral.
+# Returns $true when a key was removed (the caller persists the state).
+function Clear-GitSyncDeferredNotice {
+    param([hashtable]$State, [string]$RepoDir, [string]$CandidateKey)
+    $key = Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey
+    if ($State.ContainsKey($key)) { $State.Remove($key); return $true }
+    return $false
+}
+
 function Get-GitSyncDeferredNotice {
     param([string]$RepoDir, [string]$CandidateKey, $Output, [int]$ExitCode)
     $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
@@ -3091,7 +3111,8 @@ function Get-GitSyncDeferredNotice {
     $body = ("MindWire: git 同期のブランチ名解決で GitHub API が一時的に使えず、ターンを見送りました — **$CandidateKey** exit=$ExitCode。" +
              "スレッドは無傷（park も quarantine もしない）。次の tick で最初から判定し直します。`n" +
              "clone: $RepoDir`n$detailLine")
-    return @{ key = "__git_sync_deferred__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey }
+    return @{ key = (Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey)
+              signature = $sig; message = $body; repo_key = $repoKey }
 }
 
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
@@ -5880,6 +5901,13 @@ try {
         }
         $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        # A launch that did not defer got past git-sync: end this candidate's deferral episode so
+        # its next outage alerts again (see Get-GitSyncDeferredNotice).
+        if ($code -ne $GitSyncDeferredExitCode -and
+            (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
         $verdict = Get-ConductorVerdict -Output $output
         # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
         # -Delivered / -YieldTo (Get-SummonStopFields, StopReason.ps1) and the one Update-SummonYield.
