@@ -1,7 +1,8 @@
 """Unit 2a as-user launcher (T-executor-pool-under-one-conductor msg-7104 / 7106 / 7108).
 
 The Win32 surface is a recording fake, so every ordering and fail-closed rule is checked on any
-platform. The real ``CreateProcessWithLogonW`` path is the operator spike's job.
+platform. The real ``CreateProcessAsUserW`` path is the operator spike's job (decision B,
+PR #485: LogonUserW + CreateProcessAsUserW so the child inherits the stdio pipes).
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from spirrow_mindwire.turn_isolation.win32 import (
     CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
     LOGON32_LOGON_INTERACTIVE,
-    LOGON_WITH_PROFILE,
+    SPAWN_PRIVILEGES,
     STARTF_USESTDHANDLES,
     SecretBuffer,
     SpawnedProcess,
@@ -51,7 +52,7 @@ TURN_DEFAULT_ENV = {
 }
 
 TOKEN, JOB, PROC, THREAD = 101, 202, 303, 404
-STD = (11, 12, 13)
+STD = (11, 12, 13)  # inheritable duplicates of the launcher's stdio
 
 
 class FakeApi:
@@ -61,7 +62,11 @@ class FakeApi:
         creds: dict[str, str | None] | None = None,
         fail: dict[str, int] | None = None,
         exit_code: int = 0,
+        missing_privileges: list[str] | None = None,
     ) -> None:
+        self.missing_privileges = missing_privileges or []
+        self.privileges_requested: list[str] | None = None
+        self.password_wiped_at_spawn: bool | None = None
         self.creds: dict[str, str | None] = (
             creds
             if creds is not None
@@ -110,15 +115,22 @@ class FakeApi:
         self._maybe_fail("CreateJobObjectW")
         return JOB
 
-    def std_handles(self) -> tuple[int, int, int]:
+    def enable_privileges(self, names: Any) -> list[str]:
+        self.calls.append("enable_privileges")
+        self.privileges_requested = list(names)
+        return list(self.missing_privileges)
+
+    def inheritable_std_handles(self) -> tuple[int, int, int]:
+        self.calls.append("dup_stdio")
+        self._maybe_fail("DuplicateHandle")
         return STD
 
-    def create_process_with_logon(self, **kwargs: Any) -> SpawnedProcess:
+    def create_process_as_user(self, **kwargs: Any) -> SpawnedProcess:
         self.calls.append("spawn")
         self.spawn_kwargs = kwargs
         self.spawn_env_raw = kwargs["environment"].raw()
-        self.spawn_password_seen = kwargs["password"].reveal()
-        self._maybe_fail("CreateProcessWithLogonW")
+        self.password_wiped_at_spawn = bool(self.secrets) and self.secrets[0].wiped
+        self._maybe_fail("CreateProcessAsUserW")
         return SpawnedProcess(PROC, THREAD, 4242)
 
     def assign_process_to_job(self, job: int, process: int) -> None:
@@ -175,6 +187,8 @@ def test_happy_path_order_flags_and_exit_code() -> None:
         "create_job",
         "logon_user",
         "create_environment_block",
+        "enable_privileges",
+        "dup_stdio",
         "spawn",
         "assign",
         "resume",
@@ -183,15 +197,54 @@ def test_happy_path_order_flags_and_exit_code() -> None:
     kw = api.spawn_kwargs
     assert kw is not None
     assert api.logon_type == LOGON32_LOGON_INTERACTIVE
-    assert kw["logon_flags"] == LOGON_WITH_PROFILE
+    assert kw["token"] == TOKEN  # the LogonUserW token, not a second logon
     assert kw["creation_flags"] == CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
     assert kw["startup_flags"] == STARTF_USESTDHANDLES
-    assert kw["std_handles"] == STD  # the launcher's own stdio, passed through
-    assert kw["desktop"] is None  # msg-7108: seclogon grants winsta/desktop only for NULL
+    assert kw["std_handles"] == STD  # inheritable duplicates of the launcher's stdio
+    assert list(kw["inherit_handles"]) == list(STD)  # and nothing else is inherited
+    assert kw["desktop"] is None
     assert kw["environment"] is not None  # never a NULL lpEnvironment
     assert kw["command_line"] == 'claude "a b"'
-    assert (kw["user"], kw["domain"]) == ("mindwire-turn", ".")
-    assert api.spawn_password_seen == PASSWORD
+    assert "password" not in kw  # decision B: the spawn takes the token only
+    assert api.privileges_requested == list(SPAWN_PRIVILEGES)
+
+
+def test_password_is_wiped_before_the_spawn() -> None:
+    api = FakeApi()
+    _launch(api)
+    assert api.password_wiped_at_spawn is True
+
+
+def test_stdio_duplicates_are_closed_after_spawn() -> None:
+    api = FakeApi()
+    _launch(api)
+    assert set(STD) <= set(api.closed)
+
+
+def test_stdio_duplication_failure_stops_before_spawn() -> None:
+    api = FakeApi(fail={"DuplicateHandle": 6})
+    assert _stop(api).reason == "turn stdio handle duplication failed (6)"
+    assert "spawn" not in api.calls
+    assert JOB in api.closed and TOKEN in api.closed
+
+
+def test_privilege_not_held_names_the_missing_right() -> None:
+    api = FakeApi(
+        fail={"CreateProcessAsUserW": 1314},
+        missing_privileges=["SeAssignPrimaryTokenPrivilege"],
+    )
+    assert _stop(api).reason == (
+        "turn spawn failed: owner lacks privilege: "
+        "Replace a process level token (SeAssignPrimaryTokenPrivilege)"
+    )
+    assert "resume" not in api.calls
+    assert set(STD) <= set(api.closed)
+
+
+def test_privilege_not_held_without_a_known_gap_names_both_rights() -> None:
+    api = FakeApi(fail={"CreateProcessAsUserW": 1314})
+    reason = _stop(api).reason
+    assert "SeAssignPrimaryTokenPrivilege" in reason and "SeIncreaseQuotaPrivilege" in reason
 
 
 def test_environment_is_turn_users_block_plus_gh_token_only(
@@ -269,12 +322,7 @@ def test_empty_credential_counts_as_missing() -> None:
         ("LogonUserW", 1909, "turn user logon failed: account disabled/locked"),
         ("LogonUserW", 5, "turn user logon failed: LogonUserW (5)"),
         ("CreateEnvironmentBlock", 8, "turn user logon failed: CreateEnvironmentBlock (8)"),
-        (
-            "CreateProcessWithLogonW",
-            1385,
-            "turn user logon failed: logon right not granted (Allow log on locally)",
-        ),
-        ("CreateProcessWithLogonW", 2, "turn user logon failed: CreateProcessWithLogonW (2)"),
+        ("CreateProcessAsUserW", 2, "turn spawn failed: CreateProcessAsUserW (2)"),
     ],
 )
 def test_each_step_failure_stops_without_a_running_child(
@@ -283,7 +331,7 @@ def test_each_step_failure_stops_without_a_running_child(
     api = FakeApi(fail={api_name: code})
     assert _stop(api).reason == reason
     assert "resume" not in api.calls
-    if api_name != "CreateProcessWithLogonW":
+    if api_name != "CreateProcessAsUserW":
         assert "spawn" not in api.calls
     assert all(sb.wiped for sb in api.secrets)
 

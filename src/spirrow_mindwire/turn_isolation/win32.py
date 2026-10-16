@@ -3,9 +3,9 @@
 Everything the launcher does to the OS goes through :class:`Win32Api`, so the launcher's
 ordering and fail-closed rules (msg-7104 / msg-7106 / msg-7108) are unit-tested with a fake on
 any platform. The real binding, :class:`_CtypesWin32Api`, is plain ``ctypes`` — the same thing
-as a P/Invoke, and no new dependency: pywin32 (already a Windows dependency) has no
-``CreateProcessWithLogonW``, and its ``CredRead`` hands the secret back as an immutable
-``bytes`` that cannot be wiped.
+as a P/Invoke, and no new dependency: pywin32 (already a Windows dependency) cannot build the
+``STARTUPINFOEX`` handle list the spawn needs, and its ``CredRead`` hands the secret back as an
+immutable ``bytes`` that cannot be wiped.
 
 Secrets travel as :class:`SecretBuffer` — a mutable ctypes wide-char buffer the launcher wipes
 (``memset`` 0, the ctypes spelling of ``SecureZeroMemory``) as soon as the spawn call returns.
@@ -19,24 +19,34 @@ from __future__ import annotations
 
 import ctypes
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 # --- constants the launcher passes; tests pin them by value -----------------------------------
-LOGON32_LOGON_INTERACTIVE = 2  # msg-7106: the same logon type CreateProcessWithLogonW performs
+LOGON32_LOGON_INTERACTIVE = 2  # msg-7106: the account holds "Allow log on locally" only
 LOGON32_PROVIDER_DEFAULT = 0
-LOGON_WITH_PROFILE = 0x00000001
 CREATE_SUSPENDED = 0x00000004
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 STARTF_USESTDHANDLES = 0x00000100
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+# CreateProcessAsUserW with a token for another user needs these in the caller's token
+# (Microsoft docs, CreateProcessAsUserW remarks). Local Security Policy names in the values.
+SE_ASSIGNPRIMARYTOKEN_NAME = "SeAssignPrimaryTokenPrivilege"
+SE_INCREASE_QUOTA_NAME = "SeIncreaseQuotaPrivilege"
+SPAWN_PRIVILEGES: dict[str, str] = {
+    SE_ASSIGNPRIMARYTOKEN_NAME: "Replace a process level token",
+    SE_INCREASE_QUOTA_NAME: "Adjust memory quotas for a process",
+}
 
 ERROR_NOT_FOUND = 1168
 ERROR_LOGON_FAILURE = 1326
 ERROR_ACCOUNT_RESTRICTION = 1327
 ERROR_ACCOUNT_DISABLED = 1331
 ERROR_LOGON_TYPE_NOT_GRANTED = 1385
+ERROR_PRIVILEGE_NOT_HELD = 1314
 ERROR_ACCOUNT_LOCKED_OUT = 1909
 
 
@@ -143,15 +153,23 @@ class Win32Api(CredentialReader, Protocol):
     def create_kill_on_close_job(self) -> int:
         """A job handle with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``."""
 
-    def std_handles(self) -> tuple[int, int, int]: ...
+    def enable_privileges(self, names: Sequence[str]) -> list[str]:
+        """Enable each privilege in the launcher's own token; return the ones it does not hold.
 
-    def create_process_with_logon(
+        Best effort: never raises. A privilege the token lacks cannot be enabled; the spawn then
+        fails with ``ERROR_PRIVILEGE_NOT_HELD`` and the launcher names what was missing.
+        """
+
+    def inheritable_std_handles(self) -> tuple[int, int, int]:
+        """Inheritable duplicates of the launcher's stdin/stdout/stderr (0 where there is none).
+
+        The caller closes them. The launcher's own handles are left untouched.
+        """
+
+    def create_process_as_user(
         self,
         *,
-        user: str,
-        domain: str,
-        password: SecretBuffer,
-        logon_flags: int,
+        token: int,
         command_line: str,
         creation_flags: int,
         environment: SecretBuffer,
@@ -159,7 +177,11 @@ class Win32Api(CredentialReader, Protocol):
         startup_flags: int,
         desktop: str | None,
         std_handles: tuple[int, int, int],
-    ) -> SpawnedProcess: ...
+        inherit_handles: Sequence[int],
+    ) -> SpawnedProcess:
+        """``CreateProcessAsUserW(token, bInheritHandles=TRUE)``, restricted through a
+        ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST`` to exactly ``inherit_handles``: the child inherits
+        those and no other inheritable handle the launcher happens to hold."""
 
     def assign_process_to_job(self, job: int, process: int) -> None: ...
 
@@ -190,6 +212,7 @@ if sys.platform == "win32":
     # Handle- and DWORD-returning functions: the ctypes default restype is a C int, which would
     # truncate a 64-bit HANDLE and turn the DWORD failure sentinel into -1.
     _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.GetCurrentProcess.restype = wintypes.HANDLE
     _k32.GetStdHandle.restype = wintypes.HANDLE
     _k32.ResumeThread.restype = wintypes.DWORD
     _k32.WaitForSingleObject.restype = wintypes.DWORD
@@ -230,6 +253,19 @@ if sys.platform == "win32":
             ("hStdInput", wintypes.HANDLE),
             ("hStdOutput", wintypes.HANDLE),
             ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [("StartupInfo", _STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+    class _LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class _TOKEN_PRIVILEGES1(ctypes.Structure):  # noqa: N801 - Win32 name, one entry
+        _fields_ = [
+            ("PrivilegeCount", wintypes.DWORD),
+            ("Luid", _LUID),
+            ("Attributes", wintypes.DWORD),
         ]
 
     class _PROCESS_INFORMATION(ctypes.Structure):  # noqa: N801 - Win32 name
@@ -281,6 +317,13 @@ if sys.platform == "win32":
     _INFINITE = 0xFFFFFFFF
     _WAIT_FAILED = 0xFFFFFFFF
     _STD_HANDLES = (-10, -11, -12)
+    _DUPLICATE_SAME_ACCESS = 0x00000002
+    _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+    _TOKEN_ADJUST_PRIVILEGES = 0x0020
+    _TOKEN_QUERY = 0x0008
+    _SE_PRIVILEGE_ENABLED = 0x00000002
+    _ERROR_NOT_ALL_ASSIGNED = 1300
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
     def _fail(api: str) -> Win32Error:
         return Win32Error(api, ctypes.get_last_error())
@@ -353,17 +396,63 @@ if sys.platform == "win32":
                 raise err
             return int(job)
 
-        def std_handles(self) -> tuple[int, int, int]:
-            h = [int(_k32.GetStdHandle(n) or 0) for n in _STD_HANDLES]
-            return (h[0], h[1], h[2])
+        def enable_privileges(self, names: Sequence[str]) -> list[str]:
+            missing: list[str] = []
+            token = wintypes.HANDLE()
+            if not _adv.OpenProcessToken(
+                wintypes.HANDLE(_k32.GetCurrentProcess()),
+                _TOKEN_ADJUST_PRIVILEGES | _TOKEN_QUERY,
+                ctypes.byref(token),
+            ):
+                return list(names)
+            try:
+                for name in names:
+                    tp = _TOKEN_PRIVILEGES1()
+                    tp.PrivilegeCount = 1
+                    tp.Attributes = _SE_PRIVILEGE_ENABLED
+                    if not _adv.LookupPrivilegeValueW(None, name, ctypes.byref(tp.Luid)):
+                        missing.append(name)
+                        continue
+                    ok = _adv.AdjustTokenPrivileges(
+                        token, False, ctypes.byref(tp), ctypes.sizeof(tp), None, None
+                    )
+                    if not ok or ctypes.get_last_error() == _ERROR_NOT_ALL_ASSIGNED:
+                        missing.append(name)
+            finally:
+                _k32.CloseHandle(token)
+            return missing
 
-        def create_process_with_logon(
+        def inheritable_std_handles(self) -> tuple[int, int, int]:
+            me = wintypes.HANDLE(_k32.GetCurrentProcess())
+            out: list[int] = []
+            try:
+                for n in _STD_HANDLES:
+                    src = _k32.GetStdHandle(n)
+                    if not src or src == _INVALID_HANDLE_VALUE:
+                        out.append(0)
+                        continue
+                    dup = wintypes.HANDLE()
+                    if not _k32.DuplicateHandle(
+                        me,
+                        wintypes.HANDLE(src),
+                        me,
+                        ctypes.byref(dup),
+                        0,
+                        True,
+                        _DUPLICATE_SAME_ACCESS,
+                    ):
+                        raise _fail("DuplicateHandle")
+                    out.append(int(dup.value or 0))
+            except Win32Error:
+                for h in out:
+                    self.close_handle(h)
+                raise
+            return (out[0], out[1], out[2])
+
+        def create_process_as_user(
             self,
             *,
-            user: str,
-            domain: str,
-            password: SecretBuffer,
-            logon_flags: int,
+            token: int,
             command_line: str,
             creation_flags: int,
             environment: SecretBuffer,
@@ -371,29 +460,57 @@ if sys.platform == "win32":
             startup_flags: int,
             desktop: str | None,
             std_handles: tuple[int, int, int],
+            inherit_handles: Sequence[int],
         ) -> SpawnedProcess:
-            si = _STARTUPINFOW()
-            si.cb = ctypes.sizeof(si)
+            handles = list(dict.fromkeys(h for h in inherit_handles if h))
+            six = _STARTUPINFOEXW()
+            si = six.StartupInfo
+            si.cb = ctypes.sizeof(six) if handles else ctypes.sizeof(si)
             si.dwFlags = startup_flags
             si.lpDesktop = desktop
             si.hStdInput, si.hStdOutput, si.hStdError = std_handles
-            pi = _PROCESS_INFORMATION()
-            cmd = ctypes.create_unicode_buffer(command_line)  # the API may write to it
-            ok = _adv.CreateProcessWithLogonW(
-                user,
-                domain,
-                password.buffer,
-                logon_flags,
-                None,
-                cmd,
-                creation_flags,
-                ctypes.cast(environment.buffer, ctypes.c_void_p),
-                current_directory,
-                ctypes.byref(si),
-                ctypes.byref(pi),
-            )
-            if not ok:
-                raise _fail("CreateProcessWithLogonW")
+            handle_array = (wintypes.HANDLE * max(len(handles), 1))(*handles)
+            attr_buf = None
+            if handles:
+                size = ctypes.c_size_t()
+                _k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+                attr_buf = ctypes.create_string_buffer(size.value)
+                if not _k32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(size)):
+                    raise _fail("InitializeProcThreadAttributeList")
+            try:
+                if attr_buf is not None:
+                    if not _k32.UpdateProcThreadAttribute(
+                        attr_buf,
+                        0,
+                        ctypes.c_size_t(_PROC_THREAD_ATTRIBUTE_HANDLE_LIST),
+                        handle_array,
+                        ctypes.c_size_t(ctypes.sizeof(wintypes.HANDLE) * len(handles)),
+                        None,
+                        None,
+                    ):
+                        raise _fail("UpdateProcThreadAttribute")
+                    six.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p)
+                    creation_flags |= EXTENDED_STARTUPINFO_PRESENT
+                pi = _PROCESS_INFORMATION()
+                cmd = ctypes.create_unicode_buffer(command_line)  # the API may write to it
+                ok = _adv.CreateProcessAsUserW(
+                    wintypes.HANDLE(token),
+                    None,
+                    cmd,
+                    None,
+                    None,
+                    bool(handles),
+                    creation_flags,
+                    ctypes.cast(environment.buffer, ctypes.c_void_p),
+                    current_directory,
+                    ctypes.byref(six),
+                    ctypes.byref(pi),
+                )
+                if not ok:
+                    raise _fail("CreateProcessAsUserW")
+            finally:
+                if attr_buf is not None:
+                    _k32.DeleteProcThreadAttributeList(attr_buf)
             return SpawnedProcess(int(pi.hProcess or 0), int(pi.hThread or 0), int(pi.dwProcessId))
 
         def assign_process_to_job(self, job: int, process: int) -> None:

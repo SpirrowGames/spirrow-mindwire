@@ -2,26 +2,34 @@
 
 It runs as the owner and stands in for the program it starts:
 ``mindwire-turn-launcher <program> [args...]``. The sequence is the one the design thread
-settled (msg-7099, revised in msg-7104 / msg-7106 / msg-7108) and :func:`launch` is the only
-place it is spelled out:
+settled (msg-7099, revised in msg-7104 / msg-7106 / msg-7108) with the spawn call replaced by
+the human's decision B on PR #485 (``LogonUserW`` + ``CreateProcessAsUserW`` instead of
+``CreateProcessWithLogonW``, so the child can inherit the stdio pipes). :func:`launch` is the
+only place the sequence is spelled out:
 
 0. Read both secrets itself, as the owner, from the owner's Credential Manager:
    ``mindwire/turn-user`` (the turn user's password) and ``mindwire/implementer-pat``. Neither
    ever arrives through argv, an environment variable, stdin or a log, and nothing outside
    sends them in. A missing one stops with ``turn user credential missing`` /
    ``implementer PAT credential missing``.
-1. ``LogonUserW(..., LOGON32_LOGON_INTERACTIVE)`` — the same logon type
-   ``CreateProcessWithLogonW`` performs, so a missing "Allow log on locally" right fails here,
-   before anything is built (msg-7106).
+1. ``LogonUserW(..., LOGON32_LOGON_INTERACTIVE)`` — a missing "Allow log on locally" right
+   fails here, before anything is built (msg-7106). The password is wiped as soon as this
+   returns: the token is the only thing the spawn needs.
 2. ``CreateEnvironmentBlock(token, bInherit=FALSE)`` — the turn user's own default
    environment (USERPROFILE, APPDATA, TEMP, localized system paths).
 3. Overlay the allow-list: only the names declared for ``turn``; in 2a that is ``GH_TOKEN``.
    Nothing is read from the owner's environment.
-4. ``CreateProcessWithLogonW(LOGON_WITH_PROFILE, CREATE_UNICODE_ENVIRONMENT |
-   CREATE_SUSPENDED)`` with that explicit block (never ``NULL``), the launcher's own standard
-   handles through ``STARTF_USESTDHANDLES`` and ``lpDesktop = NULL`` (msg-7108: seclogon grants
-   the window station / desktop only then).
-5. Release the token, wipe the password and the block.
+4. Enable ``SeAssignPrimaryTokenPrivilege`` / ``SeIncreaseQuotaPrivilege`` in the launcher's
+   own token (best effort), make inheritable duplicates of the launcher's stdin/stdout/stderr,
+   then ``CreateProcessAsUserW(token, bInheritHandles=TRUE, CREATE_UNICODE_ENVIRONMENT |
+   CREATE_SUSPENDED)`` with the explicit block (never ``NULL``), those duplicates through
+   ``STARTF_USESTDHANDLES`` and ``lpDesktop = NULL``. A ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``
+   limits inheritance to exactly those three duplicates. ``ERROR_PRIVILEGE_NOT_HELD`` stops
+   with a reason naming the Local Security Policy right the owner account lacks.
+5. Close the duplicates and the token, wipe the block.
+
+Since the child is now a direct child of the launcher, it also starts inside whatever job holds
+the launcher (``_sdk_job_hook``). Nested jobs are supported on Windows 8 and later.
 
 Job object (msg-7104 objection 2): created at startup with ``KILL_ON_JOB_CLOSE`` and held only
 here. The suspended child is assigned to it and resumed **only if the assignment succeeded**;
@@ -57,8 +65,9 @@ from .win32 import (
     ERROR_ACCOUNT_LOCKED_OUT,
     ERROR_LOGON_FAILURE,
     ERROR_LOGON_TYPE_NOT_GRANTED,
+    ERROR_PRIVILEGE_NOT_HELD,
     LOGON32_LOGON_INTERACTIVE,
-    LOGON_WITH_PROFILE,
+    SPAWN_PRIVILEGES,
     STARTF_USESTDHANDLES,
     CredentialReader,
     SecretBuffer,
@@ -75,13 +84,22 @@ IMPLEMENTER_PAT_CREDENTIAL = "mindwire/implementer-pat"
 # only source and the Credential Manager read goes away (the two are never used together).
 TURN_ENV_FROM_CREDENTIAL: Mapping[str, str] = {"GH_TOKEN": IMPLEMENTER_PAT_CREDENTIAL}
 
-SPAWN_LOGON_FLAGS = LOGON_WITH_PROFILE
 SPAWN_CREATION_FLAGS = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
 SPAWN_STARTUP_FLAGS = STARTF_USESTDHANDLES
 
 _STEP_LOGON = "LogonUserW"
 _STEP_ENV = "CreateEnvironmentBlock"
-_STEP_SPAWN = "CreateProcessWithLogonW"
+_STEP_SPAWN = "CreateProcessAsUserW"
+
+
+def spawn_failure_reason(code: int, missing_privileges: Sequence[str]) -> str:
+    """``CreateProcessAsUserW`` failed. 1314 names the owner-account rights that are missing."""
+    if code == ERROR_PRIVILEGE_NOT_HELD:
+        names = [n for n in SPAWN_PRIVILEGES if n in missing_privileges] or list(SPAWN_PRIVILEGES)
+        rights = ", ".join(f"{SPAWN_PRIVILEGES[n]} ({n})" for n in names)
+        return f"turn spawn failed: owner lacks privilege: {rights}"
+    return f"turn spawn failed: {_STEP_SPAWN} ({code})"
+
 
 _LOGON_REASONS = {
     ERROR_LOGON_TYPE_NOT_GRANTED: "logon right not granted (Allow log on locally)",
@@ -149,6 +167,7 @@ def launch(
     job = 0
     token = 0
     block: SecretBuffer | None = None
+    stdio: tuple[int, int, int] = (0, 0, 0)
     spawned: SpawnedProcess | None = None
     try:
         overlay: dict[str, str] = {}
@@ -166,30 +185,38 @@ def launch(
             )
         except Win32Error as exc:
             raise TurnIsolationStop(logon_failure_reason(_STEP_LOGON, exc.code)) from None
+        finally:
+            password.wipe()  # the token is all the spawn needs
         try:
             default_env = api.create_environment_block(token)
         except Win32Error as exc:
             raise TurnIsolationStop(logon_failure_reason(_STEP_ENV, exc.code)) from None
         block = SecretBuffer.environment_block(build_turn_environment(default_env, overlay))
         overlay.clear()
+        missing_privileges = api.enable_privileges(list(SPAWN_PRIVILEGES))
         try:
-            spawned = api.create_process_with_logon(
-                user=turn_user.user,
-                domain=turn_user.domain,
-                password=password,
-                logon_flags=SPAWN_LOGON_FLAGS,
+            stdio = api.inheritable_std_handles()
+        except Win32Error as exc:
+            raise TurnIsolationStop(f"turn stdio handle duplication failed ({exc.code})") from None
+        try:
+            spawned = api.create_process_as_user(
+                token=token,
                 command_line=subprocess.list2cmdline(list(argv)),
                 creation_flags=SPAWN_CREATION_FLAGS,
                 environment=block,
                 current_directory=current_directory,
                 startup_flags=SPAWN_STARTUP_FLAGS,
                 desktop=None,
-                std_handles=api.std_handles(),
+                std_handles=stdio,
+                inherit_handles=stdio,
             )
         except Win32Error as exc:
-            raise TurnIsolationStop(logon_failure_reason(_STEP_SPAWN, exc.code)) from None
+            raise TurnIsolationStop(spawn_failure_reason(exc.code, missing_privileges)) from None
     finally:
-        # Step 5, on every path: the secrets are dead the moment the spawn call returns.
+        # Step 5, on every path: the secrets are dead the moment the spawn call returns, and the
+        # child holds its own copies of the stdio duplicates.
+        for handle in stdio:
+            api.close_handle(handle)
         api.close_handle(token)
         if block is not None:
             block.wipe()
