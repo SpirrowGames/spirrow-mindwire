@@ -65,6 +65,8 @@ def _merged(n: int = 1) -> PrHeadRow:
         ("--T.x--", "t.x"),
         ("T_日本語_x", "t_-_x"),
         ("...", ""),
+        ("T-foo..bar", "t-foo.bar"),
+        ("T-a...b....c", "t-a.b.c"),
     ],
 )
 def test_normalize_stem(thread_id: str, stem: str) -> None:
@@ -89,6 +91,15 @@ def test_long_stem_cut_on_a_dash_leaves_no_double_dash() -> None:
     assert "--" not in stem
     assert stem.startswith("a" * 54 + "-")
     assert re.fullmatch(r"[0-9a-f]{8}", stem[-8:])
+
+
+def test_long_stem_with_dot_runs_has_no_double_dot() -> None:
+    """PR #484 review advisory: ``..`` is ref-illegal, also after the cut-and-hash path."""
+    long_id = "a" * 50 + "..b" * 20
+    stem = normalize_stem(long_id)
+    assert len(stem) > 8 and re.fullmatch(r"[0-9a-f]{8}", stem[-8:])
+    assert ".." not in stem
+    assert ".." not in generation_name(stem, 2)
 
 
 def test_generation_name() -> None:

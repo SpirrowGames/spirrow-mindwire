@@ -36,6 +36,8 @@ from spirrow_mindwire.git_sync import (
     GitSyncParkError,
     GitSyncPhase,
     ThreadBranch,
+    generation_name,
+    normalize_stem,
     parse_github_remote,
 )
 from spirrow_mindwire.git_sync.hook import run_to_completion
@@ -301,6 +303,16 @@ async def test_ref_illegal_name_parks(env: Env) -> None:
         await hook.pre_turn("...")  # stem "" → "loop/" is not a legal ref
     assert ei.value.code is GitParkCode.BRANCH_RESOLVE_FAILED
     assert "check-ref-format" in ei.value.summary
+
+
+@pytest.mark.parametrize("thread_id", ["T-foo..bar", "a" * 50 + "..b" * 20])
+def test_dot_run_stem_passes_git_check_ref_format(thread_id: str) -> None:
+    """PR #484 review advisory, checked against git itself (the naming tests stay git-free)."""
+    name = generation_name(normalize_stem(thread_id), 1)
+    ok = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{name}"], capture_output=True, check=False
+    )
+    assert ok.returncode == 0, name
 
 
 @pytest.mark.anyio
