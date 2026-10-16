@@ -158,6 +158,12 @@ $ConductorKillUnconfirmedExitCode = 7
 # DIRTY_CLONE_EXIT_CODE in src/spirrow_mindwire/clone_guard.py (a pytest pins the two). Not 5: 5/6/7
 # are the wall-clock budget's codes above.
 $DirtyCloneExitCode = 8
+# Exit code of mindwire-loop when the git-sync hook (ADR-2026-10-09-23 unit 1, [turn.git] sync =
+# true) could not name the thread's branch because the GitHub API stayed transiently unavailable
+# through its retries (design v1.2 B-2, Bohr msg-6766). Mirrors GIT_SYNC_DEFERRED_EXIT_CODE in
+# src/spirrow_mindwire/git_sync/errors.py (a pytest pins the two). No park, no quarantine, no repo
+# parking: the launch is reverted and the next tick re-derives the name.
+$GitSyncDeferredExitCode = 9
 # Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
 # guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
 $CloneCheckTimeoutSeconds = 60
@@ -3058,6 +3064,57 @@ function Get-DirtyCloneNotice {
               reason = $reason; head = $head; detail = $detail }
 }
 
+# --- git-sync deferral (ADR-2026-10-09-23 unit 1, design v1.2 B-2) ---
+# The daemon exits $GitSyncDeferredExitCode when the git-sync hook could not name the thread's
+# branch because the GitHub API stayed transiently unavailable (5xx / timeout / rate limit) through
+# its retries. Not the thread's fault and not the clone's: nobody is quarantined, put on
+# retry-pending or parked, and other candidates keep going. The notification rides the same
+# Send-NotificationIfChanged channel as the dirty clone, but on a per-CANDIDATE key (repo + thread):
+# unlike a dirty clone, a deferral parks nothing, so several threads on one repo can defer in the
+# same sweep, and on a shared per-repo key their differing signatures would overwrite each other
+# and re-alert on every launch (PR #473 review, 3f026f8). Each candidate's key is dropped again as
+# soon as that candidate gets past git-sync (Clear-GitSyncDeferredNotice), so the debounce means
+# "once per outage episode per thread", not "once ever". An unreadable payload still notifies
+# (signature 'git-sync-deferred:parse-failed') and never borrows a GitHub key.
+function Get-GitSyncDeferredNoticeKey {
+    param([string]$RepoDir, [string]$CandidateKey)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    return "__git_sync_deferred__/$repoKey/$CandidateKey"
+}
+
+# Drops a candidate's deferral notice key once its launch ended any way other than a deferral.
+# Returns $true when a key was removed (the caller persists the state).
+function Clear-GitSyncDeferredNotice {
+    param([hashtable]$State, [string]$RepoDir, [string]$CandidateKey)
+    $key = Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey
+    if ($State.ContainsKey($key)) { $State.Remove($key); return $true }
+    return $false
+}
+
+function Get-GitSyncDeferredNotice {
+    param([string]$RepoDir, [string]$CandidateKey, $Output, [int]$ExitCode)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    $payload = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_GIT_SYNC_DEFERRED_PAYLOAD\s+(.*)$') {
+            try { $payload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
+            break
+        }
+    }
+    $sig = 'git-sync-deferred:parse-failed'
+    $detailLine = '(payload parse failed)'
+    if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'candidate') {
+        $sig = "git-sync-deferred:$($payload.candidate)"
+        $detailLine = "thread=$($payload.thread_id) branch=$($payload.candidate)"
+        if ($payload.detail) { $detailLine += "`n$($payload.detail)" }
+    }
+    $body = ("MindWire: git 同期のブランチ名解決で GitHub API が一時的に使えず、ターンを見送りました — **$CandidateKey** exit=$ExitCode。" +
+             "スレッドは無傷（park も quarantine もしない）。次の tick で最初から判定し直します。`n" +
+             "clone: $RepoDir`n$detailLine")
+    return @{ key = (Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey)
+              signature = $sig; message = $body; repo_key = $repoKey }
+}
+
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
 # An exit $DirtyCloneExitCode used to be counted like any launch: the LAUNCH commit stayed in
 # head_skip.json, so three refused runs on one head reached T42's threshold and the conductor
@@ -5844,6 +5901,13 @@ try {
         }
         $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        # A launch that did not defer got past git-sync: end this candidate's deferral episode so
+        # its next outage alerts again (see Get-GitSyncDeferredNotice).
+        if ($code -ne $GitSyncDeferredExitCode -and
+            (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
         $verdict = Get-ConductorVerdict -Output $output
         # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
         # -Delivered / -YieldTo (Get-SummonStopFields, StopReason.ps1) and the one Update-SummonYield.
@@ -5989,6 +6053,24 @@ try {
             continue
         }
 
+        # EXIT CODE $GitSyncDeferredExitCode — git-sync deferral (ADR-2026-10-09-23 unit 1, design
+        # v1.2 B-2). A transient GitHub API failure, not this thread's fault: MUST stay above the
+        # generic non-zero branch below (which would retry and then quarantine). The launch is
+        # reverted so it counts toward neither backoff nor STALLED; the repo is NOT parked (the
+        # clone is fine) and the sweep continues.
+        if ($code -eq $GitSyncDeferredExitCode) {
+            $dispositions[$cand.key] = 'git-sync-deferred'
+            $notice = Get-GitSyncDeferredNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "git-sync-deferred $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN git-sync-deferred $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            Send-NotificationIfChanged -State $notifyState -Key $notice.key `
+                -Signature $notice.signature -Message $notice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "git-sync-deferred $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine, no park; sweep CONTINUES"
+            continue
+        }
+
         # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
         # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
         # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
@@ -5997,7 +6079,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {

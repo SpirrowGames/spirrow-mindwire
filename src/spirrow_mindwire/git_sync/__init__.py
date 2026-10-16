@@ -1,10 +1,4 @@
-"""git-sync hook around a dispatched turn (ADR-2026-10-09-23 unit 1, D7 / D8; design v1.2).
-
-This first slice carries the pure naming layer only: the mechanical branch name and the
-push-target guard (:mod:`.branch`), the generation search over merged PRs (:mod:`.resolve`) and
-the park / defer outcomes (:mod:`.errors`). The hook itself and its wiring into the dispatcher
-come in the next slice (PR #473); until then nothing imports this package at runtime.
-"""
+"""git-sync hook around a dispatched turn (ADR-2026-10-09-23 unit 1, D7 / D8; design v1.2)."""
 
 from __future__ import annotations
 
@@ -19,6 +13,7 @@ from .errors import (
     GitSyncPhase,
     emit_git_sync_deferred_payload,
 )
+from .hook import GitSyncHook, PrHeadClient, parse_github_remote
 from .resolve import MAX_GENERATION, resolve_generation
 
 __all__ = [
@@ -28,12 +23,15 @@ __all__ = [
     "MAX_GENERATION",
     "GitParkCode",
     "GitSyncDeferredError",
+    "GitSyncHook",
     "GitSyncParkError",
     "GitSyncPhase",
+    "PrHeadClient",
     "ProtectedBranchError",
     "ThreadBranch",
     "emit_git_sync_deferred_payload",
     "generation_name",
     "normalize_stem",
+    "parse_github_remote",
     "resolve_generation",
 ]

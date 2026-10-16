@@ -120,6 +120,12 @@ from .dispatcher.event_log import (
     EVENT_KIND_DELIVERY_FAILED,
 )
 from .dispatcher.registry import InMemoryAdapterRegistry
+from .git_sync import (
+    GIT_SYNC_DEFERRED_EXIT_CODE,
+    GitSyncDeferredError,
+    GitSyncHook,
+    emit_git_sync_deferred_payload,
+)
 from .github.client import (
     CheckRollup,
     EnvironmentTerminalError,
@@ -708,8 +714,31 @@ def _build_dispatcher(
         event_sink=_log_event_sink,
         spec_pin_writer=pin_writer,
         clone_guard=clone_guard,
+        git_sync=build_git_sync_hook(settings),
     )
     return mcp, registry, dispatcher
+
+
+def build_git_sync_hook(settings: MindwireSettings) -> GitSyncHook | None:
+    """The git-sync hook for ``[loop].repo_dir``, or ``None`` (ADR-2026-10-09-23 unit 1).
+
+    ``None`` whenever ``[turn.git] sync`` is false — the default — or no repo_dir is known (the
+    adapters were injected by a test): the dispatcher then runs no git beyond the clone guard's,
+    exactly as before ``[turn.git]`` existed (INV-0). The GitHub client is the implementer's
+    (author) identity, built per resolution and closed after it.
+    """
+    git_cfg = settings.turn.git
+    if not git_cfg.sync or settings.loop.repo_dir is None:
+        return None
+    from .github.client import GitHubClient
+
+    return GitSyncHook(
+        Path(settings.loop.repo_dir),
+        remote=git_cfg.remote,
+        lfs=git_cfg.lfs,
+        branch_override=git_cfg.branch_override,
+        github_factory=GitHubClient,
+    )
 
 
 def build_loop(
@@ -1474,6 +1503,20 @@ def main() -> None:
             env_exc.status_code,
         )
         sys.exit(2)
+    except GitSyncDeferredError as deferred_exc:
+        # ADR-2026-10-09-23 unit 1 (design v1.2 B-2): the GitHub API stayed transiently
+        # unavailable through the retries while naming this thread's branch. Not this thread's
+        # fault and not the clone's: no park, no quarantine; the wrapper reverts the launch and
+        # notifies on the dirty-clone channel, and the next tick re-derives the name from n = 1.
+        emit_git_sync_deferred_payload(deferred_exc)
+        logger.warning(
+            "git-sync deferred exit=%d: thread=%s candidate=%s detail=%s",
+            GIT_SYNC_DEFERRED_EXIT_CODE,
+            deferred_exc.thread_id,
+            deferred_exc.candidate,
+            deferred_exc.detail,
+        )
+        sys.exit(GIT_SYNC_DEFERRED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not

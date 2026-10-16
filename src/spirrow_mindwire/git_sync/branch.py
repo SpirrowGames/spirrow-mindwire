@@ -4,7 +4,9 @@ Two pure pieces, kept apart from the hook so they can be tested without git:
 
 - :func:`normalize_stem` / :func:`generation_name` — the mechanical name ``loop/<thread_id>``
   (D8). Lowercase; every character outside ``[a-z0-9._-]`` becomes ``-``; runs of ``-`` collapse
-  to one; leading / trailing ``-`` and ``.`` are stripped. A stem longer than
+  to one; runs of ``.`` collapse to one (git forbids ``..`` anywhere in a ref name, so an id
+  carrying one would otherwise park its thread on every turn); leading / trailing ``-`` and ``.``
+  are stripped. A stem longer than
   :data:`STEM_MAX_LEN` keeps its first :data:`STEM_KEEP_LEN` characters (minus any trailing ``-``,
   so the single-``-`` rule still holds), then ``-`` and the first
   :data:`HASH_LEN` hex digits of the sha256 of the thread id (the original, so two ids that
@@ -37,12 +39,14 @@ PROTECTED_BRANCH_PREFIXES: tuple[str, ...] = ("release/",)
 
 _DISALLOWED = re.compile(r"[^a-z0-9._-]")
 _DASH_RUN = re.compile(r"-{2,}")
+_DOT_RUN = re.compile(r"\.{2,}")
 
 
 def normalize_stem(thread_id: str) -> str:
     """The name part of ``loop/<...>`` for ``thread_id`` (D8). May be empty or ref-illegal."""
     stem = _DISALLOWED.sub("-", thread_id.lower())
-    stem = _DASH_RUN.sub("-", stem).strip("-.")
+    # Collapse ``.`` runs before the strip: ``..`` is ref-illegal (PR #484 review advisory).
+    stem = _DOT_RUN.sub(".", _DASH_RUN.sub("-", stem)).strip("-.")
     if len(stem) > STEM_MAX_LEN:
         digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:HASH_LEN]
         # rstrip: a cut that lands on a ``-`` must not leave ``--`` before the digest.
