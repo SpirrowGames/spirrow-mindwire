@@ -63,6 +63,21 @@ class SecretBuffer:
         return sb
 
     @classmethod
+    def from_blob(cls, address: int, size: int) -> SecretBuffer:
+        """Copy ``size`` raw bytes from ``address`` (a ``CredentialBlob``).
+
+        A generic credential's blob is arbitrary bytes, so ``size`` may be odd. The buffer holds
+        ``ceil(size / 2)`` characters plus the NUL slot: every byte fits and the last character
+        is always a whole zero terminator (PR #485 review, odd ``CredentialBlobSize``).
+        """
+        if size < 0:
+            raise ValueError("negative blob size")
+        sb = cls((size + 1) // 2)
+        if size:
+            ctypes.memmove(sb._buf, address, size)
+        return sb
+
+    @classmethod
     def environment_block(cls, env: Mapping[str, str]) -> SecretBuffer:
         """``K=V\\0K=V\\0\\0`` in sorted, case-insensitive order (CreateProcess's rule)."""
         parts = [f"{k}={env[k]}" for k in sorted(env, key=str.upper)]
@@ -280,10 +295,8 @@ if sys.platform == "win32":
                 raise Win32Error("CredReadW", err)
             try:
                 size = int(pcred.contents.CredentialBlobSize)
-                sb = SecretBuffer(size // 2)
-                if size:
-                    ctypes.memmove(sb.buffer, pcred.contents.CredentialBlob, size)
-                return sb
+                address = ctypes.cast(pcred.contents.CredentialBlob, ctypes.c_void_p).value
+                return SecretBuffer.from_blob(int(address or 0), size)
             finally:
                 _adv.CredFree(pcred)
 

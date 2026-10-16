@@ -7,6 +7,7 @@ platform. The real ``CreateProcessWithLogonW`` path is the operator spike's job.
 from __future__ import annotations
 
 import ast
+import ctypes
 import io
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -352,3 +353,21 @@ def test_launcher_changes_no_dacl() -> None:
             elif isinstance(node, ast.Name):
                 names.add(node.id)
     assert not names & {"SetSecurityInfo", "SetKernelObjectSecurity", "SetNamedSecurityInfoW"}
+
+
+@pytest.mark.parametrize("size", range(10))
+def test_from_blob_fits_odd_sizes_and_keeps_a_terminator(size: int) -> None:
+    """PR #485 review: an odd CredentialBlobSize must never overrun the buffer."""
+    blob = (ctypes.c_ubyte * max(size, 1))(*([0x41] * size))
+    sb = SecretBuffer.from_blob(ctypes.addressof(blob), size)
+    assert ctypes.sizeof(sb.buffer) >= size + ctypes.sizeof(ctypes.c_wchar)
+    assert sb.buffer[len(sb.buffer) - 1] == chr(0)
+    assert bytes(ctypes.string_at(ctypes.addressof(sb.buffer), size)) == b"A" * size
+
+
+def test_from_blob_utf16_round_trip() -> None:
+    raw = "pa55-word".encode("utf-16-le")
+    blob = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+    sb = SecretBuffer.from_blob(ctypes.addressof(blob), len(raw))
+    if ctypes.sizeof(ctypes.c_wchar) == 2:  # Windows: the blob is the text
+        assert sb.reveal() == "pa55-word"
