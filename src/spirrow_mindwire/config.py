@@ -633,6 +633,13 @@ class NaysayerGatingConfig(_StrictModel):
     loop) — instead of spending another Gemini review. Bounds the long re-review tail. Env:
     ``MINDWIRE_NAYSAYER_GATING__MAX_REVIEW_ROUNDS=4``."""
 
+    review_max_tokens: int | None = Field(default=None, ge=1)
+    """Output-token budget for the pass-1 review call (critique + VERDICT). ``None`` (the default)
+    keeps the driver's built-in default. A reasoning-model reviewer spends part of this budget on
+    reasoning, and a review that runs out ends ``finish_reason=length``, which the gate turns into a
+    fail-closed REQUEST_CHANGES with no findings. Env:
+    ``MINDWIRE_NAYSAYER_GATING__REVIEW_MAX_TOKENS=65536``."""
+
     review_login: str = "spirrowgames-ops"
     """The GitHub login the naysayer submits reviews under (T22 = ``spirrowgames-ops``); the
     head-unchanged / round-cap state counts only reviews by this login, so other reviewers (Copilot,
