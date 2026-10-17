@@ -108,9 +108,12 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
 # slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
 # on big PRs (finish_reason=length, which decide_verdict then forces to REQUEST_CHANGES — a false
-# RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
-# enough in practice).
-_DEFAULT_MAX_TOKENS = 32000
+# RC); 32000 was once enough (connector-relay confirmed ~30k in practice), but the 32000 cap still
+# ran out on PR #485 @ 290a0e1 (a ~91k-char diff, msg-7129). 65536 is the reviewer model's
+# documented output maximum, so the default now spends the whole budget the model offers; it is
+# also settable per deployment as ``[naysayer_gating] review_max_tokens``.
+_DEFAULT_MAX_TOKENS = 65536
+DEFAULT_REVIEW_MAX_TOKENS = _DEFAULT_MAX_TOKENS  # public: the composition root's fallback
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a

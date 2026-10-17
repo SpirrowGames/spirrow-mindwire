@@ -138,7 +138,7 @@ from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
 from .magickit.ledger_notes import JOURNAL_DIR_NAME, LedgerJournal
 from .magickit.watcher import ChatroomWatcher, WatchSpec
-from .naysayer.pr_review import NaysayerPrReviewDriver
+from .naysayer.pr_review import DEFAULT_REVIEW_MAX_TOKENS, NaysayerPrReviewDriver
 from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
@@ -558,6 +558,9 @@ def build_pr_review_driver(
         max_review_rounds=g.max_review_rounds,
         review_login=g.review_login,
         shadow=g.shadow,
+        max_tokens=(
+            g.review_max_tokens if g.review_max_tokens is not None else DEFAULT_REVIEW_MAX_TOKENS
+        ),
     )
 
 
