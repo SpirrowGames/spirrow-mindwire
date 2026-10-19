@@ -51,7 +51,7 @@ def test_composition_root_keeps_driver_default_when_unset(
 
     monkeypatch.setattr("spirrow_mindwire.loop_runner.NaysayerPrReviewDriver", fake_driver)
     build_pr_review_driver(NaysayerGatingConfig())
-    assert seen["max_tokens"] == pr_review.DEFAULT_REVIEW_MAX_TOKENS == 65536
+    assert "max_tokens" not in seen  # the driver's own default applies
 
 
 def test_composition_root_threads_configured_budget(monkeypatch: pytest.MonkeyPatch) -> None:
