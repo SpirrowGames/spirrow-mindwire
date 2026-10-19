@@ -2042,8 +2042,8 @@ _ADR_POINTER_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS / 2
 # ``max_tokens`` for pass 2. Deliberately smaller than pass 1 because pass 2's entire
 # legitimate output is a small JSON array (see MAX_POINTER_PAYLOAD_BYTES rationale in
 # :mod:`.pr_review_adr_pointers`). A tighter budget also caps the pathological runaway:
-# even if the model ignores the "JSON only" instruction, it cannot spend the full 32 000-
-# token pass-1 output budget on prose here.
+# even if the model ignores the "JSON only" instruction, it cannot spend the full pass-1
+# output budget (``DEFAULT_REVIEW_MAX_TOKENS`` or the deployment's override) on prose here.
 _ADR_POINTER_MAX_TOKENS = 4000
 
 
