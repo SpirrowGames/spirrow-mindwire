@@ -112,8 +112,7 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # ran out on PR #485 @ 290a0e1 (a ~91k-char diff, msg-7129). 65536 is the reviewer model's
 # documented output maximum, so the default now spends the whole budget the model offers; it is
 # also settable per deployment as ``[naysayer_gating] review_max_tokens``.
-_DEFAULT_MAX_TOKENS = 65536
-DEFAULT_REVIEW_MAX_TOKENS = _DEFAULT_MAX_TOKENS  # public: the composition root's fallback
+DEFAULT_REVIEW_MAX_TOKENS = 65536  # the one name: driver default and composition-root fallback
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a
@@ -2106,7 +2105,7 @@ class NaysayerPrReviewDriver:
         lexora: LexoraChatClient | None = None,
         github: GitHubReviewClient | None = None,
         model: str = _DEFAULT_MODEL,
-        max_tokens: int = _DEFAULT_MAX_TOKENS,
+        max_tokens: int = DEFAULT_REVIEW_MAX_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         lexora_url: str | None = None,
         github_token: str | None = None,

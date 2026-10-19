@@ -23,7 +23,7 @@ class _NoLexora:
 
 
 def test_default_review_budget_is_raised() -> None:
-    assert pr_review._DEFAULT_MAX_TOKENS == 65536
+    assert pr_review.DEFAULT_REVIEW_MAX_TOKENS == 65536
 
 
 def test_driver_uses_raised_default() -> None:

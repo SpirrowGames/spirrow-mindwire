@@ -134,7 +134,7 @@ MAX_REASON_CHARS = 200
 # ``content`` with prose, and (b) the M5' log surface, which repeats the raw
 # content for post-mortem — capping the parse input bounds that log line too.
 #
-# Derivation (from ``_DEFAULT_MAX_TOKENS = 32000`` in
+# Derivation (from ``DEFAULT_REVIEW_MAX_TOKENS``, then 32000, now 65536, in
 # :mod:`spirrow_mindwire.naysayer.pr_review`):
 # * Legitimate pass-2 output shape: MAX_POINTERS=5 records x
 #   (~30-byte ADR id + MAX_REASON_CHARS=200-byte reason + JSON scaffolding ~20 bytes)
