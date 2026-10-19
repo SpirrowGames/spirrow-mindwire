@@ -108,9 +108,11 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
 # slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
 # on big PRs (finish_reason=length, which decide_verdict then forces to REQUEST_CHANGES — a false
-# RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
-# enough in practice).
-_DEFAULT_MAX_TOKENS = 32000
+# RC); 32000 was once enough (connector-relay confirmed ~30k in practice), but the 32000 cap still
+# ran out on PR #485 @ 290a0e1 (a ~91k-char diff, msg-7129). 65536 is the reviewer model's
+# documented output maximum, so the default now spends the whole budget the model offers; it is
+# also settable per deployment as ``[naysayer_gating] review_max_tokens``.
+DEFAULT_REVIEW_MAX_TOKENS = 65536  # the one name: driver default and composition-root fallback
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a
@@ -2040,8 +2042,8 @@ _ADR_POINTER_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS / 2
 # ``max_tokens`` for pass 2. Deliberately smaller than pass 1 because pass 2's entire
 # legitimate output is a small JSON array (see MAX_POINTER_PAYLOAD_BYTES rationale in
 # :mod:`.pr_review_adr_pointers`). A tighter budget also caps the pathological runaway:
-# even if the model ignores the "JSON only" instruction, it cannot spend the full 32 000-
-# token pass-1 output budget on prose here.
+# even if the model ignores the "JSON only" instruction, it cannot spend the full pass-1
+# output budget (``DEFAULT_REVIEW_MAX_TOKENS`` or the deployment's override) on prose here.
 _ADR_POINTER_MAX_TOKENS = 4000
 
 
@@ -2103,7 +2105,7 @@ class NaysayerPrReviewDriver:
         lexora: LexoraChatClient | None = None,
         github: GitHubReviewClient | None = None,
         model: str = _DEFAULT_MODEL,
-        max_tokens: int = _DEFAULT_MAX_TOKENS,
+        max_tokens: int = DEFAULT_REVIEW_MAX_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         lexora_url: str | None = None,
         github_token: str | None = None,

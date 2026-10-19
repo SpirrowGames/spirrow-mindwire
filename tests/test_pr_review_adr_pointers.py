@@ -305,6 +305,24 @@ async def test_t5_marker_present_on_normal_approve_body() -> None:
 
 
 @pytest.mark.anyio
+async def test_pass2_budget_is_independent_of_review_budget() -> None:
+    """#487: a deployment's review budget override reaches pass 1 only.
+
+    Pass 2 keeps its own fixed budget, so MAX_POINTER_PAYLOAD_BYTES (derived from the
+    shape of legitimate pass-2 output) stays valid whatever review_max_tokens is set to.
+    """
+    from spirrow_mindwire.naysayer import pr_review
+
+    lexora = _FakeLexora(pass1_content="all good\n\nVERDICT: APPROVE", pass2_content="[]")
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub(), max_tokens=200_000)
+    _, post = _capture()
+    await driver.review(_pr(), post_critique=post)
+
+    budgets = [call[2] for call in lexora.calls]
+    assert budgets == [200_000, pr_review._ADR_POINTER_MAX_TOKENS]
+
+
+@pytest.mark.anyio
 async def test_t5_marker_present_on_normal_request_changes_body() -> None:
     lexora = _FakeLexora(
         pass1_content="broken\n\nVERDICT: REQUEST_CHANGES",

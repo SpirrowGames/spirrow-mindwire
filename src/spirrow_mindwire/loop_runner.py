@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -553,12 +554,17 @@ def build_pr_review_driver(
     (``[naysayer_gating]``): skip a re-review of an unchanged head, and cap the re-review rounds.
     """
     g = gating or NaysayerGatingConfig()
-    return NaysayerPrReviewDriver(
+    knobs = functools.partial(
+        NaysayerPrReviewDriver,
         skip_if_head_unchanged=g.skip_if_head_unchanged,
         max_review_rounds=g.max_review_rounds,
         review_login=g.review_login,
         shadow=g.shadow,
     )
+    # The driver owns its default output budget; pass one only when the deployment sets it.
+    if g.review_max_tokens is None:
+        return knobs()
+    return knobs(max_tokens=g.review_max_tokens)
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
