@@ -73,7 +73,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -104,7 +104,14 @@ from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
-from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
+from ..routing import (
+    GuardIClosure,
+    GuardICondition,
+    GuardIVerdict,
+    carve_out_iii_admissible,
+    diagnose_carve_out_iii,
+    guard_proposer_to_implementer,
+)
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
@@ -156,7 +163,6 @@ from .handoff import (
     MismatchReason,
     OperatorFault,
     declares_no_tier_c,
-    declares_tier_c,
     parse_next_token,
     resolve_handoff,
 )
@@ -189,6 +195,7 @@ from .summon import (
     render_resume_notice,
     summon_yield_decision,
 )
+from .tier_c_segment import SegmentScan, is_recorder, scan_tier_c_segment
 from .tierc_gate import (
     TierCGate,
     bounced_msg_id,
@@ -228,6 +235,10 @@ DEFAULT_REVIEW_LOGIN: str = NaysayerGatingConfig.model_fields["review_login"].de
 #: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
+GUARD_I_REDIRECT_TITLE = "Conductor stop — guard (i) redirect"
+"""The first-line prefix of every guard-(i) redirect relay — how a reader (the read-only census,
+``scripts/guard_i_latch_census.py``) recognises one without re-spelling the body."""
 
 
 def _with_stop_marker(notice: str, event: Event) -> str:
@@ -513,6 +524,7 @@ class Conductor:
         naysayer_role: Role = Role.NAYSAYER,
         implementer_role: Role = Role.IMPLEMENTER,
         human_identity: str = HUMAN_TOKEN,
+        tier_c_recorders: Collection[str] = (),
         orchestrator: PrGate | None = None,
         force_naysayer_only_on_explicit_human: bool = False,
         control: LoopControl | None = None,
@@ -557,6 +569,22 @@ class Conductor:
         # value disables the carve-out (fail-safe — every design→implement handoff hard-rejects).
         self._implementer_role = implementer_role
         self._human_identity = human_identity
+        # G1 discharge (T-guard-i-latches-on-discharged-tierc-line, Bohr msg-7202 §2 (a)): the
+        # authors whose ``TIER-C-RESOLVED:`` lines may discharge a named Tier-C declaration — the
+        # people who record a human decision given outside the chatroom (operator / Fermi). Empty
+        # (the default) = no discharge path, the pre-change G1. A roster persona is refused: an
+        # agent that could discharge the declaration latching its own proceed would make the
+        # forgery requirement meaningless, so that is a configuration error, not a choice.
+        self._tier_c_recorders = tuple(r.strip() for r in tier_c_recorders if r.strip())
+        clashing = sorted(
+            persona for persona in self._roster if is_recorder(persona, self._tier_c_recorders)
+        )
+        if clashing:
+            raise ValueError(
+                f"tier_c_recorders must not name a roster persona (got {clashing!r}): an agent "
+                f"that may discharge a Tier-C declaration could unlatch guard (i) G1 for its own "
+                f"proceed (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a))"
+            )
         # PR-gate (PR-2b-2): the orchestrator that fires the Tier B independent naysayer review on a
         # ``NEXT: pr-review <ref>``, and the implementer dispatched to fix a REQUEST_CHANGES. A
         # ``None`` orchestrator / a roster without exactly one implementer disables the gate path
@@ -669,6 +697,11 @@ class Conductor:
         # Why G3 closed carve-out ③ on the last ``_route`` (``None`` = G3 did not close it); read
         # by the guard-(i) redirect notice so the human can tell a Jev veto from an internal fault.
         self._g3_close_reason: str | None = None
+        # Every OFFLINE condition that closed carve-out ③ on the last guard-(i) REDIRECT, plus the
+        # G1 scan behind it (Bohr msg-7202 §2 (b) / msg-7204 B1); ``None`` when ``_route`` did not
+        # redirect. Read by the redirect notice so it names what closed instead of "あるいは".
+        self._guard_i_closures: tuple[GuardIClosure, ...] | None = None
+        self._guard_i_scan: SegmentScan | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -1684,6 +1717,8 @@ class Conductor:
             # thunks for the same reason — the predicate owns when they are read.
             head_id = _msg_id(messages[-1])
             self._g3_close_reason = None
+            self._guard_i_closures = None
+            self._guard_i_scan = None
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
@@ -1703,6 +1738,7 @@ class Conductor:
                     spawn_blocked=False,
                     stop_reason=None,
                 )
+            self._diagnose_guard_i_redirect(author, author_role, messages)
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
@@ -2238,13 +2274,70 @@ class Conductor:
 
         The human boundary is author-string trust, the same D-3 environment trust model as
         :meth:`_is_human` (msg-598 Q2=yes, re-accepted for G1 in msg-4858 §2).
+
+        The one exception to the latch (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2
+        (a) / msg-7204): a ``TIER-C-RESOLVED: <msg-id> decided-by=<human> on=YYYY-MM-DD`` line
+        posted by a configured ``tier_c_recorders`` author, NEWER than the declaration it names,
+        discharges that one declaration. The rule lives in
+        :func:`.tier_c_segment.scan_tier_c_segment` so the read-only census applies the same one.
         """
-        for msg in reversed(messages):
-            if self._is_human(_author(msg)):
-                return False
-            if declares_tier_c(_content(msg)):
-                return True
-        return False
+        return self._scan_tier_c_segment(messages).declares_tier_c
+
+    def _scan_tier_c_segment(self, messages: list[dict[str, Any]]) -> SegmentScan:
+        """The G1 scan with this conductor's human test and recorder list."""
+        return scan_tier_c_segment(
+            messages, is_human=self._is_human, recorders=self._tier_c_recorders
+        )
+
+    def _diagnose_guard_i_redirect(
+        self, author: str, author_role: Role | None, messages: list[dict[str, Any]]
+    ) -> None:
+        """Record and log WHICH carve-out ③ conditions closed this guard-(i) redirect.
+
+        Bohr msg-7202 §2 (b) / msg-7204 B1 (endorsed by Einstein): the decision has already been
+        made by :func:`~spirrow_mindwire.routing.guard_proposer_to_implementer`, short-circuiting
+        as before; this is the diagnosis only. Every offline condition is evaluated (no network),
+        so one notice names all of them. G3 is added only when no offline condition closed — the
+        Decider was then consulted and :meth:`_proceed_vetoed_for` left its reason; otherwise G3
+        was not evaluated and the notice says so. Logged at INFO as ``guard_i_redirect`` so the
+        conductor log says more than ``conductor stopped: reason=human`` (the msg-881 blind spot).
+        """
+        head = messages[-1]
+        head_id = _msg_id(head)
+        scan = self._scan_tier_c_segment(messages)
+        closures = diagnose_carve_out_iii(
+            head_msg_id=head_id,
+            author_is_naysayer=author_role is self._naysayer_role,
+            control_state_is_run=self._control_state is ControlState.RUN,
+            message_is_attested=lambda: self._attested(head),
+            open_tier_c_declarations=lambda: scan.open_declarations,
+            naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
+        )
+        if not closures:
+            if self._g3_close_reason == "prefetch-missing":
+                closures = (GuardIClosure(GuardICondition.G3_PREFETCH_MISSING, (head_id,)),)
+            elif self._g3_close_reason is not None:
+                closures = (GuardIClosure(GuardICondition.G3_VETO, (head_id,)),)
+            else:
+                logger.error(
+                    "guard_i_redirect head=%s: no closed condition found — routing and diagnosis "
+                    "disagree",
+                    head_id,
+                )
+        self._guard_i_closures = closures
+        self._guard_i_scan = scan
+        logger.info(
+            "guard_i_redirect head=%s author=%s closed_by=%s evidence=%s g1_boundary=%s "
+            "g1_unmatched=%s g1_malformed=%s g1_ignored_non_recorder=%s",
+            head_id,
+            author,
+            ",".join(c.condition.value for c in closures) or "unknown",
+            ";".join(f"{c.condition.value}:{'/'.join(c.evidence_ids)}" for c in closures) or "-",
+            scan.boundary_msg_id or "-",
+            ",".join(scan.unmatched) or "-",
+            ",".join(scan.malformed) or "-",
+            ",".join(scan.ignored_non_recorder) or "-",
+        )
 
     def _proceed_vetoed_for(self, head_msg_id: str) -> bool:
         """G3 read-back (veto form), three states (Bohr msg-5229 R3', Einstein msg-5230):
@@ -2664,7 +2757,8 @@ class Conductor:
             author_role=author_role,
             handoff=handoff,
             target=target,
-            g3_close_reason=self._g3_close_reason,
+            closures=self._guard_i_closures,
+            scan=self._guard_i_scan,
         )
 
     def _guard_i_redirect_target(
@@ -2723,7 +2817,8 @@ class Conductor:
         author_role: Role | None,
         handoff: Handoff,
         target: str,
-        g3_close_reason: str | None = None,
+        closures: tuple[GuardIClosure, ...] | None = None,
+        scan: SegmentScan | None = None,
     ) -> str:
         """Render the D-1 write-back body. See :meth:`_render_guard_i_redirect_notice` for shape.
 
@@ -2742,20 +2837,9 @@ class Conductor:
         # the thread when it has come to rest (if target is human). Both need to see the same
         # facts, so the body does not branch on target for the diagnostic prose.
         target_line = f"NEXT: {target}"
-        # Bohr msg-5227 R4 / msg-5229 R3': when G3 is what closed ③, say which kind of close it was
-        # so the human can tell a Jev veto from a conductor-internal fault.
-        if g3_close_reason is None:
-            g3_line = ""
-        elif g3_close_reason == "prefetch-missing":
-            g3_line = (
-                "今回 ③ を閉じたのは G3 です: G3 の事前取得が欠落しました (内部エラー。"
-                "Decider の判定ではありません)。\n\n"
-            )
-        else:
-            score = g3_close_reason.removeprefix("veto:")
-            g3_line = f"今回 ③ を閉じたのは G3 です: Jev が人に聞くべきと判定 (p={score})。\n\n"
+        closed_block = self._render_guard_i_closures(closures, scan)
         return (
-            "Conductor stop — guard (i) redirect (design→implement Tier-C gate)\n\n"
+            f"{GUARD_I_REDIRECT_TITLE} (design→implement Tier-C gate)\n\n"
             f"直近の post ({author}, role: {author_role_label}) の `NEXT:` は "
             f"implementer (`{implementer_token}`) を指しました。guard (i) はこの handoff を "
             "Tier-C の gate として拦截し、実装へは通しません "
@@ -2765,13 +2849,9 @@ class Conductor:
             "identity ではありません。\n"
             "- ② PR-gate verdict relay — 不適合: この handoff は PR-gate の verdict relay "
             "ではありません。\n"
-            "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
-            "author が naysayer でない、あるいは attest 済でない、あるいは control が "
-            "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
-            "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
-            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が「人に聞くべき」と "
-            "判定した (拒否権。Decider 無効・判定なし・エラーでは閉じない)。\n\n"
-            f"{g3_line}"
+            "- ③ attested independent naysayer proceed under control=`run` — 不適合。"
+            "今回閉じた条件は次のとおりです (T-guard-i-latches-on-discharged-tierc-line):\n"
+            f"{closed_block}\n"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "
@@ -2783,6 +2863,94 @@ class Conductor:
             "同じ head が永続 relaunch されるループ (msg-2537 §4 実測 288 回) が終端します。\n\n"
             f"{target_line}"
         )
+
+    def _render_guard_i_closures(
+        self, closures: tuple[GuardIClosure, ...] | None, scan: SegmentScan | None
+    ) -> str:
+        """One bullet per CLOSED condition, each with its evidence msg id(s) and how to open it.
+
+        Replaces the fixed "あるいは" list of every possible condition (msg-881, which named none of
+        them; Bohr msg-7202 §2 (b) / msg-7204 B1). Every line starts with indentation and ``-``, so
+        none can be read as a ``NEXT:`` / ``TIER-C:`` / ``TIER-C-RESOLVED:`` line by the parsers
+        that read this relay back.
+        """
+        if not closures:
+            return (
+                "  - 閉じた条件を特定できませんでした "
+                "(診断なし。conductor ログを確認してください)。\n"
+            )
+        lines: list[str] = []
+        offline_closed = False
+        for closure in closures:
+            ids = ", ".join(i for i in closure.evidence_ids if i) or "(msg id なし)"
+            cond = closure.condition
+            if cond is GuardICondition.NOT_NAYSAYER:
+                offline_closed = True
+                lines.append(
+                    f"  - naysayer ではない — {ids} の author は roster 上 naysayer ではありません "
+                    "(③ を使えるのは attested naysayer の proceed だけです)。"
+                )
+            elif cond is GuardICondition.NOT_RUN:
+                offline_closed = True
+                lines.append(
+                    f"  - control が `run` ではない — この project の loop control は "
+                    f"`{self._control_state.value}` です。"
+                )
+            elif cond is GuardICondition.NOT_ATTESTED:
+                offline_closed = True
+                lines.append(
+                    f"  - attest なし — {ids} の最終行に attest stamp が無いか、"
+                    "`backend` と `expected` が一致しません。"
+                )
+            elif cond is GuardICondition.G1:
+                offline_closed = True
+                lines.append(self._render_g1_closure(ids, scan))
+            elif cond is GuardICondition.G2:
+                offline_closed = True
+                lines.append(
+                    f"  - G2 — {ids} の `NEXT:` 直上の行が `TIER-C-CHECK: none` ではありません "
+                    "(空行がはさまっても閉じます)。"
+                )
+            elif cond is GuardICondition.G3_PREFETCH_MISSING:
+                lines.append(
+                    f"  - G3 — {ids}: G3 の事前取得が欠落しました (内部エラー。"
+                    "Decider の判定ではありません)。"
+                )
+            elif cond is GuardICondition.G3_VETO:
+                score = (self._g3_close_reason or "veto:?").removeprefix("veto:")
+                lines.append(f"  - G3 — {ids}: Jev が人に聞くべきと判定 (p={score})。")
+        if offline_closed:
+            lines.append("  - G3 — 未評価 (前段の条件で閉じたため、Decider は呼んでいません)。")
+        return "\n".join(lines) + "\n"
+
+    def _render_g1_closure(self, ids: str, scan: SegmentScan | None) -> str:
+        """The G1 bullet: every open declaration, the human boundary, and the discharge route."""
+        boundary = (
+            f"最後の human 投稿 {scan.boundary_msg_id} 以降"
+            if scan is not None and scan.boundary_msg_id
+            else "このスレッドに human の投稿は無く、全文が対象"
+        )
+        human = self._human_identity or "<human identity>"
+        text = (
+            f"  - G1 — 未解消の `TIER-C:` 宣言 {ids} ({boundary})。開け方: human が投稿する、"
+            "または tier_c_recorders に登録された記録者が宣言 1 件につき 1 行 "
+            f"`TIER-C-RESOLVED: <msg-id> decided-by={human} on=YYYY-MM-DD` を書く。"
+        )
+        if scan is not None:
+            notes = []
+            if scan.unmatched:
+                notes.append(
+                    f"対応する宣言が区間内に無い解消記録: {', '.join(scan.unmatched)} (unmatched)"
+                )
+            if scan.malformed:
+                notes.append(f"書式に合わない解消記録を含む投稿: {', '.join(scan.malformed)}")
+            if scan.ignored_non_recorder:
+                notes.append(
+                    "記録者でない author の解消記録 (無視): " + ", ".join(scan.ignored_non_recorder)
+                )
+            if notes:
+                text += " 参考: " + " / ".join(notes) + "。"
+        return text
 
     async def _admit(
         self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]

@@ -1011,6 +1011,7 @@ def build_conductor(
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,
             human_identity=cond_cfg.human_identity,
+            tier_c_recorders=tuple(cond_cfg.tier_c_recorders),
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
             # ADR-2026-09-14-21: merged over the shipped default inside the Conductor, so an
