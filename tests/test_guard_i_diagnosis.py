@@ -598,3 +598,33 @@ def test_census_applies_the_role_check_and_reports_why(
         naysayer="Einstein",
         roster=_ROSTER,
     )["latched"]
+
+
+@pytest.mark.anyio
+async def test_a_redirected_route_scans_the_segment_once() -> None:
+    # PR-gate #488 advisory: the verdict thunk and the diagnosis share one G1 scan.
+    mcp = _IdMcp()
+    _seed_lexora(mcp)
+    conductor = _conductor(
+        mcp, _ScriptedDispatcher(mcp, {}), control=_FakeControl(ControlState.RUN)
+    )
+    calls: list[int] = []
+    original = conductor._scan_tier_c_segment
+
+    def spy(messages: list[dict[str, Any]]) -> Any:
+        calls.append(len(messages))
+        return original(messages)
+
+    conductor._scan_tier_c_segment = spy  # type: ignore[method-assign]
+    # RUN, so the verdict itself reaches G1 (and asks for the scan) before the diagnosis does.
+    conductor._control_state = ControlState.RUN
+    route = conductor._route(conductor_handoff(conductor, mcp), list(mcp._messages))
+    assert route.stop_reason is StopReason.HUMAN
+    assert calls == [len(mcp._messages)]
+    assert conductor._guard_i_closures is not None
+
+
+def conductor_handoff(conductor: Conductor, mcp: _IdMcp) -> Any:
+    from spirrow_mindwire.conductor.handoff import resolve_handoff
+
+    return resolve_handoff(mcp._messages[-1]["content"], _ROSTER)

@@ -1728,12 +1728,22 @@ class Conductor:
             self._g3_close_reason = None
             self._guard_i_closures = None
             self._guard_i_scan = None
+            # One G1 scan per route, shared by the verdict thunk and the redirect diagnosis
+            # (PR-gate #488 advisory: it used to run twice on a redirect). Still lazy: nothing
+            # is scanned unless the predicate reaches G1 or the turn is redirected.
+            scan_memo: list[SegmentScan] = []
+
+            def scan_once() -> SegmentScan:
+                if not scan_memo:
+                    scan_memo.append(self._scan_tier_c_segment(messages))
+                return scan_memo[0]
+
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
                 control_state_is_run=self._control_state is ControlState.RUN,
                 message_is_attested=lambda: self._attested(messages[-1]),
-                segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+                segment_declares_tier_c=lambda: scan_once().declares_tier_c,
                 naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
                 decider_vetoes=lambda: self._proceed_vetoed_for(head_id),
             )
@@ -1747,7 +1757,7 @@ class Conductor:
                     spawn_blocked=False,
                     stop_reason=None,
                 )
-            self._diagnose_guard_i_redirect(author, author_role, messages)
+            self._diagnose_guard_i_redirect(author, author_role, messages, scan_once())
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
@@ -2302,9 +2312,15 @@ class Conductor:
         )
 
     def _diagnose_guard_i_redirect(
-        self, author: str, author_role: Role | None, messages: list[dict[str, Any]]
+        self,
+        author: str,
+        author_role: Role | None,
+        messages: list[dict[str, Any]],
+        scan: SegmentScan,
     ) -> None:
         """Record and log WHICH carve-out ③ conditions closed this guard-(i) redirect.
+
+        ``scan`` is the G1 scan ``_route`` already made for the verdict (one scan per route).
 
         Bohr msg-7202 §2 (b) / msg-7204 B1 (endorsed by Einstein): the decision has already been
         made by :func:`~spirrow_mindwire.routing.guard_proposer_to_implementer`, short-circuiting
@@ -2316,7 +2332,6 @@ class Conductor:
         """
         head = messages[-1]
         head_id = _msg_id(head)
-        scan = self._scan_tier_c_segment(messages)
         closures = diagnose_carve_out_iii(
             head_msg_id=head_id,
             author_is_naysayer=author_role is self._naysayer_role,
