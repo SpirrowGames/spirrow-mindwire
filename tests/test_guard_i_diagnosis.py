@@ -18,6 +18,7 @@ import importlib.util
 import itertools
 import logging
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +36,14 @@ from test_conductor_core import (
 )
 
 from spirrow_mindwire.conductor.control import ControlState
-from spirrow_mindwire.conductor.core import CONDUCTOR_RELAY_AUTHOR, Conductor, StopReason
+from spirrow_mindwire.conductor.core import (
+    CONDUCTOR_RELAY_AUTHOR,
+    Conductor,
+    StopReason,
+    roster_role,
+)
 from spirrow_mindwire.conductor.human_identity import is_human_identity
-from spirrow_mindwire.conductor.tier_c_segment import scan_tier_c_segment
+from spirrow_mindwire.conductor.tier_c_segment import AUTONOMOUS_LOOP_ROLES, scan_tier_c_segment
 from spirrow_mindwire.decider.verdict import TierCVerdictKind
 from spirrow_mindwire.routing import (
     GuardICondition,
@@ -78,8 +84,17 @@ def _lexora_880(*extra: dict[str, Any], record: str = "probe done, Takahito appr
     ]
 
 
-def _scan(messages: list[dict[str, Any]], recorders: tuple[str, ...] = ("operator",)) -> Any:
-    return scan_tier_c_segment(messages, is_human=_is_human, recorders=recorders)
+def _scan(
+    messages: list[dict[str, Any]],
+    recorders: tuple[str, ...] = ("operator",),
+    roster: Mapping[str, Role] | None = _ROSTER,
+) -> Any:
+    return scan_tier_c_segment(
+        messages,
+        is_human=_is_human,
+        recorders=recorders,
+        role_of=(lambda a: roster_role(roster, a)) if roster is not None else None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -395,8 +410,47 @@ async def test_the_relay_never_declares_or_resolves_a_tier_c_itself() -> None:
     assert "書式に合わない解消記録を含む投稿: msg-874" in relay
 
 
-def test_a_roster_persona_cannot_be_a_recorder() -> None:
-    with pytest.raises(ValueError, match="tier_c_recorders must not name a roster persona"):
+# --------------------------------------------------------------------------- #
+# Runtime, per-thread role check (Bohr msg-7209 / msg-7211, Einstein msg-7208 / msg-7210)
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_loop_roles_is_every_role() -> None:
+    # A new Role value reds this, forcing the decision whether its holder may record a resolution.
+    assert set(Role) == AUTONOMOUS_LOOP_ROLES
+
+
+_BOTH = "approved\n" + _resolved("msg-751") + "\n" + _resolved("msg-754")
+
+
+@pytest.mark.parametrize("role", sorted(AUTONOMOUS_LOOP_ROLES))
+def test_a_recorder_holding_a_loop_role_in_this_thread_discharges_nothing(role: Role) -> None:
+    scan = _scan(_lexora_880(record=_BOTH), roster={**_ROSTER, "Operator": role})
+    assert scan.open_declarations == ("msg-751", "msg-754")
+    assert scan.recorder_holds_loop_role == (("msg-874", "operator", role.value),)
+
+
+def test_a_recorder_absent_from_this_threads_roster_discharges() -> None:
+    assert not _scan(_lexora_880(record=_BOTH), roster=_ROSTER).declares_tier_c
+
+
+def test_a_recorder_who_is_naysayer_only_in_another_project_discharges_here() -> None:
+    # Project X's roster has operator as naysayer; this thread's roster (project Y) does not.
+    other_project_roster = {**_ROSTER, "operator": Role.NAYSAYER}
+    assert roster_role(other_project_roster, "operator") is Role.NAYSAYER
+    assert not _scan(_lexora_880(record=_BOTH), roster=_ROSTER).declares_tier_c
+
+
+def test_without_a_roster_a_recorder_line_is_roster_unknown_and_discharges_nothing() -> None:
+    scan = _scan(_lexora_880(record=_BOTH), roster=None)
+    assert scan.open_declarations == ("msg-751", "msg-754")
+    assert scan.roster_unknown == ("msg-874",)
+
+
+def test_an_overlapping_recorder_config_starts_the_daemon_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.conductor.core"):
         Conductor(
             mcp=_FakeChatroomMcp(),
             dispatcher=_ScriptedDispatcher(_FakeChatroomMcp(), {}),
@@ -405,6 +459,34 @@ def test_a_roster_persona_cannot_be_a_recorder() -> None:
             naysayer_identity="Einstein",
             tier_c_recorders=("operator", "einstein"),
         )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Einstein=naysayer" in w and "tier_c_recorders" in w for w in warnings), warnings
+
+
+@pytest.mark.anyio
+async def test_a_naysayer_recorder_cannot_unlatch_its_own_proceed_and_the_relay_says_why() -> None:
+    mcp = _IdMcp()
+    _seed_lexora(mcp)
+    mcp.seed_as("msg-878", author="Einstein", content=_BOTH + "\n\nNEXT: Bohr")
+    # move the proceed pair after the forged record
+    mcp._messages.append(mcp._messages.pop(-3))
+    mcp._messages.append(mcp._messages.pop(-3))
+    assert [m["msg_id"] for m in mcp._messages][-3:] == ["msg-878", "msg-879", "msg-880"]
+    disp = _ScriptedDispatcher(mcp, {})
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=_ROSTER,
+        naysayer_identity="Einstein",
+        tier_c_recorders=("Einstein",),
+        control=_FakeControl(ControlState.RUN),
+        decider=_ClearingDecider(),
+    )
+    await conductor.run()
+    assert Role.IMPLEMENTER not in [role for role, _ in disp.dispatches]
+    (relay,) = _relays(mcp)
+    assert "msg-878 の解消記録は無効: Einstein は本スレッドで naysayer" in relay
 
 
 # --------------------------------------------------------------------------- #
@@ -478,6 +560,7 @@ async def test_census_run_lists_only_latched_or_stopped_threads_and_records_read
         is_human=_is_human,
         recorders=(),
         naysayer="Einstein",
+        roster=_ROSTER,
         until=None,
         emit_all=False,
         limit=1000,
@@ -485,3 +568,33 @@ async def test_census_run_lists_only_latched_or_stopped_threads_and_records_read
     assert [r["thread_id"] for r in result["rows"]] == ["T-latched"]
     assert result["errors"][0]["thread_id"] == "T-broken"
     assert result["counts"] == {"polled": 3, "latched": 1, "stopped": 0}
+
+
+@pytest.mark.parametrize(
+    ("roster", "field"),
+    [
+        ({**_ROSTER, "operator": Role.NAYSAYER}, "recorder_holds_loop_role"),
+        (None, "roster_unknown"),
+    ],
+)
+def test_census_applies_the_role_check_and_reports_why(
+    roster: Mapping[str, Role] | None, field: str
+) -> None:
+    row = _CENSUS.census_thread(
+        "T",
+        _lexora_880(record=_BOTH),
+        is_human=_is_human,
+        recorders=("operator",),
+        naysayer="Einstein",
+        roster=roster,
+    )
+    assert row["latched"] is True
+    assert row[field]
+    assert not _CENSUS.census_thread(
+        "T",
+        _lexora_880(record=_BOTH),
+        is_human=_is_human,
+        recorders=("operator",),
+        naysayer="Einstein",
+        roster=_ROSTER,
+    )["latched"]

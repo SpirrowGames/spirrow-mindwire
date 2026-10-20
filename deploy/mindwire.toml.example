@@ -48,8 +48,9 @@ naysayer_identity = "Einstein"
 human_identity = "human"
 # Authors whose `TIER-C-RESOLVED: <msg-id> decided-by=<human_identity> on=YYYY-MM-DD` lines discharge
 # that Tier-C declaration from guard (i)'s G1 latch — the record of a human decision given outside the
-# chatroom. Default empty (only a human post unlatches G1). Never list a roster persona (refused at
-# startup). See docs/deploy.md "G1 latch and recording an out-of-chat decision".
+# chatroom. Default empty (only a human post unlatches G1). A recorder that holds proposer /
+# implementer / naysayer in a thread's roster is ignored in that thread (WARNING at startup, the
+# daemon still starts). See docs/deploy.md "G1 latch and recording an out-of-chat decision".
 # tier_c_recorders = ["operator", "Fermi"]
 # Runaway backstop: max serial turns before the conductor stops (default 40).
 max_rounds = 40

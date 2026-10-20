@@ -195,7 +195,12 @@ from .summon import (
     render_resume_notice,
     summon_yield_decision,
 )
-from .tier_c_segment import SegmentScan, is_recorder, scan_tier_c_segment
+from .tier_c_segment import (
+    AUTONOMOUS_LOOP_ROLES,
+    SegmentScan,
+    is_recorder,
+    scan_tier_c_segment,
+)
 from .tierc_gate import (
     TierCGate,
     bounced_msg_id,
@@ -572,18 +577,22 @@ class Conductor:
         # G1 discharge (T-guard-i-latches-on-discharged-tierc-line, Bohr msg-7202 §2 (a)): the
         # authors whose ``TIER-C-RESOLVED:`` lines may discharge a named Tier-C declaration — the
         # people who record a human decision given outside the chatroom (operator / Fermi). Empty
-        # (the default) = no discharge path, the pre-change G1. A roster persona is refused: an
-        # agent that could discharge the declaration latching its own proceed would make the
-        # forgery requirement meaningless, so that is a configuration error, not a choice.
+        # (the default) = no discharge path, the pre-change G1. A recorder that holds a loop role
+        # (:data:`.tier_c_segment.AUTONOMOUS_LOOP_ROLES`) in THIS roster is not refused here — that
+        # would take the daemon down over one project's roster (Einstein msg-7208 BLOCKING); its
+        # lines are ignored at runtime, per thread (msg-7209 / msg-7211), and the overlap is
+        # logged once as a WARNING so the operator sees it before a resolution silently fails.
         self._tier_c_recorders = tuple(r.strip() for r in tier_c_recorders if r.strip())
-        clashing = sorted(
-            persona for persona in self._roster if is_recorder(persona, self._tier_c_recorders)
+        overlap = sorted(
+            f"{persona}={role.value}"
+            for persona, role in self._roster.items()
+            if role in AUTONOMOUS_LOOP_ROLES and is_recorder(persona, self._tier_c_recorders)
         )
-        if clashing:
-            raise ValueError(
-                f"tier_c_recorders must not name a roster persona (got {clashing!r}): an agent "
-                f"that may discharge a Tier-C declaration could unlatch guard (i) G1 for its own "
-                f"proceed (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a))"
+        if overlap:
+            logger.warning(
+                "tier_c_recorders overlap loop roles in this roster: %s — their TIER-C-RESOLVED "
+                "lines are ignored in this thread (recorder_holds_loop_role)",
+                ", ".join(overlap),
             )
         # PR-gate (PR-2b-2): the orchestrator that fires the Tier B independent naysayer review on a
         # ``NEXT: pr-review <ref>``, and the implementer dispatched to fix a REQUEST_CHANGES. A
@@ -2286,7 +2295,10 @@ class Conductor:
     def _scan_tier_c_segment(self, messages: list[dict[str, Any]]) -> SegmentScan:
         """The G1 scan with this conductor's human test and recorder list."""
         return scan_tier_c_segment(
-            messages, is_human=self._is_human, recorders=self._tier_c_recorders
+            messages,
+            is_human=self._is_human,
+            recorders=self._tier_c_recorders,
+            role_of=self._roster_role,
         )
 
     def _diagnose_guard_i_redirect(
@@ -2328,7 +2340,8 @@ class Conductor:
         self._guard_i_scan = scan
         logger.info(
             "guard_i_redirect head=%s author=%s closed_by=%s evidence=%s g1_boundary=%s "
-            "g1_unmatched=%s g1_malformed=%s g1_ignored_non_recorder=%s",
+            "g1_unmatched=%s g1_malformed=%s g1_ignored_non_recorder=%s "
+            "g1_recorder_holds_loop_role=%s",
             head_id,
             author,
             ",".join(c.condition.value for c in closures) or "unknown",
@@ -2337,6 +2350,7 @@ class Conductor:
             ",".join(scan.unmatched) or "-",
             ",".join(scan.malformed) or "-",
             ",".join(scan.ignored_non_recorder) or "-",
+            ",".join(f"{m}:{a}={r}" for m, a, r in scan.recorder_holds_loop_role) or "-",
         )
 
     def _proceed_vetoed_for(self, head_msg_id: str) -> bool:
@@ -2947,6 +2961,11 @@ class Conductor:
             if scan.ignored_non_recorder:
                 notes.append(
                     "記録者でない author の解消記録 (無視): " + ", ".join(scan.ignored_non_recorder)
+                )
+            for msg_id, who, role in scan.recorder_holds_loop_role:
+                notes.append(
+                    f"{msg_id} の解消記録は無効: {who} は本スレッドで {role} "
+                    "(recorder-holds-loop-role)"
                 )
             if notes:
                 text += " 参考: " + " / ".join(notes) + "。"

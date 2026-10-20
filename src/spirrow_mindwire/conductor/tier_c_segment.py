@@ -21,9 +21,15 @@ What this module adds, and nothing more:
   and checks a message's declarations before collecting its own resolutions, so a message cannot
   resolve itself). A new ``TIER-C:`` line after the resolution latches G1 again.
 
-Forgery (msg-7202 §2 (a)): an agent persona — proposer, naysayer, implementer — writing the line
-discharges nothing, however it is worded, because its author is not a recorder (the conductor also
-refuses, at construction, a recorder list that names a roster persona). This is the same
+Forgery (msg-7202 §2 (a); runtime role check msg-7209 / msg-7211, endorsed by Einstein): an agent
+persona writing the line discharges nothing, however it is worded. Either its author is not a
+recorder at all, or it is a recorder that holds one of :data:`AUTONOMOUS_LOOP_ROLES` in THIS
+thread's conductor roster — then the line is ``recorder_holds_loop_role`` and discharges nothing,
+because an agent must not unlatch the G1 that stops its own proceed. The check is per thread and at
+runtime: the same recorder is valid in a project where it holds no loop role, and a configuration
+overlap never stops the daemon (msg-7208 BLOCKING). When the thread's roster is not known (the
+census without a roster), a recorder line is ``roster_unknown`` and discharges nothing. This is the
+same
 author-string environment trust as :func:`~.human_identity.is_human_identity` (D-3): noise
 reduction, not authentication; the authoritative Tier-C guard stays the human's manual ``main``
 merge. The default recorder list is empty, which is byte-for-byte the pre-change behaviour.
@@ -47,9 +53,11 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from ..value_objects import Role
 from .handoff import declares_tier_c
 
 __all__ = [
+    "AUTONOMOUS_LOOP_ROLES",
     "TIER_C_RESOLVED_KEYWORD",
     "SegmentScan",
     "TierCResolution",
@@ -57,6 +65,13 @@ __all__ = [
     "parse_resolution_lines",
     "scan_tier_c_segment",
 ]
+
+AUTONOMOUS_LOOP_ROLES: frozenset[Role] = frozenset({Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER})
+"""The conductor-roster roles whose holder may NOT discharge a declaration in that thread (Bohr
+msg-7211, Einstein's endorsement). The single place the set is written: the conductor, the census
+and the startup WARNING all read it. ``tests/test_guard_i_diagnosis.py`` pins
+``set(Role) == AUTONOMOUS_LOOP_ROLES`` so a new :class:`Role` value forces the decision of whether
+its holder may record a resolution, instead of silently being allowed to."""
 
 TIER_C_RESOLVED_KEYWORD = "TIER-C-RESOLVED"
 """The recorder's discharge keyword (msg-7202 §2 (a), one id per line per msg-7204 A1)."""
@@ -95,6 +110,9 @@ class SegmentScan:
       (including ``decided-by`` not being the human identity, or an impossible date).
     * ``ignored_non_recorder`` — msg ids of posts by NON-recorders carrying a keyword line. Shown so
       a misconfigured ``tier_c_recorders`` (or an agent trying) is visible, not silent.
+    * ``recorder_holds_loop_role`` — ``(msg_id, author, role)`` of recorder posts ignored because
+      the author holds a loop role in this thread's roster.
+    * ``roster_unknown`` — msg ids of recorder posts ignored because no roster was given.
     """
 
     open_declarations: tuple[str, ...]
@@ -103,6 +121,8 @@ class SegmentScan:
     unmatched: tuple[str, ...]
     malformed: tuple[str, ...]
     ignored_non_recorder: tuple[str, ...]
+    recorder_holds_loop_role: tuple[tuple[str, str, str], ...] = ()
+    roster_unknown: tuple[str, ...] = ()
 
     @property
     def declares_tier_c(self) -> bool:
@@ -152,13 +172,16 @@ def scan_tier_c_segment(
     *,
     is_human: Callable[[str], bool],
     recorders: Collection[str] = (),
+    role_of: Callable[[str], Role | None] | None,
 ) -> SegmentScan:
     """Run G1 over ``messages`` (oldest first, as the chatroom returns them).
 
     Walk newest → oldest. At the first human-authored message, stop: that is the only reset
     boundary (msg-4858 §2), unchanged. For every other message, first test its ``TIER-C:`` lines
     against the resolutions collected from NEWER messages, then collect its own resolutions (if
-    its author is a recorder). With ``recorders`` empty this is exactly the previous rule.
+    its author is a recorder holding no :data:`AUTONOMOUS_LOOP_ROLES` role per ``role_of``, this
+    thread's conductor-roster lookup; ``None`` = roster unknown, every recorder line is ignored).
+    With ``recorders`` empty this is exactly the previous rule.
     """
     pending: dict[str, None] = {}  # resolution targets seen so far (newer posts), insertion-ordered
     matched: set[str] = set()
@@ -166,6 +189,8 @@ def scan_tier_c_segment(
     resolved_newest_first: list[str] = []
     malformed: list[str] = []
     ignored: list[str] = []
+    loop_role: list[tuple[str, str, str]] = []
+    unknown: list[str] = []
     boundary: str | None = None
     for msg in reversed(messages):
         author = str(msg.get("author") or "")
@@ -185,6 +210,14 @@ def scan_tier_c_segment(
         if not is_recorder(author, recorders):
             ignored.append(msg_id)
             continue
+        if role_of is None:
+            unknown.append(msg_id)
+            continue
+        role = role_of(author)
+        if role in AUTONOMOUS_LOOP_ROLES:
+            assert role is not None
+            loop_role.append((msg_id, author, role.value))
+            continue
         resolutions, bad = parse_resolution_lines(body, is_human=is_human)
         if bad:
             malformed.append(msg_id)
@@ -197,4 +230,6 @@ def scan_tier_c_segment(
         unmatched=tuple(t for t in pending if t not in matched),
         malformed=tuple(reversed(malformed)),
         ignored_non_recorder=tuple(reversed(ignored)),
+        recorder_holds_loop_role=tuple(reversed(loop_role)),
+        roster_unknown=tuple(reversed(unknown)),
     )

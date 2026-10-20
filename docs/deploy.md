@@ -1020,7 +1020,10 @@ never automated (D-5: the human's manual merge is the authoritative guard).
 
     The line must match the whole grammar (one msg id per line, `decided-by` = the human identity,
     a real date), and its author must be listed in `[conductor].tier_c_recorders` (default empty =
-    no discharge path; a roster persona there stops the daemon at startup). It discharges only the
+    no discharge path). **A recorder counts only in a thread where it holds none of proposer /
+    implementer / naysayer in that thread's `[conductor].roster`**; otherwise its line is ignored
+    and reported as `recorder-holds-loop-role` (the daemon still starts, and logs a WARNING listing
+    the overlap). It discharges only the
     declaration it names, and only if it was posted after that declaration; a later `TIER-C:` line
     closes G1 again. When guard (i) does redirect, its relay now names every closed condition with
     its msg ids (G1 lists every open declaration, plus any `unmatched` / malformed / non-recorder

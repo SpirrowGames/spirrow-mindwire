@@ -424,8 +424,9 @@ class ConductorConfig(_StrictModel):
 
     This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["operator",
     "Fermi"]``). Empty (the default) = only a human post unlatches G1, the previous behaviour. A
-    roster persona here is refused at daemon startup: an agent that could discharge a declaration
-    could unlatch its own proceed. Same author-string trust as ``human_identity``."""
+    recorder holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that
+    thread (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING
+    for the overlap. Same author-string trust as ``human_identity``."""
     max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 

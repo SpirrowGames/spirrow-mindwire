@@ -25,8 +25,14 @@ Usage::
         --thread T-streaming-ledger-row --until msg-880 --naysayer Einstein
 
 ``--recorder`` should mirror the deployed ``[conductor].tier_c_recorders`` (default: none, which is
-the pre-change G1). ``--until`` truncates the thread after that message, so the row describes the
-state the conductor saw when that message was the head.
+the pre-change G1). A recorder's line counts only if the recorder holds no
+:data:`~spirrow_mindwire.conductor.tier_c_segment.AUTONOMOUS_LOOP_ROLES` role in the thread's
+CONDUCTOR roster (Bohr msg-7211) — never magickit's participant list. Give that roster with
+``--config <mindwire.toml>`` (reads ``[conductor].roster``, ``human_identity`` and
+``tier_c_recorders``; explicit flags win) or ``--roster Name=role``. With no roster, every recorder
+line is reported as ``roster_unknown`` and discharges nothing. ``--until`` truncates the thread
+after that message, so the row describes the state the conductor saw when that message was the
+head.
 
 Output (stdout, one ASCII JSON object)::
 
@@ -50,16 +56,22 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
-from spirrow_mindwire.conductor.core import CONDUCTOR_RELAY_AUTHOR, GUARD_I_REDIRECT_TITLE
+from spirrow_mindwire.conductor.core import (
+    CONDUCTOR_RELAY_AUTHOR,
+    GUARD_I_REDIRECT_TITLE,
+    roster_role,
+)
 from spirrow_mindwire.conductor.handoff import HandoffKind, declares_no_tier_c, resolve_handoff
 from spirrow_mindwire.conductor.human_identity import is_human_identity
 from spirrow_mindwire.conductor.tier_c_segment import scan_tier_c_segment
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 from spirrow_mindwire.routing import diagnose_carve_out_iii
 from spirrow_mindwire.source_marker import parse_attestation_marker
+from spirrow_mindwire.value_objects import Role
 
 _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
 if _reconfigure_err is not None:
@@ -88,6 +100,7 @@ def census_thread(
     is_human: Callable[[str], bool],
     recorders: Collection[str],
     naysayer: str,
+    roster: Mapping[str, Role] | None = None,
     until: str | None = None,
 ) -> dict[str, Any] | None:
     """The census row for one thread, or ``None`` when it has no messages (or no ``until``)."""
@@ -103,7 +116,12 @@ def census_thread(
     head_id = str(head.get("msg_id") or "")
     head_author = str(head.get("author") or "")
     head_body = str(head.get("content") or "")
-    scan = scan_tier_c_segment(msgs, is_human=is_human, recorders=recorders)
+    scan = scan_tier_c_segment(
+        msgs,
+        is_human=is_human,
+        recorders=recorders,
+        role_of=(lambda author: roster_role(roster, author)) if roster is not None else None,
+    )
     # Guard-(i) relays since the human last spoke (the boundary the scan stopped at).
     relays: list[str] = []
     for msg in reversed(msgs):
@@ -139,6 +157,10 @@ def census_thread(
         "unmatched": list(scan.unmatched),
         "malformed": list(scan.malformed),
         "ignored_non_recorder": list(scan.ignored_non_recorder),
+        "recorder_holds_loop_role": [
+            {"msg_id": m, "author": a, "role": r} for m, a, r in scan.recorder_holds_loop_role
+        ],
+        "roster_unknown": list(scan.roster_unknown),
         "guard_i_relays_since_human": relays,
         "head_closed": [
             {"condition": c.condition.value, "evidence": list(c.evidence_ids)} for c in closed
@@ -170,6 +192,7 @@ async def run_census(
     is_human: Callable[[str], bool],
     recorders: Collection[str],
     naysayer: str,
+    roster: Mapping[str, Role] | None,
     until: str | None,
     emit_all: bool,
     limit: int,
@@ -207,6 +230,7 @@ async def run_census(
                 is_human=is_human,
                 recorders=recorders,
                 naysayer=naysayer,
+                roster=roster,
                 until=until,
             )
             if row is None:
@@ -232,14 +256,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--thread", action="append", default=[], help="limit to these threads")
     parser.add_argument("--until", default=None, help="truncate each thread after this msg id")
     parser.add_argument("--naysayer", required=True, help="the roster naysayer persona")
-    parser.add_argument("--human-identity", default="human")
-    parser.add_argument("--recorder", action="append", default=[], help="tier_c_recorders entry")
+    parser.add_argument("--human-identity", default=None, help="default: config, else 'human'")
+    parser.add_argument("--recorder", action="append", default=None, help="tier_c_recorders entry")
+    parser.add_argument(
+        "--roster", action="append", default=None, help="conductor roster entry Name=role"
+    )
+    parser.add_argument("--config", type=Path, default=None, help="mindwire.toml to read")
     parser.add_argument("--all", action="store_true", help="emit every polled thread")
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--url", default=None, help="magickit MCP URL (default: in-code/env)")
     args = parser.parse_args(argv)
 
-    human = args.human_identity
+    roster: dict[str, Role] | None = None
+    human = "human"
+    recorders: tuple[str, ...] = ()
+    if args.config is not None:
+        from spirrow_mindwire.config import load_settings
+
+        cond = load_settings(args.config).conductor
+        roster = dict(cond.roster) if cond.roster else None
+        human = cond.human_identity
+        recorders = tuple(cond.tier_c_recorders)
+    if args.roster is not None:
+        try:
+            roster = {
+                name.strip(): Role(role.strip())
+                for name, _, role in (entry.partition("=") for entry in args.roster)
+            }
+        except ValueError as exc:
+            print(f"guard_i_latch_census: bad --roster: {exc}", file=sys.stderr)
+            return 2
+    if args.human_identity is not None:
+        human = args.human_identity
+    if args.recorder is not None:
+        recorders = tuple(args.recorder)
 
     def is_human(author: str) -> bool:
         return is_human_identity(author, human)
@@ -251,8 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 projects=args.project,
                 threads=args.thread,
                 is_human=is_human,
-                recorders=tuple(args.recorder),
+                recorders=recorders,
                 naysayer=args.naysayer,
+                roster=roster,
                 until=args.until,
                 emit_all=args.all,
                 limit=args.limit,
