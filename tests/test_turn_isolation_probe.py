@@ -65,12 +65,17 @@ class LocalOps:
         self.fail_dirs = {Path(os.path.normcase(str(d))) for d in (fail_dirs or set())}
         self.rev_parse_override = rev_parse
         self.written: list[Path] = []
+        self.rev_parse_clones: list[Path] = []
 
     def rev_parse(self, clone: Path) -> RunResult:
         if self.rev_parse_override is not None:
             return self.rev_parse_override
+        self.rev_parse_clones.append(clone)
+        if not clone.is_dir():  # the real launcher cannot start a child there either
+            return RunResult(128, "", f"fatal: cannot change to '{clone}': No such directory")
         p = subprocess.run(
-            ["git", "-C", str(clone), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+            ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+            cwd=clone,
             capture_output=True,
             text=True,
         )
@@ -276,7 +281,7 @@ def test_launcher_ops_passes_user_and_cwd(tmp_path: Path) -> None:
     clone = tmp_path / "clone"
     argv = json.loads(ops.rev_parse(clone).stdout)
     assert argv[:5] == ["--user", r"HOST\custom-turn", "--cwd", str(clone), "--"]
-    assert argv[5:7] == ["git", "-C"]
+    assert argv[5:] == ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"]
     gitdir = tmp_path / "gitdir"
     argv = json.loads(ops.probe_write(gitdir, PID).stdout)
     assert argv[:5] == ["--user", r"HOST\custom-turn", "--cwd", str(gitdir), "--"]
@@ -299,3 +304,42 @@ def test_check_hands_its_user_to_the_launcher(
     rc = run("custom-turn", [tmp_path], api_factory=lambda: api)
     assert rc == SECRETS_STOP_EXIT_CODE  # the fake git refused; the stop is a clone fault
     assert seen and seen[0][3:7] == ["--user", "custom-turn", "--cwd", str(tmp_path)]
+
+
+# --- PR #485 review round 7: a relative clone is named once, as an absolute path ----------------
+
+
+def test_relative_clone_is_resolved_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--clone my_repo`` must not become ``my_repo/my_repo`` (cwd + ``-C`` both relative)."""
+    repo = _repo(tmp_path / "my_repo")
+    monkeypatch.chdir(tmp_path)
+    ops = LocalOps()
+    dirs = probe_clone(Path("my_repo"), ops, pid=PID)
+    assert len(ops.rev_parse_clones) == 1 and ops.rev_parse_clones[0].is_absolute()
+    assert _same(ops.rev_parse_clones[0], repo)
+    assert len(dirs) == 1 and _same(dirs[0], repo / ".git")
+    _status_clean(repo)
+
+
+def test_relative_clone_reaches_the_launcher_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import sys
+
+    script = tmp_path / "argv_launcher.py"
+    script.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    seen: list[list[str]] = []
+
+    class Recording(LauncherOps):
+        def rev_parse(self, clone: Path) -> RunResult:
+            res = super().rev_parse(clone)
+            seen.append(json.loads(res.stdout))
+            return RunResult(128, "", "fatal: stop here")
+
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(TurnIsolationStop):
+        probe_clone(Path("my_repo"), Recording(launcher=[sys.executable, str(script)]), pid=PID)
+    argv = seen[0]
+    assert argv[:3] == ["--cwd", str(tmp_path / "my_repo"), "--"]
+    assert "-C" not in argv

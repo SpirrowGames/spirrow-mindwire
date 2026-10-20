@@ -2,10 +2,11 @@
 
 Runs once per tick, **as the turn user**, for every clone:
 
-1. ``git -C <clone> rev-parse --absolute-git-dir --git-common-dir``. A failure stops with
+1. ``git rev-parse --absolute-git-dir --git-common-dir`` with the clone as the working
+   directory (the clone is made absolute first; see :func:`probe_clone`). A failure stops with
    ``turn user cannot use clone <path>: safe.directory`` when git refused the repo's ownership
    (CVE-2022-24765), otherwise ``...: git: <first stderr line>``. ``--git-common-dir`` may be
-   relative; it is resolved against the clone.
+   relative; it is resolved against the (absolute) clone.
 2. For each distinct directory from step 1 (one for a plain clone; the worktree's git dir and
    the shared common dir for a worktree; ``.git/modules/<name>`` for a submodule): delete any
    leftover ``mindwire-probe-*``, then write and delete ``mindwire-probe-<pid>``. A failure
@@ -44,7 +45,9 @@ class RunResult:
 
 class TurnUserOps(Protocol):
     def rev_parse(self, clone: Path) -> RunResult:
-        """``git -C <clone> rev-parse --absolute-git-dir --git-common-dir`` as the turn user."""
+        """``git rev-parse --absolute-git-dir --git-common-dir`` in ``clone``, as the turn user.
+
+        ``clone`` is always absolute (:func:`probe_clone` resolves it first)."""
 
     def probe_write(self, directory: Path, pid: int) -> RunResult:
         """Remove leftover probes in ``directory``, then write and delete one, as the turn user."""
@@ -53,6 +56,10 @@ class TurnUserOps(Protocol):
 def probe_clone(clone: Path, ops: TurnUserOps, *, pid: int | None = None) -> list[Path]:
     """Probe one clone; return the directories it wrote to. Raises :class:`TurnIsolationStop`."""
     pid = os.getpid() if pid is None else pid
+    # One absolute path from here on: the launcher's ``--cwd`` and the resolution of a relative
+    # ``--git-common-dir`` must not depend on the directory the check was started from
+    # (PR #485 review round 7).
+    clone = Path(os.path.abspath(clone))
     head = f"turn user cannot use clone {clone}"
     res = ops.rev_parse(clone)
     if res.returncode != 0:
@@ -152,10 +159,10 @@ class LauncherOps:
         return RunResult(proc.returncode, proc.stdout, proc.stderr)
 
     def rev_parse(self, clone: Path) -> RunResult:
-        return self._run(
-            clone,
-            ["git", "-C", str(clone), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
-        )
+        # The launcher's ``--cwd`` is the only place the clone is named. Passing it to git as
+        # ``-C`` as well would apply a relative path twice (``<clone>/<clone>``; PR #485 review
+        # round 7).
+        return self._run(clone, ["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"])
 
     def probe_write(self, directory: Path, pid: int) -> RunResult:
         encoded = base64.b64encode(probe_write_script(directory, pid).encode("utf-16-le"))
