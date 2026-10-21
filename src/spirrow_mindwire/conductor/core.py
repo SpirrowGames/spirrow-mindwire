@@ -356,8 +356,8 @@ class StopReason(StrEnum):
     # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
     # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
     # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
-    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
-    # nowhere if re-run).
+    # TERMINAL_STOP_REASONS (this head goes nowhere if re-run; that set is the only list of such
+    # reasons).
     STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
