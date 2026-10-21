@@ -417,6 +417,16 @@ class ConductorConfig(_StrictModel):
     Author trust is the **environment** trust model (D-3): the loop-level gate is best-effort
     noise-reduction; the authoritative guard that changes never reach ``main`` is the human's manual
     merge (the same stance as the implementer allow-list)."""
+    tier_c_recorders: list[str] = Field(default_factory=list)
+    """Authors whose ``TIER-C-RESOLVED: <msg-id> decided-by=<human_identity> on=YYYY-MM-DD`` lines
+    discharge the named Tier-C declaration from guard (i)'s G1 latch
+    (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a) / msg-7204).
+
+    This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["operator",
+    "Fermi"]``). Empty (the default) = only a human post unlatches G1, the previous behaviour. A
+    recorder holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that
+    thread (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING
+    for the overlap. Same author-string trust as ``human_identity``."""
     max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 

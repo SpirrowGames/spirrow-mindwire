@@ -1008,6 +1008,27 @@ never automated (D-5: the human's manual merge is the authoritative guard).
     observation P-2 records at spawn. Un-stamped, the carve-out is not taken and the turn falls
     through to the human terminal. Same for the Obj2 forced consult: only an attested naysayer post
     discharges it, so an un-attested segment buys exactly one extra forced consult.
+  - **G1 latch and recording an out-of-chat decision** (T-guard-i-latches-on-discharged-tierc-line).
+    A `TIER-C: <label>` line anywhere since the human's last post keeps the proceed closed (G1),
+    and before this change only a human post lifted it. A decision the human gives outside the
+    chatroom (relayed by the operator or Fermi) now lifts it only if the recorder writes, **in the
+    same post that records the decision**, one line per declaration it discharges:
+
+    ```
+    TIER-C-RESOLVED: msg-754 decided-by=<[conductor].human_identity> on=2026-10-21
+    ```
+
+    The line must match the whole grammar (one msg id per line, `decided-by` = the human identity,
+    a real date), and its author must be listed in `[conductor].tier_c_recorders` (default empty =
+    no discharge path). **A recorder counts only in a thread where it holds none of proposer /
+    implementer / naysayer in that thread's `[conductor].roster`**; otherwise its line is ignored
+    and reported as `recorder-holds-loop-role` (the daemon still starts, and logs a WARNING listing
+    the overlap). It discharges only the
+    declaration it names, and only if it was posted after that declaration; a later `TIER-C:` line
+    closes G1 again. When guard (i) does redirect, its relay now names every closed condition with
+    its msg ids (G1 lists every open declaration, plus any `unmatched` / malformed / non-recorder
+    resolution lines), and the conductor log carries a `guard_i_redirect ... closed_by=...` INFO line.
+    `scripts/guard_i_latch_census.py` lists the threads that are latched now.
 
 Author trust is the environment trust model (D-3) — the chatroom accepts any author string **and any
 body**, so the carve-outs, including the stamp check, are best-effort loop-level gating and
