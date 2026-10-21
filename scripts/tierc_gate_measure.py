@@ -16,7 +16,7 @@ as an author-written ``NEXT: human``. Each falls into exactly one bucket:
 * ``iii_admitted`` — admitted on a valid label (``unsure:goal?`` included; counted separately as
   ``iii_unsure``).
 * ``iv_pr_gate_relay`` — authored by ``pr-gate-relay``. Outside the hook and the gate (msg-4361),
-  counted on its own; it is not part of the role total.
+  counted on its own; it is not part of the role total. Split by kind in ``iv_by_kind`` (below).
 * ``other_author`` — anyone else (operator, the human, off-roster authors). Never gated.
 
 **U4c additions** (T-tier-c-admission-gate Bohr msg-6488 / 6490, endorsed by Einstein):
@@ -36,6 +36,23 @@ as an author-written ``NEXT: human``. Each falls into exactly one bucket:
   read (``unmeasured: <reason>``, never a default). The mode is the one in the config file at
   measurement time: the daemon reads a single ``mindwire.toml`` for every project, and no history
   of the setting exists, so a window that spans a mode switch is attributed to the current mode.
+
+**2e-1a-iv-split** (T-decider-conductor-hook Bohr msg-7265 / msg-7267, approved by Einstein
+msg-7266). ``iv_pr_gate_relay`` is unchanged; ``iv_by_kind`` splits the same refs into exactly
+one of three lists (counts in ``iv_by_kind_counts``), checked in this order:
+
+* ``gate_ci_hold`` — the body carries a ci-hold marker (:func:`~spirrow_mindwire.conductor.
+  gate_records.ci_hold_head`): the L1 CI gate's pending hold, not a review. Checked first because
+  it shares the verdict relay's heading.
+* ``gate_verdict`` — the first line is the verdict relay heading (:func:`~spirrow_mindwire.
+  conductor.gate_records.relay_heading_pr_ref`; covers legacy verdicts without a footer and
+  bodies with two footers) or the body carries exactly one verdict footer
+  (:func:`~spirrow_mindwire.github.reviews.parse_verdict_footer`).
+* ``relay_notice`` — everything else: conductor stop / stand-down notices, R3/R5 admission and
+  R4 ci-route posts. These are not gate verdicts.
+
+All three readers are the production ones, imported, so the measurement cannot drift from what
+the pipeline counts as a verdict. Bodies are read for the check and never written out.
 
 ``retry_lookup`` is ``never_retry``: no past turn carries a ``RETRY:`` token issued by a live
 gate, so "no unresolved bounce exists" is the true answer for history.
@@ -60,10 +77,15 @@ from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.conductor.core import roster_role
-from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR
+from spirrow_mindwire.conductor.gate_records import (
+    RELAY_AUTHOR,
+    ci_hold_head,
+    relay_heading_pr_ref,
+)
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.config import MindwireSettings
 from spirrow_mindwire.decider.hook import TIERC_ENTRY_ROLES, never_retry
+from spirrow_mindwire.github.reviews import parse_verdict_footer
 from spirrow_mindwire.tier_c_admission_gate import (
     ADMIT_LABELS,
     UNSURE_LABEL,
@@ -110,6 +132,19 @@ NOT_FOUND = "not_found"
 BOUNCE_MODES: tuple[str, ...] = ("enforced", "shadow", "mode_unmeasured")
 
 
+#: ``iv_by_kind`` sub-buckets, in the order :func:`iv_kind` checks them.
+IV_KINDS: tuple[str, ...] = ("gate_ci_hold", "gate_verdict", "relay_notice")
+
+
+def iv_kind(body: str) -> str:
+    """Which ``iv_by_kind`` list a ``pr-gate-relay`` body belongs in (msg-7267 order)."""
+    if ci_hold_head(body) is not None:
+        return "gate_ci_hold"
+    if relay_heading_pr_ref(body) is not None or parse_verdict_footer(body) is not None:
+        return "gate_verdict"
+    return "relay_notice"
+
+
 def _bounce_mode(mode: str | None) -> str:
     if mode == "enforce":
         return "enforced"
@@ -137,6 +172,7 @@ def classify(
     unsure: list[str] = []
     by_label: dict[str, list[str]] = {label: [] for label in ADMITTED_LABELS}
     by_mode: dict[str, list[str]] = {m: [] for m in BOUNCE_MODES}
+    by_kind: dict[str, list[str]] = {k: [] for k in IV_KINDS}
     projects_seen: set[str] = set()
     bounce_reasons: Counter[str] = Counter()
     by_author: Counter[str] = Counter()
@@ -152,6 +188,7 @@ def classify(
             ref = f"{project}/{thread_id}#{m.msg_id}"
             if m.author == RELAY_AUTHOR:
                 ids["iv_pr_gate_relay"].append(ref)
+                by_kind[iv_kind(m.content)].append(ref)
                 continue
             if roster_role(roster, m.author) not in TIERC_ENTRY_ROLES:
                 ids["other_author"].append(ref)
@@ -200,6 +237,8 @@ def classify(
         },
         "i_bounce_by_mode": {m: len(v) for m, v in by_mode.items()},
         "i_bounce_by_mode_msg_ids": by_mode,
+        "iv_by_kind": by_kind,
+        "iv_by_kind_counts": {k: len(v) for k, v in by_kind.items()},
         "must_admit": must,
         "must_admit_dropped": [r for r, b in must.items() if b in ("i_bounce", NOT_FOUND)],
     }
