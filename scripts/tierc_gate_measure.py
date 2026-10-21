@@ -132,17 +132,22 @@ NOT_FOUND = "not_found"
 BOUNCE_MODES: tuple[str, ...] = ("enforced", "shadow", "mode_unmeasured")
 
 
+#: ``iv_by_kind`` sub-bucket names. :func:`iv_kind` returns only these constants, so a
+#: rename happens in one place and ``IV_KINDS`` cannot drift from what it returns.
+IV_GATE_CI_HOLD = "gate_ci_hold"
+IV_GATE_VERDICT = "gate_verdict"
+IV_RELAY_NOTICE = "relay_notice"
 #: ``iv_by_kind`` sub-buckets, in the order :func:`iv_kind` checks them.
-IV_KINDS: tuple[str, ...] = ("gate_ci_hold", "gate_verdict", "relay_notice")
+IV_KINDS: tuple[str, ...] = (IV_GATE_CI_HOLD, IV_GATE_VERDICT, IV_RELAY_NOTICE)
 
 
 def iv_kind(body: str) -> str:
     """Which ``iv_by_kind`` list a ``pr-gate-relay`` body belongs in (msg-7267 order)."""
     if ci_hold_head(body) is not None:
-        return "gate_ci_hold"
+        return IV_GATE_CI_HOLD
     if relay_heading_pr_ref(body) is not None or parse_verdict_footer(body) is not None:
-        return "gate_verdict"
-    return "relay_notice"
+        return IV_GATE_VERDICT
+    return IV_RELAY_NOTICE
 
 
 def _bounce_mode(mode: str | None) -> str:
