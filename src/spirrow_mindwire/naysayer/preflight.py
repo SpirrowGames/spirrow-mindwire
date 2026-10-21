@@ -295,7 +295,9 @@ def _judge(
        a generic truncation message. The caller still sees ``len(rows) >=
        limit`` and does not re-read (:func:`attest_turn`). A trace whose only
        rows are shadow rows is a third wording: the answering route left no
-       row, so it cannot pass either.
+       row, so it cannot pass either. If that read came back full, the wording
+       says the answering row may have been cut off (PR-gate on #489) — the
+       trace was found, so it is never reported as missing.
     4. A **full read** (``len(rows) >= limit``) may have been cut off and may be
        hiding a mismatching sibling, so it cannot pass.
     5. Otherwise every selected row said ``expected``. One matching row never
@@ -325,6 +327,18 @@ def _judge(
             raise PreflightError(
                 f"{what}: no accounting row carries trace {trace_id}; "
                 f"a 2xx response is not evidence of routing"
+            )
+        if shadow and len(rows) >= limit:
+            # PR-gate on #489: in a full read, "only shadow rows" is not an
+            # observation — the answering row may sit past the limit. Say what
+            # was seen (the trace DID arrive, as N shadow rows) and that the read
+            # may be cut off; never imply the trace itself is missing.
+            raise PreflightError(
+                f"{what}: trace {trace_id} was found only as {len(shadow)} shadow "
+                f"row(s) (endpoint={SHADOW_ENDPOINT!r}) and no answering-route row "
+                f"was among the {len(rows)} row(s) returned; the read came back full "
+                f"at limit {limit}, so the answering row may have been cut off and "
+                f"the route is unproven"
             )
         if shadow:
             # Stated as observed: every row carrying our trace is a shadow row.

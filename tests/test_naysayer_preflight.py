@@ -897,6 +897,31 @@ async def test_the_full_read_check_counts_shadow_rows() -> None:
     assert len(ledger.asked) == 1
 
 
+@pytest.mark.anyio
+async def test_a_full_read_with_only_our_shadow_row_says_found_and_maybe_cut_off() -> None:
+    """PR-gate on #489: shadow row present, answering row past the limit.
+
+    The trace did arrive (as a shadow row), so the message must not say it is
+    missing, and must not claim the shadow rows are the *only* rows for the
+    trace — the read is full, so the answering row may have been cut off. A
+    full read is not re-read.
+    """
+    full = [_row(30_000 + i, trace="other-trace") for i in range(TRACE_READ_LIMIT - 1)] + [
+        _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")
+    ]
+    ledger = _Ledger([full])
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest_turn(ledger, _Sleeps())
+    message = str(excinfo.value)
+    assert f"trace {_TRACE} was found only as 1 shadow row(s)" in message
+    assert "came back full" in message
+    assert "may have been cut off" in message
+    assert "not found" not in message
+    assert "the only accounting row(s)" not in message
+    assert "did not apply the filter" not in message
+    assert len(ledger.asked) == 1
+
+
 def test_the_custom_headers_value_is_the_measured_name_colon_value_form() -> None:
     """D-0a (2026-10-02): CLI 2.1.133 sends ``Name: Value``; it rejects the JSON form."""
     assert TRACE_HEADER == "X-Mindwire-Trace"
