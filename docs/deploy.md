@@ -64,6 +64,39 @@ Outbound requests from the daemon's own scripts pass `-Proxy` explicitly. That i
 has no outbound firewall permission of its own, so a request that skipped the proxy is **blocked**
 rather than quietly bypassing the chokepoint.
 
+### CPU-heavy manual jobs on the loop host
+
+Role turns (the implementer's local `bash .mindwire-gate` above all) share {{HOST_LOOP}}'s CPU with
+whatever an operator runs there by hand. A CPU-bound manual job that takes every core starves the
+gate, and the turn runs out of wall clock. Any manual job that uses a lot of CPU on this host must
+follow these three rules:
+
+1. **Cap the workers.** The job's worker processes and threads, summed over every process it
+   starts, must not exceed the host's logical core count minus 4 (on a 16-core host, 12 at most).
+2. **Start it at lowered priority.** On Windows, launch it with `cmd.exe`'s `start` command:
+   `start "" /BELOWNORMAL <command>` from a `cmd.exe` prompt, or
+   `cmd /c start "" /BELOWNORMAL <command>` from PowerShell. (In PowerShell a bare `start` is the
+   `Start-Process` alias, which rejects `/BELOWNORMAL`. The empty `""` is the window title, so a
+   quoted command is not mistaken for it.) Launching at `BelowNormal` from the start matters:
+   worker processes the job spawns inherit that class, whereas lowering the priority after launch
+   leaves workers already started at `Normal`. After launch, check in PowerShell that each process
+   really is `BelowNormal`, e.g. `Get-Process -Id <pid> | Select-Object Id, PriorityClass`.
+3. **Record when it ran and how big it was.** Write the start time, the end time and the worker
+   count to the job's own log or to the operator lane's notes. When a turn later times out, this
+   record is how anyone can tell whether a job was running alongside it.
+
+**Why.** When a heavy job that broke these rules overlapped an implementer turn, the local gate took
+3–4× its usual time, and the turn hit the 1800 s timeout. With the rules followed, the gate stayed
+within about 1.3× its usual time. Only one measurement has confirmed this, so treat it as a working
+rule, not a guarantee. The details are in thread `T-local-gate-takes-half-the-turn`.
+
+**When to revisit.**
+- If a turn's local gate takes longer than 240 s even though the rules were followed, consider an
+  exclusive lease that pauses heavy manual jobs while a role turn runs.
+- If an implementer turn times out and the operator still cannot tell, after 30 minutes with the
+  transcript and the job logs, whether another job was running at the same time, reconsider
+  recording host load in the turn record (D2 in that thread).
+
 ## Environment
 
 Set by `deploy/run-conductor.ps1`; secrets must be supplied externally.
