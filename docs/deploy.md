@@ -73,9 +73,14 @@ follow these three rules:
 
 1. **Cap the workers.** The job's worker processes and threads, summed over every process it
    starts, must not exceed the host's logical core count minus 4 (on a 16-core host, 12 at most).
-2. **Start it at lowered priority.** On Windows, launch it with `start /BELOWNORMAL`. After launch,
-   check that each process really is `BelowNormal`, e.g.
-   `Get-Process -Id <pid> | Select-Object Id, PriorityClass`.
+2. **Start it at lowered priority.** On Windows, launch it with `cmd.exe`'s `start` command:
+   `start "" /BELOWNORMAL <command>` from a `cmd.exe` prompt, or
+   `cmd /c start "" /BELOWNORMAL <command>` from PowerShell. (In PowerShell a bare `start` is the
+   `Start-Process` alias, which rejects `/BELOWNORMAL`. The empty `""` is the window title, so a
+   quoted command is not mistaken for it.) Launching at `BelowNormal` from the start matters:
+   worker processes the job spawns inherit that class, whereas lowering the priority after launch
+   leaves workers already started at `Normal`. After launch, check in PowerShell that each process
+   really is `BelowNormal`, e.g. `Get-Process -Id <pid> | Select-Object Id, PriorityClass`.
 3. **Record when it ran and how big it was.** Write the start time, the end time and the worker
    count to the job's own log or to the operator lane's notes. When a turn later times out, this
    record is how anyone can tell whether a job was running alongside it.
