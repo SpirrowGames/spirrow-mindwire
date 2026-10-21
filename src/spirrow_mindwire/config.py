@@ -680,10 +680,24 @@ class TurnGitConfig(_StrictModel):
     branch_override: dict[str, str] = Field(default_factory=dict)
 
 
+class TurnIsolationConfig(_StrictModel):
+    """``[turn.isolation]`` — run the turn as a separate Windows user (ADR-2026-10-09-23 unit 2a,
+    S7).
+
+    ``user`` unset (the default) means no isolation: every turn runs exactly as it did before
+    this table existed (D1). Set it to a local account (``mindwire-turn``) or a domain-qualified
+    name. The account's password is never configured here: the launcher reads it from the owner's
+    Credential Manager (``mindwire/turn-user``). See :mod:`spirrow_mindwire.turn_isolation`.
+    """
+
+    user: str | None = Field(default=None, min_length=1)
+
+
 class TurnConfig(_StrictModel):
-    """``[turn]`` — per-turn hooks. Only ``[turn.git]`` exists."""
+    """``[turn]`` — per-turn hooks: ``[turn.git]`` and ``[turn.isolation]``."""
 
     git: TurnGitConfig = Field(default_factory=TurnGitConfig)
+    isolation: TurnIsolationConfig = Field(default_factory=TurnIsolationConfig)
 
 
 class ModelPolicyConfig(_StrictModel):
@@ -915,6 +929,7 @@ __all__ = [
     "TierCGateConfig",
     "TurnConfig",
     "TurnGitConfig",
+    "TurnIsolationConfig",
     "WatcherConfig",
     "load_settings",
     "resolve_tier_c_decisions_log_path",
