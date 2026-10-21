@@ -64,7 +64,7 @@ Outbound requests from the daemon's own scripts pass `-Proxy` explicitly. That i
 has no outbound firewall permission of its own, so a request that skipped the proxy is **blocked**
 rather than quietly bypassing the chokepoint.
 
-### loop host で CPU を大きく使う手動ジョブ
+### CPU-heavy manual jobs on the loop host
 
 Role turns (the implementer's local `bash .mindwire-gate` above all) share {{HOST_LOOP}}'s CPU with
 whatever an operator runs there by hand. A CPU-bound manual job that takes every core starves the
