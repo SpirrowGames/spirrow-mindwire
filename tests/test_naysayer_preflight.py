@@ -29,6 +29,7 @@ test at the bottom runs the real thing.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,6 +44,7 @@ from spirrow_mindwire.lexora.client import (
 )
 from spirrow_mindwire.naysayer.preflight import (
     PREFLIGHT_ATTEMPTS,
+    SHADOW_ENDPOINT,
     TRACE_READ_LIMIT,
     TURN_ROW_REREAD_INTERVAL_SECONDS,
     TURN_ROW_REREADS,
@@ -768,6 +770,156 @@ async def test_other_turns_rows_neither_pass_nor_fail_this_turn() -> None:
 
     record = await _attest_turn(_Ledger([[foreign_bad, _turn_row(3)]]), _Sleeps())
     assert record.probe == "cost-row#3"
+
+
+# --------------------------------------------------------------------------- #
+# Shadow rows (T-per-turn-backend-attestation msg-7269): selected, not judged
+# --------------------------------------------------------------------------- #
+
+# Lexora's ``_shadow_run`` writes a row with ``endpoint="shadow"`` under the SAME
+# trace id, its ``backend`` overwritten with the shadow's own backend name
+# (msg-7184, quoting spirrow-lexora ``backends/fallback.py``). The codex name
+# here is illustrative: what matters is that it is not ``expected``.
+_SHADOW_BACKEND = "codex"
+
+
+def _shadow_row(
+    row_id: int, *, backend: str = _SHADOW_BACKEND, endpoint: str = "shadow"
+) -> dict[str, Any]:
+    return _row(row_id, backend=backend, endpoint=endpoint)
+
+
+def test_the_shadow_endpoint_is_lexoras_literal() -> None:
+    assert SHADOW_ENDPOINT == "shadow"
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_beside_the_answering_row_passes_and_is_not_in_the_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """★ msg-7269 (b)7-1: shadow on codex + answer on expected → pass; probe = answer only."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033)]])
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.preflight"):
+        record = await _attest(gateway)
+    assert record.backend == "gemini"
+    assert record.probe == "cost-row#6032"
+    excluded = [r for r in caplog.records if "shadow rows excluded" in r.getMessage()]
+    assert len(excluded) == 1
+    assert excluded[0].levelno == logging.INFO
+    assert "#6033(codex)" in excluded[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_excluding_shadow_rows_still_catches_a_fallback_that_answered() -> None:
+    """★ msg-7269 (b)7-2: the answering row on another backend is still a mismatch verdict."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032, backend="codex"), _shadow_row(6033)]])
+    with pytest.raises(PreflightError, match="did not resolve") as excinfo:
+        await _attest(gateway)
+    assert type(excinfo.value).__name__ == "_BackendMismatchError"
+    assert len(gateway.calls) == 1  # a verdict — not retried
+
+
+@pytest.mark.anyio
+async def test_shadow_rows_alone_fail_closed_with_their_own_wording() -> None:
+    """★ msg-7269 (b)7-3: no answering row → fail-closed; not the filter diagnostic."""
+    gateway = _FakeGateway(append_on_call=[[_shadow_row(6033)]] * PREFLIGHT_ATTEMPTS)
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest(gateway)
+    message = str(excinfo.value)
+    assert "shadow row(s)" in message
+    assert "no row records the route that answered" in message
+    assert "did not apply the filter" not in message
+    assert "no accounting row carries trace" not in message
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_that_names_the_expected_backend_is_still_excluded() -> None:
+    """★ msg-7269 (b)6: if a shadow backend name ever equals ``expected`` (D-8), nothing changes.
+
+    It is still left out of the probe id, and on its own it still cannot pass.
+    """
+    both = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033, backend=_EXPECTED)]])
+    assert (await _attest(both)).probe == "cost-row#6032"
+
+    alone = _FakeGateway(
+        append_on_call=[[_shadow_row(6033, backend=_EXPECTED)]] * PREFLIGHT_ATTEMPTS
+    )
+    with pytest.raises(PreflightError, match="shadow row"):
+        await _attest(alone)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("endpoint", ["Shadow", "SHADOW", "shadow-x", "shadow ", "/v1/shadow"])
+async def test_only_the_exact_shadow_endpoint_is_excluded(endpoint: str) -> None:
+    """★ msg-7269 (b)7-4: no case folding, no prefix/suffix match — such a row is judged."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033, endpoint=endpoint)]])
+    with pytest.raises(PreflightError, match="did not resolve"):
+        await _attest(gateway)
+
+    matching = _FakeGateway(
+        append_on_call=[[_row(6032), _shadow_row(6033, backend=_EXPECTED, endpoint=endpoint)]]
+    )
+    assert (await _attest(matching)).probe == "cost-row#6032+6033"
+
+
+@pytest.mark.anyio
+async def test_a_turn_with_a_shadow_row_is_attested_from_its_answering_rows() -> None:
+    """★ msg-7269 (b)7-5: the same exclusion on the turn path (``attest_turn``)."""
+    ledger = _Ledger(
+        [[_turn_row(14814), _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")]]
+    )
+    record = await _attest_turn(ledger, _Sleeps())
+    assert record.scope == "turn"
+    assert record.probe == "cost-row#14814"
+    assert len(ledger.asked) == 1
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_flushed_before_the_answer_is_re_read_at_turn_scope() -> None:
+    """Shadow-only is "could not determine", so a short read re-reads (Einstein's endorsement 3)."""
+    shadow = _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")
+    ledger, sleeps = _Ledger([[shadow], [_turn_row(14814), shadow]]), _Sleeps()
+    record = await _attest_turn(ledger, sleeps)
+    assert record.probe == "cost-row#14814"
+    assert sleeps.calls == [TURN_ROW_REREAD_INTERVAL_SECONDS]
+
+
+@pytest.mark.anyio
+async def test_the_full_read_check_counts_shadow_rows() -> None:
+    """★ msg-7269 (b)3: ``len(rows) >= limit`` is judged on all rows, shadow included."""
+    full = [_turn_row(10_000)] + [
+        _row(20_000 + i, trace=_TRACE, backend="codex", endpoint="shadow")
+        for i in range(TRACE_READ_LIMIT - 1)
+    ]
+    ledger = _Ledger([full])
+    with pytest.raises(PreflightError, match="came back full"):
+        await _attest_turn(ledger, _Sleeps())
+    assert len(ledger.asked) == 1
+
+
+@pytest.mark.anyio
+async def test_a_full_read_with_only_our_shadow_row_says_found_and_maybe_cut_off() -> None:
+    """PR-gate on #489: shadow row present, answering row past the limit.
+
+    The trace did arrive (as a shadow row), so the message must not say it is
+    missing, and must not claim the shadow rows are the *only* rows for the
+    trace — the read is full, so the answering row may have been cut off. A
+    full read is not re-read.
+    """
+    full = [_row(30_000 + i, trace="other-trace") for i in range(TRACE_READ_LIMIT - 1)] + [
+        _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")
+    ]
+    ledger = _Ledger([full])
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest_turn(ledger, _Sleeps())
+    message = str(excinfo.value)
+    assert f"trace {_TRACE} was found only as 1 shadow row(s)" in message
+    assert "came back full" in message
+    assert "may have been cut off" in message
+    assert "not found" not in message
+    assert "the only accounting row(s)" not in message
+    assert "did not apply the filter" not in message
+    assert len(ledger.asked) == 1
 
 
 def test_the_custom_headers_value_is_the_measured_name_colon_value_form() -> None:

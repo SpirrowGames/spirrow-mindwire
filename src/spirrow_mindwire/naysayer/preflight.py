@@ -50,13 +50,26 @@ probe would surface as a mismatching row and fail the spawn.
 of concurrent traffic; judgement decides them. **Selection reads ``trace_id``**
 — a fresh ULID minted for exactly one request (the probe) or one turn, sent as
 a header and echoed by the gateway into the row. It is an exact join, not a
-heuristic: no id window, no tier filter, no endpoint filter, so a concurrent
-turn's rows can neither stand in for ours (the false pass) nor contaminate our
-verdict (the false refusal) — Einstein msg-5391. **Judgement reads
-``backend``**, which names the route the gateway chose and is the column the
-model cannot write. Selecting on an echo of our own request is sound precisely
-because it decides nothing: someone replaying our trace id can only *add* rows
-to the judged set, and every one of them must still say ``expected``.
+heuristic: no id window, no tier filter, so a concurrent turn's rows can neither
+stand in for ours (the false pass) nor contaminate our verdict (the false
+refusal) — Einstein msg-5391. **Judgement reads ``backend``**, which names the
+route the gateway chose and is the column the model cannot write. Selecting on
+an echo of our own request is sound precisely because it decides nothing:
+someone replaying our trace id can only *add* rows to the judged set, and every
+non-shadow row among them must still say ``expected``.
+
+**Shadow rows are selected but not judged** (T-per-turn-backend-attestation
+msg-7269). Selection is the exact ``trace_id`` match; judgement then sets aside
+the rows Lexora writes with ``endpoint == "shadow"`` (:data:`SHADOW_ENDPOINT`).
+Such a row records a *separate* comparison request Lexora sent alongside ours
+(spirrow-lexora ``_shadow_run``, same ``trace_id``, ``backend`` overwritten with
+the shadow's own backend name) — not the path our response came back on.
+Judging it would fail every turn closed while shadow comparison is enabled, the
+same false refusal msg-5391 removed. Detection is not weakened: a fallback that
+*answered* the request leaves its row on the real endpoint (``/v1/messages``
+etc.) with the answering backend's name, and that row is still judged. The
+match is exact — no case folding, no prefix match — and a trace whose only rows
+are shadow rows does not pass.
 
 Before 2026-10 selection read ``tier`` above an id baseline (and before
 2026-09-01, ``model``). Both were addresses, not identities: ``tier`` names what
@@ -79,6 +92,7 @@ The consequence of that deletion is pinned by a test, so re-adding one reds.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -138,6 +152,14 @@ TRACE_ROW_COLUMN = "trace_id"
 # it refused the request outright (``Invalid header name: '{"X-Mindwire-Trace"'``).
 # Exactly one form is produced; nothing here tries both.
 CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
+
+# The ``endpoint`` value spirrow-lexora writes on a shadow-comparison row
+# (``backends/fallback.py`` ``_shadow_run``: ``ledger.record(endpoint="shadow",
+# ...)``, quoted in T-per-turn-backend-attestation msg-7184). Matched EXACTLY —
+# see the module docstring and :func:`_judge`. Contract with spirrow-lexora.
+SHADOW_ENDPOINT = "shadow"
+
+logger = logging.getLogger(__name__)
 
 # A turn's rows can land a moment after its stream closes. Re-read on an empty
 # (or unreadable) result only — a mismatch is a verdict and is never re-read
@@ -258,7 +280,9 @@ def _judge(
        The gateway is *asked* to filter (``?trace_id=``) but its filter is not
        trusted to exist — a gateway that predates the column ignores the
        parameter and returns the newest rows unfiltered. None of those carry our
-       id, so the answer is "no row of ours", never a pass.
+       id, so the answer is "no row of ours", never a pass. Rows with
+       ``endpoint == "shadow"`` exactly are set aside, not judged: they record
+       Lexora's comparison request, not the route that answered (msg-7269).
     2. **Mismatch first.** Any selected row whose ``backend`` is not
        ``expected`` is a verdict (:class:`_BackendMismatchError`), and it wins
        over every "could not determine" state below: a mismatching row in hand
@@ -269,7 +293,11 @@ def _judge(
        a populated ledger — a full read with none of ours — and the operator
        must see "did not apply the filter", the deploy-ordering diagnostic, not
        a generic truncation message. The caller still sees ``len(rows) >=
-       limit`` and does not re-read (:func:`attest_turn`).
+       limit`` and does not re-read (:func:`attest_turn`). A trace whose only
+       rows are shadow rows is a third wording: the answering route left no
+       row, so it cannot pass either. If that read came back full, the wording
+       says the answering row may have been cut off (PR-gate on #489) — the
+       trace was found, so it is never reported as missing.
     4. A **full read** (``len(rows) >= limit``) may have been cut off and may be
        hiding a mismatching sibling, so it cannot pass.
     5. Otherwise every selected row said ``expected``. One matching row never
@@ -279,7 +307,15 @@ def _judge(
     gateway handed the request to, and if a fallback ever served the request the
     extra row is precisely the evidence that would reveal it.
     """
-    selected = sorted((row for row in rows if row.get(TRACE_ROW_COLUMN) == trace_id), key=_row_id)
+    ours = [row for row in rows if row.get(TRACE_ROW_COLUMN) == trace_id]
+    shadow = [row for row in ours if row.get("endpoint") == SHADOW_ENDPOINT]
+    selected = sorted((row for row in ours if row.get("endpoint") != SHADOW_ENDPOINT), key=_row_id)
+    if shadow:
+        logger.info(
+            "%s: shadow rows excluded: %s",
+            what,
+            " ".join(f"#{row.get('id')}({row.get('backend')})" for row in shadow),
+        )
     backends = {str(row.get("backend")) for row in selected}
     if selected and backends != {expected}:
         raise _BackendMismatchError(
@@ -291,6 +327,28 @@ def _judge(
             raise PreflightError(
                 f"{what}: no accounting row carries trace {trace_id}; "
                 f"a 2xx response is not evidence of routing"
+            )
+        if shadow and len(rows) >= limit:
+            # PR-gate on #489: in a full read, "only shadow rows" is not an
+            # observation — the answering row may sit past the limit. Say what
+            # was seen (the trace DID arrive, as N shadow rows) and that the read
+            # may be cut off; never imply the trace itself is missing.
+            raise PreflightError(
+                f"{what}: trace {trace_id} was found only as {len(shadow)} shadow "
+                f"row(s) (endpoint={SHADOW_ENDPOINT!r}) and no answering-route row "
+                f"was among the {len(rows)} row(s) returned; the read came back full "
+                f"at limit {limit}, so the answering row may have been cut off and "
+                f"the route is unproven"
+            )
+        if shadow:
+            # Stated as observed: every row carrying our trace is a shadow row.
+            # Deliberately NOT a claim that the gateway applied the filter — an
+            # unfiltered read of the newest rows can contain a recent shadow row
+            # too (Einstein's advisory on msg-7269).
+            raise PreflightError(
+                f"{what}: the only accounting row(s) for trace {trace_id} are "
+                f"{len(shadow)} shadow row(s) (endpoint={SHADOW_ENDPOINT!r}); no row "
+                f"records the route that answered, so the route is unproven"
             )
         # Rows came back for a trace-filtered read and none is ours: the gateway
         # did not apply the filter. Stated as observed — not why it did not.
@@ -488,6 +546,7 @@ __all__ = [
     "PREFLIGHT_MAX_TOKENS",
     "PREFLIGHT_PROMPT",
     "PREFLIGHT_TIMEOUT_SECONDS",
+    "SHADOW_ENDPOINT",
     "TRACE_HEADER",
     "TRACE_READ_LIMIT",
     "TRACE_ROW_COLUMN",
