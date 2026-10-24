@@ -26,6 +26,24 @@
       "want": ["ヒューマンコール中: S (A)、巻き添えで 3 本停止中、経過 3 時間"]
     },
     {
+      "name": "a key with no disposition this tick is counted from its record, in another project too (PR #495 review)",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"A": {"thread_id": "S", "since": "2026-10-24T06:00:00Z", "by": "takahito"}, "B": null},
+      "summon_by_key": {"A/S": {"kind": "summoned"}},
+      "dispositions": {"A/S": "worked"},
+      "records": {"B/t5": ["S"], "A/t6": ["S"], "B/t7": ["OTHER"]},
+      "want": ["ヒューマンコール中: S (A)、巻き添えで 2 本停止中、経過 6 時間"]
+    },
+    {
+      "name": "two active Summons with the same thread id: a record with no disposition goes to its own project's Summon only",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"A": {"thread_id": "S", "since": "2026-10-24T10:00:00Z", "by": "takahito"}, "C": {"thread_id": "S", "since": "2026-10-24T11:00:00Z", "by": "takahito"}, "D": null},
+      "summon_by_key": {},
+      "dispositions": {},
+      "records": {"D/x": ["S"], "C/y": ["S"]},
+      "want": ["ヒューマンコール中: S (A)、巻き添えで 0 本停止中、経過 2 時間", "ヒューマンコール中: S (C)、巻き添えで 1 本停止中、経過 1 時間"]
+    },
+    {
       "name": "active Summon under an hour old, nothing held",
       "now": "2026-10-24T12:00:00Z",
       "controls": {"A": {"thread_id": "S", "since": "2026-10-24T11:20:00+00:00", "by": "takahito"}},

@@ -281,7 +281,9 @@ function Format-SummonElapsed {
 #     dispositions plus the evaluated.json summon_yield records naming it (a thread stopped at a
 #     round boundary, or held on an earlier tick, has a record but may have no LAUNCH this tick),
 #     each key once, and only keys in the Summon's scope (its project, or a thread whose owner
-#     project is the Summon's — the scope Get-SummonDisposition uses).
+#     project is the Summon's — the scope Get-SummonDisposition uses). A key that is not a
+#     candidate this tick has no disposition to read its owner from, so its record decides: see the
+#     loop below.
 #   * one line per project whose active_summon is malformed (its own work is HOLD, fail-safe);
 #   * one line per (project, owner) pair where a project is HOLD only because the OWNER project's
 #     active_summon is malformed (the #476 advisory, msg-6920): its own control may still say RUN,
@@ -303,6 +305,10 @@ function Get-SummonDigestLines {
         if ($ps.kind -eq 'valid') { $active += @{ project = $proj; summon = $ps } }
         elseif ($ps.kind -eq 'malformed') { $malformed += $proj }
     }
+    # Thread ids held by more than one active Summon: a record naming one of them cannot be told
+    # apart by its thread id alone.
+    $dupIds = @($active | ForEach-Object { $_.summon.thread_id } | Group-Object -CaseSensitive |
+                Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
     $lines = @()
     foreach ($a in $active) {
         $tid = $a.summon.thread_id
@@ -311,13 +317,21 @@ function Get-SummonDigestLines {
         $keys = @(@($Dispositions.Keys) + @($EvaluatedState.Keys) | ForEach-Object { "$_" } | Sort-Object -Unique)
         foreach ($k in $keys) {
             if ((& $projectOf $k) -eq $proj -and (& $threadOf $k) -eq $tid) { continue }  # the Summon itself
-            $disp = $SummonByKey[$k]
-            $owner = if ($null -ne $disp) { $disp.owner_project } else { $null }
-            if ((& $projectOf $k) -ne $proj -and $owner -ne $proj) { continue }
-            $isHeld = ("$($Dispositions[$k])" -ceq "held-by-summon:$tid")
-            if (-not $isHeld) {
-                $rec = Get-SummonYieldEntry -EvaluatedState $EvaluatedState -Key $k
-                $isHeld = ($null -ne $rec -and @($rec.summon_threads | Where-Object { "$_" -ceq $tid }).Count -gt 0)
+            $rec = Get-SummonYieldEntry -EvaluatedState $EvaluatedState -Key $k
+            $recNames = ($null -ne $rec -and @($rec.summon_threads | Where-Object { "$_" -ceq $tid }).Count -gt 0)
+            $sameProject = ((& $projectOf $k) -eq $proj)
+            if ($SummonByKey.ContainsKey($k) -and $null -ne $SummonByKey[$k]) {
+                # A candidate this tick: its scope is what Get-SummonDisposition resolved.
+                if (-not $sameProject -and $SummonByKey[$k].owner_project -ne $proj) { continue }
+                $isHeld = ("$($Dispositions[$k])" -ceq "held-by-summon:$tid") -or $recNames
+            }
+            else {
+                # Not a candidate this tick (PR #495 review): no disposition says which project owns
+                # its repository, so the record is the evidence — it was written only when this
+                # thread yielded to a Summon named $tid. Another project's record is attributed to
+                # this Summon only when no other active Summon has the same thread id; an ambiguous
+                # record is counted by the Summon of its own project, or by none.
+                $isHeld = $recNames -and ($sameProject -or $dupIds -notcontains $tid)
             }
             if ($isHeld) { $held[$k] = $true }
         }
