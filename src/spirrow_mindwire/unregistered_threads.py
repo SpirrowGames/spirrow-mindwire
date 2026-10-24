@@ -340,6 +340,10 @@ class EnumerateReport:
     def as_json(self) -> dict[str, Any]:
         return {
             "projects": [p.as_json() for p in self.projects],
+            # The field name itself, so the PowerShell side words its WARN,
+            # header and 時刻不明 reason from this one constant instead of
+            # hardcoding it a second time (PR #497 gate advisory).
+            "activity_field": ACTIVITY_FIELD,
             "unregistered_count_total": self.unregistered_count_total,
             "unmeasured_projects": list(self.unmeasured_projects),
             "any_unmeasured": self.any_unmeasured,

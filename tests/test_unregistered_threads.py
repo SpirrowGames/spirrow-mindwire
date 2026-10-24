@@ -358,6 +358,7 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "listed_count": None,
             },
         ],
+        "activity_field": "last_activity_at",
         "unregistered_count_total": 1,
         "unmeasured_projects": ["q"],
         "any_unmeasured": True,

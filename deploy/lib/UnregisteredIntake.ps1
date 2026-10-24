@@ -195,7 +195,7 @@ function Get-CloneCandidateMismatches {
 # Turns one unregistered_threads.py report into this tick's intake. Returns
 #   @{ added = [candidate]; shadow = [row]; idle = [row]; time_unknown = [row]; excluded_count = <int>;
 #      refused = [{ project; thread_id; key; reason }]; unmeasured = [{ project; reason }];
-#      field_absent = [{ project; absent; listed }];
+#      field_absent = [{ project; absent; listed; field }]; activity_field = <string>;
 #      probe_error = <string or $null>; mode; max_idle_days }   (the last two echo the config in force)
 # field_absent has one row per MEASURED project whose listing had >= 1 item with no last_activity_at
 # key (msg-7445), whether or not that project has any unregistered thread.
@@ -217,7 +217,7 @@ function Resolve-UnregisteredIntake {
     )
     $cfg = if ($null -ne $IntakeConfig) { $IntakeConfig } else { ConvertFrom-SweepIntakeConfig -Raw $null }
     $out = @{ added = @(); shadow = @(); idle = @(); time_unknown = @(); excluded_count = 0
-        refused = @(); unmeasured = @(); field_absent = @(); probe_error = $null; mode = $cfg.mode; max_idle_days = $cfg.max_idle_days }
+        refused = @(); unmeasured = @(); field_absent = @(); activity_field = '?'; probe_error = $null; mode = $cfg.mode; max_idle_days = $cfg.max_idle_days }
     if (-not [string]::IsNullOrWhiteSpace($ProbeError)) {
         $out.probe_error = "unregistered_threads probe failed: $ProbeError"
         return $out
@@ -226,6 +226,13 @@ function Resolve-UnregisteredIntake {
         $out.probe_error = 'unregistered_threads probe failed: no report'
         return $out
     }
+    # The listing field name comes from the enumerator's report (its ACTIVITY_FIELD), never a second
+    # literal here (PR #497 gate advisory). A report without it (an older enumerator) shows '?'.
+    $field = '?'
+    if ($Report.PSObject.Properties.Name -contains 'activity_field' -and -not [string]::IsNullOrWhiteSpace([string]$Report.activity_field)) {
+        $field = [string]$Report.activity_field
+    }
+    $out.activity_field = $field
     $known = @{}
     foreach ($c in @($Candidates)) { $known[[string]$c.key] = $true }
     $cloneOrder = @{}
@@ -249,7 +256,7 @@ function Resolve-UnregisteredIntake {
         if ($pNames -contains 'field_absent_count' -and $null -ne $p.field_absent_count) { $absent = [int]$p.field_absent_count }
         if ($absent -ge 1) {
             $listed = if ($pNames -contains 'listed_count' -and $null -ne $p.listed_count) { [string][int]$p.listed_count } else { '?' }
-            $out.field_absent += [pscustomobject]@{ project = $proj; absent = $absent; listed = $listed }
+            $out.field_absent += [pscustomobject]@{ project = $proj; absent = $absent; listed = $listed; field = $field }
         }
         # Per-thread detail from the enumerator. A row it did not describe (an id in `unregistered` with
         # no `threads` entry) is time-unknown: fail closed, never assume fresh.
@@ -284,7 +291,7 @@ function Resolve-UnregisteredIntake {
                 try { $idleDays = [double]$d.idle_days } catch { $idleDays = $null }
             }
             if ($null -eq $idleDays) {
-                $why = if ($state -eq 'ok') { 'idle_days absent' } else { "last_activity_at $state" }
+                $why = if ($state -eq 'ok') { 'idle_days absent' } else { "$field $state" }
                 $out.time_unknown += [pscustomobject]@{ project = $proj; thread_id = $tid; key = $key; reason = $why }
                 continue
             }
@@ -360,7 +367,7 @@ function Get-UnregisteredIntakeSchemaWarnings {
     param($Intake)
     $out = @()
     foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) {
-        $out += "WARN listing schema: $($f.project) $($f.absent)/$($f.listed) items lack last_activity_at"
+        $out += "WARN listing schema: $($f.project) $($f.absent)/$($f.listed) items lack $($f.field)"
     }
     return $out
 }
@@ -379,7 +386,7 @@ function Get-UnregisteredIntakeHeader {
     $timeUnknown = (Get-IntakeBucket $Intake 'time_unknown').Count
     $excluded = [int]$Intake['excluded_count']
     $unknown = if ($Intake['probe_error'] -or (Get-IntakeBucket $Intake 'unmeasured').Count -gt 0) { ' + ?' } else { '' }
-    $drift = @(foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) { "$($f.project)：一覧の $($f.absent)/$($f.listed) 件に last_activity_at が無い" })
+    $drift = @(foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) { "$($f.project)：一覧の $($f.absent)/$($f.listed) 件に $($f.field) が無い" })
     $driftNote = if ($drift.Count -gt 0) { "［$($drift -join ' / ')］" } else { '' }
     return ("未登録（登録不可）: $refused 件$unknown（この tick の自動登録 $added 件 / 登録予定（shadow） $shadow 件 / " +
             "放置 $idle 件 / 時刻不明 $timeUnknown 件$driftNote / 除外 $excluded 件）")

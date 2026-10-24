@@ -86,6 +86,7 @@ Output (stdout, JSON, ASCII-only per D-33)
           "listed_count": null
         }
       ],
+      "activity_field": "last_activity_at",
       "unregistered_count_total": 3,
       "unmeasured_projects": ["spirrow-voxelworld"],
       "any_unmeasured": true,

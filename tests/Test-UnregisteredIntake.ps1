@@ -68,7 +68,10 @@ function Proj {
     if (-not $NoThreads) { $o | Add-Member -NotePropertyName threads -NotePropertyValue $rows }
     $o
 }
-function Rep { param([object[]]$Projects) [pscustomobject]@{ projects = @($Projects) } }
+function Rep { param([object[]]$Projects, $Field = 'last_activity_at')
+    $r = [pscustomobject]@{ projects = @($Projects) }
+    if ($null -ne $Field) { $r | Add-Member -NotePropertyName activity_field -NotePropertyValue $Field }
+    $r }
 function Cfg {
     param($Clones = @{}, $Mode = 'on', $MaxIdle = 14, $Exclude = @())
     $o = [ordered]@{}
@@ -216,6 +219,13 @@ $i = Resolve (Rep $errRow)
 Check "an unmeasured project -> no drift row (unknown, not 0 or N)" 0 @($i.field_absent).Count
 $i = Resolve (Rep @((WithAbsent (Proj 'mw' @()) 2 4), (WithAbsent (Proj 'mk' @()) 3 3)))
 Check "two projects -> one WARN each" 2 @(Get-UnregisteredIntakeSchemaWarnings -Intake $i).Count
+# The field name is the enumerator's, not a literal here (PR #497 gate advisory).
+$i = Resolve (Rep @((WithAbsent (Proj 'mw' @('T-m') -times @{ 'T-m' = 'missing' }) 1 2)) -Field 'x_at')
+Check "field name comes from the report: WARN" 'WARN listing schema: mw 1/2 items lack x_at' ((@(Get-UnregisteredIntakeSchemaWarnings -Intake $i)) -join '|')
+CheckTrue "…header" ((Get-UnregisteredIntakeHeader -Intake $i).Contains('mw：一覧の 1/2 件に x_at が無い')) (Get-UnregisteredIntakeHeader -Intake $i)
+Check "…時刻不明 reason" 'x_at missing' $i.time_unknown[0].reason
+$i = Resolve (Rep @((WithAbsent (Proj 'mw' @()) 1 2)) -Field $null)
+Check "a report without activity_field -> '?' (never a guessed name)" 'WARN listing schema: mw 1/2 items lack ?' ((@(Get-UnregisteredIntakeSchemaWarnings -Intake $i)) -join '|')
 $sweepText = Get-Content -LiteralPath $sweepScript -Raw
 CheckTrue "the sweep writes the schema WARN lines to the tick log" ($sweepText -match '\$schemaWarnings = @\(Get-UnregisteredIntakeSchemaWarnings -Intake \$unregisteredIntake\)' -and
     $sweepText -match 'foreach \(\$w in \$schemaWarnings\) \{ Write-Log \$w \}')
