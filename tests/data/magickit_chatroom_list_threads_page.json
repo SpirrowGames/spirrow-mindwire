@@ -1,0 +1,60 @@
+{
+  "_provenance": {
+    "source": "magickit chatroom_list_threads (live, read-only), arguments {project: spirrow-mindwire, status_filter: [active, awaiting_reply], limit: 2, offset: 0}; the same item shape operator measured in T-sweep-intake-discovery-by-default msg-7381 §4",
+    "captured_at": "2026-10-24T04:26:52+00:00",
+    "captured_by": "Heisenberg (implementer), T-sweep-intake-discovery-by-default after msg-7452",
+    "purpose": "msg-7441 F-2: every CLI test builds its listing items from this real shape; a fake item carrying updated_at is what let the field mismatch pass for eight days"
+  },
+  "response": {
+    "items": [
+      {
+        "project": "spirrow-mindwire",
+        "thread_id": "T-sweep-intake-discovery-by-default",
+        "title": "sweep の受け付けを「列挙した候補だけ」から「clone が登録されたプロジェクトの生きた NEXT スレッドすべて」へ反転し、sweep.json は優先度と除外だけを持つ — #448 の自動登録でも拾えない 3 つの穴（候補 0 件 / repo_dir 複数 / 走査対象外）を推測でなく登録で塞ぐ",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "tags": [
+          "design",
+          "conductor",
+          "sweep",
+          "intake",
+          "silent-failure",
+          "follow-up"
+        ],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-10-24T04:21:29.298755Z"
+      },
+      {
+        "project": "spirrow-mindwire",
+        "thread_id": "T-operator-task-lane",
+        "title": "OPERATOR-TASK を自動で拾って実行する lane が無い — conductor は NEXT: operator を 1 時間ごとに起動して即 human に返すだけ（同じ head で 49〜50 回、実測）",
+        "owner": "operator",
+        "status": "active",
+        "created_at": "2026-10-23T23:57:06.641455Z",
+        "created_by_msg": "msg-7380",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "tags": [
+          "design",
+          "conductor",
+          "operator",
+          "lane",
+          "silent-failure",
+          "measured",
+          "operator-filed"
+        ],
+        "last_msg_id": "msg-7448",
+        "msg_count": 35,
+        "last_activity_at": "2026-10-24T04:18:15.615004Z"
+      }
+    ],
+    "total": 174,
+    "limit": 2,
+    "offset": 0
+  }
+}

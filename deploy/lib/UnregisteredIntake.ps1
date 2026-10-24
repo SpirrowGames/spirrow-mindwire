@@ -16,7 +16,7 @@
 #     not start moving because discovery was switched on);
 #   * its project has a `clones` entry that passes the environment probe (fully qualified, exists, not
 #     the daemon's own checkout, not a linked worktree);
-#   * its updated_at is known and at most intake.max_idle_days (default 14) old;
+#   * its last_activity_at is known and at most intake.max_idle_days (default 14) old;
 #   * its key is not in `exclude`.
 # Everything else lands in exactly one digest bucket — 登録予定（shadow）, 放置, 除外 (count only),
 # 登録不可 (clones 未登録 or a failed probe, or a PR-review thread), 時刻不明 — and in no state file.
@@ -40,8 +40,16 @@
 #     head-skip filters run (D-2.3).
 #   * A project whose enumeration failed (unregistered_count = null) registers nothing and is shown
 #     as "?" — "did not measure" is never rendered as 0 (D-2.4, msg-2531 §2 invariant 2).
-#   * No timestamp is parsed here. The enumerator classifies updated_at once, at its listing boundary,
-#     and hands over idle_days (a number) and time_state; this file only compares (msg-6770 §1).
+#   * No timestamp is parsed here. The enumerator classifies last_activity_at once, at its listing
+#     boundary, and hands over idle_days (a number) and time_state; this file only compares (msg-6770 §1).
+#
+# The field is last_activity_at, magickit chatroom_list_threads' own name, end to end (msg-7441 F-1):
+# the enumerator first read `updated_at`, which that listing never carries, and every discovered thread
+# sat in 時刻不明 for eight days with nothing saying why (msg-7381 §4). The enumerator now also counts,
+# per project and before the registered filter, the listed items with no last_activity_at key at all
+# (field_absent_count of listed_count, msg-7443 F-3c as narrowed by msg-7445). Whenever that is >= 1 the
+# tick log gets a WARN and the digest's 時刻不明 header the same N/M — stated as a count, never as a claim
+# about the API (Einstein msg-7444).
 #
 # Pure: no I/O except the injectable $PathExists / $IsLinkedWorktree checks, so
 # tests/Test-UnregisteredIntake.ps1 can dot-source this file without running the sweep.
@@ -187,11 +195,14 @@ function Get-CloneCandidateMismatches {
 # Turns one unregistered_threads.py report into this tick's intake. Returns
 #   @{ added = [candidate]; shadow = [row]; idle = [row]; time_unknown = [row]; excluded_count = <int>;
 #      refused = [{ project; thread_id; key; reason }]; unmeasured = [{ project; reason }];
+#      field_absent = [{ project; absent; listed; field }]; activity_field = <string>;
 #      probe_error = <string or $null>; mode; max_idle_days }   (the last two echo the config in force)
+# field_absent has one row per MEASURED project whose listing had >= 1 item with no last_activity_at
+# key (msg-7445), whether or not that project has any unregistered thread.
 # shadow / idle rows are { project; thread_id; key; idle_days }, time_unknown rows { ...; reason }.
 # `added` rows have exactly the shape Get-SweepCandidates returns (project, thread_id, repo_dir, key)
 # and carry no marker: nothing downstream may treat them differently (D-2.2). They are ordered by the
-# `clones` declaration order of their project, then oldest updated_at first (msg-6776 並び順).
+# `clones` declaration order of their project, then oldest last_activity_at first (msg-6776 並び順).
 # $ProbeError non-empty = the enumerator itself did not produce a report: nothing is added, and the
 # digest shows "?" with that reason. $IntakeConfig $null = the defaults (no clones, shadow, 14 days).
 function Resolve-UnregisteredIntake {
@@ -206,7 +217,7 @@ function Resolve-UnregisteredIntake {
     )
     $cfg = if ($null -ne $IntakeConfig) { $IntakeConfig } else { ConvertFrom-SweepIntakeConfig -Raw $null }
     $out = @{ added = @(); shadow = @(); idle = @(); time_unknown = @(); excluded_count = 0
-        refused = @(); unmeasured = @(); probe_error = $null; mode = $cfg.mode; max_idle_days = $cfg.max_idle_days }
+        refused = @(); unmeasured = @(); field_absent = @(); activity_field = '?'; probe_error = $null; mode = $cfg.mode; max_idle_days = $cfg.max_idle_days }
     if (-not [string]::IsNullOrWhiteSpace($ProbeError)) {
         $out.probe_error = "unregistered_threads probe failed: $ProbeError"
         return $out
@@ -215,6 +226,13 @@ function Resolve-UnregisteredIntake {
         $out.probe_error = 'unregistered_threads probe failed: no report'
         return $out
     }
+    # The listing field name comes from the enumerator's report (its ACTIVITY_FIELD), never a second
+    # literal here (PR #497 gate advisory). A report without it (an older enumerator) shows '?'.
+    $field = '?'
+    if ($Report.PSObject.Properties.Name -contains 'activity_field' -and -not [string]::IsNullOrWhiteSpace([string]$Report.activity_field)) {
+        $field = [string]$Report.activity_field
+    }
+    $out.activity_field = $field
     $known = @{}
     foreach ($c in @($Candidates)) { $known[[string]$c.key] = $true }
     $cloneOrder = @{}
@@ -229,6 +247,16 @@ function Resolve-UnregisteredIntake {
             $why = if ($p.PSObject.Properties.Name -contains 'error' -and $p.error) { [string]$p.error } else { 'not measured' }
             $out.unmeasured += [pscustomobject]@{ project = $proj; reason = $why }
             continue
+        }
+        # Schema-drift counter (msg-7445). Read before the "no unregistered thread" early exit below: a
+        # project whose live threads are all in sweep.json is still checked. A report without the key (an
+        # older enumerator) reads as 0 — it can only fail to warn, never warn falsely.
+        $pNames = @($p.PSObject.Properties.Name)
+        $absent = 0
+        if ($pNames -contains 'field_absent_count' -and $null -ne $p.field_absent_count) { $absent = [int]$p.field_absent_count }
+        if ($absent -ge 1) {
+            $listed = if ($pNames -contains 'listed_count' -and $null -ne $p.listed_count) { [string][int]$p.listed_count } else { '?' }
+            $out.field_absent += [pscustomobject]@{ project = $proj; absent = $absent; listed = $listed; field = $field }
         }
         # Per-thread detail from the enumerator. A row it did not describe (an id in `unregistered` with
         # no `threads` entry) is time-unknown: fail closed, never assume fresh.
@@ -263,7 +291,7 @@ function Resolve-UnregisteredIntake {
                 try { $idleDays = [double]$d.idle_days } catch { $idleDays = $null }
             }
             if ($null -eq $idleDays) {
-                $why = if ($state -eq 'ok') { 'idle_days absent' } else { "updated_at $state" }
+                $why = if ($state -eq 'ok') { 'idle_days absent' } else { "$field $state" }
                 $out.time_unknown += [pscustomobject]@{ project = $proj; thread_id = $tid; key = $key; reason = $why }
                 continue
             }
@@ -333,9 +361,22 @@ function Get-UnregisteredIntakeDigestRows {
     return , $rows
 }
 
+# Tick-log lines for the schema-drift counter, one per project with >= 1 listed item lacking the key
+# (msg-7445). The wording is a count, not a diagnosis. Emits the lines (wrap the call in @()).
+function Get-UnregisteredIntakeSchemaWarnings {
+    param($Intake)
+    $out = @()
+    foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) {
+        $out += "WARN listing schema: $($f.project) $($f.absent)/$($f.listed) items lack $($f.field)"
+    }
+    return $out
+}
+
 # The section header. "?" is appended whenever some part of the population was not measured, so a
 # day that could not look is never shown as a clean 0. Every bucket is counted, so a truncated row
-# list never hides how many threads are waiting in shadow.
+# list never hides how many threads are waiting in shadow. The 時刻不明 count carries the schema-drift
+# fact beside it — "<project>：一覧の N/M 件に last_activity_at が無い" — whenever some project's listing
+# lacked the key (msg-7445): in the header, so the row budget can never truncate it away.
 function Get-UnregisteredIntakeHeader {
     param($Intake)
     $refused = (Get-IntakeBucket $Intake 'refused').Count
@@ -345,6 +386,8 @@ function Get-UnregisteredIntakeHeader {
     $timeUnknown = (Get-IntakeBucket $Intake 'time_unknown').Count
     $excluded = [int]$Intake['excluded_count']
     $unknown = if ($Intake['probe_error'] -or (Get-IntakeBucket $Intake 'unmeasured').Count -gt 0) { ' + ?' } else { '' }
+    $drift = @(foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) { "$($f.project)：一覧の $($f.absent)/$($f.listed) 件に $($f.field) が無い" })
+    $driftNote = if ($drift.Count -gt 0) { "［$($drift -join ' / ')］" } else { '' }
     return ("未登録（登録不可）: $refused 件$unknown（この tick の自動登録 $added 件 / 登録予定（shadow） $shadow 件 / " +
-            "放置 $idle 件 / 時刻不明 $timeUnknown 件 / 除外 $excluded 件）")
+            "放置 $idle 件 / 時刻不明 $timeUnknown 件$driftNote / 除外 $excluded 件）")
 }

@@ -5235,7 +5235,7 @@ try {
 
     # Discovery intake (T-sweep-intake-discovery-by-default msg-6776/msg-6778 D-2.5, on top of msg-5889
     # D-2 / msg-5893 D-2.1-D-2.4; lib/UnregisteredIntake.ps1). A live thread sweep.json does not list
-    # joins THIS tick's candidates only with intake.mode=on, a usable clones[project], an updated_at
+    # joins THIS tick's candidates only with intake.mode=on, a usable clones[project], a last_activity_at
     # within intake.max_idle_days and no exclude entry — in memory only, sweep.json is not written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
     # head-skip code below (D-2.3): every filter has to see the added threads, or a quarantined one
     # would launch on every tick. Added threads are ordinary candidates from here on (D-2.2). Refused
@@ -5252,6 +5252,13 @@ try {
     }
     foreach ($u in @($unregisteredIntake.unmeasured)) {
         Write-Log "unregistered intake [$($u.project)]: ? — not measured ($($u.reason))"
+    }
+    # Schema drift (T-sweep-intake-discovery-by-default msg-7445): listed items with no last_activity_at
+    # key at all. A WARN is kept even on an otherwise quiet tick — eight silent days is what this is for.
+    $schemaWarnings = @(Get-UnregisteredIntakeSchemaWarnings -Intake $unregisteredIntake)
+    if ($schemaWarnings.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        foreach ($w in $schemaWarnings) { Write-Log $w }
     }
     if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0 -or
         @($unregisteredIntake.shadow).Count -gt 0 -or @($unregisteredIntake.idle).Count -gt 0 -or
