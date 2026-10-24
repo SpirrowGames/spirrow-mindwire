@@ -23,7 +23,8 @@ under ``tests/data/summon/`` so they cannot drift:
 The resume notice (v1.4 single lifecycle) is the third piece: the sweep ALWAYS passes
 ``--resume-notice-summons`` / ``--resume-notice-main-range`` to a thread that has a
 ``summon_yield`` record, and the conductor reports ``resume_notice=delivered`` on its stop line
-once the first role turn of the run was actually sent — whether or not the range was empty. The
+once the first role turn of the run was actually sent — whether or not the range was empty. That
+first turn always carries a notice text; an empty range has its own wording (PR-3). The
 conductor never reads or writes ``evaluated.json``; the sweep is that file's only writer.
 """
 
@@ -201,17 +202,22 @@ def parse_resume_notice(summons: str | None, main_range: str | None) -> ResumeNo
     return ResumeNotice(summons=names, main_from=main_from, main_to=main_to)
 
 
-def render_resume_notice(notice: ResumeNotice) -> str | None:
-    """The prompt paragraph (v1.1 wording), or ``None`` when the range is empty.
+def render_resume_notice(notice: ResumeNotice) -> str:
+    """The prompt paragraph. Always a text (PR-3, Bohr msg-6965 item 3).
 
-    The wording does not claim the Summon caused the change (v1.1 指摘 1): ``main`` may have moved
-    for other reasons too. ASCII parentheses: the repo's lint rejects full-width ones in literals.
+    v1.4 keeps the notice on every run that has a ``summon_yield`` record. Until PR-3 an empty range
+    rendered nothing; it now gets its own wording ("main did not change"), so the thread is still
+    told it was stopped and why. The moved wording keeps v1.1 指摘 1: it does not claim the Summon
+    caused the change, because ``main`` may have moved for other reasons too. A range with an
+    unknown end is never empty (:attr:`ResumeNotice.empty_range`), so it takes the moved wording:
+    that is the safe side of not knowing. ASCII parentheses: the repo's lint rejects full-width ones
+    in literals.
     """
-    if notice.empty_range:
-        return None
     who = ", ".join(notice.summons) if notice.summons else UNKNOWN_SHA
-    return (
-        f"[Summon 再開の注記] このスレッドは Summon {who} に譲って停止していた。"
+    head = f"[Summon 再開の注記] このスレッドは Summon {who} に譲って停止していた。"
+    if notice.empty_range:
+        return head + f"停止中に main は変わっていない ({notice.main_from})。取り込みは不要。"
+    return head + (
         f"停止中に main が {notice.main_from}..{notice.main_to} 進んだ"
         f" (Summon 以外の変更を含みうる)。続ける前に取り込みを確認すること。"
     )

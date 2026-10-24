@@ -689,8 +689,9 @@ class Conductor:
         self._summon_owner_control = summon_owner_control
         self._summon_yield_to: str | None = None
         # Resume notice (v1.4 single lifecycle). Set when the sweep passed ``--resume-notice-*``:
-        # this thread had yielded to a Summon. Attached to the FIRST role turn this run sends (only
-        # when ``main`` moved), and ``_resume_notice_delivered`` is raised once that turn was sent —
+        # this thread had yielded to a Summon. Attached to the FIRST role turn this run sends (with
+        # its own wording when ``main`` did not move, PR-3), and ``_resume_notice_delivered`` is
+        # raised once that turn was sent —
         # empty range or not — so the stop line says ``resume_notice=delivered`` and the sweep
         # clears its record. The conductor reads and writes no file for this (I-SY3).
         self._resume_notice = resume_notice
@@ -3252,7 +3253,7 @@ class Conductor:
                 self._resume_notice.main_from,
                 self._resume_notice.main_to,
                 role.value,
-                "attached" if resume_text is not None else "none (main did not move)",
+                "attached (main did not move)" if self._resume_notice.empty_range else "attached",
             )
         if self._retry_of is not None and rounds == 0:
             logger.info(
