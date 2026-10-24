@@ -24,7 +24,7 @@ from spirrow_mindwire.unregistered_threads import (
     RegisteredIndex,
     ThreadTime,
     UnregisteredThreadsError,
-    classify_updated_at,
+    classify_activity_at,
     enumerate_project,
     is_unregistered_live,
     load_registered,
@@ -40,7 +40,7 @@ def _thread(**kw: object) -> dict[str, object]:
 
 
 def _listed(threads: list[dict[str, object]]) -> list[ListedThread]:
-    """Wrap plain dicts as the boundary would, with no ``updated_at`` (``missing``)."""
+    """Wrap plain dicts as the boundary would, with no ``last_activity_at`` (``missing``)."""
     return [ListedThread(dict(t), ThreadTime("missing")) for t in threads]
 
 
@@ -328,6 +328,8 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 unregistered=("T-a",),
                 error=None,
                 malformed_count=2,
+                field_absent_count=3,
+                listed_count=7,
             ),
             project_error_report("q", "network"),
         )
@@ -342,6 +344,8 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "threads": [],
                 "error": None,
                 "malformed_count": 2,
+                "field_absent_count": 3,
+                "listed_count": 7,
             },
             {
                 "project": "q",
@@ -350,6 +354,8 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "threads": [],
                 "error": "network",
                 "malformed_count": None,
+                "field_absent_count": None,
+                "listed_count": None,
             },
         ],
         "unregistered_count_total": 1,
@@ -486,15 +492,15 @@ def test_powershell_pr_review_prefix_matches_python() -> None:
         ({"at": "x"}, "unparseable"),
     ],
 )
-def test_classify_updated_at_has_three_unmixed_states(raw: object, state: str) -> None:
+def test_classify_activity_at_has_three_unmixed_states(raw: object, state: str) -> None:
     """msg-6770 §1: 時刻あり / 時刻なし / 解釈不能 are reported as three distinct states."""
-    t = classify_updated_at(raw)
+    t = classify_activity_at(raw)
     assert t.state == state
     assert (t.at is not None) == (state == "ok")
 
 
-def test_classify_updated_at_normalises_to_utc() -> None:
-    t = classify_updated_at("2026-10-01T09:00:00+09:00")
+def test_classify_activity_at_normalises_to_utc() -> None:
+    t = classify_activity_at("2026-10-01T09:00:00+09:00")
     assert t.at == datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
 
 
@@ -503,9 +509,9 @@ def test_enumerate_reports_idle_days_and_keeps_unknown_times() -> None:
     now = datetime(2026, 10, 11, 0, 0, tzinfo=UTC)
     registered = _index(projects=("p",))
     threads = [
-        ListedThread(_thread(thread_id="T-ok"), classify_updated_at("2026-10-01T00:00:00Z")),
-        ListedThread(_thread(thread_id="T-none"), classify_updated_at(None)),
-        ListedThread(_thread(thread_id="T-bad"), classify_updated_at("garbage")),
+        ListedThread(_thread(thread_id="T-ok"), classify_activity_at("2026-10-01T00:00:00Z")),
+        ListedThread(_thread(thread_id="T-none"), classify_activity_at(None)),
+        ListedThread(_thread(thread_id="T-bad"), classify_activity_at("garbage")),
     ]
     report = enumerate_project("p", threads, registered, now=now)
     assert report.unregistered == ("T-ok", "T-none", "T-bad")
@@ -513,11 +519,21 @@ def test_enumerate_reports_idle_days_and_keeps_unknown_times() -> None:
         {
             "thread_id": "T-ok",
             "time_state": "ok",
-            "updated_at": "2026-10-01T00:00:00+00:00",
+            "last_activity_at": "2026-10-01T00:00:00+00:00",
             "idle_days": 10.0,
         },
-        {"thread_id": "T-none", "time_state": "missing", "updated_at": None, "idle_days": None},
-        {"thread_id": "T-bad", "time_state": "unparseable", "updated_at": None, "idle_days": None},
+        {
+            "thread_id": "T-none",
+            "time_state": "missing",
+            "last_activity_at": None,
+            "idle_days": None,
+        },
+        {
+            "thread_id": "T-bad",
+            "time_state": "unparseable",
+            "last_activity_at": None,
+            "idle_days": None,
+        },
     ]
 
 
@@ -529,7 +545,7 @@ def test_an_explicit_candidate_never_reaches_the_report_whatever_its_time(raw: o
     the wrapper's time and idle rules never see it.
     """
     registered = _index(("p", "T-listed"))
-    threads = [ListedThread(_thread(thread_id="T-listed"), classify_updated_at(raw))]
+    threads = [ListedThread(_thread(thread_id="T-listed"), classify_activity_at(raw))]
     report = enumerate_project("p", threads, registered)
     assert report.unregistered == ()
     assert report.threads == ()

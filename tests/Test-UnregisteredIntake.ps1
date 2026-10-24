@@ -9,7 +9,9 @@
 #      probe (absolute, existing, not the daemon checkout, not a linked worktree), D-2.5 (mode /
 #      max_idle_days / exclude / time fail-closed), explicit candidates never classified (msg-6778),
 #      ordering, the candidate-vs-clones WARN, the "?" for an unmeasured project or a failed probe, and
-#      the PR-review refusal.
+#      the PR-review refusal. The schema-drift counter (msg-7445 F-3c): a field_absent row per measured
+#      project with >= 1 item lacking last_activity_at (also with 0 unregistered), the N/M WARN and
+#      header wording (a count, never "the API lacks it"), and silence for a present-but-null key.
 #   D-2.1  A thread that is not added (shadow, idle, excluded, refused, time-unknown) never joins the candidate array, so none of the three state files the
 #      sweep writes (quarantine.json, retry-pending.json, evaluated.json) can get its key. The state
 #      writers are inline in the wrapper and there is no whole-tick harness, so this is pinned in two
@@ -59,8 +61,8 @@ function Proj {
     $c = if ($count -eq 'auto') { @($ids).Count } else { $count }
     $rows = @(foreach ($id in @($ids)) {
         $t = if ($times.ContainsKey($id)) { $times[$id] } else { 1.0 }
-        if ($t -is [string]) { [pscustomobject]@{ thread_id = $id; time_state = $t; updated_at = $null; idle_days = $null } }
-        else { [pscustomobject]@{ thread_id = $id; time_state = 'ok'; updated_at = '2026-10-01T00:00:00+00:00'; idle_days = [double]$t } }
+        if ($t -is [string]) { [pscustomobject]@{ thread_id = $id; time_state = $t; last_activity_at = $null; idle_days = $null } }
+        else { [pscustomobject]@{ thread_id = $id; time_state = 'ok'; last_activity_at = '2026-10-01T00:00:00+00:00'; idle_days = [double]$t } }
     })
     $o = [pscustomobject]@{ project = $p; unregistered_count = $c; unregistered = @($ids); error = $err; malformed_count = 0 }
     if (-not $NoThreads) { $o | Add-Member -NotePropertyName threads -NotePropertyValue $rows }
@@ -183,10 +185,40 @@ Check "…not added, not listed anywhere" 'mw/T-in' ((@($i.added) | ForEach-Obje
 Check "…and no row anywhere" 0 (@($i.refused).Count + @($i.shadow).Count + @($i.idle).Count + @($i.time_unknown).Count)
 
 $i = Resolve (Rep (Proj 'mw' @('T-m', 'T-u') -times @{ 'T-m' = 'missing'; 'T-u' = 'unparseable' }))
-Check "missing / unparseable updated_at -> 時刻不明, not added (fail-closed)" '0/2' "$(@($i.added).Count)/$(@($i.time_unknown).Count)"
-Check "時刻不明 reason names the state" 'updated_at missing' $i.time_unknown[0].reason
+Check "missing / unparseable last_activity_at -> 時刻不明, not added (fail-closed)" '0/2' "$(@($i.added).Count)/$(@($i.time_unknown).Count)"
+Check "時刻不明 reason names the field and the state" 'last_activity_at missing' $i.time_unknown[0].reason
 $i = Resolve (Rep (Proj 'mw' @('T-old-enum') -NoThreads))
 Check "a report row with no per-thread detail is 時刻不明 (never assumed fresh)" 'mw/T-old-enum' $i.time_unknown[0].key
+
+Write-Host "R — schema drift: listed items with no last_activity_at key (msg-7445 F-3c)"
+function WithAbsent { param($Row, $Absent, $Listed)
+    $Row | Add-Member -NotePropertyName field_absent_count -NotePropertyValue $Absent -Force
+    $Row | Add-Member -NotePropertyName listed_count -NotePropertyValue $Listed -Force
+    $Row }
+$i = Resolve (Rep (WithAbsent (Proj 'mw' @()) 23 23))
+Check "all 23/23 lacking the key, 0 unregistered -> one field_absent row" 'mw:23/23' ((@($i.field_absent) | ForEach-Object { "$($_.project):$($_.absent)/$($_.listed)" }) -join ',')
+Check "…tick-log WARN is the N/M count" 'WARN listing schema: mw 23/23 items lack last_activity_at' ((@(Get-UnregisteredIntakeSchemaWarnings -Intake $i)) -join '|')
+$h = Get-UnregisteredIntakeHeader -Intake $i
+CheckTrue "…時刻不明 header carries the fact" ($h.Contains('時刻不明 0 件［mw：一覧の 23/23 件に last_activity_at が無い］')) $h
+$i = Resolve (Rep (WithAbsent (Proj 'mw' @('T-a')) 1 100))
+$h = Get-UnregisteredIntakeHeader -Intake $i
+CheckTrue "1/100 -> header says 1/100" ($h.Contains('mw：一覧の 1/100 件に last_activity_at が無い')) $h
+CheckTrue "…and never claims the API lacks the field (Einstein msg-7444)" (-not ($h -match 'API|スキーマ|可能性')) $h
+$i = Resolve (Rep (WithAbsent (Proj 'mw' @('T-n') -times @{ 'T-n' = 'missing' }) 0 5))
+Check "key present but null (absent=0) -> no row, no WARN" '0/0' "$(@($i.field_absent).Count)/$(@(Get-UnregisteredIntakeSchemaWarnings -Intake $i).Count)"
+Check "…the thread is still 時刻不明" 'mw/T-n' $i.time_unknown[0].key
+CheckTrue "…and the header has no drift note" (-not (Get-UnregisteredIntakeHeader -Intake $i).Contains('［')) (Get-UnregisteredIntakeHeader -Intake $i)
+$i = Resolve (Rep (Proj 'mw' @('T-a')))
+Check "a report without the counter (older enumerator) -> no row" 0 @($i.field_absent).Count
+$errRow = [pscustomobject]@{ project = 'vw'; unregistered_count = $null; unregistered = @(); error = 'boom'; malformed_count = $null
+    field_absent_count = $null; listed_count = $null }
+$i = Resolve (Rep $errRow)
+Check "an unmeasured project -> no drift row (unknown, not 0 or N)" 0 @($i.field_absent).Count
+$i = Resolve (Rep @((WithAbsent (Proj 'mw' @()) 2 4), (WithAbsent (Proj 'mk' @()) 3 3)))
+Check "two projects -> one WARN each" 2 @(Get-UnregisteredIntakeSchemaWarnings -Intake $i).Count
+$sweepText = Get-Content -LiteralPath $sweepScript -Raw
+CheckTrue "the sweep writes the schema WARN lines to the tick log" ($sweepText -match '\$schemaWarnings = @\(Get-UnregisteredIntakeSchemaWarnings -Intake \$unregisteredIntake\)' -and
+    $sweepText -match 'foreach \(\$w in \$schemaWarnings\) \{ Write-Log \$w \}')
 
 Write-Host "R — explicit candidates are never classified (msg-6778 regression)"
 # Defensive: even if a report DID list an explicit candidate's key, with a missing / unparseable /
@@ -366,12 +398,12 @@ $dIntake = @{ added = @((Cand 'mw' 'T-a' $dirA)); probe_error = $null; max_idle_
     refused = @([pscustomobject]@{ project = 'mk'; thread_id = 'T-r'; key = 'mk/T-r'; reason = 'clones 未登録' })
     shadow = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-s'; key = 'mw/T-s'; idle_days = 3.25 })
     idle = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-i'; key = 'mw/T-i'; idle_days = 40 })
-    time_unknown = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-u'; key = 'mw/T-u'; reason = 'updated_at missing' }) }
+    time_unknown = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-u'; key = 'mw/T-u'; reason = 'last_activity_at missing' }) }
 $d = New-DailyDigest @base -UnregisteredIntake $dIntake
 CheckTrue "section header counts every bucket, with '?'" ($d.Contains('未登録（登録不可）: 1 件 + ?（この tick の自動登録 1 件 / 登録予定（shadow） 1 件 / 放置 1 件 / 時刻不明 1 件 / 除外 2 件）')) $d
 CheckTrue "refused row names key and reason" ($d -match '  mk/T-r — clones 未登録') $d
 CheckTrue "unmeasured row shows '?'" ($d -match '  vw — \? 測れなかった: Timeout') $d
-CheckTrue "時刻不明 row shows '?' and the state" ($d -match '  mw/T-u — \? 時刻不明（登録しない）: updated_at missing') $d
+CheckTrue "時刻不明 row shows '?' and the state" ($d -match '  mw/T-u — \? 時刻不明（登録しない）: last_activity_at missing') $d
 CheckTrue "shadow row shows 登録予定 and idle days" ($d -match '  mw/T-s — 登録予定（shadow）: 最終更新から 3\.3 日|  mw/T-s — 登録予定（shadow）: 最終更新から 3\.2 日') $d
 CheckTrue "放置 row shows idle days and the limit" ($d -match '  mw/T-i — 放置（登録しない）: 最終更新から 40 日 > 上限 14 日') $d
 CheckTrue "excluded threads get no row (count only)" (-not ($d -match '除外（')) $d
