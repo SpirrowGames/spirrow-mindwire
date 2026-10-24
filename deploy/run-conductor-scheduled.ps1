@@ -2103,7 +2103,13 @@ function New-DailyDigest {
         # Resolve-UnregisteredIntake (lib/UnregisteredIntake.ps1). Renders the 未登録（登録不可）section
         # right after 停止中. $null (the default) omits the section, so a caller that predates the
         # intake renders exactly what it always did; the production caller always passes it.
-        $UnregisteredIntake = $null
+        $UnregisteredIntake = $null,
+        # T-human-call-priority-interrupt PR-3 (Bohr msg-6965 items 1-2): the Summon lines, built by
+        # the caller with Get-SummonDigestLines (deploy/lib/Summon.ps1; at most
+        # $SummonDigestMaxLines + 1 lines). Emitted as the FIRST lines of the digest, above the ⚠
+        # line and the header: a person's thread holding the loop is what the reader must see in
+        # the notification preview. Empty (the default) leaves the digest exactly as it was.
+        [string[]]$SummonLines = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2253,6 +2259,9 @@ function New-DailyDigest {
                " / 再試行 $($retryCounts.scheduled) / 回復 $($retryCounts.recovered) / 再試行後隔離 $($retryCounts.quarantined)"
 
     $lines = @()
+    # PR-3 (T-human-call-priority-interrupt): the Summon lines come first of all. They are counted by
+    # every later section's running length, exactly as the ⚠ line below is.
+    if ($SummonLines.Count -gt 0) { $lines += $SummonLines }
     # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
     # rather than appending because the mobile reader sees the first ~2 lines in the notification
     # preview, and the whole point of the ⚠ is that the operator sees it without opening.
@@ -6459,7 +6468,9 @@ try {
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
                 -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
-                -UnregisteredIntake $unregisteredIntake
+                -UnregisteredIntake $unregisteredIntake `
+                -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
+                    -Dispositions $dispositions -EvaluatedState $evaluatedState -Now $nowUtc)
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest

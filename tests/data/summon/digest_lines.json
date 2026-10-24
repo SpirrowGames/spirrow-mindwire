@@ -1,0 +1,63 @@
+{
+  "_comment": "Input/output table for Get-SummonDigestLines (deploy/lib/Summon.ps1), the Summon lines at the top of the daily digest (T-human-call-priority-interrupt PR-3, Bohr msg-6965 items 1, 2 and 4). Run by tests/Test-SweepFairness.ps1. controls: project -> raw active_summon value (null = no Summon); a project that is not listed has no control probe row. summon_by_key: the candidate dispositions Get-SummonDisposition produced (kind, owner_project, malformed_project). dispositions: this tick's sweep dispositions. records: key -> summon_threads of its evaluated.json summon_yield record. want: the exact lines, in order; the wording is fixed here.",
+  "cases": [
+    {
+      "name": "no Summon anywhere: no line",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"A": null, "B": null},
+      "summon_by_key": {"A/t1": {"kind": "none"}},
+      "dispositions": {"A/t1": "worked"},
+      "records": {},
+      "want": []
+    },
+    {
+      "name": "active Summon: held this tick and held earlier both count, the Summon itself and out-of-scope keys do not",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"A": {"thread_id": "S", "since": "2026-10-24T08:30:00Z", "by": "takahito"}, "B": null, "C": null},
+      "summon_by_key": {
+        "A/S": {"kind": "summoned"},
+        "A/t1": {"kind": "yield", "yield_to": "S"},
+        "A/t2": {"kind": "none"},
+        "B/t3": {"kind": "yield", "yield_to": "S", "owner_project": "A"},
+        "C/t4": {"kind": "none"}
+      },
+      "dispositions": {"A/S": "worked", "A/t1": "held-by-summon:S", "A/t2": "head-skipped", "B/t3": "held-by-summon:S", "C/t4": "worked"},
+      "records": {"A/t1": ["S"], "A/t2": ["S"], "C/t4": ["S"]},
+      "want": ["ヒューマンコール中: S (A)、巻き添えで 3 本停止中、経過 3 時間"]
+    },
+    {
+      "name": "active Summon under an hour old, nothing held",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"A": {"thread_id": "S", "since": "2026-10-24T11:20:00+00:00", "by": "takahito"}},
+      "summon_by_key": {"A/S": {"kind": "summoned"}},
+      "dispositions": {"A/S": "worked"},
+      "records": {},
+      "want": ["ヒューマンコール中: S (A)、巻き添えで 0 本停止中、経過 1 時間未満"]
+    },
+    {
+      "name": "owner's active_summon is malformed: the owner's line and the cause on the collateral project",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"M": {"thread_id": "S"}, "Q": null},
+      "summon_by_key": {
+        "M/m1": {"kind": "malformed", "malformed_project": "M"},
+        "Q/q1": {"kind": "malformed", "owner_project": "M", "malformed_project": "M"},
+        "Q/q2": {"kind": "malformed", "owner_project": "M", "malformed_project": "M"}
+      },
+      "dispositions": {"M/m1": "held", "Q/q1": "held", "Q/q2": "held"},
+      "records": {},
+      "want": [
+        "⚠ ヒューマンコール読取不能: M の active_summon の形が壊れている — M の作業は HOLD 中 (fail-safe)",
+        "⚠ Q の HOLD の原因: owner プロジェクト M、active_summon の形が壊れている (Q 自身の設定ではない)"
+      ]
+    },
+    {
+      "name": "owner unreachable (no probe row): fail-open, no line",
+      "now": "2026-10-24T12:00:00Z",
+      "controls": {"Q": null},
+      "summon_by_key": {"Q/q1": {"kind": "none", "owner_project": "M"}},
+      "dispositions": {"Q/q1": "worked"},
+      "records": {},
+      "want": []
+    }
+  ]
+}

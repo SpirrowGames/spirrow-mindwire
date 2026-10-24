@@ -21,7 +21,10 @@
 #     stop line converted to -Delivered / -YieldTo, and (b) when a LAUNCH candidate is held by a
 #     Summon, with -Delivered $false.
 #   * Get-ResumeNoticeArgs — the conductor arguments for a thread that has a record (v1.4: always,
-#     even when main did not move; the conductor then reports delivery without a notice text).
+#     even when main did not move; the conductor then sends its "main did not change" wording).
+#   * Get-SummonDigestLines — the lines at the very top of the daily digest (PR-3): each active
+#     Summon with the number of threads it holds and its age, and each malformed read, including a
+#     project held only because its OWNER project's read is malformed.
 #
 # The record (I-SY1..I-SY4, msg-6747): evaluated.json[<key>].summon_yield =
 #   { main_sha_at_yield = <sha | 'unknown'>; yielded_at = <ISO>; summon_threads = @(<thread_id>...) }
@@ -251,4 +254,93 @@ function Get-SummonOwnerArgs {
     param($Disposition)
     if ($null -eq $Disposition -or [string]::IsNullOrWhiteSpace($Disposition.owner_project)) { return @() }
     return @('--summon-owner-project', $Disposition.owner_project)
+}
+
+# --- the digest's Summon lines (PR-3, Bohr msg-6965 items 1 and 2) ------------------------------
+
+# Most Summon lines the digest shows; the rest become one "+N 件" line. One line per project with a
+# Summon or a malformed read, so this is reached only by an unusual day — but the digest has a
+# character budget and these lines sit above it, so their number is bounded here.
+$script:SummonDigestMaxLines = 5
+
+# "経過 X 時間" for a Summon's since. $null since (Einstein's PR-3 advisory: a valid read never
+# carries one, but this renderer must not do arithmetic on it if one ever arrives) and a since in
+# the future (clock skew) are said, not computed.
+function Format-SummonElapsed {
+    param($Since, [datetime]$Now)
+    if ($null -eq $Since -or $Since -isnot [datetime]) { return '経過時間不明' }
+    $span = $Now.ToUniversalTime() - $Since.ToUniversalTime()
+    if ($span.TotalHours -lt 1) { return '経過 1 時間未満' }
+    return "経過 $([int][Math]::Floor($span.TotalHours)) 時間"
+}
+
+# The lines the daily digest puts at its very top (PR-3). PURE: every fact is passed in.
+#   * one line per project whose Summon is active:
+#       ヒューマンコール中: <thread_id> (<project>)、巻き添えで N 本停止中、経過 X 時間
+#     N counts the OTHER threads this Summon is holding: this tick's held-by-summon:<thread_id>
+#     dispositions plus the evaluated.json summon_yield records naming it (a thread stopped at a
+#     round boundary, or held on an earlier tick, has a record but may have no LAUNCH this tick),
+#     each key once, and only keys in the Summon's scope (its project, or a thread whose owner
+#     project is the Summon's — the scope Get-SummonDisposition uses).
+#   * one line per project whose active_summon is malformed (its own work is HOLD, fail-safe);
+#   * one line per (project, owner) pair where a project is HOLD only because the OWNER project's
+#     active_summon is malformed (the #476 advisory, msg-6920): its own control may still say RUN,
+#     so the digest names the cause. An owner whose probe row is missing is read as no Summon (the
+#     sweep fails open, Get-ProjectSummon), so no line is shown for it.
+# Empty when nothing applies, which leaves the digest exactly as it was.
+function Get-SummonDigestLines {
+    param($ControlByProject, $SummonByKey, $Dispositions, $EvaluatedState, [datetime]$Now)
+    if ($null -eq $ControlByProject) { $ControlByProject = @{} }
+    if ($null -eq $SummonByKey) { $SummonByKey = @{} }
+    if ($null -eq $Dispositions) { $Dispositions = @{} }
+    if ($null -eq $EvaluatedState) { $EvaluatedState = @{} }
+    $projectOf = { param($k) ("$k" -split '/', 2)[0] }
+    $threadOf = { param($k) $parts = "$k" -split '/', 2; if ($parts.Count -gt 1) { $parts[1] } else { '' } }
+    $active = @()
+    $malformed = @()
+    foreach ($proj in @($ControlByProject.Keys | ForEach-Object { "$_" } | Sort-Object)) {
+        $ps = Get-ProjectSummon -ControlByProject $ControlByProject -Project $proj
+        if ($ps.kind -eq 'valid') { $active += @{ project = $proj; summon = $ps } }
+        elseif ($ps.kind -eq 'malformed') { $malformed += $proj }
+    }
+    $lines = @()
+    foreach ($a in $active) {
+        $tid = $a.summon.thread_id
+        $proj = $a.project
+        $held = @{}
+        $keys = @(@($Dispositions.Keys) + @($EvaluatedState.Keys) | ForEach-Object { "$_" } | Sort-Object -Unique)
+        foreach ($k in $keys) {
+            if ((& $projectOf $k) -eq $proj -and (& $threadOf $k) -eq $tid) { continue }  # the Summon itself
+            $disp = $SummonByKey[$k]
+            $owner = if ($null -ne $disp) { $disp.owner_project } else { $null }
+            if ((& $projectOf $k) -ne $proj -and $owner -ne $proj) { continue }
+            $isHeld = ("$($Dispositions[$k])" -ceq "held-by-summon:$tid")
+            if (-not $isHeld) {
+                $rec = Get-SummonYieldEntry -EvaluatedState $EvaluatedState -Key $k
+                $isHeld = ($null -ne $rec -and @($rec.summon_threads | Where-Object { "$_" -ceq $tid }).Count -gt 0)
+            }
+            if ($isHeld) { $held[$k] = $true }
+        }
+        $lines += "ヒューマンコール中: $tid ($proj)、巻き添えで $($held.Count) 本停止中、$(Format-SummonElapsed -Since $a.summon.since -Now $Now)"
+    }
+    foreach ($m in $malformed) {
+        $lines += "⚠ ヒューマンコール読取不能: $m の active_summon の形が壊れている — $m の作業は HOLD 中 (fail-safe)"
+    }
+    $pairs = @{}
+    foreach ($k in @($SummonByKey.Keys | ForEach-Object { "$_" } | Sort-Object)) {
+        $d = $SummonByKey[$k]
+        if ($null -eq $d -or $d.kind -ne 'malformed' -or [string]::IsNullOrWhiteSpace($d.malformed_project)) { continue }
+        $q = & $projectOf $k
+        if ($d.malformed_project -eq $q) { continue }
+        $pairs["$q`t$($d.malformed_project)"] = $true
+    }
+    foreach ($pk in @($pairs.Keys | Sort-Object)) {
+        $q, $m = $pk -split "`t", 2
+        $lines += "⚠ $q の HOLD の原因: owner プロジェクト $m、active_summon の形が壊れている ($q 自身の設定ではない)"
+    }
+    if ($lines.Count -gt $script:SummonDigestMaxLines) {
+        $rest = $lines.Count - $script:SummonDigestMaxLines
+        $lines = @($lines[0..($script:SummonDigestMaxLines - 1)]) + @("  +$rest 件")
+    }
+    return $lines
 }

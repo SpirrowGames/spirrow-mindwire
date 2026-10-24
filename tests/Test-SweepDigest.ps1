@@ -412,6 +412,19 @@ CheckTrue "unbounded call still renders (existing tests pass, but pin it explici
     ($digest3.Length -gt 0) $digest3.Length
 CheckTrue "unbounded call does NOT contain +N marker (no truncation)" ($digest3 -notmatch '\+\d+ 件（省略）') $digest3
 
+Write-Host "New-DailyDigest -SummonLines — the Summon lines are the first lines, above the ⚠ line (T-human-call-priority-interrupt PR-3)"
+$summonTop = @('ヒューマンコール中: S (A)、巻き添えで 2 本停止中、経過 3 時間', '⚠ Q の HOLD の原因: owner プロジェクト M、active_summon の形が壊れている (Q 自身の設定ではない)')
+$digestS = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() `
+    -Budget $script:DigestBudget -HealthWarning '⚠ test-health' -SummonLines $summonTop
+$digestSLines = @($digestS -split "`n")
+CheckTrue "line 1 and 2 are the Summon lines, in order" ($digestSLines[0] -ceq $summonTop[0] -and $digestSLines[1] -ceq $summonTop[1]) ($digestSLines[0..3] -join ' | ')
+CheckTrue "the ⚠ line follows them, then the header" ($digestSLines[2] -ceq '⚠ test-health' -and $digestSLines[3] -like 'MindWire 日次ダイジェスト*') ($digestSLines[0..3] -join ' | ')
+CheckTrue "with Summon lines the digest still fits the budget" ($digestS.Length -le $script:DigestBudget) $digestS.Length
+$digestNoS = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() -SummonLines @()
+CheckTrue "no Summon lines leave the digest exactly as it was" ($digestNoS -ceq $digest3) ''
+
 # =============================================================================================
 # F-1 — PER-SECTION ROW FLOOR (Bohr msg-2418 §4-4, rescoped by msg-2436 §4)
 #
