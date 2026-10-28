@@ -859,8 +859,10 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
-class _PerCallReviewSource:
-    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+class _PerCallGateResumeSource:
+    """``ReviewSource`` + ``PrHeadSource`` for the gate resume (:mod:`.conductor.gate_resume`).
+
+    One client per read.
 
     Same shape and token as :class:`_PerCallCheckRollupSource`, so the resume reads through the
     credential the gate itself uses.
@@ -1014,7 +1016,7 @@ def build_conductor(
         else None
     )
     # One per-call source serves the gate resume as both its ReviewSource and its PrHeadSource.
-    resume_reads = _PerCallReviewSource()
+    resume_reads = _PerCallGateResumeSource()
     try:
         conductor = Conductor(
             mcp=mcp,

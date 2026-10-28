@@ -131,7 +131,7 @@ class _Reviews:
         return list(self.reviews)
 
     async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
-        # Also the resume's PrHeadSource, as the loop's ``_PerCallReviewSource`` is.
+        # Also the resume's PrHeadSource, as the loop's ``_PerCallGateResumeSource`` is.
         return _HEAD
 
 
