@@ -27,10 +27,25 @@ Two things here, and every SDK-backed role adapter uses both:
   pointing at the binary.
 
 The file is named by the SHA-256 of its content and never deleted. Sessions
-with the same prompt share one file, so concurrent spawns cannot remove a file
-another session is still starting from, and there is no cleanup to get wrong.
+with the same prompt share one file, and there is no cleanup to get wrong.
 A prompt changes only when the code or a repo's manifest does, so the
 directory holds one small file per (prompt, repo) a deploy has used.
+
+Where it lives, and what is trusted (PR-gate on #499 @ 8b818c3):
+
+- The directory is in the **user's own** cache (``%LOCALAPPDATA%`` on Windows,
+  ``$XDG_CACHE_HOME`` or ``~/.cache`` elsewhere), not the shared temp dir. In a
+  shared ``/tmp`` another local user could pre-create the directory (spawns
+  fail) or a file under a name they can compute (the prompt is predictable, so
+  is its hash). Nobody else can create entries in a user's home. On POSIX the
+  directory is also created ``0700`` and refused if it is not ours or others
+  can write to it.
+- An existing file is used only if its bytes are exactly the prompt. Anything
+  else — truncated, edited, planted — is rewritten.
+- Two spawns may race to create the same file. On Windows the loser's
+  ``os.replace`` fails while the winner's ``claude.exe`` has the file open; the
+  file there is then already the right one, so the loser checks the bytes and
+  goes on instead of failing its spawn.
 """
 
 from __future__ import annotations
@@ -38,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -66,27 +82,56 @@ class CommandLineTooLongError(RuntimeError):
 
 
 def _default_prompt_dir() -> Path:
-    return Path(tempfile.gettempdir()) / "spirrow-mindwire" / "system-prompts"
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "spirrow-mindwire" / "system-prompts"
+
+
+def _ensure_private_dir(directory: Path) -> None:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        st = directory.stat()
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise PermissionError(
+                f"system-prompt directory {directory} is writable by other users or not ours "
+                f"(uid={st.st_uid}, mode={oct(st.st_mode & 0o777)}); refusing to use it"
+            )
+
+
+def _holds(path: Path, data: bytes) -> bool:
+    try:
+        return path.read_bytes() == data
+    except OSError:
+        return False
 
 
 def system_prompt_file(text: str, *, directory: Path | None = None) -> SystemPromptFile:
     """Write ``text`` to a content-addressed file and return the SDK option for it.
 
     Written as UTF-8 with no newline translation, so the CLI reads back exactly
-    the string the adapter rendered. An existing file of the same name already
-    holds this content and is left alone; a new one is written to a temporary
+    the string the adapter rendered. A file of the same name is reused only if
+    it holds exactly these bytes; otherwise a new one is written to a temporary
     name and renamed into place, so a concurrent reader never sees half a file.
     """
     data = text.encode("utf-8")
     target_dir = directory if directory is not None else _default_prompt_dir()
+    _ensure_private_dir(target_dir)
     path = target_dir / f"{hashlib.sha256(data).hexdigest()}.md"
-    if not path.is_file():
-        target_dir.mkdir(parents=True, exist_ok=True)
+    if not _holds(path, data):
         fd, tmp = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            os.replace(tmp, path)
+            try:
+                os.replace(tmp, path)
+            except PermissionError:
+                # Lost a race on Windows: a concurrent spawn put the file there and its CLI
+                # has it open. If what is there is ours byte for byte, nothing is lost.
+                if not _holds(path, data):
+                    raise
+                Path(tmp).unlink(missing_ok=True)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
