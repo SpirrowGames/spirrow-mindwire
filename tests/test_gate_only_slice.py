@@ -130,6 +130,10 @@ class _Reviews:
         self.asked += 1
         return list(self.reviews)
 
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        # Also the resume's PrHeadSource, as the loop's ``_PerCallReviewSource`` is.
+        return _HEAD
+
 
 def _rc_reviews() -> _Reviews:
     return _Reviews(
@@ -142,6 +146,10 @@ def _rc_reviews() -> _Reviews:
             )
         ]
     )
+
+
+#: ``_conductor(heads=...)`` default: the review fake doubles as the head source.
+_SAME: Any = object()
 
 
 def _opened() -> _FakeChatroomMcp:
@@ -157,6 +165,7 @@ def _conductor(
     gate: Any,
     rollups: Any,
     reviews: Any = None,
+    heads: Any = _SAME,
     gate_only: bool = False,
     max_rounds: int = 40,
 ) -> Conductor:
@@ -169,6 +178,7 @@ def _conductor(
         orchestrator=gate,
         rollup_source=rollups,
         review_source=reviews,
+        head_source=reviews if heads is _SAME else heads,
         review_login=_GATE_LOGIN,
         gate_only=gate_only,
         max_rounds=max_rounds,
@@ -478,7 +488,9 @@ async def test_running_again_after_the_slice_dispatches_the_implementer(kind: st
     # The msg-6315 reproduction, as a regression test: before PR-A, this second run went through
     # guard (i) to a forced naysayer consult and a human stop.
     mcp, head_id = await _sliced(kind)
-    resume_rollup = _rollup(*(_GREEN if kind == "rc" else _RED))
+    # Only the R4 resume reads the rollup; the RC resume reads the head from its own source
+    # (T-gate-resume-private-repo-pat-forbidden-stalls), so its first rollup read is admission's.
+    resume_rollups = [] if kind == "rc" else [_rollup(*_RED)]
     # The implementer pushes a fix: CI on the new head has only just started (ci_wait).
     after_push = _rollup(
         *_PENDING,
@@ -493,7 +505,7 @@ async def test_running_again_after_the_slice_dispatches_the_implementer(kind: st
         mcp,
         disp,
         gate=gate,
-        rollups=_ScriptedRollupSource(resume_rollup, after_push),
+        rollups=_ScriptedRollupSource(*resume_rollups, after_push),
         reviews=_rc_reviews(),
     ).run()
     assert disp.dispatches == [(Role.IMPLEMENTER, head_id)]
@@ -545,6 +557,30 @@ async def test_gate_only_without_the_review_source_runs_inline(
     with caplog.at_level(logging.INFO):
         outcome = await _conductor(
             mcp, disp, gate=gate, rollups=rollups, reviews=None, gate_only=True
+        ).run()
+    assert disp.dispatches == [(Role.IMPLEMENTER, "m2")]
+    assert outcome.stop_reason is StopReason.NO_PROGRESS
+    assert "conductor.gate_only.ignored reason=resume_unavailable" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_gate_only_without_the_head_source_runs_inline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # T-gate-resume-private-repo-pat-forbidden-stalls: the RC resume reads the PR head from its
+    # own source, so without it the next tick could never VERIFY — slicing would strand the work.
+    mcp = _opened()
+    gate = _RelayGate(mcp, ReviewEvent.REQUEST_CHANGES, RelayRoute.IMPLEMENTER)
+    disp = _ScriptedDispatcher(mcp, {})
+    with caplog.at_level(logging.INFO):
+        outcome = await _conductor(
+            mcp,
+            disp,
+            gate=gate,
+            rollups=_ScriptedRollupSource(_rollup(*_GREEN)),
+            reviews=_rc_reviews(),
+            heads=None,
+            gate_only=True,
         ).run()
     assert disp.dispatches == [(Role.IMPLEMENTER, "m2")]
     assert outcome.stop_reason is StopReason.NO_PROGRESS
@@ -605,6 +641,7 @@ async def test_gate_only_with_no_implementer_persona_still_stops_at_the_human() 
         orchestrator=_RelayGate(mcp, ReviewEvent.APPROVE, RelayRoute.HUMAN),
         rollup_source=_ScriptedRollupSource(_rollup(*_RED)),
         review_source=_rc_reviews(),
+        head_source=_rc_reviews(),
         gate_only=True,
     )
     outcome = await conductor.run()

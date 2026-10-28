@@ -639,6 +639,19 @@ class GitHubClient:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
         return base_ref, head_sha
 
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        """The PR's ``head.sha`` from REST ``GET /pulls/{n}``; raises :class:`GitHubHTTPError`.
+
+        The gate resume's head read for a REQUEST_CHANGES relay
+        (:class:`~spirrow_mindwire.conductor.gate_resume.PrHeadSource`;
+        T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 1). It replaces the
+        GraphQL rollup there because a fine-grained PAT is refused ``statusCheckRollup.contexts``
+        on a private repo, while this endpoint is the one the gate already reads for its diff.
+        Like :meth:`fetch_pr_base_and_head`, ``head.sha`` can lag a push by a moment.
+        """
+        _, head_sha = await self.fetch_pr_base_and_head(pr)
+        return head_sha
+
     async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         """Step 2 of :meth:`fetch_pr_diff`: the three-dot ``compare`` diff, fail-loud.
 

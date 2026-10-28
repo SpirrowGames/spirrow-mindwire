@@ -17,6 +17,10 @@ What is pinned:
 5. A STALLED notice (``pr-gate-relay``, ``NEXT: human``) is not a resume candidate.
 6. ``resume_retry`` is not terminal for head_skip, and its bound is the stall watchdog: the third
    launch on the same head stands down with a STALLED notice.
+7. (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 / msg-7565) The RC resume reads
+   the PR head from its own REST source and never the rollup, so a private repo whose rollup the
+   fine-grained PAT cannot read still VERIFIES; the STALLED notice on the third launch carries the
+   check's ``outcome`` / ``detail``, whatever the outcome — VERIFIED included.
 """
 
 from __future__ import annotations
@@ -135,6 +139,38 @@ class _Reviews:
         return list(self.reviews)
 
 
+class _Heads:
+    """PR-head fake (``PrHeadSource``): a SHA, or an exception to raise (a failed strict read)."""
+
+    def __init__(self, head: str | Exception = _SHA) -> None:
+        self.head = head
+        self.asked: list[PrRef] = []
+
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        self.asked.append(pr)
+        if isinstance(self.head, Exception):
+            raise self.head
+        return self.head
+
+
+class _RaisingRollups:
+    """A rollup source that must not be read (the RC resume never reads the rollup)."""
+
+    def __init__(self) -> None:
+        self.asked: list[PrRef] = []
+
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None:
+        self.asked.append(pr)
+        raise GitHubHTTPError("Resource not accessible by personal access token", status_code=403)
+
+
+#: ``_conductor(heads=...)`` default: a head source answering ``_SHA``.
+_DEFAULT: Any = object()
+
+#: The 403 a fine-grained PAT gets on a private repo (msg-7539).
+_PAT_403 = GitHubHTTPError("Resource not accessible by personal access token", status_code=403)
+
+
 def _review(state: str, *, sha: str = _SHA, login: str = _GATE_LOGIN, at: str) -> ReviewInfo:
     return ReviewInfo(login=login, state=state, commit_id=sha, submitted_at=at)
 
@@ -148,6 +184,7 @@ def _conductor(
     *,
     rollups: Any = None,
     reviews: Any = None,
+    heads: Any = _DEFAULT,
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
     roster: Mapping[str, Role] = _ROSTER,
@@ -160,6 +197,7 @@ def _conductor(
         naysayer_identity="Einstein",
         rollup_source=rollups,
         review_source=reviews,
+        head_source=_Heads() if heads is _DEFAULT else heads,
         launches_same_head=launches_same_head,
         launch_head_msg_id=launch_head_msg_id,
     )
@@ -242,25 +280,28 @@ async def test_a_silent_resumed_implementer_stops_on_no_progress() -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("body", "rollups", "reviews"),
+    ("body", "rollups", "reviews", "heads"),
     [
-        pytest.param(_rc_relay(), _Rollups(None), _Reviews(_RC_REVIEWS), id="rc-rollup-unread"),
+        pytest.param(
+            _rc_relay(), None, _Reviews(_RC_REVIEWS), _Heads(_PAT_403), id="rc-head-raises"
+        ),
         pytest.param(
             _rc_relay(),
             _Rollups(_rollup(*_GREEN)),
             _Reviews(GitHubHTTPError("GET reviews returned 502", status_code=502)),
+            _DEFAULT,
             id="rc-reviews-raise",
         ),
-        pytest.param(_ci_route(), _Rollups(None), None, id="ci-route-rollup-unread"),
+        pytest.param(_ci_route(), _Rollups(None), None, _DEFAULT, id="ci-route-rollup-unread"),
     ],
 )
 async def test_unavailable_stops_on_resume_retry_without_posting(
-    body: str, rollups: Any, reviews: Any, caplog: pytest.LogCaptureFixture
+    body: str, rollups: Any, reviews: Any, heads: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     mcp = _thread(RELAY_AUTHOR, body)
     disp = _dispatcher(mcp)
     with caplog.at_level(logging.WARNING):
-        outcome = await _conductor(mcp, disp, rollups=rollups, reviews=reviews).run()
+        outcome = await _conductor(mcp, disp, rollups=rollups, reviews=reviews, heads=heads).run()
     assert outcome.stop_reason is StopReason.RESUME_RETRY
     assert outcome.last_msg_id == "m2"
     assert mcp.posts == []
@@ -274,17 +315,21 @@ async def test_stale_retries_silently_then_verifies_once_the_head_matches(
     body: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     rollups = _Rollups(_rollup(*_RED, head=_OTHER_SHA))
+    heads = _Heads(_OTHER_SHA)
     mcp = _thread(RELAY_AUTHOR, body)
     disp = _dispatcher(mcp)
     with caplog.at_level(logging.WARNING):
-        outcome = await _conductor(mcp, disp, rollups=rollups, reviews=_Reviews(_RC_REVIEWS)).run()
+        outcome = await _conductor(
+            mcp, disp, rollups=rollups, reviews=_Reviews(_RC_REVIEWS), heads=heads
+        ).run()
     assert outcome.stop_reason is StopReason.RESUME_RETRY
     assert mcp.posts == []
     assert disp.spawns == []
     assert f"relay_sha={_SHA} pr_head={_OTHER_SHA}" in caplog.text
 
     rollups.rollup = _rollup(*_RED, head=_SHA)
-    await _conductor(mcp, disp, rollups=rollups, reviews=_Reviews(_RC_REVIEWS)).run()
+    heads.head = _SHA
+    await _conductor(mcp, disp, rollups=rollups, reviews=_Reviews(_RC_REVIEWS), heads=heads).run()
     assert disp.dispatches[0] == (Role.IMPLEMENTER, "m2")
 
 
@@ -338,7 +383,7 @@ _CONTRADICTED = [
         _rc_relay(), _Rollups(_rollup(*_GREEN)), None, "review_source_not_wired", id="rc-no-source"
     ),
     pytest.param(
-        _rc_relay(), None, _Reviews(_RC_REVIEWS), "rollup_source_not_wired", id="rc-no-rollup"
+        _rc_relay(), None, _Reviews(_RC_REVIEWS), "head_source_not_wired", id="rc-no-head-source"
     ),
     pytest.param(_ci_route(), _Rollups(_rollup(*_GREEN)), None, "rollup_not_red", id="ci-green"),
     pytest.param(
@@ -355,8 +400,9 @@ async def test_contradicted_falls_through_to_the_old_route(
 ) -> None:
     mcp = _thread(RELAY_AUTHOR, body)
     disp = _dispatcher(mcp)
+    heads = None if reason == "head_source_not_wired" else _DEFAULT
     with caplog.at_level(logging.WARNING):
-        outcome = await _conductor(mcp, disp, rollups=rollups, reviews=reviews).run()
+        outcome = await _conductor(mcp, disp, rollups=rollups, reviews=reviews, heads=heads).run()
     # Exactly msg-6315's reproduction: guard (i) redirects, Obj2 forces the naysayer, the run
     # stops at the human. The implementer is never started.
     assert [role for role, _ in disp.dispatches] == [Role.NAYSAYER]
@@ -463,18 +509,20 @@ def test_resume_retry_is_not_terminal_and_the_head_launches_again() -> None:
 async def test_the_third_same_head_launch_stands_down_instead_of_retrying() -> None:
     mcp = _thread(RELAY_AUTHOR, _rc_relay())
     disp = _dispatcher(mcp)
-    rollups = _Rollups(None)  # UNAVAILABLE, every time
+    heads = _Heads(_PAT_403)  # UNAVAILABLE, every time
     outcome = await _conductor(
         mcp,
         disp,
-        rollups=rollups,
+        rollups=_Rollups(None),
         reviews=_Reviews(_RC_REVIEWS),
+        heads=heads,
         launches_same_head=3,
         launch_head_msg_id="m2",
     ).run()
     assert outcome.stop_reason is StopReason.STALLED
     assert disp.spawns == []
-    assert rollups.asked == []  # stands down before reading GitHub
+    # msg-7565: the check runs once on the stand-down launch too, so the notice can say why.
+    assert len(heads.asked) == 1
     assert "NEXT: human" in mcp.posts[-1]["content"]
     # Below the threshold the same thread is a silent retry.
     mcp2 = _thread(RELAY_AUTHOR, _rc_relay())
@@ -483,8 +531,184 @@ async def test_the_third_same_head_launch_stands_down_instead_of_retrying() -> N
         _dispatcher(mcp2),
         rollups=_Rollups(None),
         reviews=_Reviews(_RC_REVIEWS),
+        heads=_Heads(_PAT_403),
         launches_same_head=2,
         launch_head_msg_id="m2",
     ).run()
     assert outcome2.stop_reason is StopReason.RESUME_RETRY
     assert mcp2.posts == []
+
+
+# --------------------------------------------------------------------------- #
+# 7. private repo: the RC resume never reads the rollup; STALLED carries the cause
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("no_admission")
+@pytest.mark.parametrize(
+    "rollups",
+    [
+        pytest.param(None, id="rollup-not-wired"),
+        pytest.param(_Rollups(None), id="rollup-unread"),
+        pytest.param(_RaisingRollups(), id="rollup-403"),
+    ],
+)
+async def test_rc_relay_verifies_on_a_private_repo_without_the_rollup(rollups: Any) -> None:
+    # The voxelworld regression (msg-7539): the fine-grained PAT is refused the rollup's GraphQL
+    # contexts, yet the head (REST) and the reviews are readable, so the RC resume VERIFIES.
+    mcp = _thread(RELAY_AUTHOR, _rc_relay())
+    disp = _dispatcher(mcp)
+    await _conductor(mcp, disp, rollups=rollups, reviews=_Reviews(_RC_REVIEWS)).run()
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m2")
+    assert Role.NAYSAYER not in [role for role, _ in disp.dispatches]
+    if rollups is not None:
+        assert rollups.asked == []  # not even asked
+
+
+def _rc_candidate() -> Any:
+    cand = resume_candidate(author=RELAY_AUTHOR, body=_rc_relay(), names_implementer=True)
+    assert cand is not None
+    return cand
+
+
+@pytest.mark.anyio
+async def test_verify_rc_reads_the_head_source_not_the_rollup() -> None:
+    rollups = _RaisingRollups()
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=rollups,
+        review_source=_Reviews(_RC_REVIEWS),
+        review_login=_GATE_LOGIN,
+        head_source=_Heads(),
+    )
+    assert check.outcome is ResumeOutcome.VERIFIED
+    assert check.pr_head == _SHA
+    assert rollups.asked == []
+    # No rollup source at all is not CONTRADICTED for RC (it was before this change).
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=None,
+        review_source=_Reviews(_RC_REVIEWS),
+        review_login=_GATE_LOGIN,
+        head_source=_Heads(),
+    )
+    assert check.outcome is ResumeOutcome.VERIFIED
+
+
+@pytest.mark.anyio
+async def test_verify_rc_head_read_failure_is_unavailable_and_a_moved_head_is_stale() -> None:
+    reviews = _Reviews(_RC_REVIEWS)
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=None,
+        review_source=reviews,
+        review_login=_GATE_LOGIN,
+        head_source=_Heads(_PAT_403),
+    )
+    assert check.outcome is ResumeOutcome.UNAVAILABLE
+    assert check.detail.startswith("head: ")
+    assert "Resource not accessible" in check.detail
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=None,
+        review_source=reviews,
+        review_login=_GATE_LOGIN,
+        head_source=_Heads(_OTHER_SHA),
+    )
+    assert check.outcome is ResumeOutcome.STALE
+    assert check.pr_head == _OTHER_SHA
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=None,
+        review_source=reviews,
+        review_login=_GATE_LOGIN,
+        head_source=_Heads(""),
+    )
+    assert check.outcome is ResumeOutcome.UNAVAILABLE
+
+
+@pytest.mark.anyio
+async def test_verify_missing_sources_are_contradicted_per_kind() -> None:
+    check = await verify_resume(
+        _rc_candidate(),
+        rollup_source=_Rollups(_rollup(*_GREEN)),
+        review_source=_Reviews(_RC_REVIEWS),
+        review_login=_GATE_LOGIN,
+        head_source=None,
+    )
+    assert (check.outcome, check.detail) == (ResumeOutcome.CONTRADICTED, "head_source_not_wired")
+    route = resume_candidate(author=RELAY_AUTHOR, body=_ci_route(), names_implementer=True)
+    assert route is not None
+    # CI_ROUTE is unchanged: no rollup source is still CONTRADICTED, and a head source is unused.
+    heads = _Heads()
+    check = await verify_resume(
+        route, rollup_source=None, review_source=None, review_login=_GATE_LOGIN, head_source=heads
+    )
+    assert (check.outcome, check.detail) == (ResumeOutcome.CONTRADICTED, "rollup_source_not_wired")
+    assert heads.asked == []
+
+
+_STALL_CASES = [
+    pytest.param(_Reviews(_RC_REVIEWS), _Heads(_PAT_403), "unavailable", id="unavailable"),
+    pytest.param(_Reviews(_RC_REVIEWS), _Heads(_OTHER_SHA), "stale", id="stale"),
+    pytest.param(_Reviews([]), _Heads(), "contradicted", id="contradicted"),
+    pytest.param(_Reviews(_RC_REVIEWS), _Heads(), "verified", id="verified"),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("reviews", "heads", "outcome_value"), _STALL_CASES)
+async def test_the_stall_launch_stands_down_on_every_outcome_and_names_it(
+    reviews: Any, heads: Any, outcome_value: str
+) -> None:
+    # msg-7565: the watchdog wins whatever the check says — VERIFIED included, because the count
+    # is of the head, and a VERIFIED dispatch to a silent implementer leaves that head in place.
+    mcp = _thread(RELAY_AUTHOR, _rc_relay())
+    disp = _dispatcher(mcp)
+    outcome = await _conductor(
+        mcp,
+        disp,
+        rollups=_RaisingRollups(),
+        reviews=reviews,
+        heads=heads,
+        launches_same_head=3,
+        launch_head_msg_id="m2",
+    ).run()
+    assert outcome.stop_reason is StopReason.STALLED
+    assert disp.spawns == []
+    assert disp.dispatches == []
+    body = mcp.posts[-1]["content"]
+    assert f"- 直前の gate_resume: `outcome={outcome_value} detail=" in body
+    assert "原因は特定していません" not in body
+    assert body.rstrip().endswith("NEXT: human")
+
+
+@pytest.mark.anyio
+async def test_a_silent_implementer_after_verified_is_still_bounded_by_the_watchdog() -> None:
+    # The regression msg-7565 names: had the watchdog been consulted only on retry outcomes, a
+    # VERIFIED head whose implementer never posts would be resumed forever.
+    mcp = _thread(RELAY_AUTHOR, _rc_relay())
+    for launch in (1, 2):
+        disp = _ScriptedDispatcher(mcp, {})  # the implementer runs and posts nothing
+        outcome = await _conductor(
+            mcp,
+            disp,
+            reviews=_Reviews(_RC_REVIEWS),
+            launches_same_head=launch,
+            launch_head_msg_id="m2",
+        ).run()
+        assert disp.dispatches == [(Role.IMPLEMENTER, "m2")]
+        assert outcome.stop_reason is StopReason.NO_PROGRESS
+        assert mcp.posts == []
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(
+        mcp,
+        disp,
+        reviews=_Reviews(_RC_REVIEWS),
+        launches_same_head=3,
+        launch_head_msg_id="m2",
+    ).run()
+    assert outcome.stop_reason is StopReason.STALLED
+    assert disp.dispatches == []
+    assert "outcome=verified" in mcp.posts[-1]["content"]
