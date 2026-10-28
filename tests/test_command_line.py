@@ -37,6 +37,9 @@ from spirrow_mindwire.value_objects import Event, ReplyDraft, Role, ThreadRef
 
 _OBLIGATIONS = load_manifest()
 
+#: Taken at import, before ``conftest``'s autouse fixture points the default at a temp dir.
+_REAL_DEFAULT_PROMPT_DIR = _command_line._default_prompt_dir
+
 #: Longer than the limit on its own, so it fails if it ever lands on the command line again.
 _HUGE = "x" * (WINDOWS_COMMAND_LINE_LIMIT + 1000)
 
@@ -99,13 +102,19 @@ def test_losing_the_replace_race_to_a_different_file_still_fails(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_tests_do_not_write_prompts_into_the_real_cache() -> None:
+    """``conftest`` redirects the default; a prompt written with no directory lands outside it."""
+    path = Path(system_prompt_file("isolation probe")["path"])
+    assert not path.is_relative_to(_REAL_DEFAULT_PROMPT_DIR())
+
+
 def test_default_directory_is_the_users_cache_not_shared_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert not _command_line._default_prompt_dir().is_relative_to(tempfile.gettempdir())
+    assert not _REAL_DEFAULT_PROMPT_DIR().is_relative_to(tempfile.gettempdir())
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    assert _command_line._default_prompt_dir() == tmp_path / "spirrow-mindwire" / "system-prompts"
+    assert _REAL_DEFAULT_PROMPT_DIR() == tmp_path / "spirrow-mindwire" / "system-prompts"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
