@@ -146,6 +146,8 @@ from .gate_records import (
     verdict_heads,
 )
 from .gate_resume import (
+    PrHeadSource,
+    ResumeCheck,
     ResumeOutcome,
     ReviewSource,
     log_resume_check,
@@ -514,6 +516,14 @@ class RouteDecision:
     stop_reason: StopReason | None
 
 
+def _resume_cause(check: ResumeCheck) -> str:
+    """The STALLED notice's ``cause`` for a gate-resume check (Bohr msg-7563 修正 3).
+
+    ``outcome=<o> detail=<d>``; :func:`.stall.sanitize_cause` makes it one code-span-safe line.
+    """
+    return f"outcome={check.outcome.value} detail={check.detail}"
+
+
 class Conductor:
     """Serial, NEXT-driven driver for one design thread (the autonomous relay, msg-520)."""
 
@@ -535,6 +545,7 @@ class Conductor:
         control: LoopControl | None = None,
         rollup_source: CheckRollupSource | None = None,
         review_source: ReviewSource | None = None,
+        head_source: PrHeadSource | None = None,
         review_login: str = DEFAULT_REVIEW_LOGIN,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
@@ -609,6 +620,11 @@ class Conductor:
         # REQUEST_CHANGES relay left at the head, and the login whose reviews count as the gate's.
         # ``None`` makes every RC resume CONTRADICTED (fall through to ``_route``), never VERIFIED.
         self._review_source = review_source
+        # The RC resume's PR-head read (REST ``GET /pulls/{n}``), kept off the rollup because a
+        # fine-grained PAT is refused the rollup's GraphQL contexts on a private repo
+        # (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 1). ``None`` makes
+        # every RC resume CONTRADICTED, like a missing review source.
+        self._head_source = head_source
         self._review_login = review_login
         # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1' / msg-6316). Set only
         # by the sweep's gate-lane launch (``--gate-only``); a hand run and a role-lane launch keep
@@ -1000,19 +1016,29 @@ class Conductor:
             )
             resume_identity = self._implementer_identity
             if candidate is not None and resume_identity:
-                # The watchdog first: UNAVAILABLE / STALE post nothing, so this is their bound.
-                stalled = await self._stand_down_if_stalled(
-                    round_index, latest_msg_id, resume_identity, forced, forced_saveable
-                )
-                if stalled is not None:
-                    return stalled
+                # Verify once, then the watchdog, whatever the outcome (Bohr msg-7565, endorsed by
+                # Einstein): UNAVAILABLE / STALE post nothing, and a VERIFIED dispatch of an
+                # implementer that posts nothing leaves the same head too — ``launches_same_head``
+                # counts the head, not the role — so this one check is the bound on all of them.
+                # The check's outcome rides into the STALLED notice as its ``cause``.
                 check = await verify_resume(
                     candidate,
                     rollup_source=self._rollup_source,
                     review_source=self._review_source,
                     review_login=self._review_login,
+                    head_source=self._head_source,
                 )
                 log_resume_check(candidate, check)
+                stalled = await self._stand_down_if_stalled(
+                    round_index,
+                    latest_msg_id,
+                    resume_identity,
+                    forced,
+                    forced_saveable,
+                    cause=_resume_cause(check),
+                )
+                if stalled is not None:
+                    return stalled
                 if check.outcome is ResumeOutcome.VERIFIED:
                     gave_up = await self._dispatch_implementer(
                         sessions,
@@ -3347,11 +3373,15 @@ class Conductor:
         target_identity: str,
         forced: int,
         forced_saveable: int,
+        *,
+        cause: str | None = None,
     ) -> ConductorOutcome | None:
         """T42 watchdog: stand down (STALLED notice, no spawn) or return ``None`` to go on.
 
         Extracted so the ordinary role path and the gate resume (:mod:`.gate_resume`) share one
         copy; the resume's silent ``resume_retry`` stops rely on it as their only bound.
+        ``cause`` is the gate resume's check on this launch (:func:`_resume_cause`), carried into
+        the notice; the ordinary role path passes none and its notice is unchanged.
         """
         if round_index != 0 or not is_stalled(
             launches_same_head=self._launches_same_head,
@@ -3365,6 +3395,7 @@ class Conductor:
             head_msg_id=latest_msg_id,
             launches_same_head=self._launches_same_head,
             target=target_identity,
+            cause=cause,
         )
         emit_stalled(stall_event)
         # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader: the human
@@ -3403,7 +3434,7 @@ class Conductor:
         """
         if not self._gate_only:
             return False
-        if self._rollup_source is None or self._review_source is None:
+        if self._rollup_source is None or self._review_source is None or self._head_source is None:
             logger.info("conductor.gate_only.ignored reason=resume_unavailable")
             return False
         body = _content(posted)

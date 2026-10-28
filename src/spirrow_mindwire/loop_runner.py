@@ -859,16 +859,23 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
-class _PerCallReviewSource:
-    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+class _PerCallGateResumeSource:
+    """``ReviewSource`` + ``PrHeadSource`` for the gate resume (:mod:`.conductor.gate_resume`).
 
-    Same shape and token as :class:`_PerCallCheckRollupSource`: the resume compares the reviews
-    against the rollup, so both must be read through the credential the gate itself uses.
+    One client per read.
+
+    Same shape and token as :class:`_PerCallCheckRollupSource`, so the resume reads through the
+    credential the gate itself uses.
 
     Unlike the rollup source this one RAISES on a failed read (``fetch_pr_reviews_strict``):
     the resume must tell "no gate review on the head" (CONTRADICTED → the human) apart from
     "GitHub could not be asked" (UNAVAILABLE → retry next tick), and the fail-soft read
     collapses the two into ``[]`` (Bohr msg-6318).
+
+    It is also the resume's ``PrHeadSource`` (T-gate-resume-private-repo-pat-forbidden-stalls,
+    Bohr msg-7563 修正 1): an RC resume reads the PR head from REST ``GET /pulls/{n}`` here, with
+    the same token as the reviews, instead of from the GraphQL rollup a fine-grained PAT cannot
+    read on a private repo. Also fail-loud: a failed read is UNAVAILABLE, never a head.
     """
 
     def __init__(self, token: str | None = None) -> None:
@@ -878,6 +885,11 @@ class _PerCallReviewSource:
         token = self._token if self._token is not None else naysayer_github_token()
         async with GitHubClient(token) as client:
             return await client.fetch_pr_reviews_strict(pr)
+
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_head_sha_strict(pr)
 
 
 def build_conductor(
@@ -1003,6 +1015,8 @@ def build_conductor(
         if summon_owner_project and summon_owner_project.strip() != loop_cfg.project
         else None
     )
+    # One per-call source serves the gate resume as both its ReviewSource and its PrHeadSource.
+    resume_reads = _PerCallGateResumeSource()
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -1034,7 +1048,12 @@ def build_conductor(
             # checks an RC relay left at the head against GitHub before the implementer is
             # resumed from it. Wired unconditionally like the rollup; an unreadable answer is
             # UNAVAILABLE (retry next tick), never VERIFIED.
-            review_source=_PerCallReviewSource(),
+            review_source=resume_reads,
+            # The RC resume's PR-head read (REST ``GET /pulls/{n}``), the same per-call source
+            # and token as the reviews (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr
+            # msg-7563 修正 1): a fine-grained PAT cannot read the rollup's GraphQL contexts on
+            # a private repo, so the RC resume no longer reads the rollup at all.
+            head_source=resume_reads,
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
             tierc_annotations_path=tierc_annotations_path,
