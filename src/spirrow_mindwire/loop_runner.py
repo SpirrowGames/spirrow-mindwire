@@ -1075,7 +1075,9 @@ def build_conductor(
             head_source=resume_reads,
             # Settled-PR check (Bohr msg-7560 v0.4 (b)): a ``NEXT: pr-review`` on a PR GitHub
             # already reports merged / closed posts that fact instead of re-gating. Wired
-            # unconditionally; an unreadable state keeps the pre-change path.
+            # unconditionally; an unreadable state keeps the pre-change path. No token argument on
+            # purpose, exactly as ``rollup_source`` above: each read resolves
+            # :func:`naysayer_github_token` at call time (tests/test_loop_runner.py pins both).
             pr_state_source=_PerCallPrStateSource(),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
