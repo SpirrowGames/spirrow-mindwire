@@ -387,13 +387,15 @@ def is_merge_self_relay(body: str) -> bool:
     return any(line.startswith(MERGE_SELF_MARK) for line in body.splitlines())
 
 
-#: Appended (above ``NEXT: <implementer>``) ONLY on the MERGE route (D3: msg-7580's steps and table
-#: plus msg-7582's Observation 1 sentence). The merge itself is a LOCAL ``git merge`` of the
-#: reviewed sha and a plain (non-force) ``git push`` of the base, never ``gh pr merge``: the
-#: implementer's command classifier maps ``gh pr merge`` to a merge-to-main whatever the base, and
-#: the denial halts the session (OBL-MERGE-MECHANISM, spec/process/obligations.yaml). Merging the
-#: reviewed sha rather than the branch tip is what ``--match-head-commit`` gave the original D3: a
-#: push that lands after the review is never merged by this turn. Like
+#: Appended (above ``NEXT: <implementer>``) ONLY on the MERGE route. D3 v0.5.1 (Bohr msg-7591,
+#: Einstein msg-7592): msg-7580's four steps and five-row table, msg-7582's Observation 1 sentence,
+#: and a merge done LOCALLY on a detached HEAD — never ``gh pr merge`` (OBL-MERGE-MECHANISM: denied
+#: as a merge-to-main whatever the base, and the denial halts the session), never the local
+#: ``develop`` branch, and never ``reset --hard`` / ``--force`` (Tier C history rewrite). Merging
+#: the reviewed sha itself is what ``--match-head-commit`` gave the original D3: a push that lands
+#: after the review is never merged by this turn. A rejected push leaves only an unreferenced merge
+#: commit on a detached HEAD, which no later turn builds on (each starts from a fresh
+#: ``origin/develop``). The merge message names the PR (Einstein msg-7592 advisory 1). Like
 #: :data:`ADVISORY_SELF_TRIAGE_INSTRUCTION` it must never contain a column-zero ``MERGE-WAIT:`` /
 #: ``MERGE-SELF:`` line, an objections sentinel, a verdict footer, or a line that parses as a
 #: ``NEXT:`` hand-off — the relay readers re-parse relay bodies (pinned in test_relay_route.py).
@@ -401,20 +403,27 @@ MERGE_SELF_INSTRUCTION = (
     "base が自動 merge の許可リスト (develop) にある PR の APPROVE で、CI は緑。human に merge を"
     "頼まず、自分で merge すること。PR とレビューした sha は、上の `MERGE-SELF:` 行の `pr=` と "
     "`head=` を使う。`gh pr merge` は使わない (base によらず main への merge として拒否され、"
-    "セッションが止まる)。merge は手元の `git merge` と `git push` で行う。\n"
+    "セッションが止まる)。merge は detached HEAD 上の `git merge` と `git push` で行い、手元の "
+    "develop ブランチには触らない。\n"
     "\n"
     "手順 (状態を読み直すのは 1 回だけ。merge の再試行はしない):\n"
     "1. `gh pr view <n> --repo <owner/repo> --json state,headRefOid,mergeCommit` で状態を読み、"
     "下の表の 1〜3 行目に当たればその行に従う。`gh pr view` が失敗した、または結果を読めなかった"
     "場合は merge を実行せず、5 行目に従う。\n"
     "2. 1〜3 行目のどれにも当たらない (open で、headRefOid がレビューした sha と一致する) ときに"
-    "限り merge する: `git fetch origin` → `git switch develop` (手元に無ければ "
-    "`git switch -c develop --track origin/develop`) → `git merge --ff-only origin/develop` → "
-    "`git merge --no-ff <レビューした sha>` → `git push origin develop` (force は付けない)。push が"
-    "通ったら 4 行目に従う。終わったら既定ブランチへ `git switch` で戻る。\n"
-    "3. merge か push が失敗したら (conflict なら `git merge --abort` してから)、もう一度だけ "
-    "`gh pr view` で状態を読み直し、1〜3 行目で分類し直す。読み直しに失敗した場合も 5 行目に"
+    "限り、次の順で merge する:\n"
+    "   a. `git status --porcelain` に何か出たら、何も始めずに 5 行目に従う。\n"
+    '   b. `git fetch origin develop "pull/<n>/head"` を実行し、'
+    "`git cat-file -e <レビューした sha>` で sha が取れたかを確かめる。取れていなければ手順 3 に"
+    "進む。\n"
+    "   c. `git switch --detach origin/develop`\n"
+    '   d. `git merge --no-ff <レビューした sha> -m "Merge PR #<n> into develop"`\n'
+    "   e. `git push origin HEAD:refs/heads/develop` (force は付けない)。push が通ったら 4 行目に"
     "従う。\n"
+    "   どこで止まっても片付けは 2 つだけ: `git rev-parse -q --verify MERGE_HEAD` が通る (conflict"
+    " の途中) なら `git merge --abort`、そのあと既定ブランチへ `git switch` で戻る。\n"
+    "3. fetch・merge・push のどれかが失敗したら、もう一度だけ `gh pr view` で状態を読み直し、"
+    "1〜3 行目で分類し直す。読み直しに失敗した場合も 5 行目に従う。\n"
     "4. 読み直しても 1〜3 行目のどれにも当たらない場合だけ、5 行目に従う。\n"
     "\n"
     "| 状態 (読み直した結果も含む) | すること |\n"
@@ -426,8 +435,8 @@ MERGE_SELF_INSTRUCTION = (
     "戻す |\n"
     "| 4. merge に成功 | merge commit を報告し、proposer に `NEXT:` で渡す |\n"
     "| 5. 読み直しても open で head が一致したまま merge が失敗した (conflict、branch "
-    "protection、権限など)、または状態が読めない | エラーの本文をそのまま報告し、proposer に "
-    "`NEXT:` で渡す |\n"
+    "protection、権限など)、作業ツリーがきれいでない、または状態が読めない | エラーの本文を"
+    "そのまま報告し、proposer に `NEXT:` で渡す |\n"
     "\n"
     "どの行でも `TIER-C:` 行や `NEXT: human` は書かないこと。"
 )

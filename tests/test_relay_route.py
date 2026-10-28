@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 import pytest
@@ -599,17 +600,25 @@ async def test_merge_relay_parses_as_its_critique(objections: str | None) -> Non
 
 
 def test_merge_self_instruction_snapshot() -> None:
-    """D3 wording (msg-7580 steps 1-4 and table rows 1-5, msg-7582 Observation 1). The branch is
-    taken by the implementer's model, so the text is the contract: change it on purpose, here."""
+    """D3 v0.5.1 wording (msg-7580 steps 1-4 and table rows 1-5, msg-7582 Observation 1, msg-7591
+    detached-HEAD merge, msg-7592 advisory 1 merge message). The branch is taken by the
+    implementer's model, so the text is the contract: change it on purpose, here."""
     instr = MERGE_SELF_INSTRUCTION
     for needle in (
         # steps
         "1. `gh pr view <n> --repo <owner/repo> --json state,headRefOid,mergeCommit`",
         "`gh pr view` が失敗した、または結果を読めなかった場合は merge を実行せず、5 行目に従う",
         "2. 1〜3 行目のどれにも当たらない",
-        "`git merge --no-ff <レビューした sha>`",
-        "`git push origin develop` (force は付けない)",
-        "3. merge か push が失敗したら",
+        "a. `git status --porcelain` に何か出たら、何も始めずに 5 行目に従う",
+        'b. `git fetch origin develop "pull/<n>/head"`',
+        "`git cat-file -e <レビューした sha>` で sha が取れたかを確かめる",
+        "取れていなければ手順 3 に進む",
+        "c. `git switch --detach origin/develop`",
+        'd. `git merge --no-ff <レビューした sha> -m "Merge PR #<n> into develop"`',
+        "e. `git push origin HEAD:refs/heads/develop` (force は付けない)",
+        "`git merge --abort`",
+        "手元の develop ブランチには触らない",
+        "3. fetch・merge・push のどれかが失敗したら",
         "もう一度だけ `gh pr view` で状態を読み直し、1〜3 行目で分類し直す",
         "読み直しに失敗した場合も 5 行目に従う",
         "4. 読み直しても 1〜3 行目のどれにも当たらない場合だけ、5 行目に従う",
@@ -629,4 +638,89 @@ def test_merge_self_instruction_snapshot() -> None:
     ):
         assert needle in instr, needle
     digest = hashlib.sha256(instr.encode("utf-8")).hexdigest()
-    assert digest == "ef793789b25ad1cbf68ee0d21a74cf93ad12f52a63189201cb0eff0a7ecf04bb"
+    assert digest == "5fa0e489f68feec77f0638f309171800d587b49b56cada2afe0a3650b4ddf499"
+
+
+# ---- msg-7591 "実装時の要件": every command the instruction tells the implementer to run ------ #
+#
+# What "the real permission check" is, measured rather than assumed: the loop's implementer has NO
+# per-call classifier. ``ImplementerSdkAdapter`` runs ``bypassPermissions`` with
+# ``can_use_tool=None`` (removed 2026-08-20; pinned by test_spawn_routes_inference_via_base_url in
+# tests/test_implementer_adapter.py), so no in-process check can refuse a refspec push to develop.
+# What remains is (a) the server-side ``guard-default-branch`` ruleset, which covers only the
+# default branch (main), and (b) the Tier A / Tier C policy the implementer is TOLD in its system
+# prompt and in OBL-MERGE-MECHANISM — the one the model holds itself to, and the one that halts a
+# session when a harness enforces it. The tests below hold every command to (b), so a future
+# edit cannot slip a forbidden verb into the text the model is asked to execute.
+
+_CMD_RE = re.compile(r"`((?:git|gh) [^`]*)`")
+
+#: The commands the MERGE route may run, in instruction order. Adding one is a deliberate change.
+_EXPECTED_COMMANDS = [
+    "gh pr merge",  # named only to forbid it ("`gh pr merge` は使わない")
+    "git merge",  # prose: "merge は detached HEAD 上の `git merge` と `git push` で行い"
+    "git push",
+    "gh pr view <n> --repo <owner/repo> --json state,headRefOid,mergeCommit",
+    "gh pr view",
+    "git status --porcelain",
+    'git fetch origin develop "pull/<n>/head"',
+    "git cat-file -e <レビューした sha>",
+    "git switch --detach origin/develop",
+    'git merge --no-ff <レビューした sha> -m "Merge PR #<n> into develop"',
+    "git push origin HEAD:refs/heads/develop",
+    "git rev-parse -q --verify MERGE_HEAD",
+    "git merge --abort",
+    "git switch",
+    "gh pr view",
+]
+
+#: Tier C as the implementer system prompt states it (merge/push to main, force-push, history
+#: rewrite, deleting) plus OBL-MERGE-MECHANISM's ``gh pr merge``.
+_FORBIDDEN = [
+    re.compile(r"\breset\b"),
+    re.compile(r"\brebase\b"),
+    re.compile(r"\bfilter-branch\b"),
+    re.compile(r"--force\b|--force-with-lease\b|(?:^|\s)-f\b"),
+    re.compile(r"\bpush\b.*\s\+\S"),  # +refspec is a force push
+    re.compile(r"\bmain\b|\bmaster\b"),
+    re.compile(r"--delete\b|(?:^|\s)-[dD]\b|\bbranch\b|\brm\b|\bclean\b|\bstash\b"),
+    re.compile(r"\bcheckout\b"),
+]
+
+
+def _instructed_commands() -> list[str]:
+    return _CMD_RE.findall(MERGE_SELF_INSTRUCTION)
+
+
+def test_merge_self_command_inventory_is_exactly_the_reviewed_set() -> None:
+    assert _instructed_commands() == _EXPECTED_COMMANDS
+
+
+def test_merge_self_commands_stay_inside_the_implementer_allow_list() -> None:
+    for cmd in _instructed_commands():
+        for pattern in _FORBIDDEN:
+            assert not pattern.search(cmd), (cmd, pattern.pattern)
+    # gh pr merge appears only as the thing NOT to use.
+    assert "`gh pr merge` は使わない" in MERGE_SELF_INSTRUCTION
+    assert _instructed_commands().count("gh pr merge") == 1
+
+
+def test_merge_self_pushes_only_develop_and_never_forces() -> None:
+    pushes = [c for c in _instructed_commands() if c.startswith("git push ")]
+    assert pushes == ["git push origin HEAD:refs/heads/develop"]
+    for push in pushes:
+        dest = push.split()[-1].split(":")[-1]
+        assert dest == "refs/heads/develop"
+        assert not push.split()[-1].startswith("+")
+
+
+def test_merge_self_never_moves_a_local_branch() -> None:
+    # msg-7591: the merge runs on a detached HEAD so a rejected push leaves no local branch
+    # holding an unpushed merge commit (Einstein msg-7590), with no reset needed to undo it.
+    switches = [c for c in _instructed_commands() if c.startswith("git switch")]
+    assert switches == ["git switch --detach origin/develop", "git switch"]
+    assert "git switch develop" not in MERGE_SELF_INSTRUCTION
+    assert "-c develop" not in MERGE_SELF_INSTRUCTION
+    assert "--ff-only" not in MERGE_SELF_INSTRUCTION
+    for forbidden in ("reset --hard", "--force", "gh pr merge <"):
+        assert forbidden not in MERGE_SELF_INSTRUCTION
