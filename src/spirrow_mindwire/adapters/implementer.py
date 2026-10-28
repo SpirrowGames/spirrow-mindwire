@@ -115,6 +115,7 @@ from ..value_objects import (
 )
 from . import _sdk_job_hook
 from ._cli_selection import cli_selection_kwargs
+from ._command_line import check_command_line, system_prompt_file
 from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
@@ -615,7 +616,9 @@ class ImplementerSdkAdapter:
         }
         kwargs: dict[str, Any] = {
             "cwd": self._cwd,
-            "system_prompt": self._system_prompt,
+            # Through a file, not ``--system-prompt``: this prompt carries the ADR index and
+            # outgrew the Windows command-line limit on 2026-10-24 (see ``_command_line``).
+            "system_prompt": system_prompt_file(self._system_prompt),
             # Expose the implementer's built-in toolset. ``tools=[]`` DISABLES all
             # built-ins (SDK 0.1.77 → ``--tools ""``), so this list is what the
             # session can call — and, with no per-call guard, the only limit on it.
@@ -673,6 +676,12 @@ class ImplementerSdkAdapter:
             )
         ledger = self._ledger_for(thread_ref, ctx)
         options = self._make_options(ledger_server=None if ledger is None else ledger[1])
+        try:
+            check_command_line(options)
+        except Exception as exc:
+            raise ImplementerSdkSpawnError(
+                f"spawn failed for role {role.value} on thread {thread_ref.thread_id}: {exc}"
+            ) from exc
 
         now = datetime.now(UTC)
         session = _Session(

@@ -263,7 +263,9 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
     assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
     assert stored_opts.model == "naysayer"
-    assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
+    # Principles injected (D-1). The prompt reaches the CLI as a file (``_command_line``).
+    prompt_text = Path(stored_opts.system_prompt["path"]).read_text(encoding="utf-8")
+    assert "silence is negligence" in prompt_text
     # The per-turn factory receives a COPY of the stored options that differs in
     # exactly one place — the trace header env (T-per-turn-backend-attestation) —
     # so the marker and the subprocess cannot drift on anything the marker says.
