@@ -392,6 +392,39 @@ async def test_r6_on_a_merge_wait_head_keeps_the_merge_wait_lane() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("latest_is_merge_wait", [True, False])
+async def test_r6_merge_wait_follows_the_latest_verdict_on_the_head(
+    latest_is_merge_wait: bool,
+) -> None:
+    # Two verdict relays on the same head (a re-run). The note follows the newest one only;
+    # the older, superseded verdict decides nothing (PR #504 gate advisory, reverse scan).
+    approve = (
+        f"{render_relay_heading(_REF, _HEAD)}\n\nVERDICT: approve (ci=success)\n\nok\n\n"
+        f"{MERGE_WAIT_LINE}\nNEXT: human"
+    )
+    comment = (
+        f"{render_relay_heading(_REF, _HEAD)}\n\nVERDICT: comment (ci=success)\n\nnote\n\n"
+        "NEXT: human"
+    )
+    older, newer = (comment, approve) if latest_is_merge_wait else (approve, comment)
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content=f"opened\n\nNEXT: pr-review {_REF}")
+    mcp.seed(author="pr-gate-relay", content=older)
+    mcp.seed(author="pr-gate-relay", content=newer)
+    mcp.seed(author="Heisenberg", content=f"again\n\nNEXT: pr-review {_REF}")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    rollup = _ScriptedRollupSource(_rollup(*_GREEN))
+    outcome = await _settled_conductor(
+        mcp, state=_StateSource(_OPEN), gate=gate, rollup=rollup
+    ).run()
+    assert gate.fired == []
+    body = mcp.posts[-1]["content"]
+    assert (MERGE_WAIT_LINE in body) is latest_is_merge_wait
+    expected = StopReason.MERGE_WAIT if latest_is_merge_wait else StopReason.HUMAN
+    assert outcome.stop_reason is expected
+
+
+@pytest.mark.anyio
 async def test_conductor_first_then_1b_reports_a_merge_exactly_once() -> None:
     # The degraded order v0.4 names: the conductor could not read the PR state (so the settled
     # check was skipped), hit R6 and posted its note. 1b then reads the note's admission heading,

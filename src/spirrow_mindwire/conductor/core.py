@@ -3233,11 +3233,14 @@ class Conductor:
         the board's merge-wait lane (``parked_lane``) instead of listing it as a decision.
         """
         head = normalize_sha(rollup.head_sha)
+        # Newest first, stopping at the first verdict relay for this head: that one is "the
+        # latest verdict relay for this head", and older, superseded relays are never parsed.
         merge_wait = False
-        for msg in messages:
+        for msg in reversed(messages):
             body = _content(msg)
             if _author(msg) == RELAY_AUTHOR and head in verdict_heads([body]):
                 merge_wait = is_merge_wait_relay(body)
+                break
         tail = f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}" if merge_wait else f"NEXT: {HUMAN_TOKEN}"
         body = (
             f"{render_admission_heading(pr_ref)}\n\n"
