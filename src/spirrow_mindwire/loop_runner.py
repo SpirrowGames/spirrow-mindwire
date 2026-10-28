@@ -132,6 +132,7 @@ from .github.client import (
     EnvironmentTerminalError,
     GitHubClient,
     PrRef,
+    PrState,
     ReviewInfo,
     naysayer_github_token,
 )
@@ -892,6 +893,24 @@ class _PerCallGateResumeSource:
             return await client.fetch_pr_head_sha_strict(pr)
 
 
+class _PerCallPrStateSource:
+    """``PrStateSource`` for the settled-PR check (T-merged-pr-fact-never-reaches-design-thread).
+
+    One client per read, and the same token as the rollup and the gate, so the check sees the PR
+    through the credential the gate it may skip would have used. Never raises in practice:
+    :meth:`GitHubClient.fetch_pr_state` answers ``UNRESOLVABLE`` on every failure, and the
+    conductor reads that (or a raise) as "could not see" and keeps its pre-change path.
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_state(pr)
+
+
 def build_conductor(
     settings: MindwireSettings,
     *,
@@ -1054,6 +1073,10 @@ def build_conductor(
             # msg-7563 修正 1): a fine-grained PAT cannot read the rollup's GraphQL contexts on
             # a private repo, so the RC resume no longer reads the rollup at all.
             head_source=resume_reads,
+            # Settled-PR check (Bohr msg-7560 v0.4 (b)): a ``NEXT: pr-review`` on a PR GitHub
+            # already reports merged / closed posts that fact instead of re-gating. Wired
+            # unconditionally; an unreadable state keeps the pre-change path.
+            pr_state_source=_PerCallPrStateSource(),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
             tierc_annotations_path=tierc_annotations_path,

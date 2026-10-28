@@ -100,7 +100,7 @@ from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..git_sync import GitSyncDeferredError, GitSyncParkError
 from ..git_sync.notice import git_sync_park_event, render_git_sync_park_notice
-from ..github.client import CheckRollup, PrRef, parse_pr_ref
+from ..github.client import CheckRollup, PrRef, PrState, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
@@ -136,6 +136,7 @@ from ..value_objects import (
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
+    MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
@@ -342,6 +343,19 @@ class CheckRollupSource(Protocol):
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None: ...
 
 
+class PrStateSource(Protocol):
+    """The one read the settled-PR check needs: the PR's lifecycle (REST ``GET /pulls/{n}``).
+
+    T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)). The real
+    :class:`~spirrow_mindwire.github.client.GitHubClient` satisfies this structurally; its
+    ``fetch_pr_state`` answers ``UNRESOLVABLE`` instead of raising, and the conductor also treats
+    a raise as "could not read". Either way the PR_REVIEW branch carries on exactly as it did
+    before this check existed (fail-closed to the pre-change path).
+    """
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState: ...
+
+
 class StopReason(StrEnum):
     """Why a conductor run stopped (returned in :class:`ConductorOutcome`)."""
 
@@ -412,6 +426,13 @@ class StopReason(StrEnum):
     # notified, and the sweep relaunches the thread once the Summon is gone. The stop line carries
     # ``yield_to=<thread_id>`` so the sweep can record whom it yielded to (I-SY1 / I-SY2).
     SUMMON_YIELD = "summon_yield"
+    # T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)): the head is a
+    # ``NEXT: pr-review <ref>`` but GitHub says that PR is already merged or closed. The fact was
+    # posted under ``pr-event-relay`` (the text 1b writes, from the shared
+    # :func:`~spirrow_mindwire.pr_event_advance.decide.lifecycle_post`) and its ``NEXT:`` — none,
+    # the proposer, or the 3-line operator form — is the new head. The gate was not fired, and
+    # this stop notifies nobody: the post's own ``NEXT:`` is the hand-off.
+    PR_SETTLED = "pr_settled"
 
 
 class SummonOwnerSource(Protocol):
@@ -546,6 +567,7 @@ class Conductor:
         rollup_source: CheckRollupSource | None = None,
         review_source: ReviewSource | None = None,
         head_source: PrHeadSource | None = None,
+        pr_state_source: PrStateSource | None = None,
         review_login: str = DEFAULT_REVIEW_LOGIN,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
@@ -625,6 +647,10 @@ class Conductor:
         # (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 1). ``None`` makes
         # every RC resume CONTRADICTED, like a missing review source.
         self._head_source = head_source
+        # Settled-PR check (T-merged-pr-fact-never-reaches-design-thread, Bohr msg-7560 v0.4 (b)):
+        # read before admission on every ``NEXT: pr-review``, so a merged / closed PR is reported
+        # instead of re-gated. ``None`` (a bare Conductor) skips the check, as does a failed read.
+        self._pr_state_source = pr_state_source
         self._review_login = review_login
         # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1' / msg-6316). Set only
         # by the sweep's gate-lane launch (``--gate-only``); a hand run and a role-lane launch keep
@@ -868,6 +894,20 @@ class Conductor:
                     return self._stop(
                         round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
                     )
+                # Settled PR (msg-7560 v0.4 (b)). Before admission, and so before R0-OVERRIDE: a
+                # merged / closed PR is never re-gated (§F.1.1), whoever wrote the nomination.
+                # The post is authored by ``pr-event-relay`` and ends in none / the proposer /
+                # operator — never ``pr-review`` — so the next tick does not come back here, and
+                # 1b (which reads only ``pr-gate-relay`` tails) does not post it a second time.
+                settled_msg = await self._post_if_pr_settled(parsed_ref)
+                if settled_msg is not None:
+                    return self._stop(
+                        round_index,
+                        StopReason.PR_SETTLED,
+                        _msg_id(settled_msg) or latest_msg_id,
+                        forced,
+                        forced_saveable,
+                    )
                 # Pre-gate CI-wait admission (design v0.3.1 §5.2A). Decided BEFORE the gate is
                 # fired, from machine facts only (the head's rollup + two clocks + two head sets
                 # read back off this thread) — the third edge of §5.2A.6, which is neither guard
@@ -889,8 +929,19 @@ class Conductor:
                         # same terminal the first verdict's own APPROVE / COMMENT reached — the
                         # earlier verdict's ``NEXT:`` is authoritative and is NOT re-parsed here
                         # (no author is trusted, msg-557).
+                        # The note (msg-7556 (b) / msg-7560 v0.4 (c)) moves the head off the
+                        # ``pr-review`` nomination: without it every tick re-ran this same R6 and
+                        # stopped in silence (magickit#111, 91 spins). Its admission heading is
+                        # what 1b reads, so a later merge of this PR still reaches the thread.
+                        note, merge_wait = await self._post_already_reviewed_note(
+                            parsed_ref.slug, decision, rollup, messages
+                        )
                         return self._stop(
-                            round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
+                            round_index,
+                            StopReason.MERGE_WAIT if merge_wait else StopReason.HUMAN,
+                            _msg_id(note) or latest_msg_id,
+                            forced,
+                            forced_saveable,
                         )
                     if decision.admission is GateAdmission.ROUTE_HUMAN:
                         # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push).
@@ -2630,8 +2681,14 @@ class Conductor:
             route = RelayRoute.HUMAN
         return route, relay_msg
 
-    async def _post_as_relay(self, body: str) -> dict[str, Any]:
+    async def _post_as_relay(self, body: str, *, author: str = RELAY_AUTHOR) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.
+
+        ``author`` is :data:`RELAY_AUTHOR` for every gate record. The one other value is
+        :data:`~spirrow_mindwire.pr_event_advance.decide.PR_EVENT_RELAY_AUTHOR`, for the
+        settled-PR post (:meth:`_post_if_pr_settled`): that post is not a gate record, so it
+        stays out of the ``verdict_heads`` / ``ci_route_heads`` readers that narrow to the relay
+        author.
 
         Shared by the two conductor-authored PR-gate posts — the R3/R5 admission escalation and
         the R4 ci-route dispatch — because they need identical handling of the one failure that
@@ -2651,7 +2708,7 @@ class Conductor:
                     "project": self._thread_ref.project_id,
                     "thread_id": self._thread_ref.thread_id,
                     "msg_type": "report",
-                    "author": RELAY_AUTHOR,
+                    "author": author,
                     "content": body,
                     # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
                     # The other two harness write paths now supply one; this relay does
@@ -2695,14 +2752,14 @@ class Conductor:
             )
             return {
                 "msg_id": "",
-                "author": RELAY_AUTHOR,
+                "author": author,
                 "content": body,
             }
         msg = result.get("msg") if isinstance(result, dict) else None
         msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
         return {
             "msg_id": msg_id,
-            "author": RELAY_AUTHOR,
+            "author": author,
             "content": body,
         }
 
@@ -3032,10 +3089,11 @@ class Conductor:
 
         The parameter is documented as "``True`` if the latest ``NEXT: pr-review <ref>`` was
         authored by the conductor's own pr-gate-relay". Taken as a literal predicate at THIS
-        call site it is a constant ``False``, and the measurement is one line: the three writers
-        that post under :data:`RELAY_AUTHOR` — the verdict relay in
+        call site it is a constant ``False``, and the measurement is one line: the writers that
+        post under :data:`RELAY_AUTHOR` — the verdict relay in
         :meth:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator._post_design_relay`,
-        :meth:`_post_admission_escalation`, and :meth:`_post_ci_route` — each emit a ``NEXT:``
+        :meth:`_post_admission_escalation`, :meth:`_post_ci_route`, and the R6 note
+        :meth:`_post_already_reviewed_note` — each emit a ``NEXT:``
         naming the implementer or the human, never ``pr-review``. So the relay author cannot
         self-nominate, no message it writes can carry a pr-review handoff, and a literal reading
         sends **every** admission through R0-OVERRIDE to INVOKE. That is not a conservative
@@ -3109,6 +3167,88 @@ class Conductor:
             f"NEXT: {HUMAN_TOKEN}"
         )
         return await self._post_as_relay(body)
+
+    async def _post_if_pr_settled(self, pr: PrRef) -> dict[str, Any] | None:
+        """Post the merged / closed fact for ``pr`` and return the post, or ``None`` to go on.
+
+        T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)). The text and the
+        hand-off come from :func:`~spirrow_mindwire.pr_event_advance.decide.lifecycle_post`, the
+        function 1b's rows 3 / 4 call, so the two callers cannot drift apart.
+
+        ``None`` means carry on to admission exactly as before. It is returned when no source is
+        wired, when the read raised or did not answer, and when the PR is open or not found. A
+        fact that was not read is never guessed.
+
+        Chatroom producer surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the intended reader is
+        whoever the post's ``NEXT:`` names in this design thread — the proposer, nobody on
+        ``none``, or the operator when the roster cannot name a proposer. When the thread is
+        resolved by the time we write, :meth:`_post_as_relay` catches
+        :class:`ThreadResolvedError` and logs a warning: disposition **(3)**, fail loudly in the
+        run log. A resolved thread has no work left for this fact to advance.
+        """
+        if self._pr_state_source is None:
+            return None
+        # Imported here, not at module top: ``pr_event_advance.decide`` imports
+        # ``conductor.gate_records``, whose package ``__init__`` imports this module, so a
+        # top-level import is circular whenever 1b's CLI is the entry point.
+        from ..pr_event_advance.decide import PR_EVENT_RELAY_AUTHOR, lifecycle_post, pr_facts_of
+
+        try:
+            state = await self._pr_state_source.fetch_pr_state(pr)
+        except Exception as exc:  # a failed read is "could not see": keep the pre-change path
+            logger.warning("settled-PR check: fetch_pr_state(%s) raised: %r", pr.slug, exc)
+            return None
+        facts = pr_facts_of(state)
+        if facts is None:
+            logger.info("settled-PR check skipped for %s: PR state unresolvable", pr.slug)
+            return None
+        try:
+            proposer: str | None = derive_identity_by_role(self._roster, Role.PROPOSER)
+        except RoleResolutionError:
+            proposer = None
+        post = lifecycle_post(
+            thread_id=self._thread_ref.thread_id, pr_ref=pr.slug, pr=facts, proposer=proposer
+        )
+        if post is None:
+            return None
+        logger.info("settled-PR check for %s: state=%s, gate not fired", pr.slug, facts.state)
+        return await self._post_as_relay(post.render(), author=PR_EVENT_RELAY_AUTHOR)
+
+    async def _post_already_reviewed_note(
+        self,
+        pr_ref: str,
+        decision: AdmissionResult,
+        rollup: CheckRollup,
+        messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Post the R6 note; return it and whether the head's verdict was a merge wait.
+
+        msg-7556 (b) / msg-7560 v0.4 (c). It moves the head off the ``pr-review`` nomination and
+        says why the run stopped. The heading is :func:`render_admission_heading`, so 1b reads
+        this post and reports the PR once it is merged or closed. It carries no verdict heading
+        and no ci-route marker, so ``verdict_heads`` / ``ci_route_heads`` read nothing from it.
+
+        The stop goes where the head's verdict sent it. When the latest verdict relay for this
+        head is a merge wait, the note repeats :data:`MERGE_WAIT_LINE`. That keeps the thread in
+        the board's merge-wait lane (``parked_lane``) instead of listing it as a decision.
+        """
+        head = normalize_sha(rollup.head_sha)
+        merge_wait = False
+        for msg in messages:
+            body = _content(msg)
+            if _author(msg) == RELAY_AUTHOR and head in verdict_heads([body]):
+                merge_wait = is_merge_wait_relay(body)
+        tail = f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}" if merge_wait else f"NEXT: {HUMAN_TOKEN}"
+        body = (
+            f"{render_admission_heading(pr_ref)}\n\n"
+            f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+            f"{decision.reason}\n\n"
+            f"The gate was NOT fired: head {head[:12]} already has a gate verdict in this "
+            f"thread, and that verdict's hand-off stands. To review again, push a new commit, or "
+            f"have a person write the pr-review hand-off for {pr_ref} by hand.\n\n"
+            f"{tail}"
+        )
+        return await self._post_as_relay(body), merge_wait
 
     async def _post_ci_route(
         self, pr_ref: str, decision: AdmissionResult, rollup: CheckRollup
