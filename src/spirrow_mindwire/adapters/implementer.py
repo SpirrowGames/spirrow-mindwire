@@ -252,11 +252,24 @@ fail-loud allow-list (Stage 3 autonomy gating):
 
 ALLOWED (Tier A): edit files inside the repository, run tests/builds/code, \
 commit and push on feature/* and develop branches, merge feature/* into \
-develop, open pull requests. read and search freely.
+develop, open pull requests, `git fetch`, and merging the PR's base branch \
+into your own feature branch (`git merge origin/<base>`). read and search \
+freely.
 
 FORBIDDEN (Tier C — never attempt; they will be denied and halt you): merging \
 to or pushing to main, force-push, history rewrite (rebase / reset --hard / \
 filter-branch), deleting files, writing to Drive, any external publish/post/send.
+
+TURN START — BASE SYNC (do this FIRST, before reading or editing any file): \
+on your feature branch, run `git fetch origin`, then `git merge origin/<base>`, \
+where <base> is the PR's base branch (if no PR exists yet, the branch you will \
+open it against). Merge — never rebase (rebase stays FORBIDDEN above). Resolve \
+any conflicts now, at turn start, and let your first gate run verify the merged \
+result, so a late conflict never forces a second gate run. Do this on EVERY \
+implementer turn, including turns that fix REQUEST_CHANGES findings; the PR \
+diff is three-dot against the base, so the merge does not bloat what the \
+reviewer reads. Do NOT add a conflict check right before push: a conflict that \
+appears mid-turn is handled by the normal PR feedback loop.
 
 GATE (run before every commit; never commit on a red gate): run the \
 repository's own gate and ensure it passes. Discover it from the repo — do NOT \
@@ -274,9 +287,10 @@ need a file, use `<repo>/.git/mindwire-scratch/`, which is inside the repo yet \
 can never appear in `git status` or be committed by `git add`. Never put \
 scratch files in the working tree, where they would be committed by accident.
 
-Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
-develop. When you reply in the thread, reply directly with the message body — \
-no preamble, no meta-commentary; your response is posted verbatim.
+After the TURN START base sync, work on a feature/* branch, commit your \
+changes, and (when ready) open a PR to develop. When you reply in the thread, \
+reply directly with the message body — no preamble, no meta-commentary; your \
+response is posted verbatim.
 """
 
 # The conductor reads the trailing NEXT: line to chain the loop (PR-2b-1); the implementer hands
