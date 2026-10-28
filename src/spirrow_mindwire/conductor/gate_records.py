@@ -491,12 +491,16 @@ def decide_relay_route(
     implementer: str | None,
     base_ref: str | None = None,
     ci_state: CiState | None = None,
-    *,
-    auto_merge_bases: frozenset[str] = AUTO_MERGE_BASES,
 ) -> RelayRoute:
     """The msg-4774 table extended by msg-7574 D1, and the ONLY place it is evaluated. Pure.
 
-    "auto base" below means ``base_ref in auto_merge_bases`` AND ``ci_state is CiState.SUCCESS``.
+    "auto base" below means ``base_ref in AUTO_MERGE_BASES`` AND ``ci_state is CiState.SUCCESS``.
+
+    The allow-list is deliberately a module constant, not a parameter: the MERGE route's payload
+    (:data:`MERGE_SELF_INSTRUCTION`) names ``develop`` in every git command, so a route decided
+    against any other base would instruct a merge into the wrong branch (PR #503 gate). Widening
+    the allow-list therefore means rendering the instruction per base first — the test
+    ``test_d1_allow_list_matches_the_instruction_target`` pins the two together.
 
     ==========================  ========================  =============  ===========
     verdict / objections        prior advisory APPROVEs   base           route
@@ -526,7 +530,7 @@ def decide_relay_route(
         return RelayRoute.HUMAN
     if carries_advisory(verdict, objections) and prior_advisory_approvals == 0:
         return RelayRoute.IMPLEMENTER
-    if base_ref is not None and base_ref in auto_merge_bases and ci_state is CiState.SUCCESS:
+    if base_ref is not None and base_ref in AUTO_MERGE_BASES and ci_state is CiState.SUCCESS:
         return RelayRoute.MERGE
     return RelayRoute.HUMAN
 

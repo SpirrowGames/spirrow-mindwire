@@ -11,6 +11,7 @@ PR-gate conductor tests in ``tests/test_conductor_core.py``.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from typing import Any
@@ -424,13 +425,19 @@ def test_d1_no_implementer_never_merges() -> None:
         assert decide_relay_route(_APPROVE, _E, 0, impl, "develop", _S) is RelayRoute.HUMAN
 
 
-def test_d1_allow_list_is_develop_only_and_overridable() -> None:
+def test_d1_allow_list_matches_the_instruction_target() -> None:
+    """The allow-list and MERGE_SELF_INSTRUCTION's git target must agree (PR #503 gate).
+
+    The instruction hardcodes ``develop``; a route decided for any other base would tell the
+    implementer to merge into the wrong branch. Extending AUTO_MERGE_BASES must fail here until
+    the instruction is rendered per base.
+    """
     assert frozenset({"develop"}) == AUTO_MERGE_BASES
-    custom = frozenset({"staging"})
-    staging = decide_relay_route(_APPROVE, _E, 0, _IMPL, "staging", _S, auto_merge_bases=custom)
-    develop = decide_relay_route(_APPROVE, _E, 0, _IMPL, "develop", _S, auto_merge_bases=custom)
-    assert staging is RelayRoute.MERGE
-    assert develop is RelayRoute.HUMAN
+    (only_base,) = AUTO_MERGE_BASES
+    assert f"HEAD:refs/heads/{only_base}" in MERGE_SELF_INSTRUCTION
+    assert f"--detach origin/{only_base}" in MERGE_SELF_INSTRUCTION
+    assert "auto_merge_bases" not in inspect.signature(decide_relay_route).parameters
+    assert decide_relay_route(_APPROVE, _E, 0, _IMPL, "staging", _S) is RelayRoute.HUMAN
 
 
 @pytest.mark.anyio
