@@ -121,6 +121,7 @@ class _FakeGitHub:
         self,
         *,
         diff: str = "diff --git a/x b/x\n+added",
+        base_ref: str = "main",
         fetch_exc: Exception | None = None,
         submit_exc: Exception | None = None,
         ci: CiStatus | None = None,
@@ -131,6 +132,7 @@ class _FakeGitHub:
         file_exc: Exception | None = None,
     ) -> None:
         self._diff = diff
+        self._base_ref = base_ref
         self._fetch_exc = fetch_exc
         self._submit_exc = submit_exc
         self._ci = ci if ci is not None else CiStatus(CiState.SUCCESS, "sha-default", [])
@@ -151,9 +153,18 @@ class _FakeGitHub:
         self.file_reads: list[tuple[PrRef, str, str]] = []
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
+        base_ref, head = await self.fetch_pr_base_and_head(pr)
+        return await self.fetch_compare_diff(pr.owner, pr.repo, base_ref, head)
+
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        # The driver's content-review path reads the PR this way (D2); ``fetched`` / ``fetch_exc``
+        # keep meaning "the PR was read for its diff" / "that read failed".
         self.fetched.append(pr)
         if self._fetch_exc is not None:
             raise self._fetch_exc
+        return self._base_ref, self._ci.head_sha or "sha-default"
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         return self._diff
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
@@ -247,6 +258,22 @@ async def test_request_changes_flow() -> None:
     _pr_arg, event, body = github.submitted[0]
     assert event is ReviewEvent.REQUEST_CHANGES
     assert "VERDICT" in body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("base", ["develop", "main"])
+async def test_content_review_carries_the_base_it_already_read(base: str) -> None:
+    # T-gate-relay-routes-develop-approvals-to-human D2: the content path reads base.ref to build
+    # the three-dot diff anyway; it now hands it to the relay router on the outcome. Still ONE
+    # PR-metadata read (``fetched``), no extra GitHub call.
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(base_ref=base)
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+    assert outcome.base_ref == base
+    assert github.fetched == [_pr()]
+    assert await driver.fetch_pr_base_ref(_pr()) == base
 
 
 # ---------- debounce (cost lever): head-unchanged skip + round cap --------- #

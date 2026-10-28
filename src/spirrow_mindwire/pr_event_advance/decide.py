@@ -33,6 +33,7 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 ==  ==================================  ==================================  =======================
 1   not a relay, or heading unreadable  —                                   Noop(NOT_RELAY_TAIL)
 2   token = ``none``                    —                                   Noop(SETTLED)
+2b  relay with ``MERGE-SELF:``          merged, or closed (not merged)      Noop (note 2b)
 3   relay                               merged                              Post: none / proposer
 4   relay                               closed, not merged                  Post: proposer (always)
 5   relay, no ci-hold                   open                                Noop(OPEN_NO_HOLD)
@@ -42,14 +43,23 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 9   anything else (unexpected state)    —                                   Noop(UNKNOWN_STATE)
 ==  ==================================  ==================================  =======================
 
+* Row 2b — ``Noop(MERGE_OWNED_BY_TURN)`` (T-gate-relay-routes-develop-approvals-to-human D5,
+  Bohr msg-7576 / msg-7578): a MERGE-route relay woke the implementer to merge the PR itself,
+  and that implementer's own post is the one terminal report, whether it merged the PR or found
+  it merged or closed (it says "not landed" itself, D3 table row 2). 1b writing
+  the same fact as well is a double advance of the proposer (Einstein msg-7575 #2 / msg-7577).
+  Once the implementer posts, the tail is no longer a relay and row 1 applies. An OPEN PR under
+  that relay falls through to rows 5-8 unchanged (it carries no ci-hold, so row 5).
 * Rows 3 and 4 come before rows 5-8, so a PR closed after a CI hold is reported as closed and a
   dead PR is never re-gated (§F.1.1 優先順位と排他).
 * The token holder does not matter (Einstein msg-5903 B1): a REQUEST_CHANGES relay that sent
-  the thread to the implementer still gets the closed/merged line. Only ``none`` — someone
+  the thread to the implementer still gets the closed/merged line. Row 2b is keyed on the
+  ``MERGE-SELF:`` mark, not on the token, for the same reason. Only ``none`` — someone
   declared the thread finished — is left alone, so this never re-opens a settled thread.
 * ``Closes-thread:`` counts only when it names THIS thread; any other value is "absent" and
   goes to the proposer — the failure direction never closes by mistake.
-* A closed-unmerged PR ALWAYS goes to the proposer, whatever the PR body declares (§F.1.1).
+* A closed-unmerged PR ALWAYS goes to the proposer, whatever the PR body declares (§F.1.1) —
+  from 1b on rows 3-4, from the implementer under row 2b.
 * The proposer persona is consulted only on the rows that need it. A ``Closes-thread:`` merge
   and the (ii) re-fire never read the roster, so a broken roster cannot misroute them. When it
   IS needed and is ``None``, the fact is still written and the hand-off becomes the 3-line
@@ -72,6 +82,7 @@ from typing import assert_never
 from ..conductor.gate_records import (
     RELAY_AUTHOR,
     ci_hold_head,
+    is_merge_self_relay,
     normalize_sha,
 )
 from ..conductor.handoff import (
@@ -126,6 +137,7 @@ class NoopReason(StrEnum):
     CI_PENDING = "ci-pending"
     HEAD_MOVED = "head-moved"
     UNKNOWN_STATE = "unknown-state"
+    MERGE_OWNED_BY_TURN = "merge-owned-by-turn"
 
 
 @dataclass(frozen=True)
@@ -149,11 +161,13 @@ Decision = Noop | Post
 
 @dataclass(frozen=True)
 class RelayTail:
-    """What 1b reads off a verdict-relay tail: the PR, its NEXT token, and any ci-hold head."""
+    """What 1b reads off a verdict-relay tail: the PR, its NEXT token, any ci-hold head, and
+    whether it is a MERGE-route relay (``merge_self``, row 2b)."""
 
     pr_ref: str
     token: str | None
     hold_head: str | None
+    merge_self: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,7 +195,12 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
     if ref is None:
         return None
     token = parse_next_token(body)
-    return RelayTail(pr_ref=ref, token=token, hold_head=ci_hold_head(body))
+    return RelayTail(
+        pr_ref=ref,
+        token=token,
+        hold_head=ci_hold_head(body),
+        merge_self=is_merge_self_relay(body),
+    )
 
 
 def heading_ref(first_line: str) -> str | None:
@@ -265,6 +284,8 @@ def decide(
     lifecycle = lifecycle_of(pr)
     if lifecycle is None:
         return Noop(NoopReason.UNKNOWN_STATE)  # row 9
+    if tail.merge_self and lifecycle in (PrLifecycle.MERGED, PrLifecycle.CLOSED):
+        return Noop(NoopReason.MERGE_OWNED_BY_TURN)  # row 2b
     ref = tail.pr_ref
     match lifecycle:
         case PrLifecycle.MERGED:  # row 3

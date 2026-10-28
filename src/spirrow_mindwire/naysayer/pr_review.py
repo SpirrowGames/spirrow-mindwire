@@ -604,6 +604,11 @@ class PrReviewOutcome:
     # ``unavailable`` via a pre-built selection; see the code paths that use
     # :func:`_unavailable_selection`).
     adr_pointer_selection: AdrPointerSelection | None = None
+    # The PR's ``base.ref`` as read by the content-review path, which already reads it to build
+    # the three-dot diff (T-gate-relay-routes-develop-approvals-to-human D2). ``None`` on every
+    # path that does not fetch the diff (CI-gate, debounce, replay, head-unchanged skip): the
+    # relay then reads it once itself, and only for an APPROVE that could route to MERGE.
+    base_ref: str | None = None
 
 
 # ─── T-gate-silently-suppresses-approve-on-truncated-diff ────────────────────────────
@@ -2284,7 +2289,10 @@ class NaysayerPrReviewDriver:
                     )
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
-        diff = await self._github.fetch_pr_diff(pr)
+        # Two reads, exactly as ``fetch_pr_diff`` does them (and fail-loud the same way), split so
+        # the base.ref it already reads reaches the relay router without a third call (D2).
+        base_ref, diff_head = await self._github.fetch_pr_base_and_head(pr)
+        diff = await self._github.fetch_compare_diff(pr.owner, pr.repo, base_ref, diff_head)
         # Capture the pre-truncation view ONCE, at the fetch site, so ``original_chars`` and
         # the truncated ``text`` the model actually sees are paired forever. Every downstream
         # consumer (message builders, both Lexora passes, verdict resolution, gate notice)
@@ -2438,6 +2446,7 @@ class NaysayerPrReviewDriver:
             would_skip_head_unchanged=would_skip_head_unchanged,
             would_cap=would_cap,
             adr_pointer_selection=pass2_selection,
+            base_ref=base_ref,
         )
 
     async def _run_two_passes(
@@ -3204,6 +3213,17 @@ class NaysayerPrReviewDriver:
                 pr.slug,
                 post_exc,
             )
+
+    async def fetch_pr_base_ref(self, pr: PrRef) -> str:
+        """The PR's current ``base.ref``, fail-loud (one GitHub read).
+
+        For the verdict relay's router only (T-gate-relay-routes-develop-approvals-to-human D2):
+        the outcome of a path that never fetched the diff carries ``base_ref=None``, and an
+        APPROVE there may still be bound for an auto-merge base. Raises like
+        :meth:`GitHubClient.fetch_pr_base_and_head`; the caller turns any failure into "unknown".
+        """
+        base_ref, _head = await self._github.fetch_pr_base_and_head(pr)
+        return base_ref
 
     async def aclose(self) -> None:
         """Close the shared Lexora + GitHub clients (driver teardown)."""

@@ -71,7 +71,7 @@ import re
 from collections.abc import Iterable, Sequence
 from enum import StrEnum
 
-from ..github.client import ReviewEvent
+from ..github.client import CiState, ReviewEvent
 from ..github.reviews import parse_verdict_footer
 from ..naysayer.pr_review import ObjectionParse, parse_objections
 
@@ -292,11 +292,13 @@ def verdict_heads(bodies: Iterable[str]) -> frozenset[str]:
 # :func:`decide_relay_route`; the relay writer calls it once and both the printed ``NEXT:`` and
 # the conductor's branch are read off its answer (Einstein msg-4775 #2).
 #
-# Merge authority is preserved structurally: no row sends an APPROVE anywhere but the human
-# except the FIRST advisory-carrying APPROVE on a PR, and that row only inserts one implementer
-# turn before the same merge request (the implementer is told to end with TIER-C:
-# merge-protected / NEXT: human). Every misread fails toward the human or toward exactly one
-# extra implementer turn — never past the merge hand-off (msg-4774 "パーサー").
+# Merge authority is preserved structurally: the human merges main-bound PRs, the loop merges
+# develop-bound ones (CLAUDE.md: develop への self-merge は自走可). So an APPROVE goes to the human
+# unless it is the FIRST advisory-carrying APPROVE on a PR (one implementer triage turn) or its
+# base is on the :data:`AUTO_MERGE_BASES` allow-list with CI SUCCESS (the MERGE route,
+# T-gate-relay-routes-develop-approvals-to-human D1). Every misread — an unread base, an unread
+# history, a non-SUCCESS CI — fails toward the human or toward exactly one extra implementer turn,
+# never toward a merge of a main-bound PR (msg-4774 "パーサー", msg-7574 D1).
 
 
 class RelayRoute(StrEnum):
@@ -304,6 +306,18 @@ class RelayRoute(StrEnum):
 
     IMPLEMENTER = "implementer"
     HUMAN = "human"
+    #: Wake the implementer to merge the PR itself (T-gate-relay-routes-develop-approvals-to-human
+    #: D1). Only an APPROVE on a base in :data:`AUTO_MERGE_BASES` with CI SUCCESS gets here.
+    MERGE = "merge"
+
+
+#: The PR base branches whose APPROVE the loop merges itself instead of parking at the human
+#: (T-gate-relay-routes-develop-approvals-to-human D1, Bohr msg-7574 / msg-7582). An ALLOW-list
+#: on purpose, never "anything but main": ``release/*``, an unexpected branch, and ``None`` (the
+#: base could not be read) all keep the human route, so a misread still fails toward the human
+#: and main-bound PRs are routed exactly as before. :func:`decide_relay_route` takes its own set
+#: as a keyword; this is the default.
+AUTO_MERGE_BASES: frozenset[str] = frozenset({"develop"})
 
 
 #: The line an APPROVE → human relay carries above its ``NEXT: human``. Such a hand-off is a merge
@@ -342,8 +356,80 @@ ADVISORY_SELF_TRIAGE_INSTRUCTION = (
     "Advisory のみの APPROVE。human に「直すか」を聞かずに、自分で裁くこと: 安く直せるなら同じ "
     "PR で直して push する (再ゲートになる)。見送る advisory は `DECIDED: <どれを> — <理由>` を "
     "1 行ずつ書く。見送りだけで終える場合は、最後に `NEXT: pr-review <この PR>` を書いて gate に"
-    "戻す (head が同じなら前回の APPROVE が再掲され、merge 待ちになる)。merge は PR を出した時点で"
-    "依頼済みなので、`TIER-C:` 行や `NEXT: human` で merge を頼まないこと。"
+    "戻す (head が同じなら前回の APPROVE が再掲され、PR の base に応じて自動 merge か merge 待ちに"
+    "進む)。どちらに進むかは gate が決めるので、`TIER-C:` 行や `NEXT: human` で merge を"
+    "頼まないこと。"
+)
+
+
+#: The column-zero mark a MERGE-route relay carries (D5). 1b
+#: (:mod:`~spirrow_mindwire.pr_event_advance`) reads it off the relay tail and stays silent when the
+#: PR is merged or closed, because the implementer woken by this relay owns the terminal report —
+#: two writers of the same fact is the double-advance Einstein found (msg-7575 #2, msg-7577). The
+#: line is rendered by :func:`render_merge_self_line` and also names the PR and the reviewed head,
+#: which :data:`MERGE_SELF_INSTRUCTION` refers to.
+MERGE_SELF_MARK = "MERGE-SELF:"
+
+
+def render_merge_self_line(pr_ref: str, head_sha: str) -> str:
+    """The ``MERGE-SELF:`` line of a MERGE-route relay: the PR and the head the gate reviewed."""
+    return (
+        f"{MERGE_SELF_MARK} pr={pr_ref} head={head_sha} — base は自動 merge の許可リスト内。"
+        "merge はこのスレッドの implementer が行う (Tier-C の判断依頼ではない)。"
+    )
+
+
+def is_merge_self_relay(body: str) -> bool:
+    """Does ``body`` carry the column-zero :data:`MERGE_SELF_MARK` line a MERGE relay writes?
+
+    Same trust model as :func:`is_merge_wait_relay`: 1b reads only :data:`RELAY_AUTHOR` tails, and
+    a forged line can only silence 1b once on a closed / merged PR — it cannot cause a merge."""
+    return any(line.startswith(MERGE_SELF_MARK) for line in body.splitlines())
+
+
+#: Appended (above ``NEXT: <implementer>``) ONLY on the MERGE route (D3: msg-7580's steps and table
+#: plus msg-7582's Observation 1 sentence). The merge itself is a LOCAL ``git merge`` of the
+#: reviewed sha and a plain (non-force) ``git push`` of the base, never ``gh pr merge``: the
+#: implementer's command classifier maps ``gh pr merge`` to a merge-to-main whatever the base, and
+#: the denial halts the session (OBL-MERGE-MECHANISM, spec/process/obligations.yaml). Merging the
+#: reviewed sha rather than the branch tip is what ``--match-head-commit`` gave the original D3: a
+#: push that lands after the review is never merged by this turn. Like
+#: :data:`ADVISORY_SELF_TRIAGE_INSTRUCTION` it must never contain a column-zero ``MERGE-WAIT:`` /
+#: ``MERGE-SELF:`` line, an objections sentinel, a verdict footer, or a line that parses as a
+#: ``NEXT:`` hand-off — the relay readers re-parse relay bodies (pinned in test_relay_route.py).
+MERGE_SELF_INSTRUCTION = (
+    "base が自動 merge の許可リスト (develop) にある PR の APPROVE で、CI は緑。human に merge を"
+    "頼まず、自分で merge すること。PR とレビューした sha は、上の `MERGE-SELF:` 行の `pr=` と "
+    "`head=` を使う。`gh pr merge` は使わない (base によらず main への merge として拒否され、"
+    "セッションが止まる)。merge は手元の `git merge` と `git push` で行う。\n"
+    "\n"
+    "手順 (状態を読み直すのは 1 回だけ。merge の再試行はしない):\n"
+    "1. `gh pr view <n> --repo <owner/repo> --json state,headRefOid,mergeCommit` で状態を読み、"
+    "下の表の 1〜3 行目に当たればその行に従う。`gh pr view` が失敗した、または結果を読めなかった"
+    "場合は merge を実行せず、5 行目に従う。\n"
+    "2. 1〜3 行目のどれにも当たらない (open で、headRefOid がレビューした sha と一致する) ときに"
+    "限り merge する: `git fetch origin` → `git switch develop` (手元に無ければ "
+    "`git switch -c develop --track origin/develop`) → `git merge --ff-only origin/develop` → "
+    "`git merge --no-ff <レビューした sha>` → `git push origin develop` (force は付けない)。push が"
+    "通ったら 4 行目に従う。終わったら既定ブランチへ `git switch` で戻る。\n"
+    "3. merge か push が失敗したら (conflict なら `git merge --abort` してから)、もう一度だけ "
+    "`gh pr view` で状態を読み直し、1〜3 行目で分類し直す。読み直しに失敗した場合も 5 行目に"
+    "従う。\n"
+    "4. 読み直しても 1〜3 行目のどれにも当たらない場合だけ、5 行目に従う。\n"
+    "\n"
+    "| 状態 (読み直した結果も含む) | すること |\n"
+    "|---|---|\n"
+    "| 1. merge 済み | 既存の merge commit を報告し、proposer に `NEXT:` で渡す |\n"
+    "| 2. merge されずに close 済み | 「merge されずに close された。最終 head は <sha>。この"
+    "スレッドの作業はこの PR では landing していない」と報告し、proposer に `NEXT:` で渡す |\n"
+    "| 3. open で、head がレビューした sha と違う | 報告し、`NEXT: pr-review <PR>` で gate に"
+    "戻す |\n"
+    "| 4. merge に成功 | merge commit を報告し、proposer に `NEXT:` で渡す |\n"
+    "| 5. 読み直しても open で head が一致したまま merge が失敗した (conflict、branch "
+    "protection、権限など)、または状態が読めない | エラーの本文をそのまま報告し、proposer に "
+    "`NEXT:` で渡す |\n"
+    "\n"
+    "どの行でも `TIER-C:` 行や `NEXT: human` は書かないこと。"
 )
 
 #: Objection-parse statuses that mean "no advisory to triage". ``MISSING`` is here on purpose:
@@ -394,35 +480,53 @@ def decide_relay_route(
     objections: ObjectionParse,
     prior_advisory_approvals: int | None,
     implementer: str | None,
+    base_ref: str | None = None,
+    ci_state: CiState | None = None,
+    *,
+    auto_merge_bases: frozenset[str] = AUTO_MERGE_BASES,
 ) -> RelayRoute:
-    """The msg-4774 table, and the ONLY place it is evaluated. Pure.
+    """The msg-4774 table extended by msg-7574 D1, and the ONLY place it is evaluated. Pure.
 
-    ============================  ==========================  ===========
-    verdict / objections          prior advisory APPROVEs     route
-    ============================  ==========================  ===========
-    REQUEST_CHANGES               —                           implementer
-    APPROVE, EMPTY or MISSING     —                           human
-    APPROVE, anything else        0                           implementer
-    APPROVE, anything else        ≥ 1                         human
-    COMMENT                       —                           human
-    ============================  ==========================  ===========
+    "auto base" below means ``base_ref in auto_merge_bases`` AND ``ci_state is CiState.SUCCESS``.
 
-    ``prior_advisory_approvals is None`` means the history could not be read; that fails to the
-    human (the count that would stop an advisory chain is unknown, so do not start one). No
-    implementer persona also fails to the human — there is nobody to route to. Relay-post
-    failure is the conductor's fail-safe, not a policy row, and stays there (msg-4776 #2).
+    ==========================  ========================  =============  ===========
+    verdict / objections        prior advisory APPROVEs   base           route
+    ==========================  ========================  =============  ===========
+    REQUEST_CHANGES             —                         —              implementer
+    APPROVE, EMPTY or MISSING   —                         auto base      merge
+    APPROVE, EMPTY or MISSING   —                         anything else  human
+    APPROVE, anything else      0                         —              implementer
+    APPROVE, anything else      ≥ 1                       auto base      merge
+    APPROVE, anything else      ≥ 1                       anything else  human
+    COMMENT                     —                         —              human
+    ==========================  ========================  =============  ===========
+
+    ``prior_advisory_approvals is None`` means the history could not be read: it never starts an
+    advisory chain (the count that would stop one is unknown) and is otherwise read as "≥ 1".
+    ``base_ref is None`` (unread), any base outside the allow-list, and any ``ci_state`` other than
+    ``SUCCESS`` are "anything else", so every misread fails to the human and a ``main``-bound
+    APPROVE is routed exactly as before. No implementer persona fails to the human — there is
+    nobody to route to. Relay-post failure is the conductor's fail-safe, not a policy row, and
+    stays there (msg-4776 #2).
     """
     if not implementer:
         return RelayRoute.HUMAN
     if verdict is ReviewEvent.REQUEST_CHANGES:
         return RelayRoute.IMPLEMENTER
+    if verdict is not ReviewEvent.APPROVE:
+        return RelayRoute.HUMAN
     if carries_advisory(verdict, objections) and prior_advisory_approvals == 0:
         return RelayRoute.IMPLEMENTER
+    if base_ref is not None and base_ref in auto_merge_bases and ci_state is CiState.SUCCESS:
+        return RelayRoute.MERGE
     return RelayRoute.HUMAN
 
 
 __all__ = [
     "ADVISORY_SELF_TRIAGE_INSTRUCTION",
+    "AUTO_MERGE_BASES",
+    "MERGE_SELF_INSTRUCTION",
+    "MERGE_SELF_MARK",
     "MERGE_WAIT_LINE",
     "MERGE_WAIT_MARK",
     "RELAY_AUTHOR",
@@ -432,6 +536,7 @@ __all__ = [
     "ci_hold_head",
     "ci_route_heads",
     "decide_relay_route",
+    "is_merge_self_relay",
     "is_merge_wait_relay",
     "normalize_sha",
     "prior_advisory_approvals",
@@ -439,6 +544,7 @@ __all__ = [
     "render_admission_heading",
     "render_ci_hold_marker",
     "render_ci_route_marker",
+    "render_merge_self_line",
     "render_relay_heading",
     "verdict_heads",
 ]
