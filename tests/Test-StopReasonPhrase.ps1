@@ -251,6 +251,7 @@ $unnotified = @(
     'hold'           # the operator asked for the stop, so telling them is not news
     'ci_wait'        # pre-gate CI-wait DEFER (design v0.3.1 §5.2A); past the cap it becomes 'human'
     'merge_wait'     # PR-gate APPROVE on a human-merged PR: the merge-wait PR list carries it (msg-4361)
+    'pr_settled'     # pr-review on an already merged/closed PR: the fact is posted, its NEXT hands on (msg-7560)
     'resume_retry'   # gate resume could not read GitHub / head moved: silent retry, bounded by the stall watchdog
     'slice_end'      # gate-lane run handed its relay / ci-route head to the role lane (msg-6313 §1′)
     'summon_yield'   # yielded to a Summon (T-human-call-priority-interrupt): heard via the digest's Summon line
