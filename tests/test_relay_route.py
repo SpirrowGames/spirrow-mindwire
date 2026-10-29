@@ -637,7 +637,7 @@ def test_merge_self_instruction_snapshot() -> None:
         "`gh pr view` が失敗した、または結果を読めなかった場合は merge を実行せず、5 行目に従う",
         "2. 1〜3 行目のどれにも当たらない",
         "a. `git status --porcelain` に何か出たら、何も始めずに 5 行目に従う",
-        'b. `git fetch origin develop "pull/<n>/head"`',
+        'b. `git fetch origin develop "refs/pull/<n>/head"`',
         "`git cat-file -e <レビューした sha>` で sha が取れたかを確かめる",
         "取れていなければ手順 3 に進む",
         "c. `git switch --detach origin/develop`",
@@ -665,7 +665,7 @@ def test_merge_self_instruction_snapshot() -> None:
     ):
         assert needle in instr, needle
     digest = hashlib.sha256(instr.encode("utf-8")).hexdigest()
-    assert digest == "5fa0e489f68feec77f0638f309171800d587b49b56cada2afe0a3650b4ddf499"
+    assert digest == "b9775532fc5e61fd5fc33fcd9bcb3ae745abc4c0a00db893750b147f876a8da1"
 
 
 # ---- msg-7591 "実装時の要件": every command the instruction tells the implementer to run ------ #
@@ -690,7 +690,7 @@ _EXPECTED_COMMANDS = [
     "gh pr view <n> --repo <owner/repo> --json state,headRefOid,mergeCommit",
     "gh pr view",
     "git status --porcelain",
-    'git fetch origin develop "pull/<n>/head"',
+    'git fetch origin develop "refs/pull/<n>/head"',
     "git cat-file -e <レビューした sha>",
     "git switch --detach origin/develop",
     'git merge --no-ff <レビューした sha> -m "Merge PR #<n> into develop"',

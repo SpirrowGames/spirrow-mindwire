@@ -413,7 +413,7 @@ MERGE_SELF_INSTRUCTION = (
     "2. 1〜3 行目のどれにも当たらない (open で、headRefOid がレビューした sha と一致する) ときに"
     "限り、次の順で merge する:\n"
     "   a. `git status --porcelain` に何か出たら、何も始めずに 5 行目に従う。\n"
-    '   b. `git fetch origin develop "pull/<n>/head"` を実行し、'
+    '   b. `git fetch origin develop "refs/pull/<n>/head"` を実行し、'
     "`git cat-file -e <レビューした sha>` で sha が取れたかを確かめる。取れていなければ手順 3 に"
     "進む。\n"
     "   c. `git switch --detach origin/develop`\n"
