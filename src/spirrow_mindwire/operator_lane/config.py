@@ -8,6 +8,7 @@ reason (D2'' (b-3) / D2⁗); only the operator turns it back on, by hand, after 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -51,10 +52,26 @@ def _strings(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(value)
 
 
+# On Windows a read that lands while another writer's ``os.replace`` swaps the file in is refused
+# (PermissionError); it is transient, so the config readers retry briefly (PR #505 gate).
+_READ_RETRIES = 50
+
+
+def _read_text(path: Path) -> str:
+    for attempt in range(_READ_RETRIES + 1):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt >= _READ_RETRIES:
+                raise
+            time.sleep(0.02)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def load_config(path: Path) -> LaneConfig:
     """Read the config. A missing file is a disabled lane; a malformed one raises ``ValueError``."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(_read_text(path))
     except FileNotFoundError:
         return LaneConfig()
     if not isinstance(raw, dict):
@@ -80,7 +97,7 @@ def load_config(path: Path) -> LaneConfig:
 def disable(path: Path, *, reason: str, now: datetime) -> None:
     """Turn the lane off (guard_open). Everything else in the file is kept as it was."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(_read_text(path))
     except (FileNotFoundError, ValueError):
         raw = {}
     if not isinstance(raw, dict):
@@ -88,7 +105,8 @@ def disable(path: Path, *, reason: str, now: datetime) -> None:
     raw["enabled"] = False
     raw["disabled_reason"] = reason
     raw["disabled_at"] = iso(now)
-    atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
+    # No mutex owns the config file, so a concurrent writer must never share our temp file.
+    atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n", unique_tmp=True)
 
 
 __all__ = ["DEFAULT_PROJECTS", "LaneConfig", "disable", "load_config"]

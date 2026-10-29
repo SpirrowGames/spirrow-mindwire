@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -140,20 +141,51 @@ def parse_iso(value: Any) -> datetime | None:
 # --- atomic write -----------------------------------------------------------------------------
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, unique_tmp: bool = False) -> None:
     """Write ``path`` so a reader sees the old content or the whole new content, never a part.
 
     The bytes go to ``<path>.tmp``, are flushed and ``fsync``-ed, and only then ``os.replace``-d
     over ``path`` (D2⁷ for reports, D3'' / D3⁸ for the state files). A crash leaves at most the
     ``.tmp``, which no reader looks at.
+
+    The fixed ``.tmp`` name is safe only for a single writer: the state files are written under
+    the mutex and a report has its own ``run_id``. A file with no such owner (the config, which
+    :func:`.config.disable` rewrites) passes ``unique_tmp=True``: each writer gets its own
+    ``<path>.<pid>-<random>.tmp``, so concurrent writers never share or truncate a temp file and
+    the last ``os.replace`` wins with a whole file (PR #505 gate).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    if unique_tmp:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
+    else:
+        tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace(tmp, path, retries=_REPLACE_RETRIES if unique_tmp else 0)
+    except BaseException:
+        if unique_tmp:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        raise
+
+
+# Windows refuses a replace while another writer's replace onto the same target is in flight
+# (PermissionError); with distinct temp files that is transient, so the unique path retries.
+_REPLACE_RETRIES = 50
+
+
+def _replace(tmp: Path, path: Path, *, retries: int) -> None:
+    for attempt in range(retries + 1):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt >= retries:
+                raise
+            time.sleep(0.02)
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
