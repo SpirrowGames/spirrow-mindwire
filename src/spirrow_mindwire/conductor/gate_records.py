@@ -315,8 +315,8 @@ class RelayRoute(StrEnum):
 #: (T-gate-relay-routes-develop-approvals-to-human D1, Bohr msg-7574 / msg-7582). An ALLOW-list
 #: on purpose, never "anything but main": ``release/*``, an unexpected branch, and ``None`` (the
 #: base could not be read) all keep the human route, so a misread still fails toward the human
-#: and main-bound PRs are routed exactly as before. :func:`decide_relay_route` takes its own set
-#: as a keyword; this is the default.
+#: and main-bound PRs are routed exactly as before. A module constant, not a parameter: the
+#: reason is in :func:`decide_relay_route`'s docstring.
 AUTO_MERGE_BASES: frozenset[str] = frozenset({"develop"})
 
 
@@ -496,7 +496,7 @@ def decide_relay_route(
 
     "auto base" below means ``base_ref in AUTO_MERGE_BASES`` AND ``ci_state is CiState.SUCCESS``.
 
-    The allow-list is deliberately a module constant, not a parameter: the MERGE route's payload
+    Why :data:`AUTO_MERGE_BASES` is a module constant, not a parameter: the MERGE route's payload
     (:data:`MERGE_SELF_INSTRUCTION`) names ``develop`` in every git command, so a route decided
     against any other base would instruct a merge into the wrong branch (PR #503 gate). Widening
     the allow-list therefore means rendering the instruction per base first — the test
@@ -509,13 +509,17 @@ def decide_relay_route(
     APPROVE, EMPTY or MISSING   —                         auto base      merge
     APPROVE, EMPTY or MISSING   —                         anything else  human
     APPROVE, anything else      0                         —              implementer
+    APPROVE, anything else      None (unread)             —              human
     APPROVE, anything else      ≥ 1                       auto base      merge
     APPROVE, anything else      ≥ 1                       anything else  human
     COMMENT                     —                         —              human
     ==========================  ========================  =============  ===========
 
-    ``prior_advisory_approvals is None`` means the history could not be read: it never starts an
-    advisory chain (the count that would stop one is unknown) and is otherwise read as "≥ 1".
+    ``prior_advisory_approvals is None`` means the history could not be read. For an
+    advisory-carrying APPROVE that routes to the human: it neither starts a triage turn (the count
+    that would stop one is unknown) nor merges (the advisories may never have been triaged, and
+    :data:`MERGE_SELF_INSTRUCTION` carries no triage step) — PR #503 gate round 2, Fermi msg-7618.
+    An APPROVE without advisories needs no triage, so an unread history does not affect its row.
     ``base_ref is None`` (unread), any base outside the allow-list, and any ``ci_state`` other than
     ``SUCCESS`` are "anything else", so every misread fails to the human and a ``main``-bound
     APPROVE is routed exactly as before. No implementer persona fails to the human — there is
@@ -528,8 +532,11 @@ def decide_relay_route(
         return RelayRoute.IMPLEMENTER
     if verdict is not ReviewEvent.APPROVE:
         return RelayRoute.HUMAN
-    if carries_advisory(verdict, objections) and prior_advisory_approvals == 0:
-        return RelayRoute.IMPLEMENTER
+    if carries_advisory(verdict, objections):
+        if prior_advisory_approvals is None:
+            return RelayRoute.HUMAN
+        if prior_advisory_approvals == 0:
+            return RelayRoute.IMPLEMENTER
     if base_ref is not None and base_ref in AUTO_MERGE_BASES and ci_state is CiState.SUCCESS:
         return RelayRoute.MERGE
     return RelayRoute.HUMAN

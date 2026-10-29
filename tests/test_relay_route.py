@@ -399,10 +399,13 @@ _APPROVE, _RC, _COMMENT = ReviewEvent.APPROVE, ReviewEvent.REQUEST_CHANGES, Revi
         (_APPROVE, _OK, 0, "main", _S, RelayRoute.IMPLEMENTER),
         # row 5: later advisory APPROVE on an auto base with green CI -> merge
         (_APPROVE, _OK, 1, "develop", _S, RelayRoute.MERGE),
-        (_APPROVE, _OK, None, "develop", _S, RelayRoute.MERGE),
+        # row 4b: advisory APPROVE with an unread history -> human, even on an auto base
+        # (PR #503 gate round 2, Fermi msg-7618: never merge untriaged advisories)
+        (_APPROVE, _OK, None, "develop", _S, RelayRoute.HUMAN),
+        (_APPROVE, _OK, None, "main", _S, RelayRoute.HUMAN),
+        (_APPROVE, _OK, None, None, _S, RelayRoute.HUMAN),
         # row 6: later advisory APPROVE anywhere else -> human
         (_APPROVE, _OK, 1, "main", _S, RelayRoute.HUMAN),
-        (_APPROVE, _OK, None, None, _S, RelayRoute.HUMAN),
         (_APPROVE, _OK, 2, "develop", CiState.PENDING, RelayRoute.HUMAN),
         # row 7: COMMENT -> human, even on develop
         (_COMMENT, _E, 0, "develop", _S, RelayRoute.HUMAN),
@@ -438,6 +441,23 @@ def test_d1_allow_list_matches_the_instruction_target() -> None:
     assert f"--detach origin/{only_base}" in MERGE_SELF_INSTRUCTION
     assert "auto_merge_bases" not in inspect.signature(decide_relay_route).parameters
     assert decide_relay_route(_APPROVE, _E, 0, _IMPL, "staging", _S) is RelayRoute.HUMAN
+
+
+def test_d1_advisory_approve_with_unread_history_goes_to_human() -> None:
+    """An unread history must not let advisories skip triage into a merge (Fermi msg-7618 #3)."""
+    assert decide_relay_route(_APPROVE, _OK, None, _IMPL, "develop", _S) is RelayRoute.HUMAN
+
+
+def test_d1_clean_approve_with_unread_history_still_merges_on_develop() -> None:
+    """No advisories, nothing to triage: an unread history does not change the clean row."""
+    for objections in (_E, _M):
+        got = decide_relay_route(_APPROVE, objections, None, _IMPL, "develop", _S)
+        assert got is RelayRoute.MERGE
+
+
+def test_d1_advisory_approve_with_unread_history_on_main_goes_to_human() -> None:
+    """The main-bound case stays the human merge wait, as before this PR."""
+    assert decide_relay_route(_APPROVE, _OK, None, _IMPL, "main", _S) is RelayRoute.HUMAN
 
 
 @pytest.mark.anyio
