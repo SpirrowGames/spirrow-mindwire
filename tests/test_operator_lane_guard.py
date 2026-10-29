@@ -150,3 +150,19 @@ def test_mixed_v4_and_v6_entries_never_crash_the_audit(remote: list[str]) -> Non
     assert not _covers(remote, "198.51.100.1")
     assert not _covers(["2001:db8::/64"], "192.0.2.10")
     assert not _covers(["192.0.2.0/24"], "2001:db8::1")
+
+
+def test_duplicate_rules_report_every_rules_gaps() -> None:
+    """PR #505 gate advisory: two same-named rules, both incomplete — the verdict names the gaps
+    of each, not only the first one's; one complete rule among them still passes."""
+    snap = copy.deepcopy(GOOD)
+    first = dict(snap["rules"][0], enabled="False")
+    second = dict(snap["rules"][0], action="Allow")
+    snap["rules"] = [first, second]
+    verdict = guard.audit_firewall(snap, CONFIG)
+    assert verdict.status == guard.OPEN
+    text = "\n".join(verdict.problems)
+    assert "rule 1 of 2" in text and "rule 2 of 2" in text
+    assert len(verdict.problems) >= 2
+    snap["rules"] = [first, copy.deepcopy(GOOD["rules"][0])]
+    assert guard.audit_firewall(snap, CONFIG).ok

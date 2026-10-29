@@ -164,7 +164,16 @@ def audit_firewall(snapshot: dict[str, Any], config: LaneConfig) -> GuardVerdict
     else:
         per_rule = [_rule_problems(r, sid, config.magickit_addresses, active) for r in rules]
         if all(per_rule):
-            problems.extend(per_rule[0])
+            if len(per_rule) == 1:
+                problems.extend(per_rule[0])
+            else:
+                # Several rules share the name and none is complete: name every rule's gaps, so a
+                # fix to one does not just reveal the next (PR #505 gate advisory).
+                for i, rule_problems in enumerate(per_rule, 1):
+                    problems.extend(
+                        f"rule {i} of {len(per_rule)} named {config.firewall_rule_name!r}: {p}"
+                        for p in rule_problems
+                    )
     return GuardVerdict(OPEN if problems else OK, tuple(problems))
 
 
