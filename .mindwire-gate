@@ -28,4 +28,5 @@ pwsh -NoProfile -File tests/Test-ConductorWallClock.ps1
 pwsh -NoProfile -File tests/Test-DirtyClone.ps1
 pwsh -NoProfile -File tests/Test-GitSyncDeferred.ps1
 pwsh -NoProfile -File tests/Test-UnregisteredIntake.ps1
+pwsh -NoProfile -File tests/Test-OperatorLane.ps1
 uv run pytest

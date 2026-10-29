@@ -84,7 +84,7 @@ ignore_missing_imports = true
 # Silence the missing-imports errors here rather than salt every import with
 # ``# type: ignore``.
 [[tool.mypy.overrides]]
-module = ["win32api", "win32job", "pywintypes", "psutil"]
+module = ["win32api", "win32job", "win32cred", "pywintypes", "psutil"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

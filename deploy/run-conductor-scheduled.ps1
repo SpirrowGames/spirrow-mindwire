@@ -238,6 +238,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Pure helpers; the probe call and the
 # append live in the run section below.
 . (Join-Path $PSScriptRoot 'lib/UnregisteredIntake.ps1')
+# The operator pass (T-operator-task-lane PR2): Test-OperatorLaneEnabled / ConvertTo-OperatorLaneCandidates /
+# Invoke-OperatorLanePass / Publish-OperatorLaneResult. Calls Write-Log and Send-NotificationIfChanged
+# at call time, so they may be defined further down.
+. (Join-Path $PSScriptRoot 'lib/OperatorLane.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -5364,6 +5368,20 @@ try {
         -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)
     foreach ($k in $declaredScan.byProject.Keys) { $stopClassByProject[$k] = $declaredScan.byProject[$k] }
     $stopClassFailed += @($declaredScan.failed)
+
+    # Operator pass (T-operator-task-lane PR2, D1'; lib/OperatorLane.ps1). Here — after the head probe,
+    # before the sweep launches anything — so the lane sees this tick's heads and a held project
+    # (absent from $headsByProject) is never touched. At most one OPERATOR-TASK is dispatched, detached;
+    # the tick waits at most ~30 s for it. Fail-open for the sweep; the lane fails closed on its own.
+    if (Test-OperatorLaneEnabled -ConfigPath (Join-Path $dataDir 'config\operator_lane.json')) {
+        $operatorLaneResult = Invoke-OperatorLanePass `
+            -Rows (ConvertTo-OperatorLaneCandidates -Candidates $candidates -HeadsByProject $headsByProject) `
+            -DataDir $dataDir -HeadSkipPath $headSkipStatePath `
+            -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l } `
+            -NewInputFile { param($j, $l) New-ProbeInputFile -Json $j -Label $l } `
+            -RemoveInputFile { param($f) Remove-ProbeInputFile -Path $f }
+        Publish-OperatorLaneResult -Result $operatorLaneResult -NotifyState $notifyState
+    }
 
     # --- resource-axis HOLD: one probe per DISTINCT repo_dir (§5a v2, D-KEY-4c) ----------------
     # Batch the resolver call once per tick. The distinct repo_dir set is small (7 today per
