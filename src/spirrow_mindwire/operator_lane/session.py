@@ -218,10 +218,14 @@ def _create_process_with_logon(
             ("dwThreadId", wintypes.DWORD),
         ]
 
+    # Windows-only attributes go through ``Any`` so mypy on a POSIX runner accepts them.
+    win_msvcrt: Any = msvcrt
+    win_os: Any = os
+    win_ctypes: Any = ctypes
     handles = []
     for fh in (fin, fout, ferr):
-        h = msvcrt.get_osfhandle(fh.fileno())
-        os.set_handle_inheritable(h, True)
+        h = win_msvcrt.get_osfhandle(fh.fileno())
+        win_os.set_handle_inheritable(h, True)
         handles.append(h)
     si = STARTUPINFOW()
     si.cb = ctypes.sizeof(STARTUPINFOW)
@@ -246,7 +250,7 @@ def _create_process_with_logon(
         ctypes.byref(pi),
     )
     if not ok:
-        raise OSError(ctypes.GetLastError(), "CreateProcessWithLogonW failed")
+        raise OSError(win_ctypes.GetLastError(), "CreateProcessWithLogonW failed")
     kernel32 = _win(ctypes).kernel32
     kernel32.CloseHandle(pi.hThread)
     kernel32.CloseHandle(pi.hProcess)
