@@ -217,6 +217,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The relay routes on which the conductor dispatches the implementer on the verdict relay
+#: (T-gate-relay-routes-develop-approvals-to-human D4). Anything else — HUMAN, or a route this
+#: build does not know (``_fire_pr_gate`` already maps a missing / foreign one to HUMAN) — stops.
+_IMPLEMENTER_DISPATCH_ROUTES: frozenset[RelayRoute] = frozenset(
+    {RelayRoute.IMPLEMENTER, RelayRoute.MERGE}
+)
+
 # Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
 _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 #: The login whose reviews count as the PR-gate's when a REQUEST_CHANGES relay is resumed
@@ -1014,9 +1021,12 @@ class Conductor:
                 # execution fail-safes, which are not policy: a missing relay id (post result with
                 # no msg_id) breaks no-progress tracking on the continue path (Tier B msg-572 #2),
                 # and no implementer persona means nobody to dispatch. Both stop at the human.
+                # Both IMPLEMENTER (fix / triage) and MERGE (an auto-merge-base APPROVE the
+                # implementer merges itself, T-gate-relay-routes-develop-approvals-to-human D4)
+                # dispatch the implementer on the relay.
                 if (
                     not relay_msg_id
-                    or relay_route is not RelayRoute.IMPLEMENTER
+                    or relay_route not in _IMPLEMENTER_DISPATCH_ROUTES
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id

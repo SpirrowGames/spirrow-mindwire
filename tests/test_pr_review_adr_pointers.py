@@ -143,6 +143,12 @@ class _FakeGitHub:
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         return self._diff
 
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        return "main", self._ci.head_sha or "sha"
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
+        return self._diff
+
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         return self._ci
 

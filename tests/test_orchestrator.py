@@ -1265,6 +1265,12 @@ class _FakeGitHubCi:
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         raise NotImplementedError
 
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        raise NotImplementedError
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
+        raise NotImplementedError
+
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         return self._ci
 
