@@ -95,9 +95,13 @@ def _covers(remote: Sequence[str], address: str) -> bool:
                 lo, hi = (ipaddress.ip_address(p.strip()) for p in entry.split("-", 1))
                 if lo.version == target.version and lo <= target <= hi:  # type: ignore[operator]
                     return True
-            elif target in ipaddress.ip_network(entry.strip(), strict=False):
-                return True
-        except ValueError:
+            else:
+                net = ipaddress.ip_network(entry.strip(), strict=False)
+                # A rule lists v4 and v6 together; compare like with like explicitly rather than
+                # lean on ``__contains__``'s cross-version behaviour (PR #505 gate).
+                if net.version == target.version and target in net:
+                    return True
+        except (ValueError, TypeError):
             continue
     return False
 

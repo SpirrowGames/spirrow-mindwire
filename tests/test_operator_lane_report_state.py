@@ -369,3 +369,41 @@ def test_first_enable_only_when_the_lane_never_ran(tmp_path: Path) -> None:
     st.initialise(paths)
     assert st.load_heads(paths) == {}
     assert not st.first_enable(paths)
+
+
+def test_concurrent_config_disable_never_corrupts_the_file(tmp_path: Path) -> None:
+    """PR #505 gate: ``disable()`` has no mutex owner, so two writers racing on it must neither
+    share a temp file nor leave a torn config: the file is always whole JSON, lane off."""
+    from spirrow_mindwire.operator_lane.config import disable
+
+    cfg = tmp_path / "operator_lane.json"
+    cfg.write_text(json.dumps({"enabled": True, "projects": ["p"]}), encoding="utf-8")
+    errors: list[BaseException] = []
+    now = datetime(2026, 10, 30, tzinfo=UTC)
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(40):
+                disable(cfg, reason=f"guard_open: writer {n} round {i}", now=now)
+        except BaseException as exc:  # pragma: no cover - the assertion below reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["enabled"] is False and data["projects"] == ["p"]
+    assert data["disabled_reason"].startswith("guard_open: writer ")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_unique_tmp_write_does_not_use_the_shared_tmp_name(tmp_path: Path) -> None:
+    target = tmp_path / "f.json"
+    shared = tmp_path / "f.json.tmp"
+    shared.write_text("someone else's partial write", encoding="utf-8")
+    st.atomic_write_text(target, "{}\n", unique_tmp=True)
+    assert target.read_text(encoding="utf-8") == "{}\n"
+    assert shared.read_text(encoding="utf-8") == "someone else's partial write"

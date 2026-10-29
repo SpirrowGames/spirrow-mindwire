@@ -129,3 +129,24 @@ def test_an_audit_that_cannot_run_is_open() -> None:
         return 1, "", "Get-NetFirewallRule: access denied"
 
     assert guard.check_firewall(CONFIG, broken).status == guard.OPEN
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        ["192.0.2.10/32", "2001:db8::/64"],
+        ["2001:db8::/64", "192.0.2.10/32"],
+        ["192.0.2.10", "2001:db8::1"],
+        ["2001:db8::1", "192.0.2.10"],
+        ["192.0.2.0/24", "2001:db8::1-2001:db8::ff"],
+    ],
+)
+def test_mixed_v4_and_v6_entries_never_crash_the_audit(remote: list[str]) -> None:
+    """PR #505 gate: the runbook's rule lists v4 and v6 together, so every v4 target meets a v6
+    entry and vice versa. Each must be skipped, not raise, in either order."""
+    from spirrow_mindwire.operator_lane.guard import _covers
+
+    assert _covers(remote, "192.0.2.10")
+    assert not _covers(remote, "198.51.100.1")
+    assert not _covers(["2001:db8::/64"], "192.0.2.10")
+    assert not _covers(["192.0.2.0/24"], "2001:db8::1")
