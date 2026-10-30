@@ -761,3 +761,18 @@ def test_prescreen_posts_needs_hands_without_a_session(tmp_path: Path) -> None:
     assert "OPERATOR-LANE: needs-hands prescreen「deploy」" in text
     assert text.rstrip().endswith("NEXT: operator")
     assert h.heads()["dispatched"] is True
+
+
+def test_prescreen_post_failure_is_retried_and_a_landed_post_is_not_doubled(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path)
+    h.chat.msgs[-1]["content"] = HEAD_BODY.replace("scripts/probe.py を流して", "deploy して")
+    h.chat.post_mode = "down"
+    h.run_pass()
+    assert st.load_heads(h.paths) == {}  # not recorded: the next tick tries again
+    h.chat.post_mode = "landed_then_timeout"
+    h.run_pass()
+    h.chat.post_mode = None
+    h.run_pass()  # the landed post is now the head, so nothing is posted twice
+    assert len(h.chat.posts) == 1

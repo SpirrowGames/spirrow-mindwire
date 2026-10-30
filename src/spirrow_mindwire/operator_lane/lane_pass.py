@@ -563,6 +563,7 @@ def _post_prescreen(target: dict[str, str], word: str, deps: PassDeps) -> PassRe
     key = head_key(target["project"], target["thread_id"])
     with hold_mutex(deps.paths.mutex):
         heads = load_heads(deps.paths)
+        prior = heads.get(key)
         heads[key] = {"head_msg_id": target["head_msg_id"], "spawn_attempts": 0, "dispatched": True}
         save_heads(deps.paths, heads)
     body = (
@@ -584,10 +585,18 @@ def _post_prescreen(target: dict[str, str], word: str, deps: PassDeps) -> PassRe
     try:
         msg_id = deps.chat.post(target["project"], target["thread_id"], body)
     except Exception as exc:
+        # Undo the record so the next tick retries; a post that did land moved the head (PR #506)
+        with hold_mutex(deps.paths.mutex):
+            heads = load_heads(deps.paths)
+            if prior is None:
+                heads.pop(key, None)
+            else:
+                heads[key] = prior
+            save_heads(deps.paths, heads)
         res.notify(
             f"operator-lane:prescreen:{target['head_msg_id']}",
             f"operator lane: {target['thread_id']} の pre-screen 報告を投稿できませんでした（{exc}）。"
-            "head は dispatch 済みとして記録したので、lane はもう拾いません。",
+            "次の tick でもう一度投稿します。",
         )
         return res
     res.log(f"operator pass: {target['thread_id']} pre-screened ({word}) -> {msg_id}")
