@@ -176,7 +176,9 @@ def test_isolation_check_refuses_runner_settings(env: dict[str, str]) -> None:
 
 def test_isolation_check_accepts_the_users_own_environment() -> None:
     runner = {"MINDWIRE_MAGICKIT_MCP_URL": "http://magickit:8000/mcp", "MINDWIRE_X": " "}
-    sess.check_isolated_env({"PATH": "C:/bin", "USERPROFILE": "C:/Users/mw", "Y": " "}, runner)
+    runner |= {"MINDWIRE_N": "4", "MINDWIRE_FLAG": "true"}  # short values collide by chance
+    env = {"NUMBER_OF_PROCESSORS": "4", "SOME_FLAG": "true", "Y": " "}
+    sess.check_isolated_env({"PATH": "C:/bin", "USERPROFILE": "C:/Users/mw", **env}, runner)
 
 
 class _FakeWin:

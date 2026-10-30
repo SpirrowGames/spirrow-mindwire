@@ -20,8 +20,10 @@
       "Bash(rm -f --recursive:*)",
       "Bash(rm --force -r:*)",
       "Bash(rm --force --recursive:*)",
-      "Bash(Remove-Item -Recurse:*)",
-      "Bash(Remove-Item -Force -Recurse:*)"
+      "Bash(Remove-Item -R:*)",
+      "Bash(Remove-Item -r:*)",
+      "Bash(Remove-Item -Force -R:*)",
+      "Bash(Remove-Item -Force -r:*)"
     ]
   }
 }

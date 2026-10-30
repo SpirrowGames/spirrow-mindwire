@@ -263,12 +263,15 @@ def _create_process_with_logon(
 
 
 _RUNNER_ONLY_PREFIX = "MINDWIRE_"
+_MIN_LEAK_VALUE_LEN = 8  # "4" or "true" matches by chance; secrets and addresses are longer
 
 
 def check_isolated_env(env: dict[str, str], runner_env: Any) -> None:
-    """Raise if ``env`` has a ``MINDWIRE_*`` name or any value of the runner's ``MINDWIRE_*``."""
+    """Raise if ``env`` has a ``MINDWIRE_*`` name or a long value of the runner's ``MINDWIRE_*``."""
     secrets = {
-        v for k, v in runner_env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) and v.strip()
+        v
+        for k, v in runner_env.items()
+        if k.upper().startswith(_RUNNER_ONLY_PREFIX) and len(v.strip()) >= _MIN_LEAK_VALUE_LEN
     }
     leaked = sorted(
         k for k, v in env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) or v in secrets

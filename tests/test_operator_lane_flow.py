@@ -725,7 +725,11 @@ def test_deny_list_covers_every_recursive_force_delete_the_audit_names() -> None
     # The deny list is prefix-only; the audit must still catch what slips past it.
     for command in ("cd /t && rm -r -f *", "rm  -r  -f *", "x; rm -f -R y", "sudo rm -rf /"):
         assert audit.search(command), command
-    for command in ("rm -r x", "rm x -r; echo -f", "git rm -f x"):
+    ps = ("Remove-Item -Rec x", "Remove-Item -Force -Recu x", "Remove-Item x -r", "ri -Rec x")
+    for command in (*ps, "rd x -r", "rm -Rec x", "rmdir /s /q x", "del /s x"):
+        assert audit.search(command), command
+    assert all(any(c.startswith(p) for p in prefixes) for c in ps[:2]), ps
+    for command in ("rm -r x", "rm x -r; echo -f", "git rm -f x", "del x; grep -r y"):
         assert not audit.search(command), command
 
 

@@ -66,12 +66,15 @@ AUDIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("git push --force", re.compile(r"\bgit\s+push\b[^\n]*(--force|\s-f\b)")),
     ("git push main", re.compile(r"\bgit\s+push\b[^\n]*\bmain\b")),
     ("magickit deploy", re.compile(r"magickit[^\n]*deploy|deploy[^\n]*magickit", re.I)),
-    # rm anywhere in a command, with a recursive and a force flag in any order, split or not.
+    # rm anywhere in a command, with a recursive and a force flag in any order, split or not; and
+    # PowerShell's delete under any alias with -Recurse cut to any prefix. Text only: not a sandbox.
     (
         "recursive delete",
         re.compile(
             r"\brm\b(?=[^\n;&|]*\s-(?:[a-z]*r|-recursive))(?=[^\n;&|]*\s-(?:[a-z]*f|-force))"
-            r"|\bRemove-Item\b[^\n]*-Recurse",
+            r"|\bRemove-Item\b[^\n]*\s-r[a-z]*\b"
+            r"|\b(?:ri|rd|rmdir|del|erase)\b[^\n;&|]*\s(?:-r[a-z]*|/s)\b"
+            r"|\brm\b[^\n;&|]*\s-rec[a-z]*\b",
             re.I,
         ),
     ),
