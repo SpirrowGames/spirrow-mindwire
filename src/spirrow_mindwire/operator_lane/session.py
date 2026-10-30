@@ -8,8 +8,11 @@
   the runner dies, the OS closes its Job handle and every process in the Job dies with it, so no
   session can outlive its runner and post late. With ``run_as_user`` set the session is started
   through ``CreateProcessWithLogonW`` as that user (D2'' (b-2)), whose password is read from the
-  Windows Credential Manager; the session then has that user's own environment — none of the
-  runner's variables (the magickit URL among them) reach it.
+  Windows Credential Manager. The session's environment block is built explicitly from that user's
+  own logon token (``CreateEnvironmentBlock`` with ``bInherit=FALSE``) and checked by
+  :func:`check_isolated_env` before the start, so none of the runner's variables (the magickit URL
+  among them) reach it. ``lpEnvironment`` is never ``NULL``: what ``NULL`` means for this API is
+  not something the isolation should depend on (PR #506 gate).
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ _CREATE_SUSPENDED = 0x00000004
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
 _LOGON_WITH_PROFILE = 0x00000001
+_LOGON32_LOGON_INTERACTIVE = 2
+_LOGON32_PROVIDER_DEFAULT = 0
 _STARTF_USESTDHANDLES = 0x00000100
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
@@ -236,6 +241,9 @@ def _create_process_with_logon(
     if "\\" in user:
         domain, user = user.split("\\", 1)
     cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(list(argv)))
+    env = _user_environment(user, domain, password)
+    check_isolated_env(env, os.environ)
+    env_block = ctypes.create_unicode_buffer(encode_env_block(env))
     ok = _win(ctypes).advapi32.CreateProcessWithLogonW(
         user,
         domain,
@@ -244,7 +252,7 @@ def _create_process_with_logon(
         None,
         cmdline,
         _CREATE_SUSPENDED | _CREATE_NO_WINDOW | _CREATE_UNICODE_ENVIRONMENT,
-        None,
+        env_block,
         cwd or None,
         ctypes.byref(si),
         ctypes.byref(pi),
@@ -255,6 +263,89 @@ def _create_process_with_logon(
     kernel32.CloseHandle(pi.hThread)
     kernel32.CloseHandle(pi.hProcess)
     return int(pi.dwProcessId)
+
+
+_RUNNER_ONLY_PREFIX = "MINDWIRE_"
+
+
+def check_isolated_env(env: dict[str, str], runner_env: Any) -> None:
+    """Refuse a session environment that carries any of the runner's ``MINDWIRE_*`` settings.
+
+    Checked by name (``MINDWIRE_*``) and by value (a value equal to one of the runner's
+    ``MINDWIRE_*`` values, whatever it is called), so a URL or key re-exported under another
+    name is refused too. Raises ``RuntimeError``; the caller turns that into a session that
+    never started.
+    """
+    secrets = {
+        v for k, v in runner_env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) and v.strip()
+    }
+    leaked = sorted(
+        k for k, v in env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) or v in secrets
+    )
+    if leaked:
+        raise RuntimeError(f"session environment carries runner settings: {', '.join(leaked)}")
+
+
+def parse_env_block(block: str) -> dict[str, str]:
+    """A Win32 environment block (NUL-terminated ``NAME=value`` entries, then a NUL) as a dict."""
+    env: dict[str, str] = {}
+    for entry in block.split("\0"):
+        if not entry:
+            continue
+        name, sep, value = entry[1:].partition("=")  # a leading '=' is part of names like '=C:'
+        if sep:
+            env[entry[0] + name] = value
+    return env
+
+
+def encode_env_block(env: dict[str, str]) -> str:
+    """The inverse of :func:`parse_env_block`, sorted case-insensitively as Win32 requires."""
+    return "".join(f"{k}={env[k]}\0" for k in sorted(env, key=str.upper)) + "\0"
+
+
+def _user_environment(user: str, domain: str, password: str) -> dict[str, str]:
+    """The environment of ``user``'s own logon, inheriting nothing from this process."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = _win(ctypes).advapi32
+    userenv = _win(ctypes).userenv
+    kernel32 = _win(ctypes).kernel32
+    win_ctypes: Any = ctypes
+    token = wintypes.HANDLE()
+    if not advapi32.LogonUserW(
+        user,
+        domain,
+        password,
+        _LOGON32_LOGON_INTERACTIVE,
+        _LOGON32_PROVIDER_DEFAULT,
+        ctypes.byref(token),
+    ):
+        raise OSError(win_ctypes.GetLastError(), "LogonUserW failed")
+    block = ctypes.c_void_p()
+    try:
+        userenv.CreateEnvironmentBlock.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.HANDLE,
+            wintypes.BOOL,
+        ]
+        if not userenv.CreateEnvironmentBlock(ctypes.byref(block), token, False):
+            raise OSError(win_ctypes.GetLastError(), "CreateEnvironmentBlock failed")
+        try:
+            entries: list[str] = []
+            addr = block.value or 0
+            while True:
+                entry = ctypes.wstring_at(addr)
+                if not entry:
+                    break
+                entries.append(entry)
+                addr += (len(entry) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            return parse_env_block("\0".join(entries) + "\0\0")
+        finally:
+            userenv.DestroyEnvironmentBlock.argtypes = [ctypes.c_void_p]
+            userenv.DestroyEnvironmentBlock(block)
+    finally:
+        kernel32.CloseHandle(token)
 
 
 def _assign_resume_wait(job_handle: Any, pid: int, timeout_sec: int) -> SessionOutcome:
