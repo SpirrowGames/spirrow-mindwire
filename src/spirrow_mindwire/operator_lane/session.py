@@ -11,8 +11,7 @@
   Windows Credential Manager. The session's environment block is built explicitly from that user's
   own logon token (``CreateEnvironmentBlock`` with ``bInherit=FALSE``) and checked by
   :func:`check_isolated_env` before the start, so none of the runner's variables (the magickit URL
-  among them) reach it. ``lpEnvironment`` is never ``NULL``: what ``NULL`` means for this API is
-  not something the isolation should depend on (PR #506 gate).
+  among them) reach it; ``lpEnvironment`` is never ``NULL`` (PR #506 gate).
 """
 
 from __future__ import annotations
@@ -269,13 +268,7 @@ _RUNNER_ONLY_PREFIX = "MINDWIRE_"
 
 
 def check_isolated_env(env: dict[str, str], runner_env: Any) -> None:
-    """Refuse a session environment that carries any of the runner's ``MINDWIRE_*`` settings.
-
-    Checked by name (``MINDWIRE_*``) and by value (a value equal to one of the runner's
-    ``MINDWIRE_*`` values, whatever it is called), so a URL or key re-exported under another
-    name is refused too. Raises ``RuntimeError``; the caller turns that into a session that
-    never started.
-    """
+    """Raise if ``env`` has a ``MINDWIRE_*`` name or any value of the runner's ``MINDWIRE_*``."""
     secrets = {
         v for k, v in runner_env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) and v.strip()
     }

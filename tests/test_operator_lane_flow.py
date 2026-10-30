@@ -688,8 +688,7 @@ def test_exhausted_old_head_does_not_block_a_new_head() -> None:
 
 
 def test_lane_post_as_head_is_read_once_then_left_alone(tmp_path: Path) -> None:
-    """PR #506 gate finding 2: the lane's own ``NEXT: operator`` post is not a task, and is
-    recorded so it does not take a head-read slot on every later tick."""
+    """PR #506 gate finding 2: the lane's own post is read once, not on every tick."""
     h = Harness(tmp_path)
     h.chat.msgs[-1]["content"] = HEAD_BODY.replace(
         "scripts/probe.py を流して", "magickit を deploy して"

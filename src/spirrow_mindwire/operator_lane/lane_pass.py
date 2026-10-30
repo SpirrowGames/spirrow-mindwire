@@ -522,8 +522,7 @@ def _dispatch(
             continue
         task = is_operator_task_head(str(head.get("content") or ""))
         if task is None:
-            # Not a task the lane may take (e.g. the lane's own needs-hands post). Record the head
-            # so it stops taking one of the MAX_HEAD_READS slots every tick (PR #506 gate).
+            # e.g. the lane's own post: record it so it stops taking a read slot (PR #506 gate)
             _mark_not_a_task(deps, cand)
             continue
         target = {
