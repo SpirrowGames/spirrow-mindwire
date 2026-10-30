@@ -66,7 +66,17 @@ AUDIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("git push --force", re.compile(r"\bgit\s+push\b[^\n]*(--force|\s-f\b)")),
     ("git push main", re.compile(r"\bgit\s+push\b[^\n]*\bmain\b")),
     ("magickit deploy", re.compile(r"magickit[^\n]*deploy|deploy[^\n]*magickit", re.I)),
-    ("recursive delete", re.compile(r"\brm\s+-[a-z]*r[a-z]*f|\bRemove-Item\b[^\n]*-Recurse", re.I)),
+    # ``rm`` with a recursive flag and a force flag anywhere in the same command, in any order or
+    # split (``-rf``, ``-fr``, ``-r -f``, ``--recursive --force``) — PR #506 gate advisory.
+    (
+        "recursive delete",
+        re.compile(
+            r"\brm\b(?=[^\n;&|]*\s-(?:[a-z]*r[a-z]*\b|-recursive\b))"
+            r"(?=[^\n;&|]*\s-(?:[a-z]*f[a-z]*\b|-force\b))"
+            r"|\bRemove-Item\b[^\n]*-Recurse",
+            re.I,
+        ),
+    ),
     ("branch delete", re.compile(r"\bgit\s+branch\s+-D\b|\bgh\s+repo\s+delete\b")),
 )
 
