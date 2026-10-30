@@ -776,3 +776,14 @@ def test_prescreen_post_failure_is_retried_and_a_landed_post_is_not_doubled(
     h.chat.post_mode = None
     h.run_pass()  # the landed post is now the head, so nothing is posted twice
     assert len(h.chat.posts) == 1
+
+
+def test_prescreen_on_a_resolved_thread_is_not_retried(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.chat.msgs[-1]["content"] = HEAD_BODY.replace("scripts/probe.py を流して", "deploy して")
+    h.chat.post_mode = "resolved"
+    h.run_pass()
+    assert h.heads()["dispatched"] is True  # terminal: kept, so the next tick leaves it alone
+    h.chat.post_mode = None
+    h.run_pass()
+    assert h.chat.posts == []

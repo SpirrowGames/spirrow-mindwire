@@ -584,6 +584,15 @@ def _post_prescreen(target: dict[str, str], word: str, deps: PassDeps) -> PassRe
         return res
     try:
         msg_id = deps.chat.post(target["project"], target["thread_id"], body)
+    except ThreadResolvedError as exc:
+        # Terminal: keep the record (no retry); fallback surface (1) is this notification
+        res.action = "thread_resolved"
+        res.notify(
+            f"operator-lane:prescreen:{target['head_msg_id']}",
+            f"operator lane: {target['thread_id']} は resolved のため pre-screen 報告を投稿できません（{exc}）。"
+            f"{target['head_msg_id']} の OPERATOR-TASK「{word}」を手で確認してください。",
+        )
+        return res
     except Exception as exc:
         # Undo the record so the next tick retries; a post that did land moved the head (PR #506)
         with hold_mutex(deps.paths.mutex):
