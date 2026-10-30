@@ -676,6 +676,68 @@ def test_eligibility_filters(tmp_path: Path) -> None:
     assert lp.eligible_candidates(cfg, [cand], done, skip) == []
 
 
+def test_exhausted_old_head_does_not_block_a_new_head() -> None:
+    """PR #506 gate finding 1: spawn attempts used up on an old head never hide a new one."""
+    cfg = LaneConfig(enabled=True, projects=(PROJECT,), max_spawn_attempts=2)
+    skip = {THREAD: {"last_observed_head_msg_id": "msg-2", "last_observed_nomination": "operator"}}
+    cand = {"project": PROJECT, "thread_id": THREAD, "head_msg_id": "msg-2"}
+    old = {st.head_key(PROJECT, THREAD): {"head_msg_id": "msg-1", "spawn_attempts": 9}}
+    assert lp.eligible_candidates(cfg, [cand], old, skip) == [cand]
+    same = {st.head_key(PROJECT, THREAD): {"head_msg_id": "msg-2", "spawn_attempts": 2}}
+    assert lp.eligible_candidates(cfg, [cand], same, skip) == []
+
+
+def test_lane_post_as_head_is_read_once_then_left_alone(tmp_path: Path) -> None:
+    """PR #506 gate finding 2: the lane's own ``NEXT: operator`` post is not a task, and is
+    recorded so it does not take a head-read slot on every later tick."""
+    h = Harness(tmp_path)
+    h.chat.msgs[-1]["content"] = HEAD_BODY.replace(
+        "scripts/probe.py を流して", "magickit を deploy して"
+    )
+    assert h.run_pass().action == "prescreened"
+    lane_post = h.chat.msgs[-1]["msg_id"]
+    h.set_skip_record(lane_post)
+    reads: list[str] = []
+    real = h.chat.messages
+
+    def counting(project: str, thread_id: str) -> list[dict[str, Any]]:
+        reads.append(thread_id)
+        return real(project, thread_id)
+
+    h.chat.messages = counting  # type: ignore[method-assign]
+    assert h.run_pass().action == "idle"
+    assert h.heads() == {"head_msg_id": lane_post, "spawn_attempts": 0, "not_a_task": True}
+    assert h.run_pass().action == "idle"
+    assert reads == [THREAD]
+    assert h.spawned == []
+
+
+def test_deny_list_covers_every_recursive_force_delete_the_audit_names() -> None:
+    """PR #506 gate finding 3: split / reordered ``rm`` flags are denied up front, not only
+    audited after the run."""
+    settings = Path(__file__).resolve().parents[1] / "deploy" / "operator-lane"
+    deny = json.loads((settings / "session-settings.json").read_text(encoding="utf-8"))
+    prefixes = [
+        r[len("Bash(") : -len(":*)")] for r in deny["permissions"]["deny"] if r.endswith(":*)")
+    ]
+    pattern = dict(rn.AUDIT_PATTERNS)["recursive delete"]
+    for command in (
+        "rm -rf x",
+        "rm -fr x",
+        "rm -r -f x",
+        "rm -f -r x",
+        "rm -R -f x",
+        "rm -f -R x",
+        "rm -fR x",
+        "rm --recursive --force x",
+        "rm --force --recursive x",
+        "rm -f --recursive x",
+        "Remove-Item -Force -Recurse x",
+    ):
+        assert pattern.search(command), command
+        assert any(command.startswith(p) for p in prefixes), command
+
+
 def test_marked_or_malformed_operator_heads_are_not_taken() -> None:
     assert rn.is_operator_task_head(HEAD_BODY) == "scripts/probe.py を流して結果を報告する"
     marked = "OPERATOR-LANE: needs-hands quarantined\n" + HEAD_BODY

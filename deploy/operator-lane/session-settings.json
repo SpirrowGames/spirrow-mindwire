@@ -10,7 +10,18 @@
       "Bash(git branch -D:*)",
       "Bash(gh repo delete:*)",
       "Bash(rm -rf:*)",
-      "Bash(Remove-Item -Recurse:*)"
+      "Bash(rm -r:*)",
+      "Bash(rm -R:*)",
+      "Bash(rm -fr:*)",
+      "Bash(rm -fR:*)",
+      "Bash(rm -f -r:*)",
+      "Bash(rm -f -R:*)",
+      "Bash(rm --recursive:*)",
+      "Bash(rm -f --recursive:*)",
+      "Bash(rm --force -r:*)",
+      "Bash(rm --force --recursive:*)",
+      "Bash(Remove-Item -Recurse:*)",
+      "Bash(Remove-Item -Force -Recurse:*)"
     ]
   }
 }

@@ -473,11 +473,23 @@ def eligible_candidates(
         entry = heads.get(head_key(project, thread_id)) or {}
         if entry.get("head_msg_id") == head and (
             entry.get("dispatched")
+            or entry.get("not_a_task")
             or int(entry.get("spawn_attempts") or 0) >= config.max_spawn_attempts
         ):
             continue
         out.append({"project": project, "thread_id": thread_id, "head_msg_id": head})
     return out
+
+
+def _mark_not_a_task(deps: PassDeps, cand: dict[str, str]) -> None:
+    with hold_mutex(deps.paths.mutex):
+        heads = load_heads(deps.paths)
+        heads[head_key(cand["project"], cand["thread_id"])] = {
+            "head_msg_id": cand["head_msg_id"],
+            "spawn_attempts": 0,
+            "not_a_task": True,
+        }
+        save_heads(deps.paths, heads)
 
 
 def prescreen(task: str) -> str | None:
@@ -510,6 +522,9 @@ def _dispatch(
             continue
         task = is_operator_task_head(str(head.get("content") or ""))
         if task is None:
+            # Not a task the lane may take (e.g. the lane's own needs-hands post). Record the head
+            # so it stops taking one of the MAX_HEAD_READS slots every tick (PR #506 gate).
+            _mark_not_a_task(deps, cand)
             continue
         target = {
             **cand,
