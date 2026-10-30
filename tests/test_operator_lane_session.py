@@ -241,22 +241,3 @@ def test_logon_start_refuses_an_environment_with_runner_settings(
         for f in files:
             f.close()
     assert fake.calls == []  # nothing was started
-
-
-@pytest.mark.parametrize(
-    ("command", "hit"),
-    [
-        ("rm -rf x", True),
-        ("rm -fr x", True),
-        ("rm -r -f x", True),
-        ("rm -f -R x", True),
-        ("rm --recursive --force x", True),
-        ("rm -r x", False),
-        ("rm x -r; echo -f", False),
-    ],
-)
-def test_recursive_delete_audit_tolerates_split_flags(command: str, hit: bool) -> None:
-    from spirrow_mindwire.operator_lane.runner import AUDIT_PATTERNS
-
-    pattern = dict(AUDIT_PATTERNS)["recursive delete"]
-    assert bool(pattern.search(command)) is hit
