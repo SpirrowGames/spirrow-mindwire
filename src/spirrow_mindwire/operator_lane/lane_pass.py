@@ -560,12 +560,6 @@ def _dispatch(
 def _post_prescreen(target: dict[str, str], word: str, deps: PassDeps) -> PassResult:
     """D4 pre-screen: post the needs-hands stop without starting a session."""
     run_id = deps.new_run_id()
-    key = head_key(target["project"], target["thread_id"])
-    with hold_mutex(deps.paths.mutex):
-        heads = load_heads(deps.paths)
-        prior = heads.get(key)
-        heads[key] = {"head_msg_id": target["head_msg_id"], "spawn_attempts": 0, "dispatched": True}
-        save_heads(deps.paths, heads)
     body = (
         f"{rpt.header(run_id, target['head_msg_id'], target['operator_task'])}\n"
         f"{rpt.marker(run_id, rpt.KIND_REPORT)}\n"
@@ -584,30 +578,24 @@ def _post_prescreen(target: dict[str, str], word: str, deps: PassDeps) -> PassRe
         return res
     try:
         msg_id = deps.chat.post(target["project"], target["thread_id"], body)
-    except ThreadResolvedError as exc:
-        # Terminal: keep the record (no retry); fallback surface (1) is this notification
-        res.action = "thread_resolved"
+    except ThreadResolvedError as exc:  # terminal; fallback surface (1) is this notification
+        msg_id = "none"
         res.notify(
             f"operator-lane:prescreen:{target['head_msg_id']}",
-            f"operator lane: {target['thread_id']} は resolved のため pre-screen 報告を投稿できません（{exc}）。"
-            f"{target['head_msg_id']} の OPERATOR-TASK「{word}」を手で確認してください。",
+            f"operator lane: {target['thread_id']} は resolved です（{exc}）。",
         )
-        return res
-    except Exception as exc:
-        # Undo the record so the next tick retries; a post that did land moved the head (PR #506)
-        with hold_mutex(deps.paths.mutex):
-            heads = load_heads(deps.paths)
-            if prior is None:
-                heads.pop(key, None)
-            else:
-                heads[key] = prior
-            save_heads(deps.paths, heads)
+    except Exception as exc:  # nothing recorded yet, so the next tick retries (PR #506 gate)
         res.notify(
             f"operator-lane:prescreen:{target['head_msg_id']}",
-            f"operator lane: {target['thread_id']} の pre-screen 報告を投稿できませんでした（{exc}）。"
-            "次の tick でもう一度投稿します。",
+            f"operator lane: {target['thread_id']} の pre-screen 報告を投稿できませんでした（{exc}）。次の tick でもう一度投稿します。",
         )
         return res
+    # Recorded after the post: one that landed moved the head, so a crash here never doubles it
+    key = head_key(target["project"], target["thread_id"])
+    with hold_mutex(deps.paths.mutex):
+        heads = load_heads(deps.paths)
+        heads[key] = {"head_msg_id": target["head_msg_id"], "spawn_attempts": 0, "dispatched": True}
+        save_heads(deps.paths, heads)
     res.log(f"operator pass: {target['thread_id']} pre-screened ({word}) -> {msg_id}")
     return res
 
