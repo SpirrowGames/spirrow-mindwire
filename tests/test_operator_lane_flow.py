@@ -690,9 +690,7 @@ def test_exhausted_old_head_does_not_block_a_new_head() -> None:
 def test_lane_post_as_head_is_read_once_then_left_alone(tmp_path: Path) -> None:
     """PR #506 gate finding 2: the lane's own post is read once, not on every tick."""
     h = Harness(tmp_path)
-    h.chat.msgs[-1]["content"] = HEAD_BODY.replace(
-        "scripts/probe.py を流して", "magickit を deploy して"
-    )
+    h.chat.msgs[-1]["content"] = HEAD_BODY.replace("scripts/probe.py を流して", "deploy して")
     assert h.run_pass().action == "prescreened"
     lane_post = h.chat.msgs[-1]["msg_id"]
     h.set_skip_record(lane_post)
@@ -712,27 +710,16 @@ def test_lane_post_as_head_is_read_once_then_left_alone(tmp_path: Path) -> None:
 
 
 def test_deny_list_covers_every_recursive_force_delete_the_audit_names() -> None:
-    """PR #506 gate finding 3: split / reordered ``rm`` flags are denied up front, not only
-    audited after the run."""
+    """PR #506 gate finding 3: split / reordered ``rm`` flags are denied up front too."""
     settings = Path(__file__).resolve().parents[1] / "deploy" / "operator-lane"
     deny = json.loads((settings / "session-settings.json").read_text(encoding="utf-8"))
     prefixes = [
         r[len("Bash(") : -len(":*)")] for r in deny["permissions"]["deny"] if r.endswith(":*)")
     ]
     audit = dict(rn.AUDIT_PATTERNS)["recursive delete"]
-    for command in (
-        "rm -rf x",
-        "rm -fr x",
-        "rm -r -f x",
-        "rm -f -r x",
-        "rm -R -f x",
-        "rm -f -R x",
-        "rm -fR x",
-        "rm --recursive --force x",
-        "rm --force --recursive x",
-        "rm -f --recursive x",
-        "Remove-Item -Force -Recurse x",
-    ):
+    names = "rm -rf x|rm -fr x|rm -r -f x|rm -f -r x|rm -R -f x|rm -f -R x|rm -fR x"
+    names += "|rm --recursive --force x|rm --force --recursive x|rm -f --recursive x"
+    for command in (*names.split("|"), "Remove-Item -Force -Recurse x"):
         assert any(command.startswith(p) for p in prefixes), command
         assert audit.search(command), command
     # The deny list is prefix-only; the audit must still catch what slips past it.
