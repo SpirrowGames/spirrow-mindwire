@@ -1,17 +1,12 @@
 # ruff: noqa: RUF001, E501 - posted Japanese text: fullwidth punctuation and wide lines on purpose
 """The conductor's operator pass (D1', D3'' - D3⁸, D5, D2⁶ / D2⁷).
 
-The ``MindWire-Conductor`` wrapper calls this once per tick, after its head probe and before its
-own sweep (D1': dispatch is decided by the conductor's tick and nothing else). One pass does at
-most ONE of these, in this order:
+Called once per conductor tick, before its sweep (D1'). One pass does at most one of:
 
-1. If a lock exists: leave a live one alone; otherwise settle it — reclaim an expired manual lease;
-   for a conductor run, a failed spawn is retried (2 attempts in total, D5) and a finished or dead
-   run goes through the completion table below.
-2. Otherwise dispatch at most one task: pick the first operator head (D5), mark it ``dispatched``
-   in ``heads`` (fail-closed: before anything starts), create the ``spawning`` lock, start the
-   runner detached, and watch the lock for up to 30 s (D3⁶) so a runner that dies at once is
-   settled in this tick.
+1. A lock exists: leave a live one alone, else settle it (expired manual lease, spawn retry, D5, or
+   the completion table below).
+2. Else dispatch one task: mark its head ``dispatched`` (fail-closed), create the ``spawning``
+   lock, start the runner detached and watch it for 30 s (D3⁶). A pre-screen hit posts instead.
 
 Completion table (D2⁷; rows read top-down; the lock's ``result`` decides, ``posted()`` never does):
 
@@ -25,8 +20,8 @@ lock ``result``                            ``<run_id>.md``              outcome
 none
 =========================================  ===========================  ===========================
 
-``posted(run_id)`` is consulted only right before a re-post or a quarantine post, to avoid posting
-twice. A re-post that fails keeps the lock, so the next tick tries once more (once per tick).
+``posted(run_id)`` is read only right before a re-post or quarantine post. A failed re-post retries
+next tick.
 
 Slow work (chatroom reads and posts, the guard) runs OUTSIDE the mutex: a hand-driven
 ``lock acquire`` gives up on the mutex after 10 s, and must not lose to a network call.

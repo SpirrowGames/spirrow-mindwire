@@ -763,27 +763,14 @@ def test_prescreen_posts_needs_hands_without_a_session(tmp_path: Path) -> None:
     assert h.heads()["dispatched"] is True
 
 
-def test_prescreen_post_failure_is_retried_and_a_landed_post_is_not_doubled(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("mode", ["down", "landed_then_timeout", "resolved"])
+def test_prescreen_post_failure(tmp_path: Path, mode: str) -> None:
+    """PR #506 gate: a failed post is retried, landed never doubled, resolved dropped."""
     h = Harness(tmp_path)
     h.chat.msgs[-1]["content"] = HEAD_BODY.replace("scripts/probe.py を流して", "deploy して")
-    h.chat.post_mode = "down"
+    h.chat.post_mode = mode
     h.run_pass()
-    assert st.load_heads(h.paths) == {}  # not recorded: the next tick tries again
-    h.chat.post_mode = "landed_then_timeout"
-    h.run_pass()
-    h.chat.post_mode = None
-    h.run_pass()  # the landed post is now the head, so nothing is posted twice
-    assert len(h.chat.posts) == 1
-
-
-def test_prescreen_on_a_resolved_thread_is_not_retried(tmp_path: Path) -> None:
-    h = Harness(tmp_path)
-    h.chat.msgs[-1]["content"] = HEAD_BODY.replace("scripts/probe.py を流して", "deploy して")
-    h.chat.post_mode = "resolved"
-    h.run_pass()
-    assert h.heads()["dispatched"] is True  # terminal: kept, so the next tick leaves it alone
+    assert (st.load_heads(h.paths) == {}) is (mode != "resolved")
     h.chat.post_mode = None
     h.run_pass()
-    assert h.chat.posts == []
+    assert len(h.chat.posts) == (0 if mode == "resolved" else 1)
