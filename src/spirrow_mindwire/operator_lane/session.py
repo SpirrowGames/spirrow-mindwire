@@ -1,17 +1,15 @@
 """Starting processes: the detached runner (D1' Spawner) and the isolated session (D2'', D3⁵).
 
 * :class:`DetachedRunnerSpawner` — the operator pass starts ``run-session`` detached and returns at
-  once (D1': the tick is blocked only for the seconds a start takes). Swappable behind
-  :class:`Spawner` for ``claude --bg`` once T-spawn-via-claude-bg settles.
+  once (D1'). Swappable behind :class:`Spawner` for ``claude --bg`` once T-spawn-via-claude-bg
+  settles.
 * :class:`JobSessionLauncher` — the runner starts ``claude`` SUSPENDED, puts it in a Job Object with
-  ``KILL_ON_JOB_CLOSE``, resumes it, waits with a timeout and kills the whole Job past it (D3⁵). If
-  the runner dies, the OS closes its Job handle and every process in the Job dies with it, so no
-  session can outlive its runner and post late. With ``run_as_user`` set the session is started
-  through ``CreateProcessWithLogonW`` as that user (D2'' (b-2)), whose password is read from the
-  Windows Credential Manager. The session's environment block is built explicitly from that user's
-  own logon token (``CreateEnvironmentBlock`` with ``bInherit=FALSE``) and checked by
-  :func:`check_isolated_env` before the start, so none of the runner's variables (the magickit URL
-  among them) reach it; ``lpEnvironment`` is never ``NULL`` (PR #506 gate).
+  ``KILL_ON_JOB_CLOSE``, resumes it, and kills the whole Job past the timeout (D3⁵). A dead
+  runner's Job takes the session with it, so none posts late. With ``run_as_user`` the session runs
+  via ``CreateProcessWithLogonW`` as that user (D2'' (b-2); password from the Credential Manager),
+  with an environment built from that user's logon token (``CreateEnvironmentBlock``,
+  ``bInherit=FALSE``) and checked by :func:`check_isolated_env`, so no runner variable (the magickit
+  URL among them) reaches it (PR #506 gate).
 """
 
 from __future__ import annotations
