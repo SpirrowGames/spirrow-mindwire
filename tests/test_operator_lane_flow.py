@@ -720,6 +720,7 @@ def test_deny_list_covers_every_recursive_force_delete_the_audit_names() -> None
     prefixes = [
         r[len("Bash(") : -len(":*)")] for r in deny["permissions"]["deny"] if r.endswith(":*)")
     ]
+    audit = dict(rn.AUDIT_PATTERNS)["recursive delete"]
     for command in (
         "rm -rf x",
         "rm -fr x",
@@ -734,6 +735,12 @@ def test_deny_list_covers_every_recursive_force_delete_the_audit_names() -> None
         "Remove-Item -Force -Recurse x",
     ):
         assert any(command.startswith(p) for p in prefixes), command
+        assert audit.search(command), command
+    # The deny list is prefix-only; the audit must still catch what slips past it.
+    for command in ("cd /t && rm -r -f *", "rm  -r  -f *", "x; rm -f -R y", "sudo rm -rf /"):
+        assert audit.search(command), command
+    for command in ("rm -r x", "rm x -r; echo -f", "git rm -f x"):
+        assert not audit.search(command), command
 
 
 def test_marked_or_malformed_operator_heads_are_not_taken() -> None:
