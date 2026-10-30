@@ -8,15 +8,13 @@ reason (D2'' (b-3) / D2⁗); only the operator turns it back on, by hand, after 
 from __future__ import annotations
 
 import json
-import os
-import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .state import atomic_write_bytes, atomic_write_text, iso
+from .state import atomic_write_text, iso
 
 DEFAULT_PROJECTS = ("spirrow-mindwire",)
 
@@ -96,63 +94,14 @@ def load_config(path: Path) -> LaneConfig:
     )
 
 
-def _read_bytes(path: Path) -> bytes:
-    for attempt in range(_READ_RETRIES + 1):
-        try:
-            return path.read_bytes()
-        except PermissionError:
-            if attempt >= _READ_RETRIES:
-                raise
-            time.sleep(0.02)
-    raise AssertionError("unreachable")  # pragma: no cover
-
-
-def backup_name(path: Path, now: datetime) -> str:
-    """``<config>.malformed-<YYYYMMDDTHHMMSSZ>-<pid>-<hex6>.bak`` (T-operator-task-lane msg-7660).
-
-    Only ``[A-Za-z0-9._-]``: ``iso(now)`` carries colons, which Windows refuses in a file name, so
-    the time is written compactly here and ``iso`` is kept for the ``disabled_at`` value only. The
-    pid and the random suffix keep two calls in the same second from sharing (overwriting) a name.
-    """
-    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"{path.name}.malformed-{stamp}-{os.getpid()}-{secrets.token_hex(3)}.bak"
-
-
 def disable(path: Path, *, reason: str, now: datetime) -> None:
-    """Turn the lane off (guard_open). Everything else in the file is kept as it was.
-
-    A config that cannot be read (bad JSON, bad UTF-8, not an object) is still overwritten with
-    ``enabled: false``: leaving it alone would let a later hand fix of the syntax bring back
-    ``"enabled": true`` and un-latch the guard (msg-7657). Its bytes are first copied to a
-    :func:`backup_name` file so the operator's settings are not lost; restoring them is by hand
-    (``docs/operator-lane.md``). The disabling write always wins over the copy: a copy that fails
-    is recorded in ``disabled_reason`` and does not stop the write; only the write's own failure
-    raises (msg-7660).
-    """
+    """Turn the lane off (guard_open). Everything else in the file is kept as it was."""
     try:
-        original: bytes | None = _read_bytes(path)
-    except FileNotFoundError:
-        original = None
-    raw: dict[str, Any] = {}
-    unreadable = False
-    if original is not None:
-        try:
-            parsed = json.loads(original.decode("utf-8"))
-        except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueError
-            parsed = None
-        if isinstance(parsed, dict):
-            raw = parsed
-        else:
-            unreadable = True
-    if unreadable:
-        assert original is not None
-        bak = path.with_name(backup_name(path, now))
-        try:
-            atomic_write_bytes(bak, original, unique_tmp=True)
-        except OSError as exc:
-            reason = f"{reason}; original config unreadable, backup failed: {type(exc).__name__}"
-        else:
-            reason = f"{reason}; original config unreadable, preserved at {bak.name}"
+        raw = json.loads(_read_text(path))
+    except (FileNotFoundError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
     raw["enabled"] = False
     raw["disabled_reason"] = reason
     raw["disabled_at"] = iso(now)
@@ -160,4 +109,4 @@ def disable(path: Path, *, reason: str, now: datetime) -> None:
     atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n", unique_tmp=True)
 
 
-__all__ = ["DEFAULT_PROJECTS", "LaneConfig", "backup_name", "disable", "load_config"]
+__all__ = ["DEFAULT_PROJECTS", "LaneConfig", "disable", "load_config"]
