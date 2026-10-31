@@ -194,6 +194,13 @@ $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $retryPendingStatePath = Join-Path $dataDir "state\retry-pending.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
+# T-D8-codex-backend-adr14-15-amendment (Bohr msg-6582 gap 1, endorsed Einstein msg-6587): per-repo
+# count of `n3-routing-unresolved` tokens seen in conductor output since the last FULL digest. The
+# Python side only logs the token (the N-3 trusted side was unreadable, so the request went to
+# Gemini); this file is how "always Gemini" reaches a human instead of going unnoticed (msg-6477).
+# Written only by this sweep.
+$n3UnresolvedStatePath = Join-Path $dataDir "state\n3-unresolved.json"
+
 # T-decider-conductor-hook DECIDED 2e-2: the Conductor's Jev annotations (written under
 # [decider.tierc] mode = "annotate" | "bounce"; spirrow_mindwire.config.resolve_tierc_annotations_path).
 # Read by scripts/parked_humans.py; a missing file means "nothing annotated".
@@ -2093,6 +2100,11 @@ function New-DailyDigest {
         # Get-StopClassDigestLines. Fixed size (two lines, the second capped), emitted after the
         # 駐機中 section. Empty (the default) leaves the digest exactly as it was.
         [string[]]$StopClassLines = @(),
+        # T-D8-codex-backend-adr14-15-amendment (msg-6582 gap 1): the N-3 fail-safe lines, built by
+        # the caller with Get-N3UnresolvedDigestLines. Emitted after the stop-reason lines. Empty
+        # (the default) leaves the digest exactly as it was.
+        [string[]]$N3UnresolvedLines = @(),
+
         # T-composer-entrypoint-missing-drops-decision-cards D-3: the 材料未送信の判断待ち section,
         # built by the caller with Get-MaterialMissingDigestLines (same shape as $ParkedCloneLines:
         # header, rows, trailing ""). Emitted first among the caller-built sections — a decision with
@@ -2656,6 +2668,7 @@ function New-DailyDigest {
         $lines += $cloneTail
     }
     if ($StopClassLines.Count -gt 0) { $lines += $StopClassLines }
+    if ($N3UnresolvedLines.Count -gt 0) { $lines += $N3UnresolvedLines }
 
     $lines += $quarCountLine
     if ($totalQ -eq 0) {
@@ -5154,6 +5167,48 @@ function Get-StopClassDigestLines {
     return , $lines
 }
 
+# --- N-3 routing fail-safe surfacing (T-D8-codex-backend-adr14-15-amendment, Bohr msg-6582 gap 1) --
+# The Python N-3 router writes a WARNING carrying the token `n3-routing-unresolved` whenever it could
+# not read the trusted side and so routed a request to Gemini. That is already safe; what must not
+# happen is that it stays that way unnoticed (msg-6477). Following the conductor.stalled /
+# conductor.run_timeout pattern, the wrapper — not Python — surfaces it: each run's output is
+# counted, the counts accumulate per repo in $n3UnresolvedStatePath, and the daily digest carries
+# one line per repo. Not a quarantine, not a halt: the request has already gone to Gemini.
+$N3UnresolvedToken = 'n3-routing-unresolved'
+
+# Number of output lines carrying the token. Select-String -SimpleMatch for the same
+# array-vs-scalar reason as the `loop control:` filter (Einstein msg-2787).
+function Get-N3UnresolvedCount {
+    param($Output)
+    if ($null -eq $Output) { return 0 }
+    return @($Output | Select-String -Pattern $N3UnresolvedToken -SimpleMatch).Count
+}
+
+# Adds $Count to $State[$Repo]; a zero count leaves the state untouched.
+function Add-N3UnresolvedCount {
+    param([hashtable]$State, [string]$Repo, [int]$Count)
+    if ($Count -le 0) { return }
+    $prev = 0
+    if ($State.ContainsKey($Repo)) { $prev = [int]$State[$Repo] }
+    $State[$Repo] = $prev + $Count
+}
+
+# Digest lines: @() when nothing was counted, so the digest is unchanged; otherwise one row per
+# repo (sorted) with its count and the fail-safe it took, then a blank separator.
+function Get-N3UnresolvedDigestLines {
+    param([hashtable]$Counts)
+    $rows = @()
+    if ($null -ne $Counts) {
+        foreach ($repo in ($Counts.Keys | Sort-Object)) {
+            $n = [int]$Counts[$repo]
+            if ($n -gt 0) { $rows += "  $repo   $N3UnresolvedToken x$n — routed to Gemini (fail-safe)" }
+        }
+    }
+    if ($rows.Count -eq 0) { return , @() }
+    $lines = @("N-3 routing unresolved (codex not used): $($rows.Count) repo(s)") + $rows + @("")
+    return , $lines
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -5966,6 +6021,15 @@ try {
             Add-Content -LiteralPath $logPath -Value $output -Encoding utf8
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
+        $n3Count = Get-N3UnresolvedCount -Output $output
+        if ($n3Count -gt 0) {
+            Confirm-LogWorthKeeping
+            Write-Log "$($cand.key): $N3UnresolvedToken x$n3Count in $($cand.repo_dir) — routed to Gemini (fail-safe)"
+            $n3State = Get-JsonState -Path $n3UnresolvedStatePath
+            if ($null -eq $n3State) { $n3State = @{} }
+            Add-N3UnresolvedCount -State $n3State -Repo "$($cand.repo_dir)" -Count $n3Count
+            Save-JsonState -Path $n3UnresolvedStatePath -State $n3State
+        }
 
         # Note: the batch W-2c refresh above already advanced the starvation clock for every
         # decide-visited candidate (including this one), so there is no per-launch refresh here.
@@ -6474,6 +6538,7 @@ try {
                 -StaleHumanThreshold $StaleHumanThreshold `
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
                 -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
+                -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (Get-JsonState -Path $n3UnresolvedStatePath)) `
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake `
                 -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
@@ -6555,6 +6620,10 @@ try {
                 if ($headSkipMode -ne 'report' -and @($retryState.events).Count -gt 0) {
                     $retryState.events = @()
                     Save-JsonState -Path $retryPendingStatePath -State $retryState
+                }
+                # Same rule for the N-3 counts: "since the last digest the human actually read".
+                if (Test-Path -LiteralPath $n3UnresolvedStatePath) {
+                    Save-JsonState -Path $n3UnresolvedStatePath -State @{}
                 }
             }
             Save-JsonState -Path $notifyHealthPath -State $notifyHealth

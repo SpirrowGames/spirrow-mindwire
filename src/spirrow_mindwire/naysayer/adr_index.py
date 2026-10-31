@@ -242,6 +242,17 @@ def load_adr_index(repo_root: Path | None = None) -> tuple[tuple[str, str], ...]
     return tuple((e.adr_id, e.title) for e in load_adr_entries(repo_root))
 
 
+def adr_manifest_path(repo_root: Path | None = None) -> Path:
+    """The manifest file :func:`load_adr_entries` reads: ``<repo_root>/spec/adr_index.yaml``.
+
+    ``repo_root`` defaults to **this** repo. Exposed so the design-time N-3 routing can be
+    told exactly which file the prompt carries (thread msg-6588: ``system_assets``) from the
+    same expression the loader reads, rather than from a restated path.
+    """
+    root = repo_root if repo_root is not None else _REPO_ROOT
+    return root / _MANIFEST_REL
+
+
 def load_adr_entries(repo_root: Path | None = None) -> tuple[AdrEntry, ...]:
     """Load the in-repo ADR manifest as full ``AdrEntry`` records (deduped, sorted).
 
@@ -253,9 +264,8 @@ def load_adr_entries(repo_root: Path | None = None) -> tuple[AdrEntry, ...]:
     valid body locator; this fallback only exists so the loader itself does not raise
     during prompt construction (fail-open policy from Tier B Finding-2, msg-442).
     """
-    root = repo_root if repo_root is not None else _REPO_ROOT
     try:
-        raw = (root / _MANIFEST_REL).read_text(encoding="utf-8")
+        raw = adr_manifest_path(repo_root).read_text(encoding="utf-8")
         data = yaml.safe_load(raw)
     except (OSError, yaml.YAMLError):
         # Missing file (OSError) OR a malformed/un-parseable manifest (YAMLError, e.g. a
@@ -336,6 +346,7 @@ def build_adr_index_block(repo_root: Path | None = None) -> str:
 __all__ = [
     "BODY_LOCATOR_RE",
     "AdrEntry",
+    "adr_manifest_path",
     "body_locator_is_valid",
     "build_adr_index_block",
     "load_adr_entries",
