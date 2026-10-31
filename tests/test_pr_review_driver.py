@@ -4109,6 +4109,30 @@ def test_prompt_defers_the_class_vocabulary_to_the_injected_sot() -> None:
     assert "objection_classes:" in system  # the frontmatter really is in the same prompt
 
 
+def test_redaction_placeholder_guidance_is_in_the_task_prompt_not_the_preamble() -> None:
+    """The transport-placeholder guidance rides in the PR-gate task prompt only.
+
+    T-gate-input-entropy-redaction-mangles-identifiers D2: the gateway rewrote a 63-char test
+    name into ``[REDACTED:entropy#2]`` and the model blocked on it as a SyntaxError. The guidance
+    must reach the pass-1 system prompt, must keep "a real defect near the placeholder is still
+    a defect" (so the model does not repeat D1's mistake), and must NOT be in the principles
+    preamble, which is the verbatim-injected governed SOT (Einstein msg-7135 Obj.1).
+    """
+    marker = "`[REDACTED:...]`"
+    assert marker in _PR_REVIEW_SYSTEM_PROMPT
+    assert "inserted by the transport path" in _PR_REVIEW_SYSTEM_PROMPT
+    assert "is still" in _PR_REVIEW_SYSTEM_PROMPT and "a real defect" in _PR_REVIEW_SYSTEM_PROMPT
+
+    preamble = build_preamble()
+    assert "REDACTED" not in preamble
+
+    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    assert marker in system
+    # It sits after the preamble, i.e. inside the task-prompt part of the assembly.
+    assert system.index(marker) > system.index(preamble) + len(preamble) - 1
+    assert system.count(marker) == _PR_REVIEW_SYSTEM_PROMPT.count(marker)
+
+
 @pytest.mark.parametrize("boundary_name", list(_BOUNDARY_CHARS.keys()))
 @pytest.mark.parametrize("finish_reason", ["stop", "length"])
 @pytest.mark.parametrize("model_verdict", list(ModelVerdict))

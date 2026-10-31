@@ -477,6 +477,18 @@ _VERDICT_RE = re.compile(
 #     column-0 APPROVE ban nor the quoted-echo defence introduced above is weakened.
 #   * "You may additionally" — permissive, not mandatory. A blocking objection alone still counts
 #     as a complete review; the affordance exists to remove pressure, not to add a checklist item.
+#
+# ---- Transport-redaction placeholders (T-gate-input-entropy-redaction-mangles-identifiers) ----
+#
+# Something on the Lexora/gateway path (not mindwire — nothing in this repo emits it) rewrites
+# long identifiers into ``[REDACTED:entropy#N]`` before the model sees them; the model then read
+# ``def [REDACTED:entropy#2]():`` as a SyntaxError and blocked a green PR (voxelworld#333). The
+# paragraph below tells the model the placeholder is a transport artefact. It lives in THIS task
+# prompt only — never in the principles SOT / preamble, which is injected verbatim and is a
+# governed artefact (Einstein msg-7135 Obj.1). No verdict-side detection of the placeholder is
+# added (D1/D1' withdrawn, msg-7136): string matching cannot tell a hallucinated objection from a
+# real bug that merely quotes a redacted line. Pinned by
+# test_redaction_placeholder_guidance_is_in_the_task_prompt_not_the_preamble.
 _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
@@ -497,6 +509,13 @@ For every objection, quote the specific hunk/line you object to and explain the 
 concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
+
+A placeholder of the form `[REDACTED:...]` in the diff or anywhere else in your \
+input was inserted by the transport path that carried this review to you; it is \
+not part of the pull request's source. Do not raise a correctness or syntax \
+objection on the strength of the placeholder itself (for example, treating \
+`def [REDACTED:...]():` as invalid code). A real defect in the code around a \
+placeholder is still a real defect: object to it as you normally would.
 
 Then, at the very END of your reply and immediately BEFORE the verdict line, \
 emit exactly one machine-readable objection block: the marker below at the \
