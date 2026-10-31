@@ -74,6 +74,21 @@ _DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_DEFAULT_MARG
 # this is the module that sends it; the preflight re-exports it.
 TRACE_HEADER = "X-Mindwire-Trace"
 
+# ADR-14 §7.3 routing declaration (thread T-D8-codex-backend-adr14-15-amendment, Bohr msg-6982 /
+# msg-6984, Einstein msg-6987). Its presence says one thing: "mindwire classified this payload
+# under §7.3, and the tier this request asks for is the result". It carries NO parameters — the
+# tier is named only by the request's ``model`` field, so the two can never disagree (msg-6981).
+# Lexora uses codex for a tier whose backend chain reaches codex only when this header is ``v1``;
+# without it that tier is served by its declared unrouted backend (Gemini). It is something the
+# caller declares, not something anyone authenticates: it protects against honest clients that
+# are stale, misconfigured or ad hoc, not against a deliberate forger.
+#
+# **Off by default, set by the caller.** Only a caller whose tier came out of
+# :func:`spirrow_mindwire.naysayer.n3_routing.route_tier` for THIS payload (or whose payload is
+# classified in advance, i.e. the fixed preflight probe) passes ``n3_routed=True``.
+N3_ROUTE_HEADER = "X-Mindwire-N3-Route"
+N3_ROUTE_VALUE = "v1"
+
 
 def lexora_url() -> str:
     """Resolve the Lexora URL from ``MINDWIRE_LEXORA_URL`` (env) or the default.
@@ -163,6 +178,7 @@ class LexoraChatClient(Protocol):
         model: str,
         messages: list[ChatMessage],
         max_tokens: int,
+        n3_routed: bool = False,
     ) -> ChatCompletion: ...
 
     async def health(self) -> dict[str, Any]: ...
@@ -329,6 +345,7 @@ class LexoraClient:
         messages: list[ChatMessage],
         max_tokens: int,
         trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
         """``POST /v1/chat/completions`` for ``model`` (a Lexora tier name).
 
@@ -340,6 +357,10 @@ class LexoraClient:
         ``trace_id``, when given, is sent as the ``X-Mindwire-Trace`` header so
         the gateway records it on this request's cost row — the preflight reads
         its own row back by it (T-per-turn-backend-attestation).
+
+        ``n3_routed=True`` sends ``X-Mindwire-N3-Route: v1`` (see :data:`N3_ROUTE_HEADER`). It is
+        off by default: a caller that has not run the §7.3 classification for this payload must
+        not declare that it has.
         """
         body = {
             "model": model,
@@ -347,8 +368,14 @@ class LexoraClient:
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
         try:
-            headers = {TRACE_HEADER: trace_id} if trace_id is not None else None
-            resp = await self._client.post("/v1/chat/completions", json=body, headers=headers)
+            headers: dict[str, str] = {}
+            if trace_id is not None:
+                headers[TRACE_HEADER] = trace_id
+            if n3_routed:
+                headers[N3_ROUTE_HEADER] = N3_ROUTE_VALUE
+            resp = await self._client.post(
+                "/v1/chat/completions", json=body, headers=headers or None
+            )
         except httpx.TimeoutException as e:
             # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
             # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
@@ -425,6 +452,8 @@ def _error_detail(resp: httpx.Response) -> str:
 
 __all__ = [
     "LEXORA_BACKEND_TIMEOUT_SECONDS",
+    "N3_ROUTE_HEADER",
+    "N3_ROUTE_VALUE",
     "TRACE_HEADER",
     "ChatCompletion",
     "ChatMessage",

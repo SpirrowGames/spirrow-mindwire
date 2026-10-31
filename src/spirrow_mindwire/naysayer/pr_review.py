@@ -52,6 +52,7 @@ from enum import Enum
 from typing import Any
 
 from ..github.client import (
+    PR_FILES_LIST_CAP,
     CiState,
     CiStatus,
     CrossPrApproveCoverage,
@@ -61,6 +62,7 @@ from ..github.client import (
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    PrRoutingFacts,
     Retryability,
     ReviewEvent,
     ReviewInfo,
@@ -83,6 +85,15 @@ from ..lexora.client import (
     LexoraClient,
     LexoraTimeoutError,
 )
+from .n3_routing import (
+    N3Request,
+    TierDecision,
+    UnresolvedNotifier,
+    has_marker,
+    load_n3_globs,
+    notify_unresolved,
+    route_tier,
+)
 from .pr_review_adr_pointers import (
     AdrPointerSelection,
     append_marker,
@@ -95,6 +106,8 @@ from .pr_review_adr_pointers import (
     unavailable_log_line,
 )
 from .principles import (
+    CODEX_OUTPUT_RESERVE_TOKENS,
+    N3_CONFIG_PATH,
     NAYSAYER_MODEL_TIER,
     PrinciplesError,
     objection_classes,
@@ -103,7 +116,6 @@ from .principles import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
 # Gemini 3.1 Pro (the current naysayer tier) is a reasoning model with a 1M+ token context: its
 # reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
 # slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
@@ -2101,6 +2113,10 @@ def _submit_decision(scope: Scope) -> str:
     return "unknown-raise"
 
 
+async def _raise_unread() -> str | None:
+    raise NaysayerPrReviewError("PR facts unreadable; base ref unknown")
+
+
 class NaysayerPrReviewDriver:
     """Independent PR-diff code review via Lexora (one-shot) + GitHub (T20 → ADR-19 driver)."""
 
@@ -2109,7 +2125,7 @@ class NaysayerPrReviewDriver:
         *,
         lexora: LexoraChatClient | None = None,
         github: GitHubReviewClient | None = None,
-        model: str = _DEFAULT_MODEL,
+        model: str | None = None,
         max_tokens: int = DEFAULT_REVIEW_MAX_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         lexora_url: str | None = None,
@@ -2119,11 +2135,16 @@ class NaysayerPrReviewDriver:
         review_login: str = _DEFAULT_REVIEW_LOGIN,
         shadow: bool = False,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        n3_notifier: UnresolvedNotifier | None = None,
     ) -> None:
+        # ``None`` (the default): the tier is decided per PR by ``route_tier`` (ADR-14 §7.3 /
+        # §7.6, :meth:`_route`). A string pins it (tests / an operator override).
         self._model = model
         # Injected so the submit-retry backoff (``_submit_review``) is testable without real
         # waiting; production uses asyncio.sleep.
         self._sleep = sleep
+        # ADR-14 §7.3 / msg-6477: told when the base-side N-3 config cannot be resolved.
+        self._n3_notifier = n3_notifier
         self._max_tokens = max_tokens
         self._skip_if_head_unchanged = skip_if_head_unchanged
         self._max_review_rounds = max_review_rounds
@@ -2328,8 +2349,13 @@ class NaysayerPrReviewDriver:
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
+        tier = (
+            self._model
+            if self._model is not None
+            else (await self._route(pr, view=view, coverage=coverage)).tier
+        )
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
-            view, pr.slug, coverage=coverage
+            view, pr.slug, coverage=coverage, tier=tier, n3_routed=self._model is None
         )
 
         if isinstance(pass1_result, LexoraTimeoutError):
@@ -2344,6 +2370,7 @@ class NaysayerPrReviewDriver:
             return await self._degrade_on_timeout(
                 pr,
                 ci,
+                tier=tier,
                 pass2_selection=pass2_selection,
                 pass2_raw=pass2_raw,
                 post_critique=post_critique,
@@ -2441,7 +2468,7 @@ class NaysayerPrReviewDriver:
             head_sha=ci.head_sha,
             truncated=truncated,
             finish_reason=completion.finish_reason,
-            model=completion.model or self._model,
+            model=completion.model or tier,
             principles_version=principles_version(),
             would_skip_head_unchanged=would_skip_head_unchanged,
             would_cap=would_cap,
@@ -2449,12 +2476,89 @@ class NaysayerPrReviewDriver:
             base_ref=base_ref,
         )
 
+    async def _route(
+        self,
+        pr: PrRef,
+        *,
+        view: DiffView,
+        coverage: list[CrossPrApproveCoverage],
+    ) -> TierDecision:
+        """Decide this PR's naysayer tier with :func:`route_tier` (ADR-14 §7.3 / §7.5 / §7.6).
+
+        Inputs, each read fail-safe toward the Gemini tier:
+
+        - **marker**: the PR's labels. Unreadable labels → ``None`` (→ Gemini).
+        - **paths**: ``GET /pulls/{n}/files`` — every ``filename`` and every
+          ``previous_filename`` (renamed OR copied). Never the disk: a deleted file is just
+          a path (msg-6579). The list counts as complete only if it is readable, its entry
+          count equals the PR's ``changed_files``, and it is under GitHub's 3000-file cap;
+          otherwise → Gemini (msg-6573 (b), test 19).
+        - **globs**: ``load_n3_globs`` with trusted = the PR's base ref, working = its
+          head. A PR cannot loosen the boundary it is judged against (base is always
+          enforced), and a glob it adds counts at once (head may only add).
+        - **prompt size**: pass 1's messages as built for this PR.
+
+        A trusted-side resolution failure goes to :func:`notify_unresolved` (WARNING with
+        the ``n3-routing-unresolved`` token, plus the injected notifier) so a persistent one
+        cannot quietly turn every review into a Gemini review (thread msg-6477).
+        """
+        facts: PrRoutingFacts | None
+        try:
+            facts = await self._github.fetch_pr_routing_facts(pr)
+        except Exception as exc:
+            logger.warning(
+                "n3 routing: cannot read PR facts for %s (%s); routing to the Gemini tier",
+                pr.slug,
+                exc,
+            )
+            facts = None
+
+        async def _read_at(ref: str) -> str | None:
+            return await self._github.fetch_file_at(pr, path=N3_CONFIG_PATH, ref=ref)
+
+        paths: tuple[str, ...] = ()
+        complete = False
+        if facts is None:
+            marker: bool | None = None
+            globs = await load_n3_globs(trusted=_raise_unread, working=None)
+        else:
+            marker = has_marker(facts.labels)
+            base_ref, head_sha = facts.base_ref, facts.head_sha
+            globs = await load_n3_globs(
+                trusted=lambda: _read_at(base_ref),
+                working=lambda: _read_at(head_sha),
+            )
+            try:
+                listed = await self._github.fetch_pr_files(pr)
+            except Exception as exc:
+                logger.warning("n3 routing: cannot list files of %s (%s)", pr.slug, exc)
+            else:
+                paths = listed.paths
+                complete = (
+                    listed.entries == facts.changed_files and listed.entries < PR_FILES_LIST_CAP
+                )
+        messages = _build_messages(view.text, pr.slug, coverage=coverage)
+        decision = route_tier(
+            N3Request(
+                marker=marker,
+                paths=paths,
+                globs=globs,
+                prompt_chars=sum(len(m.content or "") for m in messages),
+                paths_complete=complete,
+            )
+        )
+        await notify_unresolved(globs, f"PR-gate {pr.slug} (base)", self._n3_notifier)
+        logger.info("n3 routing: %s -> tier=%s (%s)", pr.slug, decision.tier, decision.reason)
+        return decision
+
     async def _run_two_passes(
         self,
         view: DiffView,
         pr_slug: str,
         *,
         coverage: list[CrossPrApproveCoverage] | None = None,
+        tier: str,
+        n3_routed: bool,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -2480,13 +2584,25 @@ class NaysayerPrReviewDriver:
           selection so the marker is always well-defined (fail-open).
         * ``pass2_raw`` — the raw ``content`` string pass 2 returned (empty string on
           failure). Retained for the M5' log line (msg-701 §2, msg-703 M5').
+
+        ``n3_routed`` is True only when ``tier`` came out of :meth:`_route` for this PR — never
+        when an operator/test pinned ``model`` — and is sent on BOTH passes as the
+        ``X-Mindwire-N3-Route: v1`` declaration (ADR-14 §7.3, thread msg-6982): the two passes
+        carry the same diff, so they carry the same classification.
         """
         pass1_task = self._lexora.chat_completion(
-            model=self._model,
+            model=tier,
             messages=_build_messages(view.text, pr_slug, coverage=coverage),
-            max_tokens=self._max_tokens,
+            # The codex tier's prompt limit is derived from CODEX_OUTPUT_RESERVE_TOKENS, so the
+            # request stays within it; the raised budget (msg-7130) applies to the Gemini tier.
+            max_tokens=(
+                min(self._max_tokens, CODEX_OUTPUT_RESERVE_TOKENS)
+                if tier == NAYSAYER_MODEL_TIER
+                else self._max_tokens
+            ),
+            n3_routed=n3_routed,
         )
-        pass2_task = self._collect_adr_pointers(view.text, pr_slug)
+        pass2_task = self._collect_adr_pointers(view.text, pr_slug, tier=tier, n3_routed=n3_routed)
         # ``return_exceptions=True`` isolates the two passes: pass 2's exception must never
         # reach the caller (fail-open), and pass 1's exception is inspected below so the
         # LexoraTimeoutError → degrade path is preserved while other exceptions still
@@ -2502,7 +2618,7 @@ class NaysayerPrReviewDriver:
         return pass1_outcome, pass2_selection, pass2_raw
 
     async def _collect_adr_pointers(
-        self, text: str, pr_slug: str
+        self, text: str, pr_slug: str, *, tier: str, n3_routed: bool
     ) -> tuple[AdrPointerSelection, str]:
         """Run pass 2 → M1'/M2 pipeline. Returns (selection, raw_content).
 
@@ -2518,9 +2634,10 @@ class NaysayerPrReviewDriver:
         try:
             completion = await asyncio.wait_for(
                 self._lexora.chat_completion(
-                    model=self._model,
+                    model=tier,
                     messages=_build_pass2_messages(text, pr_slug),
                     max_tokens=_ADR_POINTER_MAX_TOKENS,
+                    n3_routed=n3_routed,
                 ),
                 timeout=_ADR_POINTER_TIMEOUT_SECONDS,
             )
@@ -2536,6 +2653,7 @@ class NaysayerPrReviewDriver:
         pr: PrRef,
         ci: CiStatus,
         *,
+        tier: str | None = None,
         pass2_selection: AdrPointerSelection | None = None,
         pass2_raw: str = "",
         post_critique: PostCritique,
@@ -2606,7 +2724,7 @@ class NaysayerPrReviewDriver:
             body=receipt.body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
-            model=self._model,
+            model=tier if tier is not None else self._model,
             principles_version=principles_version(),
             timed_out=True,
             # Preserve the shadow counterfactual flags across the timeout degrade so per-PR

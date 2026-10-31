@@ -50,13 +50,13 @@ probe would surface as a mismatching row and fail the spawn.
 of concurrent traffic; judgement decides them. **Selection reads ``trace_id``**
 — a fresh ULID minted for exactly one request (the probe) or one turn, sent as
 a header and echoed by the gateway into the row. It is an exact join, not a
-heuristic: no id window, no tier filter, so a concurrent turn's rows can neither
-stand in for ours (the false pass) nor contaminate our verdict (the false
-refusal) — Einstein msg-5391. **Judgement reads ``backend``**, which names the
+heuristic: no id window, no tier filter, no endpoint filter, so a concurrent
+turn's rows can neither stand in for ours (the false pass) nor contaminate our
+verdict (the false refusal) — Einstein msg-5391. **Judgement reads ``backend``**, which names the
 route the gateway chose and is the column the model cannot write. Selecting on
 an echo of our own request is sound precisely because it decides nothing:
 someone replaying our trace id can only *add* rows to the judged set, and every
-non-shadow row among them must still say ``expected``.
+non-shadow row among them must still name an allowed backend.
 
 **Shadow rows are selected but not judged** (T-per-turn-backend-attestation
 msg-7269). Selection is the exact ``trace_id`` match; judgement then sets aside
@@ -98,6 +98,8 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from ..lexora.client import (
+    N3_ROUTE_HEADER,
+    N3_ROUTE_VALUE,
     TRACE_HEADER,
     ChatCompletion,
     ChatMessage,
@@ -106,7 +108,7 @@ from ..lexora.client import (
 )
 from ..route_authority import ROUTE_REDACTED, route_authority
 from ..ulid_util import new_ulid
-from ..value_objects import AttestationRecord
+from ..value_objects import AttestationRecord, join_backends
 
 # msg-954 §3, from the T36 learning ("Lexora Gemini 502 頻発 → retry-until-
 # success (最大 3 attempt)"). A 1-shot fail-closed preflight would park the loop
@@ -169,9 +171,21 @@ TURN_ROW_REREADS = 3
 TURN_ROW_REREAD_INTERVAL_SECONDS = 2.0
 
 
-def custom_headers_env_value(trace_id: str) -> str:
-    """The ``ANTHROPIC_CUSTOM_HEADERS`` value that makes a turn carry ``trace_id``."""
-    return f"{TRACE_HEADER}: {trace_id}"
+def custom_headers_env_value(trace_id: str, *, n3_routed: bool = False) -> str:
+    """The ``ANTHROPIC_CUSTOM_HEADERS`` value that makes a turn carry ``trace_id``.
+
+    ``n3_routed=True`` adds the ADR-14 §7.3 routing declaration
+    (``X-Mindwire-N3-Route: v1``, :data:`~spirrow_mindwire.lexora.client.N3_ROUTE_HEADER`) as a
+    second ``Name: Value`` line. **The two-line form is not measured** the way the one-line form
+    above was (D-0a): if the CLI rejects it the turn fails loudly, and if it drops the second line
+    Lexora serves the codex tier from its unrouted backend (Gemini), which the per-turn
+    attestation then reports as a mismatch — both fail closed, neither sends content to codex
+    without the declaration. Confirm at cutover from Lexora's ``n3_route`` log.
+    """
+    lines = [f"{TRACE_HEADER}: {trace_id}"]
+    if n3_routed:
+        lines.append(f"{N3_ROUTE_HEADER}: {N3_ROUTE_VALUE}")
+    return "\n".join(lines)
 
 
 class PreflightError(RuntimeError):
@@ -222,6 +236,7 @@ class LexoraPreflightClient(Protocol):
         messages: list[ChatMessage],
         max_tokens: int,
         trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion: ...
 
     async def stats_costs_recent(
@@ -268,11 +283,16 @@ def _judge(
     rows: list[dict[str, Any]],
     *,
     trace_id: str,
-    expected: str,
+    allowed: frozenset[str],
     limit: int,
     what: str,
-) -> str:
-    """Select ``trace_id``'s rows out of ``rows`` and judge them. Returns the probe id.
+) -> tuple[frozenset[str], str]:
+    """Select ``trace_id``'s rows and judge them. Returns ``(observed backends, probe id)``.
+
+    ``allowed`` is the tier's accepted set (ADR-14 §7.6,
+    :func:`~spirrow_mindwire.naysayer.principles.allowed_backends`): ``{codex,
+    gemini-fallback}`` for the codex tier, ``{gemini}`` for the Gemini tier. A row
+    passes iff its ``backend`` is IN the set; every selected row must pass.
 
     The order of the checks is the design (Einstein msg-5389 §1):
 
@@ -283,8 +303,8 @@ def _judge(
        id, so the answer is "no row of ours", never a pass. Rows with
        ``endpoint == "shadow"`` exactly are set aside, not judged: they record
        Lexora's comparison request, not the route that answered (msg-7269).
-    2. **Mismatch first.** Any selected row whose ``backend`` is not
-       ``expected`` is a verdict (:class:`_BackendMismatchError`), and it wins
+    2. **Mismatch first.** Any selected row whose ``backend`` is not in
+       ``allowed`` is a verdict (:class:`_BackendMismatchError`), and it wins
        over every "could not determine" state below: a mismatching row in hand
        is never set aside because the read *also* looked incomplete.
     3. **No selected row** cannot pass: a 2xx response is not evidence of
@@ -300,7 +320,7 @@ def _judge(
        trace was found, so it is never reported as missing.
     4. A **full read** (``len(rows) >= limit``) may have been cut off and may be
        hiding a mismatching sibling, so it cannot pass.
-    5. Otherwise every selected row said ``expected``. One matching row never
+    5. Otherwise every selected row named an allowed backend. One matching row never
        licenses ignoring a non-matching sibling, which is why (2) checks all.
 
     ``success`` is NOT filtered on. A failed row still records which backend the
@@ -316,11 +336,11 @@ def _judge(
             what,
             " ".join(f"#{row.get('id')}({row.get('backend')})" for row in shadow),
         )
-    backends = {str(row.get("backend")) for row in selected}
-    if selected and backends != {expected}:
+    backends = frozenset(str(row.get("backend")) for row in selected)
+    if selected and not backends <= allowed:
         raise _BackendMismatchError(
-            f"{what} did not resolve to the expected backend: rows for trace "
-            f"{trace_id} report {sorted(backends)!r}, expected {expected!r}"
+            f"{what} did not resolve to an allowed backend: rows for trace "
+            f"{trace_id} report {sorted(backends)!r}, allowed {sorted(allowed)!r}"
         )
     if not selected:
         if not rows:
@@ -363,16 +383,16 @@ def _judge(
             f"({len(rows)} row(s) at limit {limit}), so rows may have been cut off; "
             f"a set that may be incomplete cannot attest the route"
         )
-    return "cost-row#" + "+".join(str(_row_id(row)) for row in selected)
+    return backends, "cost-row#" + "+".join(str(_row_id(row)) for row in selected)
 
 
 async def _attempt(
     client: LexoraPreflightClient,
     *,
     tier: str,
-    expected: str,
-) -> tuple[str, str]:
-    """Run one probe/read-back cycle. Returns ``(backend, probe_id)``.
+    allowed: frozenset[str],
+) -> tuple[frozenset[str], str]:
+    """Run one probe/read-back cycle. Returns ``(observed backends, probe_id)``.
 
     Each attempt mints its **own** trace id. A previous attempt that failed at
     the transport layer may still have left a row behind; a trace id shared
@@ -386,23 +406,27 @@ async def _attempt(
         messages=[ChatMessage(role="user", content=PREFLIGHT_PROMPT)],
         max_tokens=PREFLIGHT_MAX_TOKENS,
         trace_id=trace_id,
+        # The probe is a fixed prompt with no repository content, so its §7.3 classification
+        # is decided in advance: it declares itself routed (thread msg-6982). Without the
+        # declaration a probe on the codex-backed ``naysayer`` tier would be served by Gemini
+        # and could never attest the tier it is asked about.
+        n3_routed=True,
     )
     rows = await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
-    probe = _judge(
+    return _judge(
         rows,
         trace_id=trace_id,
-        expected=expected,
+        allowed=allowed,
         limit=TRACE_READ_LIMIT,
         what=f"preflight probe for tier {tier!r}",
     )
-    return expected, probe
 
 
 async def attest_backend(
     *,
     base_url: str,
     tier: str,
-    expected: str,
+    allowed: frozenset[str],
     client: LexoraPreflightClient | None = None,
     attempts: int = PREFLIGHT_ATTEMPTS,
     now: Callable[[], datetime] | None = None,
@@ -443,7 +467,7 @@ async def attest_backend(
     try:
         for _ in range(max(1, attempts)):
             try:
-                backend, probe = await _attempt(client, tier=tier, expected=expected)
+                backends, probe = await _attempt(client, tier=tier, allowed=allowed)
             except _BackendMismatchError:
                 raise  # verdict, not transient — see the docstring
             except (PreflightError, LexoraError) as exc:
@@ -451,8 +475,8 @@ async def attest_backend(
                 continue
             return AttestationRecord(
                 tier=tier,
-                backend=backend,
-                expected=expected,
+                backend=join_backends(backends),
+                expected=join_backends(allowed),
                 route=route,
                 probe=probe,
                 scope="probe",
@@ -474,7 +498,7 @@ async def attest_turn(
     *,
     route: str,
     tier: str,
-    expected: str,
+    allowed: frozenset[str],
     trace_id: str,
     read_rows: TurnRowReader,
     limit: int = TRACE_READ_LIMIT,
@@ -495,7 +519,7 @@ async def attest_turn(
     particular there is **no fallback to the probe-scope attestation**: falling
     back would reopen the very gap this closes, exactly when resolution fails.
 
-    - a mismatching ``backend`` → :class:`PreflightError` at once, **never
+    - a ``backend`` outside ``allowed`` → :class:`PreflightError` at once, **never
       re-read** (a verdict, not a transient);
     - a full read (possibly truncated) → :class:`PreflightError` at once: the
       same trace re-read returns the same full set;
@@ -520,7 +544,9 @@ async def attest_turn(
             last = exc
             continue
         try:
-            probe = _judge(rows, trace_id=trace_id, expected=expected, limit=limit, what=what)
+            backends, probe = _judge(
+                rows, trace_id=trace_id, allowed=allowed, limit=limit, what=what
+            )
         except _BackendMismatchError:
             raise  # verdict — see the docstring
         except PreflightError as exc:
@@ -530,8 +556,8 @@ async def attest_turn(
             continue
         return AttestationRecord(
             tier=tier,
-            backend=expected,
-            expected=expected,
+            backend=join_backends(backends),
+            expected=join_backends(allowed),
             route=route,
             probe=probe,
             scope="turn",
