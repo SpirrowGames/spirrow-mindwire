@@ -415,7 +415,8 @@ exit 3
     # no -UvOptions either.
     # +1 for Invoke-SummonGit (T-human-call-priority-interrupt, PR #475 review): a git launcher, so
     # no -UvOptions (it passes -Environment instead).
-    Check 'fifteen helper call sites in the sweep script' 15 $helperCalls.Count
+    # +1 for Invoke-AutoGateTick (T-gate-fires-on-pr-open 1c): no -UvOptions, like 1b.
+    Check 'sixteen helper call sites in the sweep script' 16 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
@@ -593,6 +594,30 @@ exit 3
     Check 'no JSON -> $null' $null (Invoke-PrEventAdvanceTick -Project 'p')
     $script:peThrow = $true
     Check 'a throw inside -> $null, not an exception' $null (Invoke-PrEventAdvanceTick -Project 'p')
+    $script:peThrow = $false
+
+    Write-Host 'P2 — 1c tick: one call per tick, the cap logs its one line, failures return'
+    Import-SweepFunction 'Invoke-AutoGateTick'
+    $dataDir = 'C:\data'
+    $script:peCalls.Clear()
+    $script:logLines.Clear()
+    Check 'no project -> no probe' $null (Invoke-AutoGateTick -Projects @())
+    Check 'no project -> no call' 0 $script:peCalls.Count
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"status":"ran","fired":1}' }
+    $o = Invoke-AutoGateTick -Projects @('p', 'q')
+    Check 'fired parsed' 1 $o.fired
+    Check 'argv names the state file and every project' '-m|spirrow_mindwire.pr_event_advance.auto_gate|--projects|p,q|--sweep-config|C:\cfg\sweep.json|--state-file|C:\data\state\auto-gate-daily.json' ($script:peCalls[0].Arguments -join '|')
+    Check 'exactly one log line per pass' 1 $script:logLines.Count
+    $script:logLines.Clear()
+    $script:peResult = @{ ok = $true; code = 0; stdout = '{"status":"cap_reached","message":"auto-gate: daily cap reached (30/30), pass skipped"}' }
+    $null = Invoke-AutoGateTick -Projects @('p')
+    Check 'the cap logs exactly its fixed line' 'auto-gate: daily cap reached (30/30), pass skipped' ($script:logLines -join '|')
+    $script:peResult = @{ ok = $false; code = $null; stdout = ''; error = 'timeout' }
+    Check '1c probe not ok -> $null' $null (Invoke-AutoGateTick -Projects @('p'))
+    $script:peResult = @{ ok = $true; code = 1; stdout = '{"error":"bad config"}' }
+    Check '1c exit 1 -> the error object is returned' 'bad config' (Invoke-AutoGateTick -Projects @('p')).error
+    $script:peThrow = $true
+    Check '1c throw inside -> $null, not an exception' $null (Invoke-AutoGateTick -Projects @('p'))
     $script:peThrow = $false
 
     Write-Host 'T3 — the sweep calls the startup cleanup before reading the sweep list'

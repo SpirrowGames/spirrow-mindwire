@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -261,6 +262,30 @@ class OpenPrListing:
     prs: tuple[OpenPr, ...]
     examined: int
     unrecognized: int
+
+
+@dataclass(frozen=True)
+class GatePr:
+    """One open PR as 1c reads it: the listing's own fields, without a per-PR read.
+
+    Separate from :class:`OpenPr`, whose contract is to carry no body or merge-state field.
+    """
+
+    ref: PrRef
+    draft: bool
+    head_sha: str
+    base_ref: str
+    body: str
+    author_login: str
+    author_type: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class GatePrListing:
+    prs: tuple[GatePr, ...]
+    examined: int
+    unrecognized: int = 0
 
 
 @dataclass(frozen=True)
@@ -1126,13 +1151,38 @@ class GitHubClient:
         """
         from ..stall_ledger.heartbeat import build_open_pr_query
 
-        query = build_open_pr_query(owner, repo)
+        rows = await self._open_pr_rows(build_open_pr_query(owner, repo))
+        prs: list[OpenPr] = []
+        unrecognized = 0
+        for row in rows:
+            parsed = _open_pr_row(owner, repo, row)
+            if parsed is None:
+                unrecognized += 1
+            else:
+                prs.append(parsed)
+        return OpenPrListing(prs=tuple(prs), examined=len(rows), unrecognized=unrecognized)
+
+    async def list_open_gate_prs(self, owner: str, repo: str) -> GatePrListing:
+        """The same listing and failure contract as :meth:`list_open_prs`, read for 1c."""
+        from ..stall_ledger.heartbeat import build_open_pr_query
+
+        rows = await self._open_pr_rows(build_open_pr_query(owner, repo))
+        prs: list[GatePr] = []
+        unrecognized = 0
+        for row in rows:
+            parsed = _gate_pr_row(owner, repo, row)
+            if parsed is None:
+                unrecognized += 1
+            else:
+                prs.append(parsed)
+        return GatePrListing(prs=tuple(prs), examined=len(rows), unrecognized=unrecognized)
+
+    async def _open_pr_rows(self, query: Mapping[str, Any]) -> list[object]:
+        """Every raw row of an open-PR listing, or :class:`OpenPrListingError`."""
         path = str(query["path"])
         base_params: dict[str, Any] = dict(query["params"])
         per_page = int(base_params["per_page"])
-        prs: list[OpenPr] = []
-        examined = 0
-        unrecognized = 0
+        out: list[object] = []
         page = 1
         while True:
             params = {**base_params, "page": page}
@@ -1163,17 +1213,11 @@ class GitHubClient:
                     f"GET {path}: expected a list, got {type(rows).__name__}",
                     outcome="parse_error",
                 )
-            for row in rows:
-                examined += 1
-                parsed = _open_pr_row(owner, repo, row)
-                if parsed is None:
-                    unrecognized += 1
-                else:
-                    prs.append(parsed)
+            out.extend(rows)
             if len(rows) < per_page:
                 break
             page += 1
-        return OpenPrListing(prs=tuple(prs), examined=examined, unrecognized=unrecognized)
+        return out
 
     async def list_prs_by_head(self, owner: str, repo: str, branch: str) -> list[PrHeadRow]:
         """Every PR (open, closed or merged) whose head is exactly ``{owner}:{branch}``.
@@ -1937,6 +1981,35 @@ class GitHubClient:
                 rate_limited=_is_rate_limited(resp),
             )
         return resp.text
+
+
+def _gate_pr_row(owner: str, repo: str, row: object) -> GatePr | None:
+    """One listing row -> :class:`GatePr`, or ``None`` if it lacks a field 1c decides on.
+
+    A missing ``body`` is GitHub's empty description, not a malformed row. A missing author is
+    malformed: it decides the bot rule.
+    """
+    base_row = _open_pr_row(owner, repo, row)
+    if base_row is None or not isinstance(row, dict):
+        return None
+    base = row.get("base")
+    base_ref = base.get("ref") if isinstance(base, dict) else None
+    user = row.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    user_type = user.get("type") if isinstance(user, dict) else None
+    body = row.get("body")
+    if not isinstance(base_ref, str) or not base_ref or not isinstance(login, str) or not login:
+        return None
+    return GatePr(
+        ref=base_row.ref,
+        draft=base_row.draft,
+        head_sha=base_row.head_sha,
+        base_ref=base_ref,
+        body=body if isinstance(body, str) else "",
+        author_login=login,
+        author_type=user_type if isinstance(user_type, str) else "",
+        created_at=base_row.created_at,
+    )
 
 
 def _open_pr_row(owner: str, repo: str, row: object) -> OpenPr | None:

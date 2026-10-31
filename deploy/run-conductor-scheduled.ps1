@@ -5083,6 +5083,47 @@ function Invoke-PrEventAdvanceTick {
     }
 }
 
+# --- 1c: the first PR-gate fires without anyone writing NEXT: pr-review ---------------------------
+# (chatroom T-gate-fires-on-pr-open.) One invocation per tick over every project whose HOLD check
+# passed, so "at most 3 fires per tick" counts the tick. sweep.json `auto_gate` decides dry-run or
+# live; absent means dry-run. A cap-stopped pass logs its one fixed line and nothing else. Fail-open
+# on the SWEEP, for the same reason as Invoke-PrEventAdvanceTick.
+function Invoke-AutoGateTick {
+    param([string[]]$Projects)
+
+    if (@($Projects).Count -eq 0) { return $null }
+    try {
+        $stateFile = Join-Path $dataDir "state\auto-gate-daily.json"
+        $projectList = $Projects -join ','
+        $r = Invoke-BoundedUvProbe -Label 'auto-gate' -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.pr_event_advance.auto_gate', '--projects', $projectList, '--sweep-config', $sweepConfigPath, '--state-file', $stateFile)
+        if (-not $r.ok) {
+            Write-Log "auto-gate: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
+        }
+        $json = Get-ProbeJsonLine -Result $r
+        if (-not $json) {
+            Write-Log "auto-gate: no JSON on stdout (exit=$($r.code)) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($r.code -ne 0) {
+            Write-Log "auto-gate: pass failed (exit=$($r.code)): $($obj.error)"
+        }
+        elseif ($obj.message) {
+            Write-Log $obj.message
+        }
+        else {
+            Write-Log "auto-gate: $json"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "auto-gate failed ($($_.Exception.Message)) — sweep continues (fail-open)"
+        return $null
+    }
+}
+
 # --- park wake: STOP: blocked-on threads wake when their trigger fires -------------------------
 # For each distinct project in the sweep list (and, since Slice 3b, each project sweep.json declares
 # under `projects` — see Invoke-DeclaredProjectsParkWake), run `python -m spirrow_mindwire.park_wake`
@@ -5311,6 +5352,8 @@ try {
     # Park-wake tick output per project (Slice 3), for the digest's stop-reason line.
     $stopClassByProject = @{}
     $stopClassFailed = @()
+    # 1c runs once after this loop, over the projects that passed their HOLD check.
+    $autoGateProjects = @()
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         # Control first: a project whose hold has already landed needs no head probe at all, so asking
         # in this order keeps a settled HOLD to exactly one MCP read per project per tick. A hold the
@@ -5345,6 +5388,7 @@ try {
             }
         }
         if (Test-HoldObserved -Control $c) { continue }
+        $autoGateProjects += $proj
         # 1b (T-pr-event-advances-thread): after the HOLD check, so a held project gets no 1b
         # writes either, and BEFORE the head probe, so a thread it writes to shows a moved head
         # in this same tick. Fail-open (see Invoke-PrEventAdvanceTick).
@@ -5356,6 +5400,9 @@ try {
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
+
+    $autoGate = Invoke-AutoGateTick -Projects $autoGateProjects
+    $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
 
     # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
     # are classified too. See Invoke-DeclaredProjectsParkWake.
@@ -6473,7 +6520,7 @@ try {
                 -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
                 -StaleHumanThreshold $StaleHumanThreshold `
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
-                -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
+                -StopClassLines (@(Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed | ForEach-Object { $_ }) + $autoGateDigestLines) `
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake `
                 -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
