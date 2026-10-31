@@ -5124,6 +5124,24 @@ function Invoke-AutoGateTick {
     }
 }
 
+# The projects 1c scans (PR #512 review): the ones that passed the candidate loop's HOLD check, plus
+# every `clones` project no candidate names. A PR needs no live thread to be open, and this is the
+# case 1c exists for: its design thread idles at NEXT: none and nobody is left to write the line.
+# Only `clones` widens the scan, because a project's repo is read from its clone. Control first and
+# the same HOLD skip as the candidate loop, so a held project gets no 1c write. As in
+# Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject.
+function Get-AutoGateProjects {
+    param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones)
+
+    $out = @($PassedHold)
+    foreach ($proj in @($Clones.Keys | ForEach-Object { [string]$_ } | Where-Object { $CandidateProjects -notcontains $_ })) {
+        $control = Invoke-ControlProbe -Project $proj
+        if (Test-HoldObserved -Control $control) { continue }
+        $out += $proj
+    }
+    return @($out | Sort-Object -Unique)
+}
+
 # --- park wake: STOP: blocked-on threads wake when their trigger fires -------------------------
 # For each distinct project in the sweep list (and, since Slice 3b, each project sweep.json declares
 # under `projects` — see Invoke-DeclaredProjectsParkWake), run `python -m spirrow_mindwire.park_wake`
@@ -5352,7 +5370,8 @@ try {
     # Park-wake tick output per project (Slice 3), for the digest's stop-reason line.
     $stopClassByProject = @{}
     $stopClassFailed = @()
-    # 1c runs once after this loop, over the projects that passed their HOLD check.
+    # 1c runs once after this loop, over the projects that passed their HOLD check and every other
+    # `clones` project (Get-AutoGateProjects).
     $autoGateProjects = @()
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         # Control first: a project whose hold has already landed needs no head probe at all, so asking
@@ -5401,7 +5420,9 @@ try {
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
 
-    $autoGate = Invoke-AutoGateTick -Projects $autoGateProjects
+    $autoGate = Invoke-AutoGateTick -Projects (Get-AutoGateProjects -PassedHold $autoGateProjects `
+        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
+        -Clones $sweepIntakeConfig.clones)
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
 
     # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
