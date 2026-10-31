@@ -1,0 +1,389 @@
+"""Starting processes: the detached runner (D1' Spawner) and the isolated session (D2'', D3⁵).
+
+* :class:`DetachedRunnerSpawner` — the operator pass starts ``run-session`` detached and returns at
+  once (D1'). Swappable behind :class:`Spawner` for ``claude --bg`` once T-spawn-via-claude-bg
+  settles.
+* :class:`JobSessionLauncher` — the runner starts ``claude`` SUSPENDED, puts it in a Job Object with
+  ``KILL_ON_JOB_CLOSE``, resumes it, and kills the whole Job past the timeout (D3⁵). A dead
+  runner's Job takes the session with it, so none posts late. With ``run_as_user`` the session runs
+  via ``CreateProcessWithLogonW`` as that user (D2'' (b-2); password from the Credential Manager),
+  with an environment built from that user's logon token (``CreateEnvironmentBlock``,
+  ``bInherit=FALSE``) and checked by :func:`check_isolated_env`, so no runner variable (the magickit
+  URL among them) reaches it (PR #506 gate).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+_DETACHED_PROCESS = 0x00000008
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_LOGON_WITH_PROFILE = 0x00000001
+_LOGON32_LOGON_INTERACTIVE = 2
+_LOGON32_PROVIDER_DEFAULT = 0
+_STARTF_USESTDHANDLES = 0x00000100
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_SUSPEND_RESUME = 0x0800
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
+_WAIT_TIMEOUT = 0x00000102
+
+
+def _win(ctypes_module: Any) -> Any:
+    """``ctypes.windll`` without a platform-dependent type error (Windows-only callers)."""
+    return getattr(ctypes_module, "windll")  # noqa: B009 - absent on POSIX type stubs
+
+
+class Spawner(Protocol):
+    def spawn_runner(self, *, run_id: str, data_dir: Path, log_path: Path) -> int:
+        """Start ``run-session`` for ``run_id`` detached; return its pid."""
+
+
+@dataclass(frozen=True)
+class DetachedRunnerSpawner:
+    python: str = sys.executable
+
+    def argv(self, run_id: str, data_dir: Path) -> list[str]:
+        return [
+            self.python,
+            "-m",
+            "spirrow_mindwire.operator_lane",
+            "run-session",
+            "--run-id",
+            run_id,
+            "--data-dir",
+            str(data_dir),
+        ]
+
+    def spawn_runner(self, *, run_id: str, data_dir: Path, log_path: Path) -> int:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as log:
+            kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": log,
+                "stderr": subprocess.STDOUT,
+                "close_fds": True,
+                "env": {**os.environ, "PYTHONIOENCODING": "utf-8"},
+            }
+            if sys.platform == "win32":
+                flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+                try:
+                    proc = subprocess.Popen(
+                        self.argv(run_id, data_dir),
+                        creationflags=flags | _CREATE_BREAKAWAY_FROM_JOB,
+                        **kwargs,
+                    )
+                except OSError:
+                    # The scheduler's Job may forbid breakaway; detached is still detached.
+                    proc = subprocess.Popen(
+                        self.argv(run_id, data_dir), creationflags=flags, **kwargs
+                    )
+            else:
+                proc = subprocess.Popen(
+                    self.argv(run_id, data_dir), start_new_session=True, **kwargs
+                )
+        return int(proc.pid)
+
+
+@dataclass(frozen=True)
+class SessionOutcome:
+    exit_code: int | None
+    timed_out: bool
+    error: str | None = None
+
+
+class SessionLauncher(Protocol):
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin_path: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        cwd: str | None,
+        timeout_sec: int,
+    ) -> SessionOutcome:
+        """Run ``argv`` to completion (or kill it at ``timeout_sec``); never raise."""
+
+
+def read_credential(target: str) -> tuple[str, str]:
+    """``(user, password)`` of a generic Windows Credential Manager entry (ADR-23 D9 style)."""
+    import win32cred
+
+    cred = win32cred.CredRead(target, win32cred.CRED_TYPE_GENERIC)
+    blob = cred["CredentialBlob"]
+    password = blob.decode("utf-16-le") if isinstance(blob, bytes) else str(blob)
+    return str(cred["UserName"]), password
+
+
+@dataclass(frozen=True)
+class JobSessionLauncher:
+    """Windows only. ``run_as_user=""`` starts the session as the runner's own user (tests)."""
+
+    run_as_user: str = ""
+    credential_target: str = ""
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin_path: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        cwd: str | None,
+        timeout_sec: int,
+    ) -> SessionOutcome:
+        if sys.platform != "win32":
+            return SessionOutcome(None, False, "the session launcher is Windows-only")
+        from ..adapters._sdk_job_hook import close_handle, create_job
+
+        try:
+            job = create_job(f"operator-lane:{stdout_path.stem}")
+        except Exception as exc:
+            return SessionOutcome(None, False, f"cannot create the Job Object: {exc}")
+        try:
+            with (
+                open(stdin_path, "rb") as fin,
+                open(stdout_path, "wb") as fout,
+                open(stderr_path, "wb") as ferr,
+            ):
+                try:
+                    pid = self._start_suspended(argv, fin, fout, ferr, cwd)
+                except Exception as exc:
+                    return SessionOutcome(None, False, f"cannot start the session: {exc}")
+                return _assign_resume_wait(job.handle, pid, timeout_sec)
+        finally:
+            close_handle(job)
+
+    def _start_suspended(
+        self, argv: Sequence[str], fin: Any, fout: Any, ferr: Any, cwd: str | None
+    ) -> int:
+        if not self.run_as_user:
+            proc = subprocess.Popen(
+                list(argv),
+                stdin=fin,
+                stdout=fout,
+                stderr=ferr,
+                cwd=cwd or None,
+                creationflags=_CREATE_SUSPENDED | _CREATE_NO_WINDOW,
+            )
+            return int(proc.pid)
+        user, password = read_credential(self.credential_target)
+        return _create_process_with_logon(user, password, argv, fin, fout, ferr, cwd)
+
+
+def _create_process_with_logon(
+    user: str, password: str, argv: Sequence[str], fin: Any, fout: Any, ferr: Any, cwd: str | None
+) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class PROCESSINFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    # Windows-only attributes go through ``Any`` so mypy on a POSIX runner accepts them.
+    win_msvcrt: Any = msvcrt
+    win_os: Any = os
+    win_ctypes: Any = ctypes
+    handles = []
+    for fh in (fin, fout, ferr):
+        h = win_msvcrt.get_osfhandle(fh.fileno())
+        win_os.set_handle_inheritable(h, True)
+        handles.append(h)
+    si = STARTUPINFOW()
+    si.cb = ctypes.sizeof(STARTUPINFOW)
+    si.dwFlags = _STARTF_USESTDHANDLES
+    si.hStdInput, si.hStdOutput, si.hStdError = handles
+    pi = PROCESSINFORMATION()
+    domain = "."
+    if "\\" in user:
+        domain, user = user.split("\\", 1)
+    cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(list(argv)))
+    env = _user_environment(user, domain, password)
+    check_isolated_env(env, os.environ)
+    env_block = ctypes.create_unicode_buffer(encode_env_block(env))
+    ok = _win(ctypes).advapi32.CreateProcessWithLogonW(
+        user,
+        domain,
+        password,
+        _LOGON_WITH_PROFILE,
+        None,
+        cmdline,
+        _CREATE_SUSPENDED | _CREATE_NO_WINDOW | _CREATE_UNICODE_ENVIRONMENT,
+        env_block,
+        cwd or None,
+        ctypes.byref(si),
+        ctypes.byref(pi),
+    )
+    if not ok:
+        raise OSError(win_ctypes.GetLastError(), "CreateProcessWithLogonW failed")
+    kernel32 = _win(ctypes).kernel32
+    kernel32.CloseHandle(pi.hThread)
+    kernel32.CloseHandle(pi.hProcess)
+    return int(pi.dwProcessId)
+
+
+_RUNNER_ONLY_PREFIX = "MINDWIRE_"
+_MIN_LEAK_VALUE_LEN = 8  # "4" or "true" matches by chance; secrets and addresses are longer
+
+
+def check_isolated_env(env: dict[str, str], runner_env: Any) -> None:
+    """Raise if ``env`` has a ``MINDWIRE_*`` name or a long value of the runner's ``MINDWIRE_*``."""
+    secrets = {
+        v
+        for k, v in runner_env.items()
+        if k.upper().startswith(_RUNNER_ONLY_PREFIX) and len(v.strip()) >= _MIN_LEAK_VALUE_LEN
+    }
+    leaked = sorted(
+        k for k, v in env.items() if k.upper().startswith(_RUNNER_ONLY_PREFIX) or v in secrets
+    )
+    if leaked:
+        raise RuntimeError(f"session environment carries runner settings: {', '.join(leaked)}")
+
+
+def parse_env_block(block: str) -> dict[str, str]:
+    """A Win32 environment block (NUL-terminated ``NAME=value`` entries, then a NUL) as a dict."""
+    env: dict[str, str] = {}
+    for entry in block.split("\0"):
+        if not entry:
+            continue
+        name, sep, value = entry[1:].partition("=")  # a leading '=' is part of names like '=C:'
+        if sep:
+            env[entry[0] + name] = value
+    return env
+
+
+def encode_env_block(env: dict[str, str]) -> str:
+    """The inverse of :func:`parse_env_block`, sorted case-insensitively as Win32 requires."""
+    return "".join(f"{k}={env[k]}\0" for k in sorted(env, key=str.upper)) + "\0"
+
+
+def _user_environment(user: str, domain: str, password: str) -> dict[str, str]:
+    """The environment of ``user``'s own logon, inheriting nothing from this process."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = _win(ctypes).advapi32
+    userenv = _win(ctypes).userenv
+    kernel32 = _win(ctypes).kernel32
+    win_ctypes: Any = ctypes
+    token = wintypes.HANDLE()
+    if not advapi32.LogonUserW(
+        user,
+        domain,
+        password,
+        _LOGON32_LOGON_INTERACTIVE,
+        _LOGON32_PROVIDER_DEFAULT,
+        ctypes.byref(token),
+    ):
+        raise OSError(win_ctypes.GetLastError(), "LogonUserW failed")
+    block = ctypes.c_void_p()
+    try:
+        userenv.CreateEnvironmentBlock.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.HANDLE,
+            wintypes.BOOL,
+        ]
+        if not userenv.CreateEnvironmentBlock(ctypes.byref(block), token, False):
+            raise OSError(win_ctypes.GetLastError(), "CreateEnvironmentBlock failed")
+        try:
+            entries: list[str] = []
+            addr = block.value or 0
+            while True:
+                entry = ctypes.wstring_at(addr)
+                if not entry:
+                    break
+                entries.append(entry)
+                addr += (len(entry) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            return parse_env_block("\0".join(entries) + "\0\0")
+        finally:
+            userenv.DestroyEnvironmentBlock.argtypes = [ctypes.c_void_p]
+            userenv.DestroyEnvironmentBlock(block)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _assign_resume_wait(job_handle: Any, pid: int, timeout_sec: int) -> SessionOutcome:
+    """Job-assign the suspended process, resume it, wait; kill the Job on timeout."""
+    import ctypes
+
+    import win32api
+    import win32job
+
+    kernel32 = _win(ctypes).kernel32
+    ntdll = _win(ctypes).ntdll
+    access = (
+        _PROCESS_TERMINATE
+        | _PROCESS_SET_QUOTA
+        | _PROCESS_SUSPEND_RESUME
+        | _PROCESS_QUERY_LIMITED_INFORMATION
+        | _SYNCHRONIZE
+    )
+    proc = win32api.OpenProcess(access, False, pid)
+    try:
+        try:
+            win32job.AssignProcessToJobObject(job_handle, proc)
+        except Exception as exc:
+            # Not in the Job means not killable as a tree: never let it run.
+            win32api.TerminateProcess(proc, 1)
+            return SessionOutcome(None, False, f"cannot assign the session to the Job: {exc}")
+        ntdll.NtResumeProcess(int(proc))
+        waited = kernel32.WaitForSingleObject(int(proc), int(timeout_sec * 1000))
+        if waited == _WAIT_TIMEOUT:
+            win32job.TerminateJobObject(job_handle, 1)
+            kernel32.WaitForSingleObject(int(proc), 10_000)
+            return SessionOutcome(None, True)
+        code = ctypes.c_ulong(0)
+        kernel32.GetExitCodeProcess(int(proc), ctypes.byref(code))
+        return SessionOutcome(int(code.value), False)
+    finally:
+        win32api.CloseHandle(proc)
+
+
+__all__ = [
+    "DetachedRunnerSpawner",
+    "JobSessionLauncher",
+    "SessionLauncher",
+    "SessionOutcome",
+    "Spawner",
+    "read_credential",
+]
