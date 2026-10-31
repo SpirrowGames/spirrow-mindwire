@@ -134,16 +134,19 @@ MAX_REASON_CHARS = 200
 # ``content`` with prose, and (b) the M5' log surface, which repeats the raw
 # content for post-mortem — capping the parse input bounds that log line too.
 #
-# Derivation (from ``_DEFAULT_MAX_TOKENS = 32000`` in
-# :mod:`spirrow_mindwire.naysayer.pr_review`):
+# Derivation. The cap is set by the shape of legitimate pass-2 output, not by the pass-1
+# review budget (``DEFAULT_REVIEW_MAX_TOKENS``, overridable as ``[naysayer_gating]
+# review_max_tokens``). Pass 2 runs on its own fixed ``_ADR_POINTER_MAX_TOKENS`` in
+# :mod:`spirrow_mindwire.naysayer.pr_review`, so raising the review budget does not change
+# what pass 2 can emit (pinned by test_pass2_budget_is_independent_of_review_budget):
 # * Legitimate pass-2 output shape: MAX_POINTERS=5 records x
 #   (~30-byte ADR id + MAX_REASON_CHARS=200-byte reason + JSON scaffolding ~20 bytes)
 #   ≈ 1.25 KiB, plus outer array brackets and whitespace ≈ ~1.5 KiB worst case.
 # * 8 KiB is ~5x that ceiling: comfortably absorbs JSON reformatting variance,
 #   whitespace, and one or two oversize ``reason`` fields (they truncate in M2 §7,
 #   so their pre-truncation size does not compromise correctness); still small
-#   enough that a runaway model burning the full 32 000-token output budget on
-#   critique prose (~30-100+ KiB depending on token density) trips the cap and
+#   enough that a runaway model burning a large output budget (32 000 tokens when this
+#   was derived) on critique prose (~30-100+ KiB depending on token density) trips the cap and
 #   surfaces as ``unavailable``, rather than silently smuggling free-form text
 #   through the pointer channel.
 # * NOT the naive 16 KiB (msg-705 §5 explicitly forbids adopting 16 KiB without

@@ -12,6 +12,7 @@ import spirrow_mindwire.conductor.handoff as handoff_mod
 from spirrow_mindwire.conductor.handoff import (
     HUMAN_TOKEN,
     NONE_TOKEN,
+    OPERATOR_TOKEN,
     TIER_C_LABELS,
     Handoff,
     HandoffKind,
@@ -360,16 +361,103 @@ def test_implementer_block_teaches_tier_c_syntax_and_enum() -> None:
     assert "unsure:goal?" in block
 
 
-def test_naysayer_block_does_not_carry_tier_c_guidance() -> None:
-    # D-3 negative — msg-2540 §3 / Einstein msg-2539 Obj-3: the naysayer's `NEXT: human` is an
-    # escalation of a design concern, NOT a Tier-C decision request. Forcing a `TIER-C: <label>`
-    # onto that surface would push two distinct concepts into one field (hybrid complexity). So
-    # the naysayer block deliberately does NOT include the TIER-C emission guidance, and the D-2
-    # future machine-judgement check (msg-2540 §3 pin) must exclude naysayer authorship from its
-    # denominator. Pinned here so a future edit to `_ROLE_HANDOFF_GUIDANCE` cannot silently
-    # extend the emission guidance to naysayer and destroy that exclusion by "helpful uniformity".
+def test_naysayer_block_teaches_tier_c_syntax_and_enum() -> None:
+    # T-naysayer-omits-tierc-label D1 (Bohr msg-6654 / spec msg-6658, Einstein msg-6657) — this
+    # REVERSES the D-3 negative pin (msg-2540 §3 / Einstein Obj-3). Obj-3 assumed an unlabelled
+    # naysayer `NEXT: human` still reached the human; since `[tierc_gate] mode = "enforce"`
+    # (2026-10-03) R1 bounces it, and the audit in operator msg-6652 found 5 of 6 R1 bounces were
+    # naysayer posts re-sent unchanged plus a label line. The naysayer now gets the guidance.
     block = build_handoff_protocol_block(Role.NAYSAYER)
-    assert "TIER-C:" not in block
+    assert "TIER-C:" in block
+    for label in TIER_C_LABELS:
+        assert f"`{label}`" in block, f"enum label {label!r} missing from naysayer guidance"
+    assert "unsure:goal?" in block
+    assert "other:<one-line reason>" not in block
+
+
+def test_every_role_block_carries_an_admitted_label_example() -> None:
+    # D4 (msg-6658 §5): every role's block shows a worked `TIER-C: <label>` / `NEXT: human`
+    # example, and the label in it is one the gate admits.
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+    for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
+        lines = build_handoff_protocol_block(role).splitlines()
+        examples = [
+            lines[n - 1].strip().removeprefix("TIER-C:").strip()
+            for n in range(1, len(lines))
+            if lines[n] == f"    NEXT: {HUMAN_TOKEN}" and lines[n - 1].startswith("    TIER-C:")
+        ]
+        assert examples, f"{role}: no worked TIER-C example"
+        for label in examples:
+            assert label in ADMIT_LABELS, (role, label)
+            h = resolve_handoff(f"body\n\nTIER-C: {label}\nNEXT: {HUMAN_TOKEN}", _ROSTER)
+            assert h.kind is HandoffKind.HUMAN, (role, label)
+
+
+def test_naysayer_block_drops_non_tier_c_human_conditions() -> None:
+    # D1 / D2'-b (msg-6656, msg-6658 §1-§2): `human` is no longer an outlet for "a concern that
+    # needs the human now", for manual work, or for an unsettled proposer-naysayer conflict.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    assert "escalate a concern that needs the human now" not in block
+    assert "conflict you could not settle" not in block
+    assert "no task only the human can do" not in block
+    assert f"`NEXT: {OPERATOR_TOKEN}`" in block
+
+
+def test_naysayer_tier_c_check_conditions_are_exactly_the_admitted_labels() -> None:
+    # D2'-b (msg-6656, msg-6658 §5): the TIER-C-CHECK conditions map one-to-one onto the
+    # admitted label set, so the checklist cannot disagree with what the gate counts as Tier-C.
+    from spirrow_mindwire.conductor import handoff
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+    assert frozenset(handoff._NAYSAYER_CHECK_CONDITIONS) == ADMIT_LABELS
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    for label, condition in handoff._NAYSAYER_CHECK_CONDITIONS.items():
+        assert f"{condition} (`{label}`)" in block, label
+    with pytest.raises(RuntimeError, match="_NAYSAYER_CHECK_CONDITIONS"):
+        handoff._check_label_definitions(
+            {"cost": "x"}, ADMIT_LABELS, name="_NAYSAYER_CHECK_CONDITIONS"
+        )
+
+
+def test_naysayer_block_bounds_unsettled_objections() -> None:
+    # D2'-a / D2'-c (Einstein msg-6655 correctness objection, Bohr msg-6656): a non-Tier-C
+    # objection still unsettled after two hand-backs is recorded and the design goes to the
+    # implementer — handing back forever would act as the veto the naysayer does not have.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    assert "handed it back to the proposer twice" in block
+    assert "`Unresolved objection:`" in block
+    assert "PR gate" in block
+
+
+def test_naysayer_unresolved_objection_bound_is_non_tier_c_only() -> None:
+    # D6-a / D6-b' / D6-c' (Bohr msg-6684, revised msg-6694 after PR-gate's blocking finding on
+    # #469): a Tier-C objection may go back to the proposer at most once, then to the human with a
+    # label (straight away when no redesign can remove it), never to the implementer; the
+    # two-hand-back `Unresolved objection:` → implementer path is for non-Tier-C objections only.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    slash = " / ".join(TIER_C_LABELS)
+    assert slash == handoff_mod._TIER_C_SLASH_LIST
+    opening = block.index("hand back to the proposer if your objections need a disposition")
+    tier_c_start = block.index("That hand-back for a disposition also covers")
+    bound = block.index("handed it back to the proposer twice")
+    unresolved = block.index("`Unresolved objection:`")
+    assert opening < tier_c_start < bound < unresolved
+    tier_c_part = block[tier_c_start : block.rindex("Only when", 0, bound)]
+    # the opening hand-back explicitly covers Tier-C objections, capped at one
+    assert f"itself a Tier-C type ({slash}), but at most once" in tier_c_part
+    # after that one hand-back (or at once, when no redesign can remove it): labelled human
+    assert (
+        f"hand to the human (`NEXT: {HUMAN_TOKEN}`) with that type as the `TIER-C:` label"
+        in tier_c_part
+    )
+    assert "hand it to the human with the label straight away" in tier_c_part
+    assert "never goes to the implementer, however many times" in tier_c_part
+    assert "twice" not in tier_c_part
+    # the two-hand-back bound and its implementer route are conditioned on non-Tier-C
+    bound_part = block[block.rindex("Only when", 0, bound) : unresolved + 200]
+    assert f"the objection is not one of {slash}" in bound_part
+    assert "then hand to the implementer" in bound_part
 
 
 def test_naysayer_block_is_advisory() -> None:
@@ -1350,6 +1438,7 @@ class TestLabelProseIsDerivedNotHardcoded:
         # module already proves the import-time check passed; pin only the rendered output here.
         assert "    TIER-C: goal\n" in build_handoff_protocol_block(Role.PROPOSER)
         assert "    TIER-C: cost\n" in build_handoff_protocol_block(Role.IMPLEMENTER)
+        assert "    TIER-C: irreversible\n" in build_handoff_protocol_block(Role.NAYSAYER)
         assert "TIER-C: merge-protected" not in build_handoff_protocol_block(Role.IMPLEMENTER)
 
     def test_count_word_follows_len(self) -> None:

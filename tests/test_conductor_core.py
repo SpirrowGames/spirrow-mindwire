@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.conductor.control import ControlState
+from spirrow_mindwire.conductor.control import ControlSnapshot, ControlState
 from spirrow_mindwire.conductor.core import (
     CONDUCTOR_RELAY_AUTHOR,
     Conductor,
@@ -208,6 +208,9 @@ class _FakeControl:
         self.reads += 1
         return state
 
+    async def read_snapshot(self) -> ControlSnapshot:
+        return ControlSnapshot(state=await self.read())
+
     async def report_observed(self, state: ControlState) -> None:
         self.observed.append(state)
 
@@ -315,7 +318,8 @@ class _ScriptedPrGate:
         route = self._route_override or decide_relay_route(
             verdict, parse_objections(outcome.body).status, 0, implementer
         )
-        nxt = implementer if route is RelayRoute.IMPLEMENTER and implementer else "human"
+        dispatches = route in (RelayRoute.IMPLEMENTER, RelayRoute.MERGE)
+        nxt = implementer if dispatches and implementer else "human"
         # As production: an APPROVE that stops at the human is a merge wait (msg-4361).
         merge_wait = (
             f"{MERGE_WAIT_LINE}\n" if verdict is ReviewEvent.APPROVE and nxt == "human" else ""
@@ -1875,6 +1879,21 @@ async def test_u3_10_conductor_follows_relay_route_not_verdict() -> None:
     outcome2 = await _conductor(mcp2, disp2, orchestrator=gate2).run()
     assert disp2.dispatches == []
     assert outcome2.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_merge_route_dispatches_the_implementer_and_is_not_a_merge_wait() -> None:
+    # T-gate-relay-routes-develop-approvals-to-human D4: an auto-merge-base APPROVE (route MERGE)
+    # wakes the implementer on the relay, exactly like IMPLEMENTER, instead of parking at the
+    # human under StopReason.MERGE_WAIT.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE, route_override=RelayRoute.MERGE)
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["merged abc1234\n\nNEXT: human"]})
+    await _conductor(mcp, disp, orchestrator=gate).run()
+    assert disp.dispatches[0][0] is Role.IMPLEMENTER
+    assert parse_next_token(disp.events[0].payload.body) == "Heisenberg"
+    assert MERGE_WAIT_LINE not in disp.events[0].payload.body
 
 
 @pytest.mark.anyio

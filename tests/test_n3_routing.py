@@ -432,10 +432,35 @@ def test_output_reserve_covers_the_named_naysayer_requests() -> None:
     from spirrow_mindwire.adapters import naysayer_lexora
     from spirrow_mindwire.naysayer import pr_review, preflight
 
+    # Pass 1's budget is not listed: it may exceed the reserve, and the driver clamps it on the
+    # codex tier (test_pass_one_budget_is_clamped_on_the_codex_tier_only).
     for value in (
-        pr_review._DEFAULT_MAX_TOKENS,
         pr_review._ADR_POINTER_MAX_TOKENS,
         naysayer_lexora._DEFAULT_MAX_TOKENS,
         preflight.PREFLIGHT_MAX_TOKENS,
     ):
         assert value <= principles.CODEX_OUTPUT_RESERVE_TOKENS
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tier", "expected"),
+    [
+        (principles.NAYSAYER_MODEL_TIER, principles.CODEX_OUTPUT_RESERVE_TOKENS),
+        (principles.NAYSAYER_GEMINI_TIER, 65536),
+    ],
+)
+async def test_pass_one_budget_is_clamped_on_the_codex_tier_only(tier: str, expected: int) -> None:
+    from spirrow_mindwire.naysayer.pr_review import DiffView, NaysayerPrReviewDriver
+
+    sent: list[int] = []
+
+    class _Lexora:
+        async def chat_completion(self, *, max_tokens: int, **_: object) -> object:
+            sent.append(max_tokens)
+            raise RuntimeError("stop after recording the request")
+
+    driver = NaysayerPrReviewDriver(lexora=_Lexora(), github=object())  # type: ignore[arg-type]
+    view = DiffView(text="diff", original_chars=4, limit=100, warn_threshold=90)
+    await driver._run_two_passes(view, "o/r#1", tier=tier, n3_routed=True)
+    assert max(sent) == expected

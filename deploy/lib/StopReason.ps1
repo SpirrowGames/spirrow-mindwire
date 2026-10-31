@@ -42,6 +42,11 @@
 #               carries it (Takahito, msg-4361: "main へのマージは判断点から外す"), so a Discord
 #               ping and a decision card would be a second copy of the same request. 1b
 #               (pr_event_advance) resumes the thread when the PR is merged or closed.
+#   'pr_settled' — a `NEXT: pr-review` named a PR that GitHub already reports merged or closed
+#               (T-merged-pr-fact-never-reaches-design-thread, Bohr msg-7560 v0.4). The conductor
+#               posted that fact under pr-event-relay instead of re-gating, and the post's own
+#               NEXT (none / the proposer / the 3-line operator form) is the hand-off. A person
+#               who must act is reached through that NEXT, not through this stop.
 #   'resume_retry' — the conductor found a PR-gate post at the head that would resume the
 #               implementer, but could not read GitHub or the PR head had moved past it
 #               (T-sweep-starves-deep-candidates, Bohr msg-6318). Nothing is posted; the next tick
@@ -51,6 +56,11 @@
 #               stopped before spawning the implementer (T-sweep-starves-deep-candidates PR-B,
 #               Bohr msg-6313 §1′). The post stays the head; the next tick launches it in the role
 #               lane and the gate resume picks it up. Routine hand-off, not a stop anyone waits on.
+#   'summon_yield' — the thread yielded to an active Summon (T-human-call-priority-interrupt, Bohr
+#               msg-6743 §3 / msg-6755 v1.6): a person called the loop to another thread on purpose,
+#               so each bystander's stop is not news. Where a forgotten Summon is heard is the
+#               Summon line at the top of the digest (no automatic release, msg-6742) — PR-3 of the
+#               same thread; this PR (PR-2) only makes the stop itself.
 # 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
 # where the K alert sounds. That is not this map's notification.
 # Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1
@@ -147,4 +157,26 @@ function New-NotificationHeader {
 
     $phrase = Get-StopReasonPhrase -StopReason $StopReason
     return "MindWire: **$ThreadId** ($Project) — $phrase (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
+}
+
+function Get-SummonStopFields {
+    # The Summon fields of the conductor's LAST `conductor stopped:` line (T-human-call-priority-
+    # interrupt, Bohr msg-6749 v1.3: "停止行の解析は StopReason.ps1 に追加します"; v1.6 converts
+    # them to Update-SummonYield's -Delivered / -YieldTo, and this is the only place that reads
+    # them off the line). Returns @{ delivered = [bool]; yield_to = <thread id or $null> }.
+    #   resume_notice=delivered — the run sent the first role turn carrying (or, for an empty
+    #                             range, standing in for) the resume notice;
+    #   yield_to=<S>            — only on reason=summon_yield: the Summon the run yielded to.
+    # Both may be on one line (delivered, then yielded later in the same run — I-SY5). No stop line
+    # (the run died before printing one) reads as neither, which keeps the record (at least once).
+    param([string[]]$Output)
+
+    $fields = @{ delivered = $false; yield_to = $null }
+    $line = @($Output | Where-Object { "$_" -match 'conductor stopped:' }) | Select-Object -Last 1
+    if (-not $line) { return $fields }
+    if ("$line" -match '(^|\s)resume_notice=delivered(\s|$)') { $fields.delivered = $true }
+    if ("$line" -match 'reason=summon_yield(\s|$)' -and "$line" -match '(^|\s)yield_to=(\S+)') {
+        $fields.yield_to = $Matches[2]
+    }
+    return $fields
 }

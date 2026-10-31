@@ -39,6 +39,32 @@ def _load_cli_module() -> ModuleType:
 
 _MODULE = _load_cli_module()
 
+#: msg-7441 F-2: the real shape of a magickit ``chatroom_list_threads`` page. Every listing item
+#: in this file is built from it, so a test can no longer pass on a field the real listing does
+#: not carry (the fake items used to have ``updated_at``; the real ones never did).
+_FIXTURE = Path(__file__).resolve().parent / "data" / "magickit_chatroom_list_threads_page.json"
+_REAL_PAGE: dict[str, Any] = json.loads(_FIXTURE.read_text(encoding="utf-8"))["response"]
+_REAL_ITEM: dict[str, Any] = _REAL_PAGE["items"][0]
+_KEEP: Any = object()
+
+
+def _real_item(
+    thread_id: str, status: str, *, last_activity_at: Any = _KEEP, drop: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """One listing item of the real shape, with ``thread_id`` / ``status`` overridden.
+
+    ``last_activity_at`` keeps the captured value unless given (``None`` = present but null);
+    ``drop`` removes keys outright (the schema-drift case: the key is absent, not null).
+    """
+    item: dict[str, Any] = json.loads(json.dumps(_REAL_ITEM))
+    item["thread_id"] = thread_id
+    item["status"] = status
+    if last_activity_at is not _KEEP:
+        item["last_activity_at"] = last_activity_at
+    for key in drop:
+        item.pop(key, None)
+    return item
+
 
 class _RecordingMcp:
     """Returns a fixed listing per project and records every call the CLI makes."""
@@ -111,14 +137,14 @@ def test_read_only_wrapper_allows_the_one_read_tool() -> None:
 
 def test_list_live_threads_forwards_the_status_filter() -> None:
     """The tool call must scope to LIVE_STATUSES server-side, not filter client-side."""
-    inner = _RecordingMcp({"p": [{"thread_id": "T-a", "status": "active"}]})
-    threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    inner = _RecordingMcp({"p": [_real_item("T-a", "active")]})
+    threads, malformed, _ = asyncio.run(_MODULE._list_live_threads(inner, "p"))
     assert len(inner.calls) == 1
     _, args = inner.calls[0]
     assert args["project"] == "p"
     assert args["status_filter"] == sorted(LIVE_STATUSES)
     assert args["limit"] == 200
-    assert threads == [{"thread_id": "T-a", "status": "active"}]
+    assert [t.thread for t in threads] == [_real_item("T-a", "active")]
     assert malformed == 0
 
 
@@ -142,7 +168,7 @@ def test_list_live_threads_counts_non_dict_items() -> None:
                 return {"items": [], "total": 3}
             return {
                 "items": [
-                    {"thread_id": "T-a", "status": "active"},
+                    _real_item("T-a", "active"),
                     "not-a-dict",
                     ["also", "not"],
                 ],
@@ -150,8 +176,8 @@ def test_list_live_threads_counts_non_dict_items() -> None:
             }
 
     inner = _Mixed()
-    threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
-    assert threads == [{"thread_id": "T-a", "status": "active"}]
+    threads, malformed, _ = asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    assert [t.thread for t in threads] == [_real_item("T-a", "active")]
     assert malformed == 2
 
 
@@ -175,27 +201,27 @@ def test_list_live_threads_advances_offset_by_raw_page_length() -> None:
             if offset == 0:
                 return {
                     "items": [
-                        {"thread_id": "T-a", "status": "active"},
+                        _real_item("T-a", "active"),
                         "garbage",
-                        {"thread_id": "T-b", "status": "active"},
+                        _real_item("T-b", "active"),
                     ],
                     "total": 5,
                 }
             if offset == 3:
                 return {
                     "items": [
-                        {"thread_id": "T-c", "status": "active"},
-                        {"thread_id": "T-d", "status": "active"},
+                        _real_item("T-c", "active"),
+                        _real_item("T-d", "active"),
                     ],
                     "total": 5,
                 }
             return {"items": [], "total": 5}
 
     inner = _TwoPage()
-    threads, malformed = asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    threads, malformed, _ = asyncio.run(_MODULE._list_live_threads(inner, "p"))
     # Offset advanced by RAW length (3) after page 1, not by dict-only (2).
     assert [c["offset"] for c in inner.calls] == [0, 3]
-    assert [t["thread_id"] for t in threads] == ["T-a", "T-b", "T-c", "T-d"]
+    assert [t.thread["thread_id"] for t in threads] == ["T-a", "T-b", "T-c", "T-d"]
     assert malformed == 1
 
 
@@ -204,12 +230,12 @@ def test_run_produces_a_report_per_project_in_config_order() -> None:
     inner = _RecordingMcp(
         {
             "p1": [
-                {"thread_id": "T-x", "status": "active"},
-                {"thread_id": "T-y", "status": "active"},
+                _real_item("T-x", "active"),
+                _real_item("T-y", "active"),
             ],
             "p2": [
-                {"thread_id": "T-z", "status": "awaiting_reply"},
-                {"thread_id": "T-pr-review-spirrow-mindwire-1", "status": "active"},
+                _real_item("T-z", "awaiting_reply"),
+                _real_item("T-pr-review-spirrow-mindwire-1", "active"),
             ],
         }
     )
@@ -255,7 +281,7 @@ def test_run_surfaces_malformed_items_without_mixing_them_into_the_count() -> No
                 return {"items": [], "total": 3}
             return {
                 "items": [
-                    {"thread_id": "T-live", "status": "active"},
+                    _real_item("T-live", "active"),
                     "stray-string",
                     None,
                 ],
@@ -280,7 +306,7 @@ def test_run_surfaces_malformed_items_without_mixing_them_into_the_count() -> No
 def test_a_project_that_measures_zero_and_drops_zero_reports_any_malformed_false() -> None:
     """A clean project must not trip the malformed alarm."""
     registered = RegisteredIndex(pairs=frozenset(), projects=("p",))
-    inner = _RecordingMcp({"p": [{"thread_id": "T-a", "status": "active"}]})
+    inner = _RecordingMcp({"p": [_real_item("T-a", "active")]})
 
     async def _fake_run() -> Any:
         mcp = _MODULE.ReadOnlyMcp(inner)
@@ -298,7 +324,7 @@ def test_a_project_that_measures_zero_and_drops_zero_reports_any_malformed_false
 def test_a_per_project_mcp_failure_is_recorded_not_raised() -> None:
     """Invariant 2 from msg-2531 §2: 0 件 と 測れなかった を同じ表示にしない."""
     registered = RegisteredIndex(pairs=frozenset(), projects=("healthy", "broken"))
-    inner = _RecordingMcp({"healthy": [{"thread_id": "T-a", "status": "active"}]})
+    inner = _RecordingMcp({"healthy": [_real_item("T-a", "active")]})
     failing = _FailingMcp(inner, fail_project="broken", reason="transport boom")
 
     async def _fake_run() -> Any:
@@ -430,8 +456,8 @@ def test_main_end_to_end_with_stubbed_mcp(
             if project == "p1":
                 return {
                     "items": [
-                        {"thread_id": "T-x", "status": "active"},
-                        {"thread_id": "T-live-unregistered", "status": "awaiting_reply"},
+                        _real_item("T-x", "active"),
+                        _real_item("T-live-unregistered", "awaiting_reply"),
                     ],
                     "total": 2,
                 }
@@ -461,3 +487,186 @@ def test_main_end_to_end_with_stubbed_mcp(
     # test payload gains any non-ASCII character; we approximate that
     # here by checking the current payload round-trips as ASCII.
     assert stdout.encode("ascii", errors="strict")
+
+
+# ----------------------- T-sweep-intake-discovery-by-default (msg-6770 §1 / msg-6778)
+
+
+def test_list_live_threads_classifies_time_without_dropping() -> None:
+    """The boundary labels each item's last_activity_at; it never drops an item for its time."""
+    inner = _RecordingMcp(
+        {
+            "p": [
+                _real_item("T-ok", "active", last_activity_at="2026-10-01T00:00:00Z"),
+                _real_item("T-none", "active", last_activity_at=None),
+                _real_item("T-bad", "active", last_activity_at="not-a-time"),
+            ]
+        }
+    )
+    threads, malformed, _ = asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    assert [(t.thread["thread_id"], t.time.state) for t in threads] == [
+        ("T-ok", "ok"),
+        ("T-none", "missing"),
+        ("T-bad", "unparseable"),
+    ]
+    assert malformed == 0
+
+
+def test_no_per_thread_read_is_possible() -> None:
+    """Einstein msg-6769 (N+1): the listing is the only tool this script may call.
+
+    The time comes from the listing's ``last_activity_at``; a per-thread read
+    (chatroom_get_thread) would be refused by ReadOnlyMcp before it left
+    the process.
+    """
+    assert frozenset({"chatroom_list_threads"}) == _MODULE.READ_ONLY_TOOLS
+
+
+def test_the_timestamp_is_parsed_in_exactly_one_place() -> None:
+    """msg-6770 §1: classify_activity_at is called only from _list_live_threads."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    callers: list[str] = []
+    for base in ("src", "scripts", "deploy"):
+        for path in (root / base).rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                    continue
+                for node in ast.walk(fn):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "classify_activity_at"
+                    ):
+                        callers.append(f"{path.relative_to(root).as_posix()}::{fn.name}")
+    assert callers == ["scripts/unregistered_threads.py::_list_live_threads"]
+
+
+def test_main_scans_a_project_named_only_in_clones(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """穴 1 / 穴 3: a project with no candidate is scanned once its clone is declared."""
+    path = tmp_path / "sweep.json"
+    path.write_text(json.dumps({"clones": {"pnew": "/c/new"}}), encoding="utf-8")
+
+    class _Stub:
+        def __init__(self, url: str | None = None) -> None:
+            pass
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            if int(arguments.get("offset") or 0) > 0 or arguments.get("project") != "pnew":
+                return {"items": [], "total": 1}
+            return {
+                "items": [_real_item("T-n", "active", last_activity_at="2026-10-01T00:00:00Z")],
+                "total": 1,
+            }
+
+    monkeypatch.setattr(_MODULE, "StreamableHttpChatroomMcp", _Stub)
+    old = sys.argv
+    try:
+        sys.argv = ["prog", "--sweep-config", str(path)]
+        rc = _MODULE.main()
+    finally:
+        sys.argv = old
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [p["project"] for p in payload["projects"]] == ["pnew"]
+    (row,) = payload["projects"][0]["threads"]
+    assert row["thread_id"] == "T-n"
+    assert row["time_state"] == "ok"
+    assert row["last_activity_at"] == "2026-10-01T00:00:00+00:00"
+    assert "updated_at" not in row
+    assert isinstance(row["idle_days"], float)
+
+
+# ----------------------- T-sweep-intake-discovery-by-default (msg-7441 F-1/F-2, msg-7445 F-3)
+
+
+def test_the_fixture_is_the_real_listing_shape() -> None:
+    """F-2: the pinned page is magickit's 13-field item, with last_activity_at and no updated_at."""
+    items = _REAL_PAGE["items"]
+    assert items, "fixture has no items"
+    for item in items:
+        assert len(item) == 13, sorted(item)
+        assert "last_activity_at" in item
+        assert "updated_at" not in item
+    assert _MODULE.ACTIVITY_FIELD == "last_activity_at"
+
+
+def test_no_listing_item_in_this_file_is_built_with_updated_at() -> None:
+    """F-2: the fake ``updated_at``-only shape is gone from these tests and cannot come back."""
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    keys = [
+        k.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for k in node.keys
+        if isinstance(k, ast.Constant)
+    ]
+    assert "updated_at" not in keys
+
+
+def _report_for(items: list[Any], registered: RegisteredIndex | None = None) -> Any:
+    reg = registered or RegisteredIndex(pairs=frozenset(), projects=("p",))
+    inner = _RecordingMcp({"p": items})
+    return asyncio.run(
+        _MODULE._enumerate_project_with_recovery(_MODULE.ReadOnlyMcp(inner), "p", reg)
+    )
+
+
+def test_real_shape_page_reports_no_absent_field() -> None:
+    """F-3d: the real listing triggers no schema WARN (field_absent_count == 0)."""
+    report = _report_for([dict(i) for i in _REAL_PAGE["items"]])
+    assert report.field_absent_count == 0
+    assert report.listed_count == len(_REAL_PAGE["items"])
+    assert all(t.time_state == "ok" for t in report.threads)
+
+
+def test_all_items_lacking_the_key_are_counted_even_when_none_is_unregistered() -> None:
+    """F-3c/F-3d: counted before the registered filter — M/M with 0 unregistered threads."""
+    items = [_real_item(f"T-{n}", "active", drop=("last_activity_at",)) for n in range(23)]
+    registered = RegisteredIndex(
+        pairs=frozenset(("p", f"T-{n}") for n in range(23)), projects=("p",)
+    )
+    report = _report_for(items, registered)
+    assert report.unregistered_count == 0
+    assert (report.field_absent_count, report.listed_count) == (23, 23)
+    assert report.as_json()["field_absent_count"] == 23
+    assert report.as_json()["listed_count"] == 23
+
+
+def test_one_item_of_a_hundred_lacking_the_key_is_counted_as_one() -> None:
+    """Einstein msg-7444: 1 of 100 is reported as 1/100, a count — nothing more is inferred."""
+    items = [_real_item(f"T-{n}", "active") for n in range(99)]
+    items.append(_real_item("T-odd", "active", drop=("last_activity_at",)))
+    report = _report_for(items)
+    assert (report.field_absent_count, report.listed_count) == (1, 100)
+    odd = [t for t in report.threads if t.thread_id == "T-odd"]
+    assert [t.time_state for t in odd] == ["missing"]
+
+
+def test_a_present_null_key_is_not_counted_as_absent() -> None:
+    """Einstein msg-7442: a legitimately null last_activity_at is 時刻不明, not schema drift."""
+    report = _report_for([_real_item(f"T-{n}", "active", last_activity_at=None) for n in range(3)])
+    assert report.field_absent_count == 0
+    assert [t.time_state for t in report.threads] == ["missing"] * 3
+
+
+def test_an_unparseable_value_is_not_counted_as_absent() -> None:
+    report = _report_for([_real_item("T-bad", "active", last_activity_at="not-a-time")])
+    assert report.field_absent_count == 0
+    assert [t.time_state for t in report.threads] == ["unparseable"]
+
+
+def test_a_failed_listing_has_unknown_absent_and_listed_counts() -> None:
+    inner = _FailingMcp(_RecordingMcp({}), fail_project="p")
+    report = asyncio.run(
+        _MODULE._enumerate_project_with_recovery(
+            inner, "p", RegisteredIndex(pairs=frozenset(), projects=("p",))
+        )
+    )
+    assert (report.field_absent_count, report.listed_count) == (None, None)

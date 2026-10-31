@@ -74,6 +74,17 @@ async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
         "observed_state": payload.get("observed_state"),
         "observed_at": payload.get("observed_at"),
         "configured": bool(payload.get("configured")),
+        # T-human-call-priority-interrupt PR-2 (Bohr msg-6755 v1.6 §2, msg-6800 v1.7): the raw
+        # ``active_summon`` value, re-serialised as a JSON STRING (``null`` when the key is absent).
+        # A string, because the sweep's ``ConvertFrom-Json`` turns any ISO-looking string into a
+        # [datetime] and drops its offset, so ``since`` could no longer be checked against the
+        # contract. The sweep classifies this text itself (ConvertFrom-ActiveSummonJson in
+        # deploy/lib/Summon.ps1), pinned to the same fixture as the conductor's parser.
+        "active_summon_json": (
+            json.dumps(payload["active_summon"], ensure_ascii=True)
+            if "active_summon" in payload
+            else None
+        ),
     }
 
 

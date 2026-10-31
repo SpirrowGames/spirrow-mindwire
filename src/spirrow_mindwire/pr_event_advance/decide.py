@@ -33,6 +33,7 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 ==  ==================================  ==================================  =======================
 1   not a relay, or heading unreadable  —                                   Noop(NOT_RELAY_TAIL)
 2   token = ``none``                    —                                   Noop(SETTLED)
+2b  relay with ``MERGE-SELF:``          merged, or closed (not merged)      Noop (note 2b)
 3   relay                               merged                              Post: none / proposer
 4   relay                               closed, not merged                  Post: proposer (always)
 5   relay, no ci-hold                   open                                Noop(OPEN_NO_HOLD)
@@ -42,18 +43,31 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 9   anything else (unexpected state)    —                                   Noop(UNKNOWN_STATE)
 ==  ==================================  ==================================  =======================
 
+* Row 2b — ``Noop(MERGE_OWNED_BY_TURN)`` (T-gate-relay-routes-develop-approvals-to-human D5,
+  Bohr msg-7576 / msg-7578): a MERGE-route relay woke the implementer to merge the PR itself,
+  and that implementer's own post is the one terminal report, whether it merged the PR or found
+  it merged or closed (it says "not landed" itself, D3 table row 2). 1b writing
+  the same fact as well is a double advance of the proposer (Einstein msg-7575 #2 / msg-7577).
+  Once the implementer posts, the tail is no longer a relay and row 1 applies. An OPEN PR under
+  that relay falls through to rows 5-8 unchanged (it carries no ci-hold, so row 5).
 * Rows 3 and 4 come before rows 5-8, so a PR closed after a CI hold is reported as closed and a
   dead PR is never re-gated (§F.1.1 優先順位と排他).
 * The token holder does not matter (Einstein msg-5903 B1): a REQUEST_CHANGES relay that sent
-  the thread to the implementer still gets the closed/merged line. Only ``none`` — someone
+  the thread to the implementer still gets the closed/merged line. Row 2b is keyed on the
+  ``MERGE-SELF:`` mark, not on the token, for the same reason. Only ``none`` — someone
   declared the thread finished — is left alone, so this never re-opens a settled thread.
 * ``Closes-thread:`` counts only when it names THIS thread; any other value is "absent" and
   goes to the proposer — the failure direction never closes by mistake.
-* A closed-unmerged PR ALWAYS goes to the proposer, whatever the PR body declares (§F.1.1).
+* A closed-unmerged PR ALWAYS goes to the proposer, whatever the PR body declares (§F.1.1) —
+  from 1b on rows 3-4, from the implementer under row 2b.
 * The proposer persona is consulted only on the rows that need it. A ``Closes-thread:`` merge
   and the (ii) re-fire never read the roster, so a broken roster cannot misroute them. When it
   IS needed and is ``None``, the fact is still written and the hand-off becomes the 3-line
   ``NEXT: operator`` form (msg-5904 B2) — silence would re-fail every tick unseen.
+* Rows 3 and 4 are :func:`lifecycle_post`, which the conductor also calls on a
+  ``NEXT: pr-review`` head (T-merged-pr-fact-never-reaches-design-thread, msg-7560 v0.4). The two
+  callers read disjoint tails: this module reads only :data:`RELAY_AUTHOR` headings, and no
+  relay post ends in ``pr-review``.
 * Once a :class:`Post` lands, the tail is authored by :data:`PR_EVENT_RELAY_AUTHOR`, which row 1
   rejects: the second tick is a no-op without any counter (R5).
 
@@ -72,6 +86,7 @@ from typing import assert_never
 from ..conductor.gate_records import (
     RELAY_AUTHOR,
     ci_hold_head,
+    is_merge_self_relay,
     normalize_sha,
 )
 from ..conductor.handoff import (
@@ -83,7 +98,7 @@ from ..conductor.handoff import (
     TIER_C_CHECK_NONE,
     parse_next_token,
 )
-from ..github.client import CiState, parse_pr_ref
+from ..github.client import CiState, PrResolution, PrState, parse_pr_ref
 
 #: The author 1b writes under. Distinct from :data:`RELAY_AUTHOR` on purpose: the gate-records
 #: readers (``verdict_heads`` / ``ci_route_heads`` / ``prior_advisory_approvals``) narrow to that
@@ -126,6 +141,7 @@ class NoopReason(StrEnum):
     CI_PENDING = "ci-pending"
     HEAD_MOVED = "head-moved"
     UNKNOWN_STATE = "unknown-state"
+    MERGE_OWNED_BY_TURN = "merge-owned-by-turn"
 
 
 @dataclass(frozen=True)
@@ -149,11 +165,13 @@ Decision = Noop | Post
 
 @dataclass(frozen=True)
 class RelayTail:
-    """What 1b reads off a verdict-relay tail: the PR, its NEXT token, and any ci-hold head."""
+    """What 1b reads off a verdict-relay tail: the PR, its NEXT token, any ci-hold head, and
+    whether it is a MERGE-route relay (``merge_self``, row 2b)."""
 
     pr_ref: str
     token: str | None
     hold_head: str | None
+    merge_self: bool = False
 
 
 @dataclass(frozen=True)
@@ -171,6 +189,32 @@ class PrFacts:
     body: str = ""
 
 
+def pr_facts_of(state: PrState) -> PrFacts | None:
+    """Map a GitHub read onto :class:`PrFacts`; ``None`` when GitHub did not answer.
+
+    Lives beside :func:`lifecycle_post` so both of its callers (1b's runner and the conductor's
+    PR_REVIEW branch) read a PR's lifecycle through one mapping (msg-7560 v0.4 (a)).
+    """
+    match state.resolution:
+        case PrResolution.UNRESOLVABLE:
+            return None
+        case PrResolution.OPEN:
+            lifecycle = PrLifecycle.OPEN.value
+        case PrResolution.CLOSED:
+            lifecycle = PrLifecycle.MERGED.value if state.merged else PrLifecycle.CLOSED.value
+        case PrResolution.NOT_FOUND:
+            lifecycle = "not-found"  # a definite answer, but not one of §F.1.1's three → row 9
+        case _:
+            assert_never(state.resolution)
+    return PrFacts(
+        state=lifecycle,
+        head_sha=state.head_sha,
+        merge_commit_sha=state.merge_commit_sha,
+        closed_at=state.closed_at,
+        body=state.body or "",
+    )
+
+
 def read_relay_tail(author: str, body: str) -> RelayTail | None:
     """The tail as a verdict relay, or ``None`` if it is not one (row 1)."""
     if author != RELAY_AUTHOR:
@@ -181,7 +225,12 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
     if ref is None:
         return None
     token = parse_next_token(body)
-    return RelayTail(pr_ref=ref, token=token, hold_head=ci_hold_head(body))
+    return RelayTail(
+        pr_ref=ref,
+        token=token,
+        hold_head=ci_hold_head(body),
+        merge_self=is_merge_self_relay(body),
+    )
 
 
 def heading_ref(first_line: str) -> str | None:
@@ -244,6 +293,37 @@ def _heading(pr_ref: str) -> str:
     return f"PR event (1b, {PR_EVENT_RELAY_AUTHOR}) — {pr_ref}"
 
 
+def lifecycle_post(
+    *, thread_id: str, pr_ref: str, pr: PrFacts, proposer: str | None
+) -> Post | None:
+    """Rows 3 and 4 alone: a MERGED / CLOSED PR → the :class:`Post`; OPEN or unknown → ``None``.
+
+    Shared by 1b's :func:`decide` and the conductor's PR_REVIEW branch
+    (T-merged-pr-fact-never-reaches-design-thread, Bohr msg-7560 v0.4 (a)), so the rule that a
+    settled PR's fact is written — and where it hands to — lives in exactly one place. The two
+    callers take disjoint tails: 1b reads a :data:`RELAY_AUTHOR` heading, the conductor a
+    ``NEXT: pr-review <ref>`` nomination, and no relay post ever ends in ``pr-review``.
+    """
+    match lifecycle_of(pr):
+        case PrLifecycle.MERGED:  # row 3
+            sha = pr.merge_commit_sha or "merge commit 不明"
+            body = f"{_heading(pr_ref)}\n\nPR {pr_ref} が merge された（{sha}）。"  # noqa: RUF001 (§F.1.1 wording)
+            if closes_thread(pr.body, thread_id):
+                return Post(body=body, next_line=f"NEXT: {NONE_TOKEN}")
+            return Post(body=body, next_line=_to_proposer(thread_id, proposer))
+        case PrLifecycle.CLOSED:  # row 4 — the Closes-thread declaration is ignored here
+            closed_at = pr.closed_at.isoformat() if pr.closed_at else "closed_at 不明"
+            head = pr.head_sha or "head 不明"
+            body = (
+                f"{_heading(pr_ref)}\n\n"
+                f"PR {pr_ref} が merge されずに close された（{closed_at}、最終 head {head}）。"  # noqa: RUF001 (§F.1.1 wording)
+                "本スレッドの作業はこの PR では landing していない。"
+            )
+            return Post(body=body, next_line=_to_proposer(thread_id, proposer))
+        case PrLifecycle.OPEN | None:
+            return None
+
+
 def decide(
     *,
     thread_id: str,
@@ -265,38 +345,26 @@ def decide(
     lifecycle = lifecycle_of(pr)
     if lifecycle is None:
         return Noop(NoopReason.UNKNOWN_STATE)  # row 9
+    if tail.merge_self and lifecycle in (PrLifecycle.MERGED, PrLifecycle.CLOSED):
+        return Noop(NoopReason.MERGE_OWNED_BY_TURN)  # row 2b
     ref = tail.pr_ref
-    match lifecycle:
-        case PrLifecycle.MERGED:  # row 3
-            sha = pr.merge_commit_sha or "merge commit 不明"
-            body = f"{_heading(ref)}\n\nPR {ref} が merge された（{sha}）。"  # noqa: RUF001 (§F.1.1 wording)
-            if closes_thread(pr.body, thread_id):
-                return Post(body=body, next_line=f"NEXT: {NONE_TOKEN}")
-            return Post(body=body, next_line=_to_proposer(thread_id, proposer))
-        case PrLifecycle.CLOSED:  # row 4 — the Closes-thread declaration is ignored here
-            closed_at = pr.closed_at.isoformat() if pr.closed_at else "closed_at 不明"
-            head = pr.head_sha or "head 不明"
-            body = (
-                f"{_heading(ref)}\n\n"
-                f"PR {ref} が merge されずに close された（{closed_at}、最終 head {head}）。"  # noqa: RUF001 (§F.1.1 wording)
-                "本スレッドの作業はこの PR では landing していない。"
-            )
-            return Post(body=body, next_line=_to_proposer(thread_id, proposer))
-        case PrLifecycle.OPEN:
-            if tail.hold_head is None:
-                return Noop(NoopReason.OPEN_NO_HOLD)  # row 5
-            if not _same_head(tail.hold_head, pr.head_sha):
-                return Noop(NoopReason.HEAD_MOVED)  # row 6
-            if ci is None or ci not in _CI_TERMINAL:
-                return Noop(NoopReason.CI_PENDING)  # row 7
-            body = (  # row 8
-                f"{_heading(ref)}\n\n"
-                f"PR {ref} の CI が head {tail.hold_head} で終端した（{ci.value}）ので、"  # noqa: RUF001 (§F.1.1 wording)
-                "gate を 1 回だけ撃ち直す。"
-            )
-            return Post(body=body, next_line=f"NEXT: {PR_REVIEW_TOKEN} {ref}")
-        case _:
-            assert_never(lifecycle)
+    settled = lifecycle_post(thread_id=thread_id, pr_ref=ref, pr=pr, proposer=proposer)
+    if settled is not None:  # rows 3 / 4
+        return settled
+    # Row 9 was excluded above and lifecycle_post answered every settled PR, so this is OPEN.
+    assert lifecycle is PrLifecycle.OPEN
+    if tail.hold_head is None:
+        return Noop(NoopReason.OPEN_NO_HOLD)  # row 5
+    if not _same_head(tail.hold_head, pr.head_sha):
+        return Noop(NoopReason.HEAD_MOVED)  # row 6
+    if ci is None or ci not in _CI_TERMINAL:
+        return Noop(NoopReason.CI_PENDING)  # row 7
+    body = (  # row 8
+        f"{_heading(ref)}\n\n"
+        f"PR {ref} の CI が head {tail.hold_head} で終端した（{ci.value}）ので、"  # noqa: RUF001 (§F.1.1 wording)
+        "gate を 1 回だけ撃ち直す。"
+    )
+    return Post(body=body, next_line=f"NEXT: {PR_REVIEW_TOKEN} {ref}")
 
 
 __all__ = [
@@ -312,8 +380,10 @@ __all__ = [
     "decide",
     "heading_ref",
     "lifecycle_of",
+    "lifecycle_post",
     "needs_ci",
     "operator_handoff",
+    "pr_facts_of",
     "precheck",
     "read_relay_tail",
 ]

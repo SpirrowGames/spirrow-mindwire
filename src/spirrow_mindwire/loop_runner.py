@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -99,6 +100,7 @@ from .conductor.run_budget import (
     validate_budgets,
 )
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
+from .conductor.summon import ResumeNotice, parse_resume_notice
 from .conductor.tierc_gate import TierCGate
 from .config import (
     MindwireSettings,
@@ -106,9 +108,11 @@ from .config import (
     Stage3LoopConfig,
     load_settings,
     resolve_tier_c_decisions_log_path,
+    resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
     resolve_tierc_rules_snapshot_dir,
 )
+from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
@@ -117,11 +121,18 @@ from .dispatcher.event_log import (
     EVENT_KIND_DELIVERY_FAILED,
 )
 from .dispatcher.registry import InMemoryAdapterRegistry
+from .git_sync import (
+    GIT_SYNC_DEFERRED_EXIT_CODE,
+    GitSyncDeferredError,
+    GitSyncHook,
+    emit_git_sync_deferred_payload,
+)
 from .github.client import (
     CheckRollup,
     EnvironmentTerminalError,
     GitHubClient,
     PrRef,
+    PrState,
     ReviewInfo,
     naysayer_github_token,
 )
@@ -544,12 +555,17 @@ def build_pr_review_driver(
     (``[naysayer_gating]``): skip a re-review of an unchanged head, and cap the re-review rounds.
     """
     g = gating or NaysayerGatingConfig()
-    return NaysayerPrReviewDriver(
+    knobs = functools.partial(
+        NaysayerPrReviewDriver,
         skip_if_head_unchanged=g.skip_if_head_unchanged,
         max_review_rounds=g.max_review_rounds,
         review_login=g.review_login,
         shadow=g.shadow,
     )
+    # The driver owns its default output budget; pass one only when the deployment sets it.
+    if g.review_max_tokens is None:
+        return knobs()
+    return knobs(max_tokens=g.review_max_tokens)
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
@@ -705,8 +721,31 @@ def _build_dispatcher(
         event_sink=_log_event_sink,
         spec_pin_writer=pin_writer,
         clone_guard=clone_guard,
+        git_sync=build_git_sync_hook(settings),
     )
     return mcp, registry, dispatcher
+
+
+def build_git_sync_hook(settings: MindwireSettings) -> GitSyncHook | None:
+    """The git-sync hook for ``[loop].repo_dir``, or ``None`` (ADR-2026-10-09-23 unit 1).
+
+    ``None`` whenever ``[turn.git] sync`` is false — the default — or no repo_dir is known (the
+    adapters were injected by a test): the dispatcher then runs no git beyond the clone guard's,
+    exactly as before ``[turn.git]`` existed (INV-0). The GitHub client is the implementer's
+    (author) identity, built per resolution and closed after it.
+    """
+    git_cfg = settings.turn.git
+    if not git_cfg.sync or settings.loop.repo_dir is None:
+        return None
+    from .github.client import GitHubClient
+
+    return GitSyncHook(
+        Path(settings.loop.repo_dir),
+        remote=git_cfg.remote,
+        lfs=git_cfg.lfs,
+        branch_override=git_cfg.branch_override,
+        github_factory=GitHubClient,
+    )
 
 
 def build_loop(
@@ -821,16 +860,23 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
-class _PerCallReviewSource:
-    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+class _PerCallGateResumeSource:
+    """``ReviewSource`` + ``PrHeadSource`` for the gate resume (:mod:`.conductor.gate_resume`).
 
-    Same shape and token as :class:`_PerCallCheckRollupSource`: the resume compares the reviews
-    against the rollup, so both must be read through the credential the gate itself uses.
+    One client per read.
+
+    Same shape and token as :class:`_PerCallCheckRollupSource`, so the resume reads through the
+    credential the gate itself uses.
 
     Unlike the rollup source this one RAISES on a failed read (``fetch_pr_reviews_strict``):
     the resume must tell "no gate review on the head" (CONTRADICTED → the human) apart from
     "GitHub could not be asked" (UNAVAILABLE → retry next tick), and the fail-soft read
     collapses the two into ``[]`` (Bohr msg-6318).
+
+    It is also the resume's ``PrHeadSource`` (T-gate-resume-private-repo-pat-forbidden-stalls,
+    Bohr msg-7563 修正 1): an RC resume reads the PR head from REST ``GET /pulls/{n}`` here, with
+    the same token as the reviews, instead of from the GraphQL rollup a fine-grained PAT cannot
+    read on a private repo. Also fail-loud: a failed read is UNAVAILABLE, never a head.
     """
 
     def __init__(self, token: str | None = None) -> None:
@@ -840,6 +886,29 @@ class _PerCallReviewSource:
         token = self._token if self._token is not None else naysayer_github_token()
         async with GitHubClient(token) as client:
             return await client.fetch_pr_reviews_strict(pr)
+
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_head_sha_strict(pr)
+
+
+class _PerCallPrStateSource:
+    """``PrStateSource`` for the settled-PR check (T-merged-pr-fact-never-reaches-design-thread).
+
+    One client per read, and the same token as the rollup and the gate, so the check sees the PR
+    through the credential the gate it may skip would have used. Never raises in practice:
+    :meth:`GitHubClient.fetch_pr_state` answers ``UNRESOLVABLE`` on every failure, and the
+    conductor reads that (or a raise) as "could not see" and keeps its pre-change path.
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_state(pr)
 
 
 def build_conductor(
@@ -856,6 +925,8 @@ def build_conductor(
     retry_of: RetryOf | None = None,
     run_phase: RunPhase | None = None,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -936,8 +1007,14 @@ def build_conductor(
     if dec_cfg.tierc.mode == "bounce" and settings.tierc_gate.mode != "enforce":
         logger.warning(
             'decider: tierc=bounce has no effect without [tierc_gate] mode = "enforce" '
-            "(the Jev bounce shares the gate's RETRY store); acting as shadow"
+            "(the Jev bounce shares the gate's RETRY store); bouncing nothing, annotating only"
         )
+    # DECIDED 2e-2: the digest's Jev line. Written under annotate / bounce only; ``None`` = none.
+    tierc_annotations_path = (
+        resolve_tierc_annotations_path(settings)
+        if decider is not None and dec_cfg.tierc.mode in ANNOTATING_TIERC_MODES
+        else None
+    )
     logger.info(
         "decider: backend=%s tierc=%s questions=%s built=%s",
         resolve_decider_backend(dec_cfg.backend),
@@ -951,6 +1028,14 @@ def build_conductor(
         logger.info("tierc_gate: enforce (log=%s)", tierc_gate.log_path)
     else:
         logger.info("tierc_gate: off")
+    # Summon: the owning project is in scope only when it is not this thread's own project.
+    owner_project = (
+        summon_owner_project.strip()
+        if summon_owner_project and summon_owner_project.strip() != loop_cfg.project
+        else None
+    )
+    # One per-call source serves the gate resume as both its ReviewSource and its PrHeadSource.
+    resume_reads = _PerCallGateResumeSource()
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -959,6 +1044,7 @@ def build_conductor(
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,
             human_identity=cond_cfg.human_identity,
+            tier_c_recorders=tuple(cond_cfg.tier_c_recorders),
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
             # ADR-2026-09-14-21: merged over the shipped default inside the Conductor, so an
@@ -981,9 +1067,21 @@ def build_conductor(
             # checks an RC relay left at the head against GitHub before the implementer is
             # resumed from it. Wired unconditionally like the rollup; an unreadable answer is
             # UNAVAILABLE (retry next tick), never VERIFIED.
-            review_source=_PerCallReviewSource(),
+            review_source=resume_reads,
+            # The RC resume's PR-head read (REST ``GET /pulls/{n}``), the same per-call source
+            # and token as the reviews (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr
+            # msg-7563 修正 1): a fine-grained PAT cannot read the rollup's GraphQL contexts on
+            # a private repo, so the RC resume no longer reads the rollup at all.
+            head_source=resume_reads,
+            # Settled-PR check (Bohr msg-7560 v0.4 (b)): a ``NEXT: pr-review`` on a PR GitHub
+            # already reports merged / closed posts that fact instead of re-gating. Wired
+            # unconditionally; an unreadable state keeps the pre-change path. No token argument on
+            # purpose, exactly as ``rollup_source`` above: each read resolves
+            # :func:`naysayer_github_token` at call time (tests/test_loop_runner.py pins both).
+            pr_state_source=_PerCallPrStateSource(),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
+            tierc_annotations_path=tierc_annotations_path,
             # Adapter-error side channel (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
             # line when a dispatch raised. ``None`` = no reader (tests, library callers).
@@ -1004,6 +1102,13 @@ def build_conductor(
             # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1'): ``--gate-only``
             # from the sweep's gate-lane launch. ``False`` for a hand run and a role-lane launch.
             gate_only=gate_only,
+            # Summon (T-human-call-priority-interrupt PR-2, v1.6 §4): the owning project's
+            # Summon is read only when the sweep named a project other than this one.
+            summon_owner_project=owner_project,
+            summon_owner_control=(
+                LoopControlReader(mcp, project=owner_project) if owner_project else None
+            ),
+            resume_notice=resume_notice,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -1022,6 +1127,7 @@ def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
         f"conductor stopped: reason={StopReason.ADAPTER_ERROR.value} rounds={snapshot.rounds} "
         f"forced_naysayer={snapshot.forced} forced_naysayer_saveable={snapshot.forced_saveable} "
         f"last_msg={snapshot.last_msg_id} error_code={snapshot.error_code}"
+        + (" resume_notice=delivered" if snapshot.resume_notice_delivered else "")
     )
 
 
@@ -1034,6 +1140,8 @@ async def run_conductor(
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -1096,6 +1204,8 @@ async def run_conductor(
             retry_of=retry_of,
             run_phase=run_phase,
             gate_only=gate_only,
+            summon_owner_project=summon_owner_project,
+            resume_notice=resume_notice,
         )
 
     outcome, timed_out = await run_with_budget(
@@ -1143,6 +1253,8 @@ async def _run_conductor_once(
     retry_of: RetryOf | None,
     run_phase: RunPhase,
     gate_only: bool = False,
+    summon_owner_project: str | None = None,
+    resume_notice: ResumeNotice | None = None,
 ) -> ConductorOutcome:
     """The body :func:`run_conductor` bounds: resolve, preflight, build, run, tear down."""
     project = settings.loop.project
@@ -1185,6 +1297,8 @@ async def _run_conductor_once(
         retry_of=retry_of,
         run_phase=run_phase,
         gate_only=gate_only,
+        summon_owner_project=summon_owner_project,
+        resume_notice=resume_notice,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1359,6 +1473,25 @@ def main() -> None:
     # T-sweep-starves-deep-candidates PR-B (Bohr msg-6313 §1' / msg-6316). Written by the sweep on
     # gate-lane launches only. Absent = the run goes as far as it always did, so a hand-run
     # conductor and a role-lane launch are unchanged.
+    # T-human-call-priority-interrupt PR-2 (Bohr msg-6755 v1.6 §4 / msg-6751 v1.4). Written by the
+    # sweep only: the project owning the repository this candidate writes to, when it is not the
+    # thread's own (its Summon is in scope too), and the resume notice of a thread that had yielded
+    # to a Summon. Absent = own project only / not yielded, so a hand run is unchanged.
+    parser.add_argument(
+        "--summon-owner-project",
+        default=None,
+        help="conductor: the project owning this run's repository (its Summon is in scope too)",
+    )
+    parser.add_argument(
+        "--resume-notice-summons",
+        default=None,
+        help="conductor: comma-separated Summon thread ids this thread had yielded to",
+    )
+    parser.add_argument(
+        "--resume-notice-main-range",
+        default=None,
+        help="conductor: <a>..<b> — main when the thread first yielded, and at this launch",
+    )
     parser.add_argument(
         "--gate-only",
         action="store_true",
@@ -1382,6 +1515,10 @@ def main() -> None:
                     launch_head_msg_id=args.launch_head_msg_id or None,
                     retry_of=parse_retry_of(args.retry_of),
                     gate_only=args.gate_only,
+                    summon_owner_project=args.summon_owner_project or None,
+                    resume_notice=parse_resume_notice(
+                        args.resume_notice_summons, args.resume_notice_main_range
+                    ),
                 )
             )
         else:
@@ -1417,6 +1554,20 @@ def main() -> None:
             env_exc.status_code,
         )
         sys.exit(2)
+    except GitSyncDeferredError as deferred_exc:
+        # ADR-2026-10-09-23 unit 1 (design v1.2 B-2): the GitHub API stayed transiently
+        # unavailable through the retries while naming this thread's branch. Not this thread's
+        # fault and not the clone's: no park, no quarantine; the wrapper reverts the launch and
+        # notifies on the dirty-clone channel, and the next tick re-derives the name from n = 1.
+        emit_git_sync_deferred_payload(deferred_exc)
+        logger.warning(
+            "git-sync deferred exit=%d: thread=%s candidate=%s detail=%s",
+            GIT_SYNC_DEFERRED_EXIT_CODE,
+            deferred_exc.thread_id,
+            deferred_exc.candidate,
+            deferred_exc.detail,
+        )
+        sys.exit(GIT_SYNC_DEFERRED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
@@ -1507,3 +1658,12 @@ __all__ = [
     "run_conductor",
     "run_loop",
 ]
+
+
+# `python -m spirrow_mindwire.loop_runner` is how deploy/run-conductor.ps1 launches the daemon
+# (T-composer-entrypoint-missing-drops-decision-cards D-1'). Going through the venv's python.exe
+# instead of `.venv\Scripts\mindwire-loop.exe` means a running conductor no longer holds the
+# package's console-script exe open, so `uv sync --reinstall-package spirrow-mindwire` cannot stop
+# part-way on `os error 32` against it and leave other entry points missing.
+if __name__ == "__main__":  # pragma: no cover
+    main()

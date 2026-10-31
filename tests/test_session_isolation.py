@@ -45,10 +45,22 @@ _NOT_SDK_BACKED: dict[str, str] = {
     "__init__.py": "package marker; defines no adapter",
     "_sdk_result.py": "parses an SDK result object; spawns nothing",
     "_session_isolation.py": "this module IS the policy",
+    "claude_bg.py": (
+        "launches `claude --bg` as a CLI subprocess and constructs no "
+        "ClaudeAgentOptions; the session's settings come from the repo's "
+        "`.claude/agents/<identity>.md` by design (T-spawn-via-claude-bg msg-6787 §1). "
+        "Whether a --bg session needs the equivalent of SDK isolation is an open "
+        "question raised on that thread, not something this test can decide"
+    ),
     "_cli_selection.py": (
         "builds the model / cli_path kwargs for an adapter to splat; constructs "
         "no ClaudeAgentOptions and spawns nothing — isolation is applied by the "
         "adapter that USES it, next to its own session_isolation_kwargs() call"
+    ),
+    "_command_line.py": (
+        "writes the system-prompt file and measures the command line of options "
+        "an adapter already built; constructs no ClaudeAgentOptions and spawns "
+        "nothing — isolation is applied by the adapter that built those options"
     ),
     "_connect_budget.py": (
         "bounds the await on a client the calling adapter already built; "

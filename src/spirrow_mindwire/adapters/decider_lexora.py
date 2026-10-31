@@ -65,9 +65,9 @@ from typing import Any, Literal, Protocol
 from ..decider.questions import (
     MATCHED_RULE_KEY,
     SHOULD_ASK_HUMAN_KEY,
+    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_VERSION,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
-    TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
 )
@@ -94,6 +94,10 @@ plus headroom so Lexora's fallback-to-Null answer arrives before we cut the conn
 HUMAN_NEXT = "human"
 _BACKEND_ENV = "MINDWIRE_DECIDER_BACKEND"
 _URL_ENV = "MINDWIRE_LEXORA_URL"
+# Every accepted [decider.tierc].mode. "off" is a valid setting, handled by build_decider's early
+# return (no Decider is built), so it never reaches the unknown-mode check; it is listed here so
+# the error message names the whole set a config may carry (#465 PR-gate review of ba7b45e).
+_TIERC_MODES = ("off", "shadow", "annotate", "bounce")
 _ALL_TIERC_KEYS: tuple[str, ...] = TIER_C_GENUINE_KEYS + TIER_C_SPURIOUS_KEYS
 
 MATCHED_RULE_SOURCE_CHOICE = "choice"
@@ -182,7 +186,9 @@ async def decide_once(
     if rules is None and state.gate_result is None:
         raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
     body = build_decide_request(state, policy=policy, rules=rules, proceed=proceed)
-    v2_version = TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_V2_QUESTIONS_VERSION
+    v2_version = (
+        TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_ESCALATION_QUESTIONS_VERSION
+    )
     version_fields: dict[str, Any] = (
         {"questions_version": TIERC_QUESTIONS_VERSION}
         if rules is None
@@ -300,7 +306,7 @@ def _v2_result(
     policy: str,
     latency_ms: int | None,
     no_verdict: Callable[[DecisionOutcome, str | None], DecisionResult],
-    questions_version: str = TIERC_V2_QUESTIONS_VERSION,
+    questions_version: str = TIERC_ESCALATION_QUESTIONS_VERSION,
 ) -> DecisionResult:
     """tierc-v2 steps 4-5: ``should_ask_human`` alone decides MALFORMED and the verdict;
     ``matched_rule`` is validated on its own and never changes the outcome (msg-4380 Δ3)."""
@@ -581,9 +587,10 @@ def build_decider(
     """Composition-root factory. ``None`` = Decider off (no HTTP will ever be made).
 
     Raises ``ValueError`` for configurations that would be silently wrong: an unknown backend,
-    ``lexora`` without ``MINDWIRE_LEXORA_URL``, or a Tier-C mode whose acting half is not built
-    yet (``annotate`` — accepting it would log as if annotating while annotating nothing).
-    ``bounce`` is acted on by the Conductor under ``[tierc_gate] mode = "enforce"``
+    ``lexora`` without ``MINDWIRE_LEXORA_URL``, or an unknown Tier-C mode. ``annotate``
+    (DECIDED 2e-2) writes the digest's Jev line for a ``NEXT: human`` that reaches the human
+    (:mod:`spirrow_mindwire.decider.annotation`); ``bounce`` does the same and, under
+    ``[tierc_gate] mode = "enforce"``, is also acted on by the Conductor
     (:meth:`~spirrow_mindwire.conductor.core.Conductor._enforce_tierc_gate`).
 
     ``questions="tierc-v2"`` reads the rules file at ``rules_path`` **once, here** (msg-4384: no
@@ -598,14 +605,16 @@ def build_decider(
     missing / malformed rules file — the evaluation's own input — refuses startup.
     """
     backend = resolve_backend(config_backend)
+    # mode "off" returns here, before any check below: it is valid under every backend and
+    # builds no Decider, so the unknown-mode error further down can never fire for it.
     if backend == "off" or tierc_mode == "off":
         return None
     if backend != "lexora":
         raise ValueError(f"unknown decider backend {backend!r} (expected 'off' or 'lexora')")
-    if tierc_mode not in ("shadow", "bounce"):
+    if tierc_mode not in _TIERC_MODES:
         raise ValueError(
-            f"[decider.tierc].mode={tierc_mode!r} is not implemented yet: 'shadow' and "
-            "'bounce' are wired ('annotate' lands in a later step)"
+            f"unknown [decider.tierc].mode={tierc_mode!r} "
+            f"(expected one of {', '.join(repr(m) for m in _TIERC_MODES)})"
         )
     if questions not in ("tierc-v1", "tierc-v2"):
         raise ValueError(f"unknown [decider.tierc].questions {questions!r}")

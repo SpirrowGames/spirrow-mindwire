@@ -32,12 +32,43 @@ earlier "log-only until P-1 ∧ P-2 hold" rule (msg-2531 §1) no longer
 applies: Operator Board §F.1 / msg-4900 §2 dropped the plan to express
 "cannot be swept" as a ``parked`` state. The sweep wrapper now adds
 every thread this predicate reports to the current tick's candidates
-(in memory; ``sweep.json`` is never written) when its project passes the
-environment probe, and lists the rest with their reason in the daily
-digest. See ``scripts/unregistered_threads.py`` and
+(in memory; ``sweep.json`` is never written) when the discovery rule
+below admits it (D-2.5), and lists the rest with their reason in the
+daily digest. See ``scripts/unregistered_threads.py`` and
 ``deploy/lib/UnregisteredIntake.ps1`` for the split between an
 auto-registered thread (an ordinary candidate, quarantinable) and a
 refused one (never in any state file).
+
+**Discovery by default** (T-sweep-intake-discovery-by-default, Bohr
+msg-6776 as amended by msg-6778). The scanned projects are the union of
+``sweep.json``'s ``clones`` keys, the candidates' projects and the
+``projects`` key (穴 3: a project named nowhere used to be neither
+scanned nor shown). Every unregistered thread now also carries how long
+it has been idle, read from the listing's own ``last_activity_at`` — never
+from a per-thread read (Einstein msg-6769: no N+1 calls per tick). The
+timestamp is interpreted in exactly one place, :func:`classify_activity_at`,
+which only the CLI's ``_list_live_threads`` calls. That boundary
+CLASSIFIES (ok / missing / unparseable) and drops nothing: whether a
+thread is admitted is decided later, by the wrapper's
+``Resolve-UnregisteredIntake``, and only for threads ``sweep.json`` does
+not list. An explicitly listed candidate never reaches this module's
+report at all (:func:`is_unregistered_live` filter 3), so neither a
+missing timestamp nor ``max_idle_days`` can touch it (msg-6778).
+
+**The field is ``last_activity_at``** (T-sweep-intake-discovery-by-default
+msg-7441 F-1, msg-7445). The listing this reads is magickit's
+``chatroom_list_threads``, whose items carry ``last_activity_at`` and no
+``updated_at`` (operator measurement, msg-7381 §4; the real item shape is
+pinned in ``tests/data/magickit_chatroom_list_threads_page.json``). The
+first version of this module read ``updated_at``, a field the listing
+never had, so every thread was "time unknown" for eight days without a
+word. Two things now stop that recurring: the name is the same from the
+wire to the wrapper (input key, :func:`classify_activity_at`, the JSON
+key, the PowerShell key), and the boundary counts the items that lack the
+key outright (:attr:`ProjectReport.field_absent_count`, msg-7443 F-3c as
+narrowed by msg-7445) so the wrapper can say so in the tick log and the
+digest. There is no ``updated_at`` fallback (msg-7441 F-1: one field, not
+two).
 
 Fail direction: this module makes **no** MCP calls of its own — the CLI
 around it does. What it does with an MCP failure is separated from what
@@ -73,8 +104,9 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 #: Chatroom statuses that count as "live work in flight" for D-2.
 #: Kept string-value-identical to
@@ -93,6 +125,86 @@ LIVE_STATUSES: frozenset[str] = frozenset({"active", "awaiting_reply"})
 #: Here we match the class as a whole, so the un-templated prefix is what
 #: we want.
 PR_REVIEW_PREFIX: str = "T-pr-review-"
+
+#: The listing field the idle time is read from (msg-7441 F-1). One name,
+#: used for the input key, the JSON output key and the PowerShell key.
+ACTIVITY_FIELD: str = "last_activity_at"
+
+#: The three states of a listing item's ``last_activity_at`` (msg-6770 §1).
+#: They are never mixed: "had a time", "had none" and "had something that
+#: is not a time" are reported as such, so the wrapper can fail closed on
+#: the last two without confusing them with each other. ``missing`` covers
+#: both an absent key and a ``null`` / blank value; the absent-key case is
+#: additionally COUNTED, not given a state of its own (msg-7445 F-3a).
+TimeState = Literal["ok", "missing", "unparseable"]
+
+
+@dataclass(frozen=True)
+class ThreadTime:
+    """The classified ``last_activity_at`` of one listing item.
+
+    ``at`` is set (timezone-aware, UTC) only when ``state == "ok"``.
+    """
+
+    state: TimeState
+    at: datetime | None = None
+
+
+def classify_activity_at(raw: object) -> ThreadTime:
+    """Classify a listing item's raw ``last_activity_at`` value. The ONE timestamp parser.
+
+    Called only by the CLI's ``_list_live_threads`` (pinned by
+    ``tests/test_unregistered_threads_cli.py``), so there is a single
+    place where wire data becomes a time. Absent / ``None`` / blank is
+    ``missing``; a non-string, a string ``datetime.fromisoformat`` rejects,
+    or a time with no UTC offset (ambiguous, so not a time we can compare)
+    is ``unparseable``.
+    """
+    if raw is None:
+        return ThreadTime("missing")
+    if not isinstance(raw, str):
+        return ThreadTime("unparseable")
+    text = raw.strip()
+    if not text:
+        return ThreadTime("missing")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return ThreadTime("unparseable")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return ThreadTime("unparseable")
+    return ThreadTime("ok", parsed.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class ListedThread:
+    """One dict-shaped listing item plus its classified ``last_activity_at``."""
+
+    thread: dict[str, Any]
+    time: ThreadTime
+
+
+@dataclass(frozen=True)
+class UnregisteredThread:
+    """One unregistered live thread as the wrapper sees it.
+
+    ``idle_days`` is the time since ``last_activity_at`` in days (``None``
+    unless ``time_state == "ok"``). The wrapper compares it against
+    ``intake.max_idle_days`` and never parses a timestamp itself.
+    """
+
+    thread_id: str
+    time_state: TimeState
+    last_activity_at: str | None = None
+    idle_days: float | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "thread_id": self.thread_id,
+            "time_state": self.time_state,
+            ACTIVITY_FIELD: self.last_activity_at,
+            "idle_days": self.idle_days,
+        }
 
 
 class UnregisteredThreadsError(ValueError):
@@ -148,6 +260,16 @@ class ProjectReport:
     ``unregistered_count is None``: when the whole listing failed we do
     not know what we did not see, and the honest report is "unknown",
     not "zero".
+
+    ``field_absent_count`` / ``listed_count`` are the schema-drift
+    counter (msg-7443 F-3c as narrowed by msg-7445): of the
+    ``listed_count`` dict-shaped items the listing returned for this
+    project — ALL of them, counted before the registered filter, so a
+    project whose every live thread is already in ``sweep.json`` is still
+    checked — ``field_absent_count`` had no ``last_activity_at`` key at
+    all. A key present with a ``null`` value is not counted. The wrapper
+    reports ``N/M`` as a fact; nothing here infers what it means. Both are
+    ``None`` when the listing failed, like ``malformed_count``.
     """
 
     project: str
@@ -155,14 +277,22 @@ class ProjectReport:
     unregistered: tuple[str, ...] = ()
     error: str | None = None
     malformed_count: int | None = 0
+    #: Per-thread detail for ``unregistered``, same order. Carries the
+    #: time classification the wrapper's intake decision needs.
+    threads: tuple[UnregisteredThread, ...] = ()
+    field_absent_count: int | None = 0
+    listed_count: int | None = 0
 
     def as_json(self) -> dict[str, Any]:
         return {
             "project": self.project,
             "unregistered_count": self.unregistered_count,
             "unregistered": list(self.unregistered),
+            "threads": [t.as_json() for t in self.threads],
             "error": self.error,
             "malformed_count": self.malformed_count,
+            "field_absent_count": self.field_absent_count,
+            "listed_count": self.listed_count,
         }
 
 
@@ -210,6 +340,10 @@ class EnumerateReport:
     def as_json(self) -> dict[str, Any]:
         return {
             "projects": [p.as_json() for p in self.projects],
+            # The field name itself, so the PowerShell side words its WARN,
+            # header and 時刻不明 reason from this one constant instead of
+            # hardcoding it a second time (PR #497 gate advisory).
+            "activity_field": ACTIVITY_FIELD,
             "unregistered_count_total": self.unregistered_count_total,
             "unmeasured_projects": list(self.unmeasured_projects),
             "any_unmeasured": self.any_unmeasured,
@@ -219,28 +353,44 @@ class EnumerateReport:
 
 
 def parse_registered(payload: Any) -> RegisteredIndex:
-    """Parse the ``candidates`` array of ``sweep.json`` into a :class:`RegisteredIndex`.
+    """Parse ``sweep.json`` into a :class:`RegisteredIndex`.
 
-    Only the two fields D-2 needs (``project``, ``thread_id``) are
-    validated here — ``repo_dir`` is not, because a missing repo_dir is
-    a real defect but not one this script exists to catch (the sweep
-    wrapper already refuses to run on it, ``run-conductor-scheduled.ps1``
-    L2341-2345). A candidate with a missing or blank ``project`` /
-    ``thread_id`` is rejected at load time rather than silently dropped:
-    a candidate that vanished from the registered set would be
-    indistinguishable from an unregistered thread and would inflate the
-    D-2 count.
+    ``pairs`` comes from the ``candidates`` array. Only the two fields D-2
+    needs (``project``, ``thread_id``) are validated here — ``repo_dir``
+    is not, because a missing repo_dir is a real defect but not one this
+    script exists to catch (the sweep wrapper already refuses to run on
+    it, ``Get-SweepCandidates``). A candidate with a missing or blank
+    ``project`` / ``thread_id`` is rejected at load time rather than
+    silently dropped: a candidate that vanished from the registered set
+    would be indistinguishable from an unregistered thread and would
+    inflate the D-2 count. A missing ``candidates`` key is an empty list;
+    a present non-array one is rejected.
+
+    ``projects`` (the scan range) is the union, in this order, of the
+    candidates' projects, the ``clones`` keys and the ``projects`` key
+    (msg-6776 走査と受け付け). ``clones`` is validated for shape and
+    rejected loudly (an object of non-blank project -> non-blank string),
+    matching the wrapper, which throws on the same error. A malformed
+    ``projects`` key widens nothing and is not an error here: the
+    park-wake tick already names it in the digest as
+    ``sweep.json:projects`` (``Get-SweepDeclaredProjects``).
     """
     if not isinstance(payload, dict):
         raise UnregisteredThreadsError("sweep.json root must be a JSON object")
 
-    raw_candidates = payload.get("candidates")
+    raw_candidates = payload.get("candidates", [])
     if not isinstance(raw_candidates, list):
         raise UnregisteredThreadsError("sweep.json 'candidates' must be a JSON array")
 
     pairs: set[tuple[str, str]] = set()
     projects: list[str] = []
     seen_projects: set[str] = set()
+
+    def _add_project(name: str) -> None:
+        if name not in seen_projects:
+            seen_projects.add(name)
+            projects.append(name)
+
     for index, raw in enumerate(raw_candidates):
         where = f"candidates[{index}]"
         if not isinstance(raw, dict):
@@ -258,9 +408,25 @@ def parse_registered(payload: Any) -> RegisteredIndex:
         project_s = project.strip()
         thread_id_s = thread_id.strip()
         pairs.add((project_s, thread_id_s))
-        if project_s not in seen_projects:
-            seen_projects.add(project_s)
-            projects.append(project_s)
+        _add_project(project_s)
+
+    if "clones" in payload:
+        clones = payload["clones"]
+        if not isinstance(clones, dict):
+            raise UnregisteredThreadsError(
+                "sweep.json 'clones' must be a JSON object (project -> clone path)"
+            )
+        for key, value in clones.items():
+            if not str(key).strip() or not isinstance(value, str) or not value.strip():
+                raise UnregisteredThreadsError(
+                    f"sweep.json 'clones' has a blank key or value: {key!r} => {value!r}"
+                )
+            _add_project(str(key).strip())
+
+    declared = payload.get("projects")
+    if isinstance(declared, list) and all(isinstance(p, str) and p.strip() for p in declared):
+        for p in declared:
+            _add_project(p.strip())
 
     return RegisteredIndex(pairs=frozenset(pairs), projects=tuple(projects))
 
@@ -299,21 +465,25 @@ def is_unregistered_live(project: str, thread: dict[str, Any], registered: Regis
 
 def enumerate_project(
     project: str,
-    threads: Iterable[dict[str, Any]],
+    threads: Iterable[ListedThread],
     registered: RegisteredIndex,
     *,
     malformed_count: int = 0,
+    field_absent_count: int = 0,
+    now: datetime | None = None,
 ) -> ProjectReport:
     """Apply :func:`is_unregistered_live` over ``threads`` and produce a report.
 
-    ``threads`` is a well-shaped iterable of thread dicts. Callers are
-    responsible for filtering out non-object items *before* handing the
-    list here; the CLI's ``_list_live_threads`` does exactly that at the
-    tool boundary and passes the count of what it dropped through
-    ``malformed_count``. This function does not re-filter: the type
-    signature declares ``Iterable[dict[str, Any]]`` and the shape check
-    lives at the one boundary that actually meets untrusted input
-    (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management).
+    ``threads`` is a well-shaped iterable of :class:`ListedThread` — a
+    dict plus its already-classified ``last_activity_at``. Callers are
+    responsible for filtering out non-object items and for classifying
+    the time *before* handing the list here; the CLI's
+    ``_list_live_threads`` does both at the tool boundary and passes the
+    count of what it dropped through ``malformed_count``. This function
+    neither re-filters nor parses a timestamp: the shape check and the
+    time parse live at the one boundary that actually meets untrusted
+    input (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management;
+    msg-6770 §1 — one place interprets the time).
 
     A thread whose ``thread_id`` is missing, empty, or a falsy non-string
     value (e.g., ``0``, ``[]``, ``{}``) is ignored — the coercion below
@@ -324,25 +494,56 @@ def enumerate_project(
     expects ``thread_id`` to be a string, so any such coercion reflects a
     schema violation upstream.
 
+    ``now`` (default: the current UTC time) is what ``idle_days`` is
+    measured against. A thread whose time is not ``ok`` is still listed,
+    with ``idle_days = None``: classifying is not dropping (msg-6778).
+
     ``malformed_count`` is the count of non-object items the caller
     already dropped upstream (msg-2648 §3 — the CLI's ``_list_live_threads``
     filters non-dicts before handing the accumulated list here). It flows
     through unchanged onto :attr:`ProjectReport.malformed_count` and is
     **never** merged into ``unregistered_count``.
+
+    ``field_absent_count`` is the boundary's count of items with no
+    ``last_activity_at`` key (msg-7445), passed through the same way; the
+    ``listed_count`` beside it is the number of items in ``threads``, all
+    of them, before any filter (the ``M`` of ``N/M``).
     """
+    reference = now if now is not None else datetime.now(UTC)
     unregistered: list[str] = []
-    for thread in threads:
+    details: list[UnregisteredThread] = []
+    listed_count = 0
+    for listed in threads:
+        listed_count += 1
+        thread = listed.thread
         if not is_unregistered_live(project, thread, registered):
             continue
         thread_id = str(thread.get("thread_id") or "").strip()
-        if thread_id:
-            unregistered.append(thread_id)
+        if not thread_id:
+            continue
+        unregistered.append(thread_id)
+        at = listed.time.at
+        if listed.time.state == "ok" and at is not None:
+            idle = max(0.0, (reference - at).total_seconds() / 86400.0)
+            details.append(
+                UnregisteredThread(
+                    thread_id=thread_id,
+                    time_state="ok",
+                    last_activity_at=at.isoformat(),
+                    idle_days=round(idle, 3),
+                )
+            )
+        else:
+            details.append(UnregisteredThread(thread_id=thread_id, time_state=listed.time.state))
     return ProjectReport(
         project=project,
         unregistered_count=len(unregistered),
         unregistered=tuple(unregistered),
         error=None,
         malformed_count=malformed_count,
+        threads=tuple(details),
+        field_absent_count=field_absent_count,
+        listed_count=listed_count,
     )
 
 
@@ -355,7 +556,8 @@ def project_error_report(project: str, error: str) -> ProjectReport:
     converting an :class:`~spirrow_mindwire.magickit.client.MagickitMcpError`
     (or any transport failure) go through this helper so the "did not
     measure" signal is uniform. ``malformed_count`` is ``None`` here for
-    the same reason ``unregistered_count`` is: when the whole listing
+    the same reason ``unregistered_count`` is (and so are
+    ``field_absent_count`` / ``listed_count``): when the whole listing
     call failed we do not know how many items came back garbled, and a
     zero would silently claim the population was cleanly enumerated.
     """
@@ -365,16 +567,24 @@ def project_error_report(project: str, error: str) -> ProjectReport:
         unregistered=(),
         error=error,
         malformed_count=None,
+        field_absent_count=None,
+        listed_count=None,
     )
 
 
 __all__ = [
+    "ACTIVITY_FIELD",
     "LIVE_STATUSES",
     "PR_REVIEW_PREFIX",
     "EnumerateReport",
+    "ListedThread",
     "ProjectReport",
     "RegisteredIndex",
+    "ThreadTime",
+    "TimeState",
+    "UnregisteredThread",
     "UnregisteredThreadsError",
+    "classify_activity_at",
     "enumerate_project",
     "is_unregistered_live",
     "load_registered",

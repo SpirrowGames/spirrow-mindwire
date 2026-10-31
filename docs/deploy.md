@@ -64,6 +64,39 @@ Outbound requests from the daemon's own scripts pass `-Proxy` explicitly. That i
 has no outbound firewall permission of its own, so a request that skipped the proxy is **blocked**
 rather than quietly bypassing the chokepoint.
 
+### CPU-heavy manual jobs on the loop host
+
+Role turns (the implementer's local `bash .mindwire-gate` above all) share {{HOST_LOOP}}'s CPU with
+whatever an operator runs there by hand. A CPU-bound manual job that takes every core starves the
+gate, and the turn runs out of wall clock. Any manual job that uses a lot of CPU on this host must
+follow these three rules:
+
+1. **Cap the workers.** The job's worker processes and threads, summed over every process it
+   starts, must not exceed the host's logical core count minus 4 (on a 16-core host, 12 at most).
+2. **Start it at lowered priority.** On Windows, launch it with `cmd.exe`'s `start` command:
+   `start "" /BELOWNORMAL <command>` from a `cmd.exe` prompt, or
+   `cmd /c start "" /BELOWNORMAL <command>` from PowerShell. (In PowerShell a bare `start` is the
+   `Start-Process` alias, which rejects `/BELOWNORMAL`. The empty `""` is the window title, so a
+   quoted command is not mistaken for it.) Launching at `BelowNormal` from the start matters:
+   worker processes the job spawns inherit that class, whereas lowering the priority after launch
+   leaves workers already started at `Normal`. After launch, check in PowerShell that each process
+   really is `BelowNormal`, e.g. `Get-Process -Id <pid> | Select-Object Id, PriorityClass`.
+3. **Record when it ran and how big it was.** Write the start time, the end time and the worker
+   count to the job's own log or to the operator lane's notes. When a turn later times out, this
+   record is how anyone can tell whether a job was running alongside it.
+
+**Why.** When a heavy job that broke these rules overlapped an implementer turn, the local gate took
+3–4× its usual time, and the turn hit the 1800 s timeout. With the rules followed, the gate stayed
+within about 1.3× its usual time. Only one measurement has confirmed this, so treat it as a working
+rule, not a guarantee. The details are in thread `T-local-gate-takes-half-the-turn`.
+
+**When to revisit.**
+- If a turn's local gate takes longer than 240 s even though the rules were followed, consider an
+  exclusive lease that pauses heavy manual jobs while a role turn runs.
+- If an implementer turn times out and the operator still cannot tell, after 30 minutes with the
+  transcript and the job logs, whether another job was running at the same time, reconsider
+  recording host load in the turn record (D2 in that thread).
+
 ## Environment
 
 Set by `deploy/run-conductor.ps1`; secrets must be supplied externally.
@@ -328,7 +361,7 @@ the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
-**Merging is not deploying.** The task runs `uv run mindwire-loop` from this checkout — the venv holds
+**Merging is not deploying.** The task runs the loop (`uv run --no-sync python -m spirrow_mindwire.loop_runner`) from this checkout — the venv holds
 an *editable* install, so the working tree IS the running module — and nothing pulled it. A merged fix
 could therefore sit undeployed indefinitely, with GitHub showing it merged and the task history
 showing exit 0. The only way to notice was to compare `git log` against `origin/main` by hand.
@@ -356,6 +389,15 @@ Three rules are load-bearing:
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
   and a fast-forward cannot conflict with them.
+- **The venv is synced by `sync-repo.ps1` and nowhere else** (T-composer-entrypoint-missing-drops-
+  decision-cards D-2'). The loop and the decision composer both launch as
+  `uv run --no-sync python -m <module>`, so nothing syncs mid-tick, and no `.venv\Scripts\mindwire-*.exe`
+  is either needed or held open. `sync-repo.ps1` runs `uv sync --locked` whenever the SHA-256 over
+  `pyproject.toml` + `uv.lock` differs from the one recorded by the last *successful* sync
+  (`<data_dir>/state/venv-sync.json`), and counts a sync as successful only if the two launched
+  modules then import. A failed sync records nothing, so every tick retries it. It reports
+  `status=failed` with `deps_hash`, and the alert is deduplicated on that hash. `--locked` never
+  rewrites `uv.lock`: a stale lock fails loudly and is fixed by committing a regenerated lock.
 - **A sync failure is not a sweep failure.** One unreachable GitHub must not stop the loop; it keeps
   running the code it has, which is known-good and merely possibly old.
 
@@ -1057,6 +1099,27 @@ never automated (D-5: the human's manual merge is the authoritative guard).
     observation P-2 records at spawn. Un-stamped, the carve-out is not taken and the turn falls
     through to the human terminal. Same for the Obj2 forced consult: only an attested naysayer post
     discharges it, so an un-attested segment buys exactly one extra forced consult.
+  - **G1 latch and recording an out-of-chat decision** (T-guard-i-latches-on-discharged-tierc-line).
+    A `TIER-C: <label>` line anywhere since the human's last post keeps the proceed closed (G1),
+    and before this change only a human post lifted it. A decision the human gives outside the
+    chatroom (relayed by the operator or Fermi) now lifts it only if the recorder writes, **in the
+    same post that records the decision**, one line per declaration it discharges:
+
+    ```
+    TIER-C-RESOLVED: msg-754 decided-by=<[conductor].human_identity> on=2026-10-21
+    ```
+
+    The line must match the whole grammar (one msg id per line, `decided-by` = the human identity,
+    a real date), and its author must be listed in `[conductor].tier_c_recorders` (default empty =
+    no discharge path). **A recorder counts only in a thread where it holds none of proposer /
+    implementer / naysayer in that thread's `[conductor].roster`**; otherwise its line is ignored
+    and reported as `recorder-holds-loop-role` (the daemon still starts, and logs a WARNING listing
+    the overlap). It discharges only the
+    declaration it names, and only if it was posted after that declaration; a later `TIER-C:` line
+    closes G1 again. When guard (i) does redirect, its relay now names every closed condition with
+    its msg ids (G1 lists every open declaration, plus any `unmatched` / malformed / non-recorder
+    resolution lines), and the conductor log carries a `guard_i_redirect ... closed_by=...` INFO line.
+    `scripts/guard_i_latch_census.py` lists the threads that are latched now.
 
 Author trust is the environment trust model (D-3) — the chatroom accepts any author string **and any
 body**, so the carve-outs, including the stamp check, are best-effort loop-level gating and

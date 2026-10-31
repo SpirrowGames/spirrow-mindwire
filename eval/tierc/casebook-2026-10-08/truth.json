@@ -1,0 +1,14 @@
+{
+  "truth_source": "audit-operator",
+  "audit_msg": "spirrow-mindwire/T-tierc-overpass-self-contradicting-escalations#msg-6653",
+  "note": "Hand-transcribed from the operator's audit table (msg-6653). Not a labeller label: never pool with labels.*.jsonl or any shadow-* directory (Bohr msg-6664 §0).",
+  "rows": [
+    {"project": "spirrow-mindwire", "thread": "T-per-project-deploy-rule", "msg_id": "msg-6288", "truth": "genuine", "failure_type": "none", "evidence": ["msg-6591"], "evidence_note": "the human chose B"},
+    {"project": "spirrow-mindwire", "thread": "T-real-infra-values-egress-from-agent-context", "msg_id": "msg-6362", "truth": "genuine", "failure_type": "none", "evidence": ["msg-6444"], "evidence_note": "the human ruled"},
+    {"project": "spirrow-mindwire", "thread": "T-pr-review-threads-outlive-their-prs", "msg_id": "msg-6467", "truth": "genuine", "failure_type": "none", "evidence": ["msg-6590"], "evidence_note": "the human chose A"},
+    {"project": "spirrow-mindwire", "thread": "T-D8-codex-backend-adr14-15-amendment", "msg_id": "msg-6482", "truth": "genuine", "failure_type": "none", "evidence": ["msg-6563"], "evidence_note": "the human chose A"},
+    {"project": "spirrow-lexora", "thread": "T-streaming-ledger-row", "msg_id": "msg-672", "truth": "genuine", "failure_type": "none", "evidence": ["msg-755", "msg-760"], "evidence_note": "(a) needed the human's approval; (b)(c) were resolved by the operator's investigation"},
+    {"project": "spirrow-mindwire", "thread": "T-pr-review-threads-outlive-their-prs", "msg_id": "msg-6606", "truth": "spurious", "failure_type": "self_negation", "evidence": ["msg-6653"], "evidence_note": "the body itself says the escalation is premature and a re-test is needed", "negation_sentence": "This escalation is premature."},
+    {"project": "spirrow-lexora", "thread": "T-streaming-ledger-row", "msg_id": "msg-754", "truth": "spurious", "failure_type": "false_premise", "evidence": ["msg-756"], "evidence_note": ":8110 is the Lexora gateway, not vLLM (config/lexora_config.yaml:5 in the Lexora repository; vLLM is localhost:8000); the author corrected the misreading in msg-756"}
+  ]
+}

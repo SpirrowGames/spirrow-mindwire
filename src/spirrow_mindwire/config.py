@@ -417,6 +417,16 @@ class ConductorConfig(_StrictModel):
     Author trust is the **environment** trust model (D-3): the loop-level gate is best-effort
     noise-reduction; the authoritative guard that changes never reach ``main`` is the human's manual
     merge (the same stance as the implementer allow-list)."""
+    tier_c_recorders: list[str] = Field(default_factory=list)
+    """Authors whose ``TIER-C-RESOLVED: <msg-id> decided-by=<human_identity> on=YYYY-MM-DD`` lines
+    discharge the named Tier-C declaration from guard (i)'s G1 latch
+    (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a) / msg-7204).
+
+    This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["operator",
+    "Fermi"]``). Empty (the default) = only a human post unlatches G1, the previous behaviour. A
+    recorder holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that
+    thread (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING
+    for the overlap. Same author-string trust as ``human_identity``."""
     max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 
@@ -525,9 +535,11 @@ class DeciderTierCConfig(_StrictModel):
       ままなので、 default 設定では Decider は構築されず HTTP も飛ばない
       (``adapters.decider_lexora.build_decider`` が ``None`` を返す)。
       有効化は ``MINDWIRE_DECIDER_BACKEND=lexora`` + ``MINDWIRE_LEXORA_URL``。
-    * ``annotate`` — LIKELY_NOT に対して escalation 通知に注釈 1 行を
-      付ける。 §6-C 制約 1 (genuine 見逃し 0 件) を満たしたときのみ
-      投入 (D15)。
+    * ``annotate`` — DECIDED 2e-2 (msg-5141): 人に届いた ``NEXT: human`` に、digest で
+      ``Jev: should_ask_human=p (未検証、AUC 未確立) — <該当ルール>`` を 1 行付け、p の低い
+      ものを下に並べる。 届く・止まる・routing は変えない (D20)。 書き先は
+      ``<data_dir>/state/tierc_annotations.jsonl`` (:mod:`.decider.annotation`)。
+      ``bounce`` も同じ注釈を書く (差し戻さずに人へ届いたものに付く)。
     * ``bounce`` — tierc-v2: label gate が通した (``RETRY:`` / ``unsure:goal?``
       以外の) ``NEXT: human`` に Jev が actionable な ``LIKELY_NOT`` を出したとき、
       書いた本人へ 1 回だけ差し戻す。 ``RETRY:`` は必ず人へ届く。 ``[tierc_gate]
@@ -631,6 +643,13 @@ class NaysayerGatingConfig(_StrictModel):
     loop) — instead of spending another Gemini review. Bounds the long re-review tail. Env:
     ``MINDWIRE_NAYSAYER_GATING__MAX_REVIEW_ROUNDS=4``."""
 
+    review_max_tokens: int | None = Field(default=None, ge=1)
+    """Output-token budget for the pass-1 review call (critique + VERDICT). ``None`` (the default)
+    keeps the driver's built-in default. A reasoning-model reviewer spends part of this budget on
+    reasoning, and a review that runs out ends ``finish_reason=length``, which the gate turns into a
+    fail-closed REQUEST_CHANGES with no findings. Env:
+    ``MINDWIRE_NAYSAYER_GATING__REVIEW_MAX_TOKENS=65536``."""
+
     review_login: str = "spirrowgames-ops"
     """The GitHub login the naysayer submits reviews under (T22 = ``spirrowgames-ops``); the
     head-unchanged / round-cap state counts only reviews by this login, so other reviewers (Copilot,
@@ -643,6 +662,105 @@ class NaysayerGatingConfig(_StrictModel):
     runs, so behaviour and coverage are unchanged while the saving is measured. Set
     ``skip_if_head_unchanged`` / ``max_review_rounds`` to the policy you are evaluating, then read
     the logs before enforcing. Env: ``MINDWIRE_NAYSAYER_GATING__SHADOW=true``."""
+
+
+class TurnGitConfig(_StrictModel):
+    """``[turn.git]`` — the git-sync hook around a dispatched turn (ADR-2026-10-09-23 D7 / D8).
+
+    ``sync = false`` (the default) builds no hook at all: the dispatcher runs exactly the git it
+    ran before this table existed (INV-0). ``remote`` is the remote fetched from and pushed to;
+    ``lfs = true`` adds ``git lfs pull`` on the thread branch. ``branch_override`` maps a
+    thread id to the branch it already uses, so an in-flight thread keeps its name (D8); an
+    override is still refused when it names the default branch or a protected branch.
+    """
+
+    sync: bool = False
+    remote: str = Field(default="origin", min_length=1)
+    lfs: bool = False
+    branch_override: dict[str, str] = Field(default_factory=dict)
+
+
+class TurnIsolationConfig(_StrictModel):
+    """``[turn.isolation]`` — run the turn as a separate Windows user (ADR-2026-10-09-23 unit 2a,
+    S7).
+
+    ``user`` unset (the default) means no isolation: every turn runs exactly as it did before
+    this table existed (D1). Set it to a local account (``mindwire-turn``) or a domain-qualified
+    name. The account's password is never configured here: the launcher reads it from the owner's
+    Credential Manager (``mindwire/turn-user``). See :mod:`spirrow_mindwire.turn_isolation`.
+    """
+
+    user: str | None = Field(default=None, min_length=1)
+
+
+class TurnConfig(_StrictModel):
+    """``[turn]`` — per-turn hooks: ``[turn.git]`` and ``[turn.isolation]``."""
+
+    git: TurnGitConfig = Field(default_factory=TurnGitConfig)
+    isolation: TurnIsolationConfig = Field(default_factory=TurnIsolationConfig)
+
+
+class ModelPolicyConfig(_StrictModel):
+    """``[model_policy]`` — the per-turn ``--model`` allow-list (T-spawn-via-claude-bg PR-A).
+
+    Read by :func:`spirrow_mindwire.conductor.model_policy.choose_model`. Opus is the default; the
+    lists below only ever *narrow* when Sonnet may be used (msg-6788: the Sonnet conditions are a
+    closed allow-list). Every glob is matched against a repo-relative, ``/``-separated path; ``**``
+    spans directories, ``*`` and ``?`` do not.
+    """
+
+    opus_model: str = "claude-opus-5-5"
+    sonnet_model: str = "claude-sonnet-5-5"
+
+    sonnet_forbidden_paths: tuple[str, ...] = (
+        "src/spirrow_mindwire/conductor/head_skip.py",
+        "src/spirrow_mindwire/conductor/handoff.py",
+        "src/spirrow_mindwire/conductor/stand_down.py",
+        "src/spirrow_mindwire/conductor/parked_lane.py",
+        "src/spirrow_mindwire/pr_review_sweep/**",
+        "scripts/head_skip_decide.py",
+        "scripts/parked_humans.py",
+        "scripts/pr_review_sweep_*",
+        "deploy/**/*sweep*",
+    )
+    """C3: a planned file matching any of these forces Opus (Conductor state-transition code:
+    head_skip / handoff / sweep / stand_down / parked — msg-6788 condition 3, msg-6810 C3).
+    C3 matches case-insensitively, so ``*sweep*`` also covers ``SweepFairness.ps1``."""
+
+    docs_config_globs: tuple[str, ...] = (
+        "docs/**",
+        "spec/**",
+        "tests/**",
+        "**/*.md",
+        "**/*.toml",
+        "**/*.toml.example",
+        "**/*.json.example",
+        "**/*.yaml",
+        "**/*.yml",
+    )
+    """C1 ``docs-config``: every planned file must match one of these (docs / config / tests)."""
+
+    revision_markers: tuple[str, ...] = ("仕様の誤り", "訂正", "revised", "supersede")
+    """C5: fixed substrings (case-insensitive) that mark a design whose instructions were
+    revised. A hit only ever pushes the turn to Opus."""
+
+    recent_window: int = Field(default=10, ge=1)
+    """C4a: how many of the thread's most recent messages the caller scans for REQUEST_CHANGES /
+    no-progress / malformed handoff."""
+
+    @field_validator(
+        "opus_model",
+        "sonnet_model",
+        "sonnet_forbidden_paths",
+        "docs_config_globs",
+        "revision_markers",
+    )
+    @classmethod
+    def _no_blank_entries(cls, v: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        entries = (v,) if isinstance(v, str) else v
+        if any(not e.strip() for e in entries):
+            raise ValueError("blank entries are not allowed")
+        return v
 
 
 class MindwireSettings(BaseSettings):
@@ -670,6 +788,8 @@ class MindwireSettings(BaseSettings):
     naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
     tierc_gate: TierCGateConfig = Field(default_factory=TierCGateConfig)
+    turn: TurnConfig = Field(default_factory=TurnConfig)
+    model_policy: ModelPolicyConfig = Field(default_factory=ModelPolicyConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -691,6 +811,16 @@ def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
     """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store,
     and the §2.6 decision log the conductor writes ``DECIDED:`` / ``DEFERRED:`` lines to (U4a)."""
     return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
+
+
+TIERC_ANNOTATIONS_FILENAME = "tierc_annotations.jsonl"
+"""The Jev annotation log under ``<data_dir>/state/`` (2e-2). The sweep reads the same path."""
+
+
+def resolve_tierc_annotations_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/tierc_annotations.jsonl`` — the Jev annotation lines the digest shows
+    under ``[decider.tierc] mode = "annotate" | "bounce"`` (T-decider-conductor-hook 2e-2)."""
+    return settings.paths.data_dir / "state" / TIERC_ANNOTATIONS_FILENAME
 
 
 TIERC_RULES_FILENAME = "tierc_rules.toml"
@@ -779,6 +909,7 @@ def load_settings(config_path: Path | None = None) -> MindwireSettings:
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
+    "TIERC_ANNOTATIONS_FILENAME",
     "TIERC_RULES_FILENAME",
     "TIER_C_DECISIONS_LOG_FILENAME",
     "ClaudeCodeConfig",
@@ -796,9 +927,13 @@ __all__ = [
     "PhanthandConfig",
     "Stage3LoopConfig",
     "TierCGateConfig",
+    "TurnConfig",
+    "TurnGitConfig",
+    "TurnIsolationConfig",
     "WatcherConfig",
     "load_settings",
     "resolve_tier_c_decisions_log_path",
+    "resolve_tierc_annotations_path",
     "resolve_tierc_rules_path",
     "resolve_tierc_rules_snapshot_dir",
 ]

@@ -120,6 +120,7 @@ def test_success_closes_and_removes_state() -> None:
     assert report.state == {}
     payload = next(a for n, a in mcp.calls if n == "chatroom_close_thread")
     assert payload["author"] == "orchestrator"
+    assert payload["role"] == "integrator"
     assert payload["embodiment"] == "unknown"
     assert "merged" in payload["summary_content"]
 
@@ -374,3 +375,19 @@ def test_settings_reject_nonpositive() -> None:
         Phase2Settings(breaker=0)
     with pytest.raises(ValueError):
         Phase2Settings(author=" ")
+
+
+@pytest.mark.parametrize("role", ["", " ", "\t\n"])
+def test_settings_reject_empty_role(role: str) -> None:
+    with pytest.raises(ValueError, match="role"):
+        Phase2Settings(role=role)
+
+
+def test_every_close_payload_carries_the_configured_role() -> None:
+    """msg-7279: no close goes out without a role, and the configured one is the one sent."""
+    mcp = _Mcp(closable={_tid(1), _tid(2)})
+    settings = Phase2Settings(enabled=True, author="Heisenberg", role="implementer")
+    _tick(mcp, [_row(1), _row(2)], {}, settings=settings)
+    closes = [a for n, a in mcp.calls if n == "chatroom_close_thread"]
+    assert len(closes) == 2
+    assert all(c["role"] == "implementer" and c["author"] == "Heisenberg" for c in closes)

@@ -71,6 +71,16 @@ Contract with the wrapper:
     this reader never falls back to ``now()``: that fallback would report a thread stuck for weeks
     as zero hours old, which is exactly the silent stall this item exists to surface.
 
+    ``jev_ask_score`` / ``jev_line`` (T-decider-conductor-hook DECIDED 2e-2, msg-5141): with
+    ``--annotations <path>`` every parked row also carries the Jev annotation the Conductor wrote
+    for that exact head (:mod:`spirrow_mindwire.decider.annotation`, joined on project +
+    thread_id + head_msg_id): ``jev_ask_score`` is ``should_ask_human`` (a float) and ``jev_line``
+    the one display line, spelled by :func:`~spirrow_mindwire.decider.annotation.annotation_line`
+    so the wrapper only places it. A row with no annotation carries ``null`` / ``""``. The
+    annotation is display only: it never decides membership in ``parked``. A file that cannot be
+    read leaves every row without a line, writes one note to stderr and adds no ``errors`` row:
+    it is not a fetch failure, so it must not read as "判断待ちに含まれていない可能性あり".
+
 Fail direction — the opposite of head_skip's cache, on purpose. head_skip fails OPEN into a
 launch (one cheap MCP call beats a silent park). This poll fails CLOSED on the parked side:
 
@@ -100,10 +110,12 @@ import asyncio
 import json
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.conductor.parked_lane import classify_parked
+from spirrow_mindwire.decider.annotation import TierCAnnotation, annotation_line, read_annotations
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 
@@ -158,7 +170,31 @@ async def _fetch_last_message(
     return (msg_id, body, last.get("timestamp")) if msg_id else None
 
 
-async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None) -> dict[str, Any]:
+def _load_annotations(path: Path | None) -> dict[tuple[str, str, str], TierCAnnotation]:
+    """The annotations by key, or ``{}`` — never raises (display only, 2e-2).
+
+    A read failure or skipped lines are reported on stderr, which the wrapper's probe log keeps;
+    stdout stays the one JSON line."""
+    if path is None:
+        return {}
+    try:
+        found, skipped = read_annotations(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"parked_humans: annotations unreadable, rows shown without Jev: {exc}", file=sys.stderr
+        )
+        return {}
+    if skipped:
+        print(f"parked_humans: {skipped} malformed annotation line(s) skipped", file=sys.stderr)
+    return found
+
+
+async def _poll(
+    project: str,
+    candidates: list[dict[str, Any]],
+    url: str | None,
+    annotations: dict[tuple[str, str, str], TierCAnnotation] | None = None,
+) -> dict[str, Any]:
     """Iterate the candidates and classify each as parked-on-human / not / error.
 
     Order-preserving: ``parked`` and ``errors`` come out in the input candidate order, so a
@@ -208,6 +244,7 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
             last_msg_at, ts_reason = _normalise_timestamp(raw_timestamp)
             if last_msg_at is None:
                 errors.append({"thread_id": thread_id, "reason": ts_reason})
+            ann = (annotations or {}).get((project, thread_id, actual_msg_id))
             parked.append(
                 {
                     "thread_id": thread_id,
@@ -217,6 +254,8 @@ async def _poll(project: str, candidates: list[dict[str, Any]], url: str | None)
                     "operator_task": lane.operator_task or "",
                     "protocol_violation": lane.protocol_violation,
                     "last_msg_at": last_msg_at,
+                    "jev_ask_score": ann.ask_score if ann is not None else None,
+                    "jev_line": annotation_line(ann) if ann is not None else "",
                 }
             )
     return {
@@ -237,6 +276,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
+    )
+    parser.add_argument(
+        "--annotations",
+        type=Path,
+        default=None,
+        help="the Conductor's tierc_annotations.jsonl (2e-2); omitted = no Jev lines",
     )
     args = parser.parse_args()
 
@@ -260,7 +305,9 @@ def main() -> int:
     candidates = [c for c in candidates_raw if isinstance(c, dict)]
 
     try:
-        result = asyncio.run(_poll(args.project, candidates, args.url))
+        result = asyncio.run(
+            _poll(args.project, candidates, args.url, _load_annotations(args.annotations))
+        )
     except Exception as exc:
         # A whole-poll failure (asyncio setup, transport dead, etc.) is different from a per-
         # candidate failure and short-circuits with a non-zero exit so the wrapper's caller side

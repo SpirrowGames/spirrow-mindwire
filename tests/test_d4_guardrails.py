@@ -406,6 +406,7 @@ async def test_adapter_proceed_veto_end_to_end(
     ]
     assert line["vetoed"] is vetoed and line["head_msg_id"] == "m2"
     assert line["ask_score"] == p
+    assert line["ask_line"] is False  # T-jev-tierc-audit-2026-10-12 F2'': no ASK: line in m2
     # never mixed into the §6 escalation tally
     assert not any(r.getMessage().startswith("decider_decision ") for r in caplog.records)
 

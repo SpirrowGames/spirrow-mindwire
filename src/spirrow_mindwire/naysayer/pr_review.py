@@ -106,7 +106,9 @@ from .pr_review_adr_pointers import (
     unavailable_log_line,
 )
 from .principles import (
+    CODEX_OUTPUT_RESERVE_TOKENS,
     N3_CONFIG_PATH,
+    NAYSAYER_MODEL_TIER,
     PrinciplesError,
     objection_classes,
     principles_version,
@@ -118,9 +120,11 @@ logger = logging.getLogger(__name__)
 # reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
 # slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
 # on big PRs (finish_reason=length, which decide_verdict then forces to REQUEST_CHANGES — a false
-# RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
-# enough in practice).
-_DEFAULT_MAX_TOKENS = 32000
+# RC); 32000 was once enough (connector-relay confirmed ~30k in practice), but the 32000 cap still
+# ran out on PR #485 @ 290a0e1 (a ~91k-char diff, msg-7129). 65536 is the reviewer model's
+# documented output maximum, so the default now spends the whole budget the model offers; it is
+# also settable per deployment as ``[naysayer_gating] review_max_tokens``.
+DEFAULT_REVIEW_MAX_TOKENS = 65536  # the one name: driver default and composition-root fallback
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a
@@ -612,6 +616,11 @@ class PrReviewOutcome:
     # ``unavailable`` via a pre-built selection; see the code paths that use
     # :func:`_unavailable_selection`).
     adr_pointer_selection: AdrPointerSelection | None = None
+    # The PR's ``base.ref`` as read by the content-review path, which already reads it to build
+    # the three-dot diff (T-gate-relay-routes-develop-approvals-to-human D2). ``None`` on every
+    # path that does not fetch the diff (CI-gate, debounce, replay, head-unchanged skip): the
+    # relay then reads it once itself, and only for an APPROVE that could route to MERGE.
+    base_ref: str | None = None
 
 
 # ─── T-gate-silently-suppresses-approve-on-truncated-diff ────────────────────────────
@@ -2050,8 +2059,8 @@ _ADR_POINTER_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS / 2
 # ``max_tokens`` for pass 2. Deliberately smaller than pass 1 because pass 2's entire
 # legitimate output is a small JSON array (see MAX_POINTER_PAYLOAD_BYTES rationale in
 # :mod:`.pr_review_adr_pointers`). A tighter budget also caps the pathological runaway:
-# even if the model ignores the "JSON only" instruction, it cannot spend the full 32 000-
-# token pass-1 output budget on prose here.
+# even if the model ignores the "JSON only" instruction, it cannot spend the full pass-1
+# output budget (``DEFAULT_REVIEW_MAX_TOKENS`` or the deployment's override) on prose here.
 _ADR_POINTER_MAX_TOKENS = 4000
 
 
@@ -2117,7 +2126,7 @@ class NaysayerPrReviewDriver:
         lexora: LexoraChatClient | None = None,
         github: GitHubReviewClient | None = None,
         model: str | None = None,
-        max_tokens: int = _DEFAULT_MAX_TOKENS,
+        max_tokens: int = DEFAULT_REVIEW_MAX_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         lexora_url: str | None = None,
         github_token: str | None = None,
@@ -2301,7 +2310,10 @@ class NaysayerPrReviewDriver:
                     )
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
-        diff = await self._github.fetch_pr_diff(pr)
+        # Two reads, exactly as ``fetch_pr_diff`` does them (and fail-loud the same way), split so
+        # the base.ref it already reads reaches the relay router without a third call (D2).
+        base_ref, diff_head = await self._github.fetch_pr_base_and_head(pr)
+        diff = await self._github.fetch_compare_diff(pr.owner, pr.repo, base_ref, diff_head)
         # Capture the pre-truncation view ONCE, at the fetch site, so ``original_chars`` and
         # the truncated ``text`` the model actually sees are paired forever. Every downstream
         # consumer (message builders, both Lexora passes, verdict resolution, gate notice)
@@ -2461,6 +2473,7 @@ class NaysayerPrReviewDriver:
             would_skip_head_unchanged=would_skip_head_unchanged,
             would_cap=would_cap,
             adr_pointer_selection=pass2_selection,
+            base_ref=base_ref,
         )
 
     async def _route(
@@ -2580,7 +2593,13 @@ class NaysayerPrReviewDriver:
         pass1_task = self._lexora.chat_completion(
             model=tier,
             messages=_build_messages(view.text, pr_slug, coverage=coverage),
-            max_tokens=self._max_tokens,
+            # The codex tier's prompt limit is derived from CODEX_OUTPUT_RESERVE_TOKENS, so the
+            # request stays within it; the raised budget (msg-7130) applies to the Gemini tier.
+            max_tokens=(
+                min(self._max_tokens, CODEX_OUTPUT_RESERVE_TOKENS)
+                if tier == NAYSAYER_MODEL_TIER
+                else self._max_tokens
+            ),
             n3_routed=n3_routed,
         )
         pass2_task = self._collect_adr_pointers(view.text, pr_slug, tier=tier, n3_routed=n3_routed)
@@ -3312,6 +3331,17 @@ class NaysayerPrReviewDriver:
                 pr.slug,
                 post_exc,
             )
+
+    async def fetch_pr_base_ref(self, pr: PrRef) -> str:
+        """The PR's current ``base.ref``, fail-loud (one GitHub read).
+
+        For the verdict relay's router only (T-gate-relay-routes-develop-approvals-to-human D2):
+        the outcome of a path that never fetched the diff carries ``base_ref=None``, and an
+        APPROVE there may still be bound for an auto-merge base. Raises like
+        :meth:`GitHubClient.fetch_pr_base_and_head`; the caller turns any failure into "unknown".
+        """
+        base_ref, _head = await self._github.fetch_pr_base_and_head(pr)
+        return base_ref
 
     async def aclose(self) -> None:
         """Close the shared Lexora + GitHub clients (driver teardown)."""

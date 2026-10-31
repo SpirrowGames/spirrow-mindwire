@@ -25,6 +25,7 @@ from typing import Any
 
 from .conductor.gate_records import (
     ADVISORY_SELF_TRIAGE_INSTRUCTION,
+    MERGE_SELF_INSTRUCTION,
     MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
@@ -32,6 +33,7 @@ from .conductor.gate_records import (
     decide_relay_route,
     prior_advisory_approvals,
     render_ci_hold_marker,
+    render_merge_self_line,
     render_relay_heading,
 )
 from .conductor.handoff import HUMAN_TOKEN
@@ -466,12 +468,40 @@ class PrReviewOrchestrator:
             prior = await self._prior_advisory_approvals(
                 project=project, design_thread=design_thread, pr_ref=pr_ref
             )
-        route = decide_relay_route(outcome.verdict, objections, prior, implementer)
+        # D1/D2 (T-gate-relay-routes-develop-approvals-to-human msg-7582): the base decides whether
+        # an APPROVE is merged by the loop (MERGE) or waits for the human. The content-review path
+        # already read it; a path that did not (replay, head-unchanged skip) leaves it ``None``,
+        # and it is read here ONCE — only when it can change the answer: an APPROVE with an
+        # implementer, green CI and a known head that would otherwise stop at the human. Without
+        # a reviewed head there is nothing to bind the merge to, so the base counts as unknown.
+        base_ref = outcome.base_ref if outcome.head_sha else None
+        route = decide_relay_route(
+            outcome.verdict, objections, prior, implementer, base_ref, outcome.ci_state
+        )
+        if (
+            route is RelayRoute.HUMAN
+            and base_ref is None
+            and implementer
+            and outcome.verdict is ReviewEvent.APPROVE
+            and outcome.ci_state is CiState.SUCCESS
+            and outcome.head_sha
+        ):
+            base_ref = await self._read_base_ref(pr_ref)
+            route = decide_relay_route(
+                outcome.verdict, objections, prior, implementer, base_ref, outcome.ci_state
+            )
         tail: list[str] = []
         if route is RelayRoute.IMPLEMENTER:
             assert implementer  # decide_relay_route never picks IMPLEMENTER without one
             if outcome.verdict is ReviewEvent.APPROVE:
                 tail.append(ADVISORY_SELF_TRIAGE_INSTRUCTION)
+            tail.append(f"NEXT: {implementer}")
+        elif route is RelayRoute.MERGE:
+            # D3: the implementer merges; D5: the column-zero MERGE-SELF line tells 1b the
+            # terminal report (merged / closed) is the implementer's to write, not its own.
+            assert implementer and outcome.head_sha  # MERGE needs both (see above)
+            tail.append(render_merge_self_line(pr_ref, outcome.head_sha))
+            tail.append(MERGE_SELF_INSTRUCTION)
             tail.append(f"NEXT: {implementer}")
         elif outcome.verdict is ReviewEvent.APPROVE:
             # An APPROVE that stops at the human is a merge WAIT, not a Tier-C decision (msg-4361).
@@ -562,6 +592,27 @@ class PrReviewOrchestrator:
             if isinstance(m, dict)
         ]
         return prior_advisory_approvals(pairs, pr_ref)
+
+    async def _read_base_ref(self, pr_ref: str) -> str | None:
+        """The PR's base branch for the relay router, or ``None`` when it cannot be read (D2).
+
+        ``None`` routes an APPROVE to the human (merge-wait), the direction every misread takes.
+        Any exception counts: this read can only ever widen what the loop does on its own, so a
+        failure of any kind must leave it narrow.
+        """
+        pr = parse_pr_ref(pr_ref)
+        if pr is None:
+            return None
+        try:
+            return await self._driver.fetch_pr_base_ref(pr)
+        except Exception as exc:  # fail toward the human, whatever went wrong (msg-7584 #3)
+            logger.warning(
+                "pr-gate relay: could not read the base of %s (%s); routing the APPROVE to the "
+                "human",
+                pr_ref,
+                exc,
+            )
+            return None
 
     async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> _ResolvedThread:
         """Pick the thread id this PR's gate writes to, and prove it is free or ours.
