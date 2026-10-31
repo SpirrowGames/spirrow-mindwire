@@ -24,6 +24,7 @@
 |---|---|---|---|
 | 1a | `T-pr-review-threads-outlive-their-prs` の Phase 1/2 | **既存スレッドを再開**（`src/spirrow_mindwire/pr_review_sweep/`） | PR-review 台帳（`T-pr-review-<repo>-<n>`、1 PR = 1 台帳）に限り、PR の merge / close で台帳を close。**作業スレッド（1 スレッド = N PR）とは閉じる条件が違う**: 台帳は merged でも closed でも無条件で close してよいが、作業スレッドは 1b の表に従い、閉じるのは `Closes-thread:` 付きの merge だけ（msg-5150 §2） |
 | 1b | `T-pr-event-advances-thread`（旧名 `T-merged-pr-advances-thread`、msg-5148 §2 で改名。未起票） | 新規 | PR のイベントで止まっている作業スレッドを前へ進める。**閉じるのは `Closes-thread:` 付きの merge だけ**。3 状態の動作は下の §F.1.1。§17.1 `RES-GATE-PENDING-NO-REFIRE` の後継（(ii)） |
+| 1c | `T-gate-fires-on-pr-open` | 新規（`src/spirrow_mindwire/pr_event_advance/auto_gate/`） | open PR の初回 gate を、本文の `Thread:` が指す作業スレッドへの `NEXT: pr-review` 1 通で撃つ。既定は dry-run（`sweep.json` の `auto_gate`）。1 tick 3 件・1 日 30 件まで |
 | 2 | `T-next-operator-is-silent` | 新規 | conductor が `NEXT: operator` を `no_handoff_to_human rounds=0` で無音で捨てる欠陥を直す（最小: ledger に「operator 待ち」を明示）。初回ターンは再現 → 設計 |
 | 3 | `T-sweep-intake-and-quarantine-stalls` の D-2 の続き（`T-sweep-auto-register-unregistered` は立てない） | **既存スレッドに合流**（msg-5148 §1。`unregistered_threads.py` の docstring が同スレッドの D-2 を担うと書いている） | `scripts/unregistered_threads.py` の出力を環境 probe 付きで sweep に自動登録。**probe 失敗は登録しない**。理由は毎 tick その場で導いて daily digest に載せる。**`parked` 状態は作らず、`state/quarantine.json` にも入れない**（msg-4900 §2）。digest にはもう 1 項目、**末尾が `NEXT: human` のまま N 時間以上動いていないスレッドを古い順に**載せる（スレッド末尾からその場で導く。永続化しない）。§17.1 `RES-A-GAP` の後継（msg-5148 §2） |
 
