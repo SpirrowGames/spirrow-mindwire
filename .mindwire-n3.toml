@@ -11,12 +11,14 @@
 # - Paths and globs are normalised (`\` -> `/`, case-folded) and matched with fnmatch: `*` also
 #   crosses `/`.
 #
-# Draft list (Heisenberg, msg-6475 / msg-6573): this file itself (also matched unconditionally),
+# Draft list (Heisenberg, msg-6475 / msg-6573; n3_design_time.py per msg-6588, it holds PROMPT_ASSETS):
+# this file itself (also matched unconditionally),
 # the routing code and its constants, the attestation, the
 # credential/route reducers, session isolation, deploy and CI configuration.
 n3_sensitive_paths = [
     ".mindwire-n3.toml",
     "src/spirrow_mindwire/naysayer/n3_routing.py",
+    "src/spirrow_mindwire/naysayer/n3_design_time.py",
     "src/spirrow_mindwire/naysayer/principles.py",
     "src/spirrow_mindwire/naysayer/preflight.py",
     "src/spirrow_mindwire/mcp_write_server/auth.py",
