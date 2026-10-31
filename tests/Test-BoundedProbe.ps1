@@ -598,7 +598,9 @@ exit 3
 
     Write-Host 'P2 — 1c tick: one call per tick, the cap logs its one line, failures return'
     Import-SweepFunction 'Invoke-AutoGateTick'
-    $dataDir = 'C:\data'
+    # A real directory, not a literal drive path: Join-Path throws on a drive this host lacks, and
+    # CI runs this file on Linux. The expected path below goes through the same Join-Path.
+    $dataDir = $scratch
     $script:peCalls.Clear()
     $script:logLines.Clear()
     Check 'no project -> no probe' $null (Invoke-AutoGateTick -Projects @())
@@ -606,7 +608,7 @@ exit 3
     $script:peResult = @{ ok = $true; code = 0; stdout = '{"status":"ran","fired":1}' }
     $o = Invoke-AutoGateTick -Projects @('p', 'q')
     Check 'fired parsed' 1 $o.fired
-    Check 'argv names the state file and every project' '-m|spirrow_mindwire.pr_event_advance.auto_gate|--projects|p,q|--sweep-config|C:\cfg\sweep.json|--state-file|C:\data\state\auto-gate-daily.json' ($script:peCalls[0].Arguments -join '|')
+    Check 'argv names the state file and every project' ('-m|spirrow_mindwire.pr_event_advance.auto_gate|--projects|p,q|--sweep-config|C:\cfg\sweep.json|--state-file|' + (Join-Path $dataDir 'state\auto-gate-daily.json')) ($script:peCalls[0].Arguments -join '|')
     Check 'exactly one log line per pass' 1 $script:logLines.Count
     $script:logLines.Clear()
     $script:peResult = @{ ok = $true; code = 0; stdout = '{"status":"cap_reached","message":"auto-gate: daily cap reached (30/30), pass skipped"}' }
