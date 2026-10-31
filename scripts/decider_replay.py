@@ -92,9 +92,9 @@ from typing import IO, Any, Literal
 
 from spirrow_mindwire.adapters.decider_lexora import DECIDER_TIMEOUT_SECONDS, decide_once
 from spirrow_mindwire.decider.questions import (
+    TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
-    TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
     tierc_v2_questions,
@@ -258,7 +258,7 @@ def build_tierc_v2_record(state: DecisionState, rules: TierCRules) -> dict[str, 
     return {
         "thread_id": state.thread_id,
         "round_index": state.round_index,
-        "questions_version": TIERC_V2_QUESTIONS_VERSION,
+        "questions_version": TIERC_ESCALATION_QUESTIONS_VERSION,
         "rules_sha256": rules.sha256,
         "scope": TierCScope.IN_GATE.value,
         "questions": tierc_v2_questions(rules),

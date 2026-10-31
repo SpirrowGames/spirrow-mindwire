@@ -277,6 +277,34 @@ async def test_fetch_pr_diff_meta_missing_base_ref_fails_loud() -> None:
 
 
 @pytest.mark.anyio
+async def test_fetch_pr_head_sha_strict_reads_rest_pull_head() -> None:
+    # T-gate-resume-private-repo-pat-forbidden-stalls (Bohr msg-7563 修正 1): the RC resume's
+    # head read is REST ``GET /pulls/{n}`` only — no GraphQL, which a fine-grained PAT is refused
+    # on a private repo — and fails loud on a refused read.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(200, json={"base": {"ref": "main"}, "head": {"sha": "abc123"}})
+        return httpx.Response(500, text="should not be called")
+
+    async with _client(handler) as client:
+        assert await client.fetch_pr_head_sha_strict(_PR) == "abc123"
+    assert calls == ["/repos/spirrowgames/spirrow-mindwire/pulls/42"]
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"message": "Resource not accessible by personal access token"}
+        )
+
+    async with _client(refused) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.fetch_pr_head_sha_strict(_PR)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.anyio
 async def test_fetch_pr_diff_meta_missing_head_sha_fails_loud() -> None:
     # AC-3: meta shape is wrong (head.sha absent) -> raise; do not fall back.
     def handler(request: httpx.Request) -> httpx.Response:

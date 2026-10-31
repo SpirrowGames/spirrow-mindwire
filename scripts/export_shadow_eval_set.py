@@ -4,8 +4,9 @@ Spec (Bohr, each approved by Einstein): msg-4634 DECIDED 2d-2 (export → lock �
 Jev's output in a separate file the labellers never read), msg-4636 DECIDED 2d-3 (read the
 point-in-time input the hook logged instead of rebuilding it; ``--replay`` / ``--fixture``
 shapes), msg-4639 DECIDED 2d-4 / 2d-6 (count one registered questions version only —
-``tierc-v3`` since msg-5753 DECIDED 2d-15; ``following`` = the 3 messages after, as in the
-replay), msg-4641 DECIDED 2d-7 (a row with fewer than 3 is counted when its thread ended with
+``tierc-v4`` since T-jev-tierc-audit-2026-10-12 F3, ``tierc-v3`` from msg-5753 DECIDED 2d-15;
+``following`` = the 3 messages after, as in the replay), msg-4641 DECIDED 2d-7 (a row with
+fewer than 3 is counted when its thread ended with
 ``NEXT: none`` or has been quiet for 72 h at ``--as-of``, otherwise held)
 and msg-4643 DECIDED 2d-8 (everything after ``--as-of`` is dropped first).
 
@@ -107,9 +108,10 @@ from spirrow_mindwire.config import load_settings
 
 LOG_PREFIX = "decider_decision "
 ROUTED_STOP = "stop"
-REGISTERED_QUESTIONS_VERSION = "tierc-v3"
-"""msg-5753 DECIDED 2d-15: the one questions version ``eval/tierc/shadow-prereg.md`` registers.
-Equal to ``decider.questions.TIERC_V2_QUESTIONS_VERSION`` and to the pre-registration's
+REGISTERED_QUESTIONS_VERSION = "tierc-v4"
+"""msg-5753 DECIDED 2d-15 (re-registered as tierc-v4 by T-jev-tierc-audit-2026-10-12 F3,
+Bohr msg-6860): the one questions version ``eval/tierc/shadow-prereg.md`` registers.
+Equal to ``decider.questions.TIERC_ESCALATION_QUESTIONS_VERSION`` and to the pre-registration's
 §1 condition 3 — ``tests/test_tierc_registered_version.py`` fails the gate when they drift."""
 EVAL_SET_SHADOW = "shadow"
 ROSTER_SOURCE_LOGGED = "logged"

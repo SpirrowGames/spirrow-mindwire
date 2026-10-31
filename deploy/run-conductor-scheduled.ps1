@@ -158,6 +158,12 @@ $ConductorKillUnconfirmedExitCode = 7
 # DIRTY_CLONE_EXIT_CODE in src/spirrow_mindwire/clone_guard.py (a pytest pins the two). Not 5: 5/6/7
 # are the wall-clock budget's codes above.
 $DirtyCloneExitCode = 8
+# Exit code of mindwire-loop when the git-sync hook (ADR-2026-10-09-23 unit 1, [turn.git] sync =
+# true) could not name the thread's branch because the GitHub API stayed transiently unavailable
+# through its retries (design v1.2 B-2, Bohr msg-6766). Mirrors GIT_SYNC_DEFERRED_EXIT_CODE in
+# src/spirrow_mindwire/git_sync/errors.py (a pytest pins the two). No park, no quarantine, no repo
+# parking: the launch is reverted and the next tick re-derives the name.
+$GitSyncDeferredExitCode = 9
 # Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
 # guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
 $CloneCheckTimeoutSeconds = 60
@@ -194,6 +200,11 @@ $digestStatePath = Join-Path $dataDir "state\digest.json"
 # Gemini); this file is how "always Gemini" reaches a human instead of going unnoticed (msg-6477).
 # Written only by this sweep.
 $n3UnresolvedStatePath = Join-Path $dataDir "state\n3-unresolved.json"
+
+# T-decider-conductor-hook DECIDED 2e-2: the Conductor's Jev annotations (written under
+# [decider.tierc] mode = "annotate" | "bounce"; spirrow_mindwire.config.resolve_tierc_annotations_path).
+# Read by scripts/parked_humans.py; a missing file means "nothing annotated".
+$tiercAnnotationsPath = Join-Path $dataDir "state\tierc_annotations.jsonl"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
 # derive the ⚠ line ("full digest is X periods overdue") from period-typed fields —
 # last_full_success_period and first_attempt_period. Two, not one: a success record alone cannot
@@ -209,6 +220,12 @@ $notifyHealthPath = Join-Path $dataDir "state\notify-health.json"
 # (question + options) and its signature; the wrapper reuses it when the
 # signature has not changed (I-3: ≤1 composer call per reason:last_msg stop).
 $pendingDecisionsPath = Join-Path $dataDir "state\pending-decisions.json"
+# T-composer-entrypoint-missing-drops-decision-cards D-2': deps_hash of the last SUCCESSFUL venv
+# sync. Written only by deploy/sync-repo.ps1; the wrapper just tells it where the file is.
+$venvSyncStatePath = Join-Path $dataDir "state\venv-sync.json"
+# T-composer-entrypoint-missing-drops-decision-cards D-3: parked decisions whose material did not
+# reach magickit (key -> { signature, reason, first_seen, last_attempt, attempts, ... }).
+$materialMissingPath = Join-Path $dataDir "state\material-missing.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 # --- library dot-sources -------------------------------------------------------------------------
@@ -220,6 +237,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # Launch fairness (T-sweep-starves-deep-candidates): dispatch order, launch_wait_since, gate lane,
 # and the two-clock admission rule. Pure helpers; the dispatch loop below is a skeleton around them.
 . (Join-Path $PSScriptRoot 'lib/SweepFairness.ps1')
+# Summon (T-human-call-priority-interrupt PR-2, Bohr msg-6755 v1.6): the active_summon contract, the
+# yield decision, lane 0 and the summon_yield record of evaluated.json. Pure helpers; the probe reads
+# and the git reads live in the run section below. Uses ConvertTo-EvaluatedRow from SweepFairness.ps1.
+. (Join-Path $PSScriptRoot 'lib/Summon.ps1')
 # Auto-registration of unregistered live threads into this tick's candidates (T-sweep-intake-and-
 # quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Pure helpers; the probe call and the
 # append live in the run section below.
@@ -781,7 +802,10 @@ function Invoke-BoundedUvProbe {
         [string[]]$Launcher = @('uv', 'run', 'python'),
         # uv's own options, inserted between `uv run` and `python` (see Get-BoundedProbeCommandLine).
         # Empty by default: a caller that does not pass it gets exactly the argv it got before.
-        [string[]]$UvOptions = @()
+        [string[]]$UvOptions = @(),
+        # Extra environment variables for the child (name -> value). Empty by default, so every
+        # existing caller's environment is unchanged.
+        [hashtable]$Environment = @{}
     )
 
     $result = @{
@@ -808,6 +832,7 @@ function Invoke-BoundedUvProbe {
     # The streams are decoded as UTF-8 above; have python encode them that way too instead of the
     # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
     $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+    foreach ($k in $Environment.Keys) { $psi.Environment[[string]$k] = [string]$Environment[$k] }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = $null
@@ -2079,11 +2104,24 @@ function New-DailyDigest {
         # the caller with Get-N3UnresolvedDigestLines. Emitted after the stop-reason lines. Empty
         # (the default) leaves the digest exactly as it was.
         [string[]]$N3UnresolvedLines = @(),
+
+        # T-composer-entrypoint-missing-drops-decision-cards D-3: the 材料未送信の判断待ち section,
+        # built by the caller with Get-MaterialMissingDigestLines (same shape as $ParkedCloneLines:
+        # header, rows, trailing ""). Emitted first among the caller-built sections — a decision with
+        # no card on the board is the one a human is otherwise least likely to find. Rows go through
+        # the same budget ladder. Empty (the default) leaves the digest exactly as it was.
+        [string[]]$MaterialMissingLines = @(),
         # T-sweep-intake-and-quarantine-stalls msg-5889 D-2: this tick's intake, the return value of
         # Resolve-UnregisteredIntake (lib/UnregisteredIntake.ps1). Renders the 未登録（登録不可）section
         # right after 停止中. $null (the default) omits the section, so a caller that predates the
         # intake renders exactly what it always did; the production caller always passes it.
-        $UnregisteredIntake = $null
+        $UnregisteredIntake = $null,
+        # T-human-call-priority-interrupt PR-3 (Bohr msg-6965 items 1-2): the Summon lines, built by
+        # the caller with Get-SummonDigestLines (deploy/lib/Summon.ps1; at most
+        # $SummonDigestMaxLines + 1 lines). Emitted as the FIRST lines of the digest, above the ⚠
+        # line and the header: a person's thread holding the loop is what the reader must see in
+        # the notification preview. Empty (the default) leaves the digest exactly as it was.
+        [string[]]$SummonLines = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2233,6 +2271,9 @@ function New-DailyDigest {
                " / 再試行 $($retryCounts.scheduled) / 回復 $($retryCounts.recovered) / 再試行後隔離 $($retryCounts.quarantined)"
 
     $lines = @()
+    # PR-3 (T-human-call-priority-interrupt): the Summon lines come first of all. They are counted by
+    # every later section's running length, exactly as the ⚠ line below is.
+    if ($SummonLines.Count -gt 0) { $lines += $SummonLines }
     # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
     # rather than appending because the mobile reader sees the first ~2 lines in the notification
     # preview, and the whole point of the ⚠ is that the operator sees it without opening.
@@ -2352,13 +2393,39 @@ function New-DailyDigest {
     # changes no row content; it only moves construction ahead of the first budget decision.
 
     # 判断待ち rows — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
-    # grammar-ownership rule). Row order is preserved (msg-1370's caller-owned order — this
-    # renderer does not resort human-parked; only quarantine sections are sorted oldest-first).
+    # grammar-ownership rule). Row order is the caller's (msg-1370), with one exception: since
+    # DECIDED 2e-2 rows Jev annotated are re-ordered by should_ask_human (see below).
     # The count and the row order come from $HumanParked, which is itself the output of
     # scripts/parked_humans.py — so this section restores fully from a wiped pending-decisions.json
     # (A-14); the cache only enriches the row with the composer's question.
+    #
+    # T-decider-conductor-hook DECIDED 2e-1c (msg-5141): a merge wait (lane merge_wait — a PR-gate
+    # APPROVE whose merge is Takahito's) is not a question, so its row goes to its own section
+    # below instead of this list. DECIDED 2e-2: rows Jev annotated are ordered by should_ask_human,
+    # lowest last; rows without an annotation keep their order ahead of them (an unjudged row is
+    # never pushed under a judged one). Display only — nothing here changes what reaches the human.
+    $laneOfRow = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
+    $jevScoreOf = {
+        param($x)
+        if (($x.PSObject.Properties.Name -contains 'jev_ask_score') -and ($null -ne $x.jev_ask_score)) { return [double]$x.jev_ask_score }
+        return $null
+    }
+    $ordered = @()
+    $mergeWaitEntries = @()
+    for ($i = 0; $i -lt $HumanParked.Count; $i++) {
+        $row = $HumanParked[$i]
+        if ((& $laneOfRow $row) -eq 'merge_wait') {
+            $mergeWaitEntries += [PSCustomObject]@{ Line = "  $($row.key)   [$($row.head_msg_id)]"; AgeSeconds = 0 }
+            continue
+        }
+        $score = & $jevScoreOf $row
+        # Unannotated rows sort as 2.0 — above every possible p in [0, 1].
+        $ordered += [PSCustomObject]@{ Row = $row; Index = $i; Score = $(if ($null -eq $score) { 2.0 } else { $score }) }
+    }
+    $ordered = @($ordered | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = 'Index'; Descending = $false })
     $parkedEntries = @()
-    foreach ($p in $HumanParked) {
+    foreach ($o in $ordered) {
+        $p = $o.Row
         $key = $p.key
         $head = $p.head_msg_id
         # Look up the composer question by (key, signature = "human:<head>"). Any other
@@ -2389,7 +2456,13 @@ function New-DailyDigest {
         $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
         # D7: the lane tag (operator 作業 / 宛先誤り / merge 待ち / protocol 違反) — see Get-ParkedRowTag.
         $suffix = Get-ParkedRowTag -Row $p -Default $suffix
-        $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
+        # DECIDED 2e-2: Jev's line, spelled by spirrow_mindwire.decider.annotation (via
+        # parked_humans.py), placed under its row as part of the same entry so the budget ladder
+        # keeps or drops the two together.
+        $jevLine = if ($p.PSObject.Properties.Name -contains 'jev_line') { "$($p.jev_line)" } else { '' }
+        $rowLine = "  $key   [$head]$suffix"
+        if ($jevLine) { $rowLine += "`n    $jevLine" }
+        $parkedEntries += [PSCustomObject]@{ Line = $rowLine; AgeSeconds = 0 }
     }
 
     # 取得失敗 rows (I-2 "黙って劣化しない").
@@ -2450,21 +2523,29 @@ function New-DailyDigest {
     }
 
     # D7: the header counts decisions only; operator work and misroutes are named next to it.
-    $laneOf = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
-    $operatorCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'operator_work' }).Count
-    $misrouteCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'misroute' }).Count
+    # #465 PR-gate (msg-6631, upheld by the human): the header is counted from the SAME split that
+    # built the lists above — $parkedEntries for 判断待ち, $mergeWaitEntries for merge 待ち, with the
+    # one lane classifier $laneOfRow — never re-derived from $HumanParked. A header whose count
+    # comes from a second derivation can drift from the list it heads; this one cannot.
+    $operatorCount = @($ordered | Where-Object { (& $laneOfRow $_.Row) -eq 'operator_work' }).Count
+    $misrouteCount = @($ordered | Where-Object { (& $laneOfRow $_.Row) -eq 'misroute' }).Count
     # msg-4361: a merge wait is not a decision; the merge-wait PR list carries it.
-    $mergeWaitCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'merge_wait' }).Count
-    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount - $mergeWaitCount
+    $mergeWaitCount = $mergeWaitEntries.Count
+    $decisionCount = $parkedEntries.Count - $operatorCount - $misrouteCount
     $parkedHeader = "判断待ち: $decisionCount 件"
     if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
         $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"
     }
-    if ($mergeWaitCount -gt 0) {
-        $parkedHeader += "（merge 待ち $mergeWaitCount 件は PR 一覧）"
-    }
     $parkedHeadLines = @("", $parkedHeader)
-    if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+    if ($parkedEntries.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+
+    # merge 待ち (DECIDED 2e-1c, msg-5141): APPROVE 済みで merge を待つだけの PR。判断の一覧の外に
+    # 置く。表示だけで routing は変えない。Emitted only when there is one — the merge-wait PR list
+    # (/dashboard/prs) is where they are worked, so a 0 line here would only spend budget.
+    $mergeWaitHeadLines = @()
+    if ($mergeWaitEntries.Count -gt 0) {
+        $mergeWaitHeadLines = @("", "merge 待ち（APPROVE 済み・判断不要、PR 一覧で merge）: $mergeWaitCount 件")
+    }
 
     # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
     # to see "取得失敗: N" even when the individual rows had to be dropped for budget.
@@ -2514,8 +2595,10 @@ function New-DailyDigest {
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
     $reserveAfterStaleHuman = (_LinesCost $unregHeadLines) +
                             (_SectionFloorCost -Entries $unregEntries -Indent '  ') + $reserveAfterUnreg
-    $reserveAfterFetchErr = (_LinesCost $staleHumanHeadLines) +
+    $reserveAfterMergeWait = (_LinesCost $staleHumanHeadLines) +
                             (_SectionFloorCost -Entries $staleHumanList -Indent '  ') + $reserveAfterStaleHuman
+    $reserveAfterFetchErr = (_LinesCost $mergeWaitHeadLines) +
+                            (_SectionFloorCost -Entries $mergeWaitEntries -Indent '  ') + $reserveAfterMergeWait
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
     $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
@@ -2548,6 +2631,28 @@ function New-DailyDigest {
         if ($staleList.Count -gt 0) {
             $reserveAfterCloneParked += (_LinesCost @($staleHeadLine)) + (_SectionFloorCost -Entries $staleList -Indent '  ')
         }
+    }
+    # 材料未送信 (D-3). Placed before 駐機中, so its reserve is everything after it: the 駐機中
+    # section at its floor, the stop-reason lines, and $reserveAfterCloneParked.
+    if ($MaterialMissingLines.Count -gt 0) {
+        $reserveAfterMaterialMissing = $reserveAfterCloneParked + (_LinesCost $StopClassLines)
+        if ($ParkedCloneLines.Count -gt 0) {
+            $cloneFloorRows = @()
+            if ($ParkedCloneLines.Count -gt 2) { $cloneFloorRows = @($ParkedCloneLines[1..($ParkedCloneLines.Count - 2)]) }
+            $reserveAfterMaterialMissing += (_LinesCost @($ParkedCloneLines[0], "")) +
+                (_SectionFloorCost -Entries $cloneFloorRows -Indent '  ')
+        }
+        $mmHead = $MaterialMissingLines[0]
+        $mmRows = @()
+        if ($MaterialMissingLines.Count -gt 2) { $mmRows = @($MaterialMissingLines[1..($MaterialMissingLines.Count - 2)]) }
+        $mmTail = @("")
+        $lines += $mmHead
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $mmRows -MaxLen $Budget `
+            -Reserve ($reserveAfterMaterialMissing + (_LinesCost $mmTail)) -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+        $lines += $mmTail
     }
     if ($ParkedCloneLines.Count -gt 0) {
         $cloneHead = $ParkedCloneLines[0]
@@ -2611,7 +2716,7 @@ function New-DailyDigest {
     # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
     # (msg-814 §5). Rows were built above; only the emission happens here.
     $lines += $parkedHeadLines
-    if ($HumanParked.Count -gt 0) {
+    if ($parkedEntries.Count -gt 0) {
         $runLen = [ref]($lines -join "`n").Length
         $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve $reserveAfterParked -RunningLen $runLen
         $lines += $result.Emitted
@@ -2630,6 +2735,15 @@ function New-DailyDigest {
         $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '    '
+    }
+
+    # merge 待ち (DECIDED 2e-1c). Rows were built above; same floor discipline as every other section.
+    if ($mergeWaitEntries.Count -gt 0) {
+        $lines += $mergeWaitHeadLines
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $mergeWaitEntries -MaxLen $Budget -Reserve $reserveAfterMergeWait -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
     # 停止中 (msg-5889 D-1). Rows were built above; same floor discipline as every other section.
@@ -2970,6 +3084,57 @@ function Get-DirtyCloneNotice {
              "clone を確認し、要る WIP は退避してからデフォルトブランチの clean な状態に戻してください（自動では片付けません）。")
     return @{ key = "__dirty_clone__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey
               reason = $reason; head = $head; detail = $detail }
+}
+
+# --- git-sync deferral (ADR-2026-10-09-23 unit 1, design v1.2 B-2) ---
+# The daemon exits $GitSyncDeferredExitCode when the git-sync hook could not name the thread's
+# branch because the GitHub API stayed transiently unavailable (5xx / timeout / rate limit) through
+# its retries. Not the thread's fault and not the clone's: nobody is quarantined, put on
+# retry-pending or parked, and other candidates keep going. The notification rides the same
+# Send-NotificationIfChanged channel as the dirty clone, but on a per-CANDIDATE key (repo + thread):
+# unlike a dirty clone, a deferral parks nothing, so several threads on one repo can defer in the
+# same sweep, and on a shared per-repo key their differing signatures would overwrite each other
+# and re-alert on every launch (PR #473 review, 3f026f8). Each candidate's key is dropped again as
+# soon as that candidate gets past git-sync (Clear-GitSyncDeferredNotice), so the debounce means
+# "once per outage episode per thread", not "once ever". An unreadable payload still notifies
+# (signature 'git-sync-deferred:parse-failed') and never borrows a GitHub key.
+function Get-GitSyncDeferredNoticeKey {
+    param([string]$RepoDir, [string]$CandidateKey)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    return "__git_sync_deferred__/$repoKey/$CandidateKey"
+}
+
+# Drops a candidate's deferral notice key once its launch ended any way other than a deferral.
+# Returns $true when a key was removed (the caller persists the state).
+function Clear-GitSyncDeferredNotice {
+    param([hashtable]$State, [string]$RepoDir, [string]$CandidateKey)
+    $key = Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey
+    if ($State.ContainsKey($key)) { $State.Remove($key); return $true }
+    return $false
+}
+
+function Get-GitSyncDeferredNotice {
+    param([string]$RepoDir, [string]$CandidateKey, $Output, [int]$ExitCode)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    $payload = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_GIT_SYNC_DEFERRED_PAYLOAD\s+(.*)$') {
+            try { $payload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
+            break
+        }
+    }
+    $sig = 'git-sync-deferred:parse-failed'
+    $detailLine = '(payload parse failed)'
+    if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'candidate') {
+        $sig = "git-sync-deferred:$($payload.candidate)"
+        $detailLine = "thread=$($payload.thread_id) branch=$($payload.candidate)"
+        if ($payload.detail) { $detailLine += "`n$($payload.detail)" }
+    }
+    $body = ("MindWire: git 同期のブランチ名解決で GitHub API が一時的に使えず、ターンを見送りました — **$CandidateKey** exit=$ExitCode。" +
+             "スレッドは無傷（park も quarantine もしない）。次の tick で最初から判定し直します。`n" +
+             "clone: $RepoDir`n$detailLine")
+    return @{ key = (Get-GitSyncDeferredNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey)
+              signature = $sig; message = $body; repo_key = $repoKey }
 }
 
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
@@ -3372,9 +3537,20 @@ function Get-ParkedLaneFields {
 }
 
 # Push the composer's material to magickit's `/v1/decisions/{project}/{thread_id}/material`.
-# Never throws, never blocks the notification path. Returns the raw Invoke-MaterialPut result for
-# the test seam; the caller ignores the return value in production (D-34: the notification body
-# does NOT branch on the PUT's fate).
+# Never throws, never blocks the notification path.
+#
+# Returns @{ outcome; reason; put } (T-composer-entrypoint-missing-drops-decision-cards D-3):
+#   outcome = 'suppressed' — same signature as the last alert (DM-3); nothing attempted.
+#             'pushed'     — the PUT returned ok.
+#             'missing'    — a parked decision whose material did NOT reach magickit: no envelope
+#                            (composer failed), any of the three skip branches, or a failed PUT.
+#   reason  = a short machine-greppable cause for 'missing' (composer_failed / composer_status=X /
+#             no_head_msg_id_read[: tail_fetch_error] / no_output / put_http_N / put_error).
+#   put     = the raw Invoke-MaterialPut result when a PUT was attempted, else $null.
+# Before D-3 the caller ignored the outcome (D-34: the notification body did not branch on the PUT).
+# D-3 amends that on one point only: on 'missing' the caller prepends a ⚠ line to the SAME
+# notification, because six skips on 2026-10-04 went unseen while the notifications themselves
+# were delivered. The PUT stays fail-open: the notification still fires on every outcome.
 #
 # Log lines (DM-5, msg-1445 §3): every branch produces exactly one line and calls Confirm-
 # LogWorthKeeping so nothing gets dropped by the idle-tick collapse. Textually pinned so an
@@ -3398,13 +3574,15 @@ function Push-DecisionMaterial {
         # Silent-by-design: the same tick will also suppress the notification below, and we already
         # logged this same signature once. Adding another line would double the log volume on every
         # parked-thread tick.
-        return $null
+        return @{ outcome = 'suppressed'; reason = $null; put = $null }
     }
 
     if ($null -eq $Envelope) {
         # No composer output at all — the wrapper will fire the raw ping. Do not PUT; there is
-        # nothing to PUT.
-        return $null
+        # nothing to PUT. Still a decision with no material on the board (D-3).
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — composer が envelope を返さなかった ∴ 材料を送らない"
+        return @{ outcome = 'missing'; reason = 'composer_failed'; put = $null }
     }
 
     # Every field access below goes through Get-EnvelopeField so a hashtable envelope (from a
@@ -3419,7 +3597,7 @@ function Push-DecisionMaterial {
     if ($status -and $status -ne 'ok') {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — composer_status=$status ∴ 材料なし"
-        return $null
+        return @{ outcome = 'missing'; reason = "composer_status=$status"; put = $null }
     }
 
     # DM-4 (I-16): the head msg id must be the one the composer *actually read*. If missing (e.g.
@@ -3429,7 +3607,13 @@ function Push-DecisionMaterial {
     if (-not $head) {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — composer が読んだ head が不明 (extras.head_msg_id_read 無し) ∴ 材料を送らない (ページは J-absent)"
-        return $null
+        # The composer records why it has no head (2026-10-04: `tail_fetch_error: ModuleNotFoundError:
+        # No module named 'ulid'`). Carrying it into the reason is what makes the ⚠ line and the
+        # digest row say what broke instead of only that something did.
+        $why = 'no_head_msg_id_read'
+        $tailErr = Get-EnvelopeField -Object (Get-EnvelopeField -Object $Envelope -Name 'extras') -Name 'tail_fetch_error'
+        if (-not [string]::IsNullOrEmpty($tailErr)) { $why = "no_head_msg_id_read: $tailErr" }
+        return @{ outcome = 'missing'; reason = $why; put = $null }
     }
 
     # Build the PUT body. Follows magickit's S5 slice §1.1 field table verbatim. All fields except
@@ -3448,7 +3632,7 @@ function Push-DecisionMaterial {
     if ($null -eq $output) {
         Confirm-LogWorthKeeping
         Write-Log "material push skipped: $Key — envelope に output が無い (composer_status=ok だが output=null) ∴ 材料を送らない"
-        return $null
+        return @{ outcome = 'missing'; reason = 'no_output'; put = $null }
     }
 
     # $output is guaranteed non-null here by the DM-6 guard above.
@@ -3556,7 +3740,28 @@ function Push-DecisionMaterial {
     else {
         Write-Log "material push FAILED (non-fatal): $Key head=$head — $($result.error) — 通知は継続"
     }
-    return $result
+    if ($result.ok) { return @{ outcome = 'pushed'; reason = $null; put = $result } }
+    $why = if ($result.status) { "put_http_$($result.status)" } else { 'put_error' }
+    return @{ outcome = 'missing'; reason = $why; put = $result }
+}
+
+# The composer's uv argument string (T-composer-entrypoint-missing-drops-decision-cards D-1').
+#
+# `run --no-sync python -m spirrow_mindwire.decision_request.cli`, NOT `run mindwire-compose-decision`:
+#   * By entry-point name, uv resolved `mindwire-compose-decision` from PATH when the venv's
+#     `.venv\Scripts\mindwire-compose-decision.exe` was missing (a partial `uv sync`). In production
+#     that fell through to a global Python's stale editable install pointing at the implementer's
+#     working clone, and every material push from 2026-10-04 02:23 JST was skipped. `python -m`
+#     runs the project venv's python.exe and imports from it; there is no PATH fallback.
+#   * `--no-sync` keeps uv from syncing the venv in the middle of a tick (while the conductor runs).
+#     The venv is synced in one place only: deploy/sync-repo.ps1, with `uv sync --locked`.
+# Its own function so Test-DecisionComposerWiring.ps1 can pin the shape without spawning uv.
+function Get-ComposerCliArguments {
+    param([string]$Backend, [string]$Identity, [int]$TailCount = 0)
+    # S3 spec D-38: pass --tail N when the caller asks for it (currently: only the claude-code
+    # backend does).
+    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
+    return "run --no-sync python -m spirrow_mindwire.decision_request.cli --backend $Backend --identity `"$Identity`"$tailArg"
 }
 
 # Invoke the CLI with the input JSON on stdin, return @{ ok; envelope; error }. This is the seam
@@ -3588,8 +3793,7 @@ function Invoke-ComposerCli {
     # (payload tail is what the CLI sees) is untouched. Kept as a caller-supplied parameter rather
     # than an in-function branch on $Backend so the seam stays testable without threading the
     # backend through Format-DecisionMessage etc.
-    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
-    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`"$tailArg"
+    $psi.Arguments = Get-ComposerCliArguments -Backend $Backend -Identity $Identity -TailCount $TailCount
     $psi.WorkingDirectory = $repoRoot
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -3883,20 +4087,167 @@ function Format-DecisionMessage {
     return $body
 }
 
+# --- material-missing (T-composer-entrypoint-missing-drops-decision-cards D-3) -------------------
+# A parked decision whose material never reached magickit has no card on the board: on 2026-10-04
+# three real Tier-C escalations dropped off the live column this way, and the six skips behind it
+# were only log lines nobody reads. state\material-missing.json makes that a STATE:
+#
+#   { "<project>/<thread>": { signature, reason, first_seen, last_attempt, attempts,
+#                              project, thread_id, last_msg_id, stop_reason, rounds } }
+#
+# Recorded on every 'missing' outcome of Push-DecisionMaterial (composer failed, the three skip
+# branches, a failed PUT). Removed when a PUT succeeds, when the thread's signature advances, or
+# when the key leaves the sweep list. Surfaced on two paths: a ⚠ line at the top of that tick's
+# notification, and a section of the daily digest. Retried at most once per
+# $MaterialMissingRetryInterval, without re-notifying (see Invoke-MaterialMissingRetry).
+#
+# I-16 still holds: a retry re-runs the composer and PUTs only the head it read. Nothing here fills
+# a missing head from last_msg_id.
+$MaterialMissingRetryInterval = [TimeSpan]::FromHours(1)
+
+# The ⚠ line, in one place so the notification and the tests read the same string.
+function Get-MaterialMissingWarningLine {
+    param([string]$Reason)
+    $r = "$Reason"
+    if ($r.Length -gt 160) { $r = $r.Substring(0, 159) + '…' }
+    return "⚠ 判断材料を送れていない（$r）— ボードに判断カードが出ません"
+}
+
+# Upsert. The same signature as the existing record = another failed attempt at the same stop: keep
+# first_seen, bump attempts. A different signature is a new stop: start over.
+function Set-MaterialMissing {
+    param(
+        [hashtable]$State, [string]$Key, [string]$Signature, [string]$Reason,
+        [string]$Project, [string]$ThreadId, [string]$LastMsgId, [string]$StopReason, [int]$Rounds,
+        [datetime]$Now = (Get-Date).ToUniversalTime()
+    )
+    $nowIso = $Now.ToUniversalTime().ToString('o')
+    $prev = if ($State.ContainsKey($Key)) { $State[$Key] } else { $null }
+    $prevSig = if ($null -ne $prev) { "$(Get-EnvelopeField -Object $prev -Name 'signature')" } else { '' }
+    $firstSeen = $nowIso
+    $attempts = 1
+    if ($null -ne $prev -and $prevSig -eq $Signature) {
+        # Through ConvertTo-UtcInstant: a re-read state file hands back a [DateTime], not the string.
+        $fs = Get-EnvelopeField -Object $prev -Name 'first_seen'
+        if ($fs) { $firstSeen = (ConvertTo-UtcInstant $fs).ToString('o') }
+        $attempts = 1 + [int](Get-EnvelopeField -Object $prev -Name 'attempts')
+    }
+    $State[$Key] = @{
+        signature = $Signature; reason = $Reason
+        first_seen = $firstSeen; last_attempt = $nowIso; attempts = $attempts
+        project = $Project; thread_id = $ThreadId; last_msg_id = $LastMsgId
+        stop_reason = $StopReason; rounds = $Rounds
+    }
+}
+
+# The sweep calls this with every verdict's "$reason:$last_msg". Once the signature moves, the stop
+# the record describes is over, and so is the record (D-3: "signature が進んだとき").
+function Clear-MaterialMissingIfAdvanced {
+    param([hashtable]$State, [string]$Key, [string]$Signature)
+    if ($null -eq $State -or -not $State.ContainsKey($Key)) { return }
+    if ("$(Get-EnvelopeField -Object $State[$Key] -Name 'signature')" -ne $Signature) { $State.Remove($Key) }
+}
+
+# The bounded retry (D-3). For each record whose last_attempt is at least $Interval old: run the
+# composer again (dropping a cached envelope that could not be pushed) and PUT, bypassing the
+# notification dedup but NOT notifying. DM-3 rejected an unbounded PUT stream to every parked thread
+# on every tick. This covers only the keys that failed, at most once per $Interval each, and it
+# stops at the first success. A key no longer in the sweep list is dropped instead of retried.
+function Invoke-MaterialMissingRetry {
+    param(
+        [hashtable]$MissingState,
+        [hashtable]$PendingDecisionsState,
+        [string[]]$LiveKeys,
+        [datetime]$Now = (Get-Date).ToUniversalTime(),
+        [TimeSpan]$Interval = $MaterialMissingRetryInterval
+    )
+    $retried = 0
+    foreach ($key in @($MissingState.Keys)) {
+        if ($LiveKeys -notcontains $key) {
+            Write-Log "material-missing dropped: $key — no longer in the sweep list"
+            $MissingState.Remove($key)
+            continue
+        }
+        $rec = $MissingState[$key]
+        $rawLast = Get-EnvelopeField -Object $rec -Name 'last_attempt'
+        $last = if ($rawLast) { ConvertTo-UtcInstant $rawLast } else { $null }
+        if ($null -ne $last -and ($Now.ToUniversalTime() - $last) -lt $Interval) { continue }
+
+        $sig = "$(Get-EnvelopeField -Object $rec -Name 'signature')"
+        $reason = "$(Get-EnvelopeField -Object $rec -Name 'reason')"
+        # A cached envelope is reused only when the PUT was what failed: the envelope itself was
+        # fine. Every other reason means the envelope was the problem, so compose again.
+        if (-not $reason.StartsWith('put_') -and $PendingDecisionsState.ContainsKey($key)) {
+            $PendingDecisionsState.Remove($key)
+        }
+        $project = "$(Get-EnvelopeField -Object $rec -Name 'project')"
+        $thread = "$(Get-EnvelopeField -Object $rec -Name 'thread_id')"
+        $lastMsg = "$(Get-EnvelopeField -Object $rec -Name 'last_msg_id')"
+        $stopReason = "$(Get-EnvelopeField -Object $rec -Name 'stop_reason')"
+        $rounds = [int](Get-EnvelopeField -Object $rec -Name 'rounds')
+
+        Confirm-LogWorthKeeping
+        Write-Log "material-missing retry: $key signature=$sig (previous reason: $reason)"
+        $envelope = Get-DecisionEnvelope -State $PendingDecisionsState `
+            -Key $key -Project $project -ThreadId $thread `
+            -Signature $sig -LastMsgId $lastMsg -StopReason $stopReason -Rounds $rounds
+        # An empty NotifyState: the retry bypasses the notification dedup on purpose. The
+        # notification for this signature already went out, with its ⚠ line.
+        $push = Push-DecisionMaterial -NotifyState @{} -Key $key -Signature $sig `
+            -Project $project -ThreadId $thread -StopReason $stopReason -Envelope $envelope
+        $retried++
+        if ($push.outcome -eq 'pushed') {
+            Write-Log "material-missing recovered: $key — material pushed on retry"
+            $MissingState.Remove($key)
+        }
+        else {
+            Set-MaterialMissing -State $MissingState -Key $key -Signature $sig -Reason "$($push.reason)" `
+                -Project $project -ThreadId $thread -LastMsgId $lastMsg -StopReason $stopReason `
+                -Rounds $rounds -Now $Now
+        }
+    }
+    return $retried
+}
+
+# The digest section (D-3): header, one row per key (oldest first), trailing blank. Same shape as
+# Get-DirtyCloneDigestLines, so New-DailyDigest budgets its rows the same way. Empty when nothing is
+# missing, so such a digest is byte-identical to before.
+function Get-MaterialMissingDigestLines {
+    param([hashtable]$State, [datetime]$Now)
+    if ($null -eq $State -or $State.Count -eq 0) { return , @() }
+    $rows = foreach ($k in $State.Keys) {
+        $r = $State[$k]
+        $rawFirst = Get-EnvelopeField -Object $r -Name 'first_seen'
+        $since = if ($rawFirst) { ConvertTo-UtcInstant $rawFirst } else { $null }
+        $first = if ($null -ne $since) { $since.ToString('o') } else { '' }
+        $age = if ($null -ne $since) { Format-DurationDigest -Span ($Now.ToUniversalTime() - $since) } else { '?' }
+        $line = "  $k   reason=$(Get-EnvelopeField -Object $r -Name 'reason') 経過=$age 試行=$(Get-EnvelopeField -Object $r -Name 'attempts')"
+        if ($line.Length -gt 200) { $line = $line.Substring(0, 199) + '…' }
+        [PSCustomObject]@{ Line = $line; Since = $first }
+    }
+    $lines = @("材料未送信の判断待ち（ボードに判断カードが出ていない）: $($State.Count) 件")
+    $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
+    $lines += ""
+    return , $lines
+}
+
 # The full "the loop is parked on a human decision" sequence, extracted from the sweep tick so the
 # order (material PUT → notification) and the fail-open behaviour (a broken PUT never suppresses
 # the notification) are testable in isolation (msg-1445 §5 / W-3). Inlined, this sequence is
 # unreachable from the AST-lift test harness — the only way to pin that the PUT precedes the
-# notification and that the notification body is 1 character identical whether the PUT threw or
-# returned 4xx or 5xx is to make the sequence a named function.
+# notification, and that below the D-3 ⚠ line the notification body is 1 character identical
+# whether the PUT threw or returned 4xx or 5xx, is to make the sequence a named function.
 #
-# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5):
+# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5, amended by
+# T-composer-entrypoint-missing-drops-decision-cards D-3):
 #   1. Compose (or reuse the cached) envelope for this ({Key}, {Signature}).
-#   2. Push the material to magickit — non-blocking, fail-open, its result is ignored.
+#   2. Push the material to magickit — non-blocking, fail-open. Its outcome is used for one thing
+#      only: on 'missing', record material-missing.json and prepend the ⚠ line (D-3).
 #   3. Format the Discord body from the envelope. If enrichment fails for any reason, use the
 #      $RawFallback the caller built.
-#   4. Send-NotificationIfChanged: the caller sees exactly the body the enrichment produced,
-#      whether the PUT succeeded, failed, or was skipped for freshness.
+#   4. Send-NotificationIfChanged: the notification fires whether the PUT succeeded, failed, or
+#      was skipped. The body is the enrichment's output, preceded by the ⚠ line when material is
+#      missing; nothing else in it depends on the PUT.
 #
 # The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
 # without it the PUT would fire on every tick against a driven-by-human-response wait,
@@ -3912,7 +4263,10 @@ function Send-HumanParkAlert {
         [string]$LastMsgId,
         [string]$StopReason,
         [int]$Rounds,
-        [string]$RawFallback
+        [string]$RawFallback,
+        # D-3: state\material-missing.json. $null (tests that predate D-3) records nothing; the ⚠
+        # line is added either way, because it depends only on this tick's outcome.
+        [hashtable]$MaterialMissingState = $null
     )
 
     # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
@@ -3931,15 +4285,36 @@ function Send-HumanParkAlert {
         -Signature $Signature -LastMsgId $LastMsgId `
         -StopReason $StopReason -Rounds $Rounds
 
-    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
-    # discarded; the notification body below does NOT branch on it.
-    $null = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
+    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Fail-open: its failure never
+    # suppresses the notification. The body below branches on it in exactly one way (D-3, which
+    # amends D-34): a 'missing' outcome prepends the ⚠ line; the rest of the body is unchanged.
+    $push = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
         -Project $Project -ThreadId $ThreadId -StopReason $StopReason -Envelope $envelope
 
+    # D-3: record the outcome, and on 'missing' put a ⚠ line at the top of this notification. On
+    # 2026-10-04 the notifications reached a person while the skips did not, so this is the
+    # quickest place to be seen. The body's budget gives up the line's length, so the total stays
+    # within $DecisionMessageDiscordBudget.
+    $warning = $null
+    if ($push.outcome -eq 'missing') {
+        $warning = Get-MaterialMissingWarningLine -Reason $push.reason
+        if ($null -ne $MaterialMissingState) {
+            Set-MaterialMissing -State $MaterialMissingState -Key $Key -Signature $Signature `
+                -Reason "$($push.reason)" -Project $Project -ThreadId $ThreadId -LastMsgId $LastMsgId `
+                -StopReason $StopReason -Rounds $Rounds
+        }
+    }
+    elseif ($push.outcome -eq 'pushed' -and $null -ne $MaterialMissingState -and $MaterialMissingState.ContainsKey($Key)) {
+        $MaterialMissingState.Remove($Key)
+    }
+
+    $formatBudget = $DecisionMessageDiscordBudget
+    if ($warning) { $formatBudget -= ($warning.Length + 1) }
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `
-        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope
+        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget
     $message = if ($enriched) { $enriched } else { $RawFallback }
+    if ($warning) { $message = "$warning`n$message" }
 
     Send-NotificationIfChanged -State $NotifyState -Key $Key `
         -Signature $Signature -Message $message
@@ -4188,8 +4563,14 @@ function Invoke-ParkedHumansProbe {
     $tmp = $null
     try {
         $tmp = New-ProbeInputFile -Json $payload -Label "parked-humans-$Project"
+        # DECIDED 2e-2: the Conductor's Jev annotations (display only). A harness that loads this
+        # function without the script's path block has no $tiercAnnotationsPath; it gets a path
+        # that does not exist, which parked_humans.py reads as "nothing annotated". Never an empty
+        # value: an empty argv slot could vanish and leave '--annotations' without its argument.
+        $annPath = Get-Variable -Name tiercAnnotationsPath -ValueOnly -ErrorAction SilentlyContinue
+        if (-not $annPath) { $annPath = 'tierc_annotations.absent.jsonl' }
         $r = Invoke-BoundedUvProbe -Label "parked-humans-$Project" -TimeoutSeconds $ParkedHumansProbeTimeoutSeconds `
-            -Arguments @($probe, '--project', $Project, '--input', $tmp)
+            -Arguments @($probe, '--project', $Project, '--input', $tmp, '--annotations', "$annPath")
     }
     catch {
         Write-Log "parked-humans probe [$Project] threw ($($_.Exception.Message)) — treating as no-parked (fail-closed)"
@@ -4253,6 +4634,10 @@ function Invoke-ParkedHumansProbe {
             # present on probe output, so New-DailyDigest's 停止中 section considers every row; the
             # renderer turns it into an age fresh each tick and nothing persists it.
             last_msg_at        = if ($p.PSObject.Properties.Name -contains 'last_msg_at') { $p.last_msg_at } else { $null }
+            # DECIDED 2e-2: Jev's should_ask_human and its display line for this exact head, from
+            # the Conductor's tierc_annotations.jsonl ($null / '' when there is none). Display only.
+            jev_ask_score      = if ($p.PSObject.Properties.Name -contains 'jev_ask_score') { $p.jev_ask_score } else { $null }
+            jev_line           = if ($p.PSObject.Properties.Name -contains 'jev_line') { "$($p.jev_line)" } else { '' }
         }
     }
     $errorsOut = @()
@@ -4388,6 +4773,19 @@ function Invoke-PredictedResourceProbe {
     return $map
 }
 
+# --- sweep.json discovery keys reader (T-sweep-intake-discovery-by-default, Bohr msg-6776) --------
+# Returns ConvertFrom-SweepIntakeConfig's view of sweep.json's `clones` / `intake` / `exclude`
+# (lib/UnregisteredIntake.ps1). Throws on a shape error, like Get-SweepOwnerMap: a malformed config
+# stops the tick. A per-project environment problem in `clones` does not throw; it makes only that
+# project 登録不可 in Resolve-UnregisteredIntake.
+function Get-SweepIntakeConfig {
+    param([string]$Path)
+    # Get-SweepCandidates already threw on a missing file; defaults keep this reader from adding noise.
+    if (-not (Test-Path -LiteralPath $Path)) { return (ConvertFrom-SweepIntakeConfig -Raw $null) }
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    return (ConvertFrom-SweepIntakeConfig -Raw $raw -Source $Path)
+}
+
 # --- sweep.json owner_map reader (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) --
 # Returns @{ <predicted_resource> = <owning_project> } from sweep.json's top-level `owner_map`
 # field, or @{} when the file has no such field. Missing = OFF (fully backward compatible):
@@ -4515,6 +4913,52 @@ function Invoke-DeclaredProjectsParkWake {
     return @{ byProject = $byProject; failed = $failed }
 }
 
+# --- Summon: origin/main of a candidate's clone (I-SY4, Bohr msg-6747) ------------------------------
+# The summon_yield record compares origin/main when a thread first yielded with origin/main when it
+# is launched again, so the turn can be told that main moved meanwhile. The sweep does not otherwise
+# sync a candidate's clone, so this fetches `main` itself — only when the answer is used (a record is
+# created, or a thread with a record is launched), at most once per clone per tick (plus a refresh
+# right after a run and right before a launch). Bounded: a hung fetch is killed, never waited on
+# (the T-parked-humans-probe-has-no-timeout lesson). Any failure answers 'unknown', which the
+# conductor always shows (a range with an unknown end is never "empty") — never a stale SHA, which
+# could hide that main moved.
+$SummonGitTimeoutSeconds = 60
+$script:SummonMainShaCache = @{}
+
+# Runs through Invoke-BoundedUvProbe, the one helper whose bound is regression-tested
+# (Test-BoundedProbe.ps1 H1-H4 and SG): on timeout the whole tree is killed and the kill is
+# CONFIRMED (KILL-UNCONFIRMED is logged when it is not), an output pipe still held after exit is a
+# failure rather than an empty success, and nothing is left running when it returns. A private
+# copy of that logic previously swallowed a failed Kill() and still reported "(killed)".
+# -Launcher exists for tests only; production always runs `git`.
+function Invoke-SummonGit {
+    param([string]$RepoDir, [string[]]$GitArgs, [int]$TimeoutSeconds = $SummonGitTimeoutSeconds,
+        [string[]]$Launcher = @('git'))
+    return Invoke-BoundedUvProbe -Launcher $Launcher -Arguments (@('-C', $RepoDir) + $GitArgs) `
+        -TimeoutSeconds $TimeoutSeconds -Label "summon-git-$($GitArgs[0])" -WorkingDirectory $RepoDir `
+        -Environment @{ GIT_TERMINAL_PROMPT = '0' }
+}
+
+function Get-SummonMainSha {
+    param([string]$RepoDir, [switch]$Refresh)
+    $key = ConvertTo-DirtyCloneRepoKey $RepoDir
+    if (-not $Refresh -and $script:SummonMainShaCache.ContainsKey($key)) { return $script:SummonMainShaCache[$key] }
+    $sha = $script:SummonUnknownSha
+    $fetch = Invoke-SummonGit -RepoDir $RepoDir -GitArgs @('fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main')
+    if (-not $fetch.ok -or $fetch.code -ne 0) {
+        $why = if (-not $fetch.ok) { $fetch.error } else { "exit $($fetch.code): $(("$($fetch.stderr)" -split "`n")[0])" }
+        Write-Log "WARN summon: origin/main of $RepoDir unreadable ($why) — recorded as '$sha'"
+    }
+    else {
+        $rev = Invoke-SummonGit -RepoDir $RepoDir -GitArgs @('rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main')
+        $text = "$($rev.stdout)".Trim()
+        if ($rev.ok -and $rev.code -eq 0 -and $text -match '^[0-9a-f]{7,64}$') { $sha = $text }
+        else { Write-Log "WARN summon: rev-parse origin/main failed in $RepoDir — recorded as '$sha'" }
+    }
+    $script:SummonMainShaCache[$key] = $sha
+    return $sha
+}
+
 # --- deploy probe ---------------------------------------------------------------------------------
 # Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
 # verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
@@ -4530,7 +4974,7 @@ function Invoke-RepoSync {
         return $null
     }
     try {
-        $raw = & pwsh -NoProfile -File $probe 2>&1
+        $raw = & pwsh -NoProfile -File $probe -StatePath $venvSyncStatePath 2>&1
         $code = $LASTEXITCODE
         if ($code -ne 0) {
             Write-Log "repo sync exited $code — running whatever code is checked out. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
@@ -4544,6 +4988,19 @@ function Invoke-RepoSync {
         Write-Log "repo sync failed ($($_.Exception.Message)) — running whatever code is checked out"
         return $null
     }
+}
+
+# The dedup signature of a non-happy deploy verdict (skipped / blocked / failed) for the
+# `__deploy_health__` notification. A verdict carrying `deps_hash` is a venv-sync failure
+# (T-composer-entrypoint-missing-drops-decision-cards D-2' + Einstein's closing [edge-case] advisory): it is
+# keyed on the hash, not on uv's message text, so every failure of the same pyproject/uv.lock state
+# (lock mismatch, import check, `os error 32`, …) alerts once while sync-repo retries it every tick,
+# and a new commit that still fails (new hash) alerts again. Git-step verdicts keep their old key.
+function Get-DeployHealthSignature {
+    param($Sync)
+    $hash = if ($Sync.PSObject.Properties.Name -contains 'deps_hash') { "$($Sync.deps_hash)" } else { '' }
+    if ($hash) { return "$($Sync.status):deps:$hash" }
+    return "$($Sync.status):$($Sync.reason)"
 }
 
 # --- gate-bootstrap tick -------------------------------------------------------------------------
@@ -4769,6 +5226,11 @@ try {
     # fresh composer call per parked thread this tick and self-heals; a missing pending-decisions
     # file is not a fatal condition.
     $pendingDecisionsState = Get-JsonState -Path $pendingDecisionsPath
+    # D-3 (T-composer-entrypoint-missing-drops-decision-cards): parked decisions whose material did
+    # not reach magickit. Same lifetime as the composer cache: read here, written at the end of the
+    # tick next to it. A corrupt file collapses to empty, which loses at most the retry of those
+    # keys until their next failure records them again.
+    $materialMissingState = Get-JsonState -Path $materialMissingPath
 
     # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
     # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
@@ -4791,7 +5253,13 @@ try {
         }
         elseif ($sync.status -eq 'current') {
             # Buffered, not committed: on an idle tick this collapses away with everything else.
-            Write-Log "repo up to date ($($sync.head))"
+            # Except a venv re-sync (D-2': first tick on a new sync-repo, or a retry after a failed
+            # sync that has now succeeded) — that changed the environment, so keep it.
+            if ($sync.PSObject.Properties.Name -contains 'synced_deps' -and $sync.synced_deps) {
+                Confirm-LogWorthKeeping
+                Write-Log "repo up to date ($($sync.head)); venv synced (deps_hash differed from the last successful sync)"
+            }
+            else { Write-Log "repo up to date ($($sync.head))" }
         }
         else {
             # skipped / blocked / failed. Deliberately NOT committed to the log on its own: the log is
@@ -4800,7 +5268,7 @@ try {
             # week on a feature branch costs one alert, not 2016.
             Write-Log "repo sync $($sync.status): $($sync.reason)"
             Send-NotificationIfChanged -State $notifyState -Key "__deploy_health__" `
-                -Signature "$($sync.status):$($sync.reason)" `
+                -Signature (Get-DeployHealthSignature -Sync $sync) `
                 -Message ("MindWire: main の自動取り込みが **$($sync.status)** です — $($sync.reason)。" +
                           "ループは現在チェックアウトされているコードで動き続けます（古い可能性があります）。")
         }
@@ -4820,15 +5288,19 @@ try {
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
 
-    # Auto-registration (msg-5889 D-2 / msg-5893 D-2.1-D-2.4, lib/UnregisteredIntake.ps1). Live threads
-    # that sweep.json does not list join THIS tick's candidates — in memory only, sweep.json is not
-    # written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
+    # Discovery intake (T-sweep-intake-discovery-by-default msg-6776/msg-6778 D-2.5, on top of msg-5889
+    # D-2 / msg-5893 D-2.1-D-2.4; lib/UnregisteredIntake.ps1). A live thread sweep.json does not list
+    # joins THIS tick's candidates only with intake.mode=on, a usable clones[project], a last_activity_at
+    # within intake.max_idle_days and no exclude entry — in memory only, sweep.json is not written. It MUST stay here, before the gate-bootstrap / probe / quarantine / retry-pending /
     # head-skip code below (D-2.3): every filter has to see the added threads, or a quarantined one
     # would launch on every tick. Added threads are ordinary candidates from here on (D-2.2). Refused
     # ones never join, so no state file can get their key (D-2.1); they are carried only to the
     # parked-humans poll and the digest. tests/Test-UnregisteredIntake.ps1 pins the order.
+    $sweepIntakeConfig = Get-SweepIntakeConfig -Path $sweepConfigPath
+    foreach ($w in @(Get-CloneCandidateMismatches -Candidates $candidates -Clones $sweepIntakeConfig.clones)) { Write-Log $w }
     $unregProbe = Invoke-UnregisteredThreadsProbe -SweepConfigPath $sweepConfigPath
-    $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error
+    $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error `
+        -IntakeConfig $sweepIntakeConfig -DaemonRoot $repoRoot
     $candidates = Join-UnregisteredCandidates -Candidates $candidates -Intake $unregisteredIntake
     if ($unregisteredIntake.probe_error) {
         Write-Log "unregistered intake: ? — $($unregisteredIntake.probe_error) (nothing auto-registered this tick)"
@@ -4836,12 +5308,29 @@ try {
     foreach ($u in @($unregisteredIntake.unmeasured)) {
         Write-Log "unregistered intake [$($u.project)]: ? — not measured ($($u.reason))"
     }
-    if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0) {
+    # Schema drift (T-sweep-intake-discovery-by-default msg-7445): listed items with no last_activity_at
+    # key at all. A WARN is kept even on an otherwise quiet tick — eight silent days is what this is for.
+    $schemaWarnings = @(Get-UnregisteredIntakeSchemaWarnings -Intake $unregisteredIntake)
+    if ($schemaWarnings.Count -gt 0) {
         Confirm-LogWorthKeeping
+        foreach ($w in $schemaWarnings) { Write-Log $w }
+    }
+    if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0 -or
+        @($unregisteredIntake.shadow).Count -gt 0 -or @($unregisteredIntake.idle).Count -gt 0 -or
+        @($unregisteredIntake.time_unknown).Count -gt 0 -or $unregisteredIntake.excluded_count -gt 0) {
+        Confirm-LogWorthKeeping
+        # The "auto-registered N [...]" prefix is kept verbatim: the PR-2 migration runbook greps it.
         Write-Log ("unregistered intake: auto-registered $(@($unregisteredIntake.added).Count) " +
                    "[$((@($unregisteredIntake.added) | ForEach-Object { $_.key }) -join ', ')], " +
                    "refused $(@($unregisteredIntake.refused).Count) " +
-                   "[$((@($unregisteredIntake.refused) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')]")
+                   "[$((@($unregisteredIntake.refused) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')], " +
+                   "shadow($($unregisteredIntake.mode)) $(@($unregisteredIntake.shadow).Count) " +
+                   "[$((@($unregisteredIntake.shadow) | ForEach-Object { $_.key }) -join ', ')], " +
+                   "idle>$($unregisteredIntake.max_idle_days)d $(@($unregisteredIntake.idle).Count) " +
+                   "[$((@($unregisteredIntake.idle) | ForEach-Object { $_.key }) -join ', ')], " +
+                   "time-unknown $(@($unregisteredIntake.time_unknown).Count) " +
+                   "[$((@($unregisteredIntake.time_unknown) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')], " +
+                   "excluded $($unregisteredIntake.excluded_count)")
     }
 
     # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the
@@ -4977,6 +5466,20 @@ try {
             }
         }
     }
+    # Summon (Bohr msg-6745 v1.1 指摘 3 (b)): the owning projects of owner_map that no candidate names
+    # are read too, so a Summon in such a project holds the candidates writing to its repository on
+    # this tick instead of being found by their conductor one launch later. The rows go into
+    # $controlByProject, which the resource-axis HOLD gate also reads: a HOLD on such an owner now
+    # holds those candidates here as well (before, its row was missing and the gate failed open).
+    foreach ($ownerProj in @($sweepOwnerMap.Values | Sort-Object -Unique)) {
+        if ($controlByProject.ContainsKey($ownerProj)) { continue }
+        $oc = Invoke-ControlProbe -Project $ownerProj
+        $controlByProject[$ownerProj] = $oc
+        if ($null -ne $oc) {
+            Write-Log ("control probe [{0}] (owner_map owner): desired={1} observed={2}" -f $ownerProj, $oc.desired_state, $oc.observed_state)
+        }
+    }
+
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
@@ -5127,11 +5630,31 @@ try {
     # list is put in that variable for the loop and the sweep.json order is restored right after it.
     # Everything after the loop that walks $candidates (the not-reached pass, the parked-humans poll)
     # keeps sweep.json order.
+    # Summon (T-human-call-priority-interrupt PR-2, v1.6 §2): what each candidate is this tick —
+    # the Summon itself (lane 0), held by one, held because a Summon read was malformed, or not
+    # affected — from the control rows already read above. No extra MCP call.
+    $summonByKey = @{}
+    foreach ($c in $candidates) {
+        $summonByKey[$c.key] = Get-SummonDisposition -Candidate $c -ControlByProject $controlByProject `
+            -PredictedResourceByRepoDir $predictedResourceByRepoDir -OwnerMap $sweepOwnerMap
+    }
+    foreach ($proj in @($controlByProject.Keys | Sort-Object)) {
+        $ps = Get-ProjectSummon -ControlByProject $controlByProject -Project $proj
+        if ($ps.kind -eq 'valid') {
+            Confirm-LogWorthKeeping
+            Write-Log "SUMMON ACTIVE [$proj]: thread=$($ps.thread_id) since=$($ps.since.ToString('o')) by=$($ps.by)"
+        }
+        elseif ($ps.kind -eq 'malformed') {
+            Confirm-LogWorthKeeping
+            Write-Log "WARN SUMMON MALFORMED [$proj]: active_summon does not match the contract — every candidate in its scope is HELD (fail-safe)"
+        }
+    }
     $sweepOrderCandidates = $candidates
     $candidates = Get-OrderedSweepCandidates -Candidates $sweepOrderCandidates -Verdicts $decideVerdicts `
-        -EvaluatedState $evaluatedState -Now $nowUtc
+        -EvaluatedState $evaluatedState -Now $nowUtc -SummonByKey $summonByKey
     $gateCandidateCount = @($candidates | Where-Object {
-        $decideVerdicts.ContainsKey($_.key) -and (Get-SweepLane -Verdict $decideVerdicts[$_.key]) -eq 'gate' }).Count
+        $decideVerdicts.ContainsKey($_.key) -and
+        (Get-SweepLane -Verdict $decideVerdicts[$_.key] -Summon $summonByKey[$_.key]) -eq 'gate' }).Count
     $launchScheduler = New-LaunchScheduler -LaunchBudgetSeconds $sweepBudgets.launch -GateBudgetSeconds $sweepBudgets.gate
     # loopElapsed's origin: decide time is excluded, so a slow decide cannot close the gate lane
     # (Einstein msg-5589). The tick budget (tickElapsed) still includes it.
@@ -5326,6 +5849,30 @@ try {
         if ($decision -ne 'launch') {
             throw "head_skip decide returned unexpected decision '$decision' for $($cand.key)"
         }
+        # Summon (v1.6 §2). After HOLD and quarantine (HOLD -> quarantine -> Summon): a LAUNCH that a
+        # Summon holds is not launched, and keeps its launch_wait_since, so it rejoins its lane at its
+        # old place once the Summon is gone. Path (b) of the summon_yield record (I-SY1 / I-SY2): the
+        # one Update-SummonYield, with -Delivered $false. Report mode writes nothing.
+        $summonDisp = $summonByKey[$cand.key]
+        if ($null -ne $summonDisp -and $summonDisp.kind -eq 'malformed') {
+            $held++
+            $dispositions[$cand.key] = 'held'
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — Summon read malformed for project $($summonDisp.malformed_project), HELD (fail-safe), not launching (launch_wait_since kept)"
+            continue
+        }
+        if ($null -ne $summonDisp -and $summonDisp.kind -eq 'yield') {
+            $held++
+            $dispositions[$cand.key] = "held-by-summon:$($summonDisp.yield_to)"
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — held-by-summon:$($summonDisp.yield_to), not launching (launch_wait_since kept)"
+            if ($headSkipMode -ne 'report') {
+                $syEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+                $sySha = if (Test-SummonYieldNeedsSha -Entry $syEntry -Delivered $false -YieldTo $summonDisp.yield_to) {
+                    Get-SummonMainSha -RepoDir $cand.repo_dir } else { $null }
+                Set-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key -Entry (
+                    Update-SummonYield -Entry $syEntry -Delivered $false -YieldTo $summonDisp.yield_to -MainSha $sySha -Now $nowUtc)
+            }
+            continue
+        }
         # Report mode: dry-run. The CLI touched no state, so we must not commit-launch or spawn.
         # This is how an operator measures "what would come out of a wire commit" per msg-1430 §W-5.
         if ($headSkipMode -eq 'report') {
@@ -5414,9 +5961,40 @@ try {
         # apart from $stallArgs (the T42 / retry arguments) and re-assigned on every candidate, so
         # nothing can accumulate across iterations (PR #458 gate advisory).
         $laneArgs = @(Get-ConductorLaneArgs -Lane $lane)
-        $output = (& $inner @stallArgs @laneArgs *>&1) | ForEach-Object { "$_" }
+        # Summon (v1.6 §4 / v1.4): the owning project whose Summon is also in scope, and — whenever
+        # this thread has a summon_yield record — the resume notice, with origin/main read now.
+        # Re-assigned on every candidate like $laneArgs.
+        $summonArgs = @(Get-SummonOwnerArgs -Disposition $summonDisp)
+        $resumeEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+        if ($null -ne $resumeEntry) {
+            $summonArgs += @(Get-ResumeNoticeArgs -Entry $resumeEntry -MainSha (Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh))
+            Write-Log "resume-notice $($cand.key): $($summonArgs -join ' ')"
+        }
+        $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        # A launch that did not defer got past git-sync: end this candidate's deferral episode so
+        # its next outage alerts again (see Get-GitSyncDeferredNotice).
+        if ($code -ne $GitSyncDeferredExitCode -and
+            (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
         $verdict = Get-ConductorVerdict -Output $output
+        # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
+        # -Delivered / -YieldTo (Get-SummonStopFields, StopReason.ps1) and the one Update-SummonYield.
+        # Before any exit-code branch, so every way a run can end is covered; no stop line = neither,
+        # which keeps the record and re-delivers on the next launch (at least once).
+        $summonStop = Get-SummonStopFields -Output $output
+        if ($summonStop.delivered -or $summonStop.yield_to) {
+            $syBefore = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+            $sySha = if (Test-SummonYieldNeedsSha -Entry $syBefore -Delivered $summonStop.delivered -YieldTo $summonStop.yield_to) {
+                Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh } else { $null }
+            $syAfter = Update-SummonYield -Entry $syBefore -Delivered $summonStop.delivered -YieldTo $summonStop.yield_to `
+                -MainSha $sySha -Now $nowUtc
+            Set-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key -Entry $syAfter
+            $syDesc = if ($null -eq $syAfter) { 'removed' } else { "$($syAfter.main_sha_at_yield) [$($syAfter.summon_threads -join ',')]" }
+            Write-Log "summon-yield $($cand.key): delivered=$($summonStop.delivered) yield_to=$($summonStop.yield_to) -> record $syDesc"
+        }
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
         # fully described by the summary line below.
         #
@@ -5555,6 +6133,24 @@ try {
             continue
         }
 
+        # EXIT CODE $GitSyncDeferredExitCode — git-sync deferral (ADR-2026-10-09-23 unit 1, design
+        # v1.2 B-2). A transient GitHub API failure, not this thread's fault: MUST stay above the
+        # generic non-zero branch below (which would retry and then quarantine). The launch is
+        # reverted so it counts toward neither backoff nor STALLED; the repo is NOT parked (the
+        # clone is fine) and the sweep continues.
+        if ($code -eq $GitSyncDeferredExitCode) {
+            $dispositions[$cand.key] = 'git-sync-deferred'
+            $notice = Get-GitSyncDeferredNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "git-sync-deferred $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN git-sync-deferred $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            Send-NotificationIfChanged -State $notifyState -Key $notice.key `
+                -Signature $notice.signature -Message $notice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "git-sync-deferred $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine, no park; sweep CONTINUES"
+            continue
+        }
+
         # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
         # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
         # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
@@ -5563,7 +6159,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
@@ -5709,6 +6305,10 @@ try {
         # candidate we did not act on would reproduce the exponential-starvation loop #140 was
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
+        # D-3: a material-missing record describes one stop; once this thread's signature moves,
+        # that stop is over.
+        Clear-MaterialMissingIfAdvanced -State $materialMissingState -Key $cand.key `
+            -Signature "$($verdict.reason):$($verdict.last_msg)"
 
         # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`,
         # `self_handoff_to_human` or `stalled_to_human` (T42) run parks the thread until its head moves — head_skip's
@@ -5737,6 +6337,7 @@ try {
                             " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
                             "chatroom を確認してください。")
             Send-HumanParkAlert -PendingDecisionsState $pendingDecisionsState `
+                -MaterialMissingState $materialMissingState `
                 -NotifyState $notifyState -Key $cand.key `
                 -Project $cand.project -ThreadId $thread `
                 -Signature $sig -LastMsgId $verdict.last_msg `
@@ -5808,6 +6409,20 @@ try {
     # nothing and therefore changed nothing here; it writes nothing either (msg-5434 test list).
     if ($headSkipMode -ne 'report') {
         Save-JsonState -Path $retryPendingStatePath -State $retryState
+    }
+
+    # D-3: the bounded material retry — keys in material-missing.json whose last attempt is at least
+    # $MaterialMissingRetryInterval old get one more composer + PUT, with no notification. Not in
+    # report mode, which promises to launch nothing (a composer run is a launch of its own).
+    if ($headSkipMode -ne 'report' -and $materialMissingState.Count -gt 0) {
+        $null = Invoke-MaterialMissingRetry -MissingState $materialMissingState `
+            -PendingDecisionsState $pendingDecisionsState -LiveKeys $liveKeys -Now $nowUtc
+    }
+    if ($materialMissingState.Count -gt 0) {
+        # Buffered, not committed: a standing record must not defeat the idle-tick collapse. The
+        # notification's ⚠ line and the digest are the channels a person reads.
+        Write-Log ("material missing (no decision card on the board): " +
+                   (($materialMissingState.Keys | Sort-Object | ForEach-Object { "$_ ($($materialMissingState[$_].reason))" }) -join ', '))
     }
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
@@ -5924,7 +6539,10 @@ try {
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
                 -StopClassLines (Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed) `
                 -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (Get-JsonState -Path $n3UnresolvedStatePath)) `
-                -UnregisteredIntake $unregisteredIntake
+                -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
+                -UnregisteredIntake $unregisteredIntake `
+                -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
+                    -Dispositions $dispositions -EvaluatedState $evaluatedState -Now $nowUtc)
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
@@ -6045,6 +6663,7 @@ try {
 
     Save-JsonState -Path $notifyStatePath -State $notifyState
     Save-JsonState -Path $pendingDecisionsPath -State $pendingDecisionsState
+    Save-JsonState -Path $materialMissingPath -State $materialMissingState
 }
 catch {
     $exitCode = 1

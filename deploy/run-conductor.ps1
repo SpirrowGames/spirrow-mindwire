@@ -81,8 +81,16 @@ Write-Host "[adr18] starting Stage 3 conductor daemon (project + thread from min
 . (Join-Path $PSScriptRoot 'lib/ConductorBudget.ps1')
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
 $hardBudget = Get-ConductorHardBudgetSeconds -ConfigPath (Join-Path $dataDir "config/mindwire.toml")
+#
+# Launched as `uv run --no-sync python -m spirrow_mindwire.loop_runner`, not `uv run mindwire-loop`
+# (T-composer-entrypoint-missing-drops-decision-cards D-1'):
+#   * `python -m` runs the venv's python.exe, so nothing depends on `.venv\Scripts\mindwire-loop.exe`
+#     existing, and a running conductor does not lock that exe — a deploy's
+#     `uv sync --reinstall-package spirrow-mindwire` no longer dies on `os error 32` against it.
+#   * `--no-sync` keeps `uv run` from re-syncing (and possibly rewriting uv.lock) in the middle of a
+#     tick. The venv is synced in exactly one place: deploy/sync-repo.ps1 (`uv sync --locked`).
 $run = Invoke-ConductorBounded -FilePath 'uv' `
-    -Arguments (@('run', 'mindwire-loop', '--mode', 'conductor') + @($args)) `
+    -Arguments (@('run', '--no-sync', 'python', '-m', 'spirrow_mindwire.loop_runner', '--mode', 'conductor') + @($args)) `
     -HardBudgetSeconds $hardBudget -WorkingDirectory $repoRoot `
     -TempDirectory (Join-Path $dataDir "tmp/conductor")
 foreach ($line in $run.lines) { Write-Output $line }

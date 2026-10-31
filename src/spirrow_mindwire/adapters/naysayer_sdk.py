@@ -140,6 +140,7 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._command_line import check_command_line, system_prompt_file
 from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS, connect_bounded
 from ._sdk_result import (
     SdkIsErrorSignal,
@@ -697,7 +698,9 @@ class NaysayerSdkAdapter:
         env = {"ANTHROPIC_BASE_URL": self._inference_base_url, **self._extra_env}
         kwargs: dict[str, Any] = {
             "cwd": self._cwd,
-            "system_prompt": self._system_prompt,
+            # Through a file, not ``--system-prompt``: the ADR index and the obligations ride in
+            # this prompt and only grow (see ``_command_line``).
+            "system_prompt": system_prompt_file(self._system_prompt),
             "tools": [],
             "allowed_tools": self._allowed_tools,
             "mcp_servers": self._mcp_servers,
@@ -785,6 +788,14 @@ class NaysayerSdkAdapter:
                 f"session: {exc}"
             ) from exc
         options = self._make_options()
+        # Per-turn options differ from these only in env, which is not on the command line,
+        # so measuring once here covers every turn of the session.
+        try:
+            check_command_line(options)
+        except Exception as exc:
+            raise NaysayerSdkSpawnError(
+                f"spawn failed for role {role.value} on thread {thread_ref.thread_id}: {exc}"
+            ) from exc
 
         now = datetime.now(UTC)
         handle = SessionHandle(

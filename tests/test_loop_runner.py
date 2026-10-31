@@ -20,11 +20,12 @@ touching any core (watcher / dispatcher / adapter):
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -259,6 +260,12 @@ class _FakeGitHub:
         self.closed = False
 
     async def fetch_pr_diff(self, pr: Any) -> str:
+        raise AssertionError("not called")
+
+    async def fetch_pr_base_and_head(self, pr: Any) -> tuple[str, str]:
+        raise AssertionError("not called")
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         raise AssertionError("not called")
 
     async def fetch_ci_status(self, pr: Any) -> Any:
@@ -1128,3 +1135,66 @@ def test_main_exit_two_payload_carries_repo_for_permission_scope(
     assert payload["scope"] == "environment/permission"
     assert payload["owner"] == "other-owner"
     assert payload["repo"] == "other-repo"
+
+
+# --- Settled-PR check wiring (T-merged-pr-fact-never-reaches-design-thread, PR #504 gate) ---
+
+
+def test_build_conductor_wires_the_settled_pr_state_source(tmp_path: Path) -> None:
+    # PR #504 gate finding (untested): build_conductor must construct the real per-call source
+    # (no TypeError) and hand it to the Conductor, or the settled-PR check is never live.
+    cond = build_conductor(
+        _conductor_settings(human_identity="takahito"),
+        mcp=_FakeMcp(_FakeChatroom()),
+        proposer=_StubAdapter("fake-proposer", _proposer_caps()),
+        implementer=_StubAdapter("fake-implementer", _exec_caps()),
+        naysayer=_StubAdapter("fake-naysayer", _naysayer_caps()),
+    )
+    assert isinstance(cond.conductor._pr_state_source, loop_runner._PerCallPrStateSource)
+
+
+class _RecordingGitHubClient:
+    tokens: ClassVar[list[str | None]] = []
+    reads: ClassVar[list[Any]] = []
+    answer: ClassVar[Any] = None
+
+    def __init__(self, token: str | None = None, *args: Any, **kwargs: Any) -> None:
+        type(self).tokens.append(token)
+
+    async def __aenter__(self) -> _RecordingGitHubClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def fetch_pr_state(self, pr: Any) -> Any:
+        type(self).reads.append(pr)
+        return type(self).answer
+
+
+@pytest.mark.parametrize(
+    ("ctor_token", "expected"),
+    [(None, "review-side-token"), ("explicit-token", "explicit-token")],
+)
+def test_per_call_pr_state_source_reads_through_the_review_token(
+    monkeypatch: pytest.MonkeyPatch, ctor_token: str | None, expected: str
+) -> None:
+    # The source is built with no token on purpose (same as _PerCallCheckRollupSource): each read
+    # resolves naysayer_github_token() at call time, so the check sees the PR through the gate's
+    # credential. An explicit token overrides that. One client per read.
+    from spirrow_mindwire.github.client import PrResolution, PrState, parse_pr_ref
+
+    ref = parse_pr_ref("SpirrowGames/spirrow-mindwire#504")
+    assert ref is not None
+    answer = PrState(ref=ref, resolution=PrResolution.CLOSED, merged=True)
+    _RecordingGitHubClient.tokens = []
+    _RecordingGitHubClient.reads = []
+    _RecordingGitHubClient.answer = answer
+    monkeypatch.setattr(loop_runner, "GitHubClient", _RecordingGitHubClient)
+    monkeypatch.setattr(loop_runner, "naysayer_github_token", lambda: "review-side-token")
+
+    source = loop_runner._PerCallPrStateSource(ctor_token)
+    assert asyncio.run(source.fetch_pr_state(ref)) is answer
+    assert asyncio.run(source.fetch_pr_state(ref)) is answer
+    assert _RecordingGitHubClient.tokens == [expected, expected]
+    assert _RecordingGitHubClient.reads == [ref, ref]

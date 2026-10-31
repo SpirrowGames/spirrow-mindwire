@@ -265,7 +265,9 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     # ADR-14 §7.3 / §7.6: decided by route_tier — the Gemini-only tier while the design-time
     # marker is not read (fail-safe), so N-3 cannot reach the codex tier.
     assert stored_opts.model == "naysayer-gemini"
-    assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
+    # Principles injected (D-1). The prompt reaches the CLI as a file (``_command_line``).
+    prompt_text = Path(stored_opts.system_prompt["path"]).read_text(encoding="utf-8")
+    assert "silence is negligence" in prompt_text
     # The per-turn factory receives a COPY of the stored options that differs in
     # exactly one place — the trace header env (T-per-turn-backend-attestation) —
     # so the marker and the subprocess cannot drift on anything the marker says.

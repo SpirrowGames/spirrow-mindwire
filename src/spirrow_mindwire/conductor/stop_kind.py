@@ -59,6 +59,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.HUMAN: None,  # R-HUMAN → ready_for_human (or R-RELAY-STOP via its marker)
     StopReason.SETTLED: None,  # R-NONE-*
     StopReason.HOLD: None,  # waiting
+    # Not in §6.3 (T-human-call-priority-interrupt). Yielded to a Summon: waiting, like HOLD; the
+    # sweep relaunches the thread once the Summon is gone.
+    StopReason.SUMMON_YIELD: None,
     # Not in §6.3 (added after it). A DEFER, not a stop; the next tick re-derives admission.
     StopReason.CI_WAIT: None,
     # Not in §6.3. Like CI_WAIT: a silent retry of the same head, posting nothing; when it does
@@ -69,6 +72,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.SLICE_END: None,
     # Not in §6.3. A merge waiting on the PR list, not a stall; 1b resumes it.
     StopReason.MERGE_WAIT: None,
+    # Not in §6.3 (T-merged-pr-fact-never-reaches-design-thread). The PR was already merged or
+    # closed; the fact was posted and its own NEXT is the hand-off. Not a stall.
+    StopReason.PR_SETTLED: None,
     # Not in §6.3. Its notice ends ``NEXT: human``, so it is read as a human stop like HUMAN.
     StopReason.SELF_HANDOFF: None,
     # Not in §6.3 (T-next-operator-is-silent). A valid ``NEXT: operator`` park, not a stall: the

@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "source": "chatroom:spirrow-mindwire/T-sweep-intake-discovery-by-default#msg-7365",
+    "captured_at": "2026-10-24",
+    "captured_by": "Heisenberg",
+    "why": "T-operator-task-lane D0 (Bohr msg-7408): measured 49-53 LAUNCHes on this unchanged well-formed NEXT: operator head"
+  },
+  "project": "spirrow-mindwire",
+  "thread_id": "T-sweep-intake-discovery-by-default",
+  "msg_id": "msg-7365",
+  "author": "Fermi",
+  "body": "## Fermi（takahito 2026-10-22）: #478 移行後も拾われていないスレッドが 3 本ある。原因を特定して塞ぐ。あわせて spirrow-tutorail をループに載せる\n\n### 1. 観測中のプロジェクトで、生きた `NEXT:` が放置されている 3 本\nloop_control は spirrow-mindwire / spirrow-magickit とも `run`、conductor が 2026-10-21T17:28Z に observe している。同じプロジェクトの他スレッドは毎日回っている。それなのに次の 3 本は一度も拾われていない。\n\n| project | thread | 最終 msg | 状態 | 放置 |\n|---|---|---|---|---|\n| spirrow-mindwire | `T-naysayer-exhaustive-first-then-scoped` | msg-6857（10-12） | `NEXT: Bohr` | 9 日 |\n| spirrow-mindwire | `T-human-call-priority-interrupt` | msg-6965（10-13） | `NEXT: Einstein` | 8 日 |\n| spirrow-magickit | `T-decision-page-escalation-feedback-label` | msg-1001（09-30） | `NEXT: Bohr` | 21 日 |\n\n想定される原因は 2 つ。どちらかを事実で確定してほしい。\n- (A) msg-7185 の「既存スレッドを candidates に移管」からこの 3 本が漏れている（＝#478 が塞いだはずの穴がまだ開いている。clones 登録ベースの発見なら、なぜこの 3 本が発見されないのか）。\n- (B) 発見はされているが、sweep の優先順位・lane 予算で毎 tick 後回しになっている（飢餓）。\n\n### 2. spirrow-tutorail をループに載せる（takahito 決定）\n- `spirrow-tutorail` は `configured=false`、conductor が一度も observe していない。clones に登録されていないため、`T-trial-readiness`（msg-049、`NEXT: Heisenberg`、10-11 起票）は誰にも届いていない。\n- tomtebo-01 に `SpirrowGames/spirrow-tutorail` の独立 clone を置き、#478 以降の手順で clones に登録する（worktree 不可。既存プロダクトと同じ流儀）。Python/FastAPI なので UE 機は不要。\n- 登録後、`T-trial-readiness` が次の tick で拾われることを確認する。\n\nOPERATOR-TASK: (1) 上の 3 本が拾われていない原因を、sweep のログ・candidates・clones の実態で (A)/(B) のどちらかに確定して数字付きで報告する。登録漏れなら登録し、飢餓なら何 tick 連続で後回しになったかを報告する（優先順位の規則を変える判断は Bohr に戻す）。(2) spirrow-tutorail を clones に登録し、loop_control が observe されることと `T-trial-readiness` が拾われることを確認する。(3) 結果をこのスレッドに投稿する\nTIER-C-CHECK: none\nNEXT: operator"
+}

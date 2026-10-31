@@ -42,9 +42,14 @@ Only ``VERIFIED`` opens guard (i). ``UNAVAILABLE`` / ``STALE`` are bounded by th
 watchdog (:mod:`.stall`): ``resume_retry`` posts nothing, so the same head is launched again and
 counted, and the third launch stands down with a STALLED notice. No retry state is kept here.
 
+Where the PR head comes from (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563):
+an RC resume reads it from REST ``GET /pulls/{n}`` (:class:`PrHeadSource`) and never reads the
+rollup, because a fine-grained PAT is refused the rollup's GraphQL contexts on a private repo; an
+R4 resume reads it from the rollup, whose rows it needs anyway. See :func:`verify_resume`.
+
 The resume never calls :func:`~spirrow_mindwire.gate_admission.gate_admission`. It only reads the
-rollup, so resuming after R4 is not counted as a second red on the head (R5); R5 is still judged
-on the next ``NEXT: pr-review`` after the implementer's turn.
+rollup (R4) or the head and reviews (RC), so resuming after R4 is not counted as a second red on
+the head (R5); R5 is still judged on the next ``NEXT: pr-review`` after the implementer's turn.
 """
 
 from __future__ import annotations
@@ -120,6 +125,22 @@ class ReviewSource(Protocol):
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
 
 
+class PrHeadSource(Protocol):
+    """The PR's current head SHA, read without the rollup (msg-7563 修正 1; Einstein's advisory).
+
+    A protocol of its own rather than a third method on :class:`ReviewSource`: the head is PR
+    metadata, not review state (interface segregation). The loop's per-call source implements
+    both with one token, so the head and the reviews are still read through the credential the
+    gate itself uses.
+
+    Must RAISE when the head could not be read (UNAVAILABLE). The real client's
+    ``fetch_pr_head_sha_strict`` reads REST ``GET /pulls/{n}`` ``head.sha``, which a
+    fine-grained PAT can read on a private repo where the GraphQL rollup contexts are refused.
+    """
+
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str: ...
+
+
 class RollupSource(Protocol):
     """Structural twin of ``core.CheckRollupSource`` (``None`` = could not read)."""
 
@@ -175,17 +196,40 @@ async def verify_resume(
     rollup_source: RollupSource | None,
     review_source: ReviewSource | None,
     review_login: str,
+    head_source: PrHeadSource | None = None,
 ) -> ResumeCheck:
     """Read GitHub and sort ``candidate`` into one of the four outcomes. Never raises.
 
-    The PR head is read from the rollup for both kinds, so both share one "is this still the
-    head?" test. A missing source is CONTRADICTED, not UNAVAILABLE: it is configuration, and
-    retrying cannot fix it (msg-6318).
+    The two kinds read the PR head from different places (T-gate-resume-private-repo-pat-
+    forbidden-stalls, Bohr msg-7563 修正 1 / 修正 2):
+
+    - **REQUEST_CHANGES** reads it from ``head_source`` (REST ``GET /pulls/{n}`` ``head.sha``)
+      and never touches the rollup. The RC check needs only "is the relay's SHA still the head?"
+      and "is the gate login's latest review on it CHANGES_REQUESTED?"; the rollup's GraphQL
+      ``statusCheckRollup.contexts`` is refused to a fine-grained PAT on a private repo, which
+      made every RC resume there UNAVAILABLE until the stall watchdog fired.
+    - **CI_ROUTE** reads it from the rollup, as before: it needs the rollup's rows anyway
+      (:func:`~spirrow_mindwire.gate_admission.rollup_is_red`, the same judgement admission R4
+      made). Where the rollup is unreadable, R4 never posts a ci-route, so no such head exists.
+
+    A missing source is CONTRADICTED, not UNAVAILABLE: it is configuration, and retrying cannot
+    fix it (msg-6318).
     """
+    if candidate.kind is ResumeKind.CI_ROUTE:
+        return await _verify_ci_route(candidate, rollup_source)
+    return await _verify_request_changes(
+        candidate,
+        head_source=head_source,
+        review_source=review_source,
+        review_login=review_login,
+    )
+
+
+async def _verify_ci_route(
+    candidate: ResumeCandidate, rollup_source: RollupSource | None
+) -> ResumeCheck:
     if rollup_source is None:
         return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="rollup_source_not_wired")
-    if candidate.kind is ResumeKind.REQUEST_CHANGES and review_source is None:
-        return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="review_source_not_wired")
     try:
         rollup = await rollup_source.fetch_check_rollup(candidate.pr)
     except Exception as exc:  # a source that raises is a failed read, never a verdict
@@ -195,13 +239,31 @@ async def verify_resume(
     pr_head = normalize_sha(rollup.head_sha)
     if pr_head != candidate.head_sha:
         return ResumeCheck(outcome=ResumeOutcome.STALE, detail="head moved", pr_head=pr_head)
-    if candidate.kind is ResumeKind.CI_ROUTE:
-        if rollup_is_red(rollup.rows):
-            return ResumeCheck(outcome=ResumeOutcome.VERIFIED, detail="rollup red", pr_head=pr_head)
-        return ResumeCheck(
-            outcome=ResumeOutcome.CONTRADICTED, detail="rollup_not_red", pr_head=pr_head
-        )
-    assert review_source is not None  # checked above for REQUEST_CHANGES
+    if rollup_is_red(rollup.rows):
+        return ResumeCheck(outcome=ResumeOutcome.VERIFIED, detail="rollup red", pr_head=pr_head)
+    return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="rollup_not_red", pr_head=pr_head)
+
+
+async def _verify_request_changes(
+    candidate: ResumeCandidate,
+    *,
+    head_source: PrHeadSource | None,
+    review_source: ReviewSource | None,
+    review_login: str,
+) -> ResumeCheck:
+    if review_source is None:
+        return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="review_source_not_wired")
+    if head_source is None:
+        return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="head_source_not_wired")
+    try:
+        raw_head = await head_source.fetch_pr_head_sha_strict(candidate.pr)
+    except Exception as exc:  # a source that raises is a failed read, never a verdict
+        return ResumeCheck(outcome=ResumeOutcome.UNAVAILABLE, detail=f"head: {exc!r}")
+    pr_head = normalize_sha(raw_head)
+    if not pr_head:
+        return ResumeCheck(outcome=ResumeOutcome.UNAVAILABLE, detail="head: empty head.sha")
+    if pr_head != candidate.head_sha:
+        return ResumeCheck(outcome=ResumeOutcome.STALE, detail="head moved", pr_head=pr_head)
     try:
         reviews = await review_source.fetch_pr_reviews_strict(candidate.pr)
     except Exception as exc:
@@ -251,6 +313,7 @@ def log_resume_check(candidate: ResumeCandidate, check: ResumeCheck) -> None:
 
 
 __all__ = [
+    "PrHeadSource",
     "ResumeCandidate",
     "ResumeCheck",
     "ResumeKind",

@@ -92,7 +92,8 @@ CODEX_CONTEXT_WINDOW_TOKENS = 272_000
 # itself may inject into the window (an upper bound: it counts policies that may not apply).
 CODEX_HARNESS_RESERVE_TOKENS = 60_928
 # Decided on the mindwire side: the catalog has no output limit and Lexora passes
-# ``max_output_tokens=None``. This is the largest ``max_tokens`` mindwire sends to a naysayer tier;
+# ``max_output_tokens=None``. This is the largest ``max_tokens`` mindwire sends to the codex tier
+# (the review driver clamps its pass-1 budget to it on that tier only);
 # ``tests/test_n3_routing.py`` keeps every such request at or below it.
 CODEX_OUTPUT_RESERVE_TOKENS = 32_000
 CODEX_TIER_PROMPT_CHAR_LIMIT = (

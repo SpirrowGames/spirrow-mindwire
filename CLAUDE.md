@@ -22,7 +22,7 @@
 
 | ADR | 内容 | thread |
 |---|---|---|
-| ADR-2026-05-27-09 (T28) | identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。 | T-T28-author-role-identity |
+| ADR-2026-05-27-09 (T28) | identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。D-6 は ADR-2026-10-22-24 で改訂（実装レーンの制限を撤廃、本番 deploy は Takahito の指示のみ）。 | T-T28-author-role-identity |
 | ADR-2026-05-29-10 (T29) | role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum) | T-T29-role-registry |
 | ADR-2026-05-29-11 | author/identity partition キー正規化 (lowercase + 区切り正規化 + 単射性 gate + strict-by-default) | T-author-partition-key-normalization |
 | ADR-2026-05-29-12 | embodiment 自己申告値化 (ADR-09 D-5 拡張・実装、5 API optional 受け口、enum、状態遷移 msg 必須化、human 例外、response-side omit) | T-embodiment-self-declared |

@@ -34,8 +34,15 @@ through the roster by ``Conductor._route``; msg-4532 §1):
    the quarantine record's log tail.
 
 Event vocabulary (for T47): kind ``conductor.stalled``. Fields: ``project``, ``thread``,
-``head_msg_id``, ``launches_same_head``, ``target``. ``head_msg_id`` is both the head that was
-launched K times and the last point of progress: nothing has been posted since it.
+``head_msg_id``, ``launches_same_head``, ``target``, and — only on the gate-resume path — ``cause``.
+``head_msg_id`` is both the head that was launched K times and the last point of progress:
+nothing has been posted since it.
+
+``cause`` (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 3 / msg-7565): the
+gate resume runs :func:`~.gate_resume.verify_resume` once on the launch that stands down and
+passes its outcome and detail here, so the STALLED body says why the resume never dispatched
+(e.g. ``outcome=unavailable detail=...`` for a read the PAT was refused). The ordinary role path
+passes nothing, and its event and notice are unchanged.
 """
 
 from __future__ import annotations
@@ -58,6 +65,10 @@ EVENT_KIND_STALLED = "conductor.stalled"
 # (BASE 15 min, then 30, capped at 60) the 3rd launch on a stuck head comes about 45 minutes after
 # the first at the earliest. Einstein msg-4583 judged the slow side correct for a fallback detector.
 STALL_THRESHOLD = 3
+
+#: The longest ``cause`` the STALLED notice carries. The full text is in the
+#: ``conductor.gate_resume.*`` log line; the notice only has to point at it.
+CAUSE_MAX_CHARS = 300
 
 # Distinct from 1 (crash / adapter error), 2 (environment terminal, not quarantined) and 3 (T44
 # stand-down with no chatroom to speak in). Like 3, it gets no special case in the wrapper:
@@ -95,27 +106,61 @@ def is_stalled(
     return launch_head_msg_id == head_msg_id
 
 
+def sanitize_cause(cause: str) -> str:
+    """``cause`` as one code-span-safe line: no newlines or backticks, at most
+    :data:`CAUSE_MAX_CHARS` characters (msg-7563 修正 3)."""
+    flat = " ".join(cause.replace("`", "'").split())
+    if len(flat) > CAUSE_MAX_CHARS:
+        flat = flat[: CAUSE_MAX_CHARS - 1] + "…"
+    return flat
+
+
 def stalled_event(
-    *, project: str, thread: str, head_msg_id: str, launches_same_head: int, target: str
+    *,
+    project: str,
+    thread: str,
+    head_msg_id: str,
+    launches_same_head: int,
+    target: str,
+    cause: str | None = None,
 ) -> Event:
-    """Build the ``conductor.stalled`` event (no message body, per the I6 Event convention)."""
+    """Build the ``conductor.stalled`` event (no message body, per the I6 Event convention).
+
+    ``cause`` is stored already sanitised (:func:`sanitize_cause`), and only when given, so an
+    event without one is byte-for-byte what it was before.
+    """
+    fields: dict[str, object] = {
+        "project": project,
+        "thread": thread,
+        "head_msg_id": head_msg_id,
+        "launches_same_head": launches_same_head,
+        "target": target,
+    }
+    if cause is not None:
+        fields["cause"] = sanitize_cause(cause)
     return Event(
         event_id=new_ulid(),
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_STALLED,
-        fields={
-            "project": project,
-            "thread": thread,
-            "head_msg_id": head_msg_id,
-            "launches_same_head": launches_same_head,
-            "target": target,
-        },
+        fields=fields,
     )
 
 
 def emit_stalled(event: Event) -> None:
     """Write the event as one warning line (the line a quarantine record's log tail carries)."""
     f = event.fields
+    if "cause" in f:
+        logger.warning(
+            "%s project=%s thread=%s head_msg_id=%s launches_same_head=%s target=%s cause=%s",
+            event.kind,
+            f.get("project"),
+            f.get("thread"),
+            f.get("head_msg_id"),
+            f.get("launches_same_head"),
+            f.get("target"),
+            f.get("cause"),
+        )
+        return
     logger.warning(
         "%s project=%s thread=%s head_msg_id=%s launches_same_head=%s target=%s",
         event.kind,
@@ -134,13 +179,22 @@ def render_stalled_notice(event: Event) -> str:
     stop-token head is what makes the next sweep tick SKIP instead of launching a 4th time.
     """
     f = event.fields
+    cause = f.get("cause")
+    if cause is not None:
+        # The gate resume read GitHub on this launch: say what it found instead of "unknown".
+        cause_line = f"- 直前の gate_resume: `{cause}`\n"
+        why = "原因の手がかりは上の gate_resume の結果です。"
+    else:
+        cause_line = ""
+        why = "原因は特定していません (汎用 watchdog は進捗が無いことだけを見ています)。"
     return (
         f"Conductor STALLED — 同じ head で起動を繰り返しても進捗がありません\n\n"
         f"- head: `{f.get('head_msg_id')}` (`NEXT: {f.get('target')}`)\n"
         f"- この head での連続起動回数: {f.get('launches_same_head')} "
-        f"(しきい値 {STALL_THRESHOLD})\n\n"
+        f"(しきい値 {STALL_THRESHOLD})\n"
+        f"{cause_line}\n"
         f"この head のまま {f.get('target')} を起動しても、スレッドには何も投稿されていません。"
-        f"原因は特定していません (汎用 watchdog は進捗が無いことだけを見ています)。"
+        f"{why}"
         f"同じことを繰り返さないよう、今回は spawn せずに止めました "
         f"(`{EVENT_KIND_STALLED}`)。\n\n"
         f"次にやること: sweep / conductor のログで、この head に対する直前の起動が"
@@ -152,6 +206,7 @@ def render_stalled_notice(event: Event) -> str:
 
 
 __all__ = [
+    "CAUSE_MAX_CHARS",
     "EVENT_KIND_STALLED",
     "STALLED_EXIT_CODE",
     "STALL_THRESHOLD",
@@ -159,5 +214,6 @@ __all__ = [
     "emit_stalled",
     "is_stalled",
     "render_stalled_notice",
+    "sanitize_cause",
     "stalled_event",
 ]

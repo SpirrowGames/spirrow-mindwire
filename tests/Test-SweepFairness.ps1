@@ -31,6 +31,8 @@
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'deploy/lib/SweepFairness.ps1')
+. (Join-Path $repoRoot 'deploy/lib/Summon.ps1')
+. (Join-Path $repoRoot 'deploy/lib/StopReason.ps1')
 
 $sweepScript = Join-Path $repoRoot "deploy/run-conductor-scheduled.ps1"
 $parseErrors = $null
@@ -579,6 +581,307 @@ Write-Host ("  after:  role wait max {0:N0}s over {1} role turns; implementer tu
 Check "the longest role-lane wait shrinks with the slice" ($after.role_max -lt $before.role_max) "before=$($before.role_max) after=$($after.role_max)"
 Check "more role turns complete with the slice" ($after.role_done -gt $before.role_done) "before=$($before.role_done) after=$($after.role_done)"
 Check "sliced implementer turns do get launched from the role lane" ($after.impl_done -gt 0)
+
+# =============================================================================================
+# Summon (T-human-call-priority-interrupt PR-2). Spec: Bohr msg-6755 (v1.6) — lane 0, held-by-summon,
+# the summon_yield record and Update-SummonYield — with msg-6747 (I-SY1..I-SY4), msg-6749 (v1.3
+# tests), msg-6751 (v1.4 single lifecycle), msg-6753 (v1.5 I-SY5 tests) and msg-6800 (v1.7 contract).
+# The two shared fixtures under tests/data/summon/ are run here and by tests/test_conductor_summon.py.
+$summonData = Join-Path $repoRoot 'tests/data/summon'
+
+# A fixture value's raw JSON text ($null when the property is absent), read with System.Text.Json so
+# nothing is date-converted — the same reason the probe hands the value over as a string.
+function Get-RawJsonProp {
+    param([System.Text.Json.JsonElement]$Element, [string]$Name)
+    foreach ($p in $Element.EnumerateObject()) { if ($p.Name -eq $Name) { return $p.Value.GetRawText() } }
+    return $null
+}
+
+Write-Host "summon — active_summon contract fixture (shared with pytest)"
+$contractDoc = [System.Text.Json.JsonDocument]::Parse((Get-Content -LiteralPath (Join-Path $summonData 'active_summon_contract.json') -Raw))
+$contractCases = 0
+foreach ($case in $contractDoc.RootElement.GetProperty('cases').EnumerateArray()) {
+    $contractCases++
+    $name = $case.GetProperty('name').GetString()
+    $payload = $case.GetProperty('payload')
+    $r = ConvertFrom-ActiveSummonJson -Json (Get-RawJsonProp -Element $payload -Name 'active_summon')
+    $expect = $case.GetProperty('expect')
+    $kind = $expect.GetProperty('kind').GetString()
+    $ok = $r.kind -eq $kind
+    if ($ok -and $kind -eq 'valid') {
+        # -ceq: PowerShell's -eq ignores case, which would hide a case-folding parser.
+        $ok = $r.thread_id -ceq $expect.GetProperty('thread_id').GetString() -and
+              $r.by -ceq $expect.GetProperty('by').GetString() -and
+              $r.since -eq (ConvertFrom-SummonSince -Value $expect.GetProperty('since').GetString())
+    }
+    Check "contract: $name -> $kind" $ok "got kind=$($r.kind) thread=$($r.thread_id) since=$($r.since)"
+}
+Check "contract fixture has cases" ($contractCases -ge 10)
+Check "a since that ConvertFrom-Json would turn into a [datetime] still reads as the contract says" (
+    (ConvertFrom-ActiveSummonJson -Json '{"thread_id":"T","since":"2026-10-09T01:02:03","by":"h"}').kind -eq 'malformed')
+
+Write-Host "summon — summon_yield_decision fixture (shared with pytest)"
+$decisionDoc = [System.Text.Json.JsonDocument]::Parse((Get-Content -LiteralPath (Join-Path $summonData 'summon_yield_decision.json') -Raw))
+foreach ($case in $decisionDoc.RootElement.GetProperty('cases').EnumerateArray()) {
+    $name = $case.GetProperty('name').GetString()
+    $own = ConvertFrom-ActiveSummonJson -Json (Get-RawJsonProp -Element $case -Name 'own')
+    $owner = ConvertFrom-ActiveSummonJson -Json (Get-RawJsonProp -Element $case -Name 'owner')
+    $ownerProject = $case.GetProperty('owner_project'); $ownerProject = if ("$($ownerProject.ValueKind)" -eq 'Null') { $null } else { $ownerProject.GetString() }
+    $exp = $case.GetProperty('expect_yield_to'); $exp = if ("$($exp.ValueKind)" -eq 'Null') { $null } else { $exp.GetString() }
+    $got = Get-SummonYieldDecision -Project $case.GetProperty('project').GetString() -ThreadId $case.GetProperty('thread_id').GetString() `
+        -OwnSummon $own -OwnerProject $ownerProject -OwnerSummon $owner
+    Check "decision: $name -> $(if ($exp) { $exp } else { 'none' })" ($got -eq $exp) "got '$got'"
+}
+
+Write-Host "summon — digest lines (PR-3, Bohr msg-6965 items 1, 2 and 4; wording fixed in the fixture)"
+function ConvertTo-FixtureMap {
+    param([System.Text.Json.JsonElement]$Element, [scriptblock]$Value)
+    $m = @{}
+    foreach ($p in $Element.EnumerateObject()) { $m[$p.Name] = & $Value $p.Value }
+    return $m
+}
+$digestDoc = [System.Text.Json.JsonDocument]::Parse((Get-Content -LiteralPath (Join-Path $summonData 'digest_lines.json') -Raw -Encoding utf8))
+foreach ($case in $digestDoc.RootElement.GetProperty('cases').EnumerateArray()) {
+    $name = $case.GetProperty('name').GetString()
+    $controls = ConvertTo-FixtureMap -Element $case.GetProperty('controls') -Value { param($v) @{ desired_state = 'RUN'; active_summon_json = $v.GetRawText() } }
+    $byKey = ConvertTo-FixtureMap -Element $case.GetProperty('summon_by_key') -Value {
+        param($v)
+        $d = @{ kind = 'none'; yield_to = $null; owner_project = $null; since = $null; malformed_project = $null }
+        foreach ($f in $v.EnumerateObject()) { $d[$f.Name] = $f.Value.GetString() }
+        $d
+    }
+    $disps = ConvertTo-FixtureMap -Element $case.GetProperty('dispositions') -Value { param($v) $v.GetString() }
+    $evaluated = ConvertTo-FixtureMap -Element $case.GetProperty('records') -Value {
+        param($v)
+        @{ summon_yield = @{ main_sha_at_yield = 'a'; yielded_at = '2026-10-24T00:00:00.0000000Z'
+                             summon_threads = @($v.EnumerateArray() | ForEach-Object { $_.GetString() }) } }
+    }
+    $now = (ConvertFrom-SummonSince -Value $case.GetProperty('now').GetString())
+    $want = @($case.GetProperty('want').EnumerateArray() | ForEach-Object { $_.GetString() })
+    $got = @(Get-SummonDigestLines -ControlByProject $controls -SummonByKey $byKey -Dispositions $disps -EvaluatedState $evaluated -Now $now)
+    $same = ($got.Count -eq $want.Count)
+    for ($i = 0; $same -and $i -lt $want.Count; $i++) { $same = ($got[$i] -ceq $want[$i]) }
+    if (-not $same) { Write-Host "    got:  $($got -join ' | ')"; Write-Host "    want: $($want -join ' | ')" }
+    Check "digest lines: $name" $same
+}
+$digestDoc.Dispose()
+$t0 = [datetime]::new(2026, 10, 24, 12, 0, 0, [DateTimeKind]::Utc)
+Check "elapsed: a `$null since is said, not computed (Einstein's PR-3 advisory)" ((Format-SummonElapsed -Since $null -Now $t0) -ceq '経過時間不明')
+Check "elapsed: a since that is not a [datetime] is said, not computed" ((Format-SummonElapsed -Since 'yesterday' -Now $t0) -ceq '経過時間不明')
+Check "elapsed: a since in the future (clock skew) is under an hour, not negative" ((Format-SummonElapsed -Since $t0.AddHours(2) -Now $t0) -ceq '経過 1 時間未満')
+Check "elapsed: whole hours, floored" ((Format-SummonElapsed -Since $t0.AddMinutes(-150) -Now $t0) -ceq '経過 2 時間')
+$manyControls = @{}
+foreach ($i in 1..7) { $manyControls["P$i"] = @{ active_summon_json = '{"thread_id": 1}' } }
+$many = @(Get-SummonDigestLines -ControlByProject $manyControls -SummonByKey @{} -Dispositions @{} -EvaluatedState @{} -Now $t0)
+Check "digest lines are bounded: 5 lines and one +N 件 line" ($many.Count -eq 6 -and $many[5] -ceq '  +2 件')
+Check "digest lines with nothing passed in are empty, not an error" (@(Get-SummonDigestLines -ControlByProject $null -SummonByKey $null -Dispositions $null -EvaluatedState $null -Now $t0).Count -eq 0)
+
+Write-Host "summon — Update-SummonYield (I-SY5, v1.6 signature; paths (a) and (b) in one table)"
+$tNow = [datetime]::new(2026, 10, 9, 3, 0, 0, [DateTimeKind]::Utc)
+function New-SY { param([string]$Sha, [string[]]$Threads) @{ main_sha_at_yield = $Sha; yielded_at = '2026-10-09T01:00:00.0000000Z'; summon_threads = $Threads } }
+function Format-SY { param($E) if ($null -eq $E) { 'none' } else { "$($E.main_sha_at_yield)[$($E.summon_threads -join ',')]" } }
+$syTable = @(
+    @{ n = '(a) first yield, no record: created at the post-run SHA';      e = $null;                 d = $false; y = 'S1'; sha = 'c'; want = 'c[S1]' }
+    @{ n = '(b) first held-by-summon, no record: created';                  e = $null;                 d = $false; y = 'S';  sha = 'c'; want = 'c[S]' }
+    @{ n = '(a) then (b) to another Summon: SHA kept, appended';            e = (New-SY 'a' @('S1')); d = $false; y = 'S2'; sha = 'c'; want = 'a[S1,S2]' }
+    @{ n = '(b) then (a) to another Summon: same';                          e = (New-SY 'a' @('S2')); d = $false; y = 'S1'; sha = 'c'; want = 'a[S2,S1]' }
+    @{ n = 'the same Summon again: no duplicate, SHA kept';                 e = (New-SY 'a' @('S1')); d = $false; y = 'S1'; sha = 'c'; want = 'a[S1]' }
+    @{ n = 'delivered then yielded again: only the new wait remains';      e = (New-SY 'a' @('S1')); d = $true;  y = 'S2'; sha = 'c'; want = 'c[S2]' }
+    @{ n = 'yielded before delivering: the first SHA is kept';              e = (New-SY 'a' @('S1')); d = $false; y = 'S2'; sha = 'c'; want = 'a[S1,S2]' }
+    @{ n = 'delivered only: removed';                                       e = (New-SY 'a' @('S1')); d = $true;  y = $null; sha = 'c'; want = 'none' }
+    @{ n = 'neither: kept as it was';                                       e = (New-SY 'a' @('S1')); d = $false; y = $null; sha = 'c'; want = 'a[S1]' }
+    @{ n = 'no record, nothing happened: still none';                       e = $null;                 d = $false; y = $null; sha = 'c'; want = 'none' }
+    @{ n = 'SHA unreadable on create: unknown';                             e = $null;                 d = $false; y = 'S1'; sha = $null; want = 'unknown[S1]' }
+)
+foreach ($row in $syTable) {
+    $got = Update-SummonYield -Entry $row.e -Delivered $row.d -YieldTo $row.y -MainSha $row.sha -Now $tNow
+    Check "Update-SummonYield: $($row.n)" ((Format-SY $got) -eq $row.want) "got $(Format-SY $got)"
+}
+$created = Update-SummonYield -Entry $null -Delivered $false -YieldTo 'S1' -MainSha 'c' -Now $tNow
+Check "a created record carries yielded_at" ($created.yielded_at -eq $tNow.ToString('o'))
+$roundTrip = (@{ k = @{ summon_yield = (New-SY 'a' @('S1')) } } | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+$rtEntry = ConvertTo-SummonYieldEntry -Entry $roundTrip.k.summon_yield
+Check "a record read back from JSON (yielded_at as [datetime], one-element array) normalises" (
+    (Format-SY $rtEntry) -eq 'a[S1]' -and $rtEntry.yielded_at -like '2026-10-09T01:00:00*')
+Check "Test-SummonYieldNeedsSha: only when a record is created" (
+    (Test-SummonYieldNeedsSha -Entry $null -Delivered $false -YieldTo 'S') -and
+    (Test-SummonYieldNeedsSha -Entry (New-SY 'a' @('S1')) -Delivered $true -YieldTo 'S2') -and
+    -not (Test-SummonYieldNeedsSha -Entry (New-SY 'a' @('S1')) -Delivered $false -YieldTo 'S2') -and
+    -not (Test-SummonYieldNeedsSha -Entry $null -Delivered $true -YieldTo $null))
+
+Write-Host "summon — the stop line (Get-SummonStopFields, StopReason.ps1)"
+$sl = 'conductor stopped: reason=summon_yield rounds=1 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=m2'
+$f = Get-SummonStopFields -Output @('noise', "$sl yield_to=S2 resume_notice=delivered")
+Check "delivered and yield_to on one line are both read" ($f.delivered -and $f.yield_to -eq 'S2')
+$f = Get-SummonStopFields -Output @("$sl yield_to=S1")
+Check "yield_to alone" (-not $f.delivered -and $f.yield_to -eq 'S1')
+$f = Get-SummonStopFields -Output @('conductor stopped: reason=none rounds=1 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=m3 resume_notice=delivered')
+Check "delivered alone" ($f.delivered -and $null -eq $f.yield_to)
+$f = Get-SummonStopFields -Output @('conductor stopped: reason=hold rounds=0 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=None')
+Check "neither" (-not $f.delivered -and $null -eq $f.yield_to)
+$f = Get-SummonStopFields -Output @('crashed before any stop line')
+Check "no stop line reads as neither (the record is kept)" (-not $f.delivered -and $null -eq $f.yield_to)
+$f = Get-SummonStopFields -Output @('conductor stopped: reason=human rounds=1 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=m3 yield_to=X')
+Check "yield_to is read only on reason=summon_yield" ($null -eq $f.yield_to)
+
+# The wrapper's two record paths, as a skeleton calling the SAME lib functions in the SAME order the
+# dispatch loop does (the wiring pins below check the loop still does). The conductor is a stub
+# that returns the stop line it is given; $Sha is the clone's origin/main at that moment.
+function Invoke-SummonSimLaunch {
+    param([hashtable]$State, [string]$Key, [string]$Sha, [string]$StopLine)
+    $entry = Get-SummonYieldEntry -EvaluatedState $State -Key $Key
+    $passed = @(Get-ResumeNoticeArgs -Entry $entry -MainSha $Sha)
+    $sf = Get-SummonStopFields -Output @('...', $StopLine)
+    if ($sf.delivered -or $sf.yield_to) {
+        $before = Get-SummonYieldEntry -EvaluatedState $State -Key $Key
+        $after = Update-SummonYield -Entry $before -Delivered $sf.delivered -YieldTo $sf.yield_to -MainSha $Sha -Now $tNow
+        Set-SummonYieldEntry -EvaluatedState $State -Key $Key -Entry $after
+    }
+    return , $passed
+}
+function Invoke-SummonSimHeld {
+    param([hashtable]$State, [string]$Key, [string]$YieldTo, [string]$Sha)
+    $e = Get-SummonYieldEntry -EvaluatedState $State -Key $Key
+    Set-SummonYieldEntry -EvaluatedState $State -Key $Key -Entry (
+        Update-SummonYield -Entry $e -Delivered $false -YieldTo $YieldTo -MainSha $Sha -Now $tNow)
+}
+function Get-SimRecord { param([hashtable]$State, [string]$Key) Format-SY (Get-SummonYieldEntry -EvaluatedState $State -Key $Key) }
+function Join-Args { param($A) ($A -join ' ') }
+$stop = { param([string]$Reason, [string]$Extra = '') ("conductor stopped: reason=$Reason rounds=1 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=m9" + $Extra) }
+$k = 'p/T-x'
+
+Write-Host "summon — end to end through a stub conductor (v1.3 / v1.4 / v1.5 / I-SY1)"
+# (a) first: the launched run yields.
+$st = @{ $k = @{ first_seen_at = 'x' } }
+$a0 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'a' -StopLine (& $stop 'summon_yield' ' yield_to=S1')
+Check "(a) first: no notice arguments on a launch without a record" ($a0.Count -eq 0)
+Check "(a) first: the record is {a,[S1]}" ((Get-SimRecord $st $k) -eq 'a[S1]')
+Check "(a) first: other row fields kept" ($st[$k].first_seen_at -eq 'x')
+# then (b) for three ticks while main moves: SHA never moves (I-SY1), S2 appended once (I-SY2).
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S2' -Sha 'b1'
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S2' -Sha 'b2'
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S2' -Sha 'b3'
+Check "(a)->(b) x3 with main moving: SHA is still the first one, S2 once" ((Get-SimRecord $st $k) -eq 'a[S1,S2]')
+# (a) again (yields to S1 again): no duplicate, SHA kept.
+[void](Invoke-SummonSimLaunch -State $st -Key $k -Sha 'b4' -StopLine (& $stop 'summon_yield' ' yield_to=S1'))
+Check "(a) twice: no duplicate Summon, SHA kept" ((Get-SimRecord $st $k) -eq 'a[S1,S2]')
+# released: the launch passes a..now; a stop with no delivered keeps the record (at least once).
+$a1 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'c' -StopLine (& $stop 'hold')
+Check "release: the launch passes the summons and a..<now>" ((Join-Args $a1) -eq '--resume-notice-summons S1,S2 --resume-notice-main-range a..c')
+Check "no delivered on the stop line: the record stays" ((Get-SimRecord $st $k) -eq 'a[S1,S2]')
+$a2 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'd' -StopLine (& $stop 'none' ' resume_notice=delivered')
+Check "next launch: the same a, up to the current SHA" ((Join-Args $a2) -eq '--resume-notice-summons S1,S2 --resume-notice-main-range a..d')
+Check "delivered: the record is removed" ((Get-SimRecord $st $k) -eq 'none')
+$a3 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'd' -StopLine (& $stop 'none')
+Check "after delivery: no notice arguments any more" ($a3.Count -eq 0)
+
+# (b) first, then (a): same record shape.
+$st = @{}
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S2' -Sha 'a'
+[void](Invoke-SummonSimLaunch -State $st -Key $k -Sha 'b' -StopLine (& $stop 'summon_yield' ' yield_to=S1'))
+Check "(b) then (a): first SHA kept, both Summons" ((Get-SimRecord $st $k) -eq 'a[S2,S1]')
+
+# v1.4: the empty range is passed too, and only delivered removes the record.
+$st = @{}
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S1' -Sha 'a'
+$e1 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'a' -StopLine (& $stop 'hold')
+Check "empty range: still passed (a..a)" ((Join-Args $e1) -eq '--resume-notice-summons S1 --resume-notice-main-range a..a')
+Check "empty range, stopped before the first turn (no delivered): kept" ((Get-SimRecord $st $k) -eq 'a[S1]')
+$e2 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'c' -StopLine (& $stop 'empty_thread')
+Check "main moved to c meanwhile: the next launch passes a..c" ((Join-Args $e2) -eq '--resume-notice-summons S1 --resume-notice-main-range a..c')
+$st = @{}
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S1' -Sha 'a'
+[void](Invoke-SummonSimLaunch -State $st -Key $k -Sha 'a' -StopLine (& $stop 'none' ' resume_notice=delivered'))
+Check "empty range and delivered: removed" ((Get-SimRecord $st $k) -eq 'none')
+
+# v1.5: delivered and yielded again in one run -> exactly one new record, at the post-run SHA.
+$st = @{}
+Invoke-SummonSimHeld -State $st -Key $k -YieldTo 'S1' -Sha 'a'
+[void](Invoke-SummonSimLaunch -State $st -Key $k -Sha 'c' -StopLine (& $stop 'summon_yield' ' yield_to=S2 resume_notice=delivered'))
+Check "delivered + yielded: only the new wait remains {c,[S2]}" ((Get-SimRecord $st $k) -eq 'c[S2]')
+$j = $st | ConvertTo-Json -Depth 5 | ConvertFrom-Json -AsHashtable
+Check "and evaluated.json would hold exactly one summon_yield record" (@($j.Values | Where-Object { $_.ContainsKey('summon_yield') }).Count -eq 1)
+$v2 = Invoke-SummonSimLaunch -State $st -Key $k -Sha 'e' -StopLine (& $stop 'none' ' resume_notice=delivered')
+Check "the next launch after release passes c..<now>" ((Join-Args $v2) -eq '--resume-notice-summons S2 --resume-notice-main-range c..e')
+
+Write-Host "summon — Get-SummonDisposition"
+function New-Ctl { param([string]$Json) [PSCustomObject]@{ desired_state = 'run'; active_summon_json = $Json } }
+$sumJson = { param($t, $since = '2026-10-09T01:00:00Z') "{`"thread_id`":`"$t`",`"since`":`"$since`",`"by`":`"h`"}" }
+$cA = [PSCustomObject]@{ key = 'A/T-x'; project = 'A'; thread_id = 'T-x'; repo_dir = 'C:\r1' }
+$cS = [PSCustomObject]@{ key = 'A/S1'; project = 'A'; thread_id = 'S1'; repo_dir = 'C:\r1' }
+$cB = [PSCustomObject]@{ key = 'B/T-y'; project = 'B'; thread_id = 'T-y'; repo_dir = 'C:\r1' }
+$pr = @{ 'C:\r1' = @{ predicted_resource = 'github.com/o/r1'; reason = '' } }
+$om = @{ 'github.com/o/r1' = 'A' }
+$ctl = @{ A = (New-Ctl (& $sumJson 'S1')); B = (New-Ctl $null) }
+Check "a same-project bystander is held by the Summon" ((Get-SummonDisposition -Candidate $cA -ControlByProject $ctl -PredictedResourceByRepoDir $pr -OwnerMap $om).yield_to -eq 'S1')
+$dS = Get-SummonDisposition -Candidate $cS -ControlByProject $ctl -PredictedResourceByRepoDir $pr -OwnerMap $om
+Check "the Summon itself is 'summoned' with its since" ($dS.kind -eq 'summoned' -and $dS.since -eq (ConvertFrom-SummonSince '2026-10-09T01:00:00Z'))
+$dB = Get-SummonDisposition -Candidate $cB -ControlByProject $ctl -PredictedResourceByRepoDir $pr -OwnerMap $om
+Check "another project writing to the Summon project's repository is held" ($dB.kind -eq 'yield' -and $dB.yield_to -eq 'S1')
+Check "and its owner project is handed to the conductor" ((@(Get-SummonOwnerArgs -Disposition $dB) -join ' ') -eq '--summon-owner-project A')
+Check "no owner argument when the owner is the candidate's own project" (@(Get-SummonOwnerArgs -Disposition $dS).Count -eq 0)
+$dB2 = Get-SummonDisposition -Candidate $cB -ControlByProject $ctl -PredictedResourceByRepoDir $null -OwnerMap $om
+Check "resource unresolved: fail-open (not held, no owner)" ($dB2.kind -eq 'none' -and $null -eq $dB2.owner_project)
+$dBad = Get-SummonDisposition -Candidate $cA -ControlByProject @{ A = (New-Ctl '{"thread_id":"S1"}') } -PredictedResourceByRepoDir $pr -OwnerMap $om
+Check "a malformed active_summon holds the candidate (fail-safe)" ($dBad.kind -eq 'malformed' -and $dBad.malformed_project -eq 'A')
+$dNo = Get-SummonDisposition -Candidate $cA -ControlByProject @{ A = $null } -PredictedResourceByRepoDir $pr -OwnerMap $om
+Check "a failed control probe is no Summon (fail-open; the conductor enforces)" ($dNo.kind -eq 'none')
+$dOld = Get-SummonDisposition -Candidate $cA -ControlByProject @{ A = [PSCustomObject]@{ desired_state = 'run' } } -PredictedResourceByRepoDir $pr -OwnerMap $om
+Check "a probe row without the field (older probe) is no Summon" ($dOld.kind -eq 'none')
+
+Write-Host "summon — lane 0"
+$lv = New-Verdict -Token 'heisenberg'; $gv = New-Verdict -Token 'pr-review'
+Check "a summoned LAUNCH is lane 'summon'" ((Get-SweepLane -Verdict $lv -Summon $dS) -eq 'summon')
+Check "a summoned pr-review head is lane 'summon' too, so not --gate-only" ((Get-SweepLane -Verdict $gv -Summon $dS) -eq 'summon' -and @(Get-ConductorLaneArgs -Lane 'summon').Count -eq 0)
+Check "a held-by-summon LAUNCH is not a launch (block 1)" ((Get-SweepLane -Verdict $lv -Summon @{ kind = 'yield'; yield_to = 'S1' }) -eq 'none')
+Check "a summoned DEFER stays 'none'" ((Get-SweepLane -Verdict (New-Verdict -Decision 'defer') -Summon $dS) -eq 'none')
+Check "no Summon read: lanes as before" ((Get-SweepLane -Verdict $gv) -eq 'gate' -and (Get-SweepLane -Verdict $lv -Summon @{ kind = 'none' }) -eq 'role')
+$oc = @((New-Cand 'p/T-g'), (New-Cand 'p/T-r'), (New-Cand 'p/S-late'), (New-Cand 'p/T-held'), (New-Cand 'q/S-early'))
+$ov = @{ 'p/T-g' = $gv; 'p/T-r' = $lv; 'p/S-late' = $lv; 'p/T-held' = $lv; 'q/S-early' = $gv }
+$os = @{
+    'p/S-late' = @{ kind = 'summoned'; since = (ConvertFrom-SummonSince '2026-10-09T02:00:00Z') }
+    'q/S-early' = @{ kind = 'summoned'; since = (ConvertFrom-SummonSince '2026-10-09T01:00:00Z') }
+    'p/T-held' = @{ kind = 'yield'; yield_to = 'S-late' }
+}
+$ordered = @(Get-OrderedSweepCandidates -Candidates $oc -Verdicts $ov -EvaluatedState @{} -Now $tNow -SummonByKey $os | ForEach-Object { $_.key })
+Check "order: held first (block 1), then lane 0 oldest since first, then gate, then role" (
+    ($ordered -join ',') -eq 'p/T-held,q/S-early,p/S-late,p/T-g,p/T-r') "got $($ordered -join ',')"
+$sch = New-LaunchScheduler -LaunchBudgetSeconds 120 -GateBudgetSeconds 60
+$adm = Request-LaunchAdmission -Scheduler $sch -Lane 'summon' -Key 'q/S-early' -TickElapsed 100 -LoopElapsed 90
+Check "lane 0 is admitted on the tick budget alone (gate budget already spent)" ($adm.admit -and $adm.reason -eq 'summon')
+Check "and does not use up the first-gate exception" (-not $sch.first_gate_evaluated)
+Complete-LaunchAttempt -Scheduler $sch -Lane 'summon' -Outcome 'launched'
+Check "a lane-0 launch counts as neither a gate nor a role launch" ($sch.summon_launched -eq 1 -and $sch.gate_launched -eq 0 -and $sch.role_launched -eq 0)
+$adm2 = Request-LaunchAdmission -Scheduler $sch -Lane 'summon' -Key 'p/S-late' -TickElapsed 130 -LoopElapsed 120
+Check "lane 0 still stops at the tick budget" (-not $adm2.admit -and $adm2.scope -eq 'break')
+Check "a worked lane-0 run does not break the sweep" ((Get-PostRunAction -Lane 'summon' -Rounds 3) -eq 'continue')
+$sch3 = New-LaunchScheduler -LaunchBudgetSeconds 120 -GateBudgetSeconds 60
+[void](Request-LaunchAdmission -Scheduler $sch3 -Lane 'summon' -Key 's' -TickElapsed 1 -LoopElapsed 0); Complete-LaunchAttempt -Scheduler $sch3 -Lane 'summon' -Outcome 'launched'
+[void](Request-LaunchAdmission -Scheduler $sch3 -Lane 'gate' -Key 'g' -TickElapsed 2 -LoopElapsed 1); Complete-LaunchAttempt -Scheduler $sch3 -Lane 'gate' -Outcome 'launched'
+[void](Request-LaunchAdmission -Scheduler $sch3 -Lane 'role' -Key 'r' -TickElapsed 3 -LoopElapsed 2)
+Check "the gate-before-role invariant still holds with lane 0 in front" ($null -eq (Test-GateAdmissionInvariant -Scheduler $sch3 -GateCandidateCount 1))
+
+Write-Host "summon — wiring (the wrapper's loop calls the lib in the order the simulation above does)"
+$loopCalls = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+$updateCalls = @($loopCalls | Where-Object { $_.GetCommandName() -eq 'Update-SummonYield' })
+Check "the loop calls Update-SummonYield exactly twice (paths (a) and (b)), and nothing else writes the record" (
+    $updateCalls.Count -eq 2 -and @($loopCalls | Where-Object { $_.GetCommandName() -eq 'Set-SummonYieldEntry' }).Count -eq 2)
+Check "path (b) passes -Delivered `$false" (@($updateCalls | Where-Object { $_.Extent.Text -match '-Delivered\s+\$false' }).Count -eq 1)
+$stopFieldCalls = @($loopCalls | Where-Object { $_.GetCommandName() -eq 'Get-SummonStopFields' })
+Check "path (a) reads the stop line with Get-SummonStopFields, after the spawn" (
+    $stopFieldCalls.Count -eq 1 -and $stopFieldCalls[0].Extent.StartOffset -gt $spawn[0].Extent.StartOffset)
+$resumeCalls = @($loopCalls | Where-Object { $_.GetCommandName() -eq 'Get-ResumeNoticeArgs' })
+Check "the resume notice arguments are built before the spawn" ($resumeCalls.Count -eq 1 -and $resumeCalls[0].Extent.StartOffset -lt $spawn[0].Extent.StartOffset)
+Check "and the spawn splats `$summonArgs" (@($spawn[0].CommandElements | Where-Object { $_.Extent.Text -eq '@summonArgs' }).Count -eq 1)
+$summonArgsAssign = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -eq '$summonArgs' -and $n.Operator -eq 'Equals' }, $true))
+Check "`$summonArgs is re-assigned on every candidate" ($summonArgsAssign.Count -eq 1)
+Check "the ordered list is built with the Summon dispositions" ($orderAssign.Count -eq 1 -and $orderAssign[0].Right.Extent.Text -match '-SummonByKey\s+\$summonByKey')
+$digestCall = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-DailyDigest' }, $true))
+Check "the daily digest is given the Summon lines from Get-SummonDigestLines (PR-3)" (
+    $digestCall.Count -eq 1 -and $digestCall[0].Extent.Text -match '-SummonLines\s+\(Get-SummonDigestLines ' -and
+    $digestCall[0].Extent.Text -match '-SummonByKey\s+\$summonByKey' -and $digestCall[0].Extent.Text -match '-Dispositions\s+\$dispositions')
+Check "the wrapper never spells the resume flags itself (the lib decides)" (-not $wrapperText.Contains('--resume-notice-') -and -not $wrapperText.Contains('--summon-owner-project'))
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

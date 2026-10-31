@@ -14,12 +14,14 @@ from typing import Any
 import pytest
 
 from spirrow_mindwire.conductor.gate_records import (
+    MERGE_SELF_INSTRUCTION,
     RELAY_AUTHOR,
     ci_hold_head,
     ci_route_heads,
     prior_advisory_approvals,
     render_admission_heading,
     render_ci_hold_marker,
+    render_merge_self_line,
     render_relay_heading,
     verdict_heads,
 )
@@ -686,3 +688,109 @@ async def test_g2_listing_stops_when_server_ignores_offset() -> None:
     got = await list_open_threads(mcp, "p", page_size=200)
     assert got == mcp.ids[:200]
     assert mcp.calls == 2  # second page adds nothing new → stop, no loop
+
+
+# --------------------------------------------------------------------------- row 2b (D5)
+# T-gate-relay-routes-develop-approvals-to-human D5 (Bohr msg-7576 / msg-7578, Einstein go): a
+# MERGE-route relay hands the merge AND its terminal report to the implementer, so 1b stays silent
+# on a merged or closed PR under it. Open PRs and unmarked relays are unchanged.
+
+
+def _merge_self_relay(*, token: str = "Heisenberg", mark: str | None = None) -> str:
+    """A MERGE-route relay shaped like ``orchestrator._post_design_relay`` writes it."""
+    line = mark if mark is not None else render_merge_self_line(_REF, _HEAD)
+    return (
+        f"{render_relay_heading(_REF, _HEAD)}\n\nVERDICT: approve (ci=success)\n\n"
+        f"critique\n\n{line}\n\n{MERGE_SELF_INSTRUCTION}\n\nNEXT: {token}"
+    )
+
+
+def _merge_self_tail(**kw: Any) -> Any:
+    return read_relay_tail(RELAY_AUTHOR, _merge_self_relay(**kw))
+
+
+def test_row2b_the_mark_is_read_off_the_relay_tail() -> None:
+    tail = _merge_self_tail()
+    assert tail is not None
+    assert tail.merge_self is True
+    assert tail.token == "Heisenberg"
+    assert tail.hold_head is None
+    assert _tail() is not None and _tail().merge_self is False
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_row2b_merged_or_closed_under_a_merge_self_relay_is_owned_by_the_turn(state: str) -> None:
+    for proposer in ("Bohr", None):
+        assert _decide(_merge_self_tail(), _pr(state), proposer=proposer) == Noop(
+            NoopReason.MERGE_OWNED_BY_TURN
+        )
+
+
+def test_row2b_closes_thread_does_not_override_the_turn() -> None:
+    pr = _pr("merged", body=f"Closes-thread: {_THREAD}")
+    assert _decide(_merge_self_tail(), pr) == Noop(NoopReason.MERGE_OWNED_BY_TURN)
+
+
+def test_row2b_an_open_pr_under_a_merge_self_relay_is_row5() -> None:
+    assert _decide(_merge_self_tail(), _pr("open")) == Noop(NoopReason.OPEN_NO_HOLD)
+    moved = _pr("open", head=_OTHER)
+    assert _decide(_merge_self_tail(), moved, ci=CiState.SUCCESS) == Noop(NoopReason.OPEN_NO_HOLD)
+
+
+def test_row2b_row2_still_wins_on_a_settled_thread() -> None:
+    assert _decide(_merge_self_tail(token="none"), _pr("merged")) == Noop(NoopReason.SETTLED)
+
+
+def test_row2b_unexpected_state_is_still_row9() -> None:
+    assert _decide(_merge_self_tail(), _pr("draft")) == Noop(NoopReason.UNKNOWN_STATE)
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        "> MERGE-SELF: pr=acme/widgets#7 head=x",  # quoted
+        " MERGE-SELF: pr=acme/widgets#7 head=x",  # indented
+        "merge-self: pr=acme/widgets#7 head=x",  # wrong case
+        "MERGE-WAIT: something else",  # the other mark
+    ],
+)
+def test_row2b_only_a_column_zero_mark_counts(mark: str) -> None:
+    d = _decide(_merge_self_tail(mark=mark), _pr("merged"))
+    assert isinstance(d, Post)
+    assert d.next_line == "NEXT: Bohr"
+
+
+def test_row2b_a_mark_under_another_author_is_row1() -> None:
+    tail = read_relay_tail("Heisenberg", _merge_self_relay())
+    assert _decide(tail, _pr("merged")) == Noop(NoopReason.NOT_RELAY_TAIL)
+
+
+@pytest.mark.parametrize(
+    ("state", "phrase"), [("merged", "が merge された"), ("closed", "close された")]
+)
+def test_row2b_regression_unmarked_relays_keep_rows_3_and_4(state: str, phrase: str) -> None:
+    d = _decide(_tail(token="Heisenberg"), _pr(state))
+    assert isinstance(d, Post)
+    assert d.next_line == "NEXT: Bohr"
+    assert phrase in d.body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("merged", [True, False])
+async def test_row2b_tick_writes_nothing_then_the_implementer_report_ends_it(merged: bool) -> None:
+    # The double advance Einstein found (msg-7575 #2): the merge lands while the MERGE relay is
+    # still the tail. 1b must not post; the implementer's own report then becomes the tail and
+    # every later tick is row 1.
+    chat = _chat(tail_body=_merge_self_relay())
+    gh = _FakeGh(_closed(merged))
+    first = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    assert first.as_dict()["posted"] == 0
+    assert first.outcomes[0].reason == NoopReason.MERGE_OWNED_BY_TURN.value
+    assert len(chat.threads[_THREAD]) == 2
+    chat.threads[_THREAD].append(
+        {"msg_id": "msg-3", "author": "Heisenberg", "content": "merged abc\n\nNEXT: Bohr"}
+    )
+    second = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    assert second.as_dict()["posted"] == 0
+    assert second.outcomes[0].reason == NoopReason.NOT_RELAY_TAIL.value
+    assert gh.ci_reads == 0

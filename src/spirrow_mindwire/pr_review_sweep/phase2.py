@@ -99,6 +99,12 @@ from .phase1 import CLOSE_CANDIDATE_CLASSES, LedgerRow, Phase1Class
 #: not decided here: msg-6014 §3 leaves it to the first live run to observe.
 DEFAULT_AUTHOR = "orchestrator"
 
+#: The role every close declares (msg-7279). A close never goes out without a role: a
+#: ``role=null`` decide under the closer's name is what msg-7218 found. The default author
+#: ``orchestrator`` holds no roles, so ``orchestrator`` + ``integrator`` is refused
+#: (``RoleNotAllowedToClose``) and rule 1 records REFUSED -- the safe failure is unchanged.
+DEFAULT_ROLE = "integrator"
+
 #: Same value the gate-bootstrap sweeper declares on its own closes. ``chatroom_close_thread``
 #: emits a ``decide`` message, so an embodiment is required on the call.
 CLOSE_EMBODIMENT = "unknown"
@@ -145,6 +151,7 @@ class Phase2Settings:
     backoff_cap_units: int = DEFAULT_BACKOFF_CAP_UNITS
     backoff_unit_seconds: int = DEFAULT_BACKOFF_UNIT_SECONDS
     author: str = DEFAULT_AUTHOR
+    role: str = DEFAULT_ROLE
 
     def __post_init__(self) -> None:
         for name in (
@@ -158,6 +165,8 @@ class Phase2Settings:
                 raise ValueError(f"Phase2Settings.{name} must be >= 1")
         if not self.author.strip():
             raise ValueError("Phase2Settings.author must be non-empty")
+        if not self.role.strip():
+            raise ValueError("Phase2Settings.role must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -350,6 +359,7 @@ async def attempt_close(
         "project": row.project,
         "thread_id": row.thread_id,
         "author": settings.author,
+        "role": settings.role,
         "summary_content": close_summary(row),
         "embodiment": CLOSE_EMBODIMENT,
     }
@@ -510,6 +520,7 @@ def report_to_json(report: Phase2Report) -> dict[str, Any]:
             "backoff_cap_units": s.backoff_cap_units,
             "backoff_unit_seconds": s.backoff_unit_seconds,
             "author": s.author,
+            "role": s.role,
         },
         "closed": [ref(a.row) for a in report.closed],
         "refused": refused,
@@ -543,6 +554,7 @@ __all__ = [
     "DEFAULT_BREAKER",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_NEEDS_HUMAN_AFTER",
+    "DEFAULT_ROLE",
     "STATE_SCHEMA_VERSION",
     "AttemptOutcome",
     "AttemptRecord",

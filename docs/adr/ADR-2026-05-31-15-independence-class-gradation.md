@@ -67,6 +67,7 @@ naysayer の Gemini 化は、SpirrowGames の private な設計情報（ADR / di
 - **防御線（改訂後）**: **paid 鍵＝必須不変条件（最後の防御線、非訓練）** + ZDR＝推奨。当初 paid+ZDR の二重防御を必須としていたが、Takahito 決定（2026-06-01）+ trilateral 収束（`T-zdr-invariant-downgrade` msg-373）で ZDR を推奨へ格下げ。データ統治の詳細・再必須化トリガー・検知点・paid 鍵の構造的保証は **ADR-14 D-4 が SOT**（本項と共有）。
 - ただし「Anthropic 境界の外に出す」事実自体は消えない。paid 鍵は学習利用を防ぐが、境界外移動そのものの解消ではない。
 - **N-3（実害度の異なる部分集合）**: naysayer 経路に渡る設計情報は一括りにできない。ゲームプレイ/コンテンツ設計は実害低だが、**セキュリティ構成・未公開脆弱性に触れる naysay（T15 認証4軸・Vaultwarden/firewall 構成議論、PR の脆弱性指摘）は実害度が異なり、かつ naysayer 経路を実際に通っている**（再帰構造）。この部分集合は ADR-14 D-4 の再必須化トリガー (ii) で ZDR 必須側に分岐する。
+  - codex の経路（ADR-14 §7）では、この部分集合を Gemini 固定とします。見分け方と、事前に分類できない場合に受け入れる残りのリスク（Takahito の goal 判断）は、ADR-14 §7.3 が SOT です。
 - adapter 層で「素の `generateContent` 以外を呼ばない」「bundle に含める機密を最小化」を gate として実装（ADR-14 D-4 と共有、ZDR 要否と独立の surface 強制）。
 
 ---
