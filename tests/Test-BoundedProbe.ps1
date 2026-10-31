@@ -415,7 +415,9 @@ exit 3
     # no -UvOptions either.
     # +1 for Invoke-SummonGit (T-human-call-priority-interrupt, PR #475 review): a git launcher, so
     # no -UvOptions (it passes -Environment instead).
-    Check 'fifteen helper call sites in the sweep script' 15 $helperCalls.Count
+    # +1 for the operator pass (T-operator-task-lane PR2, D1'): the -Invoke scriptblock handed to
+    # Invoke-OperatorLanePass; no -UvOptions either.
+    Check 'sixteen helper call sites in the sweep script' 16 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
