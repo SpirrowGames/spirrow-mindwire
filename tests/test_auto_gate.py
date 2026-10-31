@@ -300,6 +300,24 @@ def test_quoted_thread_line_is_not_read() -> None:
     assert resolve_thread_link("> Thread: T-foo").noop is AutoGateNoop.NO_THREAD
 
 
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "> Closes-thread: T-foo",
+        ">Closes-thread: T-foo",
+        "  > Closes-thread: T-foo",
+        ">> Closes-thread: T-foo",
+    ],
+)
+def test_quoted_closes_thread_line_is_not_read(quote: str) -> None:
+    """The regex runs on the raw body, so its ``^`` anchor is what keeps a quote out."""
+    assert resolve_thread_link(quote).noop is AutoGateNoop.NO_THREAD
+    for body in (f"Thread: T-bar\n\n{quote}\n", f"{quote}\r\nThread: T-bar"):
+        link = resolve_thread_link(body)
+        assert link.noop is None
+        assert link.thread_id == "T-bar"
+
+
 def test_unclosed_fence_does_not_hide_the_line_below_it() -> None:
     assert resolve_thread_link("```\ncode\nThread: T-foo").thread_id == "T-foo"
 
