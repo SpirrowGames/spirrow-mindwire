@@ -28,8 +28,9 @@ Reasoning-model handling (msg-210 / msg-215): the reply is
 e.g. ``finish_reason="length"`` with the whole budget spent on
 reasoning — is a **fail-loud** :class:`NaysayerLexoraDeliveryError`, not a
 silent empty post. ``max_tokens`` defaults to 4096 (well above the
-reasoning-model ``>=1500`` floor) and the timeout matches Lexora's 900s
-backend.
+reasoning-model ``>=1500`` floor) and the timeout is the client default:
+Lexora's 900s backend plus the client margin, so the client outlives the
+backend instead of tying with it.
 
 Failures map to the §3.4 Port exception catalog via adapter-specific
 subclasses (:class:`NaysayerLexoraSpawnError` etc.); the failure code is
@@ -49,7 +50,13 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
-from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
+from ..lexora.client import _CLIENT_DEFAULT_MARGIN_SECONDS as _CLIENT_MARGIN_SECONDS
+from ..lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
+    ChatMessage,
+    LexoraChatClient,
+    LexoraClient,
+)
 from ..ports import SpawnContext
 from ..thread_context import render_thread_context
 from ..ulid_util import new_ulid
@@ -74,7 +81,9 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 
 _DEFAULT_MODEL = "naysayer"
 _DEFAULT_MAX_TOKENS = 4096  # >= the reasoning-model 1500 floor, with content headroom
-_DEFAULT_TIMEOUT_SECONDS = 900.0  # matches the Lexora backend timeout
+# Backend timeout + the client margin (thread msg-6612/6613): an exact 900s tie with the backend
+# would let the client cut the connection before the backend's own timeout answers.
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_MARGIN_SECONDS
 
 # main order #2 (msg-215): the naysayer must disagree by default and
 # critique by *quoting the specific passage* it objects to (citation-type

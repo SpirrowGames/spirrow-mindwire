@@ -130,6 +130,12 @@ need API-key billing, stop: that is a Tier-C `cost` decision.**
      Test-NetConnection {{IP_SERVICES}} -Port 8110
      ```
 
+   - The session's environment is built from `mw-operator`'s own logon (`LogonUserW` +
+     `CreateEnvironmentBlock`, inheriting nothing), and the runner refuses to start it if any
+     `MINDWIRE_*` name or value of 8+ chars appears. A refusal shows in the run's report as `session_failed` with
+     `session environment carries runner settings: <names>`. `LogonUserW` needs the same
+     "Allow log on locally" right that `runas` uses above. If it fails, record the error code.
+
 8. **Turn it on:** set `"enabled": true`. The first enabled tick creates `state\operator_lane.json`.
 
 ## The `/mindwire-operator` skill (hand-driven sessions)

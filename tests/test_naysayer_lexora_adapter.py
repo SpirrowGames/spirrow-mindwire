@@ -60,12 +60,20 @@ class _FakeLexora:
         self._health_error = health_error
         self._health_body = health_body or {"status": "ok", "backends": {"naysayer": "healthy"}}
         self.calls: list[dict[str, Any]] = []
+        # ADR-14 §7.3 routing declaration per call (thread msg-6982).
+        self.n3_routed: list[bool] = []
         self.health_calls = 0
         self.closed = False
 
     async def chat_completion(
-        self, *, model: str, messages: list[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         self.calls.append({"model": model, "messages": messages, "max_tokens": max_tokens})
         if self._chat_error is not None:
             raise self._chat_error
@@ -195,6 +203,9 @@ async def test_deliver_emits_reply_from_content() -> None:
     # the tier name + max_tokens were passed through
     assert fake.calls[0]["model"] == "naysayer"
     assert fake.calls[0]["max_tokens"] == 4096
+    # This adapter pins its tier and never runs ``route_tier``, so it never declares the
+    # ADR-14 §7.3 routing (thread msg-6982): Lexora serves a codex tier from Gemini for it.
+    assert fake.n3_routed == [False]
     hs = await adapter.health(handle)
     assert hs.state is SessionState.IDLE
 
@@ -411,3 +422,11 @@ async def test_aclose_closes_shared_client() -> None:
     adapter = NaysayerLexoraAdapter(client=fake)
     await adapter.aclose()
     assert fake.closed is True
+
+
+def test_default_timeout_outlives_the_backend() -> None:
+    """No exact tie with Lexora's 900s backend timeout (Einstein msg-6613 advisory 2)."""
+    from spirrow_mindwire.adapters import naysayer_lexora
+    from spirrow_mindwire.lexora.client import LEXORA_BACKEND_TIMEOUT_SECONDS
+
+    assert naysayer_lexora._DEFAULT_TIMEOUT_SECONDS > LEXORA_BACKEND_TIMEOUT_SECONDS

@@ -85,7 +85,12 @@ class _FakeLexora:
         self._critique = critique
 
     async def chat_completion(
-        self, *, model: str, messages: list[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
         return ChatCompletion(
             content=self._critique,

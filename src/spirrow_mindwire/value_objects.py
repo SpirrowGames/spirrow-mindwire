@@ -247,6 +247,10 @@ class ChatroomEvent:
     payload: EventPayload  # union by event_type
     thread_context: ThreadContext | None = None
     retry_notice: str | None = None
+    # The thread's tags, as the reader saw them (``chatroom_get_thread`` ``thread.tags``).
+    # ``None`` = not read. The naysayer's tier routing reads the ``n3-sensitive`` marker
+    # here and treats ``None`` as "marked" (ADR-14 §7.3, fail-safe to the Gemini tier).
+    thread_tags: tuple[str, ...] | None = None
     # ADR-2026-10-09-23 unit 1 (design v1.2 B-3 step 6): the thread branch the git-sync hook put
     # the clone on, set by the dispatcher after ``pre_turn``. Information for the role session,
     # not a rule it must follow (D7). ``None`` (sync off) leaves the prompt byte-for-byte as before.
@@ -284,6 +288,24 @@ class ReplyDraft:
 
 AttestationScope: TypeAlias = Literal["turn", "probe"]
 """What an :class:`AttestationRecord`'s rows are rows of — see its ``scope`` field."""
+
+
+# How a SET of backend names is written into one ``AttestationRecord.backend`` / ``.expected``
+# value (ADR-14 §7.6: the codex tier accepts ``codex|gemini-fallback``). Sorted, so one set has
+# one spelling; ``|`` collides with neither the marker's field separator nor ``=``. Lives here,
+# beside the record, so the preflight can write it without importing the marker builder
+# (msg-834 §2 (c)).
+_BACKEND_SET_SEP = "|"
+
+
+def join_backends(backends: frozenset[str]) -> str:
+    """Render a backend set as one record field value (sorted, ``|``-joined)."""
+    return _BACKEND_SET_SEP.join(sorted(backends))
+
+
+def split_backends(value: str) -> frozenset[str]:
+    """Inverse of :func:`join_backends`. Empty members are dropped."""
+    return frozenset(part.strip() for part in value.split(_BACKEND_SET_SEP) if part.strip())
 
 
 @dataclass(frozen=True)
@@ -437,5 +459,7 @@ __all__ = [
     "ThreadContext",
     "ThreadContextMessage",
     "ThreadRef",
+    "join_backends",
     "mint_instance_id",
+    "split_backends",
 ]

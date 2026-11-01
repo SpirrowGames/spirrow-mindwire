@@ -112,7 +112,7 @@ from ..routing import (
     diagnose_carve_out_iii,
     guard_proposer_to_implementer,
 )
-from ..source_marker import parse_attestation_marker
+from ..source_marker import attestation_agrees, parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
@@ -604,6 +604,9 @@ class Conductor:
         self._mcp = mcp
         self._dispatcher = dispatcher
         self._thread_ref = thread_ref
+        # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
+        # the response carries none) — handed to every event for the naysayer's N-3 routing.
+        self._thread_tags: tuple[str, ...] | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -2556,7 +2559,9 @@ class Conductor:
         session — the thing the loop's carve-outs are named after ("the *independent* naysayer")
         was never shown to be independent for that post.
 
-        ``backend == expected`` is required as well as well-formedness, and what that buys is
+        ``backend`` within ``expected`` (:func:`~spirrow_mindwire.source_marker.attestation_agrees`:
+        equality for a single backend, subset for the codex tier's ``codex|gemini-fallback``,
+        ADR-14 §7.6) is required as well as well-formedness, and what that buys is
         narrow enough to be worth stating exactly. It refuses a stamp whose own fields RECORD a
         mismatch — an observation that the tier resolved somewhere other than the independent
         distribution. P-2 fails closed before such a record is ever rendered, so the harness does
@@ -2591,7 +2596,7 @@ class Conductor:
         marker" — is a constraint on the write path and is untouched.
         """
         record = parse_attestation_marker(_content(msg))
-        return record is not None and record.backend == record.expected
+        return record is not None and attestation_agrees(record)
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has an ATTESTED naysayer posted since the last ``NEXT: human`` boundary (excl. latest)?
@@ -2662,6 +2667,7 @@ class Conductor:
                 },
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
+        self._thread_tags = _thread_tags(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -3330,6 +3336,7 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
             retry_notice=retry_notice,
+            thread_tags=self._thread_tags,
             resume_notice=resume_notice,
         )
 
@@ -3702,6 +3709,19 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_tags(result: Any) -> tuple[str, ...] | None:
+    """``thread.tags`` of a ``chatroom_get_thread`` response, or None if absent/malformed.
+
+    The measured ``mode="full"`` shape (msg-4749) carries thread metadata under
+    ``thread``. Anything else is "not read", which the N-3 routing treats as marked.
+    """
+    thread = result.get("thread") if isinstance(result, dict) else None
+    tags = thread.get("tags") if isinstance(thread, dict) else None
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None
+    return tuple(tags)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

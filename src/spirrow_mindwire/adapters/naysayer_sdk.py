@@ -93,7 +93,25 @@ from ..exceptions import (
     AdapterSpawnError,
 )
 from ..lexora.client import LexoraClient
-from ..naysayer.adr_index import build_adr_index_block
+from ..naysayer.adr_index import adr_manifest_path, build_adr_index_block
+from ..naysayer.n3_design_time import (
+    PromptFiles,
+    find_repo_root,
+    remote_default_branch_reader,
+    resolve_prompt_files,
+    working_config_reader,
+)
+from ..naysayer.n3_routing import (
+    ConfigReader,
+    GlobLoad,
+    N3Request,
+    TierDecision,
+    UnresolvedNotifier,
+    has_marker,
+    load_n3_globs,
+    notify_unresolved,
+    route_tier,
+)
 from ..naysayer.preflight import (
     CUSTOM_HEADERS_ENV,
     PREFLIGHT_TIMEOUT_SECONDS,
@@ -104,11 +122,7 @@ from ..naysayer.preflight import (
     attest_turn,
     custom_headers_env_value,
 )
-from ..naysayer.principles import (
-    NAYSAYER_EXPECTED_BACKEND,
-    NAYSAYER_MODEL_TIER,
-    build_preamble,
-)
+from ..naysayer.principles import allowed_backends, build_preamble, principles_path
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -161,6 +175,31 @@ a concrete basis (principle 3), and never stay silent about a real concern \
 (principle 5). Your entire response is posted verbatim to the thread as your \
 reply, so reply directly with the critique — no preamble, no meta-commentary.
 """
+
+
+class _Routed:
+    """Sentinel type: "no tier pinned by the caller — let :func:`route_tier` decide"."""
+
+
+_ROUTED = _Routed()
+
+
+def design_time_tier_decision() -> TierDecision:
+    """The design-time tier when NO turn inputs exist yet (ADR-14 §7.3 / §7.6).
+
+    Used at spawn, before any event (the spawn-time dry-run preflight and the
+    ``source:`` options stored at spawn): with nothing read, ``route_tier`` sees
+    ``marker=None`` and answers the Gemini-only tier. Each turn then re-decides on its
+    own inputs (:meth:`NaysayerSdkAdapter._turn_tier`).
+    """
+    return route_tier(
+        N3Request(
+            marker=None,
+            paths=(),
+            globs=GlobLoad(None, "design-time routing inputs not wired"),
+            prompt_chars=0,
+        )
+    )
 
 
 class NaysayerSdkSpawnError(AdapterSpawnError):
@@ -343,6 +382,25 @@ def build_naysayer_system_prompt(
     )
 
 
+def naysayer_prompt_files(*, repo_root: Path | None = None) -> PromptFiles:
+    """The files :func:`build_naysayer_system_prompt` reads, split as N-3 routing needs them
+    (thread msg-6582 gap 2 as corrected by msg-6588).
+
+    Both are MindWire's own files, so both are ``system_assets``: the principles SOT from
+    :func:`principles_path` and the ADR manifest from :func:`adr_manifest_path` — the same
+    expressions the two loaders read, so this list cannot name a different file than the one
+    the prompt carries. The design-time prompt carries no host-repository file today, so
+    ``host_files`` is empty. ``tests/test_n3_design_time.py`` pins that the set of files the
+    builder actually opens equals the union of ``host_files`` and ``system_assets``; a
+    builder change that adds a file must add it here or that test reds. The per-turn prompt
+    (:func:`build_turn_prompt`) carries thread text only, no file.
+    """
+    return PromptFiles(
+        host_files=(),
+        system_assets=(principles_path(), adr_manifest_path(repo_root)),
+    )
+
+
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
     return build_turn_prompt(event, own_role, "Reply to this message in your role.")
 
@@ -443,14 +501,17 @@ class NaysayerSdkAdapter:
         cwd: Path,
         obligations: ObligationsManifest,
         inference_base_url: str | None = None,
-        model: str | None = NAYSAYER_MODEL_TIER,
+        model: str | None | _Routed = _ROUTED,
         system_prompt: str | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         extra_env: dict[str, str] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
-        expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
+        prompt_files: PromptFiles | None = None,
+        repo_root_finder: Callable[[Path], Awaitable[Path | None]] | None = None,
+        trusted_reader: Callable[[Path | None], ConfigReader] | None = None,
+        n3_notifier: UnresolvedNotifier | None = None,
         turn_rows: TurnRowReader | None = None,
         shutdown_grace: timedelta = timedelta(seconds=5),
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -480,7 +541,39 @@ class NaysayerSdkAdapter:
             if inference_base_url is not None
             else os.environ.get(_ENV_BASE_URL, "")
         )
-        self._model = model
+        # ADR-14 §7.6: the tier is chosen by ``route_tier`` (the one decision point) unless a
+        # caller pins one; the accepted backends are ALWAYS derived from the chosen tier through
+        # the same table, never passed in separately.
+        self._routed = isinstance(model, _Routed)
+        self._model: str | None = (
+            design_time_tier_decision().tier if isinstance(model, _Routed) else model
+        )
+        # Per-turn N-3 routing inputs (ADR-14 §7.3; thread msg-6475..6579). Each is
+        # injectable so tests touch neither git nor GitHub.
+        # - prompt_files: the files whose CONTENT the prompt carries (§7.5), split into host
+        #   files and MindWire system assets (msg-6588). Unset, it is what the builder that
+        #   renders the system prompt reports (naysayer_prompt_files). A caller that supplies
+        #   its own system_prompt must also say which files it carries: there is no default
+        #   that could quietly claim "none".
+        # - repo_root_finder: the prompt source's git top level (never the process cwd).
+        # - trusted_reader: the remote default branch through the contents API.
+        # - n3_notifier: told when the trusted side cannot be resolved (msg-6477).
+        if prompt_files is None and system_prompt is not None and self._routed:
+            raise ValueError(
+                "a routed NaysayerSdkAdapter given its own system_prompt must also be given "
+                "prompt_files: N-3 routing has to know which files that prompt carries"
+            )
+        self._prompt_files = prompt_files if prompt_files is not None else naysayer_prompt_files()
+        self._repo_root_finder = repo_root_finder or find_repo_root
+        self._trusted_reader = trusted_reader or remote_default_branch_reader
+        self._n3_notifier = n3_notifier
+        # ADR-14 §7.3 routing declaration (thread msg-6982; msg-7068, human decision B):
+        # the v1 header goes through ANTHROPIC_CUSTOM_HEADERS on every turn of a routed
+        # adapter, whatever tier route_tier picks for that turn (Lexora ignores it on a
+        # tier without codex, msg-6984). A pinned ``model`` was never classified here,
+        # so it never carries the declaration. It is fixed for the adapter's lifetime,
+        # never toggled per turn.
+        self._n3_routed = self._routed
         # Loop-readable obligations are injected — the manifest passed in is the
         # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
         # adapter never reaches for a module-global path itself. The verdict-
@@ -498,7 +591,6 @@ class NaysayerSdkAdapter:
         self._mcp_servers = mcp_servers or {}
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
-        self._expected_backend = expected_backend
         # Injectable so tests never touch the network. Unset, the default runs
         # the real probe against **this adapter's own** inference base URL — not
         # ``MINDWIRE_LEXORA_URL``, which is a different variable pointing at a
@@ -512,10 +604,60 @@ class NaysayerSdkAdapter:
         self._turn_rows = turn_rows
         self._sessions: dict[SessionHandle, _Session] = {}
 
-    async def _run_preflight(self) -> AttestationRecord:
+    async def _turn_tier(self, event: ChatroomEvent, prompt: str) -> TierDecision | None:
+        """This turn's tier from :func:`route_tier`; ``None`` when the caller pinned one.
+
+        Inputs (design-time branch of msg-6579): the thread's tags (``None`` = not read →
+        Gemini); the referenced files, resolved against the repository root with the
+        out-of-tree / symlink / existence checks; the config as the union of the remote
+        default branch (trusted) and the root's ``N3_CONFIG_PATH`` (working); the size of
+        the prompt this turn would send. Globs are loaded only when the marker was read and
+        is absent — a marked or unread request goes to Gemini whatever they say.
+        """
+        if not self._routed:
+            return None
+        tags = event.thread_tags
+        marker = None if tags is None else has_marker(tags)
+        prompt_chars = len(self._system_prompt) + len(prompt)
+        globs = GlobLoad(None, "not loaded: marker set or unread")
+        paths: tuple[str, ...] = ()
+        problem: str | None = None
+        if marker is False:
+            root = await self._repo_root_finder(self._cwd)
+            globs = await load_n3_globs(
+                trusted=self._trusted_reader(root), working=working_config_reader(root)
+            )
+            paths, problem = resolve_prompt_files(
+                host_files=self._prompt_files.host_files,
+                system_assets=self._prompt_files.system_assets,
+                summon_dir=self._cwd,
+                repo_root=root,
+            )
+            await notify_unresolved(
+                globs, f"design-time {event.thread_ref.thread_id}", self._n3_notifier
+            )
+        decision = route_tier(
+            N3Request(
+                marker=marker,
+                paths=paths,
+                globs=globs,
+                prompt_chars=prompt_chars,
+                path_problem=problem,
+            )
+        )
+        logger.info(
+            "n3 routing: design-time %s -> tier=%s (%s)",
+            event.thread_ref.thread_id,
+            decision.tier,
+            decision.reason,
+        )
+        return decision
+
+    async def _run_preflight(self, tier: str | None = None) -> AttestationRecord:
         if self._preflight is not None:
             return await self._preflight()
-        if not self._model:
+        tier = tier if tier is not None else self._model
+        if not tier:
             # Nothing to attest: with no model kwarg the session does not name a
             # tier, so there is no tier→backend resolution to observe. Refusing
             # is the honest answer; probing with an empty model would fail with
@@ -526,8 +668,8 @@ class NaysayerSdkAdapter:
             )
         return await attest_backend(
             base_url=self._inference_base_url,
-            tier=self._model,
-            expected=self._expected_backend,
+            tier=tier,
+            allowed=allowed_backends(tier),
         )
 
     async def _read_turn_rows(self, trace_id: str) -> list[dict[str, Any]]:
@@ -538,17 +680,18 @@ class NaysayerSdkAdapter:
         ) as client:
             return await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
 
-    @staticmethod
-    def _turn_options(options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
+    def _turn_options(self, options: ClaudeAgentOptions, trace_id: str) -> ClaudeAgentOptions:
         """Copy the session's ``options`` so its subprocess tags every request with ``trace_id``.
 
         The spawn-time ``options`` object is not modified: it is what the
         ``source:`` marker is rendered from, and the only field that differs here
-        is the trace header, which the marker does not describe. The header lives
+        is the request headers (the trace id, plus the §7.3 routing declaration on every
+        turn of a routed adapter), which the marker does not describe. The headers live
         in the subprocess **env** — the SDK subprocess is per turn
         (1-turn-1-session), so an env value is scoped to exactly one turn.
         """
-        env = {**options.env, CUSTOM_HEADERS_ENV: custom_headers_env_value(trace_id)}
+        headers = custom_headers_env_value(trace_id, n3_routed=self._n3_routed)
+        env = {**options.env, CUSTOM_HEADERS_ENV: headers}
         return replace(options, env=env)
 
     def _make_options(self) -> ClaudeAgentOptions:
@@ -792,8 +935,16 @@ class NaysayerSdkAdapter:
         # Never let a previous turn's record survive into this one: if anything
         # below fails, nothing is attested for this turn.
         session.attestation = None
+        prompt = _build_prompt(event, session.own_role)
         try:
-            probe_record = await self._run_preflight()
+            # ADR-14 §7.3 / §7.6: decide this turn's tier first; the preflight, the session's
+            # options (and so the source: line) and the turn attestation all follow it.
+            decision = await self._turn_tier(event, prompt)
+            if decision is not None:
+                session.options = replace(session.options, model=decision.tier)
+            probe_record = await self._run_preflight(
+                decision.tier if decision is not None else None
+            )
         except Exception as exc:
             # Yield to halt: the preflight is awaited with no client published,
             # so a halt landing here is a pure state transition that may already
@@ -879,7 +1030,7 @@ class NaysayerSdkAdapter:
             # abandoned client down. No retry here: the turn fails loudly.
             # The ``query`` and the drain after it are still unbounded.
             await connect_bounded(client, self._connect_timeout_seconds)
-            await client.query(_build_prompt(event, session.own_role))
+            await client.query(prompt)
             body, result = await _drain_reply(client)
             body_success = True
         except SdkIsErrorSignal as sig:
@@ -1013,7 +1164,7 @@ class NaysayerSdkAdapter:
             turn_record = await attest_turn(
                 route=probe_record.route,
                 tier=probe_record.tier,
-                expected=self._expected_backend,
+                allowed=allowed_backends(probe_record.tier),
                 trace_id=turn_trace_id,
                 read_rows=self._read_turn_rows,
             )
