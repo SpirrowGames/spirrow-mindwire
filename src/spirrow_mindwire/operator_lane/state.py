@@ -154,14 +154,19 @@ def atomic_write_text(path: Path, text: str, *, unique_tmp: bool = False) -> Non
     ``<path>.<pid>-<random>.tmp``, so concurrent writers never share or truncate a temp file and
     the last ``os.replace`` wins with a whole file (PR #505 gate).
     """
+    atomic_write_bytes(path, text.encode("utf-8"), unique_tmp=unique_tmp)
+
+
+def atomic_write_bytes(path: Path, data: bytes, *, unique_tmp: bool = False) -> None:
+    """:func:`atomic_write_text` for bytes kept exactly as given (the config's ``.bak`` copy)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if unique_tmp:
         tmp = path.with_name(f"{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
     else:
         tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
+        with open(tmp, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         _replace(tmp, path, retries=_REPLACE_RETRIES if unique_tmp else 0)
@@ -553,6 +558,7 @@ __all__ = [
     "MutexTimeoutError",
     "ProcessProbe",
     "PsutilProbe",
+    "atomic_write_bytes",
     "atomic_write_text",
     "conductor_lock",
     "create_lock",
