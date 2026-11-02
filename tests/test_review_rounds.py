@@ -16,8 +16,11 @@ from spirrow_mindwire.adapters.naysayer_sdk import _NAYSAYER_ROLE_PROMPT
 from spirrow_mindwire.conductor.core import Conductor
 from spirrow_mindwire.conductor.handoff import build_handoff_protocol_block
 from spirrow_mindwire.github.client import GitHubClient, GitHubHTTPError, PrRef, ReviewEvent
+from spirrow_mindwire.lexora.client import ChatCompletion
+from spirrow_mindwire.naysayer import pr_review
 from spirrow_mindwire.naysayer.pr_review import (
     _PR_REVIEW_SYSTEM_PROMPT,
+    PrRoundContext,
     _build_messages,
     _is_whole_content_review,
     decide_verdict,
@@ -289,6 +292,69 @@ def test_unreadable_vocabulary_logs_unparsed_without_raising(
     line = _log_design(caplog, _fenced([BLOCKING_ITEM]), 2)
     assert "objections_unparsed=1" in line
     assert " blocking=-" in line
+
+
+def _log_pr(caplog: pytest.LogCaptureFixture, critique: str) -> str:
+    """D5 through the PR gate's own parser, so a parser status change reaches this assertion."""
+    with caplog.at_level(logging.INFO, logger=pr_review.logger.name):
+        pr_review._log_pr_round(
+            "o/r#1",
+            "naysayer",
+            ChatCompletion("", None, "stop", "m", {"completion_tokens": 7}),
+            PrRoundContext(round_number=2, scope="delta"),
+            parse_objections(critique),
+        )
+    return caplog.messages[-1]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '[{"class": "correctness", "where": "a", "evidence": "b"}',  # unclosed array
+        "[",
+        '[{"class": }]',
+        '[{"class": "correctness", "evid',  # cut off mid-string
+        '{"class": "correctness"}',  # not an array
+        "prose first []",
+        '[]\n[{"class": "correctness", "where": "a", "evidence": "b"}]',  # decoy before a block
+    ],
+)
+def test_pr_round_block_that_does_not_parse_is_unparsed_not_zero(
+    caplog: pytest.LogCaptureFixture, payload: str
+) -> None:
+    line = _log_pr(caplog, f"{M}\n{payload}\n")
+    assert "objections_unparsed=1" in line
+    assert " blocking=-" in line
+
+
+def test_pr_round_without_a_marker_is_unparsed(caplog: pytest.LogCaptureFixture) -> None:
+    line = _log_pr(caplog, "a critique with no block")
+    assert "objections_unparsed=1" in line
+    assert " blocking=-" in line
+
+
+def test_pr_round_empty_block_is_a_real_zero(caplog: pytest.LogCaptureFixture) -> None:
+    """``[]`` read correctly, so it must not be lumped in with failures to read."""
+    line = _log_pr(caplog, f"{M}\n[]\n")
+    assert "objections_unparsed=0" in line
+    assert " blocking=0" in line
+
+
+@pytest.mark.parametrize(
+    ("element", "blocking"),
+    [
+        ({"class": "no-such-class", "where": "a", "evidence": "b"}, 1),  # status UNKNOWN
+        (1, 1),  # malformed element, status UNKNOWN
+        ({"class": "correctness", "where": "a"}, 1),  # status NO_EVIDENCE
+    ],
+)
+def test_pr_round_counts_readable_blocks_whose_status_is_not_ok(
+    caplog: pytest.LogCaptureFixture, element: object, blocking: int
+) -> None:
+    """These parsed and block the verdict, so reading only ``OK`` would lose counted blockers."""
+    line = _log_pr(caplog, f"{M}\n{json.dumps([element])}\n")
+    assert "objections_unparsed=0" in line
+    assert f" blocking={blocking}" in line
 
 
 # ── D1 / D6 / D7: one rule text in every prompt ───────────────────────────────────────────────
