@@ -89,6 +89,7 @@ from .n3_routing import (
     N3Request,
     TierDecision,
     UnresolvedNotifier,
+    codex_limit_band_trace_id,
     has_marker,
     load_n3_globs,
     notify_unresolved,
@@ -2349,13 +2350,22 @@ class NaysayerPrReviewDriver:
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        tier = (
-            self._model
-            if self._model is not None
-            else (await self._route(pr, view=view, coverage=coverage)).tier
+        routing = (
+            None if self._model is not None else await self._route(pr, view=view, coverage=coverage)
         )
+        tier = self._model if routing is None else routing.tier
+        assert tier is not None
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
-            view, pr.slug, coverage=coverage, tier=tier, n3_routed=self._model is None
+            view,
+            pr.slug,
+            coverage=coverage,
+            tier=tier,
+            n3_routed=self._model is None,
+            trace_id=(
+                codex_limit_band_trace_id()
+                if routing is not None and routing.in_codex_limit_band
+                else None
+            ),
         )
 
         if isinstance(pass1_result, LexoraTimeoutError):
@@ -2559,6 +2569,7 @@ class NaysayerPrReviewDriver:
         coverage: list[CrossPrApproveCoverage] | None = None,
         tier: str,
         n3_routed: bool,
+        trace_id: str | None = None,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -2589,20 +2600,27 @@ class NaysayerPrReviewDriver:
         when an operator/test pinned ``model`` — and is sent on BOTH passes as the
         ``X-Mindwire-N3-Route: v1`` declaration (ADR-14 §7.3, thread msg-6982): the two passes
         carry the same diff, so they carry the same classification.
+
+        ``trace_id`` is set only for a request in the codex limit band, and both passes carry it,
+        so the ledger's distinct trace ids count reviews rather than passes.
         """
         pass1_task = self._lexora.chat_completion(
             model=tier,
             messages=_build_messages(view.text, pr_slug, coverage=coverage),
             # The codex tier's prompt limit is derived from CODEX_OUTPUT_RESERVE_TOKENS, so the
-            # request stays within it; the raised budget (msg-7130) applies to the Gemini tier.
+            # request stays within it. At the default budget this changes nothing; it caps a
+            # deployment's larger review_max_tokens on this tier only.
             max_tokens=(
                 min(self._max_tokens, CODEX_OUTPUT_RESERVE_TOKENS)
                 if tier == NAYSAYER_MODEL_TIER
                 else self._max_tokens
             ),
+            trace_id=trace_id,
             n3_routed=n3_routed,
         )
-        pass2_task = self._collect_adr_pointers(view.text, pr_slug, tier=tier, n3_routed=n3_routed)
+        pass2_task = self._collect_adr_pointers(
+            view.text, pr_slug, tier=tier, n3_routed=n3_routed, trace_id=trace_id
+        )
         # ``return_exceptions=True`` isolates the two passes: pass 2's exception must never
         # reach the caller (fail-open), and pass 1's exception is inspected below so the
         # LexoraTimeoutError → degrade path is preserved while other exceptions still
@@ -2618,7 +2636,7 @@ class NaysayerPrReviewDriver:
         return pass1_outcome, pass2_selection, pass2_raw
 
     async def _collect_adr_pointers(
-        self, text: str, pr_slug: str, *, tier: str, n3_routed: bool
+        self, text: str, pr_slug: str, *, tier: str, n3_routed: bool, trace_id: str | None = None
     ) -> tuple[AdrPointerSelection, str]:
         """Run pass 2 → M1'/M2 pipeline. Returns (selection, raw_content).
 
@@ -2637,6 +2655,7 @@ class NaysayerPrReviewDriver:
                     model=tier,
                     messages=_build_pass2_messages(text, pr_slug),
                     max_tokens=_ADR_POINTER_MAX_TOKENS,
+                    trace_id=trace_id,
                     n3_routed=n3_routed,
                 ),
                 timeout=_ADR_POINTER_TIMEOUT_SECONDS,

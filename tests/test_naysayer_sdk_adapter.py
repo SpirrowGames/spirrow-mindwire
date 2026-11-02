@@ -1960,3 +1960,24 @@ def test_extra_env_may_not_claim_the_trace_header_variable(tmp_path: Path) -> No
             inference_base_url=_BASE_URL,
             extra_env={CUSTOM_HEADERS_ENV: "X-Other: 1"},
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("in_band", [True, False])
+async def test_a_design_time_turn_in_the_codex_limit_band_is_marked_for_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_band: bool
+) -> None:
+    from spirrow_mindwire.naysayer.n3_routing import TierDecision, is_codex_limit_band_trace_id
+
+    asked: list[str] = []
+    adapter = _turn_adapter(tmp_path, opts=[], turn_rows=_turn_rows_ok(asked))
+
+    async def decide(*_: object) -> TierDecision:
+        return TierDecision(
+            "naysayer-gemini", frozenset({"gemini"}), "over limit", in_codex_limit_band=in_band
+        )
+
+    monkeypatch.setattr(adapter, "_turn_tier", decide)
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    await adapter.deliver_event(handle, _event())
+    assert is_codex_limit_band_trace_id(asked[0]) is in_band

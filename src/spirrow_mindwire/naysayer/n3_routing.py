@@ -62,7 +62,9 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
+from ..ulid_util import new_ulid
 from .principles import (
+    CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT,
     CODEX_TIER_PROMPT_CHAR_LIMIT,
     N3_CONFIG_PATH,
     N3_SENSITIVE_MARKER,
@@ -202,10 +204,41 @@ class TierDecision:
     tier: str
     allowed_backends: frozenset[str]
     reason: str
+    # The prompt fell between the current codex limit and the limit before the reserve was raised:
+    # this request bills Gemini only because of that raise. Size is judged last, so an N-3 request
+    # is never flagged; it was never going to codex.
+    in_codex_limit_band: bool = False
 
 
-def _gemini(reason: str) -> TierDecision:
-    return TierDecision(NAYSAYER_GEMINI_TIER, allowed_backends(NAYSAYER_GEMINI_TIER), reason)
+def _gemini(reason: str, *, in_codex_limit_band: bool = False) -> TierDecision:
+    return TierDecision(
+        NAYSAYER_GEMINI_TIER,
+        allowed_backends(NAYSAYER_GEMINI_TIER),
+        reason,
+        in_codex_limit_band=in_codex_limit_band,
+    )
+
+
+# Lexora stores only a canonical ULID as a request's ``trace_id`` and has no other caller-set
+# column, so the mark for a band request sits inside the ULID: characters 11-16, the start of the
+# random part. A plain ULID collides with it about once in 10^9.
+CODEX_LIMIT_BAND_TRACE_MARKER = "CDXBND"
+_BAND_MARKER_START = 10
+_BAND_MARKER_END = _BAND_MARKER_START + len(CODEX_LIMIT_BAND_TRACE_MARKER)
+
+
+def codex_limit_band_trace_id() -> str:
+    """A fresh canonical ULID carrying :data:`CODEX_LIMIT_BAND_TRACE_MARKER`."""
+    ulid = new_ulid()
+    return f"{ulid[:_BAND_MARKER_START]}{CODEX_LIMIT_BAND_TRACE_MARKER}{ulid[_BAND_MARKER_END:]}"
+
+
+def is_codex_limit_band_trace_id(trace_id: object) -> bool:
+    """True iff a ledger row's ``trace_id`` was minted by :func:`codex_limit_band_trace_id`."""
+    return (
+        isinstance(trace_id, str)
+        and trace_id[_BAND_MARKER_START:_BAND_MARKER_END] == CODEX_LIMIT_BAND_TRACE_MARKER
+    )
 
 
 def lexical_path_problem(path: str) -> str | None:
@@ -258,7 +291,9 @@ def route_tier(request: N3Request) -> TierDecision:
                 return _gemini(f"{path} matches {N3_SENSITIVE_PATHS_KEY} glob {glob!r}")
     if request.prompt_chars > CODEX_TIER_PROMPT_CHAR_LIMIT:
         return _gemini(
-            f"prompt {request.prompt_chars} chars > codex tier limit {CODEX_TIER_PROMPT_CHAR_LIMIT}"
+            f"prompt {request.prompt_chars} chars > codex tier limit "
+            f"{CODEX_TIER_PROMPT_CHAR_LIMIT}",
+            in_codex_limit_band=request.prompt_chars <= CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT,
         )
     return TierDecision(NAYSAYER_MODEL_TIER, allowed_backends(NAYSAYER_MODEL_TIER), "codex tier")
 
@@ -293,12 +328,15 @@ def has_marker(names: Iterable[str]) -> bool:
 
 
 __all__ = [
+    "CODEX_LIMIT_BAND_TRACE_MARKER",
     "ConfigReader",
     "GlobLoad",
     "N3Request",
     "TierDecision",
     "UnresolvedNotifier",
+    "codex_limit_band_trace_id",
     "has_marker",
+    "is_codex_limit_band_trace_id",
     "lexical_path_problem",
     "load_n3_globs",
     "normalize_path",
