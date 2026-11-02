@@ -248,7 +248,7 @@ def _lacks_fix_options(facts: ObjectionFacts) -> bool:
 
 
 def count_round(facts: Iterable[ObjectionFacts], *, round_number: int | None) -> RoundCounts:
-    """D4. ``late_advisory`` exists only from round 2: round 1 has no scope to be outside of."""
+    """D4. ``late`` and ``late_advisory`` exist only from round 2: round 1 has no scope to miss."""
     items = tuple(facts)
     blocking = [f for f in items if f.blocks]
     advisory = [f for f in items if not f.blocks]
@@ -256,7 +256,7 @@ def count_round(facts: Iterable[ObjectionFacts], *, round_number: int | None) ->
     return RoundCounts(
         blocking=len(blocking),
         advisory=len(advisory),
-        late=sum(1 for f in blocking if f.late),
+        late=sum(1 for f in blocking if f.late) if scoped else 0,
         late_advisory=sum(1 for f in advisory if f.late) if scoped else 0,
         fix_missing=sum(1 for f in blocking if _lacks_fix_options(f)),
     )

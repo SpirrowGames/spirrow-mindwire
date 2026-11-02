@@ -191,9 +191,10 @@ def test_fix_missing_counts_blocking_only_and_needs_all_three() -> None:
     assert (counts.blocking, counts.advisory, counts.fix_missing) == (3, 1, 2)
 
 
-def test_late_advisory_needs_round_two() -> None:
+def test_late_counters_need_round_two() -> None:
     facts = [ObjectionFacts(blocks=False, late=True), ObjectionFacts(blocks=True, late=True)]
-    assert count_round(facts, round_number=1).late_advisory == 0
+    round_one = count_round(facts, round_number=1)
+    assert (round_one.late_advisory, round_one.late) == (0, 0)
     round_two = count_round(facts, round_number=2)
     assert (round_two.late_advisory, round_two.late) == (1, 1)
 
