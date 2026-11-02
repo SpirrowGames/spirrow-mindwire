@@ -8,7 +8,9 @@ kept, because a failed attempt was still routed here.
 
 A read that fills ``limit`` may have been cut off, so it prints ``truncated=true`` and the count
 is a lower bound. A failed read exits non-zero and prints no ``reviews=`` line, so a script cannot
-read a failure as zero.
+read a failure as zero. That includes a stalled ledger: the client timeout only bounds each network
+operation, so a server that keeps trickling bytes would never trip it, and ``run`` also caps the
+whole read at ``_READ_TIMEOUT_SECONDS``.
 """
 
 from __future__ import annotations
@@ -66,12 +68,22 @@ async def _read(limit: int) -> list[dict[str, Any]]:
         return await client.stats_costs_recent(limit=limit)
 
 
+async def _read_within_deadline(limit: int) -> list[dict[str, Any]]:
+    return await asyncio.wait_for(_read(limit), _READ_TIMEOUT_SECONDS)
+
+
 def run(limit: int) -> int:
     """CLI body. Prints one result line on stdout and returns the exit code."""
     try:
-        rows = asyncio.run(_read(limit))
+        rows = asyncio.run(_read_within_deadline(limit))
     except LexoraError as exc:
         print(f"codex-band-count: error: {exc}", file=sys.stderr)
+        return 1
+    except TimeoutError:
+        print(
+            f"codex-band-count: error: ledger read exceeded {_READ_TIMEOUT_SECONDS}s",
+            file=sys.stderr,
+        )
         return 1
     print(count_band(rows, limit=limit).render())
     return 0

@@ -663,3 +663,23 @@ def test_band_count_counts_requests_and_leaves_out_shadow_and_unmarked_rows() ->
     assert count_band(rows, limit=len(rows)).truncated is True
     assert "truncated=true" in count_band(rows, limit=len(rows)).render()
     assert count_band([], limit=10).render().startswith("reviews=0 rows=0")
+
+
+def test_band_count_cli_fails_loudly_when_the_ledger_read_stalls(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    from spirrow_mindwire.naysayer import codex_band_count
+
+    async def stalled(limit: int) -> list[dict[str, Any]]:
+        await asyncio.sleep(30)
+        return []
+
+    monkeypatch.setattr(codex_band_count, "_read", stalled)
+    monkeypatch.setattr(codex_band_count, "_READ_TIMEOUT_SECONDS", 0.01)
+
+    assert codex_band_count.run(10) == 1
+    captured = capsys.readouterr()
+    assert "reviews=" not in captured.out
+    assert "exceeded 0.01s" in captured.err
