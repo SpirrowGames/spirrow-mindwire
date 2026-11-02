@@ -267,6 +267,30 @@ def test_unparsed_log_line_counts_nothing(caplog: pytest.LogCaptureFixture) -> N
         assert f" {field}=-" in line
 
 
+def test_block_that_does_not_parse_logs_unparsed_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A marker with a broken block is the ``elements is None`` path; the log call must survive."""
+    line = _log_design(caplog, f"{M}\n```json\n[{{broken\n```\n", 2)
+    assert "objections_unparsed=1" in line
+    assert " blocking=-" in line
+
+
+def test_unreadable_vocabulary_logs_unparsed_without_raising(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The block parsed but cannot be classified: a posted turn must not be lost to measurement."""
+    from spirrow_mindwire.naysayer import principles
+
+    def unreadable() -> None:
+        raise principles.PrinciplesError("vocabulary unreadable")
+
+    monkeypatch.setattr(principles, "objection_classes", unreadable)
+    line = _log_design(caplog, _fenced([BLOCKING_ITEM]), 2)
+    assert "objections_unparsed=1" in line
+    assert " blocking=-" in line
+
+
 # ── D1 / D6 / D7: one rule text in every prompt ───────────────────────────────────────────────
 
 
