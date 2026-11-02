@@ -71,8 +71,9 @@ For every blocking objection give the author options, not an instruction: the sm
 (`fix_min`); a cut that removes the defect by dropping or narrowing the feature or step \
 (`fix_cut`, or "none: <one-line reason>" when it clearly cannot be cut, e.g. the spec requires \
 it); and the weight of the fix (`fix_weight`: "small" or "large"). Do not settle on one option \
-for the author. Where the author marks a passage `as-proposed`, check that it matches your \
-proposal AND look for defects in the proposal itself.
+for the author. Where the material you were given marks a passage `as-proposed`, check that it \
+matches your proposal AND look for defects in the proposal itself. A pull request review is given \
+the diff and not the PR body, so expect no such marking there.
 """
 
 OBJECTION_ELEMENT_KEYS = (

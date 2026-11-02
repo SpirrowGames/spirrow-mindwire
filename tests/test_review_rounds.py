@@ -380,6 +380,8 @@ def test_design_prompts_teach_the_folded_fence_and_it_reads_back(prompt: str) ->
 def test_rules_carry_d7_independence_and_the_late_rules() -> None:
     assert "as-proposed" in REVIEW_ROUND_RULES
     assert "defects in the proposal itself" in REVIEW_ROUND_RULES
+    # The PR-gate shares this text but never reads the PR body, where authors put these marks.
+    assert "the diff and not the PR body" in REVIEW_ROUND_RULES
     assert "LATE:" in REVIEW_ROUND_RULES
     assert "Do not raise advisory" in REVIEW_ROUND_RULES
 
