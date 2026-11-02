@@ -127,6 +127,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
@@ -2410,6 +2415,11 @@ async def test_target_terminal_422_with_live_probe_reraises_not_environment_term
     from spirrow_mindwire.github.client import EnvironmentTerminalError
 
     class _TargetGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
@@ -2445,6 +2455,11 @@ async def test_unknown_scope_reraises_not_environment_terminal() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError
 
     class _UnknownGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
@@ -2688,6 +2703,11 @@ async def test_replay_strict_read_env_terminal_raises_environment_terminal_error
     probe_calls: list[int] = []
 
     class _ReadFailGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "7777888899990000", []))
 
@@ -2739,6 +2759,11 @@ async def test_replay_strict_read_403_suspended_token_raises_environment_termina
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _SuspendedGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "6666555544443333", []))
 
@@ -2785,6 +2810,11 @@ async def test_submit_403_with_unreachable_probe_reraises_plain_error_and_no_mar
         return "chatroom-msg-id"
 
     class _Submit403ProbeDeadGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "2222333344445555", []))
             self.submitted = []
@@ -2840,6 +2870,11 @@ async def test_submit_422_with_live_probe_writes_target_terminal_marker() -> Non
         return "chatroom-msg-id"
 
     class _Submit422LiveProbeGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "8888999900001111", []))
             self.submitted = []
@@ -4200,6 +4235,11 @@ async def test_environment_terminal_raises_environment_terminal_error() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _EnvGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-env", []))
             self.probe_calls = 0
@@ -4231,6 +4271,11 @@ async def test_environment_terminal_permission_403_with_live_probe() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _PermGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-perm", []))
 
@@ -4265,6 +4310,11 @@ async def test_target_terminal_422_with_live_probe_raises_target_terminal_error(
     )
 
     class _TargetGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
@@ -4301,6 +4351,11 @@ async def test_unknown_scope_reraises_not_environment_terminal_not_target_termin
     )
 
     class _UnknownGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
@@ -4338,6 +4393,11 @@ async def test_retryable_error_reraises_raw() -> None:
     )
 
     class _RetryableGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-r", []))
             self.probe_calls = 0
@@ -4402,6 +4462,11 @@ async def test_same_identity_422_fallback_401_raises_environment_terminal_not_qu
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _FallbackAuthDiesGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-auth", []))
             self._calls = 0
@@ -4446,6 +4511,11 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
     from spirrow_mindwire.github.client import TargetTerminalError
 
     class _FallbackDeletedGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-deleted", []))
             self._calls = 0
@@ -4900,6 +4970,11 @@ class _RetryScriptGitHub(_FakeGitHub):
     ``move_head_to`` moves ``current_head`` after the first POST.
     """
 
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
@@ -5210,6 +5285,11 @@ async def test_classify_exception_returns_typed_error_chained_to_original(
     from spirrow_mindwire.github import client as client_mod
 
     class _Probe(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         async def probe_identity(self) -> int:
             return probe
 

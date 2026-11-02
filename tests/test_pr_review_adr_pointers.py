@@ -136,6 +136,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
