@@ -16,7 +16,9 @@ PR-gate tests 19 and 27-30 are in ``tests/test_pr_review_driver.py``.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,6 +26,7 @@ from spirrow_mindwire.naysayer import principles
 from spirrow_mindwire.naysayer.n3_routing import (
     GlobLoad,
     N3Request,
+    TierDecision,
     has_marker,
     lexical_path_problem,
     load_n3_globs,
@@ -435,8 +438,8 @@ def test_this_repo_carries_a_resolvable_n3_config() -> None:
 def test_codex_limit_is_pinned_from_the_three_terms() -> None:
     assert principles.CODEX_CONTEXT_WINDOW_TOKENS == 272_000
     assert principles.CODEX_HARNESS_RESERVE_TOKENS == 60_928
-    assert principles.CODEX_OUTPUT_RESERVE_TOKENS == 32_000
-    assert CODEX_TIER_PROMPT_CHAR_LIMIT == 179_072
+    assert principles.CODEX_OUTPUT_RESERVE_TOKENS == 65_536
+    assert CODEX_TIER_PROMPT_CHAR_LIMIT == 145_536
     assert CODEX_TIER_PROMPT_CHAR_LIMIT == (
         principles.CODEX_CONTEXT_WINDOW_TOKENS
         - principles.CODEX_HARNESS_RESERVE_TOKENS
@@ -448,9 +451,8 @@ def test_output_reserve_covers_the_named_naysayer_requests() -> None:
     from spirrow_mindwire.adapters import naysayer_lexora
     from spirrow_mindwire.naysayer import pr_review, preflight
 
-    # Pass 1's budget is not listed: it may exceed the reserve, and the driver clamps it on the
-    # codex tier (test_pass_one_budget_is_clamped_on_the_codex_tier_only).
     for value in (
+        pr_review.DEFAULT_REVIEW_MAX_TOKENS,
         pr_review._ADR_POINTER_MAX_TOKENS,
         naysayer_lexora._DEFAULT_MAX_TOKENS,
         preflight.PREFLIGHT_MAX_TOKENS,
@@ -470,10 +472,6 @@ def _max_tokens_literals(src_root: Path) -> list[tuple[str, int, int]]:
 
     def hit(path: Path, name: str, lineno: int, value: ast.expr | None) -> None:
         literal = _int_literal(value)
-        # DEFAULT_REVIEW_MAX_TOKENS is exempt: the driver clamps it on the codex tier
-        # (test_pass_one_budget_is_clamped_on_the_codex_tier_only).
-        if name == "DEFAULT_REVIEW_MAX_TOKENS":
-            return
         if literal is not None and "max_tokens" in name.lower() and not name.startswith("CODEX_"):
             found.append((str(path), lineno, literal))
 
@@ -510,7 +508,7 @@ def test_output_reserve_covers_every_max_tokens_literal_in_src() -> None:
     """
     src_root = Path(principles.__file__).resolve().parents[1]
     found = _max_tokens_literals(src_root)
-    assert len(found) >= 3, found  # the three named constants above are discovered
+    assert len(found) >= 4, found  # the four named constants above are discovered
     over = [f for f in found if f[2] > principles.CODEX_OUTPUT_RESERVE_TOKENS]
     assert over == [], over
 
@@ -537,3 +535,151 @@ async def test_pass_one_budget_is_clamped_on_the_codex_tier_only(tier: str, expe
     view = DiffView(text="diff", original_chars=4, limit=100, warn_threshold=90)
     await driver._run_two_passes(view, "o/r#1", tier=tier, n3_routed=True)
     assert max(sent) == expected
+
+
+# ---------- output reserve at 65,536 and the band it creates (Bohr msg-7759) ----- #
+
+
+class _RecordingLexora:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def chat_completion(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        raise RuntimeError("stop after recording the request")
+
+
+async def _sent_requests(
+    tier: str, *, max_tokens: int | None = None, trace_id: str | None = None
+) -> list[dict[str, object]]:
+    from spirrow_mindwire.naysayer.pr_review import DiffView, NaysayerPrReviewDriver
+
+    lexora = _RecordingLexora()
+    kwargs = {} if max_tokens is None else {"max_tokens": max_tokens}
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=object(), **kwargs)  # type: ignore[arg-type]
+    view = DiffView(text="diff", original_chars=4, limit=100, warn_threshold=90)
+    await driver._run_two_passes(view, "o/r#1", tier=tier, n3_routed=True, trace_id=trace_id)
+    return lexora.calls
+
+
+@pytest.mark.anyio
+async def test_default_budget_reaches_the_request_lexora_would_fall_back_with() -> None:
+    """The codex-tier request is what Lexora hands to Gemini on fallback (msg-7709).
+
+    This pins the mindwire side only; that Lexora forwards the limit was read in its code.
+    """
+    from spirrow_mindwire.naysayer.pr_review import DEFAULT_REVIEW_MAX_TOKENS
+
+    calls = await _sent_requests(principles.NAYSAYER_MODEL_TIER)
+    assert DEFAULT_REVIEW_MAX_TOKENS == 65_536
+    assert max(int(str(c["max_tokens"])) for c in calls) == 65_536
+
+
+@pytest.mark.anyio
+async def test_a_larger_configured_budget_is_clamped_on_the_codex_tier_only() -> None:
+    codex = await _sent_requests(principles.NAYSAYER_MODEL_TIER, max_tokens=100_000)
+    gemini = await _sent_requests(principles.NAYSAYER_GEMINI_TIER, max_tokens=100_000)
+    assert max(int(str(c["max_tokens"])) for c in codex) == principles.CODEX_OUTPUT_RESERVE_TOKENS
+    assert max(int(str(c["max_tokens"])) for c in gemini) == 100_000
+
+
+@pytest.mark.anyio
+async def test_both_passes_carry_the_band_trace_so_it_counts_one_review() -> None:
+    from spirrow_mindwire.naysayer.n3_routing import codex_limit_band_trace_id
+
+    trace = codex_limit_band_trace_id()
+    calls = await _sent_requests(principles.NAYSAYER_GEMINI_TIER, trace_id=trace)
+    assert [c["trace_id"] for c in calls] == [trace, trace]
+
+
+def _band_decision(prompt_chars: int, *, globs: frozenset[str] = frozenset()) -> TierDecision:
+    return route_tier(
+        N3Request(
+            marker=False, paths=("src/app.py",), globs=GlobLoad(globs), prompt_chars=prompt_chars
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt_chars", "tier", "in_band"),
+    [
+        (CODEX_TIER_PROMPT_CHAR_LIMIT, principles.NAYSAYER_MODEL_TIER, False),
+        (CODEX_TIER_PROMPT_CHAR_LIMIT + 1, principles.NAYSAYER_GEMINI_TIER, True),
+        (principles.CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT, principles.NAYSAYER_GEMINI_TIER, True),
+        (
+            principles.CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT + 1,
+            principles.NAYSAYER_GEMINI_TIER,
+            False,
+        ),
+    ],
+)
+def test_band_boundaries(prompt_chars: int, tier: str, in_band: bool) -> None:
+    decision = _band_decision(prompt_chars)
+    assert decision.tier == tier
+    assert decision.in_codex_limit_band is in_band
+
+
+def test_an_n3_prompt_inside_the_band_is_not_counted() -> None:
+    size = CODEX_TIER_PROMPT_CHAR_LIMIT + 1
+    decision = _band_decision(size, globs=frozenset({"src/*"}))
+    assert decision.tier == principles.NAYSAYER_GEMINI_TIER
+    assert decision.in_codex_limit_band is False
+
+
+def test_band_trace_id_is_a_ulid_lexora_accepts() -> None:
+    from spirrow_mindwire.naysayer.n3_routing import (
+        codex_limit_band_trace_id,
+        is_codex_limit_band_trace_id,
+    )
+    from spirrow_mindwire.ulid_util import new_ulid
+
+    # Copied from spirrow-lexora src/lexora/services/trace.py ULID_RE: a value it rejects is
+    # stored as NULL, and the marked row could never be counted.
+    lexora_ulid = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+    trace = codex_limit_band_trace_id()
+    assert lexora_ulid.fullmatch(trace)
+    assert is_codex_limit_band_trace_id(trace)
+    assert not is_codex_limit_band_trace_id(new_ulid())
+    assert not is_codex_limit_band_trace_id(None)
+
+
+def test_band_count_counts_requests_and_leaves_out_shadow_and_unmarked_rows() -> None:
+    from spirrow_mindwire.naysayer.codex_band_count import count_band
+    from spirrow_mindwire.naysayer.n3_routing import codex_limit_band_trace_id
+    from spirrow_mindwire.ulid_util import new_ulid
+
+    one, two = codex_limit_band_trace_id(), codex_limit_band_trace_id()
+    rows: list[dict[str, Any]] = [
+        {"trace_id": one, "endpoint": "/v1/chat/completions", "cost_usd": 1.0, "timestamp": "t3"},
+        {"trace_id": one, "endpoint": "/v1/chat/completions", "cost_usd": 0.5, "timestamp": "t2"},
+        {"trace_id": one, "endpoint": "shadow", "cost_usd": 9.0, "timestamp": "t2"},
+        {"trace_id": two, "endpoint": "/v1/messages", "cost_usd": None, "timestamp": "t1"},
+        {"trace_id": new_ulid(), "endpoint": "/v1/messages", "cost_usd": 7.0, "timestamp": "t0"},
+        {"trace_id": None, "endpoint": "/v1/messages", "cost_usd": 7.0, "timestamp": "t0"},
+    ]
+    result = count_band(rows, limit=100)
+    assert (result.reviews, result.rows, result.cost_usd) == (2, 3, 1.5)
+    assert (result.oldest, result.truncated) == ("t0", False)
+    assert count_band(rows, limit=len(rows)).truncated is True
+    assert "truncated=true" in count_band(rows, limit=len(rows)).render()
+    assert count_band([], limit=10).render().startswith("reviews=0 rows=0")
+
+
+def test_band_count_cli_fails_loudly_when_the_ledger_read_stalls(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    from spirrow_mindwire.naysayer import codex_band_count
+
+    async def stalled(limit: int) -> list[dict[str, Any]]:
+        await asyncio.sleep(30)
+        return []
+
+    monkeypatch.setattr(codex_band_count, "_read", stalled)
+    monkeypatch.setattr(codex_band_count, "_READ_TIMEOUT_SECONDS", 0.01)
+
+    assert codex_band_count.run(10) == 1
+    captured = capsys.readouterr()
+    assert "reviews=" not in captured.out
+    assert "exceeded 0.01s" in captured.err

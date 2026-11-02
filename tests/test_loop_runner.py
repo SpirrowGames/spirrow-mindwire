@@ -244,7 +244,13 @@ class _FakeLexora:
         self.closed = False
 
     async def chat_completion(
-        self, *, model: str, messages: Any, max_tokens: int, n3_routed: bool = False
+        self,
+        *,
+        model: str,
+        messages: Any,
+        max_tokens: int,
+        trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> Any:
         raise AssertionError("not called")
 

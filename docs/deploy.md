@@ -267,7 +267,11 @@ A request goes to `naysayer-gemini` when **any** of these holds:
   malformed, or no repository root. **Leaving the key out sends everything to Gemini.** Writing
   `n3_sensitive_paths = []` explicitly is the only way to say "no sensitive paths";
 - the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5). The value is
-  provisional until Lexora pins its `model_catalog_json` / `context_window`.
+  provisional until Lexora pins its `model_catalog_json` / `context_window`. Raising the output
+  reserve to 65,536 moved prompts of 145,537-179,072 chars from codex to Gemini. `mindwire
+  codex-band-count` counts those requests from the Lexora ledger (`MINDWIRE_LEXORA_URL`) and sums
+  their cost. It only sees requests made after this marking was deployed. If it prints
+  `truncated=true`, the count is a lower bound: re-run it with a larger `--limit`.
 
 Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
 glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't

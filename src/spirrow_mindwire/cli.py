@@ -65,6 +65,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="head commit SHA to measure (default: local `git rev-parse HEAD`; must be pushed)",
     )
+    band = sub.add_parser(
+        "codex-band-count",
+        help="count requests the Lexora ledger marks as in the codex prompt-limit band",
+    )
+    band.add_argument("--limit", type=int, default=100_000, help="newest ledger rows to read")
     check = sub.add_parser(
         "clone-check",
         help="re-judge a parked shared clone: exit 0 clean, 8 refused (payload row), 1 unknown",
@@ -124,6 +129,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .naysayer.pr_diff_size import run
 
         raise SystemExit(run(args.repo, args.pr, args.head))
+    if args.command == "codex-band-count":
+        from .naysayer.codex_band_count import run as run_band_count
+
+        raise SystemExit(run_band_count(args.limit))
     if args.command == "clone-check":
         raise SystemExit(clone_check(args.repo_dir))
     if args.command == "turn-isolation-check":
