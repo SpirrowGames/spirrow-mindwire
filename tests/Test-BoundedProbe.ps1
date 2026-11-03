@@ -565,7 +565,8 @@ exit 3
     Import-SweepFunction 'Invoke-PrEventAdvanceTick'
     # D-1 (T-sweep-preloop-overhead-exceeds-launch-budget): the heads file and the tail cache path.
     . (Join-Path $repoRoot 'deploy/lib/PreLoopBudget.ps1')
-    $tailCacheDir = 'C:\data\state	ail-cache'
+    # A real directory, not a literal drive path: Join-Path throws on a drive this host lacks (CI is Linux).
+    $tailCacheDir = Join-Path $scratch 'tail-cache'
     $PrEventAdvanceProbeTimeoutSeconds = 311
     $sweepConfigPath = 'C:\cfg\sweep.json'
     $script:peCalls = [System.Collections.Generic.List[object]]::new()
@@ -586,7 +587,7 @@ exit 3
     $c = $script:peCalls[0]
     $hfArg = $c.Arguments[[array]::IndexOf($c.Arguments, '--heads-json') + 1]
     Check 'argv = -m spirrow_mindwire.pr_event_advance --project p --sweep-config <path> --heads-json <file> --tail-cache <path>' `
-        "-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json|--heads-json|$hfArg|--tail-cache|C:\data\state	ail-cache\p.json" ($c.Arguments -join '|')
+        "-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json|--heads-json|$hfArg|--tail-cache|$(Join-Path $tailCacheDir 'p.json')" ($c.Arguments -join '|')
     Check 'the heads file carries the heads' 'msg-9' (($c.HeadsJson | ConvertFrom-Json).heads.'T-a')
     CheckTrue 'the heads file is removed after the call' (-not (Test-Path -LiteralPath $hfArg))
     Check 'bound = $PrEventAdvanceProbeTimeoutSeconds' 311 $c.TimeoutSeconds
