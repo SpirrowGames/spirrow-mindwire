@@ -549,6 +549,10 @@ class GitHubReviewClient(Protocol):
         self, owner: str, repo: str, base_ref: str, head_sha: str
     ) -> str: ...
 
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str: ...
+
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus: ...
 
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]: ...
@@ -829,6 +833,34 @@ class GitHubClient:
             len(diff),
         )
         return diff
+
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        """GitHub's ``status`` of ``base...head``: ahead / identical / behind / diverged.
+
+        ``base`` is an ancestor of ``head`` exactly when this is ``ahead`` or ``identical``. Raises
+        :class:`GitHubHTTPError` on a non-2xx or a body without a string ``status``; the caller
+        decides what an unanswered ancestry question means.
+        """
+        base_seg, head_seg = quote(base_sha, safe=""), quote(head_sha, safe="")
+        path = f"/repos/{owner}/{repo}/compare/{base_seg}...{head_seg}"
+        try:
+            resp = await self._client.get(path, params={"per_page": 1})
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            status = resp.json().get("status")
+        except (ValueError, AttributeError) as exc:
+            raise GitHubHTTPError(f"GET {path}: unreadable body: {exc}") from exc
+        if not isinstance(status, str):
+            raise GitHubHTTPError(f"GET {path}: no status in the response")
+        return status
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         """Aggregate CI state for the PR head SHA — REST first, GraphQL as fallback.

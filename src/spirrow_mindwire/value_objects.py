@@ -247,6 +247,11 @@ class ChatroomEvent:
     payload: EventPayload  # union by event_type
     thread_context: ThreadContext | None = None
     retry_notice: str | None = None
+    # T-naysayer-exhaustive-first-then-scoped D2. Set only by the conductor, only on a naysayer
+    # dispatch: the round it counted (1 + that persona's earlier posts in this thread), and from
+    # round 2 the REVIEW ROUND line. Both ``None`` off the conductor path; the prompt is unchanged.
+    review_round: int | None = None
+    review_round_notice: str | None = None
     # The thread's tags, as the reader saw them (``chatroom_get_thread`` ``thread.tags``).
     # ``None`` = not read. The naysayer's tier routing reads the ``n3-sensitive`` marker
     # here and treats ``None`` as "marked" (ADR-14 §7.3, fail-safe to the Gemini tier).

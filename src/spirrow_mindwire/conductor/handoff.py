@@ -62,6 +62,7 @@ from enum import StrEnum
 
 from ..github.client import parse_pr_ref
 from ..identity.normalize import normalize_identity_key
+from ..naysayer.review_rounds import AUTHOR_OBJECTION_LINE_RULE, AUTHOR_OBJECTION_LINE_RULE_PR
 from ..tier_c_admission_gate import (
     ADMIT_LABELS,
     LEGACY_LABEL_MAP,
@@ -1190,7 +1191,10 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
         f"    TIER-C: {require_admitted('goal', where='handoff example')}\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
+        f"    NEXT: {HUMAN_TOKEN}\n\n"
+        + _TIER_C_LABEL_GUIDANCE
+        + "\n\n"
+        + AUTHOR_OBJECTION_LINE_RULE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
     # implementer receives the same TIER-C: <label> emission guidance the proposer already has (A
@@ -1216,7 +1220,10 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"For a genuine Tier-C decision, hand to `{HUMAN_TOKEN}` and name the Tier-C type on the "
         "line above your handoff, e.g.:\n\n"
         f"    TIER-C: {require_admitted('cost', where='handoff example')}\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
+        f"    NEXT: {HUMAN_TOKEN}\n\n"
+        + _TIER_C_LABEL_GUIDANCE
+        + "\n\n"
+        + AUTHOR_OBJECTION_LINE_RULE_PR
     ),
     # T-naysayer-omits-tierc-label (Bohr msg-6658 spec, Einstein msg-6657 / go): D1 — `human` only
     # for a Tier-C type, labelled, with the shared label guidance; D2'-b — the TIER-C-CHECK is the

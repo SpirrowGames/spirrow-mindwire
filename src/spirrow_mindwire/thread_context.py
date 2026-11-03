@@ -209,6 +209,8 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     )
     head = f"You are acting as the {own_role.value} role in thread {event.thread_ref.thread_id}."
     blocks = [head]
+    if event.review_round_notice:
+        blocks.append(event.review_round_notice)
     if history:
         blocks.append(history)
     blocks.append(f"New message from {payload.author}:\n\n{payload.body}")

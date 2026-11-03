@@ -124,6 +124,11 @@ from ..naysayer.preflight import (
     custom_headers_env_value,
 )
 from ..naysayer.principles import allowed_backends, build_preamble, principles_path
+from ..naysayer.review_rounds import (
+    DESIGN_OBJECTION_FORMAT,
+    REVIEW_ROUND_RULES,
+    log_design_round,
+)
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -166,7 +171,8 @@ _ENV_BASE_URL = "MINDWIRE_NAYSAYER_BASE_URL"
 # composition root — deleted from this literal, restored to the rendered prompt
 # through injection. Keeping the manifest as the sole owner is what lets the
 # tests assert on the actual prompt the loop reads rather than a mirror.
-_NAYSAYER_ROLE_PROMPT = """\
+_NAYSAYER_ROLE_PROMPT = (
+    """\
 You are the independent naysayer in a Spirrow MindWire ChatRoom design thread. \
 You run on a different model family from the proposer/implementer; your job is \
 to apply the 5 principles above as an adversarial reviewer of the design under \
@@ -175,7 +181,12 @@ your critique of it — explicitly endorse what is sound (principle 4), object w
 a concrete basis (principle 3), and never stay silent about a real concern \
 (principle 5). Your entire response is posted verbatim to the thread as your \
 reply, so reply directly with the critique — no preamble, no meta-commentary.
+
 """
+    + REVIEW_ROUND_RULES
+    + "\n"
+    + DESIGN_OBJECTION_FORMAT
+)
 
 
 class _Routed:
@@ -1213,6 +1224,17 @@ class NaysayerSdkAdapter:
             raise NaysayerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
+
+        usage = getattr(result, "usage", None)
+        log_design_round(
+            logger,
+            body=body,
+            thread=event.thread_ref.thread_id,
+            backend=turn_record.backend,
+            model=session.options.model,
+            round_number=event.review_round,
+            out_tokens=usage.get("output_tokens") if isinstance(usage, dict) else None,
+        )
 
         session.last_active_at = datetime.now(UTC)
         session.state = SessionState.IDLE
