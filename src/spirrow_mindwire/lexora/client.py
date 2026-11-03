@@ -245,6 +245,11 @@ class LexoraClient:
             transport=transport,
         )
 
+    @property
+    def base_url(self) -> str:
+        """The gateway base URL this client sends to (for route rendering, not for requests)."""
+        return str(self._client.base_url).rstrip("/")
+
     async def __aenter__(self) -> LexoraClient:
         return self
 

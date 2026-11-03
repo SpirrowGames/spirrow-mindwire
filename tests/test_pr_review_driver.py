@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -5499,9 +5501,155 @@ async def test_a_review_in_the_codex_limit_band_is_marked_for_the_ledger(
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
     await driver.review(_pr(), post_critique=post)
     assert {call[0] for call in lexora.calls} == {tier}
-    if marked:
-        first = lexora.trace_ids[0]
-        assert is_codex_limit_band_trace_id(first)
-        assert lexora.trace_ids == [first, first]
-    else:
-        assert lexora.trace_ids == [None, None]
+    # Every review now carries one trace on both passes (the backend read-back needs it);
+    # only a band review carries the band mark.
+    first = lexora.trace_ids[0]
+    assert isinstance(first, str)
+    assert lexora.trace_ids == [first, first]
+    assert is_codex_limit_band_trace_id(first) is marked
+
+
+def _attest_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("naysayer pr-gate attest:")
+    ]
+
+
+def _rows_for(backends: list[str]) -> Callable[[str], Awaitable[list[dict[str, Any]]]]:
+    async def read(trace_id: str) -> list[dict[str, Any]]:
+        return [
+            {"id": 100 + i, "trace_id": trace_id, "backend": b, "endpoint": "/v1/chat/completions"}
+            for i, b in enumerate(backends)
+        ]
+
+    return read
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("backends", "logged"),
+    [(["codex", "codex"], "codex"), (["gemini-fallback", "gemini-fallback"], "gemini-fallback")],
+)
+async def test_pr_gate_logs_the_backend_read_back_from_the_ledger(
+    caplog: pytest.LogCaptureFixture, backends: list[str], logged: str
+) -> None:
+    # Takahito msg-7813 (2) / Bohr msg-7830: the PR gate logs the backend that actually
+    # served the review, read back by the review's own trace id — not the pre-send tier.
+    lexora = _FakeLexora()
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_routed_github(), turn_rows=_rows_for(backends), sleep=_no_sleep
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        outcome = await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert f"pr={_pr().slug} " in line
+    assert " tier=naysayer " in line
+    assert f" backend={logged} " in line
+    assert " expected=codex|gemini-fallback " in line
+    assert line.endswith("probe=cost-row#100+101")
+    # Log only: nothing about the backend reaches the posted review.
+    assert all("backend=" not in body for body in posted)
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_pr_gate_mixed_backends_across_the_two_passes_are_visible(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora,
+        github=_routed_github(),
+        turn_rows=_rows_for(["codex", "gemini-fallback"]),
+        sleep=_no_sleep,
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert " backend=codex|gemini-fallback " in line
+
+
+@pytest.mark.anyio
+async def test_pr_gate_backend_read_back_failure_logs_unknown_and_keeps_the_verdict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def broken(_trace_id: str) -> list[dict[str, Any]]:
+        raise RuntimeError("ledger down")
+
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    baseline = NaysayerPrReviewDriver(lexora=_FakeLexora(), github=_routed_github())
+    _bp, bpost = _capture()
+    expected = await baseline.review(_pr(), post_critique=bpost)
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_routed_github(), turn_rows=broken, sleep=_no_sleep
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        outcome = await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert " backend=unknown " in line
+    assert "reason=RuntimeError: ledger down" in line
+    assert outcome.verdict == expected.verdict
+
+
+@pytest.mark.anyio
+async def test_pr_gate_backend_read_back_with_no_row_logs_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def empty(_trace_id: str) -> list[dict[str, Any]]:
+        return []
+
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_routed_github(), turn_rows=empty, sleep=_no_sleep
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        outcome = await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert " backend=unknown " in line
+    assert "reason=PreflightError:" in line
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_pr_gate_with_no_ledger_reader_says_so(caplog: pytest.LogCaptureFixture) -> None:
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(), github=_routed_github())
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert line.endswith("backend=unknown expected=codex|gemini-fallback reason=no ledger reader")
+
+
+@pytest.mark.anyio
+async def test_pr_gate_mismatching_backend_logs_unknown_naming_the_reported_backend(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(),
+        github=_routed_github(),
+        turn_rows=_rows_for(["gemini", "gemini"]),
+        sleep=_no_sleep,
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        outcome = await driver.review(_pr(), post_critique=post)
+    (line,) = _attest_lines(caplog)
+    assert " backend=unknown " in line
+    assert "['gemini']" in line
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_pr_gate_default_client_reads_the_ledger_at_its_own_route() -> None:
+    driver = NaysayerPrReviewDriver(lexora_url="http://192.0.2.10:8110/", github=_routed_github())
+    try:
+        assert driver._turn_rows is not None
+        assert driver._attest_route == "192.0.2.10:8110"
+    finally:
+        await driver._lexora.aclose()
