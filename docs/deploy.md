@@ -647,6 +647,25 @@ can launch this tick, so fix the budget or the slow phase. `gate admission invar
 means a role turn was admitted while gate candidates existed and none of them had been attempted.
 That should be impossible, and seeing it means the admission code has a bug.
 
+**Pre-loop overhead (T-sweep-preloop-overhead-exceeds-launch-budget).** By 2026-11-04 the pre-loop
+phase had grown from about 22s to a median of 123s, every tick went over the 120s budget, and nothing
+launched for 2.5h without any alert. Two things were added (`deploy/lib/PreLoopBudget.ps1`):
+
+- every tick logs which phase took the time (per-project phases are named `control[p]`, `1b[p]`,
+  `parkwake[p]`, `head[p]`):
+
+  ```text
+  pre-loop phases: sync=…s intake=…s gatebootstrap=…s control[p]=…s 1b[p]=…s parkwake[p]=…s head[p]=…s autogate=…s declaredparkwake=…s operator=…s resource=…s decide=…s (pre-loop=…s launch budget=…s)
+  ```
+
+- a notification (key `sweep:preloop-budget`) when ticks keep going over budget. Each tick's level
+  is `ok` (under 80% of the launch budget), `near` (80–100%) or `over` (100% or more, nothing
+  launches). Three `over` ticks in a row send the **over** alert. Six `near`-or-`over` ticks in a
+  row, with nothing sent yet, send a **near** warning. The first non-`over` tick after an over alert
+  sends **recovered**. An `ok` tick resets everything. At most one alert per tick, and no near warning
+  ever follows an over alert. State: `state\preloop-budget.json`. The daily digest gets one line:
+  the last 24h tick count, the over-budget ticks, and the median and max pre-loop time.
+
 ### Why the sweep is cheap enough to run on a short interval
 
 Launching the conductor is not uniformly cheap:
