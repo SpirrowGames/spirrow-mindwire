@@ -244,7 +244,13 @@ class _FakeLexora:
         self.closed = False
 
     async def chat_completion(
-        self, *, model: str, messages: Any, max_tokens: int, n3_routed: bool = False
+        self,
+        *,
+        model: str,
+        messages: Any,
+        max_tokens: int,
+        trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> Any:
         raise AssertionError("not called")
 
@@ -256,6 +262,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(self) -> None:
         self.closed = False
 

@@ -104,6 +104,7 @@ from ..github.client import CheckRollup, PrRef, PrState, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
+from ..naysayer.review_rounds import render_review_round_line
 from ..routing import (
     GuardIClosure,
     GuardICondition,
@@ -604,6 +605,9 @@ class Conductor:
         self._mcp = mcp
         self._dispatcher = dispatcher
         self._thread_ref = thread_ref
+        # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
+        # the response carries none) — handed to every event for the naysayer's N-3 routing.
+        self._thread_tags: tuple[str, ...] | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -2664,6 +2668,7 @@ class Conductor:
                 },
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
+        self._thread_tags = _thread_tags(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -3301,6 +3306,8 @@ class Conductor:
         *,
         retry_notice: str | None = None,
         resume_notice: str | None = None,
+        review_round: int | None = None,
+        review_round_notice: str | None = None,
     ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
@@ -3332,8 +3339,28 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
             retry_notice=retry_notice,
+            thread_tags=self._thread_tags,
             resume_notice=resume_notice,
+            review_round=review_round,
+            review_round_notice=review_round_notice,
         )
+
+    def _review_round(
+        self, role: Role, messages: list[dict[str, Any]]
+    ) -> tuple[int | None, str | None]:
+        """D2: count this naysayer turn's round from the thread; the model is never asked to.
+
+        ``N = 1 +`` the naysayer's earlier posts here, scope = every post after the latest of them,
+        whoever wrote it. Defining it that way needs no reset: a redesign is itself the delta, and
+        a comment the naysayer made early only widens the scope. Non-naysayer turns get nothing.
+        """
+        if role is not Role.NAYSAYER:
+            return None, None
+        posts = [m for m in messages if roster_role(self._roster, _author(m)) is Role.NAYSAYER]
+        if not posts:
+            return 1, None
+        round_number = len(posts) + 1
+        return round_number, render_review_round_line(round_number, _msg_id(posts[-1]))
 
     async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
         """Spawn the session for ``identity``: the one spawn path (Bohr msg-5053 D-1..D-3).
@@ -3446,9 +3473,17 @@ class Conductor:
             )
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
+                review_round, review_round_notice = self._review_round(role, messages)
                 await self._dispatcher.dispatch(
                     handle,
-                    self._to_event(msg, messages, retry_notice=notice, resume_notice=resume_text),
+                    self._to_event(
+                        msg,
+                        messages,
+                        retry_notice=notice,
+                        resume_notice=resume_text,
+                        review_round=review_round,
+                        review_round_notice=review_round_notice,
+                    ),
                 )
         except asyncio.CancelledError:
             # A cancellation is the wall-clock budget taking the run back (msg-5498 W-1), not an
@@ -3704,6 +3739,19 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_tags(result: Any) -> tuple[str, ...] | None:
+    """``thread.tags`` of a ``chatroom_get_thread`` response, or None if absent/malformed.
+
+    The measured ``mode="full"`` shape (msg-4749) carries thread metadata under
+    ``thread``. Anything else is "not read", which the N-3 routing treats as marked.
+    """
+    thread = result.get("thread") if isinstance(result, dict) else None
+    tags = thread.get("tags") if isinstance(thread, dict) else None
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None
+    return tuple(tags)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

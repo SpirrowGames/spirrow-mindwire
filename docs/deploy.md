@@ -267,19 +267,27 @@ A request goes to `naysayer-gemini` when **any** of these holds:
   malformed, or no repository root. **Leaving the key out sends everything to Gemini.** Writing
   `n3_sensitive_paths = []` explicitly is the only way to say "no sensitive paths";
 - the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5). The value is
-  provisional until Lexora pins its `model_catalog_json` / `context_window`.
+  provisional until Lexora pins its `model_catalog_json` / `context_window`. Raising the output
+  reserve to 65,536 moved prompts of 145,537-179,072 chars from codex to Gemini. `mindwire
+  codex-band-count` counts those requests from the Lexora ledger (`MINDWIRE_LEXORA_URL`) and sums
+  their cost. It only sees requests made after this marking was deployed. If it prints
+  `truncated=true`, the count is a lower bound: re-run it with a larger `--limit`.
 
 Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
 glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
 be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
 notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+The scheduled sweep counts that token in each conductor run's output and the daily digest carries
+one line per repo ("routed to Gemini (fail-safe)"); the counts reset after a full digest delivery.
 
-**Design time is wired by the PR stacked on #463.** Until that PR lands, every design-time turn goes to
-`naysayer-gemini` (fail-safe), and the design-time bullets above describe what that PR adds.
-
-**Design time carries no file contents today.** The design-time prompt is the thread plus the
-principles, so the list of referenced files is empty. When the §7.5 prompt builder starts including
-files, it must pass the adapter the list of what it includes (`referenced_files`).
+**Which files design time routes on.** The design-time prompt is the thread, the principles SOT
+(`spec/NAYSAYER_PRINCIPLES.md`) and the ADR manifest (`spec/adr_index.yaml`). The two files are
+MindWire's own *system assets*, read from MindWire's install, not the host: they must resolve under
+MindWire's root to a path in `PROMPT_ASSETS`, or the request goes to Gemini (a principles override
+pointing elsewhere included). They are not matched against the host's globs, except when the host
+is mindwire itself. *Host files* (none today) go through the boundary check and the host's globs.
+A builder change that starts carrying another file must declare it; a structure test fails if the
+files the builder reads and the files it declares differ.
 
 **Residual risk, authorised by Takahito as a TIER-C goal decision on thread
 T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a vulnerability, on a path

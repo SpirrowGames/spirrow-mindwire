@@ -98,6 +98,7 @@ class _FakeLexora:
         self.calls: list[tuple[str, list[ChatMessage], int]] = []
         # ADR-14 §7.3 routing declaration per call (thread msg-6982).
         self.n3_routed: list[bool] = []
+        self.trace_ids: list[str | None] = []
 
     async def chat_completion(
         self,
@@ -105,9 +106,11 @@ class _FakeLexora:
         model: str,
         messages: list[ChatMessage],
         max_tokens: int,
+        trace_id: str | None = None,
         n3_routed: bool = False,
     ) -> ChatCompletion:
         self.n3_routed.append(n3_routed)
+        self.trace_ids.append(trace_id)
         self.calls.append((model, messages, max_tokens))
         if self._raise is not None:
             raise self._raise
@@ -127,6 +130,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
@@ -2410,6 +2418,11 @@ async def test_target_terminal_422_with_live_probe_reraises_not_environment_term
     from spirrow_mindwire.github.client import EnvironmentTerminalError
 
     class _TargetGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
@@ -2445,6 +2458,11 @@ async def test_unknown_scope_reraises_not_environment_terminal() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError
 
     class _UnknownGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
@@ -2688,6 +2706,11 @@ async def test_replay_strict_read_env_terminal_raises_environment_terminal_error
     probe_calls: list[int] = []
 
     class _ReadFailGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "7777888899990000", []))
 
@@ -2739,6 +2762,11 @@ async def test_replay_strict_read_403_suspended_token_raises_environment_termina
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _SuspendedGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "6666555544443333", []))
 
@@ -2785,6 +2813,11 @@ async def test_submit_403_with_unreachable_probe_reraises_plain_error_and_no_mar
         return "chatroom-msg-id"
 
     class _Submit403ProbeDeadGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "2222333344445555", []))
             self.submitted = []
@@ -2840,6 +2873,11 @@ async def test_submit_422_with_live_probe_writes_target_terminal_marker() -> Non
         return "chatroom-msg-id"
 
     class _Submit422LiveProbeGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "8888999900001111", []))
             self.submitted = []
@@ -4200,6 +4238,11 @@ async def test_environment_terminal_raises_environment_terminal_error() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _EnvGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-env", []))
             self.probe_calls = 0
@@ -4231,6 +4274,11 @@ async def test_environment_terminal_permission_403_with_live_probe() -> None:
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _PermGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-perm", []))
 
@@ -4265,6 +4313,11 @@ async def test_target_terminal_422_with_live_probe_raises_target_terminal_error(
     )
 
     class _TargetGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
 
@@ -4301,6 +4354,11 @@ async def test_unknown_scope_reraises_not_environment_terminal_not_target_termin
     )
 
     class _UnknownGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
 
@@ -4338,6 +4396,11 @@ async def test_retryable_error_reraises_raw() -> None:
     )
 
     class _RetryableGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-r", []))
             self.probe_calls = 0
@@ -4402,6 +4465,11 @@ async def test_same_identity_422_fallback_401_raises_environment_terminal_not_qu
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
 
     class _FallbackAuthDiesGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-auth", []))
             self._calls = 0
@@ -4446,6 +4514,11 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
     from spirrow_mindwire.github.client import TargetTerminalError
 
     class _FallbackDeletedGitHub(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         def __init__(self) -> None:
             super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-deleted", []))
             self._calls = 0
@@ -4900,6 +4973,11 @@ class _RetryScriptGitHub(_FakeGitHub):
     ``move_head_to`` moves ``current_head`` after the first POST.
     """
 
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
@@ -5210,6 +5288,11 @@ async def test_classify_exception_returns_typed_error_chained_to_original(
     from spirrow_mindwire.github import client as client_mod
 
     class _Probe(_FakeGitHub):
+        async def fetch_compare_status(
+            self, owner: str, repo: str, base_sha: str, head_sha: str
+        ) -> str:
+            return "ahead"
+
         async def probe_identity(self) -> int:
             return probe
 
@@ -5397,3 +5480,28 @@ async def test_routed_review_declares_n3_route_on_both_passes(
     await driver.review(_pr(), post_critique=post)
     assert {call[0] for call in lexora.calls} == {tier}
     assert lexora.n3_routed == [True, True]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("diff_chars", "tier", "marked"),
+    [(1_000, "naysayer", False), (140_000, "naysayer-gemini", True)],
+)
+async def test_a_review_in_the_codex_limit_band_is_marked_for_the_ledger(
+    diff_chars: int, tier: str, marked: bool
+) -> None:
+    from spirrow_mindwire.naysayer.n3_routing import is_codex_limit_band_trace_id
+
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    github = _routed_github()
+    github._diff = "x" * diff_chars
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {tier}
+    if marked:
+        first = lexora.trace_ids[0]
+        assert is_codex_limit_band_trace_id(first)
+        assert lexora.trace_ids == [first, first]
+    else:
+        assert lexora.trace_ids == [None, None]

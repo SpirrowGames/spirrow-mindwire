@@ -127,6 +127,27 @@ def test_spawner_starts_run_session_for_the_run(tmp_path: Path) -> None:
     ]
 
 
+def test_spawned_runner_is_detached_and_returns_at_once(tmp_path: Path) -> None:
+    """D1': the pass is blocked only for the start, not for the run."""
+    spawner = DetachedRunnerSpawner()
+    started = time.monotonic()
+    pid = spawner.spawn_runner(run_id="nolock", data_dir=tmp_path, log_path=tmp_path / "r.log")
+    assert time.monotonic() - started < 10
+    assert pid > 0
+    # With no lock for this run the runner says so and exits; its output lands in the log.
+    end = time.monotonic() + 60
+    while time.monotonic() < end and "nothing to do" not in _read(tmp_path / "r.log"):
+        time.sleep(0.2)
+    assert "nothing to do" in _read(tmp_path / "r.log")
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
 # --- PR #506 gate: the session's environment is built, never inherited ---------------------------
 
 from spirrow_mindwire.operator_lane import session as sess  # noqa: E402

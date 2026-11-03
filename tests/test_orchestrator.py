@@ -1259,6 +1259,11 @@ async def test_design_thread_must_exist() -> None:
 class _FakeGitHubCi:
     """Minimal GitHubReviewClient stub returning a fixed CI status."""
 
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(self, ci: CiStatus) -> None:
         self._ci = ci
 

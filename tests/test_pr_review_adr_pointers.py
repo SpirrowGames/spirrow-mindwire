@@ -102,6 +102,7 @@ class _FakeLexora:
         model: str,
         messages: list[ChatMessage],
         max_tokens: int,
+        trace_id: str | None = None,
         n3_routed: bool = False,
     ) -> ChatCompletion:
         self.n3_routed.append(n3_routed)
@@ -136,6 +137,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,

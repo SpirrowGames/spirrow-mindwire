@@ -44,6 +44,15 @@ The isolation check is a static audit of the firewall rule. It never tries to co
 magickit being down neither opens the guard nor stops the lane. If the audit finds anything missing,
 the lane turns itself off (`enabled: false` plus `disabled_reason`) and sends a Discord notification.
 
+If `operator_lane.json` could not be read when the lane turned itself off (broken JSON, for example
+because it was being edited at that moment), the file is still overwritten with `enabled: false`. Its
+previous bytes are first copied next to it as
+`operator_lane.json.malformed-<YYYYMMDDTHHMMSSZ>-<pid>-<hex6>.bak`, and `disabled_reason` names that
+file (or says `backup failed: <error>` if the copy could not be written). Nothing restores the backup
+automatically. To get your settings back: fix the cause shown in `disabled_reason`, open the `.bak`, fix
+its JSON, copy the keys you want into `operator_lane.json` (leave `enabled` at `false` until the guard
+cause is fixed), and then delete the `.bak` by hand.
+
 ## One-time manual setup (Takahito)
 
 Run these in an elevated PowerShell on tomtebo-01, except where a step says otherwise. Nothing here costs
@@ -120,6 +129,12 @@ need API-key billing, stop: that is a Tier-C `cost` decision.**
      runas /user:mw-operator "powershell -NoExit -Command Test-NetConnection {{IP_SERVICES}} -Port 8110"
      Test-NetConnection {{IP_SERVICES}} -Port 8110
      ```
+
+   - The session's environment is built from `mw-operator`'s own logon (`LogonUserW` +
+     `CreateEnvironmentBlock`, inheriting nothing), and the runner refuses to start it if any
+     `MINDWIRE_*` name or value of 8+ chars appears. A refusal shows in the run's report as `session_failed` with
+     `session environment carries runner settings: <names>`. `LogonUserW` needs the same
+     "Allow log on locally" right that `runas` uses above. If it fails, record the error code.
 
 8. **Turn it on:** set `"enabled": true`. The first enabled tick creates `state\operator_lane.json`.
 

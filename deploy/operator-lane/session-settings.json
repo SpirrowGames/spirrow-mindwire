@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push origin HEAD:main:*)",
+      "Bash(git branch -D:*)",
+      "Bash(gh repo delete:*)",
+      "Bash(rm -rf:*)",
+      "Bash(rm -r:*)",
+      "Bash(rm -R:*)",
+      "Bash(rm -fr:*)",
+      "Bash(rm -fR:*)",
+      "Bash(rm -f -r:*)",
+      "Bash(rm -f -R:*)",
+      "Bash(rm --recursive:*)",
+      "Bash(rm -f --recursive:*)",
+      "Bash(rm --force -r:*)",
+      "Bash(rm --force --recursive:*)",
+      "Bash(Remove-Item -R:*)",
+      "Bash(Remove-Item -r:*)",
+      "Bash(Remove-Item -Force -R:*)",
+      "Bash(Remove-Item -Force -r:*)"
+    ]
+  }
+}
