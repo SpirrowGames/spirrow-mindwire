@@ -233,3 +233,47 @@ function Get-PreLoopBudgetDigestLines {
              $n, $over, (Format-PreLoopSeconds $median), (Format-PreLoopSeconds $secs[$n - 1]))
     return $line
 }
+
+# --- D-1: heads hand-off between head probe, 1b and park-wake --------------------------------------
+# The sweep runs, per project: control -> head probe -> 1b -> park-wake (Bohr msg-7853 D-1). 1b and
+# park-wake get the heads through `--heads-json` and serve threads whose head has not moved from
+# their tail cache (src/spirrow_mindwire/tail_cache.py). They print `posted_heads`
+# ({thread_id: msg_id}) for every thread they wrote to, and the sweep writes those over its heads
+# before the next step, so it never runs the head probe a second time (msg-7845 Obj-2-1).
+
+# The heads file 1b / park-wake read, in scripts/thread_heads.py's shape. $null heads (the probe
+# failed, or a step's result was unusable) gives `{}`: no heads, so every thread is read in full.
+function ConvertTo-HeadsProbeJson {
+    param([hashtable]$Heads)
+    if ($null -eq $Heads) { return '{}' }
+    return (@{ heads = $Heads; count = $Heads.Count } | ConvertTo-Json -Depth 3 -Compress)
+}
+
+# Writes a step's posted_heads over $Heads and returns the heads to use next:
+#   * a thread with a msg id gets that id as its head;
+#   * a thread with "" (the post's id could not be read, or the post may have landed without an
+#     answer) is REMOVED, so it counts as unknown and is launched / re-read (fail-open);
+#   * a step whose result is missing or has no posted_heads (timeout, crash, exit 1) may have
+#     written anywhere, so the whole map becomes $null — every thread of the project is unknown.
+#   * $null heads stay $null.
+function Update-HeadsFromPosted {
+    param([hashtable]$Heads, $Result)
+    if ($null -eq $Heads) { return $null }
+    if ($null -eq $Result -or $null -eq $Result.PSObject.Properties['posted_heads']) { return $null }
+    $posted = $Result.posted_heads
+    if ($null -eq $posted) { return $null }
+    $pairs = if ($posted -is [System.Collections.IDictionary]) { @($posted.GetEnumerator() | ForEach-Object { @{ Name = $_.Key; Value = $_.Value } }) }
+             else { @($posted.PSObject.Properties | ForEach-Object { @{ Name = $_.Name; Value = $_.Value } }) }
+    foreach ($p in $pairs) {
+        $id = "$($p.Value)"
+        if ([string]::IsNullOrEmpty($id)) { [void]$Heads.Remove($p.Name) } else { $Heads[$p.Name] = $id }
+    }
+    return , $Heads
+}
+
+# The tail cache file of a project, under state\tail-cache. Characters outside [A-Za-z0-9._-] are
+# replaced so a project name cannot leave the directory.
+function Get-TailCacheFileName {
+    param([string]$Project)
+    return (($Project -replace '[^A-Za-z0-9._-]', '-') + '.json')
+}

@@ -229,6 +229,8 @@ $materialMissingPath = Join-Path $dataDir "state\material-missing.json"
 # T-sweep-preloop-overhead-exceeds-launch-budget D-4: the over-budget alert state machine and the
 # per-tick pre-loop samples the digest line reads (deploy/lib/PreLoopBudget.ps1). Single writer.
 $preLoopBudgetStatePath = Join-Path $dataDir "state\preloop-budget.json"
+# D-1: one tail cache per project (src/spirrow_mindwire/tail_cache.py), shared by 1b and park-wake.
+$tailCacheDir = Join-Path $dataDir "state\tail-cache"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 # --- library dot-sources -------------------------------------------------------------------------
@@ -5076,12 +5078,19 @@ function Invoke-GateBootstrapTick {
 # Runs after the project's HOLD check and BEFORE its head probe, so a held project gets no writes
 # and a thread it just wrote to has a moved head and is launched this tick. Fail-open on the SWEEP, for the same reason as Invoke-GateBootstrapTick: a broken 1b tick must
 # not stop the sweep that runs conductors. Every outcome other than a quiet no-op is logged.
+# D-1 (T-sweep-preloop-overhead-exceeds-launch-budget): $Heads is this tick's head map for the project
+# ($null = unknown). It goes to the module as `--heads-json`, with the project's tail cache, so a
+# thread whose head has not moved is not read again. The returned object carries `posted_heads`,
+# which the caller writes over its heads (Update-HeadsFromPosted).
 function Invoke-PrEventAdvanceTick {
-    param([string]$Project)
+    param([string]$Project, [hashtable]$Heads = $null)
 
+    $headsFile = $null
     try {
+        $headsFile = New-ProbeInputFile -Json (ConvertTo-HeadsProbeJson -Heads $Heads) -Label "heads-$Project"
+        $tailCachePath = Join-Path $tailCacheDir (Get-TailCacheFileName -Project $Project)
         $r = Invoke-BoundedUvProbe -Label "pr-event-advance-$Project" -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
-            -Arguments @('-m', 'spirrow_mindwire.pr_event_advance', '--project', $Project, '--sweep-config', $sweepConfigPath)
+            -Arguments @('-m', 'spirrow_mindwire.pr_event_advance', '--project', $Project, '--sweep-config', $sweepConfigPath, '--heads-json', $headsFile, '--tail-cache', $tailCachePath)
         if (-not $r.ok) {
             Write-Log "pr-event-advance [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
             return $null
@@ -5104,6 +5113,9 @@ function Invoke-PrEventAdvanceTick {
     catch {
         Write-Log "pr-event-advance [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
         return $null
+    }
+    finally {
+        if ($headsFile) { Remove-ProbeInputFile -Path $headsFile }
     }
 }
 
@@ -5178,12 +5190,33 @@ function Get-AutoGateProjects {
 # before the head probe (a thread it woke has a moved head and is launched this tick), and
 # fail-open on the SWEEP — a broken tick returns $null and the sweep goes on. The classification is
 # Python-side; this wrapper never parses a STOP: line.
-function Invoke-ParkWakeTick {
-    param([string]$Project)
+# D-1: the heads after a step that may have written (1b, park-wake). The normal path writes the step's
+# posted_heads over the heads (Update-HeadsFromPosted) and runs nothing. When the step's result is
+# unusable (timeout, crash, exit 1) it may have posted to any thread, so the heads are read once more
+# with the head probe — the same answer the old order (1b and park-wake BEFORE the probe) gave in that
+# case. A failing step costs one listing call, rather than every candidate of the project counting as
+# unknown on every tick while it keeps failing. If that probe fails too, the heads are unknown ($null).
+function Get-HeadsAfterStep {
+    param([string]$Project, [hashtable]$Heads, $Result, [string]$Step)
+    if ($null -eq $Heads) { return $null }
+    $next = Update-HeadsFromPosted -Heads $Heads -Result $Result
+    if ($null -ne $next) { return , $next }
+    Confirm-LogWorthKeeping
+    Write-Log "head probe [$Project]: $Step returned no usable result — re-reading heads (it may have posted)"
+    return Invoke-HeadProbe -Project $Project
+}
 
+# D-1: $Heads as in Invoke-PrEventAdvanceTick. A project with no head probe (the declared-projects
+# scan) passes none: every thread is then read in full, as before.
+function Invoke-ParkWakeTick {
+    param([string]$Project, [hashtable]$Heads = $null)
+
+    $headsFile = $null
     try {
+        $headsFile = New-ProbeInputFile -Json (ConvertTo-HeadsProbeJson -Heads $Heads) -Label "heads-$Project"
+        $tailCachePath = Join-Path $tailCacheDir (Get-TailCacheFileName -Project $Project)
         $r = Invoke-BoundedUvProbe -Label "park-wake-$Project" -TimeoutSeconds $ParkWakeProbeTimeoutSeconds `
-            -Arguments @('-m', 'spirrow_mindwire.park_wake', '--project', $Project, '--sweep-config', $sweepConfigPath)
+            -Arguments @('-m', 'spirrow_mindwire.park_wake', '--project', $Project, '--sweep-config', $sweepConfigPath, '--heads-json', $headsFile, '--tail-cache', $tailCachePath)
         if (-not $r.ok) {
             Write-Log "park-wake [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
             return $null
@@ -5206,6 +5239,9 @@ function Invoke-ParkWakeTick {
     catch {
         Write-Log "park-wake [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
         return $null
+    }
+    finally {
+        if ($headsFile) { Remove-ProbeInputFile -Path $headsFile }
     }
 }
 
@@ -5485,22 +5521,29 @@ try {
         }
         if (Test-HoldObserved -Control $c) { continue }
         $autoGateProjects += $proj
-        # 1b (T-pr-event-advances-thread): after the HOLD check, so a held project gets no 1b
-        # writes either, and BEFORE the head probe, so a thread it writes to shows a moved head
-        # in this same tick. Fail-open (see Invoke-PrEventAdvanceTick).
-        $phaseStartUtc = Get-SweepNowUtc
-        [void](Invoke-PrEventAdvanceTick -Project $proj)
-        Add-PreLoopPhase -Phases $preLoopPhases -Name "1b[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
-        # Park wake (Slice 3, D-7): same slot and same reasons as 1b above.
-        $phaseStartUtc = Get-SweepNowUtc
-        $parkWake = Invoke-ParkWakeTick -Project $proj
-        Add-PreLoopPhase -Phases $preLoopPhases -Name "parkwake[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
-        if ($null -ne $parkWake) { $stopClassByProject[$proj] = $parkWake } else { $stopClassFailed += $proj }
+        # D-1 (T-sweep-preloop-overhead-exceeds-launch-budget, Bohr msg-7853): control -> head probe
+        # -> 1b -> park-wake. The head probe runs first so 1b and park-wake can skip re-reading the
+        # threads whose head has not moved (their tail cache). A thread they write to still shows a
+        # moved head in this same tick: each returns `posted_heads`, which is written over the heads
+        # before the next step (Update-HeadsFromPosted) — no second head probe. A step whose result
+        # is unusable may have written anywhere, so the project's heads become unknown (fail-open).
         $phaseStartUtc = Get-SweepNowUtc
         $h = Invoke-HeadProbe -Project $proj
         Add-PreLoopPhase -Phases $preLoopPhases -Name "head[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
-        $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
+        # 1b (T-pr-event-advances-thread): after the HOLD check, so a held project gets no 1b
+        # writes either. Fail-open (see Invoke-PrEventAdvanceTick).
+        $phaseStartUtc = Get-SweepNowUtc
+        $prEvent = Invoke-PrEventAdvanceTick -Project $proj -Heads $h
+        Add-PreLoopPhase -Phases $preLoopPhases -Name "1b[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $prEvent -Step '1b'
+        # Park wake (Slice 3, D-7): same slot and same reasons as 1b above.
+        $phaseStartUtc = Get-SweepNowUtc
+        $parkWake = Invoke-ParkWakeTick -Project $proj -Heads $h
+        Add-PreLoopPhase -Phases $preLoopPhases -Name "parkwake[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+        if ($null -ne $parkWake) { $stopClassByProject[$proj] = $parkWake } else { $stopClassFailed += $proj }
+        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $parkWake -Step 'park-wake'
+        $headsByProject[$proj] = $h
     }
 
     $phaseStartUtc = Get-SweepNowUtc

@@ -665,6 +665,14 @@ launched for 2.5h without any alert. Two things were added (`deploy/lib/PreLoopB
   sends **recovered**. An `ok` tick resets everything. At most one alert per tick, and no near warning
   ever follows an over alert. State: `state\preloop-budget.json`. The daily digest gets one line:
   the last 24h tick count, the over-budget ticks, and the median and max pre-loop time.
+- the per-project order is now control → head probe → 1b → park-wake. 1b and park-wake get the
+  heads (`--heads-json`) and a tail cache per project (`state\tail-cache\<project>.json`, keyed by
+  each thread's head msg id, no TTL). A thread whose head has not moved is not read again. A cache
+  file that is missing, broken or on another schema version means a full read, as before. 1b and
+  park-wake return `posted_heads`, which the sweep writes over its heads before the next step, so
+  their own posts still show as moved heads in the same tick. A post whose msg id is unknown removes
+  the thread from the heads, so it is treated as unknown and launched. If a step returns nothing
+  usable (timeout, crash), it may have posted somewhere, so the heads are read once more.
 
 ### Why the sweep is cheap enough to run on a short interval
 

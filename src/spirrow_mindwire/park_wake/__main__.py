@@ -1,4 +1,5 @@
-"""CLI: ``python -m spirrow_mindwire.park_wake --project <p> [--sweep-config <path>]``.
+"""CLI: ``python -m spirrow_mindwire.park_wake --project <p> [--sweep-config <path>]
+[--heads-json <path>] [--tail-cache <path>]`` (the tail cache flags are 1b's; see there).
 
 Prints ONE JSON object on stdout, ASCII-only so the PowerShell wrapper's ``ConvertFrom-Json``
 reads it under any console codepage (the rule ``pr_event_advance`` follows).
@@ -25,7 +26,7 @@ from typing import Any
 from ..config import load_settings
 from ..github.client import GitHubClient
 from ..magickit.client import StreamableHttpChatroomMcp
-from ..pr_event_advance.__main__ import registered_threads
+from ..pr_event_advance.__main__ import open_cache, registered_threads
 from .runner import run_tick
 
 _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
@@ -44,6 +45,7 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             project=args.project,
             roster=roster,
             registered=registered_threads(args.sweep_config, args.project),
+            cache=open_cache(args),
         )
     return report.as_dict()
 
@@ -53,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", required=True)
     parser.add_argument("--url", default=None, help="magickit MCP URL (default: in-code/env)")
     parser.add_argument("--sweep-config", type=Path, default=None)
+    parser.add_argument("--heads-json", type=Path, default=None, help="this tick's heads")
+    parser.add_argument("--tail-cache", type=Path, default=None, help="the project's tail cache")
     args = parser.parse_args(argv)
     try:
         out = asyncio.run(_main(args))

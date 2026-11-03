@@ -180,5 +180,55 @@ $stepAt = $src.IndexOf('Step-PreLoopBudgetState -State')
 $loopAt = $src.IndexOf('$preLoopSeconds = Get-SweepElapsedSeconds -Since $tickStartUtc -Now $loopStartUtc')
 Check 'machine runs after pre-loop is measured' ($loopAt -gt 0 -and $stepAt -gt $loopAt)
 
+Write-Host "D-1: heads hand-off (control -> head probe -> 1b -> park-wake)"
+$heads = @{ 'T-a' = 'msg-1'; 'T-b' = 'msg-2'; 'T-c' = 'msg-3' }
+$oneB = '{"project":"p","posted":1,"posted_heads":{"T-a":"msg-10"}}' | ConvertFrom-Json
+$h = Update-HeadsFromPosted -Heads $heads -Result $oneB
+Check '1b post moves the head park-wake receives' ($h['T-a'] -eq 'msg-10')
+Check 'park-wake heads file carries the moved head' ((((ConvertTo-HeadsProbeJson -Heads $h) | ConvertFrom-Json).heads.'T-a') -eq 'msg-10')
+$pw = '{"project":"p","posted_heads":{"T-b":""}}' | ConvertFrom-Json
+$h = Update-HeadsFromPosted -Heads $h -Result $pw
+Check 'a blank msg id removes the thread (unknown, fail-open)' (-not $h.ContainsKey('T-b'))
+Check 'untouched threads keep their head' ($h['T-c'] -eq 'msg-3')
+$h = Update-HeadsFromPosted -Heads $h -Result ('{"project":"p","posted_heads":{}}' | ConvertFrom-Json)
+Check 'empty posted_heads changes nothing' ($h.Count -eq 2)
+Check 'a hashtable result is accepted too' ((Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ([pscustomobject]@{ posted_heads = @{ 'T-a' = 'y' } }))['T-a'] -eq 'y')
+Check 'no result -> unknown' ($null -eq (Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result $null))
+Check 'result without posted_heads (exit 1) -> unknown' ($null -eq (Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ('{"error":"boom"}' | ConvertFrom-Json)))
+Check 'null heads stay null' ($null -eq (Update-HeadsFromPosted -Heads $null -Result $oneB))
+Check 'null heads -> {} heads file' ((ConvertTo-HeadsProbeJson -Heads $null) -eq '{}')
+Check 'tail cache file name keeps a plain project' ((Get-TailCacheFileName -Project 'spirrow-mindwire') -eq 'spirrow-mindwire.json')
+Check 'tail cache file name cannot leave the directory' ((Get-TailCacheFileName -Project '..\x/y') -notmatch '[\/]')
+
+Write-Host "D-1: a step with no usable result re-reads the heads once"
+$fnStep = $fnAsts | Where-Object { $_.Name -eq 'Get-HeadsAfterStep' } | Select-Object -First 1
+Invoke-Expression $fnStep.Extent.Text
+$script:reprobes = 0
+function Invoke-HeadProbe { param([string]$Project) $script:reprobes++; return @{ 'T-a' = 'msg-50' } }
+function Write-Log { param([string]$Message) }
+function Confirm-LogWorthKeeping { }
+$h = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $oneB -Step '1b'
+Check 'normal path: no re-probe' ($script:reprobes -eq 0 -and $h['T-a'] -eq 'msg-10')
+$h = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $null -Step '1b'
+Check 'unusable result: one re-probe, its heads used' ($script:reprobes -eq 1 -and $h['T-a'] -eq 'msg-50')
+$h = Get-HeadsAfterStep -Project 'p' -Heads $null -Result $null -Step '1b'
+Check 'unknown heads: no re-probe, stay unknown' ($script:reprobes -eq 1 -and $null -eq $h)
+
+Write-Host "D-1 wiring"
+$runAt = $src.IndexOf('# --- run ---')
+$ctl = $src.IndexOf('$c = Invoke-ControlProbe -Project $proj', $runAt)
+$hp = $src.IndexOf('$h = Invoke-HeadProbe -Project $proj', $runAt)
+$ob = $src.IndexOf('$prEvent = Invoke-PrEventAdvanceTick -Project $proj -Heads $h', $runAt)
+$ob2 = $src.IndexOf("`$h = Get-HeadsAfterStep -Project `$proj -Heads `$h -Result `$prEvent -Step '1b'", $runAt)
+$pwk = $src.IndexOf('$parkWake = Invoke-ParkWakeTick -Project $proj -Heads $h', $runAt)
+$pw2 = $src.IndexOf("`$h = Get-HeadsAfterStep -Project `$proj -Heads `$h -Result `$parkWake -Step 'park-wake'", $runAt)
+$store = $src.IndexOf('$headsByProject[$proj] = $h', $runAt)
+Check 'order: control -> head -> 1b -> patch -> park-wake -> patch -> store' (
+    $ctl -gt 0 -and $hp -gt $ctl -and $ob -gt $hp -and $ob2 -gt $ob -and $pwk -gt $ob2 -and $pw2 -gt $pwk -and $store -gt $pw2) "$ctl $hp $ob $ob2 $pwk $pw2 $store"
+Check 'only one head probe call in the per-project loop' (
+    ([regex]::Matches($src.Substring($runAt), 'Invoke-HeadProbe -Project \$proj')).Count -eq 1)
+Check '1b passes --heads-json and --tail-cache' ($src -match "'spirrow_mindwire\.pr_event_advance', '--project', \`$Project, '--sweep-config', \`$sweepConfigPath, '--heads-json', \`$headsFile, '--tail-cache', \`$tailCachePath")
+Check 'park-wake passes --heads-json and --tail-cache' ($src -match "'spirrow_mindwire\.park_wake', '--project', \`$Project, '--sweep-config', \`$sweepConfigPath, '--heads-json', \`$headsFile, '--tail-cache', \`$tailCachePath")
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) failure(s)"; exit 1 }
 Write-Host "all passed"
