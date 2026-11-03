@@ -2535,7 +2535,6 @@ class NaysayerPrReviewDriver:
             round_context=round_context,
             trace_id=trace_id,
         )
-        await self._log_backend_attest(pr.slug, diff_head, tier=tier, trace_id=trace_id)
 
         if isinstance(pass1_result, LexoraTimeoutError):
             # T-infra-failure-posts-empty-rc: pass 1 did not finish within the client timeout.
@@ -2643,6 +2642,12 @@ class NaysayerPrReviewDriver:
         receipt = await self._post_and_submit(
             pr, verdict=verdict, body=body, head_sha=ci.head_sha, post_critique=post_critique
         )
+        # Backend read-back runs only AFTER the review is posted and submitted (PR #516 gate
+        # finding, round 1): telemetry must never delay or gate delivery of the artefact. A
+        # pass-1 failure (timeout degrade / fail-loud raise) returns above without it — no
+        # request reached a backend, so there would be no ledger row to read back, and
+        # polling for one would only stall the degrade path.
+        await self._log_backend_attest(pr.slug, diff_head, tier=tier, trace_id=trace_id)
         return PrReviewOutcome(
             verdict=verdict,
             body=receipt.body,

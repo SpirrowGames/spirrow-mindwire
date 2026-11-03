@@ -5653,3 +5653,51 @@ async def test_pr_gate_default_client_reads_the_ledger_at_its_own_route() -> Non
         assert driver._attest_route == "192.0.2.10:8110"
     finally:
         await driver._lexora.aclose()
+
+
+@pytest.mark.anyio
+async def test_pr_gate_backend_read_back_runs_only_after_the_review_is_posted() -> None:
+    # PR #516 gate round 1: telemetry must never delay or gate delivery of the review.
+    events: list[str] = []
+
+    async def post(body: str) -> str:
+        events.append("post")
+        return "msg-1"
+
+    async def read(trace_id: str) -> list[dict[str, Any]]:
+        events.append("read-back")
+        return await _rows_for(["codex", "codex"])(trace_id)
+
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(), github=_routed_github(), turn_rows=read, sleep=_no_sleep
+    )
+    await driver.review(_pr(), post_critique=post)
+    assert events[0] == "post"
+    assert "read-back" in events
+
+
+@pytest.mark.anyio
+async def test_pr_gate_timeout_degrade_skips_the_backend_read_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # PR #516 gate round 1: a pass-1 timeout reached no backend, so no ledger row exists;
+    # polling for one would only stall the degrade path before its COMMENT-hold is posted.
+    reads: list[str] = []
+
+    async def read(trace_id: str) -> list[dict[str, Any]]:
+        reads.append(trace_id)
+        return []
+
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(raise_exc=LexoraTimeoutError("POST /v1/chat/completions timed out")),
+        github=_routed_github(),
+        turn_rows=read,
+        sleep=_no_sleep,
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        await driver.review(_pr(), post_critique=post)
+    assert len(posted) == 1
+    assert "VERDICT: COMMENT" in posted[0]
+    assert reads == []
+    assert _attest_lines(caplog) == []
