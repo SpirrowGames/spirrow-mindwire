@@ -287,6 +287,11 @@ need a file, use `<repo>/.git/mindwire-scratch/`, which is inside the repo yet \
 can never appear in `git status` or be committed by `git add`. Never put \
 scratch files in the working tree, where they would be committed by accident.
 
+PR BODY LINES: every PR body carries a line `Thread: <the id of this thread>`, at \
+the start of a line. The loop fires the first PR-gate from it; without it the gate \
+does not fire. To keep a PR out of the gate on purpose, add the line `Gate: hold`. \
+To mention either line without triggering it, quote it with a leading `>`.
+
 After the TURN START base sync, work on a feature/* branch, commit your \
 changes, and (when ready) open a PR to develop. When you reply in the thread, \
 reply directly with the message body — no preamble, no meta-commentary; your \

@@ -122,7 +122,9 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   # Slice 3b S3b-1: sweep.json `projects` and the declared-only park-wake scan.
                   'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved',
                   # T-D8-codex-backend-adr14-15-amendment msg-6582 gap 1: the N-3 fail-safe line.
-                  'Get-N3UnresolvedCount', 'Add-N3UnresolvedCount', 'Get-N3UnresolvedDigestLines') {
+                  'Get-N3UnresolvedCount', 'Add-N3UnresolvedCount', 'Get-N3UnresolvedDigestLines',
+                  # T-gate-fires-on-pr-open: 1c also scans clones no candidate names.
+                  'Get-AutoGateProjects') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -1067,6 +1069,15 @@ $scanNone = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @(); error =
 Check "no declared project -> nothing ticked" 0 $script:parkWakeCalls.Count
 Check "no declared project -> nothing failed" 0 @($scanNone.failed).Count
 Check "no declared project -> digest unchanged" 0 (Get-StopClassDigestLines -ByProject $scanNone.byProject -Failed $scanNone.failed).Count
+
+# Get-AutoGateProjects (T-gate-fires-on-pr-open, PR #512 review): a PR whose project has no candidate.
+$agClones = [ordered]@{ 'p-cand' = 'clone-a'; 'p-idle' = 'clone-b'; 'p-held' = 'clone-c'; 'p-cand-held' = 'clone-d' }
+Check "1c scans a clones project no candidate names, not a held one or a candidate that failed HOLD" `
+    'p-cand,p-idle' ((Get-AutoGateProjects -PassedHold @('p-cand') -CandidateProjects @('p-cand', 'p-cand-held') -Clones $agClones) -join ',')
+Check "1c keeps a candidate project with no clones entry, so its error is reported" `
+    'p-idle,p-noclone' ((Get-AutoGateProjects -PassedHold @('p-noclone') -CandidateProjects @('p-noclone') -Clones ([ordered]@{ 'p-idle' = 'clone-b' })) -join ',')
+Check "1c with no candidate project passing and no clones -> nothing to scan" `
+    0 @(Get-AutoGateProjects -PassedHold @() -CandidateProjects @('p') -Clones ([ordered]@{})).Count
 
 # =============================================================================================
 # T-D8-codex-backend-adr14-15-amendment (Bohr msg-6582 gap 1, Einstein msg-6587): the N-3

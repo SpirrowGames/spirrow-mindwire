@@ -81,7 +81,8 @@ def test_every_call_site_was_found() -> None:
     # T-sweep-intake-and-quarantine-stalls (msg-5889 D-2) adds Invoke-UnregisteredThreadsProbe.
     # T-next-line-carries-who-not-why Slice 3 adds Invoke-ParkWakeTick ->
     # -m spirrow_mindwire.park_wake (D-7): fourteen.
-    assert len(_SITES) == 14, _SITES
+    # T-gate-fires-on-pr-open adds Invoke-AutoGateTick: fifteen.
+    assert len(_SITES) == 15, _SITES
 
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
