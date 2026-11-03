@@ -172,6 +172,11 @@ HEAD_CACHE_TTL: timedelta = timedelta(minutes=60)
 # the head — skipping it here would park it silently, which is the failure this set guards.
 STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN, OPERATOR_TOKEN})
 
+# The members of :data:`STOP_TOKENS` whose Stage 1 verdict needs the whole head body, not just its
+# token. The head cache (:func:`can_reuse_cached_parse`) keeps only the token, so it must never
+# serve one of these (T-operator-task-lane D0). A new conditional member belongs here too.
+BODY_DEPENDENT_STOP_TOKENS: frozenset[str] = frozenset({OPERATOR_TOKEN})
+
 
 def _is_parked_operator(head_body: str) -> bool:
     """Is this ``NEXT: operator`` head the accepted 3-line form? Asks the grammar owner."""
@@ -856,10 +861,21 @@ def can_reuse_cached_parse(record: Record | None, head_msg_id: str, now: datetim
     A ``None`` record or an unset ``last_observed_head_msg_id`` fails both: nothing cached.
     An empty ``head_msg_id`` is treated as unknown — we cannot compare against nothing, so we
     fetch (fail-open on the observability side).
+
+    3. **Token-sufficiency predicate** (T-operator-task-lane D0, Bohr msg-7408): a cache hit is
+       served by synthesising ``NEXT: <cached token>`` as the body, which reproduces Stage 1
+       only for a token whose verdict depends on the token alone. A member of
+       :data:`BODY_DEPENDENT_STOP_TOKENS` does not qualify: :func:`stage1_skips` reads the whole
+       body for it, and the synthesised one-line body never satisfies it. Measured: well-formed
+       ``NEXT: operator`` heads (msg-7364 / 7365 / 7369) SKIPped on the tick that fetched, then
+       fell through to Stage 2 on every cache-hit tick within the TTL and LAUNCHed at CAP — 49-53
+       launches on one unchanged head. Such a head is therefore always re-fetched.
     """
     if record is None or not head_msg_id or not record.last_observed_head_msg_id:
         return False
     if record.last_observed_head_msg_id != head_msg_id:
+        return False
+    if record.last_observed_nomination in BODY_DEPENDENT_STOP_TOKENS:
         return False
     return not needs_head_reparse(record, now)
 
@@ -994,6 +1010,7 @@ REPORT_MODE_VALUE: str = "report"
 
 __all__ = [
     "BASE",
+    "BODY_DEPENDENT_STOP_TOKENS",
     "CAP",
     "HEAD_CACHE_TTL",
     "REPORT_MODE_ENV",

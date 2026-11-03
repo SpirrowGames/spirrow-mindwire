@@ -72,6 +72,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.SLICE_END: None,
     # Not in §6.3. A merge waiting on the PR list, not a stall; 1b resumes it.
     StopReason.MERGE_WAIT: None,
+    # Not in §6.3 (T-merged-pr-fact-never-reaches-design-thread). The PR was already merged or
+    # closed; the fact was posted and its own NEXT is the hand-off. Not a stall.
+    StopReason.PR_SETTLED: None,
     # Not in §6.3. Its notice ends ``NEXT: human``, so it is read as a human stop like HUMAN.
     StopReason.SELF_HANDOFF: None,
     # Not in §6.3 (T-next-operator-is-silent). A valid ``NEXT: operator`` park, not a stall: the

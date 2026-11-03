@@ -417,6 +417,16 @@ class ConductorConfig(_StrictModel):
     Author trust is the **environment** trust model (D-3): the loop-level gate is best-effort
     noise-reduction; the authoritative guard that changes never reach ``main`` is the human's manual
     merge (the same stance as the implementer allow-list)."""
+    tier_c_recorders: list[str] = Field(default_factory=list)
+    """Authors whose ``TIER-C-RESOLVED: <msg-id> decided-by=<human_identity> on=YYYY-MM-DD`` lines
+    discharge the named Tier-C declaration from guard (i)'s G1 latch
+    (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a) / msg-7204).
+
+    This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["operator",
+    "Fermi"]``). Empty (the default) = only a human post unlatches G1, the previous behaviour. A
+    recorder holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that
+    thread (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING
+    for the overlap. Same author-string trust as ``human_identity``."""
     max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 
@@ -633,6 +643,13 @@ class NaysayerGatingConfig(_StrictModel):
     loop) — instead of spending another Gemini review. Bounds the long re-review tail. Env:
     ``MINDWIRE_NAYSAYER_GATING__MAX_REVIEW_ROUNDS=4``."""
 
+    review_max_tokens: int | None = Field(default=None, ge=1)
+    """Output-token budget for the pass-1 review call (critique + VERDICT). ``None`` (the default)
+    keeps the driver's built-in default. A reasoning-model reviewer spends part of this budget on
+    reasoning, and a review that runs out ends ``finish_reason=length``, which the gate turns into a
+    fail-closed REQUEST_CHANGES with no findings. Env:
+    ``MINDWIRE_NAYSAYER_GATING__REVIEW_MAX_TOKENS=65536``."""
+
     review_login: str = "spirrowgames-ops"
     """The GitHub login the naysayer submits reviews under (T22 = ``spirrowgames-ops``); the
     head-unchanged / round-cap state counts only reviews by this login, so other reviewers (Copilot,
@@ -663,10 +680,24 @@ class TurnGitConfig(_StrictModel):
     branch_override: dict[str, str] = Field(default_factory=dict)
 
 
+class TurnIsolationConfig(_StrictModel):
+    """``[turn.isolation]`` — run the turn as a separate Windows user (ADR-2026-10-09-23 unit 2a,
+    S7).
+
+    ``user`` unset (the default) means no isolation: every turn runs exactly as it did before
+    this table existed (D1). Set it to a local account (``mindwire-turn``) or a domain-qualified
+    name. The account's password is never configured here: the launcher reads it from the owner's
+    Credential Manager (``mindwire/turn-user``). See :mod:`spirrow_mindwire.turn_isolation`.
+    """
+
+    user: str | None = Field(default=None, min_length=1)
+
+
 class TurnConfig(_StrictModel):
-    """``[turn]`` — per-turn hooks. Only ``[turn.git]`` exists."""
+    """``[turn]`` — per-turn hooks: ``[turn.git]`` and ``[turn.isolation]``."""
 
     git: TurnGitConfig = Field(default_factory=TurnGitConfig)
+    isolation: TurnIsolationConfig = Field(default_factory=TurnIsolationConfig)
 
 
 class ModelPolicyConfig(_StrictModel):
@@ -898,6 +929,7 @@ __all__ = [
     "TierCGateConfig",
     "TurnConfig",
     "TurnGitConfig",
+    "TurnIsolationConfig",
     "WatcherConfig",
     "load_settings",
     "resolve_tier_c_decisions_log_path",

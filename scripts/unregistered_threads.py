@@ -16,7 +16,7 @@ script and hands its report to ``deploy/lib/UnregisteredIntake.ps1``:
 
 * A listed thread joins **that tick's** candidate array, in memory, only
   when ``intake.mode`` is ``on``, its project has a usable ``clones``
-  entry, its ``updated_at`` is within ``intake.max_idle_days`` and it is
+  entry, its ``last_activity_at`` is within ``intake.max_idle_days`` and it is
   not in ``exclude`` (T-sweep-intake-discovery-by-default D-2.5, msg-6776).
   The repo_dir is ``clones[project]``; it is never inferred from other
   candidates any more (msg-6770 §2). ``sweep.json`` is never written; this
@@ -66,22 +66,27 @@ Output (stdout, JSON, ASCII-only per D-33)
           "unregistered": ["T-a", "T-b", "T-c"],
           "threads": [
             {"thread_id": "T-a", "time_state": "ok",
-             "updated_at": "2026-10-01T00:00:00+00:00", "idle_days": 2.5},
+             "last_activity_at": "2026-10-01T00:00:00+00:00", "idle_days": 2.5},
             {"thread_id": "T-b", "time_state": "missing",
-             "updated_at": null, "idle_days": null},
+             "last_activity_at": null, "idle_days": null},
             ...
           ],
           "error": null,
-          "malformed_count": 0
+          "malformed_count": 0,
+          "field_absent_count": 0,
+          "listed_count": 41
         },
         {
           "project": "spirrow-voxelworld",
           "unregistered_count": null,
           "unregistered": [],
           "error": "chatroom_list_threads failed: TimeoutException: ...",
-          "malformed_count": null
+          "malformed_count": null,
+          "field_absent_count": null,
+          "listed_count": null
         }
       ],
+      "activity_field": "last_activity_at",
       "unregistered_count_total": 3,
       "unmeasured_projects": ["spirrow-voxelworld"],
       "any_unmeasured": true,
@@ -112,6 +117,16 @@ server-side pagination contract violation *repeat* items rather than
 *skip* them; the actual defect the gate saw is "we drop garbage
 silently", and this field is the fix — the count of dropped items is
 now observable and never mixed into the primary metric.
+
+``field_absent_count`` / ``listed_count`` (T-sweep-intake-discovery-by-default
+msg-7443 F-3c, narrowed by msg-7445): of the ``listed_count`` dict items the
+listing returned for the project — counted BEFORE the registered filter —
+``field_absent_count`` had no ``last_activity_at`` key at all. The wrapper
+logs ``listing schema: <project> N/M items lack last_activity_at`` and puts
+the same ``N/M`` fact in the digest whenever ``N >= 1``. A key present with a
+``null`` value is not counted (it is a legitimate "no time", not a missing
+field). The listing is magickit's ``chatroom_list_threads``; its items carry
+``last_activity_at`` and no ``updated_at`` (msg-7381 §4).
 
 Fail direction
 --------------
@@ -155,13 +170,14 @@ from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpCha
 from spirrow_mindwire.magickit.read_only import ReadOnlyMcp as _SharedReadOnlyMcp
 from spirrow_mindwire.magickit.read_only import ReadOnlyViolationError
 from spirrow_mindwire.unregistered_threads import (
+    ACTIVITY_FIELD,
     LIVE_STATUSES,
     EnumerateReport,
     ListedThread,
     ProjectReport,
     RegisteredIndex,
     UnregisteredThreadsError,
-    classify_updated_at,
+    classify_activity_at,
     enumerate_project,
     load_registered,
     project_error_report,
@@ -203,7 +219,7 @@ def _as_dict(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[ListedThread], int]:
+async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[ListedThread], int, int]:
     """Every live thread in a project, paged, filtered server-side to :data:`LIVE_STATUSES`.
 
     Passing ``status_filter`` at the tool boundary keeps the request
@@ -212,12 +228,16 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
     The same trim also documents intent — the client asks for exactly
     the set it plans to consume.
 
-    Returns the list of dict-shaped items — each with its ``updated_at``
-    classified by :func:`classify_updated_at`, the only call of it
-    (msg-6770 §1: the time is interpreted at this one boundary) — and the
-    count of non-dict items dropped (the msg-2648 §3 third state). The
-    classification never drops an item (msg-6778): a thread with no or a
-    garbled ``updated_at`` is returned like any other, labelled. The time
+    Returns the list of dict-shaped items — each with its
+    ``last_activity_at`` classified by :func:`classify_activity_at`, the
+    only call of it (msg-6770 §1: the time is interpreted at this one
+    boundary) — the count of non-dict items dropped (the msg-2648 §3 third
+    state) and the count of dict items with no ``last_activity_at`` key at
+    all (msg-7445, the schema-drift counter; checked on the raw item, here,
+    before any filter, because this is the only place the raw item is
+    seen). The classification never drops an item (msg-6778): a thread
+    with no or a garbled ``last_activity_at`` is returned like any other,
+    labelled. The time
     comes from the listing itself; no per-thread read is made (Einstein
     msg-6769, the N+1 boundary). The offset increment
     is deliberately ``len(items)`` and not ``len(dropped-filtered
@@ -232,6 +252,7 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
     statuses = sorted(LIVE_STATUSES)
     out: list[ListedThread] = []
     malformed = 0
+    field_absent = 0
     offset = 0
     while True:
         page = _as_dict(
@@ -252,7 +273,9 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
             break
         for item in items:
             if isinstance(item, dict):
-                out.append(ListedThread(item, classify_updated_at(item.get("updated_at"))))
+                if ACTIVITY_FIELD not in item:
+                    field_absent += 1
+                out.append(ListedThread(item, classify_activity_at(item.get(ACTIVITY_FIELD))))
             else:
                 malformed += 1
         # Offset advances by the raw page length (server-side cursor
@@ -265,7 +288,7 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
         total = page.get("total")
         if isinstance(total, int) and offset >= total:
             break
-    return out, malformed
+    return out, malformed, field_absent
 
 
 async def _enumerate_project_with_recovery(
@@ -292,12 +315,14 @@ async def _enumerate_project_with_recovery(
     knowable malformed count.
     """
     try:
-        threads, malformed = await _list_live_threads(mcp, project)
+        threads, malformed, field_absent = await _list_live_threads(mcp, project)
     except MagickitMcpError as exc:
         return project_error_report(project, f"chatroom_list_threads failed: {exc}")
     except Exception as exc:  # pragma: no cover - defence in depth
         return project_error_report(project, f"unexpected {type(exc).__name__}: {exc}")
-    return enumerate_project(project, threads, registered, malformed_count=malformed)
+    return enumerate_project(
+        project, threads, registered, malformed_count=malformed, field_absent_count=field_absent
+    )
 
 
 async def _run(registered: RegisteredIndex, url: str | None) -> EnumerateReport:

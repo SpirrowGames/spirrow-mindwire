@@ -633,6 +633,49 @@ foreach ($case in $decisionDoc.RootElement.GetProperty('cases').EnumerateArray()
     Check "decision: $name -> $(if ($exp) { $exp } else { 'none' })" ($got -eq $exp) "got '$got'"
 }
 
+Write-Host "summon — digest lines (PR-3, Bohr msg-6965 items 1, 2 and 4; wording fixed in the fixture)"
+function ConvertTo-FixtureMap {
+    param([System.Text.Json.JsonElement]$Element, [scriptblock]$Value)
+    $m = @{}
+    foreach ($p in $Element.EnumerateObject()) { $m[$p.Name] = & $Value $p.Value }
+    return $m
+}
+$digestDoc = [System.Text.Json.JsonDocument]::Parse((Get-Content -LiteralPath (Join-Path $summonData 'digest_lines.json') -Raw -Encoding utf8))
+foreach ($case in $digestDoc.RootElement.GetProperty('cases').EnumerateArray()) {
+    $name = $case.GetProperty('name').GetString()
+    $controls = ConvertTo-FixtureMap -Element $case.GetProperty('controls') -Value { param($v) @{ desired_state = 'RUN'; active_summon_json = $v.GetRawText() } }
+    $byKey = ConvertTo-FixtureMap -Element $case.GetProperty('summon_by_key') -Value {
+        param($v)
+        $d = @{ kind = 'none'; yield_to = $null; owner_project = $null; since = $null; malformed_project = $null }
+        foreach ($f in $v.EnumerateObject()) { $d[$f.Name] = $f.Value.GetString() }
+        $d
+    }
+    $disps = ConvertTo-FixtureMap -Element $case.GetProperty('dispositions') -Value { param($v) $v.GetString() }
+    $evaluated = ConvertTo-FixtureMap -Element $case.GetProperty('records') -Value {
+        param($v)
+        @{ summon_yield = @{ main_sha_at_yield = 'a'; yielded_at = '2026-10-24T00:00:00.0000000Z'
+                             summon_threads = @($v.EnumerateArray() | ForEach-Object { $_.GetString() }) } }
+    }
+    $now = (ConvertFrom-SummonSince -Value $case.GetProperty('now').GetString())
+    $want = @($case.GetProperty('want').EnumerateArray() | ForEach-Object { $_.GetString() })
+    $got = @(Get-SummonDigestLines -ControlByProject $controls -SummonByKey $byKey -Dispositions $disps -EvaluatedState $evaluated -Now $now)
+    $same = ($got.Count -eq $want.Count)
+    for ($i = 0; $same -and $i -lt $want.Count; $i++) { $same = ($got[$i] -ceq $want[$i]) }
+    if (-not $same) { Write-Host "    got:  $($got -join ' | ')"; Write-Host "    want: $($want -join ' | ')" }
+    Check "digest lines: $name" $same
+}
+$digestDoc.Dispose()
+$t0 = [datetime]::new(2026, 10, 24, 12, 0, 0, [DateTimeKind]::Utc)
+Check "elapsed: a `$null since is said, not computed (Einstein's PR-3 advisory)" ((Format-SummonElapsed -Since $null -Now $t0) -ceq '経過時間不明')
+Check "elapsed: a since that is not a [datetime] is said, not computed" ((Format-SummonElapsed -Since 'yesterday' -Now $t0) -ceq '経過時間不明')
+Check "elapsed: a since in the future (clock skew) is under an hour, not negative" ((Format-SummonElapsed -Since $t0.AddHours(2) -Now $t0) -ceq '経過 1 時間未満')
+Check "elapsed: whole hours, floored" ((Format-SummonElapsed -Since $t0.AddMinutes(-150) -Now $t0) -ceq '経過 2 時間')
+$manyControls = @{}
+foreach ($i in 1..7) { $manyControls["P$i"] = @{ active_summon_json = '{"thread_id": 1}' } }
+$many = @(Get-SummonDigestLines -ControlByProject $manyControls -SummonByKey @{} -Dispositions @{} -EvaluatedState @{} -Now $t0)
+Check "digest lines are bounded: 5 lines and one +N 件 line" ($many.Count -eq 6 -and $many[5] -ceq '  +2 件')
+Check "digest lines with nothing passed in are empty, not an error" (@(Get-SummonDigestLines -ControlByProject $null -SummonByKey $null -Dispositions $null -EvaluatedState $null -Now $t0).Count -eq 0)
+
 Write-Host "summon — Update-SummonYield (I-SY5, v1.6 signature; paths (a) and (b) in one table)"
 $tNow = [datetime]::new(2026, 10, 9, 3, 0, 0, [DateTimeKind]::Utc)
 function New-SY { param([string]$Sha, [string[]]$Threads) @{ main_sha_at_yield = $Sha; yielded_at = '2026-10-09T01:00:00.0000000Z'; summon_threads = $Threads } }
@@ -834,6 +877,10 @@ $summonArgsAssign = @($loop.Body.FindAll({ param($n) $n -is [System.Management.A
     $n.Left.Extent.Text -eq '$summonArgs' -and $n.Operator -eq 'Equals' }, $true))
 Check "`$summonArgs is re-assigned on every candidate" ($summonArgsAssign.Count -eq 1)
 Check "the ordered list is built with the Summon dispositions" ($orderAssign.Count -eq 1 -and $orderAssign[0].Right.Extent.Text -match '-SummonByKey\s+\$summonByKey')
+$digestCall = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-DailyDigest' }, $true))
+Check "the daily digest is given the Summon lines from Get-SummonDigestLines (PR-3)" (
+    $digestCall.Count -eq 1 -and $digestCall[0].Extent.Text -match '-SummonLines\s+\(Get-SummonDigestLines ' -and
+    $digestCall[0].Extent.Text -match '-SummonByKey\s+\$summonByKey' -and $digestCall[0].Extent.Text -match '-Dispositions\s+\$dispositions')
 Check "the wrapper never spells the resume flags itself (the lib decides)" (-not $wrapperText.Contains('--resume-notice-') -and -not $wrapperText.Contains('--summon-owner-project'))
 
 Write-Host ""

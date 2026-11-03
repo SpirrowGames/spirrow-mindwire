@@ -48,6 +48,7 @@ class _Inner:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.status: dict[str, str] = {}
+        self.close_payloads: list[dict[str, Any]] = []
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append(name)
@@ -62,6 +63,7 @@ class _Inner:
         if name == "chatroom_list_events":
             return {"items": [], "total": 0}
         if name == "chatroom_close_thread":
+            self.close_payloads.append(dict(arguments))
             self.status[arguments["thread_id"]] = "resolved"
             return {"ok": True}
         if name == "chatroom_get_thread":
@@ -141,6 +143,30 @@ def test_close_client_refuses_other_writes() -> None:
     wrapped = _MODULE.ReadOnlyMcp(_Inner(), CLOSE_TOOLS, label="Phase 2")
     with pytest.raises(ReadOnlyViolationError):
         asyncio.run(wrapped.call_tool("chatroom_post_message", {"thread_id": "x"}))
+
+
+def test_role_defaults_to_integrator() -> None:
+    settings = _MODULE.settings_from_args(_MODULE.build_parser().parse_args([]))
+    assert settings.role == "integrator"
+
+
+def test_role_flag_is_passed_through() -> None:
+    args = _MODULE.build_parser().parse_args(["--author", "Heisenberg", "--role", "implementer"])
+    settings = _MODULE.settings_from_args(args)
+    assert (settings.author, settings.role) == ("Heisenberg", "implementer")
+
+
+def test_report_prints_role(inner: _Inner, tmp_path: Path) -> None:
+    assert _run(False, tmp_path)["settings"]["role"] == "integrator"
+
+
+def test_enabled_close_sends_role(inner: _Inner, tmp_path: Path) -> None:
+    _run(True, tmp_path)
+    assert inner.close_payloads and all(p["role"] == "integrator" for p in inner.close_payloads)
+
+
+def test_empty_role_exits_2(tmp_path: Path) -> None:
+    assert _MODULE.main(["--role", " ", "--config", str(tmp_path / "x.json")]) == 2
 
 
 def test_bad_setting_exits_2(tmp_path: Path) -> None:

@@ -65,11 +65,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="head commit SHA to measure (default: local `git rev-parse HEAD`; must be pushed)",
     )
+    band = sub.add_parser(
+        "codex-band-count",
+        help="count requests the Lexora ledger marks as in the codex prompt-limit band",
+    )
+    band.add_argument("--limit", type=int, default=100_000, help="newest ledger rows to read")
     check = sub.add_parser(
         "clone-check",
         help="re-judge a parked shared clone: exit 0 clean, 8 refused (payload row), 1 unknown",
     )
     check.add_argument("--repo-dir", required=True, type=Path, help="the shared clone to judge")
+    iso = sub.add_parser(
+        "turn-isolation-check",
+        help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
+    )
+    iso.add_argument(
+        "--clone", action="append", default=[], type=Path, help="a clone to probe (repeatable)"
+    )
+    iso.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="mindwire.toml to read [turn.isolation] from (default: the standard location)",
+    )
     return parser
 
 
@@ -111,8 +129,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .naysayer.pr_diff_size import run
 
         raise SystemExit(run(args.repo, args.pr, args.head))
+    if args.command == "codex-band-count":
+        from .naysayer.codex_band_count import run as run_band_count
+
+        raise SystemExit(run_band_count(args.limit))
     if args.command == "clone-check":
         raise SystemExit(clone_check(args.repo_dir))
+    if args.command == "turn-isolation-check":
+        from .turn_isolation.check import run as run_isolation_check
+
+        user = load_settings(args.config).turn.isolation.user
+        raise SystemExit(run_isolation_check(user, args.clone))
     raise SystemExit(2)  # unreachable: argparse rejects anything else
 
 

@@ -143,10 +143,36 @@ def test_resume_notice_parses_summons_and_range() -> None:
     assert "取り込みを確認" in text
 
 
-def test_empty_range_renders_nothing() -> None:
+# The wording is fixed here, word for word (PR-3, Bohr msg-6965 item 3 / item 4).
+_MOVED_TEXT = (
+    "[Summon 再開の注記] このスレッドは Summon S1, S2 に譲って停止していた。"
+    "停止中に main が aaa..bbb 進んだ (Summon 以外の変更を含みうる)。"
+    "続ける前に取り込みを確認すること。"
+)
+_UNMOVED_TEXT = (
+    "[Summon 再開の注記] このスレッドは Summon S1 に譲って停止していた。"
+    "停止中に main は変わっていない (aaa)。取り込みは不要。"
+)
+
+
+def test_moved_range_wording_is_fixed() -> None:
+    n = parse_resume_notice("S1, S2", "aaa..bbb")
+    assert n is not None
+    assert render_resume_notice(n) == _MOVED_TEXT
+
+
+def test_empty_range_has_its_own_wording() -> None:
     n = parse_resume_notice("S1", "aaa..aaa")
     assert n is not None and n.empty_range
-    assert render_resume_notice(n) is None
+    assert render_resume_notice(n) == _UNMOVED_TEXT
+
+
+def test_unknown_range_takes_the_moved_wording() -> None:
+    # unknown..unknown is never "empty": not knowing whether main moved is told as "it may have".
+    n = parse_resume_notice("S1", "unknown..unknown")
+    assert n is not None and not n.empty_range
+    text = render_resume_notice(n)
+    assert "unknown..unknown 進んだ" in text and "取り込みを確認" in text
 
 
 def test_unparseable_range_is_unknown_and_never_empty() -> None:
@@ -359,7 +385,7 @@ async def test_resume_notice_rides_only_the_first_role_turn(
 
 
 @pytest.mark.anyio
-async def test_empty_range_sends_no_text_but_is_delivered(
+async def test_empty_range_sends_the_unmoved_text_and_is_delivered(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger=_CORE_LOGGER)
@@ -367,7 +393,8 @@ async def test_empty_range_sends_no_text_but_is_delivered(
     resume = ResumeNotice(summons=("S1",), main_from="aaa", main_to="aaa")
     outcome = await _make(mcp, disp, control=_SummonControl(_RUN), resume=resume).run()
     assert outcome.stop_reason is StopReason.SETTLED
-    assert disp.events[0].resume_notice is None
+    assert disp.events[0].resume_notice == _UNMOVED_TEXT
+    assert all(e.resume_notice is None for e in disp.events[1:])
     assert _stop_line(caplog).endswith(" resume_notice=delivered")
 
 

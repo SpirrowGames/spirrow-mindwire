@@ -52,6 +52,7 @@ mindwire-mcp-server = "spirrow_mindwire.mcp_write_server.http:main"
 mindwire = "spirrow_mindwire.cli:main"
 mindwire-migrate-v1-to-v2 = "spirrow_mindwire.migration.v1_to_v2:main"
 mindwire-compose-decision = "spirrow_mindwire.decision_request.cli:main"
+mindwire-turn-launcher = "spirrow_mindwire.turn_isolation.launcher:entrypoint"
 
 [build-system]
 requires = ["hatchling"]
@@ -83,7 +84,7 @@ ignore_missing_imports = true
 # Silence the missing-imports errors here rather than salt every import with
 # ``# type: ignore``.
 [[tool.mypy.overrides]]
-module = ["win32api", "win32job", "pywintypes", "psutil"]
+module = ["win32api", "win32job", "win32cred", "pywintypes", "psutil"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

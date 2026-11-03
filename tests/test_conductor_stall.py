@@ -41,11 +41,15 @@ from spirrow_mindwire.conductor.head_skip import (
     record_to_json,
 )
 from spirrow_mindwire.conductor.stall import (
+    CAUSE_MAX_CHARS,
     EVENT_KIND_STALLED,
     STALL_THRESHOLD,
     STALLED_EXIT_CODE,
     StalledError,
     is_stalled,
+    render_stalled_notice,
+    sanitize_cause,
+    stalled_event,
 )
 from spirrow_mindwire.conductor.stand_down import STAND_DOWN_EXIT_CODE
 from spirrow_mindwire.config import Stage3LoopConfig
@@ -465,3 +469,48 @@ def test_wrapper_warns_loudly_when_the_count_reads_back_zero() -> None:
     text = _SCHEDULED_PS1.read_text(encoding="utf-8")
     assert "$launchesSameHead -lt 1" in text
     assert "WARN T42 stall watchdog disabled" in text
+
+
+# --------------------------------------------------------------------------- #
+# 6. ``cause`` (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 3)
+# --------------------------------------------------------------------------- #
+
+
+def _event(cause: str | None) -> Any:
+    return stalled_event(
+        project="p",
+        thread="t",
+        head_msg_id="m2",
+        launches_same_head=3,
+        target="Heisenberg",
+        cause=cause,
+    )
+
+
+def test_no_cause_leaves_the_event_and_notice_as_they_were() -> None:
+    event = _event(None)
+    assert "cause" not in event.fields
+    body = render_stalled_notice(event)
+    assert "原因は特定していません" in body
+    assert "gate_resume" not in body
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("outcome=unavailable detail=head: line one\nline two\r\nthree", id="newlines"),
+        pytest.param("outcome=unavailable detail=``GraphQL`` `contexts`", id="backticks"),
+        pytest.param("outcome=unavailable detail=" + "x" * 2000, id="long"),
+    ],
+)
+def test_cause_is_one_code_span_line_in_the_notice(raw: str) -> None:
+    event = _event(raw)
+    cause = event.fields["cause"]
+    assert "\n" not in cause and "\r" not in cause and "`" not in cause
+    assert len(cause) <= CAUSE_MAX_CHARS
+    assert cause == sanitize_cause(raw)
+    body = render_stalled_notice(event)
+    line = next(ln for ln in body.splitlines() if ln.startswith("- 直前の gate_resume: "))
+    assert line == f"- 直前の gate_resume: `{cause}`"
+    assert "原因は特定していません" not in body
+    assert body.rstrip().endswith("NEXT: human")

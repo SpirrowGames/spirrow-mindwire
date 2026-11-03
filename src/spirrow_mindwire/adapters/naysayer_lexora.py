@@ -28,8 +28,9 @@ Reasoning-model handling (msg-210 / msg-215): the reply is
 e.g. ``finish_reason="length"`` with the whole budget spent on
 reasoning — is a **fail-loud** :class:`NaysayerLexoraDeliveryError`, not a
 silent empty post. ``max_tokens`` defaults to 4096 (well above the
-reasoning-model ``>=1500`` floor) and the timeout matches Lexora's 900s
-backend.
+reasoning-model ``>=1500`` floor) and the timeout is the client default:
+Lexora's 900s backend plus the client margin, so the client outlives the
+backend instead of tying with it.
 
 Failures map to the §3.4 Port exception catalog via adapter-specific
 subclasses (:class:`NaysayerLexoraSpawnError` etc.); the failure code is
@@ -39,6 +40,7 @@ duplicated into ``HealthStatus.details`` (I2).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -49,7 +51,18 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
-from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
+from ..lexora.client import _CLIENT_DEFAULT_MARGIN_SECONDS as _CLIENT_MARGIN_SECONDS
+from ..lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
+    ChatMessage,
+    LexoraChatClient,
+    LexoraClient,
+)
+from ..naysayer.review_rounds import (
+    DESIGN_OBJECTION_FORMAT,
+    REVIEW_ROUND_RULES,
+    log_design_round,
+)
 from ..ports import SpawnContext
 from ..thread_context import render_thread_context
 from ..ulid_util import new_ulid
@@ -74,12 +87,17 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 
 _DEFAULT_MODEL = "naysayer"
 _DEFAULT_MAX_TOKENS = 4096  # >= the reasoning-model 1500 floor, with content headroom
-_DEFAULT_TIMEOUT_SECONDS = 900.0  # matches the Lexora backend timeout
+# Backend timeout + the client margin (thread msg-6612/6613): an exact 900s tie with the backend
+# would let the client cut the connection before the backend's own timeout answers.
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_MARGIN_SECONDS
 
 # main order #2 (msg-215): the naysayer must disagree by default and
 # critique by *quoting the specific passage* it objects to (citation-type
 # adversarial review, not fabricated dissent).
-_NAYSAYER_SYSTEM_PROMPT = """\
+logger = logging.getLogger(__name__)
+
+_NAYSAYER_SYSTEM_PROMPT = (
+    """\
 You are the independent naysayer in a Spirrow MindWire ChatRoom thread \
 between multiple AI agents. You are a different model from the proposer, and \
 your job is adversarial review: do NOT agree by default. Assume the proposal \
@@ -95,7 +113,12 @@ weakest remaining point.
 
 Your entire response is posted verbatim to the thread as your reply, so reply \
 directly with the critique — no preamble, no meta-commentary.
+
 """
+    + REVIEW_ROUND_RULES
+    + "\n"
+    + DESIGN_OBJECTION_FORMAT
+)
 
 
 class NaysayerLexoraSpawnError(AdapterSpawnError):
@@ -137,6 +160,7 @@ def _build_messages(event: ChatroomEvent, own_role: Role, system_prompt: str) ->
     user = (
         f"You are acting as the {own_role.value} role in thread "
         f"{event.thread_ref.thread_id}.\n\n"
+        + (f"{event.review_round_notice}\n\n" if event.review_round_notice else "")
         + (f"{history}\n\n" if history else "")
         + f"The {payload.author} posted the following message. Critique it, "
         f"quoting the specific passages you object to:\n\n"
@@ -269,6 +293,15 @@ class NaysayerLexoraAdapter:
                         "usage": completion.usage,
                     },
                 )
+            )
+            log_design_round(
+                logger,
+                body=body,
+                thread=event.thread_ref.thread_id,
+                backend=None,
+                model=completion.model or self._model,
+                round_number=event.review_round,
+                out_tokens=completion.usage.get("completion_tokens"),
             )
         except Exception as exc:
             session.state = SessionState.FAILED

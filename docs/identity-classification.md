@@ -242,6 +242,54 @@ and nothing else, so no role spoke it: `kind = machine`, `legitimate = ∅`, and
 token, not a `chatroom_close_thread` status change, so this identity needs no closeable role
 (msg-5906; R10 pins that the module never calls the close API).
 
+## Names written outside this repo
+
+The D-8 ② owner audit in spirrow-magickit (`chatroom_check_integrity`, first run 2026-10-21T19:02Z
+across all 17 Conclair projects) listed every thread owner that does not resolve to a registered
+identity: 165 threads under 5 names. No code in this repo writes any of them. They are names that
+LLM sessions put on their own threads. They are classified here so that `scripts/identity_findings.py`
+and `scripts/register_identities.py` see the same set the identity store now holds.
+
+Unlike the sections above, this classification was not an implementer's primary-source read. The
+human (Takahito) chose it on 2026-10-22, when he approved the registry change that Einstein escalated
+as Tier-C in spirrow-magickit `T-conclair-persist-disposition-and-d8-readback` msg-1344. The
+registration and its read-back are in msg-1355 of that thread.
+
+### `operator` — **participant**, `legitimate = {integrator}`
+
+The operator lane is a Claude Code session acting as Takahito's hands: it files threads, deploys,
+runs probes and posts raw observations. Every post is LLM-written, so it is a participant. It owned
+96 of the 165 threads; 41 of them were still active or awaiting a reply, and the latest was opened
+on 2026-10-20.
+
+`integrator` is the only role, and it was chosen for one effect. magickit skips the closeable-role
+check (`CLOSEABLE_ROLES = implementer / integrator / proposer`) for an author with no registered
+identity, and the operator lane closes the threads it owns as routine work (8 on 2026-10-20 alone).
+With `machine` / `[]`, the shape the relays above use, every one of those closes would fail with
+`RoleNotAllowedToClose` once the name is registered. A post that supplies any role other than
+`integrator` is now refused with `RoleNotAllowed`. Before registration, the role was dropped to
+null instead.
+
+The `NEXT: operator` token (`conductor/handoff.py::OPERATOR_TOKEN`) is a reserved word that is
+resolved before any identity lookup. This entry does not change how it routes.
+
+### `claude-code` — **participant**, `legitimate = {integrator}`
+
+Claude Code sessions used the product name as their owner and author: 48 threads, opened from
+2026-05 to 2026-09-30, 5 of them still open. They closed their own threads while unregistered, so
+`claude-code` gets the same single role for the same reason as `operator`.
+
+### Left out on purpose
+
+These three names have no entry. A post under any of them is still reported as an unclassified
+author.
+
+| name            | threads | why it is not registered                                                     |
+| --------------- | ------- | ---------------------------------------------------------------------------- |
+| `claude.ai`     | 17      | Superseded by `Fermi` (ADR-2026-09-14-21); the latest was opened 2026-08-28 |
+| `main`          | 3       | Bootstrap threads from 2026-05-21 and 05-22; all resolved                   |
+| `operator-lane` | 1       | A spelling variant of `operator` (one thread, opened 2026-09-09)           |
+
 ## What this classification does NOT decide
 
 - **NOT this: `allowed_roles` for `naysayer-pr-review`.** This file decides it, and the value is

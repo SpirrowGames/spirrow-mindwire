@@ -31,16 +31,15 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, assert_never
 
 from ..chatroom.status import FINISHED_STATUSES
-from ..github.client import CiState, CiStatus, PrRef, PrResolution, PrState, parse_pr_ref
+from ..github.client import CiState, CiStatus, PrRef, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from .decide import (
     PR_EVENT_RELAY_AUTHOR,
     Noop,
     Post,
-    PrFacts,
-    PrLifecycle,
     decide,
     needs_ci,
+    pr_facts_of,
     precheck,
     read_relay_tail,
 )
@@ -107,28 +106,6 @@ def _noop_counts(outcomes: Iterable[ThreadOutcome]) -> dict[str, int]:
         if o.action == "noop":
             counts[o.reason] = counts.get(o.reason, 0) + 1
     return counts
-
-
-def pr_facts_of(state: PrState) -> PrFacts | None:
-    """Map a GitHub read onto :class:`PrFacts`; ``None`` when GitHub did not answer."""
-    match state.resolution:
-        case PrResolution.UNRESOLVABLE:
-            return None
-        case PrResolution.OPEN:
-            lifecycle = PrLifecycle.OPEN.value
-        case PrResolution.CLOSED:
-            lifecycle = PrLifecycle.MERGED.value if state.merged else PrLifecycle.CLOSED.value
-        case PrResolution.NOT_FOUND:
-            lifecycle = "not-found"  # a definite answer, but not one of §F.1.1's three → row 9
-        case _:
-            assert_never(state.resolution)
-    return PrFacts(
-        state=lifecycle,
-        head_sha=state.head_sha,
-        merge_commit_sha=state.merge_commit_sha,
-        closed_at=state.closed_at,
-        body=state.body or "",
-    )
 
 
 _THREAD_PAGE = 200

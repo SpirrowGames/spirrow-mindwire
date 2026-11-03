@@ -1259,10 +1259,21 @@ async def test_design_thread_must_exist() -> None:
 class _FakeGitHubCi:
     """Minimal GitHubReviewClient stub returning a fixed CI status."""
 
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(self, ci: CiStatus) -> None:
         self._ci = ci
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
+        raise NotImplementedError
+
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        raise NotImplementedError
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         raise NotImplementedError
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
@@ -1291,6 +1302,15 @@ class _FakeGitHubCi:
         # 200 so any accidental call yields a well-defined value. Kept for
         # GitHubReviewClient Protocol compliance (T-gate-review-submit-failure-handling PR-A).
         return 200
+
+    async def fetch_pr_files(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance (never reached: routing facts already raise).
+        raise NotImplementedError
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance. Raising reads as "could not read the PR's labels",
+        # which the driver routes fail-safe to the Gemini tier.
+        raise NotImplementedError
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
         # Orchestrator L2 tests never exercise the T-gate-blocks-on-miscounted-line-numbers

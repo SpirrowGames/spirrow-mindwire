@@ -93,10 +93,19 @@ class _FakeLexora:
         self.pass1_exc = pass1_exc
         self.pass2_exc = pass2_exc
         self.calls: list[tuple[str, list[ChatMessage], int]] = []
+        # ADR-14 §7.3 routing declaration per call (thread msg-6982).
+        self.n3_routed: list[bool] = []
 
     async def chat_completion(
-        self, *, model: str, messages: list[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         self.calls.append((model, list(messages), max_tokens))
         # Route on max_tokens: pass 1 uses the reasoning-model budget (>= 8000); pass 2
         # uses the smaller ADR-pointer budget. See _ADR_POINTER_MAX_TOKENS in the driver.
@@ -128,6 +137,11 @@ class _FakeLexora:
 
 
 class _FakeGitHub:
+    async def fetch_compare_status(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> str:
+        return "ahead"
+
     def __init__(
         self,
         *,
@@ -141,6 +155,12 @@ class _FakeGitHub:
         self.submitted: list[tuple[PrRef, ReviewEvent, str]] = []
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
+        return self._diff
+
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        return "main", self._ci.head_sha or "sha"
+
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
         return self._diff
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
@@ -172,6 +192,15 @@ class _FakeGitHub:
         # structurally compatible with GitHubReviewClient (T-gate-review-submit-
         # failure-handling PR-A: new Protocol member).
         return 200
+
+    async def fetch_pr_files(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance (never reached: routing facts already raise).
+        raise NotImplementedError
+
+    async def fetch_pr_routing_facts(self, pr: PrRef) -> Any:
+        # ADR-14 §7.3 Protocol compliance. Raising reads as "could not read the PR's labels",
+        # which the driver routes fail-safe to the Gemini tier.
+        raise NotImplementedError
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
         # ADR-pointer tests never exercise the T-gate-blocks-on-miscounted-line-numbers
@@ -302,6 +331,24 @@ async def test_t5_marker_present_on_normal_approve_body() -> None:
     assert posted[0].splitlines()[-1].startswith(f"{MARKER_PREFIX} pointers=")
     # GitHub-submitted body carries the same marker (same rendered string).
     assert github.submitted[0][2] == posted[0]
+
+
+@pytest.mark.anyio
+async def test_pass2_budget_is_independent_of_review_budget() -> None:
+    """#487: a deployment's review budget override reaches pass 1 only.
+
+    Pass 2 keeps its own fixed budget, so MAX_POINTER_PAYLOAD_BYTES (derived from the
+    shape of legitimate pass-2 output) stays valid whatever review_max_tokens is set to.
+    """
+    from spirrow_mindwire.naysayer import pr_review
+
+    lexora = _FakeLexora(pass1_content="all good\n\nVERDICT: APPROVE", pass2_content="[]")
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub(), max_tokens=200_000)
+    _, post = _capture()
+    await driver.review(_pr(), post_critique=post)
+
+    budgets = [call[2] for call in lexora.calls]
+    assert budgets == [200_000, pr_review._ADR_POINTER_MAX_TOKENS]
 
 
 @pytest.mark.anyio

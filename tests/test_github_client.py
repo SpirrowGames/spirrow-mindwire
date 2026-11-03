@@ -277,6 +277,34 @@ async def test_fetch_pr_diff_meta_missing_base_ref_fails_loud() -> None:
 
 
 @pytest.mark.anyio
+async def test_fetch_pr_head_sha_strict_reads_rest_pull_head() -> None:
+    # T-gate-resume-private-repo-pat-forbidden-stalls (Bohr msg-7563 修正 1): the RC resume's
+    # head read is REST ``GET /pulls/{n}`` only — no GraphQL, which a fine-grained PAT is refused
+    # on a private repo — and fails loud on a refused read.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(200, json={"base": {"ref": "main"}, "head": {"sha": "abc123"}})
+        return httpx.Response(500, text="should not be called")
+
+    async with _client(handler) as client:
+        assert await client.fetch_pr_head_sha_strict(_PR) == "abc123"
+    assert calls == ["/repos/spirrowgames/spirrow-mindwire/pulls/42"]
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"message": "Resource not accessible by personal access token"}
+        )
+
+    async with _client(refused) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.fetch_pr_head_sha_strict(_PR)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.anyio
 async def test_fetch_pr_diff_meta_missing_head_sha_fails_loud() -> None:
     # AC-3: meta shape is wrong (head.sha absent) -> raise; do not fall back.
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2177,3 +2205,76 @@ async def test_fetch_pr_state_reads_merge_commit_and_body_for_1b() -> None:
         state = await gh.fetch_pr_state(_PR)
     assert state.resolution is PrResolution.OPEN
     assert state.body is None and state.merge_commit_sha is None
+
+
+# ---------- ADR-14 §7.3 routing reads (fetch_pr_routing_facts / fetch_pr_files) ---- #
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_routing_facts_reads_labels_and_changed_files() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "base": {"ref": "main"},
+                "head": {"sha": "abc"},
+                "labels": [{"name": "n3-sensitive"}, {"name": "bug"}],
+                "changed_files": 7,
+            },
+        )
+
+    async with _client(handler) as client:
+        facts = await client.fetch_pr_routing_facts(_PR)
+    assert facts.base_ref == "main" and facts.head_sha == "abc"
+    assert facts.labels == frozenset({"n3-sensitive", "bug"})
+    assert facts.changed_files == 7
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_routing_facts_without_changed_files_fails_loud() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"base": {"ref": "m"}, "head": {"sha": "a"}, "labels": []})
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_routing_facts(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_files_paginates_and_keeps_previous_filename_for_rename_and_copy() -> None:
+    """Both names count whatever the status (Einstein's advisory: ``copied`` too)."""
+    first = [{"filename": f"f{i}.py", "status": "modified"} for i in range(98)] + [
+        {"filename": "pub/a.py", "previous_filename": "secrets/a.py", "status": "renamed"},
+        {"filename": "pub/b.py", "previous_filename": "secrets/b.py", "status": "copied"},
+    ]
+    second = [{"filename": "gone.py", "status": "removed"}]
+    pages: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/pulls/42/files")
+        pages.append(request.url.params.get("page"))
+        return httpx.Response(200, json=first if request.url.params.get("page") == "1" else second)
+
+    async with _client(handler) as client:
+        listed = await client.fetch_pr_files(_PR)
+    assert pages == ["1", "2"]
+    assert listed.entries == 101
+    for name in ("pub/a.py", "secrets/a.py", "pub/b.py", "secrets/b.py", "gone.py"):
+        assert name in listed.paths
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_files_fails_loud_on_http_error() -> None:
+    async with _client(lambda request: httpx.Response(500, json={})) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_files(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_default_branch() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/o/r"
+        return httpx.Response(200, json={"default_branch": "trunk"})
+
+    async with _client(handler) as client:
+        assert await client.fetch_default_branch("o", "r") == "trunk"

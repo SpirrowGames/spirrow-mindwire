@@ -131,3 +131,32 @@ identities:
       invariant). A distinct author from `pr-event-relay` / `conductor-relay` so no reader that
       narrows to those authors reads a wake as one of their records. The conductor routes the
       wake like any handoff, guard (i) included, so a park cannot launder a gated handoff.
+
+  - name: operator
+    kind: participant
+    legitimate: ["integrator"]
+    independence_class: main-chain
+    primary_source: "docs/identity-classification.md::§ Names written outside this repo"
+    reason: >-
+      The operator lane: a Claude Code session acting as Takahito's hands. It files threads,
+      deploys, runs probes and posts raw observations. Every post is LLM-written, so it is a
+      participant, not a machine. No code in this repo writes under this name. The `NEXT: operator`
+      token (conductor/handoff.py::OPERATOR_TOKEN) is a reserved word resolved before any identity
+      lookup, and this entry does not change it. `integrator` is its one role, so it can keep
+      closing the threads it owns: magickit skips the closeable-role check for an unregistered
+      author, but once the author is registered it requires implementer, integrator or proposer.
+      Registered with exactly these values on 2026-10-21T19:20:51Z under Takahito's Tier-C
+      approval (spirrow-magickit T-conclair-persist-disposition-and-d8-readback msg-1355), ahead
+      of D-8 ①, which makes chatroom_open_thread refuse an unregistered owner.
+
+  - name: claude-code
+    kind: participant
+    legitimate: ["integrator"]
+    independence_class: main-chain
+    primary_source: "docs/identity-classification.md::§ Names written outside this repo"
+    reason: >-
+      Claude Code sessions that used the product name as their owner and author (48 threads,
+      2026-05 to 2026-09-30, 5 still open). The posts are LLM-written, so it is a participant. It
+      closed its own threads while unregistered, so it gets the same single role as `operator`
+      for the same reason. Registered with exactly these values on 2026-10-21T19:20:52Z (same
+      approval and message as `operator`).

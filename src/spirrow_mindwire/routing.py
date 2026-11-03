@@ -60,7 +60,8 @@ behaviour verbatim from that surface, not from the ADR text.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -192,3 +193,67 @@ def guard_proposer_to_implementer(
     ):
         return GuardIVerdict.HONOR
     return GuardIVerdict.REDIRECT
+
+
+class GuardICondition(StrEnum):
+    """A carve-out ③ condition that can close the door (T-guard-i-latches-on-discharged-tierc-line,
+    Bohr msg-7202 §2 (b) / msg-7204 B1). Named so the guard-(i) relay and log can say WHICH one
+    closed instead of listing every possibility with "あるいは" (the msg-881 failure)."""
+
+    NOT_NAYSAYER = "not_naysayer"
+    NOT_RUN = "not_run"
+    NOT_ATTESTED = "not_attested"
+    G1 = "g1"
+    G2 = "g2"
+    G3_VETO = "g3_veto"
+    G3_PREFETCH_MISSING = "g3_prefetch_missing"
+
+
+@dataclass(frozen=True)
+class GuardIClosure:
+    """One closed condition and the msg ids that close it (G1: every open declaration)."""
+
+    condition: GuardICondition
+    evidence_ids: tuple[str, ...] = ()
+
+
+def diagnose_carve_out_iii(
+    *,
+    head_msg_id: str,
+    author_is_naysayer: bool,
+    control_state_is_run: bool,
+    message_is_attested: Callable[[], bool],
+    open_tier_c_declarations: Callable[[], Sequence[str]],
+    naysayer_declared_no_tier_c: Callable[[], bool],
+) -> tuple[GuardIClosure, ...]:
+    """Every OFFLINE carve-out ③ condition that is closed, in :func:`carve_out_iii_admissible`'s
+    order — the diagnosis behind a ``REDIRECT``, never the decision.
+
+    The decision stays :func:`carve_out_iii_admissible` / :func:`guard_proposer_to_implementer`,
+    short-circuiting exactly as before. This function evaluates the offline conditions WITHOUT
+    short-circuiting, so one relay names every closed condition at once and the reader does not fix
+    one only to be stopped by the next (msg-7204 B1). The invariant tying the two together — the
+    result is empty iff :func:`carve_out_iii_admissible` holds on the same observations — is pinned
+    over the whole truth table in ``tests/test_guard_i_diagnosis.py``.
+
+    Scope: G3 (the network-bound Decider) is never evaluated here; the caller reports it from the
+    routing decision it already made (veto / prefetch-missing) or as not evaluated when an offline
+    condition closed first. ``message_is_attested`` and ``naysayer_declared_no_tier_c`` describe
+    THIS message as a naysayer proceed and are read only when the author is the naysayer — for any
+    other author they cannot be fixed on this message, and reading the attest stamp there would
+    widen the observation scope the guard pins (PR-review msg-2551). G1 is a property of the
+    thread, which the next proceed inherits, so it is reported for every author.
+    """
+    closures: list[GuardIClosure] = []
+    if not author_is_naysayer:
+        closures.append(GuardIClosure(GuardICondition.NOT_NAYSAYER, (head_msg_id,)))
+    if not control_state_is_run:
+        closures.append(GuardIClosure(GuardICondition.NOT_RUN))
+    if author_is_naysayer and not message_is_attested():
+        closures.append(GuardIClosure(GuardICondition.NOT_ATTESTED, (head_msg_id,)))
+    open_declarations = tuple(open_tier_c_declarations())
+    if open_declarations:
+        closures.append(GuardIClosure(GuardICondition.G1, open_declarations))
+    if author_is_naysayer and not naysayer_declared_no_tier_c():
+        closures.append(GuardIClosure(GuardICondition.G2, (head_msg_id,)))
+    return tuple(closures)

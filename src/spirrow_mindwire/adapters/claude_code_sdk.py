@@ -75,6 +75,7 @@ from ..value_objects import (
     ThreadRef,
 )
 from ._cli_selection import cli_selection_kwargs
+from ._command_line import check_command_line, system_prompt_file
 from ._connect_budget import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     SdkConnectTimeoutError,
@@ -478,7 +479,8 @@ class ClaudeCodeSdkAdapter:
     ) -> SessionHandle:
         options = ClaudeAgentOptions(
             cwd=self._cwd,
-            system_prompt=self._system_prompt,
+            # Through a file, as the other two roles do (see ``_command_line``).
+            system_prompt=system_prompt_file(self._system_prompt),
             # ``tools=[]`` DISABLES every built-in (SDK 0.1.77 -> ``--tools ""``).
             # It is not "expose only what allowed_tools names" — that reading is
             # what left the implementer with no hands until T37 #1, and it is why
@@ -501,6 +503,7 @@ class ClaudeCodeSdkAdapter:
         connect_started = time.monotonic()
         client: _SdkClient | None = None
         try:
+            check_command_line(options)
             client = self._client_factory(options)
             await connect_bounded(client, self._spawn_timeout_seconds)
         except SdkConnectTimeoutError as exc:

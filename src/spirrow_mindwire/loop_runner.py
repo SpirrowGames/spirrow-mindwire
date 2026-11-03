@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -131,6 +132,7 @@ from .github.client import (
     EnvironmentTerminalError,
     GitHubClient,
     PrRef,
+    PrState,
     ReviewInfo,
     naysayer_github_token,
 )
@@ -553,12 +555,17 @@ def build_pr_review_driver(
     (``[naysayer_gating]``): skip a re-review of an unchanged head, and cap the re-review rounds.
     """
     g = gating or NaysayerGatingConfig()
-    return NaysayerPrReviewDriver(
+    knobs = functools.partial(
+        NaysayerPrReviewDriver,
         skip_if_head_unchanged=g.skip_if_head_unchanged,
         max_review_rounds=g.max_review_rounds,
         review_login=g.review_login,
         shadow=g.shadow,
     )
+    # The driver owns its default output budget; pass one only when the deployment sets it.
+    if g.review_max_tokens is None:
+        return knobs()
+    return knobs(max_tokens=g.review_max_tokens)
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
@@ -853,16 +860,23 @@ class _PerCallCheckRollupSource:
             return await client.fetch_check_rollup(pr)
 
 
-class _PerCallReviewSource:
-    """``ReviewSource`` for the gate resume (:mod:`.conductor.gate_resume`), one client per read.
+class _PerCallGateResumeSource:
+    """``ReviewSource`` + ``PrHeadSource`` for the gate resume (:mod:`.conductor.gate_resume`).
 
-    Same shape and token as :class:`_PerCallCheckRollupSource`: the resume compares the reviews
-    against the rollup, so both must be read through the credential the gate itself uses.
+    One client per read.
+
+    Same shape and token as :class:`_PerCallCheckRollupSource`, so the resume reads through the
+    credential the gate itself uses.
 
     Unlike the rollup source this one RAISES on a failed read (``fetch_pr_reviews_strict``):
     the resume must tell "no gate review on the head" (CONTRADICTED → the human) apart from
     "GitHub could not be asked" (UNAVAILABLE → retry next tick), and the fail-soft read
     collapses the two into ``[]`` (Bohr msg-6318).
+
+    It is also the resume's ``PrHeadSource`` (T-gate-resume-private-repo-pat-forbidden-stalls,
+    Bohr msg-7563 修正 1): an RC resume reads the PR head from REST ``GET /pulls/{n}`` here, with
+    the same token as the reviews, instead of from the GraphQL rollup a fine-grained PAT cannot
+    read on a private repo. Also fail-loud: a failed read is UNAVAILABLE, never a head.
     """
 
     def __init__(self, token: str | None = None) -> None:
@@ -872,6 +886,29 @@ class _PerCallReviewSource:
         token = self._token if self._token is not None else naysayer_github_token()
         async with GitHubClient(token) as client:
             return await client.fetch_pr_reviews_strict(pr)
+
+    async def fetch_pr_head_sha_strict(self, pr: PrRef) -> str:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_head_sha_strict(pr)
+
+
+class _PerCallPrStateSource:
+    """``PrStateSource`` for the settled-PR check (T-merged-pr-fact-never-reaches-design-thread).
+
+    One client per read, and the same token as the rollup and the gate, so the check sees the PR
+    through the credential the gate it may skip would have used. Never raises in practice:
+    :meth:`GitHubClient.fetch_pr_state` answers ``UNRESOLVABLE`` on every failure, and the
+    conductor reads that (or a raise) as "could not see" and keeps its pre-change path.
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_pr_state(pr)
 
 
 def build_conductor(
@@ -997,6 +1034,8 @@ def build_conductor(
         if summon_owner_project and summon_owner_project.strip() != loop_cfg.project
         else None
     )
+    # One per-call source serves the gate resume as both its ReviewSource and its PrHeadSource.
+    resume_reads = _PerCallGateResumeSource()
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -1005,6 +1044,7 @@ def build_conductor(
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,
             human_identity=cond_cfg.human_identity,
+            tier_c_recorders=tuple(cond_cfg.tier_c_recorders),
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
             # ADR-2026-09-14-21: merged over the shipped default inside the Conductor, so an
@@ -1027,7 +1067,18 @@ def build_conductor(
             # checks an RC relay left at the head against GitHub before the implementer is
             # resumed from it. Wired unconditionally like the rollup; an unreadable answer is
             # UNAVAILABLE (retry next tick), never VERIFIED.
-            review_source=_PerCallReviewSource(),
+            review_source=resume_reads,
+            # The RC resume's PR-head read (REST ``GET /pulls/{n}``), the same per-call source
+            # and token as the reviews (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr
+            # msg-7563 修正 1): a fine-grained PAT cannot read the rollup's GraphQL contexts on
+            # a private repo, so the RC resume no longer reads the rollup at all.
+            head_source=resume_reads,
+            # Settled-PR check (Bohr msg-7560 v0.4 (b)): a ``NEXT: pr-review`` on a PR GitHub
+            # already reports merged / closed posts that fact instead of re-gating. Wired
+            # unconditionally; an unreadable state keeps the pre-change path. No token argument on
+            # purpose, exactly as ``rollup_source`` above: each read resolves
+            # :func:`naysayer_github_token` at call time (tests/test_loop_runner.py pins both).
+            pr_state_source=_PerCallPrStateSource(),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
             tierc_annotations_path=tierc_annotations_path,

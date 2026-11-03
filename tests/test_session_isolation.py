@@ -57,6 +57,11 @@ _NOT_SDK_BACKED: dict[str, str] = {
         "no ClaudeAgentOptions and spawns nothing — isolation is applied by the "
         "adapter that USES it, next to its own session_isolation_kwargs() call"
     ),
+    "_command_line.py": (
+        "writes the system-prompt file and measures the command line of options "
+        "an adapter already built; constructs no ClaudeAgentOptions and spawns "
+        "nothing — isolation is applied by the adapter that built those options"
+    ),
     "_connect_budget.py": (
         "bounds the await on a client the calling adapter already built; "
         "constructs no ClaudeAgentOptions and spawns nothing — isolation is "

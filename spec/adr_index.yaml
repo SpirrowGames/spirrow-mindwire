@@ -57,7 +57,7 @@ adrs:
     title: "Instance を一次概念とする識別モデル"
     body: repo:docs/adr/ADR-2026-05-24-08-instance-identity-model.md
   - id: ADR-2026-05-27-09
-    title: "identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。"
+    title: "identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。D-6 は ADR-2026-10-22-24 で改訂（実装レーンの制限を撤廃、本番 deploy は Takahito の指示のみ）。"
     thread: T-T28-author-role-identity
     body: chatroom:spirrow-mindwire/T-T28-author-role-identity#msg-283
   - id: ADR-2026-05-29-10
@@ -107,3 +107,6 @@ adrs:
   - id: ADR-2026-10-09-23
     title: "中央 1 Conductor ＋ 実行機プール（executor pool under one conductor）"
     body: repo:docs/adr/ADR-2026-10-09-23-executor-pool-under-one-conductor.md
+  - id: ADR-2026-10-22-24
+    title: "Magickit の実装レーンと本番 deploy 権限（ADR-2026-05-27-09 D-6 amendment）"
+    body: repo:docs/adr/ADR-2026-10-22-24-magickit-implementation-lane-and-deploy-authority.md

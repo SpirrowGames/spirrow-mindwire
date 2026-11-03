@@ -73,7 +73,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -100,12 +100,20 @@ from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..git_sync import GitSyncDeferredError, GitSyncParkError
 from ..git_sync.notice import git_sync_park_event, render_git_sync_park_notice
-from ..github.client import CheckRollup, PrRef, parse_pr_ref
+from ..github.client import CheckRollup, PrRef, PrState, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
-from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
-from ..source_marker import parse_attestation_marker
+from ..naysayer.review_rounds import render_review_round_line
+from ..routing import (
+    GuardIClosure,
+    GuardICondition,
+    GuardIVerdict,
+    carve_out_iii_admissible,
+    diagnose_carve_out_iii,
+    guard_proposer_to_implementer,
+)
+from ..source_marker import attestation_agrees, parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
@@ -129,6 +137,7 @@ from ..value_objects import (
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
+    MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
@@ -139,6 +148,8 @@ from .gate_records import (
     verdict_heads,
 )
 from .gate_resume import (
+    PrHeadSource,
+    ResumeCheck,
     ResumeOutcome,
     ReviewSource,
     log_resume_check,
@@ -156,7 +167,6 @@ from .handoff import (
     MismatchReason,
     OperatorFault,
     declares_no_tier_c,
-    declares_tier_c,
     parse_next_token,
     resolve_handoff,
 )
@@ -189,6 +199,12 @@ from .summon import (
     render_resume_notice,
     summon_yield_decision,
 )
+from .tier_c_segment import (
+    AUTONOMOUS_LOOP_ROLES,
+    SegmentScan,
+    is_recorder,
+    scan_tier_c_segment,
+)
 from .tierc_gate import (
     TierCGate,
     bounced_msg_id,
@@ -201,6 +217,13 @@ if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
 
 logger = logging.getLogger(__name__)
+
+#: The relay routes on which the conductor dispatches the implementer on the verdict relay
+#: (T-gate-relay-routes-develop-approvals-to-human D4). Anything else — HUMAN, or a route this
+#: build does not know (``_fire_pr_gate`` already maps a missing / foreign one to HUMAN) — stops.
+_IMPLEMENTER_DISPATCH_ROUTES: frozenset[RelayRoute] = frozenset(
+    {RelayRoute.IMPLEMENTER, RelayRoute.MERGE}
+)
 
 # Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
 _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
@@ -228,6 +251,10 @@ DEFAULT_REVIEW_LOGIN: str = NaysayerGatingConfig.model_fields["review_login"].de
 #: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
+GUARD_I_REDIRECT_TITLE = "Conductor stop — guard (i) redirect"
+"""The first-line prefix of every guard-(i) redirect relay — how a reader (the read-only census,
+``scripts/guard_i_latch_census.py``) recognises one without re-spelling the body."""
 
 
 def _with_stop_marker(notice: str, event: Event) -> str:
@@ -324,6 +351,19 @@ class CheckRollupSource(Protocol):
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None: ...
 
 
+class PrStateSource(Protocol):
+    """The one read the settled-PR check needs: the PR's lifecycle (REST ``GET /pulls/{n}``).
+
+    T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)). The real
+    :class:`~spirrow_mindwire.github.client.GitHubClient` satisfies this structurally; its
+    ``fetch_pr_state`` answers ``UNRESOLVABLE`` instead of raising, and the conductor also treats
+    a raise as "could not read". Either way the PR_REVIEW branch carries on exactly as it did
+    before this check existed (fail-closed to the pre-change path).
+    """
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState: ...
+
+
 class StopReason(StrEnum):
     """Why a conductor run stopped (returned in :class:`ConductorOutcome`)."""
 
@@ -340,8 +380,8 @@ class StopReason(StrEnum):
     # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
     # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
     # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
-    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
-    # nowhere if re-run).
+    # TERMINAL_STOP_REASONS (this head goes nowhere if re-run; that set is the only list of such
+    # reasons).
     STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
@@ -394,6 +434,13 @@ class StopReason(StrEnum):
     # notified, and the sweep relaunches the thread once the Summon is gone. The stop line carries
     # ``yield_to=<thread_id>`` so the sweep can record whom it yielded to (I-SY1 / I-SY2).
     SUMMON_YIELD = "summon_yield"
+    # T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)): the head is a
+    # ``NEXT: pr-review <ref>`` but GitHub says that PR is already merged or closed. The fact was
+    # posted under ``pr-event-relay`` (the text 1b writes, from the shared
+    # :func:`~spirrow_mindwire.pr_event_advance.decide.lifecycle_post`) and its ``NEXT:`` — none,
+    # the proposer, or the 3-line operator form — is the new head. The gate was not fired, and
+    # this stop notifies nobody: the post's own ``NEXT:`` is the hand-off.
+    PR_SETTLED = "pr_settled"
 
 
 class SummonOwnerSource(Protocol):
@@ -498,6 +545,14 @@ class RouteDecision:
     stop_reason: StopReason | None
 
 
+def _resume_cause(check: ResumeCheck) -> str:
+    """The STALLED notice's ``cause`` for a gate-resume check (Bohr msg-7563 修正 3).
+
+    ``outcome=<o> detail=<d>``; :func:`.stall.sanitize_cause` makes it one code-span-safe line.
+    """
+    return f"outcome={check.outcome.value} detail={check.detail}"
+
+
 class Conductor:
     """Serial, NEXT-driven driver for one design thread (the autonomous relay, msg-520)."""
 
@@ -513,11 +568,14 @@ class Conductor:
         naysayer_role: Role = Role.NAYSAYER,
         implementer_role: Role = Role.IMPLEMENTER,
         human_identity: str = HUMAN_TOKEN,
+        tier_c_recorders: Collection[str] = (),
         orchestrator: PrGate | None = None,
         force_naysayer_only_on_explicit_human: bool = False,
         control: LoopControl | None = None,
         rollup_source: CheckRollupSource | None = None,
         review_source: ReviewSource | None = None,
+        head_source: PrHeadSource | None = None,
+        pr_state_source: PrStateSource | None = None,
         review_login: str = DEFAULT_REVIEW_LOGIN,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
@@ -547,6 +605,9 @@ class Conductor:
         self._mcp = mcp
         self._dispatcher = dispatcher
         self._thread_ref = thread_ref
+        # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
+        # the response carries none) — handed to every event for the naysayer's N-3 routing.
+        self._thread_tags: tuple[str, ...] | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -557,6 +618,26 @@ class Conductor:
         # value disables the carve-out (fail-safe — every design→implement handoff hard-rejects).
         self._implementer_role = implementer_role
         self._human_identity = human_identity
+        # G1 discharge (T-guard-i-latches-on-discharged-tierc-line, Bohr msg-7202 §2 (a)): the
+        # authors whose ``TIER-C-RESOLVED:`` lines may discharge a named Tier-C declaration — the
+        # people who record a human decision given outside the chatroom (operator / Fermi). Empty
+        # (the default) = no discharge path, the pre-change G1. A recorder that holds a loop role
+        # (:data:`.tier_c_segment.AUTONOMOUS_LOOP_ROLES`) in THIS roster is not refused here — that
+        # would take the daemon down over one project's roster (Einstein msg-7208 BLOCKING); its
+        # lines are ignored at runtime, per thread (msg-7209 / msg-7211), and the overlap is
+        # logged once as a WARNING so the operator sees it before a resolution silently fails.
+        self._tier_c_recorders = tuple(r.strip() for r in tier_c_recorders if r.strip())
+        overlap = sorted(
+            f"{persona}={role.value}"
+            for persona, role in self._roster.items()
+            if role in AUTONOMOUS_LOOP_ROLES and is_recorder(persona, self._tier_c_recorders)
+        )
+        if overlap:
+            logger.warning(
+                "tier_c_recorders overlap loop roles in this roster: %s — their TIER-C-RESOLVED "
+                "lines are ignored in this thread (recorder_holds_loop_role)",
+                ", ".join(overlap),
+            )
         # PR-gate (PR-2b-2): the orchestrator that fires the Tier B independent naysayer review on a
         # ``NEXT: pr-review <ref>``, and the implementer dispatched to fix a REQUEST_CHANGES. A
         # ``None`` orchestrator / a roster without exactly one implementer disables the gate path
@@ -572,6 +653,15 @@ class Conductor:
         # REQUEST_CHANGES relay left at the head, and the login whose reviews count as the gate's.
         # ``None`` makes every RC resume CONTRADICTED (fall through to ``_route``), never VERIFIED.
         self._review_source = review_source
+        # The RC resume's PR-head read (REST ``GET /pulls/{n}``), kept off the rollup because a
+        # fine-grained PAT is refused the rollup's GraphQL contexts on a private repo
+        # (T-gate-resume-private-repo-pat-forbidden-stalls, Bohr msg-7563 修正 1). ``None`` makes
+        # every RC resume CONTRADICTED, like a missing review source.
+        self._head_source = head_source
+        # Settled-PR check (T-merged-pr-fact-never-reaches-design-thread, Bohr msg-7560 v0.4 (b)):
+        # read before admission on every ``NEXT: pr-review``, so a merged / closed PR is reported
+        # instead of re-gated. ``None`` (a bare Conductor) skips the check, as does a failed read.
+        self._pr_state_source = pr_state_source
         self._review_login = review_login
         # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1' / msg-6316). Set only
         # by the sweep's gate-lane launch (``--gate-only``); a hand run and a role-lane launch keep
@@ -652,8 +742,9 @@ class Conductor:
         self._summon_owner_control = summon_owner_control
         self._summon_yield_to: str | None = None
         # Resume notice (v1.4 single lifecycle). Set when the sweep passed ``--resume-notice-*``:
-        # this thread had yielded to a Summon. Attached to the FIRST role turn this run sends (only
-        # when ``main`` moved), and ``_resume_notice_delivered`` is raised once that turn was sent —
+        # this thread had yielded to a Summon. Attached to the FIRST role turn this run sends (with
+        # its own wording when ``main`` did not move, PR-3), and ``_resume_notice_delivered`` is
+        # raised once that turn was sent —
         # empty range or not — so the stop line says ``resume_notice=delivered`` and the sweep
         # clears its record. The conductor reads and writes no file for this (I-SY3).
         self._resume_notice = resume_notice
@@ -669,6 +760,11 @@ class Conductor:
         # Why G3 closed carve-out ③ on the last ``_route`` (``None`` = G3 did not close it); read
         # by the guard-(i) redirect notice so the human can tell a Jev veto from an internal fault.
         self._g3_close_reason: str | None = None
+        # Every OFFLINE condition that closed carve-out ③ on the last guard-(i) REDIRECT, plus the
+        # G1 scan behind it (Bohr msg-7202 §2 (b) / msg-7204 B1); ``None`` when ``_route`` did not
+        # redirect. Read by the redirect notice so it names what closed instead of "あるいは".
+        self._guard_i_closures: tuple[GuardIClosure, ...] | None = None
+        self._guard_i_scan: SegmentScan | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -809,6 +905,20 @@ class Conductor:
                     return self._stop(
                         round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
                     )
+                # Settled PR (msg-7560 v0.4 (b)). Before admission, and so before R0-OVERRIDE: a
+                # merged / closed PR is never re-gated (§F.1.1), whoever wrote the nomination.
+                # The post is authored by ``pr-event-relay`` and ends in none / the proposer /
+                # operator — never ``pr-review`` — so the next tick does not come back here, and
+                # 1b (which reads only ``pr-gate-relay`` tails) does not post it a second time.
+                settled_msg = await self._post_if_pr_settled(parsed_ref)
+                if settled_msg is not None:
+                    return self._stop(
+                        round_index,
+                        StopReason.PR_SETTLED,
+                        _msg_id(settled_msg) or latest_msg_id,
+                        forced,
+                        forced_saveable,
+                    )
                 # Pre-gate CI-wait admission (design v0.3.1 §5.2A). Decided BEFORE the gate is
                 # fired, from machine facts only (the head's rollup + two clocks + two head sets
                 # read back off this thread) — the third edge of §5.2A.6, which is neither guard
@@ -830,8 +940,19 @@ class Conductor:
                         # same terminal the first verdict's own APPROVE / COMMENT reached — the
                         # earlier verdict's ``NEXT:`` is authoritative and is NOT re-parsed here
                         # (no author is trusted, msg-557).
+                        # The note (msg-7556 (b) / msg-7560 v0.4 (c)) moves the head off the
+                        # ``pr-review`` nomination: without it every tick re-ran this same R6 and
+                        # stopped in silence (magickit#111, 91 spins). Its admission heading is
+                        # what 1b reads, so a later merge of this PR still reaches the thread.
+                        note, merge_wait = await self._post_already_reviewed_note(
+                            parsed_ref.slug, decision, rollup, messages
+                        )
                         return self._stop(
-                            round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
+                            round_index,
+                            StopReason.MERGE_WAIT if merge_wait else StopReason.HUMAN,
+                            _msg_id(note) or latest_msg_id,
+                            forced,
+                            forced_saveable,
                         )
                     if decision.admission is GateAdmission.ROUTE_HUMAN:
                         # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push).
@@ -904,9 +1025,12 @@ class Conductor:
                 # execution fail-safes, which are not policy: a missing relay id (post result with
                 # no msg_id) breaks no-progress tracking on the continue path (Tier B msg-572 #2),
                 # and no implementer persona means nobody to dispatch. Both stop at the human.
+                # Both IMPLEMENTER (fix / triage) and MERGE (an auto-merge-base APPROVE the
+                # implementer merges itself, T-gate-relay-routes-develop-approvals-to-human D4)
+                # dispatch the implementer on the relay.
                 if (
                     not relay_msg_id
-                    or relay_route is not RelayRoute.IMPLEMENTER
+                    or relay_route not in _IMPLEMENTER_DISPATCH_ROUTES
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
@@ -957,19 +1081,29 @@ class Conductor:
             )
             resume_identity = self._implementer_identity
             if candidate is not None and resume_identity:
-                # The watchdog first: UNAVAILABLE / STALE post nothing, so this is their bound.
-                stalled = await self._stand_down_if_stalled(
-                    round_index, latest_msg_id, resume_identity, forced, forced_saveable
-                )
-                if stalled is not None:
-                    return stalled
+                # Verify once, then the watchdog, whatever the outcome (Bohr msg-7565, endorsed by
+                # Einstein): UNAVAILABLE / STALE post nothing, and a VERIFIED dispatch of an
+                # implementer that posts nothing leaves the same head too — ``launches_same_head``
+                # counts the head, not the role — so this one check is the bound on all of them.
+                # The check's outcome rides into the STALLED notice as its ``cause``.
                 check = await verify_resume(
                     candidate,
                     rollup_source=self._rollup_source,
                     review_source=self._review_source,
                     review_login=self._review_login,
+                    head_source=self._head_source,
                 )
                 log_resume_check(candidate, check)
+                stalled = await self._stand_down_if_stalled(
+                    round_index,
+                    latest_msg_id,
+                    resume_identity,
+                    forced,
+                    forced_saveable,
+                    cause=_resume_cause(check),
+                )
+                if stalled is not None:
+                    return stalled
                 if check.outcome is ResumeOutcome.VERIFIED:
                     gave_up = await self._dispatch_implementer(
                         sessions,
@@ -1684,12 +1818,24 @@ class Conductor:
             # thunks for the same reason — the predicate owns when they are read.
             head_id = _msg_id(messages[-1])
             self._g3_close_reason = None
+            self._guard_i_closures = None
+            self._guard_i_scan = None
+            # One G1 scan per route, shared by the verdict thunk and the redirect diagnosis
+            # (PR-gate #488 advisory: it used to run twice on a redirect). Still lazy: nothing
+            # is scanned unless the predicate reaches G1 or the turn is redirected.
+            scan_memo: list[SegmentScan] = []
+
+            def scan_once() -> SegmentScan:
+                if not scan_memo:
+                    scan_memo.append(self._scan_tier_c_segment(messages))
+                return scan_memo[0]
+
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
                 control_state_is_run=self._control_state is ControlState.RUN,
                 message_is_attested=lambda: self._attested(messages[-1]),
-                segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+                segment_declares_tier_c=lambda: scan_once().declares_tier_c,
                 naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
                 decider_vetoes=lambda: self._proceed_vetoed_for(head_id),
             )
@@ -1703,6 +1849,7 @@ class Conductor:
                     spawn_blocked=False,
                     stop_reason=None,
                 )
+            self._diagnose_guard_i_redirect(author, author_role, messages, scan_once())
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
@@ -2238,13 +2385,80 @@ class Conductor:
 
         The human boundary is author-string trust, the same D-3 environment trust model as
         :meth:`_is_human` (msg-598 Q2=yes, re-accepted for G1 in msg-4858 §2).
+
+        The one exception to the latch (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2
+        (a) / msg-7204): a ``TIER-C-RESOLVED: <msg-id> decided-by=<human> on=YYYY-MM-DD`` line
+        posted by a configured ``tier_c_recorders`` author, NEWER than the declaration it names,
+        discharges that one declaration. The rule lives in
+        :func:`.tier_c_segment.scan_tier_c_segment` so the read-only census applies the same one.
         """
-        for msg in reversed(messages):
-            if self._is_human(_author(msg)):
-                return False
-            if declares_tier_c(_content(msg)):
-                return True
-        return False
+        return self._scan_tier_c_segment(messages).declares_tier_c
+
+    def _scan_tier_c_segment(self, messages: list[dict[str, Any]]) -> SegmentScan:
+        """The G1 scan with this conductor's human test and recorder list."""
+        return scan_tier_c_segment(
+            messages,
+            is_human=self._is_human,
+            recorders=self._tier_c_recorders,
+            role_of=self._roster_role,
+        )
+
+    def _diagnose_guard_i_redirect(
+        self,
+        author: str,
+        author_role: Role | None,
+        messages: list[dict[str, Any]],
+        scan: SegmentScan,
+    ) -> None:
+        """Record and log WHICH carve-out ③ conditions closed this guard-(i) redirect.
+
+        ``scan`` is the G1 scan ``_route`` already made for the verdict (one scan per route).
+
+        Bohr msg-7202 §2 (b) / msg-7204 B1 (endorsed by Einstein): the decision has already been
+        made by :func:`~spirrow_mindwire.routing.guard_proposer_to_implementer`, short-circuiting
+        as before; this is the diagnosis only. Every offline condition is evaluated (no network),
+        so one notice names all of them. G3 is added only when no offline condition closed — the
+        Decider was then consulted and :meth:`_proceed_vetoed_for` left its reason; otherwise G3
+        was not evaluated and the notice says so. Logged at INFO as ``guard_i_redirect`` so the
+        conductor log says more than ``conductor stopped: reason=human`` (the msg-881 blind spot).
+        """
+        head = messages[-1]
+        head_id = _msg_id(head)
+        closures = diagnose_carve_out_iii(
+            head_msg_id=head_id,
+            author_is_naysayer=author_role is self._naysayer_role,
+            control_state_is_run=self._control_state is ControlState.RUN,
+            message_is_attested=lambda: self._attested(head),
+            open_tier_c_declarations=lambda: scan.open_declarations,
+            naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
+        )
+        if not closures:
+            if self._g3_close_reason == "prefetch-missing":
+                closures = (GuardIClosure(GuardICondition.G3_PREFETCH_MISSING, (head_id,)),)
+            elif self._g3_close_reason is not None:
+                closures = (GuardIClosure(GuardICondition.G3_VETO, (head_id,)),)
+            else:
+                logger.error(
+                    "guard_i_redirect head=%s: no closed condition found — routing and diagnosis "
+                    "disagree",
+                    head_id,
+                )
+        self._guard_i_closures = closures
+        self._guard_i_scan = scan
+        logger.info(
+            "guard_i_redirect head=%s author=%s closed_by=%s evidence=%s g1_boundary=%s "
+            "g1_unmatched=%s g1_malformed=%s g1_ignored_non_recorder=%s "
+            "g1_recorder_holds_loop_role=%s",
+            head_id,
+            author,
+            ",".join(c.condition.value for c in closures) or "unknown",
+            ";".join(f"{c.condition.value}:{'/'.join(c.evidence_ids)}" for c in closures) or "-",
+            scan.boundary_msg_id or "-",
+            ",".join(scan.unmatched) or "-",
+            ",".join(scan.malformed) or "-",
+            ",".join(scan.ignored_non_recorder) or "-",
+            ",".join(f"{m}:{a}={r}" for m, a, r in scan.recorder_holds_loop_role) or "-",
+        )
 
     def _proceed_vetoed_for(self, head_msg_id: str) -> bool:
         """G3 read-back (veto form), three states (Bohr msg-5229 R3', Einstein msg-5230):
@@ -2346,7 +2560,9 @@ class Conductor:
         session — the thing the loop's carve-outs are named after ("the *independent* naysayer")
         was never shown to be independent for that post.
 
-        ``backend == expected`` is required as well as well-formedness, and what that buys is
+        ``backend`` within ``expected`` (:func:`~spirrow_mindwire.source_marker.attestation_agrees`:
+        equality for a single backend, subset for the codex tier's ``codex|gemini-fallback``,
+        ADR-14 §7.6) is required as well as well-formedness, and what that buys is
         narrow enough to be worth stating exactly. It refuses a stamp whose own fields RECORD a
         mismatch — an observation that the tier resolved somewhere other than the independent
         distribution. P-2 fails closed before such a record is ever rendered, so the harness does
@@ -2381,7 +2597,7 @@ class Conductor:
         marker" — is a constraint on the write path and is untouched.
         """
         record = parse_attestation_marker(_content(msg))
-        return record is not None and record.backend == record.expected
+        return record is not None and attestation_agrees(record)
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has an ATTESTED naysayer posted since the last ``NEXT: human`` boundary (excl. latest)?
@@ -2452,6 +2668,7 @@ class Conductor:
                 },
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
+        self._thread_tags = _thread_tags(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -2481,8 +2698,14 @@ class Conductor:
             route = RelayRoute.HUMAN
         return route, relay_msg
 
-    async def _post_as_relay(self, body: str) -> dict[str, Any]:
+    async def _post_as_relay(self, body: str, *, author: str = RELAY_AUTHOR) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.
+
+        ``author`` is :data:`RELAY_AUTHOR` for every gate record. The one other value is
+        :data:`~spirrow_mindwire.pr_event_advance.decide.PR_EVENT_RELAY_AUTHOR`, for the
+        settled-PR post (:meth:`_post_if_pr_settled`): that post is not a gate record, so it
+        stays out of the ``verdict_heads`` / ``ci_route_heads`` readers that narrow to the relay
+        author.
 
         Shared by the two conductor-authored PR-gate posts — the R3/R5 admission escalation and
         the R4 ci-route dispatch — because they need identical handling of the one failure that
@@ -2502,7 +2725,7 @@ class Conductor:
                     "project": self._thread_ref.project_id,
                     "thread_id": self._thread_ref.thread_id,
                     "msg_type": "report",
-                    "author": RELAY_AUTHOR,
+                    "author": author,
                     "content": body,
                     # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
                     # The other two harness write paths now supply one; this relay does
@@ -2546,14 +2769,14 @@ class Conductor:
             )
             return {
                 "msg_id": "",
-                "author": RELAY_AUTHOR,
+                "author": author,
                 "content": body,
             }
         msg = result.get("msg") if isinstance(result, dict) else None
         msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
         return {
             "msg_id": msg_id,
-            "author": RELAY_AUTHOR,
+            "author": author,
             "content": body,
         }
 
@@ -2664,7 +2887,8 @@ class Conductor:
             author_role=author_role,
             handoff=handoff,
             target=target,
-            g3_close_reason=self._g3_close_reason,
+            closures=self._guard_i_closures,
+            scan=self._guard_i_scan,
         )
 
     def _guard_i_redirect_target(
@@ -2723,7 +2947,8 @@ class Conductor:
         author_role: Role | None,
         handoff: Handoff,
         target: str,
-        g3_close_reason: str | None = None,
+        closures: tuple[GuardIClosure, ...] | None = None,
+        scan: SegmentScan | None = None,
     ) -> str:
         """Render the D-1 write-back body. See :meth:`_render_guard_i_redirect_notice` for shape.
 
@@ -2742,20 +2967,9 @@ class Conductor:
         # the thread when it has come to rest (if target is human). Both need to see the same
         # facts, so the body does not branch on target for the diagnostic prose.
         target_line = f"NEXT: {target}"
-        # Bohr msg-5227 R4 / msg-5229 R3': when G3 is what closed ③, say which kind of close it was
-        # so the human can tell a Jev veto from a conductor-internal fault.
-        if g3_close_reason is None:
-            g3_line = ""
-        elif g3_close_reason == "prefetch-missing":
-            g3_line = (
-                "今回 ③ を閉じたのは G3 です: G3 の事前取得が欠落しました (内部エラー。"
-                "Decider の判定ではありません)。\n\n"
-            )
-        else:
-            score = g3_close_reason.removeprefix("veto:")
-            g3_line = f"今回 ③ を閉じたのは G3 です: Jev が人に聞くべきと判定 (p={score})。\n\n"
+        closed_block = self._render_guard_i_closures(closures, scan)
         return (
-            "Conductor stop — guard (i) redirect (design→implement Tier-C gate)\n\n"
+            f"{GUARD_I_REDIRECT_TITLE} (design→implement Tier-C gate)\n\n"
             f"直近の post ({author}, role: {author_role_label}) の `NEXT:` は "
             f"implementer (`{implementer_token}`) を指しました。guard (i) はこの handoff を "
             "Tier-C の gate として拦截し、実装へは通しません "
@@ -2765,13 +2979,9 @@ class Conductor:
             "identity ではありません。\n"
             "- ② PR-gate verdict relay — 不適合: この handoff は PR-gate の verdict relay "
             "ではありません。\n"
-            "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
-            "author が naysayer でない、あるいは attest 済でない、あるいは control が "
-            "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
-            "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
-            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が「人に聞くべき」と "
-            "判定した (拒否権。Decider 無効・判定なし・エラーでは閉じない)。\n\n"
-            f"{g3_line}"
+            "- ③ attested independent naysayer proceed under control=`run` — 不適合。"
+            "今回閉じた条件は次のとおりです (T-guard-i-latches-on-discharged-tierc-line):\n"
+            f"{closed_block}\n"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "
@@ -2783,6 +2993,99 @@ class Conductor:
             "同じ head が永続 relaunch されるループ (msg-2537 §4 実測 288 回) が終端します。\n\n"
             f"{target_line}"
         )
+
+    def _render_guard_i_closures(
+        self, closures: tuple[GuardIClosure, ...] | None, scan: SegmentScan | None
+    ) -> str:
+        """One bullet per CLOSED condition, each with its evidence msg id(s) and how to open it.
+
+        Replaces the fixed "あるいは" list of every possible condition (msg-881, which named none of
+        them; Bohr msg-7202 §2 (b) / msg-7204 B1). Every line starts with indentation and ``-``, so
+        none can be read as a ``NEXT:`` / ``TIER-C:`` / ``TIER-C-RESOLVED:`` line by the parsers
+        that read this relay back.
+        """
+        if not closures:
+            return (
+                "  - 閉じた条件を特定できませんでした "
+                "(診断なし。conductor ログを確認してください)。\n"
+            )
+        lines: list[str] = []
+        offline_closed = False
+        for closure in closures:
+            ids = ", ".join(i for i in closure.evidence_ids if i) or "(msg id なし)"
+            cond = closure.condition
+            if cond is GuardICondition.NOT_NAYSAYER:
+                offline_closed = True
+                lines.append(
+                    f"  - naysayer ではない — {ids} の author は roster 上 naysayer ではありません "
+                    "(③ を使えるのは attested naysayer の proceed だけです)。"
+                )
+            elif cond is GuardICondition.NOT_RUN:
+                offline_closed = True
+                lines.append(
+                    f"  - control が `run` ではない — この project の loop control は "
+                    f"`{self._control_state.value}` です。"
+                )
+            elif cond is GuardICondition.NOT_ATTESTED:
+                offline_closed = True
+                lines.append(
+                    f"  - attest なし — {ids} の最終行に attest stamp が無いか、"
+                    "`backend` と `expected` が一致しません。"
+                )
+            elif cond is GuardICondition.G1:
+                offline_closed = True
+                lines.append(self._render_g1_closure(ids, scan))
+            elif cond is GuardICondition.G2:
+                offline_closed = True
+                lines.append(
+                    f"  - G2 — {ids} の `NEXT:` 直上の行が `TIER-C-CHECK: none` ではありません "
+                    "(空行がはさまっても閉じます)。"
+                )
+            elif cond is GuardICondition.G3_PREFETCH_MISSING:
+                lines.append(
+                    f"  - G3 — {ids}: G3 の事前取得が欠落しました (内部エラー。"
+                    "Decider の判定ではありません)。"
+                )
+            elif cond is GuardICondition.G3_VETO:
+                score = (self._g3_close_reason or "veto:?").removeprefix("veto:")
+                lines.append(f"  - G3 — {ids}: Jev が人に聞くべきと判定 (p={score})。")
+        if offline_closed:
+            lines.append("  - G3 — 未評価 (前段の条件で閉じたため、Decider は呼んでいません)。")
+        return "\n".join(lines) + "\n"
+
+    def _render_g1_closure(self, ids: str, scan: SegmentScan | None) -> str:
+        """The G1 bullet: every open declaration, the human boundary, and the discharge route."""
+        boundary = (
+            f"最後の human 投稿 {scan.boundary_msg_id} 以降"
+            if scan is not None and scan.boundary_msg_id
+            else "このスレッドに human の投稿は無く、全文が対象"
+        )
+        human = self._human_identity or "<human identity>"
+        text = (
+            f"  - G1 — 未解消の `TIER-C:` 宣言 {ids} ({boundary})。開け方: human が投稿する、"
+            "または tier_c_recorders に登録された記録者が宣言 1 件につき 1 行 "
+            f"`TIER-C-RESOLVED: <msg-id> decided-by={human} on=YYYY-MM-DD` を書く。"
+        )
+        if scan is not None:
+            notes = []
+            if scan.unmatched:
+                notes.append(
+                    f"対応する宣言が区間内に無い解消記録: {', '.join(scan.unmatched)} (unmatched)"
+                )
+            if scan.malformed:
+                notes.append(f"書式に合わない解消記録を含む投稿: {', '.join(scan.malformed)}")
+            if scan.ignored_non_recorder:
+                notes.append(
+                    "記録者でない author の解消記録 (無視): " + ", ".join(scan.ignored_non_recorder)
+                )
+            for msg_id, who, role in scan.recorder_holds_loop_role:
+                notes.append(
+                    f"{msg_id} の解消記録は無効: {who} は本スレッドで {role} "
+                    "(recorder-holds-loop-role)"
+                )
+            if notes:
+                text += " 参考: " + " / ".join(notes) + "。"
+        return text
 
     async def _admit(
         self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]
@@ -2803,10 +3106,11 @@ class Conductor:
 
         The parameter is documented as "``True`` if the latest ``NEXT: pr-review <ref>`` was
         authored by the conductor's own pr-gate-relay". Taken as a literal predicate at THIS
-        call site it is a constant ``False``, and the measurement is one line: the three writers
-        that post under :data:`RELAY_AUTHOR` — the verdict relay in
+        call site it is a constant ``False``, and the measurement is one line: the writers that
+        post under :data:`RELAY_AUTHOR` — the verdict relay in
         :meth:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator._post_design_relay`,
-        :meth:`_post_admission_escalation`, and :meth:`_post_ci_route` — each emit a ``NEXT:``
+        :meth:`_post_admission_escalation`, :meth:`_post_ci_route`, and the R6 note
+        :meth:`_post_already_reviewed_note` — each emit a ``NEXT:``
         naming the implementer or the human, never ``pr-review``. So the relay author cannot
         self-nominate, no message it writes can carry a pr-review handoff, and a literal reading
         sends **every** admission through R0-OVERRIDE to INVOKE. That is not a conservative
@@ -2881,6 +3185,91 @@ class Conductor:
         )
         return await self._post_as_relay(body)
 
+    async def _post_if_pr_settled(self, pr: PrRef) -> dict[str, Any] | None:
+        """Post the merged / closed fact for ``pr`` and return the post, or ``None`` to go on.
+
+        T-merged-pr-fact-never-reaches-design-thread (Bohr msg-7560 v0.4 (b)). The text and the
+        hand-off come from :func:`~spirrow_mindwire.pr_event_advance.decide.lifecycle_post`, the
+        function 1b's rows 3 / 4 call, so the two callers cannot drift apart.
+
+        ``None`` means carry on to admission exactly as before. It is returned when no source is
+        wired, when the read raised or did not answer, and when the PR is open or not found. A
+        fact that was not read is never guessed.
+
+        Chatroom producer surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the intended reader is
+        whoever the post's ``NEXT:`` names in this design thread — the proposer, nobody on
+        ``none``, or the operator when the roster cannot name a proposer. When the thread is
+        resolved by the time we write, :meth:`_post_as_relay` catches
+        :class:`ThreadResolvedError` and logs a warning: disposition **(3)**, fail loudly in the
+        run log. A resolved thread has no work left for this fact to advance.
+        """
+        if self._pr_state_source is None:
+            return None
+        # Imported here, not at module top: ``pr_event_advance.decide`` imports
+        # ``conductor.gate_records``, whose package ``__init__`` imports this module, so a
+        # top-level import is circular whenever 1b's CLI is the entry point.
+        from ..pr_event_advance.decide import PR_EVENT_RELAY_AUTHOR, lifecycle_post, pr_facts_of
+
+        try:
+            state = await self._pr_state_source.fetch_pr_state(pr)
+        except Exception as exc:  # a failed read is "could not see": keep the pre-change path
+            logger.warning("settled-PR check: fetch_pr_state(%s) raised: %r", pr.slug, exc)
+            return None
+        facts = pr_facts_of(state)
+        if facts is None:
+            logger.info("settled-PR check skipped for %s: PR state unresolvable", pr.slug)
+            return None
+        try:
+            proposer: str | None = derive_identity_by_role(self._roster, Role.PROPOSER)
+        except RoleResolutionError:
+            proposer = None
+        post = lifecycle_post(
+            thread_id=self._thread_ref.thread_id, pr_ref=pr.slug, pr=facts, proposer=proposer
+        )
+        if post is None:
+            return None
+        logger.info("settled-PR check for %s: state=%s, gate not fired", pr.slug, facts.state)
+        return await self._post_as_relay(post.render(), author=PR_EVENT_RELAY_AUTHOR)
+
+    async def _post_already_reviewed_note(
+        self,
+        pr_ref: str,
+        decision: AdmissionResult,
+        rollup: CheckRollup,
+        messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Post the R6 note; return it and whether the head's verdict was a merge wait.
+
+        msg-7556 (b) / msg-7560 v0.4 (c). It moves the head off the ``pr-review`` nomination and
+        says why the run stopped. The heading is :func:`render_admission_heading`, so 1b reads
+        this post and reports the PR once it is merged or closed. It carries no verdict heading
+        and no ci-route marker, so ``verdict_heads`` / ``ci_route_heads`` read nothing from it.
+
+        The stop goes where the head's verdict sent it. When the latest verdict relay for this
+        head is a merge wait, the note repeats :data:`MERGE_WAIT_LINE`. That keeps the thread in
+        the board's merge-wait lane (``parked_lane``) instead of listing it as a decision.
+        """
+        head = normalize_sha(rollup.head_sha)
+        # Newest first, stopping at the first verdict relay for this head: that one is "the
+        # latest verdict relay for this head", and older, superseded relays are never parsed.
+        merge_wait = False
+        for msg in reversed(messages):
+            body = _content(msg)
+            if _author(msg) == RELAY_AUTHOR and head in verdict_heads([body]):
+                merge_wait = is_merge_wait_relay(body)
+                break
+        tail = f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}" if merge_wait else f"NEXT: {HUMAN_TOKEN}"
+        body = (
+            f"{render_admission_heading(pr_ref)}\n\n"
+            f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+            f"{decision.reason}\n\n"
+            f"The gate was NOT fired: head {head[:12]} already has a gate verdict in this "
+            f"thread, and that verdict's hand-off stands. To review again, push a new commit, or "
+            f"have a person write the pr-review hand-off for {pr_ref} by hand.\n\n"
+            f"{tail}"
+        )
+        return await self._post_as_relay(body), merge_wait
+
     async def _post_ci_route(
         self, pr_ref: str, decision: AdmissionResult, rollup: CheckRollup
     ) -> dict[str, Any]:
@@ -2917,6 +3306,8 @@ class Conductor:
         *,
         retry_notice: str | None = None,
         resume_notice: str | None = None,
+        review_round: int | None = None,
+        review_round_notice: str | None = None,
     ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
@@ -2948,8 +3339,28 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
             retry_notice=retry_notice,
+            thread_tags=self._thread_tags,
             resume_notice=resume_notice,
+            review_round=review_round,
+            review_round_notice=review_round_notice,
         )
+
+    def _review_round(
+        self, role: Role, messages: list[dict[str, Any]]
+    ) -> tuple[int | None, str | None]:
+        """D2: count this naysayer turn's round from the thread; the model is never asked to.
+
+        ``N = 1 +`` the naysayer's earlier posts here, scope = every post after the latest of them,
+        whoever wrote it. Defining it that way needs no reset: a redesign is itself the delta, and
+        a comment the naysayer made early only widens the scope. Non-naysayer turns get nothing.
+        """
+        if role is not Role.NAYSAYER:
+            return None, None
+        posts = [m for m in messages if roster_role(self._roster, _author(m)) is Role.NAYSAYER]
+        if not posts:
+            return 1, None
+        round_number = len(posts) + 1
+        return round_number, render_review_round_line(round_number, _msg_id(posts[-1]))
 
     async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
         """Spawn the session for ``identity``: the one spawn path (Bohr msg-5053 D-1..D-3).
@@ -3050,7 +3461,7 @@ class Conductor:
                 self._resume_notice.main_from,
                 self._resume_notice.main_to,
                 role.value,
-                "attached" if resume_text is not None else "none (main did not move)",
+                "attached (main did not move)" if self._resume_notice.empty_range else "attached",
             )
         if self._retry_of is not None and rounds == 0:
             logger.info(
@@ -3062,9 +3473,17 @@ class Conductor:
             )
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
+                review_round, review_round_notice = self._review_round(role, messages)
                 await self._dispatcher.dispatch(
                     handle,
-                    self._to_event(msg, messages, retry_notice=notice, resume_notice=resume_text),
+                    self._to_event(
+                        msg,
+                        messages,
+                        retry_notice=notice,
+                        resume_notice=resume_text,
+                        review_round=review_round,
+                        review_round_notice=review_round_notice,
+                    ),
                 )
         except asyncio.CancelledError:
             # A cancellation is the wall-clock budget taking the run back (msg-5498 W-1), not an
@@ -3144,11 +3563,15 @@ class Conductor:
         target_identity: str,
         forced: int,
         forced_saveable: int,
+        *,
+        cause: str | None = None,
     ) -> ConductorOutcome | None:
         """T42 watchdog: stand down (STALLED notice, no spawn) or return ``None`` to go on.
 
         Extracted so the ordinary role path and the gate resume (:mod:`.gate_resume`) share one
         copy; the resume's silent ``resume_retry`` stops rely on it as their only bound.
+        ``cause`` is the gate resume's check on this launch (:func:`_resume_cause`), carried into
+        the notice; the ordinary role path passes none and its notice is unchanged.
         """
         if round_index != 0 or not is_stalled(
             launches_same_head=self._launches_same_head,
@@ -3162,6 +3585,7 @@ class Conductor:
             head_msg_id=latest_msg_id,
             launches_same_head=self._launches_same_head,
             target=target_identity,
+            cause=cause,
         )
         emit_stalled(stall_event)
         # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader: the human
@@ -3200,7 +3624,7 @@ class Conductor:
         """
         if not self._gate_only:
             return False
-        if self._rollup_source is None or self._review_source is None:
+        if self._rollup_source is None or self._review_source is None or self._head_source is None:
             logger.info("conductor.gate_only.ignored reason=resume_unavailable")
             return False
         body = _content(posted)
@@ -3315,6 +3739,19 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_tags(result: Any) -> tuple[str, ...] | None:
+    """``thread.tags`` of a ``chatroom_get_thread`` response, or None if absent/malformed.
+
+    The measured ``mode="full"`` shape (msg-4749) carries thread metadata under
+    ``thread``. Anything else is "not read", which the N-3 routing treats as marked.
+    """
+    thread = result.get("thread") if isinstance(result, dict) else None
+    tags = thread.get("tags") if isinstance(thread, dict) else None
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None
+    return tuple(tags)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

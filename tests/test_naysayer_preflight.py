@@ -29,6 +29,7 @@ test at the bottom runs the real thing.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,6 +44,7 @@ from spirrow_mindwire.lexora.client import (
 )
 from spirrow_mindwire.naysayer.preflight import (
     PREFLIGHT_ATTEMPTS,
+    SHADOW_ENDPOINT,
     TRACE_READ_LIMIT,
     TURN_ROW_REREAD_INTERVAL_SECONDS,
     TURN_ROW_REREADS,
@@ -52,9 +54,10 @@ from spirrow_mindwire.naysayer.preflight import (
     custom_headers_env_value,
 )
 from spirrow_mindwire.naysayer.principles import (
-    NAYSAYER_EXPECTED_BACKEND,
+    NAYSAYER_GEMINI_TIER,
     NAYSAYER_MODEL_TIER,
     NAYSAYER_UPSTREAM_MODEL,
+    allowed_backends,
 )
 from spirrow_mindwire.value_objects import AttestationRecord
 
@@ -149,6 +152,8 @@ class _FakeGateway:
         self._honours = honours_trace_filter
         self.calls: list[dict[str, Any]] = []
         self.stats_reads: list[dict[str, Any]] = []
+        # ADR-14 §7.3 routing declaration per probe (thread msg-6982).
+        self.n3_routed: list[bool] = []
 
     async def chat_completion(
         self,
@@ -157,7 +162,9 @@ class _FakeGateway:
         messages: list[ChatMessage],
         max_tokens: int,
         trace_id: str | None = None,
+        n3_routed: bool = False,
     ) -> ChatCompletion:
+        self.n3_routed.append(n3_routed)
         index = len(self.calls)
         self.calls.append(
             {"model": model, "messages": messages, "max_tokens": max_tokens, "trace_id": trace_id}
@@ -193,7 +200,7 @@ async def _attest(gateway: _FakeGateway, **kwargs: Any) -> AttestationRecord:
     return await attest_backend(
         base_url=_ROUTE,
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
         **kwargs,
@@ -230,6 +237,16 @@ async def test_the_probe_sends_a_trace_id_and_reads_back_by_the_same_one() -> No
 
 
 @pytest.mark.anyio
+async def test_the_probe_declares_n3_route() -> None:
+    """ADR-14 §7.3 (msg-6982): the fixed probe carries no repository content, so its
+    classification is decided in advance and it sends the ``v1`` declaration — otherwise a
+    probe of the codex-backed tier would be served by Gemini and never attest that tier."""
+    gateway = _FakeGateway()
+    await _attest(gateway)
+    assert gateway.n3_routed == [True]
+
+
+@pytest.mark.anyio
 async def test_route_is_the_credential_guarded_authority_not_the_raw_url() -> None:
     """The record's ``route`` runs through the SAME reducer as the source line.
 
@@ -241,7 +258,7 @@ async def test_route_is_the_credential_guarded_authority_not_the_raw_url() -> No
     record = await attest_backend(
         base_url="https://user:t0ken@gw.example:8443/v1",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
     )
@@ -255,7 +272,7 @@ async def test_route_redacts_when_the_userinfo_boundary_is_unresolvable() -> Non
     record = await attest_backend(
         base_url="https://admin:p/assword@api.internal:8443/",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         client=gateway,
         now=lambda: _NOW,
     )
@@ -513,7 +530,7 @@ async def test_a_mismatch_in_hand_beats_a_full_read() -> None:
     rows = [_row(10_000 + i) for i in range(TRACE_READ_LIMIT - 1)]
     rows.append(_row(20_000, backend="anthropic"))
     gateway = _FakeGateway(append_on_call=[rows, [_row(1)], [_row(2)]])
-    with pytest.raises(PreflightError, match="did not resolve to the expected backend"):
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
         await _attest(gateway)
     assert len(gateway.calls) == 1
 
@@ -578,23 +595,24 @@ async def test_empty_reply_body_does_not_fail_the_attestation() -> None:
 
 @pytest.mark.anyio
 async def test_production_constants_attest_against_a_live_shaped_row() -> None:
-    """The values the daemon spawns with must attest a row shaped like the real one.
+    """The Gemini tier's production allowed set must attest a row shaped like the real one.
 
-    Mutate ``NAYSAYER_EXPECTED_BACKEND`` to the upstream model id and the row
-    saying ``backend: "gemini"`` stops matching, and this reds.
+    Put the upstream model id into ``TIER_ALLOWED_BACKENDS`` instead of ``gemini`` and the
+    row saying ``backend: "gemini"`` stops matching, and this reds.
     """
     gateway = _FakeGateway(
         append_on_call=[[_row(6032, tier="naysayer", model=_LIVE_MODEL_ID, backend="gemini")]],
     )
     record = await attest_backend(
         base_url=_ROUTE,
-        tier=NAYSAYER_MODEL_TIER,
-        expected=NAYSAYER_EXPECTED_BACKEND,
+        tier=NAYSAYER_GEMINI_TIER,
+        allowed=allowed_backends(NAYSAYER_GEMINI_TIER),
         client=gateway,
         now=lambda: _NOW,
     )
     assert record.backend == "gemini"
-    assert record.tier == "naysayer"
+    assert record.expected == "gemini"
+    assert record.tier == NAYSAYER_GEMINI_TIER
 
 
 @pytest.mark.anyio
@@ -603,15 +621,71 @@ async def test_comparing_against_the_upstream_model_id_fails_every_attestation()
     gateway = _FakeGateway(
         append_on_call=[[_row(6032, tier="naysayer", model=_LIVE_MODEL_ID, backend="gemini")]],
     )
-    with pytest.raises(PreflightError, match="did not resolve to the expected backend"):
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
         await attest_backend(
             base_url=_ROUTE,
             tier=NAYSAYER_MODEL_TIER,
-            expected=NAYSAYER_UPSTREAM_MODEL,
+            allowed=frozenset({NAYSAYER_UPSTREAM_MODEL}),
             client=gateway,
             now=lambda: _NOW,
             attempts=1,
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["codex", "gemini-fallback"])
+async def test_codex_tier_accepts_codex_and_gemini_fallback(backend: str) -> None:
+    """ADR-14 §7.6: the codex tier accepts ``codex`` (primary) and ``gemini-fallback``."""
+    gateway = _FakeGateway(append_on_call=[[_row(7001, tier="naysayer", backend=backend)]])
+    record = await attest_backend(
+        base_url=_ROUTE,
+        tier=NAYSAYER_MODEL_TIER,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
+        client=gateway,
+        now=lambda: _NOW,
+    )
+    assert record.backend == backend
+    assert record.expected == "codex|gemini-fallback"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tier", "backend"),
+    [
+        (NAYSAYER_MODEL_TIER, "gemini"),
+        (NAYSAYER_GEMINI_TIER, "codex"),
+        (NAYSAYER_GEMINI_TIER, "gemini-fallback"),
+    ],
+)
+async def test_backend_outside_the_tier_set_fails_closed(tier: str, backend: str) -> None:
+    """ADR-14 §7.6: plain ``gemini`` on the codex tier, or codex/fallback on the Gemini tier,
+    is a downstream wiring mismatch and fails closed (never retried)."""
+    gateway = _FakeGateway(append_on_call=[[_row(7002, tier=tier, backend=backend)]] * 3)
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
+        await attest_backend(
+            base_url=_ROUTE,
+            tier=tier,
+            allowed=allowed_backends(tier),
+            client=gateway,
+            now=lambda: _NOW,
+        )
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_codex_tier_turn_with_both_codex_and_fallback_rows_passes() -> None:
+    """A turn whose codex attempt failed and fell back writes a row for each; both allowed."""
+    ledger = _Ledger([[_turn_row(1, backend="codex"), _turn_row(2, backend="gemini-fallback")]])
+    record = await attest_turn(
+        route=_ROUTE,
+        tier=NAYSAYER_MODEL_TIER,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
+        trace_id=_TRACE,
+        read_rows=ledger,
+        now=lambda: _NOW,
+    )
+    assert record.backend == "codex|gemini-fallback"
+    assert record.probe == "cost-row#1+2"
 
 
 # --------------------------------------------------------------------------- #
@@ -652,7 +726,7 @@ async def _attest_turn(ledger: _Ledger, sleeps: _Sleeps, **kwargs: Any) -> Attes
     return await attest_turn(
         route="lexora.local:8110",
         tier=_TIER,
-        expected=_EXPECTED,
+        allowed=frozenset({_EXPECTED}),
         trace_id=_TRACE,
         read_rows=ledger,
         sleep=sleeps,
@@ -770,10 +844,165 @@ async def test_other_turns_rows_neither_pass_nor_fail_this_turn() -> None:
     assert record.probe == "cost-row#3"
 
 
+# --------------------------------------------------------------------------- #
+# Shadow rows (T-per-turn-backend-attestation msg-7269): selected, not judged
+# --------------------------------------------------------------------------- #
+
+# Lexora's ``_shadow_run`` writes a row with ``endpoint="shadow"`` under the SAME
+# trace id, its ``backend`` overwritten with the shadow's own backend name
+# (msg-7184, quoting spirrow-lexora ``backends/fallback.py``). The codex name
+# here is illustrative: what matters is that it is not ``expected``.
+_SHADOW_BACKEND = "codex"
+
+
+def _shadow_row(
+    row_id: int, *, backend: str = _SHADOW_BACKEND, endpoint: str = "shadow"
+) -> dict[str, Any]:
+    return _row(row_id, backend=backend, endpoint=endpoint)
+
+
+def test_the_shadow_endpoint_is_lexoras_literal() -> None:
+    assert SHADOW_ENDPOINT == "shadow"
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_beside_the_answering_row_passes_and_is_not_in_the_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """★ msg-7269 (b)7-1: shadow on codex + answer on expected → pass; probe = answer only."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033)]])
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.preflight"):
+        record = await _attest(gateway)
+    assert record.backend == "gemini"
+    assert record.probe == "cost-row#6032"
+    excluded = [r for r in caplog.records if "shadow rows excluded" in r.getMessage()]
+    assert len(excluded) == 1
+    assert excluded[0].levelno == logging.INFO
+    assert "#6033(codex)" in excluded[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_excluding_shadow_rows_still_catches_a_fallback_that_answered() -> None:
+    """★ msg-7269 (b)7-2: the answering row on another backend is still a mismatch verdict."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032, backend="codex"), _shadow_row(6033)]])
+    with pytest.raises(PreflightError, match="did not resolve") as excinfo:
+        await _attest(gateway)
+    assert type(excinfo.value).__name__ == "_BackendMismatchError"
+    assert len(gateway.calls) == 1  # a verdict — not retried
+
+
+@pytest.mark.anyio
+async def test_shadow_rows_alone_fail_closed_with_their_own_wording() -> None:
+    """★ msg-7269 (b)7-3: no answering row → fail-closed; not the filter diagnostic."""
+    gateway = _FakeGateway(append_on_call=[[_shadow_row(6033)]] * PREFLIGHT_ATTEMPTS)
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest(gateway)
+    message = str(excinfo.value)
+    assert "shadow row(s)" in message
+    assert "no row records the route that answered" in message
+    assert "did not apply the filter" not in message
+    assert "no accounting row carries trace" not in message
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_that_names_the_expected_backend_is_still_excluded() -> None:
+    """★ msg-7269 (b)6: if a shadow backend name ever equals ``expected`` (D-8), nothing changes.
+
+    It is still left out of the probe id, and on its own it still cannot pass.
+    """
+    both = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033, backend=_EXPECTED)]])
+    assert (await _attest(both)).probe == "cost-row#6032"
+
+    alone = _FakeGateway(
+        append_on_call=[[_shadow_row(6033, backend=_EXPECTED)]] * PREFLIGHT_ATTEMPTS
+    )
+    with pytest.raises(PreflightError, match="shadow row"):
+        await _attest(alone)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("endpoint", ["Shadow", "SHADOW", "shadow-x", "shadow ", "/v1/shadow"])
+async def test_only_the_exact_shadow_endpoint_is_excluded(endpoint: str) -> None:
+    """★ msg-7269 (b)7-4: no case folding, no prefix/suffix match — such a row is judged."""
+    gateway = _FakeGateway(append_on_call=[[_row(6032), _shadow_row(6033, endpoint=endpoint)]])
+    with pytest.raises(PreflightError, match="did not resolve"):
+        await _attest(gateway)
+
+    matching = _FakeGateway(
+        append_on_call=[[_row(6032), _shadow_row(6033, backend=_EXPECTED, endpoint=endpoint)]]
+    )
+    assert (await _attest(matching)).probe == "cost-row#6032+6033"
+
+
+@pytest.mark.anyio
+async def test_a_turn_with_a_shadow_row_is_attested_from_its_answering_rows() -> None:
+    """★ msg-7269 (b)7-5: the same exclusion on the turn path (``attest_turn``)."""
+    ledger = _Ledger(
+        [[_turn_row(14814), _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")]]
+    )
+    record = await _attest_turn(ledger, _Sleeps())
+    assert record.scope == "turn"
+    assert record.probe == "cost-row#14814"
+    assert len(ledger.asked) == 1
+
+
+@pytest.mark.anyio
+async def test_a_shadow_row_flushed_before_the_answer_is_re_read_at_turn_scope() -> None:
+    """Shadow-only is "could not determine", so a short read re-reads (Einstein's endorsement 3)."""
+    shadow = _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")
+    ledger, sleeps = _Ledger([[shadow], [_turn_row(14814), shadow]]), _Sleeps()
+    record = await _attest_turn(ledger, sleeps)
+    assert record.probe == "cost-row#14814"
+    assert sleeps.calls == [TURN_ROW_REREAD_INTERVAL_SECONDS]
+
+
+@pytest.mark.anyio
+async def test_the_full_read_check_counts_shadow_rows() -> None:
+    """★ msg-7269 (b)3: ``len(rows) >= limit`` is judged on all rows, shadow included."""
+    full = [_turn_row(10_000)] + [
+        _row(20_000 + i, trace=_TRACE, backend="codex", endpoint="shadow")
+        for i in range(TRACE_READ_LIMIT - 1)
+    ]
+    ledger = _Ledger([full])
+    with pytest.raises(PreflightError, match="came back full"):
+        await _attest_turn(ledger, _Sleeps())
+    assert len(ledger.asked) == 1
+
+
+@pytest.mark.anyio
+async def test_a_full_read_with_only_our_shadow_row_says_found_and_maybe_cut_off() -> None:
+    """PR-gate on #489: shadow row present, answering row past the limit.
+
+    The trace did arrive (as a shadow row), so the message must not say it is
+    missing, and must not claim the shadow rows are the *only* rows for the
+    trace — the read is full, so the answering row may have been cut off. A
+    full read is not re-read.
+    """
+    full = [_row(30_000 + i, trace="other-trace") for i in range(TRACE_READ_LIMIT - 1)] + [
+        _row(14815, trace=_TRACE, backend="codex", endpoint="shadow")
+    ]
+    ledger = _Ledger([full])
+    with pytest.raises(PreflightError) as excinfo:
+        await _attest_turn(ledger, _Sleeps())
+    message = str(excinfo.value)
+    assert f"trace {_TRACE} was found only as 1 shadow row(s)" in message
+    assert "came back full" in message
+    assert "may have been cut off" in message
+    assert "not found" not in message
+    assert "the only accounting row(s)" not in message
+    assert "did not apply the filter" not in message
+    assert len(ledger.asked) == 1
+
+
 def test_the_custom_headers_value_is_the_measured_name_colon_value_form() -> None:
     """D-0a (2026-10-02): CLI 2.1.133 sends ``Name: Value``; it rejects the JSON form."""
     assert TRACE_HEADER == "X-Mindwire-Trace"
     assert custom_headers_env_value("01ABC") == "X-Mindwire-Trace: 01ABC"
+    # ADR-14 §7.3 routing declaration as a second ``Name: Value`` line (thread msg-6982).
+    assert (
+        custom_headers_env_value("01ABC", n3_routed=True)
+        == "X-Mindwire-Trace: 01ABC\nX-Mindwire-N3-Route: v1"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -799,7 +1028,7 @@ async def test_manual_live_preflight_against_the_real_gateway() -> None:
     record = await attest_backend(
         base_url=base_url,
         tier=NAYSAYER_MODEL_TIER,
-        expected=NAYSAYER_EXPECTED_BACKEND,
+        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
     )
-    assert record.backend == NAYSAYER_EXPECTED_BACKEND
+    assert record.backend in allowed_backends(NAYSAYER_MODEL_TIER)
     assert record.probe.startswith("cost-row#")

@@ -64,6 +64,39 @@ Outbound requests from the daemon's own scripts pass `-Proxy` explicitly. That i
 has no outbound firewall permission of its own, so a request that skipped the proxy is **blocked**
 rather than quietly bypassing the chokepoint.
 
+### CPU-heavy manual jobs on the loop host
+
+Role turns (the implementer's local `bash .mindwire-gate` above all) share {{HOST_LOOP}}'s CPU with
+whatever an operator runs there by hand. A CPU-bound manual job that takes every core starves the
+gate, and the turn runs out of wall clock. Any manual job that uses a lot of CPU on this host must
+follow these three rules:
+
+1. **Cap the workers.** The job's worker processes and threads, summed over every process it
+   starts, must not exceed the host's logical core count minus 4 (on a 16-core host, 12 at most).
+2. **Start it at lowered priority.** On Windows, launch it with `cmd.exe`'s `start` command:
+   `start "" /BELOWNORMAL <command>` from a `cmd.exe` prompt, or
+   `cmd /c start "" /BELOWNORMAL <command>` from PowerShell. (In PowerShell a bare `start` is the
+   `Start-Process` alias, which rejects `/BELOWNORMAL`. The empty `""` is the window title, so a
+   quoted command is not mistaken for it.) Launching at `BelowNormal` from the start matters:
+   worker processes the job spawns inherit that class, whereas lowering the priority after launch
+   leaves workers already started at `Normal`. After launch, check in PowerShell that each process
+   really is `BelowNormal`, e.g. `Get-Process -Id <pid> | Select-Object Id, PriorityClass`.
+3. **Record when it ran and how big it was.** Write the start time, the end time and the worker
+   count to the job's own log or to the operator lane's notes. When a turn later times out, this
+   record is how anyone can tell whether a job was running alongside it.
+
+**Why.** When a heavy job that broke these rules overlapped an implementer turn, the local gate took
+3–4× its usual time, and the turn hit the 1800 s timeout. With the rules followed, the gate stayed
+within about 1.3× its usual time. Only one measurement has confirmed this, so treat it as a working
+rule, not a guarantee. The details are in thread `T-local-gate-takes-half-the-turn`.
+
+**When to revisit.**
+- If a turn's local gate takes longer than 240 s even though the rules were followed, consider an
+  exclusive lease that pauses heavy manual jobs while a role turn runs.
+- If an implementer turn times out and the operator still cannot tell, after 30 minutes with the
+  transcript and the job logs, whether another job was running at the same time, reconsider
+  recording host load in the turn record (D2 in that thread).
+
 ## Environment
 
 Set by `deploy/run-conductor.ps1`; secrets must be supplied externally.
@@ -198,6 +231,72 @@ behaviour or coverage** — the full review still runs:
   policy you are evaluating) makes the PR-gate compute and log `would SKIP` / `would CAP` per review,
   and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
   review — so Item 2's saving is measured before you enforce it.
+
+## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6)
+
+The naysayer answers through one of two Lexora tiers, chosen per request by
+`naysayer/n3_routing.py::route_tier` (the only place that decides):
+
+| tier | answered by | the attestation accepts |
+|---|---|---|
+| `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
+| `naysayer-gemini` | Gemini only | `gemini` |
+
+A request goes to `naysayer-gemini` when **any** of these holds:
+
+- it carries the marker `n3-sensitive`: a PR **label** at the PR-gate, a thread **tag** at design time.
+  Labels or tags that couldn't be read count as marked. The conductor passes the tags it got from
+  `chatroom_get_thread`; the watcher path doesn't read them, so it always counts as marked;
+- a path is outside the repository:
+  - at the PR-gate, GitHub's file list is checked **lexically**, with no disk access: an absolute path,
+    a drive letter or a `..` segment counts as outside. A deleted file is just a path;
+  - at design time, each referenced path is resolved first: `~` is expanded, the path is made absolute
+    against the summon directory, and `realpath` follows symlinks. It must exist and lie under the
+    `realpath` of `git rev-parse --show-toplevel`;
+- the PR-gate's changed-file list may be incomplete: the files endpoint can't be read, its count differs
+  from the PR's `changed_files`, or it hit GitHub's 3000-file cap. On a rename **or** copy, both
+  `filename` and `previous_filename` are matched;
+- it touches `.mindwire-n3.toml`, the per-repo config file at the repository **root**, whatever the
+  globs say;
+- a changed or referenced file matches a glob in that file's `n3_sensitive_paths` list. The globs are the
+  union of a trusted side, which is always enforced, and a working side, which may only add globs:
+  - PR-gate: the PR's **base** ref is trusted; its **head** is the working side;
+  - design time: the HOST_REPO's remote **default branch** is trusted, read through the contents API;
+    the working side is `.mindwire-n3.toml` at the local repository root, never the current directory;
+- the config can't be resolved: file or key missing on the trusted side, either side unreadable or
+  malformed, or no repository root. **Leaving the key out sends everything to Gemini.** Writing
+  `n3_sensitive_paths = []` explicitly is the only way to say "no sensitive paths";
+- the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5). The value is
+  provisional until Lexora pins its `model_catalog_json` / `context_window`. Raising the output
+  reserve to 65,536 moved prompts of 145,537-179,072 chars from codex to Gemini. `mindwire
+  codex-band-count` counts those requests from the Lexora ledger (`MINDWIRE_LEXORA_URL`) and sums
+  their cost. It only sees requests made after this marking was deployed. If it prints
+  `truncated=true`, the count is a lower bound: re-run it with a larger `--limit`.
+
+Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
+glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
+be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
+notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+The scheduled sweep counts that token in each conductor run's output and the daily digest carries
+one line per repo ("routed to Gemini (fail-safe)"); the counts reset after a full digest delivery.
+
+**Which files design time routes on.** The design-time prompt is the thread, the principles SOT
+(`spec/NAYSAYER_PRINCIPLES.md`) and the ADR manifest (`spec/adr_index.yaml`). The two files are
+MindWire's own *system assets*, read from MindWire's install, not the host: they must resolve under
+MindWire's root to a path in `PROMPT_ASSETS`, or the request goes to Gemini (a principles override
+pointing elsewhere included). They are not matched against the host's globs, except when the host
+is mindwire itself. *Host files* (none today) go through the boundary check and the host's globs.
+A builder change that starts carrying another file must declare it; a structure test fails if the
+files the builder reads and the files it declares differ.
+
+**Residual risk, authorised by Takahito as a TIER-C goal decision on thread
+T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a vulnerability, on a path
+no glob lists and with no marker set. That request can't be classified in advance, and it reaches the
+codex tier.
+
+**Merge order (§7.6):** this routing and the per-tier attestation take effect together with Lexora's
+codex path. Lexora must serve both `naysayer` (the fallback wrapper) and `naysayer-gemini` before this
+is deployed. Otherwise every naysayer attestation fails closed.
 
 ## Run
 
@@ -1008,6 +1107,27 @@ never automated (D-5: the human's manual merge is the authoritative guard).
     observation P-2 records at spawn. Un-stamped, the carve-out is not taken and the turn falls
     through to the human terminal. Same for the Obj2 forced consult: only an attested naysayer post
     discharges it, so an un-attested segment buys exactly one extra forced consult.
+  - **G1 latch and recording an out-of-chat decision** (T-guard-i-latches-on-discharged-tierc-line).
+    A `TIER-C: <label>` line anywhere since the human's last post keeps the proceed closed (G1),
+    and before this change only a human post lifted it. A decision the human gives outside the
+    chatroom (relayed by the operator or Fermi) now lifts it only if the recorder writes, **in the
+    same post that records the decision**, one line per declaration it discharges:
+
+    ```
+    TIER-C-RESOLVED: msg-754 decided-by=<[conductor].human_identity> on=2026-10-21
+    ```
+
+    The line must match the whole grammar (one msg id per line, `decided-by` = the human identity,
+    a real date), and its author must be listed in `[conductor].tier_c_recorders` (default empty =
+    no discharge path). **A recorder counts only in a thread where it holds none of proposer /
+    implementer / naysayer in that thread's `[conductor].roster`**; otherwise its line is ignored
+    and reported as `recorder-holds-loop-role` (the daemon still starts, and logs a WARNING listing
+    the overlap). It discharges only the
+    declaration it names, and only if it was posted after that declaration; a later `TIER-C:` line
+    closes G1 again. When guard (i) does redirect, its relay now names every closed condition with
+    its msg ids (G1 lists every open declaration, plus any `unmatched` / malformed / non-recorder
+    resolution lines), and the conductor log carries a `guard_i_redirect ... closed_by=...` INFO line.
+    `scripts/guard_i_latch_census.py` lists the threads that are latched now.
 
 Author trust is the environment trust model (D-3) — the chatroom accepts any author string **and any
 body**, so the carve-outs, including the stamp check, are best-effort loop-level gating and

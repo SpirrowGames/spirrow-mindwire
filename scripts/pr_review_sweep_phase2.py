@@ -58,6 +58,7 @@ from spirrow_mindwire.pr_review_sweep.phase2 import (
     DEFAULT_BREAKER,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_NEEDS_HUMAN_AFTER,
+    DEFAULT_ROLE,
     Phase2Settings,
     State,
     ToolCaller,
@@ -170,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="actually close ledgers (irreversible). Without it nothing is written.",
     )
     parser.add_argument("--author", default=DEFAULT_AUTHOR)
+    parser.add_argument(
+        "--role",
+        default=DEFAULT_ROLE,
+        help="role every close declares (msg-7279); never sent without one",
+    )
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="N")
     parser.add_argument("--breaker", type=int, default=DEFAULT_BREAKER, help="K")
     parser.add_argument(
@@ -194,6 +200,7 @@ def settings_from_args(args: argparse.Namespace) -> Phase2Settings:
         backoff_cap_units=args.backoff_cap_units,
         backoff_unit_seconds=args.backoff_unit_seconds,
         author=args.author,
+        role=args.role,
     )
 
 
