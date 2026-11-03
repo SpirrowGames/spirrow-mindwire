@@ -235,7 +235,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
   - **エントロピーでの判定（D-2）から外すもの。** トークンの切り出し（32 文字以上）は変えません。`.`・`:`・`\` は切り出しの時点で区切りになります。
     - **A（語の形）:** `_` で 1 個以上つないだもので、最初の segment が `[A-Za-z][A-Za-z0-9]*`、2 つ目以降の segment がそれぞれ `[A-Za-z][A-Za-z0-9]*` または `[0-9]+`（数字だけ）であるもの。等号で分けた両辺がそれぞれこの形であるものも含みます。両端の `_` は無視します。
     - **B（path の形）:** `/` を含み、`+` を含まないもの（`+` は標準 base64 の特徴なので、含めば外しません）。
-    - **C（外さない条件）:** A か B に当てはまっても、`[_\-/=]` で分けたときに区切りのない 32 文字以上の連続を含むなら、外しません（base64・PAT のような、人が読めない高エントロピーの文字列は伏せたままにします。区切りのない hex・UUID・`sha<N>:<hex>` は、上のハッシュの形の除外で元から伏せません）。
+    - **C（外さない条件）:** A か B に当てはまっても、`[_\-/=]` で分けたときに区切りのない 32 文字以上の連続を含むなら、外しません（base64・PAT のような、人が読めない高エントロピーの文字列は伏せたままにします。区切りのない hex・UUID・`sha<N>:<hex>` は、上のハッシュの形の除外に当たるので伏せません。Lexora の実装は #511 の前からこの除外を持っており、#511 がテストの「伏せるもの」に hex を挙げたのは仕様の誤りでした（spirrow-lexora 同スレッド msg-952）。この修正で、伏せる範囲そのものは変わりません）。
     - 既知の接頭辞・PEM・Bearer はエントロピーの判定より前に判定するので、この除外の影響を受けません。
   - **代入での判定（D-1）から外すもの。** 対象は password・passwd・secret・token・api key の 5 語を含む key line の候補です。次の場合は key line とみなさず、続く 6 行の窓も開きません。
     - token のあとが、token と同じ大文字・小文字の英字で続く場合（spirrow-lexora `T-redactor-over-redacts-identifiers-and-paths` msg-959 で「英字が続く場合」から狭めたもの）。外すもの: tokens、tokenizer、TOKENS。外さないもの: tokenValue、TokenValue、TOKENValue、TOKENs（新しい語の始まりか、大文字・小文字が混在しているため）。複数形の secrets と passwords は外さず、これまでどおり伏せます。
@@ -247,7 +247,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
     - key line の外にある、`_` でつないだパスフレーズ。
     - tokens の下にある秘密（代入での判定では捕まらなくなります）。
     - `tokenvalue`・`TOKENVALUE` のように、token のあとが同じ大文字・小文字で語の切れ目なく続く名前の値。形だけでは tokenizer と区別できないので、代入での判定では捕まりません（msg-959 で既知の漏れとして受け入れたもの。msg-921 の時点から含まれていた範囲です）。
-  - **残る多めの伏せ字**（既知のもの。直すなら別の判断）: ハイフンだけでつないだトークン（単独で書いたスレッド ID など）、3 語以上の複合のキー名（token_count_max など）、`+` を含む path で 32 文字以上かつエントロピーが 4.0 以上のもの、C に当たる長い camelCase / PascalCase の識別子（FVoxelWorldPlayProofHostSubsystemInitializer など。形だけでは base62 の PAT と区別できないので、外しません）、数字で始まり英字を含む segment（3d、2fa など）を含むトークン、途中に空の segment があるトークン（`a__b` など。A の形に当たりません）、JSON のメンバー名が 5 語を含むときのその値（`"secretName": "..."` など。メンバー名は key line の別の形として扱い、除外を広げません。spirrow-lexora 同スレッド msg-952）。
+  - **残る多めの伏せ字**（既知のもの。直すなら別の判断）: ハイフンだけでつないだトークン（単独で書いたスレッド ID など）、3 語以上の複合のキー名（token_count_max など）、`+` を含む path で 32 文字以上かつエントロピーが 4.0 以上のもの、C に当たる長い camelCase / PascalCase の識別子（FVoxelWorldPlayProofHostSubsystemInitializer など。形だけでは base62 の PAT と区別できないので、外しません）、数字で始まり英字を含む segment（3d、2fa など）を含むトークン、途中に空の segment があるトークン（`a__b` など。A の形に当たりません）、JSON のメンバー名が 5 語のどれかを含むときのその値（上の camelCase の除外に当たる名前でも伏せます。メンバー名は key line の別の形として扱い、除外を広げません。spirrow-lexora 同スレッド msg-952）。
 - **行の数を変えません。** 複数行にまたがる一致（PEM など）は 1 行ずつ置き換え、改行の位置を残します。naysayer が示す `file:line` は、実際のソースの同じ場所を指したままです。
   - 行の中で伏せた箇所の文字列そのもの（行番号ではなく）を照合することは、直しません。指摘は `file:line` で置くもので、変わるのは秘密そのものだけであり、それを戻してはならないからです。
 - **diff の行頭の記号を残し、記号を外した中身で照合します**（#482 への PR-gate の REQUEST_CHANGES、1 件目への対応）。naysayer のプロンプトには unified diff が入ります。diff では、複数行の秘密（PEM など）の各行の先頭に `+`・`-`・空白の記号が付くので、生の文字列のまま複数行のパターンを当てると、記号で途切れて当たりません。そこで次のようにします。
@@ -295,7 +295,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
     - **diff のメタデータの行**: `index …`・`new file mode …`・`rename from …`・`Binary files …`・`\ No newline at end of file` を含む diff で、これらの行が伏せたあとも入力と同じであること。diff ではない部分（PR やスレッドの本文）で `index ` から始まる行に秘密を置いた場合と、`\` から始まる別の文字列の行に秘密を置いた場合に、その秘密を伏せること。PR やスレッドの本文に、diff の外で、記号の無い PEM（`-----BEGIN … PRIVATE KEY-----` から始まるもの）を貼った場合に、開始行から終了行までを伏せること。PR やスレッドの本文に、`@@` の見出しの無い diff の断片（`+-----BEGIN … PRIVATE KEY-----` と、続く `+` の行）を貼った場合と、正しい hunk の途中に記号の無いコメントの行が挟まって hunk が早く終わり、そのあとの `+` の行に PEM がある場合に、どちらもその PEM を伏せること。改行の無いファイルの末尾に行を足した diff（hunk の途中に `\ No newline at end of file` があり、そのあとの `+` の行に PEM を置いたもの）と、同じ diff で印の行が訳された文言（`\ ファイル末尾に改行がありません`）のもので、どちらもその PEM を伏せること。PR の本文に `@@ -10,12 +10,12 @@` の行を貼り、その直後に記号の無い PEM（`-----BEGIN …`・中身の行・`-----END …`）を続けた場合に、その PEM を開始行から終了行まで伏せること。hunk の中で空白の行が記号の無い空の行になっている diff と、`-- ` で始まる行を消した（`--- ` で始まる）`-` の行を含む hunk で、行数の数え方が崩れず、hunk の中身が照合されること。あわせて、知らない形の記号の無い行に秘密を置いた場合に、1 文字目を外さずに照合して伏せること。
     - **識別子と path の除外**（上の「識別子と path の形を外す」）
       - 伏せてはならないもの（0 件であること）: 実例 3 件の文字列（`test_verify_refuses_a_declaration_without_matching_scope_hashes`、`verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT`、`C:/workspace/unreal/VoxelWorldPlayProofHost-v3`）、ADR の path、バックスラッシュの path、SCREAMING_SNAKE の定数、spirrow-lexora `T-redactor-over-redacts-identifiers-and-paths` で Einstein が挙げた識別子 7 例、代入での判定で外す例 5 件（同スレッド msg-904）。
-      - 伏せるもの（漏れ 0 件であること）: 区切りのない 32 文字以上の base64・英数字（区切りのない hex・UUID・`sha<N>:<hex>` はハッシュの形の除外のままで、伏せないことを確かめます）、`/` と `+` の両方を含む標準 base64（property test、seed を固定して 500 件）、`abcdefghijklmnopqrstuv/wxyz+123456==`、既知の接頭辞を持つもの、ハイフンだけでつないだトークン、代入での判定で伏せる例（同スレッド msg-904）、既存の代入とエントロピーのテスト全部。
+      - 伏せるもの（漏れ 0 件であること）: 区切りのない 32 文字以上の base64・英数字（区切りのない hex・UUID・`sha<N>:<hex>` はハッシュの形の除外に当たり、伏せないことを確かめます。#511 で hex をここに挙げていたのは誤りで、実装の挙動は変わりません）、`/` と `+` の両方を含む標準 base64（property test、seed を固定して 500 件）、`abcdefghijklmnopqrstuv/wxyz+123456==`、既知の接頭辞を持つもの、ハイフンだけでつないだトークン、代入での判定で伏せる例（同スレッド msg-904）、既存の代入とエントロピーのテスト全部。
       - 漏れの率を測るもの（合否の基準ではなく記録用）: 上の「弱まる検出」の 2 種類。
 - **失敗したとき:** スキャナが例外を出したら、Lexora はエラーを返し、backend を呼びません。
 - **記録:** Lexora は request_costs の行に `redactions=<kind:count,…>` を書きます。数だけで、値は書きません。
