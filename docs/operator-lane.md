@@ -44,6 +44,15 @@ The isolation check is a static audit of the firewall rule. It never tries to co
 magickit being down neither opens the guard nor stops the lane. If the audit finds anything missing,
 the lane turns itself off (`enabled: false` plus `disabled_reason`) and sends a Discord notification.
 
+If `operator_lane.json` could not be read when the lane turned itself off (broken JSON, for example
+because it was being edited at that moment), the file is still overwritten with `enabled: false`. Its
+previous bytes are first copied next to it as
+`operator_lane.json.malformed-<YYYYMMDDTHHMMSSZ>-<pid>-<hex6>.bak`, and `disabled_reason` names that
+file (or says `backup failed: <error>` if the copy could not be written). Nothing restores the backup
+automatically. To get your settings back: fix the cause shown in `disabled_reason`, open the `.bak`, fix
+its JSON, copy the keys you want into `operator_lane.json` (leave `enabled` at `false` until the guard
+cause is fixed), and then delete the `.bak` by hand.
+
 ## One-time manual setup (Takahito)
 
 Run these in an elevated PowerShell on tomtebo-01, except where a step says otherwise. Nothing here costs

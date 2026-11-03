@@ -90,6 +90,7 @@ class _FakeLexora:
         model: str,
         messages: list[ChatMessage],
         max_tokens: int,
+        trace_id: str | None = None,
         n3_routed: bool = False,
     ) -> ChatCompletion:
         return ChatCompletion(

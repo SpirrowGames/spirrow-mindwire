@@ -95,10 +95,17 @@ CODEX_HARNESS_RESERVE_TOKENS = 60_928
 # ``max_output_tokens=None``. This is the largest ``max_tokens`` mindwire sends to the codex tier
 # (the review driver clamps its pass-1 budget to it on that tier only);
 # ``tests/test_n3_routing.py`` keeps every such request at or below it.
-CODEX_OUTPUT_RESERVE_TOKENS = 32_000
+# 65,536 rather than the original 32,000 (Takahito's cost decision on option A, answering Bohr
+# msg-7759): Lexora hands the original request to Gemini when codex falls back, limit included, so
+# 32,000 here would bring back the output cap that forced a false REQUEST_CHANGES on #485.
+CODEX_OUTPUT_RESERVE_TOKENS = 65_536
 CODEX_TIER_PROMPT_CHAR_LIMIT = (
     CODEX_CONTEXT_WINDOW_TOKENS - CODEX_HARNESS_RESERVE_TOKENS - CODEX_OUTPUT_RESERVE_TOKENS
 )
+# The limit while the reserve was 32,000. A non-N-3 prompt above CODEX_TIER_PROMPT_CHAR_LIMIT and
+# at or below this used to reach codex and now bills Gemini; n3_routing marks those requests so the
+# Lexora ledger can count them.
+CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT = 179_072
 
 
 def allowed_backends(tier: str) -> frozenset[str]:
@@ -321,6 +328,7 @@ __all__ = [
     "CODEX_CONTEXT_WINDOW_TOKENS",
     "CODEX_HARNESS_RESERVE_TOKENS",
     "CODEX_OUTPUT_RESERVE_TOKENS",
+    "CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT",
     "CODEX_TIER_PROMPT_CHAR_LIMIT",
     "EXPECTED_PRINCIPLES_VERSION",
     "GEMINI_BACKEND",

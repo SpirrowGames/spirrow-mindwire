@@ -107,6 +107,7 @@ from ..naysayer.n3_routing import (
     N3Request,
     TierDecision,
     UnresolvedNotifier,
+    codex_limit_band_trace_id,
     has_marker,
     load_n3_globs,
     notify_unresolved,
@@ -1014,7 +1015,12 @@ class NaysayerSdkAdapter:
         # it (``_turn_options``), and the gateway records it on every cost row those
         # requests cause, streaming included — the exact join the turn attestation
         # below selects on (Einstein msg-5391: no id window, no tier filter).
-        turn_trace_id = new_ulid()
+        # A turn in the codex limit band is marked so the ledger can count it.
+        turn_trace_id = (
+            codex_limit_band_trace_id()
+            if decision is not None and decision.in_codex_limit_band
+            else new_ulid()
+        )
         turn_options = self._turn_options(session.options, turn_trace_id)
         client: _SdkClient | None = None
         body_success = False
