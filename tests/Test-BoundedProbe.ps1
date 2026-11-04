@@ -418,7 +418,9 @@ exit 3
     # +1 for the operator pass (T-operator-task-lane PR2, D1'): the -Invoke scriptblock handed to
     # Invoke-OperatorLanePass; no -UvOptions either.
     # +1 for Invoke-AutoGateTick (T-gate-fires-on-pr-open 1c): no -UvOptions, like 1b.
-    Check 'seventeen helper call sites in the sweep script' 17 $helperCalls.Count
+    # +1 for Invoke-CloneRecover (T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0): no
+    # -UvOptions, like Invoke-CloneCheck.
+    Check 'eighteen helper call sites in the sweep script' 18 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

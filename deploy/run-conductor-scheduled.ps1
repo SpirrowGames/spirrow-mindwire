@@ -3085,7 +3085,7 @@ function Get-DirtyCloneNotice {
     $body = ("MindWire: 共有 clone が汚れているため起動を拒否しました — **$CandidateKey** exit=$ExitCode。" +
              "スレッドは無傷（quarantine も STALLED のカウントもしない）。この clone は駐機し、clean に戻るまで同じ clone の候補は起動しません（毎 tick ``mindwire clone-check`` で再判定し、戻れば自動で再開）。`n" +
              "clone: $RepoDir`n$detailLine`n" +
-             "clone を確認し、要る WIP は退避してからデフォルトブランチの clean な状態に戻してください（自動では片付けません）。")
+             "clone を確認し、要る WIP は退避してからデフォルトブランチの clean な状態に戻してください（WIP は自動では片付けません。tree が clean で branch の commit が全部 remote にある wrong_head だけは、次の tick に clone-recover がデフォルトブランチへ自動で戻します）。")
     return @{ key = "__dirty_clone__/$repoKey"; signature = $sig; message = $body; repo_key = $repoKey
               reason = $reason; head = $head; detail = $detail }
 }
@@ -3211,15 +3211,47 @@ function Invoke-CloneCheck {
     return @{ code = [int]$r.code; output = $out; stderr = "$($r.stderr)" }
 }
 
+# T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 (operator msg-7774, Takahito 2026-11-04
+# §2): run `mindwire clone-recover --repo-dir <dir>` once, bounded. It changes the clone only when
+# the guard says wrong_head, the fetch succeeded, and every commit on the branch is already on
+# origin/<default> (or origin/develop). Then it switches to <default>, fast-forwards, and deletes the
+# local branch. Returns @{ code; row (the MINDWIRE_CLONE_RECOVER json text or ''); stderr }.
+# A probe that could not run or timed out reports code -1.
+function Invoke-CloneRecover {
+    param([string]$RepoDir)
+    $r = Invoke-BoundedUvProbe -Label 'clone-recover' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir)
+    if (-not $r.ok) { return @{ code = -1; row = ''; stderr = "$($r.error)" } }
+    $row = ''
+    foreach ($line in @("$($r.stdout)" -split "`r?`n")) {
+        if ($line.StartsWith('MINDWIRE_CLONE_RECOVER ')) { $row = $line.Substring(23) }
+    }
+    return @{ code = [int]$r.code; row = $row; stderr = "$($r.stderr)" }
+}
+
 # D-3c: re-judge every parked repo once. $Probe is a scriptblock taking the repo_dir and returning
 # Invoke-CloneCheck's shape (Invoke-CloneCheck in production, a stub in tests). Returns the repo
 # keys released this tick. Mutates $Parked and $NotifyState.
+# $Recover (optional; Invoke-CloneRecover in production) runs first, and only for a repo parked as
+# wrong_head (PR-0). It only logs. The probe that follows still decides whether to release, so a
+# recovery that did nothing, or failed, leaves the parking exactly as it was before PR-0.
 function Update-DirtyCloneParking {
-    param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [string]$NowIso)
+    param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [string]$NowIso,
+          [scriptblock]$Recover = $null)
     $released = @()
     foreach ($key in @($Parked.Keys)) {
         $rec = $Parked[$key]
         $repoDir = "$($rec.repo_dir)"
+        if ($null -ne $Recover -and "$($rec.reason)" -eq 'wrong_head') {
+            $rr = & $Recover $repoDir
+            $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
+            $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
+            if ($rcode -eq 0) {
+                Write-Log "dirty-clone-recovered ${repoDir}: wrong_head $($rec.head) switched to the default branch, no commit lost — $rrow"
+            } else {
+                Write-Log "dirty-clone-recover-skipped ${repoDir}: clone-recover exit=$rcode — $rrow"
+            }
+        }
         $res = & $Probe $repoDir
         $code = if ($null -ne $res -and $null -ne $res.code) { [int]$res.code } else { -1 }
         if ($code -eq 0) {
@@ -5784,7 +5816,8 @@ try {
     if ($dirtyClonesParked.Count -gt 0) {
         $nowIsoPark = (Get-Date).ToUniversalTime().ToString('o')
         $null = Update-DirtyCloneParking -Parked $dirtyClonesParked -NotifyState $notifyState `
-            -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark
+            -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark `
+            -Recover { param($d) Invoke-CloneRecover -RepoDir $d }
         Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
         # Persist the notification state in the same breath as the parking state (PR #435 gate,
         # round 1): a release removes the repo's alert signature from $notifyState, and the only

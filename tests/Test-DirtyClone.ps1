@@ -498,5 +498,41 @@ else {
     finally { if (Test-Path -LiteralPath $hsState) { Remove-Item -LiteralPath $hsState -Force } }
 }
 
+# ===================================================================================================
+# T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 (operator msg-7774, Takahito 2026-11-04 §2):
+# a repo parked as wrong_head gets one clone-recover before the clone-check. The recover only logs;
+# the probe still makes the release decision.
+# ===================================================================================================
+Write-Host ''
+Write-Host 'PR-0 — clone-recover before the re-judge'
+$cleanRes = @{ code = 0; output = @(); stderr = '' }
+$whRes = @{ code = $DirtyCloneExitCode; output = @((New-Payload -Reason 'wrong_head' -Head 'feature/x')); stderr = '' }
+$script:recoverCalls = @()
+$recOk = { param($d) $script:recoverCalls += $d; @{ code = 0; row = '{"outcome":"recovered"}'; stderr = '' } }
+$recNo = { param($d) $script:recoverCalls += $d; @{ code = 3; row = '{"outcome":"not_eligible"}'; stderr = '' } }
+
+$p0 = @{ $repoKeyP = @{ repo_dir = $repoP; reason = 'wrong_head'; head = 'feature/x'; detail = ''; since = '2026-11-01T00:00:00Z'; signature = 'dirty-clone:wrong_head:feature/x' } }
+$script:logLines = @()
+$rel = Update-DirtyCloneParking -Parked $p0 -NotifyState @{} -Probe { param($d) $cleanRes } -NowIso '2026-11-04T00:00:00Z' -Recover $recOk
+Check 'PR-0: wrong_head repo gets one recover call' 1 $script:recoverCalls.Count
+Check 'PR-0: recovered + clean probe releases the repo' $false $p0.ContainsKey($repoKeyP)
+Check 'PR-0: recovery is logged' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-recovered *' }).Count -eq 1)
+
+$script:recoverCalls = @()
+$p1 = @{ $repoKeyP = @{ repo_dir = $repoP; reason = 'wrong_head'; head = 'feature/x'; detail = ''; since = '2026-11-01T00:00:00Z'; signature = 'dirty-clone:wrong_head:feature/x' } }
+$script:logLines = @()
+$null = Update-DirtyCloneParking -Parked $p1 -NotifyState @{} -Probe { param($d) $whRes } -NowIso '2026-11-04T00:00:00Z' -Recover $recNo
+Check 'PR-0: not-eligible recover leaves the repo parked (probe decides)' $true $p1.ContainsKey($repoKeyP)
+Check 'PR-0: not-eligible is logged as skipped' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-recover-skipped *exit=3*' }).Count -eq 1)
+
+$script:recoverCalls = @()
+$p2 = @{ $repoKeyP = @{ repo_dir = $repoP; reason = 'dirty_tree'; head = 'feature/x'; detail = ''; since = '2026-11-01T00:00:00Z'; signature = 'dirty-clone:dirty_tree:feature/x' } }
+$null = Update-DirtyCloneParking -Parked $p2 -NotifyState @{} -Probe { param($d) $whRes } -NowIso '2026-11-04T00:00:00Z' -Recover $recOk
+Check 'PR-0: dirty_tree repo is never handed to recover' 0 $script:recoverCalls.Count
+
+Check 'PR-0: the sweep passes Invoke-CloneRecover to the re-judge' $true ($scriptText -match 'Recover \{ param\(\$d\) Invoke-CloneRecover -RepoDir \$d \}')
+$crv = $functions | Where-Object { $_.Name -eq 'Invoke-CloneRecover' } | Select-Object -First 1
+Check 'Invoke-CloneRecover runs the clone-recover subcommand' $true ($crv.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-recover', '--repo-dir'")
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all dirty-clone checks passed"

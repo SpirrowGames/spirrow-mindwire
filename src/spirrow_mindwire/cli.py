@@ -20,6 +20,12 @@ MCP). Exit 0 = clean, prints nothing. Exit 8 = refused, prints the one
 :func:`~spirrow_mindwire.clone_guard.emit_dirty_clone_payload` the daemon uses. Exit 1 = the
 clone's state could not be judged (any other exception): a one-line summary on stderr, no
 traceback, so "could not tell" is never confused with "dirty".
+
+``mindwire clone-recover --repo-dir <dir>`` (T-dirty-clone-wip-retreat-and-silent-stall-alerts,
+PR-0) switches a ``wrong_head`` clone back to its default branch when every commit on its branch is
+already on the remote; see :mod:`spirrow_mindwire.clone_recover`. Exit 0 recovered, 3 not
+eligible (nothing changed), 1 failed. The wrapper calls it before ``clone-check``, which still
+makes the release decision.
 """
 
 from __future__ import annotations
@@ -75,6 +81,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="re-judge a parked shared clone: exit 0 clean, 8 refused (payload row), 1 unknown",
     )
     check.add_argument("--repo-dir", required=True, type=Path, help="the shared clone to judge")
+    recover = sub.add_parser(
+        "clone-recover",
+        help="switch a wrong_head clone back to its default branch if that loses no commit",
+    )
+    recover.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -135,6 +146,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(run_band_count(args.limit))
     if args.command == "clone-check":
         raise SystemExit(clone_check(args.repo_dir))
+    if args.command == "clone-recover":
+        from .clone_recover import run as run_clone_recover
+
+        raise SystemExit(run_clone_recover(args.repo_dir))
     if args.command == "turn-isolation-check":
         from .turn_isolation.check import run as run_isolation_check
 
