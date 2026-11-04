@@ -19,6 +19,13 @@ disposition is **(1)**: the refusal is recorded in this tick's JSON output, whic
 wrapper writes to its durable tick log. Nothing is re-posted elsewhere: a resolved thread has
 no work left to advance, so the record is for the operator reading the log, not a hand-off.
 
+Tail cache (T-sweep-preloop-overhead-exceeds-launch-budget D-1): when the sweep passes this
+tick's heads, a thread whose head has not moved is decided from its cached tail instead of a
+``chatroom_get_thread`` read (:mod:`~spirrow_mindwire.tail_cache`). The decision is still made
+every tick. ``posted_heads`` in the JSON gives the msg id of every post (``""`` when it could not be
+read, or when the post may have landed without an answer), so the sweep can move its heads without
+probing again.
+
 This module never calls (and does not import) ``chatroom_close_thread`` (R10): ``NEXT: none``
 is a handoff token, and a status close is the human's / a closeable role's act.
 """
@@ -33,6 +40,7 @@ from typing import Any, Protocol, assert_never
 from ..chatroom.status import FINISHED_STATUSES
 from ..github.client import CiState, CiStatus, PrRef, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
+from ..tail_cache import CachedTail, TailCache
 from .decide import (
     PR_EVENT_RELAY_AUTHOR,
     Noop,
@@ -87,17 +95,34 @@ class TickReport:
     project: str
     proposer: str | None
     outcomes: list[ThreadOutcome] = field(default_factory=list)
+    tail_cache: dict[str, Any] | None = None
+
+    def posted_heads(self) -> dict[str, str]:
+        """``{thread_id: msg_id}`` for every thread this tick may have written to.
+
+        ``""`` means the thread's head moved (or may have) to an id we could not read; the sweep
+        then drops the thread from its heads, so it is treated as unknown (fail-open).
+        """
+        return {
+            o.thread_id: (o.msg_id or "") if o.action == "posted" else ""
+            for o in self.outcomes
+            if o.action == "posted" or o.reason.startswith("post-failed")
+        }
 
     def as_dict(self) -> dict[str, Any]:
         posted = [o for o in self.outcomes if o.action == "posted"]
-        return {
+        out = {
             "project": self.project,
             "proposer": self.proposer,
             "threads": len(self.outcomes),
             "posted": len(posted),
             "outcomes": [o.as_dict() for o in self.outcomes if o.action != "noop"],
             "noop_counts": _noop_counts(self.outcomes),
+            "posted_heads": self.posted_heads(),
         }
+        if self.tail_cache is not None:
+            out["tail_cache"] = self.tail_cache
+        return out
 
 
 def _noop_counts(outcomes: Iterable[ThreadOutcome]) -> dict[str, int]:
@@ -152,7 +177,13 @@ async def list_open_threads(
     return list(seen)
 
 
-async def _read_tail(mcp: McpToolCaller, project: str, thread_id: str) -> dict[str, Any] | None:
+async def _read_tail(
+    mcp: McpToolCaller, project: str, thread_id: str, cache: TailCache | None = None
+) -> dict[str, Any] | None:
+    if cache is not None:
+        hit = cache.get(thread_id)
+        if hit is not None:
+            return hit.as_message()
     result = await mcp.call_tool(
         "chatroom_get_thread", {"project": project, "thread_id": thread_id, "mode": "full"}
     )
@@ -160,7 +191,11 @@ async def _read_tail(mcp: McpToolCaller, project: str, thread_id: str) -> dict[s
     if not isinstance(messages, list):
         return None
     rows = [m for m in messages if isinstance(m, dict)]
-    return rows[-1] if rows else None
+    if not rows:
+        return None
+    if cache is not None:
+        cache.put(thread_id, CachedTail.from_message(rows[-1]))
+    return rows[-1]
 
 
 async def advance_thread(
@@ -170,10 +205,11 @@ async def advance_thread(
     project: str,
     thread_id: str,
     proposer: str | None,
+    cache: TailCache | None = None,
 ) -> ThreadOutcome:
     """Read one thread's tail and its PR, decide, and write at most one message."""
     try:
-        tail_msg = await _read_tail(mcp, project, thread_id)
+        tail_msg = await _read_tail(mcp, project, thread_id, cache)
     except MagickitMcpError as exc:
         return ThreadOutcome(thread_id, "skipped", f"thread-unreadable: {exc}")
     if tail_msg is None:
@@ -215,6 +251,8 @@ async def advance_thread(
         case Noop(reason=reason):
             return ThreadOutcome(thread_id, "noop", reason.value, pr_ref=tail.pr_ref)
         case Post():
+            if cache is not None:
+                cache.forget(thread_id)  # its tail is about to be our post
             return await _post(mcp, project, thread_id, tail.pr_ref, decision)
         case _:
             assert_never(decision)
@@ -260,6 +298,7 @@ async def run_tick(
     project: str,
     proposer: str | None,
     registered: frozenset[str] | None = None,
+    cache: TailCache | None = None,
 ) -> TickReport:
     """One pass over every not-finished thread of ``project``.
 
@@ -269,13 +308,18 @@ async def run_tick(
     added to the sweep (§F.1 item 3).
     """
     report = TickReport(project=project, proposer=proposer)
-    for thread_id in await list_open_threads(mcp, project):
+    thread_ids = await list_open_threads(mcp, project)
+    for thread_id in thread_ids:
         outcome = await advance_thread(
-            mcp=mcp, gh=gh, project=project, thread_id=thread_id, proposer=proposer
+            mcp=mcp, gh=gh, project=project, thread_id=thread_id, proposer=proposer, cache=cache
         )
         if outcome.action == "posted" and registered is not None:
             outcome.unregistered = thread_id not in registered
         report.outcomes.append(outcome)
+    if cache is not None:
+        cache.prune(thread_ids)
+        cache.save()
+        report.tail_cache = cache.report()
     return report
 
 

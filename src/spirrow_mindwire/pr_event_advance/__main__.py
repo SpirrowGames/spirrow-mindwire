@@ -1,4 +1,8 @@
-"""CLI: ``python -m spirrow_mindwire.pr_event_advance --project <p> [--sweep-config <path>]``.
+"""CLI: ``python -m spirrow_mindwire.pr_event_advance --project <p> [--sweep-config <path>]
+[--heads-json <path>] [--tail-cache <path>]``.
+
+``--heads-json`` / ``--tail-cache`` turn on the tail cache (:mod:`~spirrow_mindwire.tail_cache`):
+both are needed for a hit, and either missing or unreadable means every thread is read in full.
 
 Prints ONE JSON object on stdout (ASCII-only, so the PowerShell wrapper's ``ConvertFrom-Json``
 reads it under any console codepage — the same rule as ``scripts/gate_bootstrap_tick.py``).
@@ -21,6 +25,7 @@ from ..conductor.roster import RoleResolutionError, derive_identity_by_role
 from ..config import load_settings
 from ..github.client import GitHubClient
 from ..magickit.client import StreamableHttpChatroomMcp
+from ..tail_cache import TailCache, load_heads
 from ..value_objects import Role
 from .runner import run_tick
 
@@ -60,6 +65,13 @@ def registered_threads(path: Path | None, project: str) -> frozenset[str] | None
     )
 
 
+def open_cache(args: argparse.Namespace) -> TailCache | None:
+    """The tail cache for this tick, or ``None`` when the sweep did not ask for one."""
+    if args.tail_cache is None:
+        return None
+    return TailCache.open(args.tail_cache, load_heads(args.heads_json))
+
+
 async def _main(args: argparse.Namespace) -> dict[str, Any]:
     proposer, roster_error = resolve_proposer()
     async with GitHubClient() as gh:
@@ -69,6 +81,7 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             project=args.project,
             proposer=proposer,
             registered=registered_threads(args.sweep_config, args.project),
+            cache=open_cache(args),
         )
     out = report.as_dict()
     if roster_error is not None:
@@ -81,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", required=True)
     parser.add_argument("--url", default=None, help="magickit MCP URL (default: in-code/env)")
     parser.add_argument("--sweep-config", type=Path, default=None)
+    parser.add_argument("--heads-json", type=Path, default=None, help="this tick's heads")
+    parser.add_argument("--tail-cache", type=Path, default=None, help="the project's tail cache")
     args = parser.parse_args(argv)
     try:
         out = asyncio.run(_main(args))

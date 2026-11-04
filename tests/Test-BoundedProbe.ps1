@@ -563,6 +563,10 @@ exit 3
     Write-Host 'P — 1b tick: argv / bound / label, and every failure returns instead of throwing'
     Import-SweepFunction 'Get-ProbeJsonLine'
     Import-SweepFunction 'Invoke-PrEventAdvanceTick'
+    # D-1 (T-sweep-preloop-overhead-exceeds-launch-budget): the heads file and the tail cache path.
+    . (Join-Path $repoRoot 'deploy/lib/PreLoopBudget.ps1')
+    # A real directory, not a literal drive path: Join-Path throws on a drive this host lacks (CI is Linux).
+    $tailCacheDir = Join-Path $scratch 'tail-cache'
     $PrEventAdvanceProbeTimeoutSeconds = 311
     $sweepConfigPath = 'C:\cfg\sweep.json'
     $script:peCalls = [System.Collections.Generic.List[object]]::new()
@@ -571,18 +575,27 @@ exit 3
     function script:Invoke-BoundedUvProbe {
         param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [int]$KillGraceMs, [string]$WorkingDirectory, [string[]]$Launcher, [string[]]$UvOptions)
         if ($script:peThrow) { throw 'boom' }
-        $script:peCalls.Add(@{ Arguments = $Arguments; TimeoutSeconds = $TimeoutSeconds; Label = $Label; UvOptions = $UvOptions })
+        $hi = [array]::IndexOf($Arguments, '--heads-json')
+        $hj = if ($hi -ge 0) { Get-Content -Raw -LiteralPath $Arguments[$hi + 1] } else { $null }
+        $script:peCalls.Add(@{ Arguments = $Arguments; TimeoutSeconds = $TimeoutSeconds; Label = $Label; UvOptions = $UvOptions; HeadsJson = $hj })
         return $script:peResult
     }
     $script:logLines.Clear()
     $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":1,"outcomes":[{"thread_id":"T-a"}],"noop_counts":{}}' }
-    $o = Invoke-PrEventAdvanceTick -Project 'p'
+    $o = Invoke-PrEventAdvanceTick -Project 'p' -Heads @{ 'T-a' = 'msg-9' }
     Check 'posted count parsed' 1 $o.posted
     $c = $script:peCalls[0]
-    Check 'argv = -m spirrow_mindwire.pr_event_advance --project p --sweep-config <path>' '-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json' ($c.Arguments -join '|')
+    $hfArg = $c.Arguments[[array]::IndexOf($c.Arguments, '--heads-json') + 1]
+    Check 'argv = -m spirrow_mindwire.pr_event_advance --project p --sweep-config <path> --heads-json <file> --tail-cache <path>' `
+        "-m|spirrow_mindwire.pr_event_advance|--project|p|--sweep-config|C:\cfg\sweep.json|--heads-json|$hfArg|--tail-cache|$(Join-Path $tailCacheDir 'p.json')" ($c.Arguments -join '|')
+    Check 'the heads file carries the heads' 'msg-9' (($c.HeadsJson | ConvertFrom-Json).heads.'T-a')
+    CheckTrue 'the heads file is removed after the call' (-not (Test-Path -LiteralPath $hfArg))
     Check 'bound = $PrEventAdvanceProbeTimeoutSeconds' 311 $c.TimeoutSeconds
     Check "label = 'pr-event-advance-p'" 'pr-event-advance-p' $c.Label
     CheckTrue 'a post is logged' (@($script:logLines | Where-Object { $_ -like 'pr-event-advance `[p`]: {*' }).Count -eq 1)
+    $script:peCalls.Clear()
+    $null = Invoke-PrEventAdvanceTick -Project 'p'
+    Check 'no heads -> an empty heads file (every thread read in full)' '{}' $script:peCalls[0].HeadsJson
     $script:logLines.Clear()
     $script:peResult = @{ ok = $true; code = 0; stdout = '{"project":"p","posted":0,"outcomes":[],"noop_counts":{"not-relay-tail":3}}' }
     $null = Invoke-PrEventAdvanceTick -Project 'p'
