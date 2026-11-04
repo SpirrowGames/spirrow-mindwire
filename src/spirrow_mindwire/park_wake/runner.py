@@ -25,6 +25,11 @@ write, :class:`ThreadResolvedError` is caught and the disposition is **(1)**: th
 this tick's JSON, which the sweep wrapper writes to its durable tick log. Nothing is re-posted
 elsewhere — a resolved thread has nobody left to wake.
 
+Tail cache (T-sweep-preloop-overhead-exceeds-launch-budget D-1): as in 1b, a thread whose head
+has not moved since its tail was cached is classified from the cached tail
+(:mod:`~spirrow_mindwire.tail_cache`). ``posted_heads`` in the JSON gives the msg id of every wake
+post (``""`` when unknown), so the sweep moves its heads without probing again.
+
 This module never calls ``chatroom_close_thread``: ``STOP: done`` is recorded, not acted on. The
 close stays the owner's act.
 """
@@ -41,6 +46,7 @@ from ..conductor.handoff import HandoffKind, StopStatus, resolve_handoff
 from ..github.client import PrRef, PrResolution, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ..pr_event_advance.runner import list_open_threads
+from ..tail_cache import CachedTail, TailCache
 from ..value_objects import Role
 from .decide import (
     DEPLOY_TERMINAL_STATUSES,
@@ -98,12 +104,23 @@ class TickReport:
     woken: list[dict[str, Any]] = field(default_factory=list)
     held: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
+    tail_cache: dict[str, Any] | None = None
+
+    def posted_heads(self) -> dict[str, str]:
+        """``{thread_id: msg_id}`` for every wake that landed or may have (``""`` = id unknown)."""
+        out: dict[str, str] = {}
+        for w in self.woken:
+            if w.get("action") == "posted":
+                out[str(w["thread_id"])] = str(w.get("msg_id") or "")
+            elif str(w.get("reason", "")).startswith("post-failed"):
+                out[str(w["thread_id"])] = ""
+        return out
 
     def classify(self, cls: StopClass, thread_id: str) -> None:
         self.classes.setdefault(cls.value, []).append(thread_id)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "project": self.project,
             "threads": self.threads,
             "counts": {c.value: len(self.classes.get(c.value, [])) for c in StopClass},
@@ -111,18 +128,32 @@ class TickReport:
             "woken": self.woken,
             "held": self.held,
             "errors": self.errors,
+            "posted_heads": self.posted_heads(),
         }
+        if self.tail_cache is not None:
+            out["tail_cache"] = self.tail_cache
+        return out
 
 
-async def read_heads(mcp: McpToolCaller, project: str) -> tuple[list[Head], list[dict[str, str]]]:
+async def read_heads(
+    mcp: McpToolCaller, project: str, cache: TailCache | None = None
+) -> tuple[list[Head], list[dict[str, str]]]:
     """The tail of every open thread of ``project``, and a row per thread that could not be read.
 
     The listing itself failing raises (:class:`MagickitMcpError`): with no thread list there is
-    nothing to classify and nothing safe to wake, so the tick fails as a whole.
+    nothing to classify and nothing safe to wake, so the tick fails as a whole. With ``cache``, a
+    thread whose head has not moved comes from the cache; the cache is pruned to the listing.
     """
     heads: list[Head] = []
     errors: list[dict[str, str]] = []
-    for thread_id in await list_open_threads(mcp, project):
+    thread_ids = await list_open_threads(mcp, project)
+    if cache is not None:
+        cache.prune(thread_ids)
+    for thread_id in thread_ids:
+        hit = cache.get(thread_id) if cache is not None else None
+        if hit is not None:
+            heads.append(_head_of(thread_id, hit))
+            continue
         try:
             result = await mcp.call_tool(
                 "chatroom_get_thread", {"project": project, "thread_id": thread_id, "mode": "full"}
@@ -135,18 +166,21 @@ async def read_heads(mcp: McpToolCaller, project: str) -> tuple[list[Head], list
         if not rows:
             errors.append({"thread_id": thread_id, "reason": "thread-unreadable: no messages"})
             continue
-        tail = rows[-1]
-        field_value = tail.get("next_participant")
-        heads.append(
-            Head(
-                thread_id=thread_id,
-                msg_id=str(tail.get("msg_id", "")),
-                author=str(tail.get("author", "")),
-                content=str(tail.get("content", "")),
-                next_participant=field_value if isinstance(field_value, str) else None,
-            )
-        )
+        tail = CachedTail.from_message(rows[-1])
+        if cache is not None:
+            cache.put(thread_id, tail)
+        heads.append(_head_of(thread_id, tail))
     return heads, errors
+
+
+def _head_of(thread_id: str, tail: CachedTail) -> Head:
+    return Head(
+        thread_id=thread_id,
+        msg_id=tail.msg_id,
+        author=tail.author,
+        content=tail.content,
+        next_participant=tail.next_participant,
+    )
 
 
 class RoleLookup:
@@ -304,6 +338,7 @@ async def run_tick(
     project: str,
     roster: Mapping[str, Role],
     registered: frozenset[str] | None = None,
+    cache: TailCache | None = None,
 ) -> TickReport:
     """One pass over every open thread of ``project``: classify, read facts, wake.
 
@@ -312,7 +347,7 @@ async def run_tick(
     ``unregistered``: no conductor acts on it until the thread is added to the sweep (as 1b).
     """
     report = TickReport(project=project)
-    heads, read_errors = await read_heads(mcp, project)
+    heads, read_errors = await read_heads(mcp, project, cache)
     report.threads = len(heads) + len(read_errors)
     report.errors.extend(read_errors)
     roles = RoleLookup(mcp)
@@ -370,11 +405,16 @@ async def run_tick(
             }
         )
     for park in selection.wake:
+        if cache is not None:
+            cache.forget(park.thread_id)  # its tail is about to be the wake
         outcome = await _post_wake(mcp, project, park)
         outcome["fact"] = reasons.get(park.trigger.key, "")
         if outcome.get("action") == "posted" and registered is not None:
             outcome["unregistered"] = park.thread_id not in registered
         report.woken.append(outcome)
+    if cache is not None:
+        cache.save()
+        report.tail_cache = cache.report()
     return report
 
 

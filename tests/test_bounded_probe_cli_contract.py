@@ -103,7 +103,7 @@ def test_pr_event_advance_call_site_resolves_to_the_1b_module() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
     assert sites.get('"pr-event-advance-$Project"') == (
         "-m spirrow_mindwire.pr_event_advance",
-        ["--project", "--sweep-config"],
+        ["--project", "--sweep-config", "--heads-json", "--tail-cache"],
     )
 
 
@@ -111,7 +111,7 @@ def test_park_wake_call_site_resolves_to_the_d7_module() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
     assert sites.get('"park-wake-$Project"') == (
         "-m spirrow_mindwire.park_wake",
-        ["--project", "--sweep-config"],
+        ["--project", "--sweep-config", "--heads-json", "--tail-cache"],
     )
 
 

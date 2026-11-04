@@ -86,6 +86,9 @@ from ..lexora.client import (
     LexoraClient,
     LexoraTimeoutError,
 )
+from ..route_authority import route_authority
+from ..ulid_util import new_ulid
+from ..value_objects import join_backends
 from .n3_routing import (
     N3Request,
     TierDecision,
@@ -107,12 +110,14 @@ from .pr_review_adr_pointers import (
     strip_wrapping_fences,
     unavailable_log_line,
 )
+from .preflight import TRACE_READ_LIMIT, TurnRowReader, attest_turn
 from .principles import (
     CODEX_OUTPUT_RESERVE_TOKENS,
     N3_CONFIG_PATH,
     NAYSAYER_MODEL_TIER,
     TIER_ALLOWED_BACKENDS,
     PrinciplesError,
+    allowed_backends,
     objection_classes,
     principles_version,
 )
@@ -2192,6 +2197,11 @@ def _build_pass2_messages(text: str, pr_slug: str) -> list[ChatMessage]:
 # still returns control to the driver within the pass-1 window rather than blocking it.
 _ADR_POINTER_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS / 2
 
+# Cap on the PR-gate backend read-back (:meth:`NaysayerPrReviewDriver._log_backend_attest`):
+# ``attest_turn`` re-reads up to TURN_ROW_REREADS times 2 s apart, so 30 s covers that with
+# room for slow reads, while a wedged ledger cannot hold a review open for long.
+_ATTEST_DEADLINE_SECONDS = 30.0
+
 # ``max_tokens`` for pass 2. Deliberately smaller than pass 1 because pass 2's entire
 # legitimate output is a small JSON array (see MAX_POINTER_PAYLOAD_BYTES rationale in
 # :mod:`.pr_review_adr_pointers`). A tighter budget also caps the pathological runaway:
@@ -2272,6 +2282,7 @@ class NaysayerPrReviewDriver:
         shadow: bool = False,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         n3_notifier: UnresolvedNotifier | None = None,
+        turn_rows: TurnRowReader | None = None,
     ) -> None:
         # ``None`` (the default): the tier is decided per PR by ``route_tier`` (ADR-14 §7.3 /
         # §7.6, :meth:`_route`). A string pins it (tests / an operator override).
@@ -2291,6 +2302,20 @@ class NaysayerPrReviewDriver:
             if lexora is not None
             else LexoraClient(lexora_url, timeout_seconds=timeout_seconds)
         )
+        # Backend read-back for the log (thread T-D8-codex-backend-adr14-15-amendment,
+        # Takahito msg-7813 (2)). ``turn_rows`` wins (tests); otherwise the driver's own
+        # ``LexoraClient`` reads the ledger. An injected ``lexora`` without ``turn_rows`` has
+        # no reader, and the attest line says so (``backend=unknown``).
+        self._turn_rows: TurnRowReader | None = turn_rows
+        self._attest_route = "injected"
+        if turn_rows is None and isinstance(self._lexora, LexoraClient):
+            client = self._lexora
+
+            async def _read_rows(trace_id: str) -> list[dict[str, Any]]:
+                return await client.stats_costs_recent(limit=TRACE_READ_LIMIT, trace_id=trace_id)
+
+            self._turn_rows = _read_rows
+            self._attest_route = route_authority(client.base_url) or "unparsed"
         # T22: the naysayer authenticates as a SEPARATE GitHub identity (spirrowgames-ops via
         # MINDWIRE_NAYSAYER_GITHUB_TOKEN) so its APPROVE / REQUEST_CHANGES is not "approving your
         # own PR". An explicit github_token arg wins (tests / overrides); otherwise resolve the
@@ -2493,6 +2518,14 @@ class NaysayerPrReviewDriver:
         )
         tier = self._model if routing is None else routing.tier
         assert tier is not None
+        # Every review carries a trace id so its backend can be read back from the ledger
+        # (:meth:`_log_backend_attest`). Only a review in the codex limit band carries the
+        # band mark, so ``codex-band-count`` still counts band reviews alone.
+        trace_id = (
+            codex_limit_band_trace_id()
+            if routing is not None and routing.in_codex_limit_band
+            else new_ulid()
+        )
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
             view,
             pr.slug,
@@ -2500,11 +2533,7 @@ class NaysayerPrReviewDriver:
             tier=tier,
             n3_routed=self._model is None,
             round_context=round_context,
-            trace_id=(
-                codex_limit_band_trace_id()
-                if routing is not None and routing.in_codex_limit_band
-                else None
-            ),
+            trace_id=trace_id,
         )
 
         if isinstance(pass1_result, LexoraTimeoutError):
@@ -2613,6 +2642,12 @@ class NaysayerPrReviewDriver:
         receipt = await self._post_and_submit(
             pr, verdict=verdict, body=body, head_sha=ci.head_sha, post_critique=post_critique
         )
+        # Backend read-back runs only AFTER the review is posted and submitted (PR #516 gate
+        # finding, round 1): telemetry must never delay or gate delivery of the artefact. A
+        # pass-1 failure (timeout degrade / fail-loud raise) returns above without it — no
+        # request reached a backend, so there would be no ledger row to read back, and
+        # polling for one would only stall the degrade path.
+        await self._log_backend_attest(pr.slug, diff_head, tier=tier, trace_id=trace_id)
         return PrReviewOutcome(
             verdict=verdict,
             body=receipt.body,
@@ -2760,6 +2795,62 @@ class NaysayerPrReviewDriver:
         await notify_unresolved(globs, f"PR-gate {pr.slug} (base)", self._n3_notifier)
         logger.info("n3 routing: %s -> tier=%s (%s)", pr.slug, decision.tier, decision.reason)
         return decision
+
+    async def _log_backend_attest(
+        self, pr_slug: str, head_sha: str, *, tier: str, trace_id: str
+    ) -> None:
+        """Log which backend actually served this review, read back from the ledger.
+
+        ``n3 routing: ... -> tier=`` is the tier chosen BEFORE the request; it does not say
+        whether Lexora answered it with codex or fell back to Gemini. This reads the rows the
+        two passes caused (same ``trace_id``) through :func:`attest_turn` and logs one line::
+
+            naysayer pr-gate attest: pr=<slug> head=<sha> tier=<t> backend=<b>
+                expected=<e> probe=<row>
+
+        (one line in the log; wrapped here).
+
+        **Fail-open, log only.** Unlike the design-time attest this never blocks or changes
+        the verdict and never reaches the posted review: a failed read-back logs
+        ``backend=unknown reason=<...>`` instead, which a post-deploy check must not count as
+        a codex observation. A mismatching backend also lands there, its reason naming the
+        backend the rows reported. The whole read-back is capped at
+        :data:`_ATTEST_DEADLINE_SECONDS`.
+        """
+        prefix = f"naysayer pr-gate attest: pr={pr_slug} head={head_sha} tier={tier}"
+        reason: str
+        expected = "?"
+        try:
+            allowed = allowed_backends(tier)
+            expected = join_backends(allowed)
+            if self._turn_rows is None:
+                reason = "no ledger reader"
+            else:
+                record = await asyncio.wait_for(
+                    attest_turn(
+                        route=self._attest_route,
+                        tier=tier,
+                        allowed=allowed,
+                        trace_id=trace_id,
+                        read_rows=self._turn_rows,
+                        sleep=self._sleep,
+                    ),
+                    timeout=_ATTEST_DEADLINE_SECONDS,
+                )
+                logger.info(
+                    "%s backend=%s expected=%s probe=%s",
+                    prefix,
+                    record.backend,
+                    record.expected,
+                    record.probe,
+                )
+                return
+        except TimeoutError:
+            reason = f"read-back exceeded {_ATTEST_DEADLINE_SECONDS:g}s"
+        except Exception as exc:  # fail-open by design (msg-7830): telemetry never gates
+            reason = f"{type(exc).__name__}: {exc}"
+        reason = " ".join(reason.split())
+        logger.info("%s backend=unknown expected=%s reason=%s", prefix, expected, reason)
 
     async def _run_two_passes(
         self,
