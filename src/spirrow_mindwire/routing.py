@@ -289,13 +289,17 @@ def continuation_admissible(
        continuation can never be a way around guard (i).
     3. ``chain_n <= cap`` — ``n`` is counted by the caller from the chain, never read from the
        report (Obj-1-2). Over the cap → :attr:`ContinueVerdict.CAP`.
-    4. ``clone_is_clean()`` — clean tree and nothing unpushed. Read last (it runs git) and only
-       when 1-3 hold. Not clean → :attr:`ContinueVerdict.DIRTY`.
+    4. ``clone_is_clean()`` — clean tree and nothing unpushed. Not clean →
+       :attr:`ContinueVerdict.DIRTY`.
+
+    Condition 4 is evaluated BEFORE the cap (PR #519 gate Obj-1): a capped continuation hands
+    the work to the proposer, which must not happen while the implementer's work exists only
+    in this clone, so DIRTY wins over CAP. It still runs only once 1-2 hold (it runs git).
     """
     if not head_author_is_implementer or chain_n is None:
         return ContinueVerdict.NO_CHAIN
-    if chain_n > cap:
-        return ContinueVerdict.CAP
     if not clone_is_clean():
         return ContinueVerdict.DIRTY
+    if chain_n > cap:
+        return ContinueVerdict.CAP
     return ContinueVerdict.ADMIT

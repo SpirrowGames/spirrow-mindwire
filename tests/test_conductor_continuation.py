@@ -194,6 +194,12 @@ def test_3b_n_is_counted_from_the_chain_not_the_report() -> None:
         )
         is ContinueVerdict.CAP
     )
+    assert (
+        continuation_admissible(
+            head_author_is_implementer=True, chain_n=4, cap=3, clone_is_clean=lambda: False
+        )
+        is ContinueVerdict.DIRTY
+    )
 
 
 # ------------------------------------------------------------------ 4. no CONTINUE line
@@ -272,6 +278,38 @@ def test_5_clean_pushed_clone_passes(pushed_clone: Path) -> None:
     _check(pushed_clone)()
 
 
+def test_5_local_branch_without_upstream_but_fully_pushed_passes(pushed_clone: Path) -> None:
+    """A branch with no upstream whose commits a remote already reaches is not unpushed."""
+    _git(pushed_clone, "branch", "--no-track", "scratch-view", "origin/feature/x")
+    _check(pushed_clone)()
+
+
+@pytest.mark.anyio
+async def test_5c_dirty_clone_wins_over_cap(pushed_clone: Path) -> None:
+    """PR #519 gate Obj-1: over the cap with unpushed work -> DIRTY, never a hand-off to the
+    proposer that cannot fetch the work."""
+    _make_dirty(pushed_clone, "unpushed")
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    for n in (1, 2, 3):
+        mcp.seed(author="Heisenberg", content=_report(f"part {n + 1}"))
+        mcp.seed(
+            author=CONDUCTOR_RELAY_AUTHOR,
+            content=render_relay(
+                n=n, cap=3, continue_body=f"part {n + 1}", implementer="Heisenberg"
+            ),
+        )
+    mcp.seed(author="Heisenberg", content=_report("part 5"))
+    disp = _ScriptedDispatcher(mcp, {})
+
+    with pytest.raises(DirtyCloneError) as ei:
+        await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+
+    assert ei.value.reason is DirtyCloneReason.UNPUSHED
+    assert _relays(mcp) == []  # no continue_cap notice posted
+    assert disp.dispatches == []
+
+
 def _make_dirty(repo: Path, state: str) -> DirtyCloneReason:
     if state == "uncommitted":
         (repo / "a.txt").write_text("changed\n", encoding="utf-8")
@@ -288,7 +326,7 @@ def _make_dirty(repo: Path, state: str) -> DirtyCloneReason:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("state", ["uncommitted", "untracked", "unpushed"])
+@pytest.mark.parametrize("state", ["uncommitted", "untracked", "unpushed", "unpushed_no_upstream"])
 async def test_5_dirty_clone_refuses_continuation(
     pushed_clone: Path, state: str, caplog: pytest.LogCaptureFixture
 ) -> None:
