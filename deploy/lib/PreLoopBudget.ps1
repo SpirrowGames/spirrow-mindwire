@@ -105,8 +105,12 @@ function ConvertTo-PreLoopBudgetState {
         $at = $null; $sec = $null; $lv = $null
         if ($s -is [System.Collections.IDictionary]) { $at = $s['at']; $sec = $s['s']; $lv = $s['level'] }
         else { $at = $s.at; $sec = $s.s; $lv = $s.level }
+        # A number is taken as it is; only a string is parsed, and always with InvariantCulture, so
+        # the result does not depend on the host's culture (PR #517 gate round 1, objection 2).
+        if ($null -eq $at -or $null -eq $sec) { continue }
         $d = 0.0
-        if ($null -eq $at -or -not [double]::TryParse("$sec", [System.Globalization.NumberStyles]::Float,
+        if ($sec -is [double] -or $sec -is [int] -or $sec -is [long] -or $sec -is [decimal] -or $sec -is [single]) { $d = [double]$sec }
+        elseif ($sec -isnot [string] -or -not [double]::TryParse($sec, [System.Globalization.NumberStyles]::Float,
                 [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { continue }
         if ("$lv" -notin @('ok', 'near', 'over')) { continue }
         $samples += @{ at = (ConvertTo-PreLoopInt $at); s = $d; level = "$lv" }
@@ -259,8 +263,18 @@ function ConvertTo-HeadsProbeJson {
 function Update-HeadsFromPosted {
     param([hashtable]$Heads, $Result)
     if ($null -eq $Heads) { return $null }
-    if ($null -eq $Result -or $null -eq $Result.PSObject.Properties['posted_heads']) { return $null }
-    $posted = $Result.posted_heads
+    if ($null -eq $Result) { return $null }
+    # The sweep parses the steps' stdout with plain ConvertFrom-Json (a PSCustomObject), but a
+    # hashtable result (ConvertFrom-Json -AsHashtable) must work too: on a hashtable,
+    # .PSObject.Properties does not list its keys (PR #517 gate round 1, objection 1).
+    if ($Result -is [System.Collections.IDictionary]) {
+        if (-not $Result.Contains('posted_heads')) { return $null }
+        $posted = $Result['posted_heads']
+    }
+    else {
+        if ($null -eq $Result.PSObject.Properties['posted_heads']) { return $null }
+        $posted = $Result.posted_heads
+    }
     if ($null -eq $posted) { return $null }
     $pairs = if ($posted -is [System.Collections.IDictionary]) { @($posted.GetEnumerator() | ForEach-Object { @{ Name = $_.Key; Value = $_.Value } }) }
              else { @($posted.PSObject.Properties | ForEach-Object { @{ Name = $_.Name; Value = $_.Value } }) }

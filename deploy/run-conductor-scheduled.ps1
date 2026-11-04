@@ -5197,13 +5197,23 @@ function Get-AutoGateProjects {
 # case. A failing step costs one listing call, rather than every candidate of the project counting as
 # unknown on every tick while it keeps failing. If that probe fails too, the heads are unknown ($null).
 function Get-HeadsAfterStep {
-    param([string]$Project, [hashtable]$Heads, $Result, [string]$Step)
+    param([string]$Project, [hashtable]$Heads, $Result, [string]$Step,
+        [System.Collections.Specialized.OrderedDictionary]$Phases = $null)
     if ($null -eq $Heads) { return $null }
     $next = Update-HeadsFromPosted -Heads $Heads -Result $Result
     if ($null -ne $next) { return , $next }
     Confirm-LogWorthKeeping
     Write-Log "head probe [$Project]: $Step returned no usable result — re-reading heads (it may have posted)"
-    return Invoke-HeadProbe -Project $Project
+    # The re-read is a head probe, so its time is added to this project's head[...] phase (D-3):
+    # otherwise it would vanish into the gap between the phases and the pre-loop total
+    # (PR #517 gate round 1, objection 3).
+    $reStartUtc = Get-SweepNowUtc
+    $reread = Invoke-HeadProbe -Project $Project
+    if ($null -ne $Phases) {
+        Add-PreLoopPhase -Phases $Phases -Name "head[$Project]" -Seconds (Get-SweepElapsedSeconds -Since $reStartUtc -Now (Get-SweepNowUtc))
+    }
+    if ($null -eq $reread) { return $null }
+    return , $reread
 }
 
 # D-1: $Heads as in Invoke-PrEventAdvanceTick. A project with no head probe (the declared-projects
@@ -5536,13 +5546,13 @@ try {
         $phaseStartUtc = Get-SweepNowUtc
         $prEvent = Invoke-PrEventAdvanceTick -Project $proj -Heads $h
         Add-PreLoopPhase -Phases $preLoopPhases -Name "1b[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
-        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $prEvent -Step '1b'
+        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $prEvent -Step '1b' -Phases $preLoopPhases
         # Park wake (Slice 3, D-7): same slot and same reasons as 1b above.
         $phaseStartUtc = Get-SweepNowUtc
         $parkWake = Invoke-ParkWakeTick -Project $proj -Heads $h
         Add-PreLoopPhase -Phases $preLoopPhases -Name "parkwake[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
         if ($null -ne $parkWake) { $stopClassByProject[$proj] = $parkWake } else { $stopClassFailed += $proj }
-        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $parkWake -Step 'park-wake'
+        $h = Get-HeadsAfterStep -Project $proj -Heads $h -Result $parkWake -Step 'park-wake' -Phases $preLoopPhases
         $headsByProject[$proj] = $h
     }
 

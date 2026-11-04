@@ -130,6 +130,22 @@ Check 'broken samples dropped' (@($st.samples).Count -eq 0)
 $st = ConvertTo-PreLoopBudgetState -Raw $null
 Check 'null raw is initial' ($st.notified_level -eq 'none')
 
+Write-Host "samples survive any host culture (PR #517 gate round 1, objection 2)"
+$rawSamples = @{ samples = @(@{ at = 1; s = 12.5; level = 'near' }, @{ at = 2; s = 7; level = 'ok' }, @{ at = 3; s = '130.25'; level = 'over' }, @{ at = 4; s = '12,5'; level = 'ok' }, @{ at = 5; s = $true; level = 'ok' }) }
+$savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+try {
+    [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+    $st = ConvertTo-PreLoopBudgetState -Raw $rawSamples
+    $fromFile = ConvertTo-PreLoopBudgetState -Raw ((ConvertTo-PreLoopBudgetStateFile -State $st) | ConvertTo-Json -Depth 5 | ConvertFrom-Json -AsHashtable)
+}
+finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture }
+Check 'de-DE: a double sample is kept as is' (@($st.samples | Where-Object { $_.at -eq 1 -and $_.s -eq 12.5 }).Count -eq 1)
+Check 'de-DE: an int sample is kept' (@($st.samples | Where-Object { $_.at -eq 2 -and $_.s -eq 7.0 }).Count -eq 1)
+Check 'de-DE: a string sample is parsed with InvariantCulture' (@($st.samples | Where-Object { $_.at -eq 3 -and $_.s -eq 130.25 }).Count -eq 1)
+Check 'a comma-decimal string is not a number (InvariantCulture)' (@($st.samples | Where-Object { $_.at -eq 4 }).Count -eq 0)
+Check 'a non-number sample is dropped' (@($st.samples | Where-Object { $_.at -eq 5 }).Count -eq 0)
+Check 'de-DE: samples survive a state file round trip' (@($fromFile.samples).Count -eq 3) "$(@($fromFile.samples).Count)"
+
 Write-Host "samples and digest line"
 $st = ConvertTo-PreLoopBudgetState -Raw @{}
 $now = 1700000000
@@ -192,7 +208,13 @@ Check 'a blank msg id removes the thread (unknown, fail-open)' (-not $h.Contains
 Check 'untouched threads keep their head' ($h['T-c'] -eq 'msg-3')
 $h = Update-HeadsFromPosted -Heads $h -Result ('{"project":"p","posted_heads":{}}' | ConvertFrom-Json)
 Check 'empty posted_heads changes nothing' ($h.Count -eq 2)
-Check 'a hashtable result is accepted too' ((Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ([pscustomobject]@{ posted_heads = @{ 'T-a' = 'y' } }))['T-a'] -eq 'y')
+Check 'a hashtable posted_heads is accepted too' ((Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ([pscustomobject]@{ posted_heads = @{ 'T-a' = 'y' } }))['T-a'] -eq 'y')
+# PR #517 gate round 1, objection 1: a hashtable RESULT (ConvertFrom-Json -AsHashtable) is not unknown.
+$hr = Update-HeadsFromPosted -Heads @{ 'T-a' = 'x'; 'T-b' = 'z' } -Result ('{"project":"p","posted_heads":{"T-a":"y","T-b":""}}' | ConvertFrom-Json -AsHashtable)
+Check 'a hashtable result (-AsHashtable) moves the head' ($null -ne $hr -and $hr['T-a'] -eq 'y')
+Check 'a hashtable result: blank msg id removes the thread' ($null -ne $hr -and -not $hr.ContainsKey('T-b'))
+Check 'a hashtable result with empty posted_heads keeps the heads' ((Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ('{"posted_heads":{}}' | ConvertFrom-Json -AsHashtable))['T-a'] -eq 'x')
+Check 'a hashtable result without posted_heads -> unknown' ($null -eq (Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ('{"error":"boom"}' | ConvertFrom-Json -AsHashtable)))
 Check 'no result -> unknown' ($null -eq (Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result $null))
 Check 'result without posted_heads (exit 1) -> unknown' ($null -eq (Update-HeadsFromPosted -Heads @{ 'T-a' = 'x' } -Result ('{"error":"boom"}' | ConvertFrom-Json)))
 Check 'null heads stay null' ($null -eq (Update-HeadsFromPosted -Heads $null -Result $oneB))
@@ -207,12 +229,27 @@ $script:reprobes = 0
 function Invoke-HeadProbe { param([string]$Project) $script:reprobes++; return @{ 'T-a' = 'msg-50' } }
 function Write-Log { param([string]$Message) }
 function Confirm-LogWorthKeeping { }
+# A fake clock: every read advances 2s, so a timed span is exactly 2s.
+$script:fakeNow = [datetime]::new(2026, 11, 4, 0, 0, 0, [DateTimeKind]::Utc)
+function Get-SweepNowUtc { $script:fakeNow = $script:fakeNow.AddSeconds(2); return $script:fakeNow }
+function Get-SweepElapsedSeconds { param([datetime]$Since, [datetime]$Now) return ($Now - $Since).TotalSeconds }
 $h = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $oneB -Step '1b'
 Check 'normal path: no re-probe' ($script:reprobes -eq 0 -and $h['T-a'] -eq 'msg-10')
 $h = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $null -Step '1b'
 Check 'unusable result: one re-probe, its heads used' ($script:reprobes -eq 1 -and $h['T-a'] -eq 'msg-50')
 $h = Get-HeadsAfterStep -Project 'p' -Heads $null -Result $null -Step '1b'
 Check 'unknown heads: no re-probe, stay unknown' ($script:reprobes -eq 1 -and $null -eq $h)
+# PR #517 gate round 1, objection 3: the re-read is timed into the project's head[...] phase.
+$ph = New-PreLoopPhaseLog
+Add-PreLoopPhase -Phases $ph -Name 'head[p]' -Seconds 5
+$null = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $oneB -Step '1b' -Phases $ph
+Check 'normal path: head phase unchanged' ($ph['head[p]'] -eq 5) "$($ph['head[p]'])"
+$null = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $null -Step '1b' -Phases $ph
+Check 're-read time is added to head[p]' ($ph['head[p]'] -eq 7) "$($ph['head[p]'])"
+Check 're-read adds no other phase' ($ph.Count -eq 1) "$($ph.Keys -join ',')"
+function Invoke-HeadProbe { param([string]$Project) $script:reprobes++; return $null }
+$h = Get-HeadsAfterStep -Project 'p' -Heads @{ 'T-a' = 'msg-1' } -Result $null -Step '1b' -Phases $ph
+Check 'failed re-read: heads unknown, still timed' ($null -eq $h -and $ph['head[p]'] -eq 9) "$($ph['head[p]'])"
 
 Write-Host "D-1 wiring"
 $runAt = $src.IndexOf('# --- run ---')
@@ -225,6 +262,8 @@ $pw2 = $src.IndexOf("`$h = Get-HeadsAfterStep -Project `$proj -Heads `$h -Result
 $store = $src.IndexOf('$headsByProject[$proj] = $h', $runAt)
 Check 'order: control -> head -> 1b -> patch -> park-wake -> patch -> store' (
     $ctl -gt 0 -and $hp -gt $ctl -and $ob -gt $hp -and $ob2 -gt $ob -and $pwk -gt $ob2 -and $pw2 -gt $pwk -and $store -gt $pw2) "$ctl $hp $ob $ob2 $pwk $pw2 $store"
+Check 'both hand-offs pass the phases (the re-read is timed)' (
+    ([regex]::Matches($src.Substring($runAt), 'Get-HeadsAfterStep -Project \$proj -Heads \$h -Result \$\w+ -Step ''[\w-]+'' -Phases \$preLoopPhases')).Count -eq 2)
 Check 'only one head probe call in the per-project loop' (
     ([regex]::Matches($src.Substring($runAt), 'Invoke-HeadProbe -Project \$proj')).Count -eq 1)
 Check '1b passes --heads-json and --tail-cache' ($src -match "'spirrow_mindwire\.pr_event_advance', '--project', \`$Project, '--sweep-config', \`$sweepConfigPath, '--heads-json', \`$headsFile, '--tail-cache', \`$tailCachePath")
