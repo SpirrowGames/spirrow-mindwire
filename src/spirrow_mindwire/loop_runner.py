@@ -68,7 +68,7 @@ import functools
 import logging
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -726,6 +726,19 @@ def _build_dispatcher(
     return mcp, registry, dispatcher
 
 
+def _continuation_clone_check(dispatcher: object) -> Callable[[], None] | None:
+    """``CloneGuard.check`` + ``check_pushed`` for the CONTINUE path, or ``None`` (fail-closed)."""
+    guard = getattr(dispatcher, "clone_guard", None)
+    if not isinstance(guard, CloneGuard):
+        return None
+
+    def check() -> None:
+        guard.check()
+        guard.check_pushed()
+
+    return check
+
+
 def build_git_sync_hook(settings: MindwireSettings) -> GitSyncHook | None:
     """The git-sync hook for ``[loop].repo_dir``, or ``None`` (ADR-2026-10-09-23 unit 1).
 
@@ -1040,6 +1053,9 @@ def build_conductor(
         conductor = Conductor(
             mcp=mcp,
             dispatcher=dispatcher,
+            # T-implementer-self-continuation condition 4: clean tree AND nothing unpushed, judged
+            # by the same guard the dispatcher runs before every dispatch.
+            continuation_clone_check=_continuation_clone_check(dispatcher),
             thread_ref=thread_ref,
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,

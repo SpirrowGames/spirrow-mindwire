@@ -90,6 +90,9 @@ class DirtyCloneReason(StrEnum):
     WRONG_HEAD = "wrong_head"
     GIT_UNAVAILABLE = "git_unavailable"
     PIN_NOT_IGNORED = "pin_not_ignored"
+    # T-implementer-self-continuation D-1'' condition 4: a local branch is ahead of its upstream.
+    # Raised only by :meth:`CloneGuard.check_pushed`, which only the CONTINUE path calls.
+    UNPUSHED = "unpushed"
 
 
 class DirtyCloneError(Exception):
@@ -241,6 +244,31 @@ class CloneGuard:
                 DirtyCloneReason.WRONG_HEAD,
                 head=head,
                 detail=f"HEAD is on {head!r}, default branch is {default!r}",
+            )
+
+    def check_pushed(self) -> None:
+        """Raise :class:`DirtyCloneError` (``unpushed``) if a local branch is ahead of upstream.
+
+        The CONTINUE path's condition 4 (T-implementer-self-continuation msg-7881 / msg-7883 test
+        5c): an implementer that committed but did not push leaves its work only in this shared
+        clone. The implementer ends its turn back on the default branch, so HEAD alone cannot
+        show it; every local branch with an upstream is read. Conservative on purpose: a stale
+        unpushed branch of another thread also refuses the continuation, and the refusal names it.
+        """
+        res = self._run(
+            ["for-each-ref", "--format=%(refname:short) %(upstream:track)", "refs/heads"],
+            head=None,
+        )
+        ahead = sorted(
+            name
+            for name, _, track in (line.partition(" ") for line in res.stdout.splitlines())
+            if "ahead" in track
+        )
+        if ahead:
+            raise self._error(
+                DirtyCloneReason.UNPUSHED,
+                head=self._head_or_none(),
+                detail="ahead of upstream: " + ", ".join(ahead),
             )
 
     # -- helpers --------------------------------------------------------------------------------

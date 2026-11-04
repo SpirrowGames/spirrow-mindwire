@@ -257,3 +257,45 @@ def diagnose_carve_out_iii(
     if author_is_naysayer and not naysayer_declared_no_tier_c():
         closures.append(GuardIClosure(GuardICondition.G2, (head_msg_id,)))
     return tuple(closures)
+
+
+class ContinueVerdict(StrEnum):
+    """What :func:`continuation_admissible` decided (T-implementer-self-continuation D-1''''')."""
+
+    ADMIT = "admit"
+    #: Not a continuation (no chain back to an entry, or interrupted) → ordinary SELF_HANDOFF.
+    NO_CHAIN = "no_chain"
+    #: n > cap → stop and hand to the proposer (stop reason ``continue_cap``).
+    CAP = "cap"
+    #: The clone is dirty or has unpushed commits → no relay; ordinary dirty-clone handling.
+    DIRTY = "dirty"
+
+
+def continuation_admissible(
+    *,
+    head_author_is_implementer: bool,
+    chain_n: int | None,
+    cap: int,
+    clone_is_clean: Callable[[], bool],
+) -> ContinueVerdict:
+    """May an implementer's ``CONTINUE:`` self-handoff start the next implementer turn?
+
+    The four conditions of Bohr msg-7881 (D-1''), in order:
+
+    1. ``head_author_is_implementer`` — only the implementer can continue itself.
+    2. ``chain_n is not None`` — the caller found an unbroken chain from the most recent guard-(i)
+       entry into the implementer to the head, made only of CONTINUE reports and conductor
+       continue relays. A proposer / naysayer / human message in between breaks it, so a
+       continuation can never be a way around guard (i).
+    3. ``chain_n <= cap`` — ``n`` is counted by the caller from the chain, never read from the
+       report (Obj-1-2). Over the cap → :attr:`ContinueVerdict.CAP`.
+    4. ``clone_is_clean()`` — clean tree and nothing unpushed. Read last (it runs git) and only
+       when 1-3 hold. Not clean → :attr:`ContinueVerdict.DIRTY`.
+    """
+    if not head_author_is_implementer or chain_n is None:
+        return ContinueVerdict.NO_CHAIN
+    if chain_n > cap:
+        return ContinueVerdict.CAP
+    if not clone_is_clean():
+        return ContinueVerdict.DIRTY
+    return ContinueVerdict.ADMIT
