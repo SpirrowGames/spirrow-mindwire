@@ -1,8 +1,8 @@
 """Bounded implementer self-continuation — the ``CONTINUE:`` line (T-implementer-self-continuation).
 
 Design: Bohr msg-7879 (D-1'), revised msg-7881 (D-1''), msg-7883 (D-1'''), msg-7885 (D-1''''),
-msg-7887 (D-1'''''); naysayer go Einstein msg-7888-equivalent (the turn that handed to the
-implementer with an empty objections array).
+msg-7887 (D-1'''''); naysayer go from Einstein (the reply to msg-7887, empty objections array,
+handed to the implementer).
 
 An implementer that cannot finish inside one turn budget ends its report with::
 
