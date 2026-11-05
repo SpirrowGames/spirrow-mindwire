@@ -55,6 +55,7 @@ import sys
 
 from spirrow_mindwire.conductor.roster import RoleResolutionError, derive_identity_by_role
 from spirrow_mindwire.config import load_settings
+from spirrow_mindwire.design_conditions import build_policy as build_design_conditions_policy
 from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
 from spirrow_mindwire.orchestrator import PrReviewOrchestrator
@@ -99,7 +100,14 @@ async def main() -> None:
     mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or package default
     # The driver resolves Lexora + the spirrowgames-ops GitHub token from env.
     driver = NaysayerPrReviewDriver()
-    orchestrator = PrReviewOrchestrator(mcp, driver=driver)
+    # Conditional proceed (T-naysayer-conditional-proceed-on-small-fixmin): the hand-run gate
+    # checks design conditions exactly as the conductor's does, from the same settings.
+    design_conditions = build_design_conditions_policy(
+        settings.naysayer_gating.conditional_proceed,
+        settings.conductor.roster,
+        human_identity=settings.conductor.human_identity,
+    )
+    orchestrator = PrReviewOrchestrator(mcp, driver=driver, design_conditions=design_conditions)
 
     print(f"[naysayer-review] opening review thread for {args.pr} (Gemini review, billed) ...")
     try:

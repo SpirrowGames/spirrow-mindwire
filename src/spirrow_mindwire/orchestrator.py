@@ -37,6 +37,7 @@ from .conductor.gate_records import (
     render_relay_heading,
 )
 from .conductor.handoff import HUMAN_TOKEN
+from .design_conditions import DesignConditionsPolicy
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, ReviewEvent, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome, parse_objections
@@ -175,7 +176,12 @@ class PrReviewOrchestrator:
         owner: str = _DEFAULT_OWNER,
         thread_prefix: str = _DEFAULT_THREAD_PREFIX,
         naysayer_author: str = _DEFAULT_NAYSAYER_AUTHOR,
+        design_conditions: DesignConditionsPolicy | None = None,
     ) -> None:
+        # T-naysayer-conditional-proceed-on-small-fixmin. ``None`` (and any project the policy
+        # does not name) leaves ``driver.review`` called exactly as before; a project that
+        # enabled conditional proceed gets a per-review check of its design conditions.
+        self._design_conditions = design_conditions
         self._mcp = mcp
         self._driver = driver
         self._owner = owner
@@ -378,9 +384,22 @@ class PrReviewOrchestrator:
                     out.append((author, body))
             return out
 
-        outcome = await self._driver.review(
-            pr, post_critique=post_critique, read_review_thread=read_review_thread
+        resolver = (
+            self._design_conditions.resolver(self._mcp, project=project)
+            if self._design_conditions is not None
+            else None
         )
+        if resolver is None:
+            outcome = await self._driver.review(
+                pr, post_critique=post_critique, read_review_thread=read_review_thread
+            )
+        else:
+            outcome = await self._driver.review(
+                pr,
+                post_critique=post_critique,
+                read_review_thread=read_review_thread,
+                design_conditions=resolver,
+            )
         relay = await self._post_design_relay(
             project=project,
             design_thread=design_thread,

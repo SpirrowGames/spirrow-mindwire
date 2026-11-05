@@ -193,6 +193,11 @@ class _FakeGitHub:
         # failure-handling PR-A: new Protocol member).
         return 200
 
+    async def fetch_pr_state(self, pr: Any) -> Any:
+        from spirrow_mindwire.github.client import PrResolution, PrState
+
+        return PrState(ref=pr, resolution=PrResolution.OPEN, body=getattr(self, "pr_body", ""))
+
     async def fetch_pr_files(self, pr: PrRef) -> Any:
         # ADR-14 §7.3 Protocol compliance (never reached: routing facts already raise).
         raise NotImplementedError

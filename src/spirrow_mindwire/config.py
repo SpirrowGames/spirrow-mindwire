@@ -663,6 +663,26 @@ class NaysayerGatingConfig(_StrictModel):
     ``skip_if_head_unchanged`` / ``max_review_rounds`` to the policy you are evaluating, then read
     the logs before enforcing. Env: ``MINDWIRE_NAYSAYER_GATING__SHADOW=true``."""
 
+    conditional_proceed: dict[str, str] = Field(default_factory=dict)
+    """Per-project conditional proceed (T-naysayer-conditional-proceed-on-small-fixmin, msg-7960).
+
+    ``{"spirrow-playproof" = "issuing"}`` shape: project → state. **This is approval-deciding
+    state, not an observation**: the PR gate reads it to decide whether a PR may be approved.
+
+    * key absent — the project never used conditional proceed: the PR gate is exactly as before.
+    * ``issuing`` — the naysayer may hand a design to the implementer on conditions, and the PR
+      gate checks every PR against the conditional go of its design thread; a PR whose
+      ``Thread:`` line is missing or unreadable is not approved.
+    * ``verify_only`` — stop issuing: the naysayer is no longer offered the conditional exit, but
+      the PR gate checks exactly as under ``issuing``, so conditions already issued stay checked.
+    * any other value — verified as ``issuing``/``verify_only`` are, never issued (fail-closed).
+
+    **Never delete a key once it has been written.** To stop, set ``verify_only``. The gate holds
+    no history of its own, so it cannot tell a deleted key from one never written; deleting it
+    would silently drop the check on conditions already issued. This is an operating contract,
+    not a mechanical guarantee. An unreadable config does not start the process at all.
+    """
+
 
 class TurnGitConfig(_StrictModel):
     """``[turn.git]`` — the git-sync hook around a dispatched turn (ADR-2026-10-09-23 D7 / D8).
