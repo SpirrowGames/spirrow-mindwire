@@ -317,6 +317,25 @@ def _make_dirty(repo: Path, state: str) -> DirtyCloneReason:
     if state == "untracked":
         (repo / "new.txt").write_text("n\n", encoding="utf-8")
         return DirtyCloneReason.DIRTY_TREE
+    if state == "unpushed_no_upstream":
+        # PR #519 gate round 2: a brand-new local branch, never pushed, so it has no
+        # upstream and its `%(upstream:track)` is empty -- the rev-list fallback must catch it.
+        _git(repo, "switch", "-q", "-c", "feature/y")
+        (repo / "c.txt").write_text("c\n", encoding="utf-8")
+        _git(repo, "add", "c.txt")
+        _git(repo, "commit", "-q", "-m", "local only, no upstream")
+        _git(repo, "switch", "-q", "main")
+        upstream = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "feature/y@{upstream}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert upstream.returncode != 0, "feature/y must have no upstream for this case"
+        return DirtyCloneReason.UNPUSHED
+    if state != "unpushed":
+        raise AssertionError(f"unknown dirty state {state!r}")
     _git(repo, "switch", "-q", "feature/x")
     (repo / "b.txt").write_text("b\n", encoding="utf-8")
     _git(repo, "add", "b.txt")
@@ -340,6 +359,9 @@ async def test_5_dirty_clone_refuses_continuation(
         await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
 
     assert ei.value.reason is expected
+    if state == "unpushed_no_upstream":
+        # Proves the no-upstream rev-list fallback fired, not the tracked `ahead` branch.
+        assert "feature/y (no upstream)" in ei.value.detail
     assert _relays(mcp) == []
     assert disp.dispatches == []
     assert "continue invalidated: reason=dirty" in caplog.text
