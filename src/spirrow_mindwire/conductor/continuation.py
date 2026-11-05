@@ -63,8 +63,10 @@ _CONTROL_RE = re.compile(r"\A(?:TIER-C-CHECK|TIER-C|ASK):")
 # ``NEXT:`` as the existing handoff parser reads it: the token is the line's own head.
 _NEXT_RE = re.compile(r"\A(?:\*\*|`|_)*NEXT(?:\*\*|`|_)*[:：]")  # noqa: RUF001
 
-# A Markdown code-fence line (``` or ~~~, optionally followed by an info string).
-_FENCE_RE = re.compile(r"\A(?:```|~~~)")
+# A Markdown code-fence line: a run of 3+ backticks or 3+ tildes, then an optional info string.
+# A backtick fence's info string may not contain a backtick (CommonMark), so ```` ``x`` ```` is
+# not a fence line.
+_FENCE_RE = re.compile(r"\A(?P<run>`{3,}(?=[^`]*\Z)|~{3,})(?P<info>.*)\Z")
 
 _RELAY_RE = re.compile(r"\A\[continue (?P<n>\d+)/(?P<cap>\d+)\]")
 
@@ -85,8 +87,8 @@ def find_continue_declaration(body: str) -> str | None:
     * If the block holds one or more ``CONTINUE:`` lines the one nearest ``NEXT:`` wins; its body
       is returned stripped (possibly ``""``). A ``CONTINUE:`` outside the block — in prose or
       inside a code fence — is not a declaration.
-    * If an odd number of code-fence lines (```` ``` ```` / ``~~~``) precede ``NEXT:``, the fence
-      is unclosed there: the trailing lines are fenced example text and nothing is declared.
+    * If a code fence is still open at ``NEXT:`` (see :func:`_fence_open_before`), the trailing
+      lines are fenced example text and nothing is declared.
     """
     lines = body.splitlines()
     i_next = len(lines) - 1
@@ -94,10 +96,9 @@ def find_continue_declaration(body: str) -> str | None:
         i_next -= 1
     if i_next < 0 or not _NEXT_RE.match(lines[i_next].strip()):
         return None
-    # PR #519 gate round 3 Obj-2: an odd number of fence lines above ``NEXT:`` means the fence is
-    # still open there, so the ``NEXT:`` and anything in the trailing block are example text inside
-    # an unclosed code fence, not a declaration.
-    if sum(1 for line in lines[:i_next] if _FENCE_RE.match(line.strip())) % 2:
+    # PR #519 gate round 3 Obj-2 / round 4 Obj-1: a fence still open above ``NEXT:`` means the
+    # ``NEXT:`` and anything in the trailing block are example text, not a declaration.
+    if _fence_open_before(lines, i_next):
         return None
     for i in range(i_next - 1, -1, -1):
         line = lines[i].strip()
@@ -109,6 +110,29 @@ def find_continue_declaration(body: str) -> str | None:
         # Walking upward, the first CONTINUE: met is the one nearest NEXT:.
         return m.group("body").strip()
     return None
+
+
+def _fence_open_before(lines: list[str], end: int) -> bool:
+    """Is a Markdown code fence still open after ``lines[:end]``?
+
+    Tracks the opening fence as CommonMark does (PR #519 gate round 4 Obj-1), instead of counting
+    fence lines: a fence opens on a run of 3+ backticks or 3+ tildes and closes only on a line that
+    is a run of the *same* character, at least as long as the opening run, with nothing after it
+    but whitespace. Inside a backtick fence a ``~~~`` line, or a shorter backtick run, is content.
+    Leading whitespace is stripped, as everywhere else in this parser.
+    """
+    open_char = ""
+    open_len = 0
+    for raw in lines[:end]:
+        m = _FENCE_RE.match(raw.strip())
+        if m is None:
+            continue
+        run = m.group("run")
+        if not open_char:
+            open_char, open_len = run[0], len(run)
+        elif run[0] == open_char and len(run) >= open_len and not m.group("info").strip():
+            open_char, open_len = "", 0
+    return bool(open_char)
 
 
 def is_continue_relay_body(body: str) -> bool:

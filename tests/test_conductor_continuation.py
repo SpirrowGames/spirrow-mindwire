@@ -469,6 +469,18 @@ async def test_5b_unwired_clone_check_is_fail_closed() -> None:
         ("Example:\n~~~text\nCONTINUE: example only\n\nNEXT: Heisenberg", None),
         # a closed fence earlier in the report does not hide a real declaration
         ("ex:\n```\nCONTINUE: x\n```\ndone\nCONTINUE: real\nNEXT: Heisenberg", "real"),
+        # PR #519 gate round 4: a ~~~ line inside an open ``` fence is content, not a close
+        ("Example:\n```text\n~~~\nCONTINUE: example only\nNEXT: Heisenberg", None),
+        # ... and a ``` line inside an open ~~~ fence likewise
+        ("Example:\n~~~\n```\nCONTINUE: example only\nNEXT: Heisenberg", None),
+        # a shorter ``` run inside an open ```` fence does not close it
+        ("Example:\n````md\n```\nCONTINUE: example only\nNEXT: Heisenberg", None),
+        # a ```` fence holding a lone ``` line, closed by ````: the real declaration after counts
+        ("ex:\n````md\n```\nCONTINUE: x\n````\ndone\nCONTINUE: real\nNEXT: Heisenberg", "real"),
+        # a longer closing run closes a shorter opening fence
+        ("ex:\n```\nCONTINUE: x\n`````\ndone\nCONTINUE: real\nNEXT: Heisenberg", "real"),
+        # a ``` line with an info string cannot close a fence
+        ("Example:\n```\n```text\nCONTINUE: example only\nNEXT: Heisenberg", None),
         # NEXT is the first line: empty walk
         ("NEXT: Heisenberg", None),
         # no NEXT at the end
