@@ -310,6 +310,62 @@ async def test_5c_dirty_clone_wins_over_cap(pushed_clone: Path) -> None:
     assert disp.dispatches == []
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["unpushed", "unpushed_no_upstream", "uncommitted"])
+async def test_5d_recovered_relay_head_rechecks_clone(pushed_clone: Path, state: str) -> None:
+    """PR #519 gate round 3 Obj-1: a relay left at the head after a restart is re-admitted only
+    on a clean, pushed clone -- condition 4 does not depend on which message the run resumes from.
+    """
+    expected = _make_dirty(pushed_clone, state)
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report())
+    mcp.seed(
+        author=CONDUCTOR_RELAY_AUTHOR,
+        content=render_relay(n=1, cap=3, continue_body="step 2 of 3", implementer="Heisenberg"),
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"]})
+
+    with pytest.raises(DirtyCloneError) as ei:
+        await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+
+    assert ei.value.reason is expected
+    assert disp.dispatches == []
+    assert mcp.posts == []
+
+
+@pytest.mark.anyio
+async def test_5e_recovered_relay_head_on_clean_clone_dispatches(pushed_clone: Path) -> None:
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report())
+    mcp.seed(
+        author=CONDUCTOR_RELAY_AUTHOR,
+        content=render_relay(n=1, cap=3, continue_body="step 2 of 3", implementer="Heisenberg"),
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"]})
+
+    await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m3")
+
+
+@pytest.mark.anyio
+async def test_5f_recovered_relay_head_unwired_check_is_not_carve_out_iv() -> None:
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report())
+    mcp.seed(
+        author=CONDUCTOR_RELAY_AUTHOR,
+        content=render_relay(n=1, cap=3, continue_body="step 2 of 3", implementer="Heisenberg"),
+    )
+    disp = _ScriptedDispatcher(mcp, {})
+
+    await _conductor(mcp, disp, clone_check=None).run()
+
+    assert (Role.IMPLEMENTER, "m3") not in disp.dispatches
+
+
 def _make_dirty(repo: Path, state: str) -> DirtyCloneReason:
     if state == "uncommitted":
         (repo / "a.txt").write_text("changed\n", encoding="utf-8")
@@ -407,6 +463,12 @@ async def test_5b_unwired_clone_check_is_fail_closed() -> None:
         ("CONTINUE: in prose\nmore prose\nNEXT: Heisenberg", None),
         # CONTINUE inside a code fence just above the block
         ("example:\n```\nCONTINUE: example\n```\nNEXT: Heisenberg", None),
+        # unclosed fence: CONTINUE and NEXT are example text inside it (PR #519 gate round 3)
+        ("Example:\n```\nCONTINUE: example only\nNEXT: Heisenberg", None),
+        # same with a ~~~ fence and a blank line
+        ("Example:\n~~~text\nCONTINUE: example only\n\nNEXT: Heisenberg", None),
+        # a closed fence earlier in the report does not hide a real declaration
+        ("ex:\n```\nCONTINUE: x\n```\ndone\nCONTINUE: real\nNEXT: Heisenberg", "real"),
         # NEXT is the first line: empty walk
         ("NEXT: Heisenberg", None),
         # no NEXT at the end
@@ -440,6 +502,24 @@ async def test_6c_fenced_continue_is_self_handoff() -> None:
     mcp.seed(
         author="Heisenberg",
         content="例:\n```\nCONTINUE: example\nNEXT: Heisenberg\n```\nNEXT: Heisenberg",
+    )
+    disp = _ScriptedDispatcher(mcp, {})
+
+    outcome = await _conductor(mcp, disp).run()
+
+    assert outcome.stop_reason is StopReason.SELF_HANDOFF
+    assert _relays(mcp) == []
+
+
+@pytest.mark.anyio
+async def test_6d_unclosed_fence_continue_is_self_handoff() -> None:
+    """PR #519 gate round 3 Obj-2: the fence is never closed, so the trailing CONTINUE / NEXT are
+    example text; no relay, ordinary SELF_HANDOFF."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(
+        author="Heisenberg",
+        content="Example:\n```\nCONTINUE: example only\nNEXT: Heisenberg",
     )
     disp = _ScriptedDispatcher(mcp, {})
 

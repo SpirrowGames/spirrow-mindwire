@@ -63,6 +63,9 @@ _CONTROL_RE = re.compile(r"\A(?:TIER-C-CHECK|TIER-C|ASK):")
 # ``NEXT:`` as the existing handoff parser reads it: the token is the line's own head.
 _NEXT_RE = re.compile(r"\A(?:\*\*|`|_)*NEXT(?:\*\*|`|_)*[:：]")  # noqa: RUF001
 
+# A Markdown code-fence line (``` or ~~~, optionally followed by an info string).
+_FENCE_RE = re.compile(r"\A(?:```|~~~)")
+
 _RELAY_RE = re.compile(r"\A\[continue (?P<n>\d+)/(?P<cap>\d+)\]")
 
 
@@ -82,12 +85,19 @@ def find_continue_declaration(body: str) -> str | None:
     * If the block holds one or more ``CONTINUE:`` lines the one nearest ``NEXT:`` wins; its body
       is returned stripped (possibly ``""``). A ``CONTINUE:`` outside the block — in prose or
       inside a code fence — is not a declaration.
+    * If an odd number of code-fence lines (```` ``` ```` / ``~~~``) precede ``NEXT:``, the fence
+      is unclosed there: the trailing lines are fenced example text and nothing is declared.
     """
     lines = body.splitlines()
     i_next = len(lines) - 1
     while i_next >= 0 and not lines[i_next].strip():
         i_next -= 1
     if i_next < 0 or not _NEXT_RE.match(lines[i_next].strip()):
+        return None
+    # PR #519 gate round 3 Obj-2: an odd number of fence lines above ``NEXT:`` means the fence is
+    # still open there, so the ``NEXT:`` and anything in the trailing block are example text inside
+    # an unclosed code fence, not a declaration.
+    if sum(1 for line in lines[:i_next] if _FENCE_RE.match(line.strip())) % 2:
         return None
     for i in range(i_next - 1, -1, -1):
         line = lines[i].strip()

@@ -2084,7 +2084,30 @@ class Conductor:
         if author != CONDUCTOR_RELAY_AUTHOR or not is_continue_relay_body(_content(messages[-1])):
             return False
         n = relay_chain_count(self._continuation_links(messages))
-        return n is not None and n <= self._continue_cap
+        if n is None or n > self._continue_cap:
+            return False
+        # PR #519 gate round 3 Obj-1: condition 4 holds on the recovery path too. A relay left at
+        # the head (the run ended after posting it) is re-admitted only if the clone is still
+        # clean and pushed; a DirtyCloneError propagates to the ordinary dirty-clone path
+        # (loop_runner exit 8), exactly as on the report path. Unwired = fail-closed: the relay
+        # is not carve-out 4 and falls through to guard (i).
+        if self._continuation_clone_check is None:
+            logger.warning(
+                "conductor continue relay not admitted: reason=clone_check_unwired head=%s",
+                _msg_id(messages[-1]),
+            )
+            return False
+        try:
+            self._continuation_clone_check()
+        except DirtyCloneError as exc:
+            logger.warning(
+                "conductor continue invalidated: reason=dirty n=%d clone=%s (relay head %s)",
+                n,
+                exc.reason.value,
+                _msg_id(messages[-1]),
+            )
+            raise
+        return True
 
     def _route_continuation(
         self, author: str, author_role: Role | None, messages: list[dict[str, Any]]
