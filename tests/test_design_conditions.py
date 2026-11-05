@@ -254,6 +254,38 @@ async def test_v_unparsed_objections_in_the_go_holds_for_the_human() -> None:
     assert "objections_unparsed" in outcome.body
 
 
+_GOOD_GO_ENTRY = {"msg_id": "msg-2", "author": "Einstein", "content": _conditional_go()}
+
+
+@pytest.mark.parametrize(
+    ("label", "messages"),
+    [
+        # PR-gate #520 round 1: each of these used to drop or coerce the entry, leaving a thread
+        # with no recognised conditional go → NOT_APPLICABLE → the model's APPROVE stood.
+        ("null entry", [None]),
+        ("non-object before the go", ["msg-1", _GOOD_GO_ENTRY]),
+        ("go missing author", [{"msg_id": "msg-2", "content": _conditional_go()}]),
+        ("go with empty author", [{**_GOOD_GO_ENTRY, "author": ""}]),
+        ("go with non-string author", [{**_GOOD_GO_ENTRY, "author": 7}]),
+        ("go missing msg_id", [{"author": "Einstein", "content": _conditional_go()}]),
+        ("go missing content", [{"msg_id": "msg-2", "author": "Einstein"}]),
+        ("go with non-string content", [{**_GOOD_GO_ENTRY, "content": ["x"]}]),
+        (
+            "malformed abort after the go",
+            [_GOOD_GO_ENTRY, {"msg_id": "msg-3", "content": "Conditions-aborted: msg-2"}],
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_v_a_malformed_thread_message_holds_and_is_never_approved(
+    label: str, messages: list[Any]
+) -> None:
+    for body in (_pr_body(*GOOD_ROWS), _pr_body(section=False)):
+        outcome, _lexora, _gh = await _review(messages, body)
+        assert outcome.verdict is ReviewEvent.COMMENT, label
+        assert "could not be read" in outcome.body, label
+
+
 def test_v_a_go_whose_ids_do_not_cover_every_blocking_objection_is_unreadable() -> None:
     go = _conditional_go().replace(
         "Conditions (2):\nCond-6-1\nCond-6-2", "Conditions (1):\nCond-6-1"

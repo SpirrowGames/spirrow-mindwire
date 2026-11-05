@@ -422,6 +422,28 @@ def build_policy(
     )
 
 
+def _validated_messages(raw: list[Any]) -> tuple[list[ThreadMessage], str | None]:
+    """Every entry must be readable, or the thread is (v): nothing is skipped or coerced.
+
+    A dropped or coerced message can hide a conditional go, an abort, or a later go, and so
+    change the table's row — an unreadable message never establishes that no condition applies.
+    ``msg_id`` and ``author`` must be non-empty strings and ``content`` a string.
+    """
+    messages: list[ThreadMessage] = []
+    for index, m in enumerate(raw):
+        if not isinstance(m, dict):
+            return [], f"message #{index} is not an object"
+        msg_id, author, content = m.get("msg_id"), m.get("author"), m.get("content")
+        if not isinstance(msg_id, str) or not msg_id.strip():
+            return [], f"message #{index} has no readable msg_id"
+        if not isinstance(author, str) or not author.strip():
+            return [], f"message {msg_id} has no readable author"
+        if not isinstance(content, str):
+            return [], f"message {msg_id} has no readable content"
+        messages.append(ThreadMessage(msg_id=msg_id, author=author, content=content))
+    return messages, None
+
+
 async def resolve_design_conditions(
     mcp: McpToolCaller, *, project: str, pr_body: str | None, policy: ThreadPolicy
 ) -> DesignConditionsCheck:
@@ -446,15 +468,11 @@ async def resolve_design_conditions(
     raw = payload.get("messages") if isinstance(payload, dict) else None
     if not isinstance(raw, list):
         return _hold(f"the design thread {thread_id} could not be read", thread_id=thread_id)
-    messages = [
-        ThreadMessage(
-            msg_id=str(m.get("msg_id") or ""),
-            author=str(m.get("author") or ""),
-            content=str(m.get("content") or ""),
+    messages, problem = _validated_messages(raw)
+    if problem is not None:
+        return _hold(
+            f"the design thread {thread_id} could not be read: {problem}", thread_id=thread_id
         )
-        for m in raw
-        if isinstance(m, dict)
-    ]
     check = check_pr_body(evaluate_thread(messages, policy), pr_body, thread_id=thread_id)
     logger.info(
         "design conditions %s/%s: outcome=%s go=%s conditions=%d reasons=%d",
