@@ -227,6 +227,11 @@ class _FakeGitHub:
         # in a subclass to route the fault into ENVIRONMENT_* / TARGET / UNKNOWN scopes.
         return 200
 
+    async def fetch_pr_state(self, pr: Any) -> Any:
+        from spirrow_mindwire.github.client import PrResolution, PrState
+
+        return PrState(ref=pr, resolution=PrResolution.OPEN, body=getattr(self, "pr_body", ""))
+
     async def fetch_pr_files(self, pr: PrRef) -> PrFileList:
         if self.pr_files is None:
             raise NotImplementedError

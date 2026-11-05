@@ -46,11 +46,19 @@ _MODULE = _load_cli_module()
 class _StubConductorConfig:
     def __init__(self, roster: dict[str, Role]) -> None:
         self.roster = roster
+        self.human_identity = "human"
+
+
+class _StubNaysayerGating:
+    # No project enables conditional proceed: the hand-run lane builds no design-conditions check.
+    def __init__(self) -> None:
+        self.conditional_proceed: dict[str, str] = {}
 
 
 class _StubSettings:
     def __init__(self, roster: dict[str, Role]) -> None:
         self.conductor = _StubConductorConfig(roster)
+        self.naysayer_gating = _StubNaysayerGating()
 
 
 class _FakeDriver:

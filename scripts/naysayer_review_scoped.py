@@ -38,7 +38,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from dataclasses import replace
 
+from spirrow_mindwire.config import load_settings
 from spirrow_mindwire.github.client import (
     CiState,
     GitHubClient,
@@ -52,6 +54,7 @@ from spirrow_mindwire.lexora.client import (
     LexoraClient,
     LexoraTimeoutError,
 )
+from spirrow_mindwire.naysayer.conditions_check import ConditionsOutcome, DesignConditionsCheck
 from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_MAX_TOKENS,
     _DEFAULT_TIMEOUT_SECONDS,
@@ -71,6 +74,29 @@ from spirrow_mindwire.naysayer.principles import (
 _reconfigure = getattr(sys.stdout, "reconfigure", None)
 if _reconfigure is not None:
     _reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
+def _conditional_proceed_configured() -> bool:
+    """Does any project enable conditional proceed? Unreadable settings count as yes.
+
+    T-naysayer-conditional-proceed-on-small-fixmin: every PR-gate path must refuse to approve a PR
+    whose design conditions it cannot check. This driver reads no chatroom (F-1), so it cannot
+    find a PR's conditional go; where the setting is in use at all, its APPROVE becomes a COMMENT
+    for the human. Where it is not, the script behaves exactly as before.
+    """
+    try:
+        return bool(load_settings().naysayer_gating.conditional_proceed)
+    except Exception:  # fail-closed: settings we cannot read may name a project
+        return True
+
+
+_SCOPED_CONDITIONS_HOLD = DesignConditionsCheck(
+    outcome=ConditionsOutcome.HOLD,
+    reasons=(
+        "this scoped driver does not read design threads, and conditional proceed is enabled "
+        "for at least one project, so it cannot rule out unchecked design conditions",
+    ),
+)
 
 
 def _build_messages(text: str, pr_slug: str, scope: str) -> list[ChatMessage]:
@@ -181,6 +207,12 @@ async def main() -> None:
             )
             sys.exit(4)
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        if decision.gate_verdict is ReviewEvent.APPROVE and _conditional_proceed_configured():
+            decision = replace(
+                decision,
+                gate_verdict=_SCOPED_CONDITIONS_HOLD.cap(decision.gate_verdict),
+                design_conditions=_SCOPED_CONDITIONS_HOLD,
+            )
         verdict = decision.gate_verdict
         # Prepend the gate notice via the SAME function the production driver uses. When the
         # gate silently overrides an APPROVE (truncation / length cap), the posted body carries

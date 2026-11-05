@@ -62,6 +62,7 @@ from ..github.client import (
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    PrResolution,
     PrRoutingFacts,
     Retryability,
     ReviewEvent,
@@ -89,6 +90,7 @@ from ..lexora.client import (
 from ..route_authority import route_authority
 from ..ulid_util import new_ulid
 from ..value_objects import join_backends
+from .conditions_check import ConditionsOutcome, ConditionsResolver, DesignConditionsCheck
 from .n3_routing import (
     N3Request,
     TierDecision,
@@ -1460,6 +1462,10 @@ class VerdictDecision:
     # list the model verdict was taken from (msg-1978 §4). Read by the E-ambiguous note.
     # 0 on short-circuit paths that build a decision without parsing a critique.
     verdict_line_count: int = 0
+    # T-naysayer-conditional-proceed-on-small-fixmin: set only when the design-conditions check
+    # overrode the gate verdict (FAIL -> REQUEST_CHANGES, HOLD -> COMMENT), so the F-conditions
+    # note can say why. ``None`` on every other path, including a passing check.
+    design_conditions: DesignConditionsCheck | None = None
 
     @property
     def diverged(self) -> bool:
@@ -1542,6 +1548,7 @@ _MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
 _MARKER_C_DEMOTED = "<!-- mindwire:note C-demoted -->"
 _MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
 _MARKER_E_AMBIGUOUS = "<!-- mindwire:note E-ambiguous -->"
+_MARKER_F_CONDITIONS = "<!-- mindwire:note F-conditions -->"
 
 
 # ─── verify_citations: single-line where + empty-line predicate ─────────────────────
@@ -1718,7 +1725,11 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_a = view.in_headroom and not view.truncated
     fire_b_diff = view.truncated
     fire_b_len = decision.finish_reason == "length"
-    fire_c = decision.suppressed
+    # "Suppressed" here means suppressed BECAUSE the review is partial, which is what the C note
+    # says. A design-conditions override also turns a model APPROVE into a non-APPROVE, but it
+    # explains itself in the F note; without this guard the C note would blame a partial review
+    # that never happened.
+    fire_c = decision.suppressed and (view.truncated or decision.finish_reason == "length")
     # C-DEMOTED (T-gate-blocks-on-miscounted-line-numbers, msg-3604 D-4 / msg-3606 D-3
     # revise). Fires whenever ``verify_citations`` demoted at least one blocking objection,
     # regardless of whether the demotion also triggered a gate_verdict override. The
@@ -1729,7 +1740,18 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_c_demoted = bool(decision.demoted_objections)
     fire_d = decision.diverged
     fire_e = decision.model_verdict is ModelVerdict.AMBIGUOUS
-    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_c_demoted or fire_d or fire_e):
+    conditions = decision.design_conditions
+    fire_f = conditions is not None and conditions.overrides
+    if not (
+        fire_a
+        or fire_b_diff
+        or fire_b_len
+        or fire_c
+        or fire_c_demoted
+        or fire_d
+        or fire_e
+        or fire_f
+    ):
         return ""
 
     lines: list[str] = [_GATE_NOTICE_SENTINEL]
@@ -1809,6 +1831,12 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"front of it (inside fences too), so that the review's own verdict is the only "
             f"one at column 0."
         )
+    if fire_f and conditions is not None:
+        # T-naysayer-conditional-proceed-on-small-fixmin: the gate, not the model, decided this
+        # verdict, so the notice names what the deterministic check found (msg-1871's rule).
+        lines.append(">")
+        lines.append(f"> {_MARKER_F_CONDITIONS}")
+        lines.extend(conditions.render_notice_lines())
     if fire_c_demoted:
         # T-gate-blocks-on-miscounted-line-numbers (msg-3604 D-4 / msg-3606 D-3 revise).
         # The gate rewrote what the model wrote (a blocking objection became advisory
@@ -2138,6 +2166,7 @@ def _build_messages(
     *,
     coverage: list[CrossPrApproveCoverage] | None = None,
     round_context: PrRoundContext | None = None,
+    conditions: DesignConditionsCheck | None = None,
 ) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
@@ -2161,15 +2190,22 @@ def _build_messages(
     :func:`_format_b_a_marker` rendering is inserted BEFORE the diff fence so the model
     reads the marker in the same message that carries the diff. ``None`` / empty list is
     the pre-B-(a) shape byte-for-byte — the marker is opt-in and fail-open in one place.
+
+    ``conditions`` (T-naysayer-conditional-proceed-on-small-fixmin): the canonical design
+    conditions this PR must meet, read from the design thread, plus the implementer's declared
+    application. Rendered only for a VERIFY / FAIL check; ``None`` or any other outcome adds
+    nothing, so a PR no conditional go governs sees the prompt it always did.
     """
     system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
     marker = _format_b_a_marker(coverage or [])
     marker_section = f"{marker}\n\n" if marker else ""
     round_section = round_context.render() if round_context is not None else ""
+    conditions_section = conditions.render_prompt_section() if conditions is not None else ""
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
         f"{marker_section}"
+        f"{conditions_section}"
         f"{round_section}"
         f"```diff\n{text}\n```"
     )
@@ -2333,6 +2369,7 @@ class NaysayerPrReviewDriver:
         *,
         post_critique: PostCritique,
         read_review_thread: ReadReviewThread | None = None,
+        design_conditions: ConditionsResolver | None = None,
     ) -> PrReviewOutcome:
         """Review one PR: L1 CI-gate → (if green) Lexora judge → post critique → submit review.
 
@@ -2355,11 +2392,24 @@ class NaysayerPrReviewDriver:
         verdict is not shadowed by a "head unchanged, use prior" short-circuit. Requires
         ``read_review_thread`` to be wired; without it the driver behaves as before
         (no replay).
+
+        ``design_conditions`` (T-naysayer-conditional-proceed-on-small-fixmin): given only for a
+        project that enabled conditional proceed. It turns the PR body into a
+        :class:`DesignConditionsCheck`; when that check applies, neither path that reuses an
+        earlier verdict (replay, head-unchanged APPROVE) runs — an APPROVE is only ever posted
+        by a review that saw the check — and a FAIL / HOLD caps the verdict after the model has
+        spoken. ``None`` is the review as it always was.
         """
         # L1 CI-gate (ADR-16 §D-2): the APPROVE must imply CI green for the reviewed head SHA.
         # Query CI BEFORE the (costly) content review and short-circuit when it is not green —
         # fail-closed: failure / pending / UNKNOWN never APPROVE (fetch_ci_status never raises).
         ci = await self._github.fetch_ci_status(pr)
+        conditions = (
+            await self._resolve_conditions(pr, design_conditions)
+            if design_conditions is not None
+            else None
+        )
+        conditions_active = conditions is not None and conditions.active
 
         # Chatroom-replay pass (DESIGN v3 §3-3). Consumes a footer-marked verdict from a
         # prior post that never made it to GitHub — the exact #192 scenario, where the
@@ -2368,7 +2418,7 @@ class NaysayerPrReviewDriver:
         # calling the model (the critique is already paid for; the discharge check via
         # ``fetch_pr_reviews_strict`` guarantees we do not double-submit if the previous
         # POST actually succeeded but we lost the response).
-        if read_review_thread is not None and ci.head_sha is not None:
+        if read_review_thread is not None and ci.head_sha is not None and not conditions_active:
             replay = await self._maybe_replay_verdict(
                 pr, ci, post_critique=post_critique, read_review_thread=read_review_thread
             )
@@ -2406,7 +2456,7 @@ class NaysayerPrReviewDriver:
             ]
             skip = (
                 self._skip_unchanged_response(pr, ci, prior)
-                if self._skip_if_head_unchanged
+                if self._skip_if_head_unchanged and not conditions_active
                 else None
             )
             # Count only the naysayer's own VERDICT reviews toward the cap (same _VERDICT_STATES as
@@ -2514,7 +2564,13 @@ class NaysayerPrReviewDriver:
         routing = (
             None
             if self._model is not None
-            else await self._route(pr, view=view, coverage=coverage, round_context=round_context)
+            else await self._route(
+                pr,
+                view=view,
+                coverage=coverage,
+                round_context=round_context,
+                conditions=conditions,
+            )
         )
         tier = self._model if routing is None else routing.tier
         assert tier is not None
@@ -2534,6 +2590,7 @@ class NaysayerPrReviewDriver:
             n3_routed=self._model is None,
             round_context=round_context,
             trace_id=trace_id,
+            conditions=conditions,
         )
 
         if isinstance(pass1_result, LexoraTimeoutError):
@@ -2621,6 +2678,15 @@ class NaysayerPrReviewDriver:
                 )
             else:
                 decision = replace(decision, verified_head_sha=ci.head_sha)
+        if conditions is not None and conditions.overrides:
+            # The deterministic design-conditions check has the last word, after the model and
+            # the citation pass: FAIL -> REQUEST_CHANGES, HOLD -> COMMENT. It can only close the
+            # gate (``cap`` never returns APPROVE).
+            decision = replace(
+                decision,
+                gate_verdict=conditions.cap(decision.gate_verdict),
+                design_conditions=conditions,
+            )
         verdict = decision.gate_verdict
         _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
@@ -2662,6 +2728,31 @@ class NaysayerPrReviewDriver:
             adr_pointer_selection=pass2_selection,
             base_ref=base_ref,
         )
+
+    async def _resolve_conditions(
+        self, pr: PrRef, resolver: ConditionsResolver
+    ) -> DesignConditionsCheck:
+        """Read the PR body and run ``resolver`` on it. Any failure is a HOLD, never a pass.
+
+        The body is read with the same single GET the sweep uses (``fetch_pr_state``); an
+        unanswered read hands ``None`` to the resolver, which holds for the human. An exception
+        out of the resolver is caught here for the same reason: a check that could not run must
+        not let the review fall back to "no conditions".
+        """
+        try:
+            state = await self._github.fetch_pr_state(pr)
+            body = (
+                (state.body or "")
+                if state.resolution in (PrResolution.OPEN, PrResolution.CLOSED)
+                else None
+            )
+            return await resolver(body)
+        except Exception as exc:  # fail-closed: an unrun check holds
+            logger.warning("design conditions: check failed for %s: %s", pr.slug, exc)
+            return DesignConditionsCheck(
+                outcome=ConditionsOutcome.HOLD,
+                reasons=(f"the design-conditions check could not run ({type(exc).__name__})",),
+            )
 
     async def _round_context(
         self, pr: PrRef, head_sha: str, read_review_thread: ReadReviewThread | None
@@ -2725,6 +2816,7 @@ class NaysayerPrReviewDriver:
         view: DiffView,
         coverage: list[CrossPrApproveCoverage],
         round_context: PrRoundContext | None = None,
+        conditions: DesignConditionsCheck | None = None,
     ) -> TierDecision:
         """Decide this PR's naysayer tier with :func:`route_tier` (ADR-14 §7.3 / §7.5 / §7.6).
 
@@ -2781,7 +2873,11 @@ class NaysayerPrReviewDriver:
                     listed.entries == facts.changed_files and listed.entries < PR_FILES_LIST_CAP
                 )
         messages = _build_messages(
-            view.text, pr.slug, coverage=coverage, round_context=round_context
+            view.text,
+            pr.slug,
+            coverage=coverage,
+            round_context=round_context,
+            conditions=conditions,
         )
         decision = route_tier(
             N3Request(
@@ -2862,6 +2958,7 @@ class NaysayerPrReviewDriver:
         n3_routed: bool,
         round_context: PrRoundContext | None = None,
         trace_id: str | None = None,
+        conditions: DesignConditionsCheck | None = None,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -2899,7 +2996,11 @@ class NaysayerPrReviewDriver:
         pass1_task = self._lexora.chat_completion(
             model=tier,
             messages=_build_messages(
-                view.text, pr_slug, coverage=coverage, round_context=round_context
+                view.text,
+                pr_slug,
+                coverage=coverage,
+                round_context=round_context,
+                conditions=conditions,
             ),
             # The codex tier's prompt limit is derived from CODEX_OUTPUT_RESERVE_TOKENS, so the
             # request stays within it. At the default budget this changes nothing; it caps a

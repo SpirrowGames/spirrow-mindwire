@@ -114,6 +114,8 @@ from .config import (
 )
 from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
+from .design_conditions import DesignConditionsPolicy
+from .design_conditions import build_policy as build_design_conditions_policy
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
@@ -568,6 +570,19 @@ def build_pr_review_driver(
     return knobs(max_tokens=g.review_max_tokens)
 
 
+def _design_conditions_policy(settings: MindwireSettings) -> DesignConditionsPolicy | None:
+    """``[naysayer_gating].conditional_proceed`` + the conductor roster, or ``None`` if unset.
+
+    The roster says who the naysayer, the implementer and the human are when the PR gate reads a
+    design thread for its conditional go (T-naysayer-conditional-proceed-on-small-fixmin).
+    """
+    return build_design_conditions_policy(
+        settings.naysayer_gating.conditional_proceed,
+        settings.conductor.roster,
+        human_identity=settings.conductor.human_identity,
+    )
+
+
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
     """Turn the config's watch list into :class:`WatchSpec`\\s.
 
@@ -777,7 +792,9 @@ def build_loop(
     # Constructor watches=() — each watch is added via add_watch() in run_loop so
     # its per-watch baseline is honoured (watcher.start() applies one flag to all).
     watcher = ChatroomWatcher(mcp, dispatcher, [])
-    orchestrator = PrReviewOrchestrator(mcp, driver=pr_review_driver)
+    orchestrator = PrReviewOrchestrator(
+        mcp, driver=pr_review_driver, design_conditions=_design_conditions_policy(settings)
+    )
     return Stage3Loop(
         mcp=mcp,
         registry=registry,
@@ -974,7 +991,9 @@ def build_conductor(
     # PR-gate (PR-2b-2): the conductor fires the Tier B independent naysayer review synchronously on
     # a ``NEXT: pr-review <ref>`` via this orchestrator (the same one build_loop wires for the
     # watcher path) — driver-化 unify, ADR-19 N-1; no parallel watcher is added.
-    orchestrator = PrReviewOrchestrator(mcp, driver=pr_review_driver)
+    orchestrator = PrReviewOrchestrator(
+        mcp, driver=pr_review_driver, design_conditions=_design_conditions_policy(settings)
+    )
     thread_ref = _thread_ref(loop_cfg.project, cond_cfg.task_thread_id)
     # Tier-C Decider (T-decider-conductor-hook step 2): ``None`` unless backend=lexora and
     # [decider.tierc].mode is on. A half-configured enablement is a startup error, not a silent off.
