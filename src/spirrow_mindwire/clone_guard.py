@@ -90,6 +90,9 @@ class DirtyCloneReason(StrEnum):
     WRONG_HEAD = "wrong_head"
     GIT_UNAVAILABLE = "git_unavailable"
     PIN_NOT_IGNORED = "pin_not_ignored"
+    # T-implementer-self-continuation D-1'' condition 4: a local branch is ahead of its upstream.
+    # Raised only by :meth:`CloneGuard.check_pushed`, which only the CONTINUE path calls.
+    UNPUSHED = "unpushed"
 
 
 class DirtyCloneError(Exception):
@@ -241,6 +244,44 @@ class CloneGuard:
                 DirtyCloneReason.WRONG_HEAD,
                 head=head,
                 detail=f"HEAD is on {head!r}, default branch is {default!r}",
+            )
+
+    def check_pushed(self) -> None:
+        """Raise :class:`DirtyCloneError` (``unpushed``) if a local branch holds unpushed commits.
+
+        The CONTINUE path's condition 4 (T-implementer-self-continuation msg-7881 / msg-7883 test
+        5c): an implementer that committed but did not push leaves its work only in this shared
+        clone. The implementer ends its turn back on the default branch, so HEAD alone cannot
+        show it; every local branch is read. Conservative on purpose: a stale unpushed branch of
+        another thread also refuses the continuation, and the refusal names it.
+
+        A branch whose track says ``ahead`` is unpushed. A branch with no upstream has no
+        tracking answer (PR #519 gate Obj-2); git prints the same empty track for it as for an
+        up-to-date branch, and ``[gone]`` for a deleted upstream. For those three, the branch is
+        unpushed when it carries any commit that no remote-tracking ref reaches
+        (``git rev-list --count <branch> --not --remotes``).
+        """
+        res = self._run(
+            ["for-each-ref", "--format=%(refname) %(upstream:track)", "refs/heads"],
+            head=None,
+        )
+        unpushed: list[str] = []
+        for line in res.stdout.splitlines():
+            ref, _, track = line.strip().partition(" ")
+            if not ref:
+                continue
+            name = ref.removeprefix("refs/heads/")
+            if "ahead" in track:
+                unpushed.append(name)
+            elif not track.strip() or "gone" in track:
+                count = self._run(["rev-list", "--count", ref, "--not", "--remotes"], head=None)
+                if count.stdout.strip() not in ("", "0"):
+                    unpushed.append(f"{name} (no upstream)")
+        if unpushed:
+            raise self._error(
+                DirtyCloneReason.UNPUSHED,
+                head=self._head_or_none(),
+                detail="unpushed commits on: " + ", ".join(sorted(unpushed)),
             )
 
     # -- helpers --------------------------------------------------------------------------------

@@ -100,6 +100,11 @@ class Dispatcher:
         # clone an earlier turn left dirty is exit 8, never this thread's park (B-3).
         self._git_sync = git_sync
 
+    @property
+    def clone_guard(self) -> CloneGuard | None:
+        """The pre-dispatch clone guard (``None`` when adapters were injected by a test)."""
+        return self._clone_guard
+
     async def spawn_instance(
         self, thread_ref: ThreadRef, role: Role, instance_id: str
     ) -> SessionHandle:

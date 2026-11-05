@@ -73,13 +73,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ..clone_guard import DirtyCloneError
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS, NaysayerGatingConfig
 from ..decider.annotation import (
     ANNOTATING_TIERC_MODES,
@@ -133,6 +134,18 @@ from ..value_objects import (
     Role,
     SessionHandle,
     ThreadRef,
+)
+from .continuation import (
+    DEFAULT_CONTINUE_CAP,
+    EMPTY_BODY_PLACEHOLDER,
+    ContinuePlan,
+    ContinueVerdict,
+    Link,
+    chain_count,
+    continuation_admissible,
+    find_continue_declaration,
+    is_continue_relay_body,
+    relay_chain_count,
 )
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
@@ -591,6 +604,8 @@ class Conductor:
         summon_owner_project: str | None = None,
         summon_owner_control: SummonOwnerSource | None = None,
         resume_notice: ResumeNotice | None = None,
+        continue_cap: int = DEFAULT_CONTINUE_CAP,
+        continuation_clone_check: Callable[[], None] | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -604,6 +619,15 @@ class Conductor:
             )
         self._mcp = mcp
         self._dispatcher = dispatcher
+        # T-implementer-self-continuation (Bohr msg-7881 / msg-7887): the per-chain CONTINUE cap and
+        # the clone check of condition 4. The check raises DirtyCloneError (CloneGuard.check +
+        # check_pushed). ``None`` = not wired: fail-closed, every continuation is refused.
+        if continue_cap < 0:
+            raise ValueError("continue_cap must be >= 0")
+        self._continue_cap = continue_cap
+        self._continuation_clone_check = continuation_clone_check
+        # Set by ``_route`` on an admitted / capped CONTINUE; consumed by ``run`` right after.
+        self._continuation: tuple[ContinueVerdict, ContinuePlan] | None = None
         self._thread_ref = thread_ref
         # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
         # the response carries none) — handed to every event for the naysayer's N-3 routing.
@@ -1130,6 +1154,21 @@ class Conductor:
             # proposer's handoff, a supervised project or an undeclared proceed costs no call.
             await self._prefetch_proceed_veto(handoff, messages, round_index)
             route = self._route(handoff, messages)
+            continuation, self._continuation = self._continuation, None
+            if continuation is not None:
+                acted = await self._act_on_continuation(
+                    continuation,
+                    sessions,
+                    messages,
+                    latest_msg_id,
+                    round_index=round_index,
+                    forced=forced,
+                    forced_saveable=forced_saveable,
+                )
+                if acted is not None:
+                    return acted
+                processed_msg_id = latest_msg_id
+                continue
             target_role = route.target_role
             target_identity = route.target_identity
             is_forced = route.is_forced
@@ -1775,6 +1814,11 @@ class Conductor:
         # Only ROLE handoffs can self-hand: HUMAN / NONE stop anyway, PR_REVIEW routes by verdict
         # rather than by name, and ABSENT has no target to compare against.
         if handoff.kind is HandoffKind.ROLE and self._is_self_handoff(handoff, author):
+            # T-implementer-self-continuation: the one exception — an implementer's CONTINUE in a
+            # valid chain. ``None`` = not a continuation; the ordinary stop below.
+            continued = self._route_continuation(author, author_role, messages)
+            if continued is not None:
+                return continued
             logger.warning(
                 "conductor self-handoff: author=%s hands to itself (target=%s) "
                 "→ stopping for a human, not spawning",
@@ -1816,6 +1860,23 @@ class Conductor:
             #
             # D-4' (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): G1 / G2 / G3 are
             # thunks for the same reason — the predicate owns when they are read.
+            if self._continue_relay_admissible(author, messages):
+                # carve-out ④ (T-implementer-self-continuation msg-7879 / msg-7881): a conductor
+                # continue relay whose chain runs back, unbroken, to a guard-(i) entry into the
+                # implementer. Anything else under this author falls through to the guard.
+                assert handoff.identity is not None
+                logger.info(
+                    "conductor guard-(i) carve-out 4: continue relay -> %s",
+                    handoff.identity,
+                )
+                return RouteDecision(
+                    target_role=handoff.role,
+                    target_identity=handoff.identity,
+                    is_forced=False,
+                    is_saveable=False,
+                    spawn_blocked=False,
+                    stop_reason=None,
+                )
             head_id = _msg_id(messages[-1])
             self._g3_close_reason = None
             self._guard_i_closures = None
@@ -1986,6 +2047,198 @@ class Conductor:
             is_saveable=False,
             spawn_blocked=False,
             stop_reason=StopReason.NO_HANDOFF,
+        )
+
+    # -- implementer self-continuation (T-implementer-self-continuation) ------------------------
+
+    def _continuation_link(self, msg: dict[str, Any]) -> Link:
+        """Classify one message for :func:`~.continuation.chain_count`."""
+        author = _author(msg)
+        content = _content(msg)
+        if author == CONDUCTOR_RELAY_AUTHOR:
+            return Link.CONTINUE_RELAY if is_continue_relay_body(content) else Link.OTHER
+        token = parse_next_token(content)
+        author_role = self._roster_role(author)
+        if author_role is self._implementer_role:
+            if (
+                token
+                and normalize_identity_key(token) == normalize_identity_key(author)
+                and find_continue_declaration(content) is not None
+            ):
+                return Link.CONTINUE_REPORT
+            return Link.OTHER
+        target_role = self._roster_role(token) if token else None
+        if target_role is self._implementer_role and (
+            self._is_human(author) or author_role is self._naysayer_role or author == RELAY_AUTHOR
+        ):
+            # The implementer ran on this handoff only if guard (i) honoured it (carve-outs 1 and
+            # 3) or carve-out 2 fired (PR-gate relay); the report right below it shows it ran.
+            return Link.ENTRY
+        return Link.OTHER
+
+    def _continuation_links(self, messages: list[dict[str, Any]]) -> list[Link]:
+        return [self._continuation_link(m) for m in messages]
+
+    def _continue_relay_admissible(self, author: str, messages: list[dict[str, Any]]) -> bool:
+        """carve-out 4: is the head a continue relay inside a valid, in-cap chain?"""
+        if author != CONDUCTOR_RELAY_AUTHOR or not is_continue_relay_body(_content(messages[-1])):
+            return False
+        n = relay_chain_count(self._continuation_links(messages))
+        if n is None or n > self._continue_cap:
+            return False
+        # PR #519 gate round 3 Obj-1: condition 4 holds on the recovery path too. A relay left at
+        # the head (the run ended after posting it) is re-admitted only if the clone is still
+        # clean and pushed; a DirtyCloneError propagates to the ordinary dirty-clone path
+        # (loop_runner exit 8), exactly as on the report path. Unwired = fail-closed: the relay
+        # is not carve-out 4 and falls through to guard (i).
+        if self._continuation_clone_check is None:
+            logger.warning(
+                "conductor continue relay not admitted: reason=clone_check_unwired head=%s",
+                _msg_id(messages[-1]),
+            )
+            return False
+        try:
+            self._continuation_clone_check()
+        except DirtyCloneError as exc:
+            logger.warning(
+                "conductor continue invalidated: reason=dirty n=%d clone=%s (relay head %s)",
+                n,
+                exc.reason.value,
+                _msg_id(messages[-1]),
+            )
+            raise
+        return True
+
+    def _route_continuation(
+        self, author: str, author_role: Role | None, messages: list[dict[str, Any]]
+    ) -> RouteDecision | None:
+        """The CONTINUE exception to the self-handoff stop; ``None`` = the ordinary SELF_HANDOFF.
+
+        An admitted or capped continuation is stashed on ``self._continuation`` for ``run`` to
+        act on (post the relay, or the cap notice). A dirty / unpushed clone re-raises the
+        clone check's :class:`DirtyCloneError`, so the run ends on the ordinary dirty-clone path
+        (``loop_runner`` exit 8) with no relay posted (msg-7883 test 5).
+        """
+        if author_role is not self._implementer_role:
+            return None
+        body = find_continue_declaration(_content(messages[-1]))
+        if body is None:
+            return None
+        n = chain_count(self._continuation_links(messages))
+        refusals: list[DirtyCloneError] = []
+
+        def clone_is_clean() -> bool:
+            if self._continuation_clone_check is None:
+                return False
+            try:
+                self._continuation_clone_check()
+            except DirtyCloneError as exc:
+                refusals.append(exc)
+                return False
+            return True
+
+        verdict = continuation_admissible(
+            head_author_is_implementer=True,
+            chain_n=n,
+            cap=self._continue_cap,
+            clone_is_clean=clone_is_clean,
+        )
+        logger.info(
+            "conductor continue %s/%d verdict=%s author=%s head=%s",
+            n if n is not None else "-",
+            self._continue_cap,
+            verdict.value,
+            author,
+            _msg_id(messages[-1]),
+        )
+        if verdict is ContinueVerdict.NO_CHAIN:
+            return None
+        assert n is not None
+        if verdict is ContinueVerdict.DIRTY:
+            logger.warning(
+                "conductor continue invalidated: reason=dirty n=%d clone=%s",
+                n,
+                refusals[0].reason.value if refusals else "clone_check_unwired",
+            )
+            if refusals:
+                raise refusals[0]
+            return None
+        self._continuation = (
+            verdict,
+            ContinuePlan(n=n, cap=self._continue_cap, continue_body=body, implementer=author),
+        )
+        # Placeholder: ``run`` acts on ``self._continuation`` before reading this decision.
+        return RouteDecision(
+            target_role=None,
+            target_identity="",
+            is_forced=False,
+            is_saveable=False,
+            spawn_blocked=False,
+            stop_reason=StopReason.SELF_HANDOFF,
+        )
+
+    def _proposer_identity(self) -> str | None:
+        for identity, role in self._roster.items():
+            if role is Role.PROPOSER:
+                return identity
+        return None
+
+    async def _act_on_continuation(
+        self,
+        continuation: tuple[ContinueVerdict, ContinuePlan],
+        sessions: dict[str, SessionHandle],
+        messages: list[dict[str, Any]],
+        latest_msg_id: str,
+        *,
+        round_index: int,
+        forced: int,
+        forced_saveable: int,
+    ) -> ConductorOutcome | None:
+        """Post the continue relay and dispatch the implementer on it, or post the cap notice.
+
+        Reader / fallback surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the relay's reader is
+        the implementer (the proposer, for the cap notice), through this thread. When the thread
+        is resolved the post returns an empty msg_id and the run stops on SELF_HANDOFF with
+        nothing posted - disposition (3), fail loudly: the stop reason reaches the tick log.
+        ``None`` = acted; ``run`` goes on to the next round.
+        """
+        verdict, plan = continuation
+        if verdict is ContinueVerdict.CAP:
+            proposer = self._proposer_identity() or HUMAN_TOKEN
+            body = (
+                f"Conductor stop — continue_cap ({plan.n}/{plan.cap})\n\n"
+                f"`{plan.implementer}` の自己継続が上限 {plan.cap} 回を超えました"
+                f"（この連鎖で {plan.n} 回目の CONTINUE）。"  # noqa: RUF001
+                f"分割上限に達した。設計側で切り直せ。\n\n"
+                f"最後の CONTINUE: {plan.continue_body or EMPTY_BODY_PLACEHOLDER}\n\n"
+                f"NEXT: {proposer}"
+            )
+            logger.warning(
+                "conductor continue stop: reason=continue_cap n=%d cap=%d -> %s",
+                plan.n,
+                plan.cap,
+                proposer,
+            )
+            posted = await self._post_as_conductor_relay(body)
+            if not _msg_id(posted):
+                return self._stop(
+                    round_index, StopReason.SELF_HANDOFF, latest_msg_id, forced, forced_saveable
+                )
+            return None
+        posted = await self._post_as_conductor_relay(plan.relay())
+        if not _msg_id(posted):
+            return self._stop(
+                round_index, StopReason.SELF_HANDOFF, latest_msg_id, forced, forced_saveable
+            )
+        logger.info("conductor continue %d/%d relay=%s", plan.n, plan.cap, _msg_id(posted))
+        return await self._dispatch_implementer(
+            sessions,
+            plan.implementer,
+            posted,
+            [*messages, posted],
+            round_index=round_index,
+            forced=forced,
+            forced_saveable=forced_saveable,
         )
 
     def _spawn_blocked(self, handoff: Handoff) -> tuple[str, str] | None:

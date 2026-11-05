@@ -1164,6 +1164,22 @@ _TIER_C_LABEL_GUIDANCE = (
     "line>` on the line directly above the `TIER-C:` line."
 )
 
+# T-implementer-self-continuation (Bohr msg-7879 / msg-7881): the bounded self-continuation the
+# conductor reads with :func:`spirrow_mindwire.conductor.continuation.find_continue_declaration`.
+_IMPLEMENTER_CONTINUE_GUIDANCE = (
+    "Continuing your own work in the next turn: a turn is cut off at its time budget with "
+    "nothing kept. If you expect the work not to fit in one turn, stop at a clean point about "
+    "20 minutes after you start, commit AND push what you have, return the clone to the default "
+    "branch, and end your reply with these two lines:\n\n"
+    "    CONTINUE: <what the next turn does, one line>\n"
+    "    NEXT: <your own persona>\n\n"
+    "The conductor then starts your next turn on a relay that quotes your CONTINUE line. Only "
+    "blank lines and `TIER-C-CHECK:` / `TIER-C:` / `ASK:` lines may stand between `CONTINUE:` and "
+    "the final `NEXT:`. The conductor counts the continuations itself (do not number them); past "
+    "its cap the work goes back to the proposer to be split. A clone left dirty or with unpushed "
+    "commits cancels the continuation. Without a `CONTINUE:` line, a `NEXT:` to yourself is a stop."
+)
+
 _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # A (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891): after you
     # DISPOSITION the naysayer's objections, hand BACK to the naysayer — not to the human. The
@@ -1224,6 +1240,8 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         + _TIER_C_LABEL_GUIDANCE
         + "\n\n"
         + AUTHOR_OBJECTION_LINE_RULE_PR
+        + "\n\n"
+        + _IMPLEMENTER_CONTINUE_GUIDANCE
     ),
     # T-naysayer-omits-tierc-label (Bohr msg-6658 spec, Einstein msg-6657 / go): D1 — `human` only
     # for a Tier-C type, labelled, with the shared label guidance; D2'-b — the TIER-C-CHECK is the
