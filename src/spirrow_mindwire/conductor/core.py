@@ -147,6 +147,7 @@ from .continuation import (
     is_continue_relay_body,
     relay_chain_count,
 )
+from .continuation_ledger import AttemptOutcome, record_admitted, record_attempt
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
@@ -606,6 +607,7 @@ class Conductor:
         resume_notice: ResumeNotice | None = None,
         continue_cap: int = DEFAULT_CONTINUE_CAP,
         continuation_clone_check: Callable[[], None] | None = None,
+        continuation_ledger_path: Path | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -626,6 +628,9 @@ class Conductor:
             raise ValueError("continue_cap must be >= 0")
         self._continue_cap = continue_cap
         self._continuation_clone_check = continuation_clone_check
+        # D-3 (PR-2, msg-7973 Obj-1-2): the continuation ledger. ``None`` = not recorded; the
+        # routing is identical either way (see :mod:`.continuation_ledger`).
+        self._continuation_ledger_path = continuation_ledger_path
         # Set by ``_route`` on an admitted / capped CONTINUE; consumed by ``run`` right after.
         self._continuation: tuple[ContinueVerdict, ContinuePlan] | None = None
         self._thread_ref = thread_ref
@@ -2106,7 +2111,19 @@ class Conductor:
                 exc.reason.value,
                 _msg_id(messages[-1]),
             )
+            self._ledger_attempt(
+                _msg_id(messages[-1]),
+                AttemptOutcome.RELAY_RECOVERED_DIRTY,
+                n=n,
+                clone=exc.reason.value,
+            )
             raise
+        # Every admission condition, the clone check included, has passed: the relay is admitted
+        # (Einstein, the go on msg-7973). Keyed on the relay's id, so a relay re-admitted after
+        # another restart stays one row.
+        self._ledger_admitted(
+            relay_msg_id=_msg_id(messages[-1]), report_msg_id=_msg_id(messages[-2]), n=n
+        )
         return True
 
     def _route_continuation(
@@ -2161,8 +2178,16 @@ class Conductor:
                 refusals[0].reason.value if refusals else "clone_check_unwired",
             )
             if refusals:
+                self._ledger_attempt(
+                    _msg_id(messages[-1]),
+                    AttemptOutcome.DIRTY,
+                    n=n,
+                    clone=refusals[0].reason.value,
+                )
                 raise refusals[0]
             return None
+        if verdict is ContinueVerdict.CAP:
+            self._ledger_attempt(_msg_id(messages[-1]), AttemptOutcome.CAP, n=n)
         self._continuation = (
             verdict,
             ContinuePlan(n=n, cap=self._continue_cap, continue_body=body, implementer=author),
@@ -2176,6 +2201,54 @@ class Conductor:
             spawn_blocked=False,
             stop_reason=StopReason.SELF_HANDOFF,
         )
+
+    def _ledger_admitted(self, *, relay_msg_id: str, report_msg_id: str, n: int) -> None:
+        """Write a ``continue_admitted`` row; a failure is a WARNING, never a routing change."""
+        path = self._continuation_ledger_path
+        if path is None or not relay_msg_id:
+            return
+        try:
+            record_admitted(
+                path,
+                project=self._thread_ref.project_id,
+                thread=self._thread_ref.thread_id,
+                relay_msg_id=relay_msg_id,
+                report_msg_id=report_msg_id,
+                n=n,
+                cap=self._continue_cap,
+            )
+        except Exception:
+            logger.warning(
+                "continuation ledger: writing continue_admitted relay=%s failed",
+                relay_msg_id,
+                exc_info=True,
+            )
+
+    def _ledger_attempt(
+        self, msg_id: str, outcome: AttemptOutcome, *, n: int, clone: str | None = None
+    ) -> None:
+        """Write a ``continue_attempt`` row; a failure is a WARNING, never a routing change."""
+        path = self._continuation_ledger_path
+        if path is None or not msg_id:
+            return
+        try:
+            record_attempt(
+                path,
+                project=self._thread_ref.project_id,
+                thread=self._thread_ref.thread_id,
+                msg_id=msg_id,
+                outcome=outcome,
+                n=n,
+                cap=self._continue_cap,
+                clone=clone,
+            )
+        except Exception:
+            logger.warning(
+                "continuation ledger: writing continue_attempt outcome=%s msg=%s failed",
+                outcome.value,
+                msg_id,
+                exc_info=True,
+            )
 
     def _proposer_identity(self) -> str | None:
         for identity, role in self._roster.items():
@@ -2231,6 +2304,8 @@ class Conductor:
                 round_index, StopReason.SELF_HANDOFF, latest_msg_id, forced, forced_saveable
             )
         logger.info("conductor continue %d/%d relay=%s", plan.n, plan.cap, _msg_id(posted))
+        # The clone check passed in ``_route_continuation`` and the relay now exists: admitted.
+        self._ledger_admitted(relay_msg_id=_msg_id(posted), report_msg_id=latest_msg_id, n=plan.n)
         return await self._dispatch_implementer(
             sessions,
             plan.implementer,

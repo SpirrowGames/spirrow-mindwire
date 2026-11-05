@@ -26,6 +26,11 @@ PR-0) switches a ``wrong_head`` clone back to its default branch when every comm
 already on the remote; see :mod:`spirrow_mindwire.clone_recover`. Exit 0 recovered, 3 not
 eligible (nothing changed), 1 failed. The wrapper calls it before ``clone-check``, which still
 makes the release decision.
+
+``mindwire continue-report [--days 7] [--config PATH]`` (T-implementer-self-continuation PR-2,
+D-3) prints the weekly view of implementer self-continuations, read from the continuation ledger
+(``<data_dir>/state/continuation_ledger.jsonl``) and nothing else: per thread, the admitted
+continuations, the highest ``n``, the cap hits and the clone refusals. Exit 0.
 """
 
 from __future__ import annotations
@@ -86,6 +91,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="switch a wrong_head clone back to its default branch if that loses no commit",
     )
     recover.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
+    cont = sub.add_parser(
+        "continue-report",
+        help="weekly view of implementer self-continuations, from the continuation ledger",
+    )
+    cont.add_argument("--days", type=int, default=7, help="window length in days (default 7)")
+    cont.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="mindwire.toml to resolve the ledger path from (default: the standard location)",
+    )
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -150,6 +166,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .clone_recover import run as run_clone_recover
 
         raise SystemExit(run_clone_recover(args.repo_dir))
+    if args.command == "continue-report":
+        from .conductor.continuation_ledger import report_text
+        from .config import resolve_continuation_ledger_path
+
+        if args.days < 1:
+            print("continue-report: --days must be >= 1", file=sys.stderr)
+            raise SystemExit(2)
+        path = resolve_continuation_ledger_path(load_settings(args.config))
+        print(report_text(path, days=args.days))
+        raise SystemExit(0)
     if args.command == "turn-isolation-check":
         from .turn_isolation.check import run as run_isolation_check
 

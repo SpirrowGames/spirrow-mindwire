@@ -473,6 +473,41 @@ class ConductorConfig(_StrictModel):
     terminals trigger the forced consult, trimming redundant design-loop naysayer (Gemini) calls
     while keeping the independent review at real Tier-C handoffs."""
 
+    continue_cap: dict[str, int] = Field(default_factory=dict)
+    """Per-project cap on implementer self-continuations per chain
+    (T-implementer-self-continuation PR-2, Bohr msg-7971 §1 / msg-7973 Obj-1-1).
+
+    ``{"spirrow-verimend" = 2}`` shape: project → cap. A project with no key gets
+    :data:`~spirrow_mindwire.conductor.continuation.DEFAULT_CONTINUE_CAP` (3); see
+    :meth:`continue_cap_for`. Each value must be a positive integer, and nothing else: ``0``, a
+    negative number, a float (``1.5``, and ``2.0`` too), a boolean and a string (``"3"``) all
+    refuse the config at load time. Nothing is rounded or coerced and nothing falls back to the
+    default: the cap counts turns, and a value bent into some other number would leave nobody
+    sure which cap is in force."""
+
+    @field_validator("continue_cap", mode="before")
+    @classmethod
+    def _continue_cap_positive_ints(cls, value: object) -> object:
+        # mode="before" so pydantic's lax int coercion ("3" -> 3, True -> 1, 2.0 -> 2) never runs.
+        if not isinstance(value, dict):
+            return value  # the dict[str, int] annotation rejects it
+        for project, cap in value.items():
+            # ``bool`` is an ``int`` subclass: rule it out first (msg-7973 Obj-1-1).
+            if isinstance(cap, bool) or not isinstance(cap, int):
+                raise ValueError(
+                    f"conductor.continue_cap[{project!r}] must be a positive integer, "
+                    f"got {type(cap).__name__} {cap!r}"
+                )
+            if cap < 1:
+                raise ValueError(
+                    f"conductor.continue_cap[{project!r}] must be a positive integer, got {cap!r}"
+                )
+        return value
+
+    def continue_cap_for(self, project: str) -> int | None:
+        """The configured cap for ``project``, or ``None`` when the project has no key."""
+        return self.continue_cap.get(project)
+
 
 class DeciderThresholdsConfig(_StrictModel):
     """``[decider.thresholds]`` — Decider 合成規則の閾値 (v3.4 §3.4)。
@@ -831,6 +866,16 @@ def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
     """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store,
     and the §2.6 decision log the conductor writes ``DECIDED:`` / ``DEFERRED:`` lines to (U4a)."""
     return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
+
+
+CONTINUATION_LEDGER_FILENAME = "continuation_ledger.jsonl"
+"""The D-3 continuation ledger under ``<data_dir>/state/`` (self-continuation PR-2)."""
+
+
+def resolve_continuation_ledger_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/continuation_ledger.jsonl`` — the D-3 continuation ledger the conductor
+    writes and ``mindwire continue-report`` reads (T-implementer-self-continuation PR-2)."""
+    return settings.paths.data_dir / "state" / CONTINUATION_LEDGER_FILENAME
 
 
 TIERC_ANNOTATIONS_FILENAME = "tierc_annotations.jsonl"
