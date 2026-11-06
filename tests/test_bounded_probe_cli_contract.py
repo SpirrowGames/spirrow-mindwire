@@ -83,7 +83,8 @@ def test_every_call_site_was_found() -> None:
     # -m spirrow_mindwire.park_wake (D-7): fourteen.
     # T-gate-fires-on-pr-open adds Invoke-AutoGateTick: fifteen.
     # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 adds Invoke-CloneRecover: sixteen.
-    assert len(_SITES) == 16, _SITES
+    # PR-1a of the same thread adds Invoke-CloneRetreat: seventeen.
+    assert len(_SITES) == 17, _SITES
 
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
@@ -97,6 +98,10 @@ def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:
     assert sites.get("'clone-recover'") == (
         "-m spirrow_mindwire.cli clone-recover",
         ["--repo-dir"],
+    )
+    assert sites.get("'clone-retreat'") == (
+        "-m spirrow_mindwire.cli clone-retreat",
+        ["--repo-dir", "--thread-id", "--head-msg", "--stop-reason", "--state-dir"],
     )
     assert sites.get("'head-skip-revert-launch'") == (
         "head_skip_decide.py",
