@@ -51,6 +51,7 @@ from spirrow_mindwire.pr_event_advance import (
     operator_handoff,
     read_relay_tail,
 )
+from spirrow_mindwire.pr_event_advance.decide import lifecycle_post
 from spirrow_mindwire.pr_event_advance.runner import (
     TOOLS_USED,
     advance_thread,
@@ -58,10 +59,15 @@ from spirrow_mindwire.pr_event_advance.runner import (
     pr_facts_of,
     run_tick,
 )
+from spirrow_mindwire.repo_projects import PrProject, RepoProjectMap, build_repo_project_map
 from spirrow_mindwire.value_objects import Role
 
 _THREAD = "T-some-work-thread"
 _REF = "acme/widgets#7"
+
+#: T-gate-fires-on-pr-open (msg-8030): acme/widgets belongs to "p" only.
+_REPO_MAP = RepoProjectMap(candidates={"acme/widgets": frozenset({"p"})})
+_PR_PROJECT = PrProject("p")
 _HEAD = "703b836737f29fe0f4139d86d2d02077c662ce5f"
 _OTHER = "1111111111111111111111111111111111111111"
 _MERGE = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -92,7 +98,15 @@ def _pr(state: str, *, head: str | None = _HEAD, body: str = "") -> PrFacts:
 def _decide(
     tail: Any, pr: PrFacts, ci: CiState | None = None, proposer: str | None = "Bohr"
 ) -> Noop | Post:
-    return decide(thread_id=_THREAD, tail=tail, pr=pr, ci=ci, proposer=proposer)
+    return decide(
+        thread_project="p",
+        pr_project=_PR_PROJECT,
+        thread_id=_THREAD,
+        tail=tail,
+        pr=pr,
+        ci=ci,
+        proposer=proposer,
+    )
 
 
 # --------------------------------------------------------------------------- R1: the 9 rows
@@ -275,10 +289,10 @@ def test_row9_unexpected_state_does_nothing(state: str) -> None:
 
 
 def test_closes_thread_is_line_anchored() -> None:
-    assert closes_thread(f"Closes-thread: {_THREAD}", _THREAD)
-    assert closes_thread(f"a\nCloses-thread: T-x\nCloses-thread: {_THREAD}\n", _THREAD)
-    assert not closes_thread(f"see Closes-thread: {_THREAD}", _THREAD)
-    assert not closes_thread(f"Closes-thread: {_THREAD}-v2", _THREAD)
+    assert closes_thread(f"Closes-thread: {_THREAD}", "p", _THREAD, "p")
+    assert closes_thread(f"a\nCloses-thread: T-x\nCloses-thread: {_THREAD}\n", "p", _THREAD, "p")
+    assert not closes_thread(f"see Closes-thread: {_THREAD}", "p", _THREAD, "p")
+    assert not closes_thread(f"Closes-thread: {_THREAD}-v2", "p", _THREAD, "p")
 
 
 # --------------------------------------------------------------------------- R13: totality
@@ -475,12 +489,12 @@ def _chat(tail_author: str = RELAY_AUTHOR, tail_body: str | None = None) -> _Fak
 async def test_r4_merged_pr_posts_once_and_r5_the_second_tick_does_nothing() -> None:
     chat = _chat()
     gh = _FakeGh(_closed(True))
-    first = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    first = await run_tick(repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", proposer="Bohr")
     assert first.as_dict()["posted"] == 1
     posted = chat.threads[_THREAD][-1]
     assert posted["author"] == PR_EVENT_RELAY_AUTHOR
     assert posted["content"].endswith("NEXT: Bohr")
-    second = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    second = await run_tick(repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", proposer="Bohr")
     assert second.as_dict()["posted"] == 0
     assert second.outcomes[0].reason == NoopReason.NOT_RELAY_TAIL.value
     assert len(chat.threads[_THREAD]) == 3
@@ -490,7 +504,9 @@ async def test_r4_merged_pr_posts_once_and_r5_the_second_tick_does_nothing() -> 
 async def test_r4_gh_unresolvable_writes_nothing() -> None:
     chat = _chat()
     gh = _FakeGh(PrState(ref=_PR, resolution=PrResolution.UNRESOLVABLE))
-    out = await advance_thread(mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    out = await advance_thread(
+        repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr"
+    )
     assert (out.action, out.reason) == ("skipped", "gh-unresolvable")
     assert "chatroom_post_message" not in chat.calls
 
@@ -525,7 +541,7 @@ async def test_r4_a_raising_pr_read_skips_that_thread_only_and_the_tick_continue
         }
     )
     gh = _RaisingGh(_closed(True), fail_pr=1)  # T-first's read raises, T-second's answers
-    report = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    report = await run_tick(repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", proposer="Bohr")
     first, second = report.outcomes
     assert (first.thread_id, first.action) == ("T-first", "skipped")
     assert first.reason.startswith("gh-error:") and "502" in first.reason
@@ -538,7 +554,9 @@ async def test_r4_a_raising_pr_read_skips_that_thread_only_and_the_tick_continue
 async def test_r4_a_raising_ci_read_writes_nothing() -> None:
     chat = _chat(tail_body=_relay(hold=_HEAD))
     gh = _RaisingGh(_open(), fail_ci=True)
-    out = await advance_thread(mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    out = await advance_thread(
+        repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr"
+    )
     assert out.action == "skipped" and out.reason.startswith("gh-error:")
     assert "chatroom_post_message" not in chat.calls
 
@@ -548,7 +566,12 @@ async def test_r4_an_unreadable_thread_writes_nothing() -> None:
     chat = _chat()
     chat.unreadable.add(_THREAD)
     out = await advance_thread(
-        mcp=chat, gh=_FakeGh(_closed(True)), project="p", thread_id=_THREAD, proposer="Bohr"
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=_FakeGh(_closed(True)),
+        project="p",
+        thread_id=_THREAD,
+        proposer="Bohr",
     )
     assert out.action == "skipped" and out.reason.startswith("thread-unreadable")
     assert "chatroom_post_message" not in chat.calls
@@ -558,7 +581,12 @@ async def test_r4_an_unreadable_thread_writes_nothing() -> None:
 async def test_r4_unresolved_roster_writes_the_fact_with_the_operator_block() -> None:
     chat = _chat()
     out = await advance_thread(
-        mcp=chat, gh=_FakeGh(_closed(False)), project="p", thread_id=_THREAD, proposer=None
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=_FakeGh(_closed(False)),
+        project="p",
+        thread_id=_THREAD,
+        proposer=None,
     )
     assert out.action == "posted" and out.next_line == "NEXT: operator"
     assert chat.threads[_THREAD][-1]["content"].endswith(operator_handoff(_THREAD))
@@ -569,7 +597,12 @@ async def test_r4_a_resolved_thread_is_reported_not_raised() -> None:
     chat = _chat()
     chat.resolved.add(_THREAD)
     out = await advance_thread(
-        mcp=chat, gh=_FakeGh(_closed(True)), project="p", thread_id=_THREAD, proposer="Bohr"
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=_FakeGh(_closed(True)),
+        project="p",
+        thread_id=_THREAD,
+        proposer="Bohr",
     )
     assert (out.action, out.reason) == ("skipped", "thread-resolved")
 
@@ -577,10 +610,14 @@ async def test_r4_a_resolved_thread_is_reported_not_raised() -> None:
 @pytest.mark.anyio
 async def test_r4_ci_is_read_only_for_a_held_open_pr_on_the_same_head() -> None:
     gh = _FakeGh(_open())
-    await advance_thread(mcp=_chat(), gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    await advance_thread(
+        repo_map=_REPO_MAP, mcp=_chat(), gh=gh, project="p", thread_id=_THREAD, proposer="Bohr"
+    )
     assert gh.ci_reads == 0  # no hold → row 5, no CI read
     held = _chat(tail_body=_relay(hold=_HEAD))
-    out = await advance_thread(mcp=held, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    out = await advance_thread(
+        repo_map=_REPO_MAP, mcp=held, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr"
+    )
     assert gh.ci_reads == 1
     assert out.next_line == f"NEXT: pr-review {_REF}"
 
@@ -589,7 +626,9 @@ async def test_r4_ci_is_read_only_for_a_held_open_pr_on_the_same_head() -> None:
 async def test_r4_a_ci_read_for_a_different_head_waits() -> None:
     gh = _FakeGh(_open(), CiStatus(state=CiState.SUCCESS, head_sha=_OTHER, failing=[]))
     held = _chat(tail_body=_relay(hold=_HEAD))
-    out = await advance_thread(mcp=held, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr")
+    out = await advance_thread(
+        repo_map=_REPO_MAP, mcp=held, gh=gh, project="p", thread_id=_THREAD, proposer="Bohr"
+    )
     assert (out.action, out.reason) == ("noop", NoopReason.CI_PENDING.value)
 
 
@@ -597,7 +636,12 @@ async def test_r4_a_ci_read_for_a_different_head_waits() -> None:
 async def test_r4_unregistered_threads_are_flagged() -> None:
     chat = _chat()
     report = await run_tick(
-        mcp=chat, gh=_FakeGh(_closed(True)), project="p", proposer="Bohr", registered=frozenset()
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=_FakeGh(_closed(True)),
+        project="p",
+        proposer="Bohr",
+        registered=frozenset(),
     )
     assert report.outcomes[0].unregistered is True
 
@@ -617,6 +661,7 @@ def test_pr_facts_of_maps_every_resolution() -> None:
 async def test_r10_the_close_api_is_never_called() -> None:
     chat = _chat()
     await run_tick(
+        repo_map=_REPO_MAP,
         mcp=chat,
         gh=_FakeGh(_closed(True, f"Closes-thread: {_THREAD}")),
         project="p",
@@ -783,14 +828,147 @@ async def test_row2b_tick_writes_nothing_then_the_implementer_report_ends_it(mer
     # every later tick is row 1.
     chat = _chat(tail_body=_merge_self_relay())
     gh = _FakeGh(_closed(merged))
-    first = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    first = await run_tick(repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", proposer="Bohr")
     assert first.as_dict()["posted"] == 0
     assert first.outcomes[0].reason == NoopReason.MERGE_OWNED_BY_TURN.value
     assert len(chat.threads[_THREAD]) == 2
     chat.threads[_THREAD].append(
         {"msg_id": "msg-3", "author": "Heisenberg", "content": "merged abc\n\nNEXT: Bohr"}
     )
-    second = await run_tick(mcp=chat, gh=gh, project="p", proposer="Bohr")
+    second = await run_tick(repo_map=_REPO_MAP, mcp=chat, gh=gh, project="p", proposer="Bohr")
     assert second.as_dict()["posted"] == 0
     assert second.outcomes[0].reason == NoopReason.NOT_RELAY_TAIL.value
     assert gh.ci_reads == 0
+
+
+# ---- project-qualified Closes-thread (T-gate-fires-on-pr-open, msg-8024 §2 / §4) ---------- #
+
+
+@pytest.mark.parametrize(
+    ("body", "pr_project", "expected"),
+    [
+        # Unqualified: exactly as before, when the PR's project is this thread's.
+        (f"Closes-thread: {_THREAD}", "p", True),
+        # Qualified with this thread's project: closes, whichever repo the PR is in.
+        (f"Closes-thread: p/{_THREAD}", "q", True),
+        (f"Closes-thread: p/{_THREAD}", "p", True),
+        # Qualified with another project: not this thread.
+        (f"Closes-thread: q/{_THREAD}", "p", False),
+        # Unqualified from a PR of another project names that project's thread, not this one.
+        (f"Closes-thread: {_THREAD}", "q", False),
+        # A value that does not read is never a close.
+        (f"Closes-thread: a/b/{_THREAD} trailing", "p", False),
+    ],
+)
+def test_closes_thread_compares_project_and_id(body: str, pr_project: str, expected: bool) -> None:
+    assert closes_thread(body, "p", _THREAD, pr_project) is expected
+
+
+def test_row3_merged_closes_thread_naming_another_project_goes_to_the_proposer() -> None:
+    other = _decide(_tail(), _pr("merged", body=f"Closes-thread: other/{_THREAD}"))
+    assert isinstance(other, Post) and other.next_line == "NEXT: Bohr"
+    # _decide runs in project "p": naming it explicitly settles, as the bare id does.
+    mine = _decide(_tail(), _pr("merged", body=f"Closes-thread: p/{_THREAD}"))
+    assert isinstance(mine, Post) and mine.next_line == "NEXT: none"
+
+
+# ---- the PR's project from clones, not from the design thread (msg-8030 / 8032 / 8034) ----- #
+
+
+def _merged_post(body: str, *, thread_project: str, pr_project: PrProject) -> Post:
+    post = lifecycle_post(
+        thread_project=thread_project,
+        thread_id=_THREAD,
+        pr_project=pr_project,
+        pr_ref=_REF,
+        pr=_pr("merged", body=body),
+        proposer="Bohr",
+    )
+    assert isinstance(post, Post)
+    return post
+
+
+def test_same_repo_bare_closes_thread_still_closes() -> None:
+    post = _merged_post(f"Closes-thread: {_THREAD}", thread_project="p", pr_project=PrProject("p"))
+    assert post.next_line == "NEXT: none"
+
+
+def test_cross_repo_bare_closes_thread_names_the_prs_project_and_does_not_close() -> None:
+    # msg-8030: a proj PR with ``Thread: hub/T`` + ``Closes-thread: T`` names proj/T to close.
+    body = f"Thread: hub/{_THREAD}\nCloses-thread: {_THREAD}"
+    post = _merged_post(body, thread_project="hub", pr_project=PrProject("proj"))
+    assert post.next_line == "NEXT: Bohr"
+    assert "閉じない" not in post.body  # resolved: it simply named another thread
+
+
+def test_cross_repo_qualified_on_both_lines_closes() -> None:
+    body = f"Thread: hub/{_THREAD}\nCloses-thread: hub/{_THREAD}"
+    post = _merged_post(body, thread_project="hub", pr_project=PrProject("proj"))
+    assert post.next_line == "NEXT: none"
+
+
+@pytest.mark.parametrize(
+    ("pr_project", "why"),
+    [
+        (PrProject(None, "none"), "（none）"),  # noqa: RUF001
+        (PrProject(None, "multiple", ("app", "hub")), "（multiple: app, hub）"),  # noqa: RUF001
+        (PrProject(None, "incomplete", ("app",)), "（incomplete: app）"),  # noqa: RUF001
+    ],
+)
+def test_unresolved_pr_project_bare_does_not_close_and_says_why(
+    pr_project: PrProject, why: str
+) -> None:
+    post = _merged_post(f"Closes-thread: {_THREAD}", thread_project="p", pr_project=pr_project)
+    assert post.next_line == "NEXT: Bohr"
+    assert f"PR {_REF} が merge された" in post.body  # the merge fact is still written
+    assert post.body.splitlines()[-1] == (
+        f"Closes-thread: {_THREAD} はプロジェクト名が無く、acme/widgets のプロジェクトを"
+        f"1 つに決められないので閉じない{why}。"
+    )
+
+
+@pytest.mark.parametrize(
+    "pr_project",
+    [
+        PrProject(None, "none"),
+        PrProject(None, "multiple", ("app", "hub")),
+        PrProject(None, "incomplete", ("app",)),
+    ],
+)
+def test_unresolved_pr_project_qualified_exact_match_still_closes(pr_project: PrProject) -> None:
+    post = _merged_post(f"Closes-thread: p/{_THREAD}", thread_project="p", pr_project=pr_project)
+    assert post.next_line == "NEXT: none"
+
+
+def test_unresolved_without_a_bare_close_for_this_thread_adds_no_line() -> None:
+    post = _merged_post("Closes-thread: T-other", thread_project="p", pr_project=PrProject(None))
+    assert "閉じない" not in post.body
+
+
+def _unread_app(clone: str) -> str:
+    if clone == "C:/hub":
+        return "https://github.com/acme/widgets.git"
+    raise OSError("origin unreadable")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body", "closes"),
+    [(f"Closes-thread: {_THREAD}", False), (f"Closes-thread: hub/{_THREAD}", True)],
+)
+async def test_1b_with_one_unread_clone_does_not_close_a_bare_id(body: str, closes: bool) -> None:
+    # msg-8034 §5: hub and app both point at acme/widgets, and only app's origin cannot be read.
+    table = build_repo_project_map({"hub": "C:/hub", "app": "C:/app"}, _unread_app)
+    chat = _chat()
+    out = await advance_thread(
+        repo_map=table,
+        mcp=chat,
+        gh=_FakeGh(_closed(True, body)),
+        project="hub",
+        thread_id=_THREAD,
+        proposer="Bohr",
+    )
+    assert out.action == "posted"
+    assert (out.next_line == "NEXT: none") is closes
+    posted = chat.threads[_THREAD][-1]["content"]
+    assert ("incomplete: app" in posted) is not closes

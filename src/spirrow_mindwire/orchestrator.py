@@ -385,7 +385,9 @@ class PrReviewOrchestrator:
             return out
 
         resolver = (
-            self._design_conditions.resolver(self._mcp, project=project)
+            self._design_conditions.resolver(
+                self._mcp, project=project, pr_owner=pr.owner, pr_repo=pr.repo
+            )
             if self._design_conditions is not None
             else None
         )

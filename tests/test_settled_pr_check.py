@@ -62,8 +62,16 @@ from spirrow_mindwire.pr_event_advance.decide import (
     read_relay_tail,
 )
 from spirrow_mindwire.pr_event_advance.runner import advance_thread
+from spirrow_mindwire.repo_projects import PrProject, RepoProjectMap
 
 _REF = "acme/widgets#7"
+
+#: T-gate-fires-on-pr-open (msg-8030): acme/widgets belongs to "p" only.
+_REPO_MAP = RepoProjectMap(candidates={"acme/widgets": frozenset({"p"})})
+_PR_PROJECT = PrProject("p")
+_CONDUCTOR_REPO_MAP = RepoProjectMap(
+    candidates={"acme/widgets": frozenset({_thread_ref().project_id})}
+)
 _THREAD = _thread_ref().thread_id  # "T-cond"
 _CLOSED_AT = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
 _MERGE_SHA = "9f1c2d3e4b5a69788796a5b4c3d2e1f0a9b8c7d6"
@@ -119,6 +127,9 @@ def _settled_conductor(
     disp = _ScriptedDispatcher(mcp, {})
     base = _conductor(mcp, disp, orchestrator=gate, rollup_source=rollup)
     base._pr_state_source = state  # the one ctor arg _conductor() does not take
+    # msg-8030: acme/widgets belongs to the design thread's project alone, so a bare
+    # ``Closes-thread:`` here is a same-repo declaration and settles as before.
+    base._repo_projects = lambda: _CONDUCTOR_REPO_MAP
     return base
 
 
@@ -135,7 +146,14 @@ def _facts(state: PrState) -> PrFacts:
 
 def test_merged_with_closes_thread_naming_this_thread_settles() -> None:
     pr = _facts(_state(PrResolution.CLOSED, merged=True, body=f"x\nCloses-thread: {_THREAD}\n"))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=pr,
+        proposer="Bohr",
+    )
     assert post is not None
     assert post.next_line == "NEXT: none"
     assert _MERGE_SHA in post.body
@@ -144,21 +162,42 @@ def test_merged_with_closes_thread_naming_this_thread_settles() -> None:
 @pytest.mark.parametrize("body", ["", "Closes-thread: T-some-other-thread\n"])
 def test_merged_without_closes_thread_for_this_thread_goes_to_the_proposer(body: str) -> None:
     pr = _facts(_state(PrResolution.CLOSED, merged=True, body=body))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=pr,
+        proposer="Bohr",
+    )
     assert post is not None
     assert post.next_line == "NEXT: Bohr"
 
 
 def test_closed_unmerged_always_goes_to_the_proposer_even_with_closes_thread() -> None:
     pr = _facts(_state(PrResolution.CLOSED, body=f"Closes-thread: {_THREAD}\n"))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=pr,
+        proposer="Bohr",
+    )
     assert post is not None
     assert post.next_line == "NEXT: Bohr"
     assert "close された" in post.body
 
 
 def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=_facts(_MERGED), proposer=None)
+    post = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=_facts(_MERGED),
+        proposer=None,
+    )
     assert post is not None
     lines = post.next_line.splitlines()
     assert len(lines) == 3
@@ -173,7 +212,17 @@ def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
     ids=["open", "not-found", "unknown"],
 )
 def test_open_or_unknown_pr_has_no_post(pr: PrFacts) -> None:
-    assert lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr") is None
+    assert (
+        lifecycle_post(
+            thread_project="p",
+            thread_id=_THREAD,
+            pr_project=_PR_PROJECT,
+            pr_ref=_REF,
+            pr=pr,
+            proposer="Bohr",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("state", [_MERGED, _CLOSED], ids=["merged", "closed"])
@@ -186,8 +235,23 @@ def test_decide_rows_3_and_4_are_exactly_lifecycle_post(
         "pr-gate-relay", f"{render_relay_heading(_REF, _HEAD)}\n\nVERDICT: approve\n\nNEXT: human"
     )
     pr = _facts(state)
-    got = decide(thread_id=_THREAD, tail=tail, pr=pr, ci=None, proposer=proposer)
-    assert got == lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer=proposer)
+    got = decide(
+        thread_project="p",
+        pr_project=_PR_PROJECT,
+        thread_id=_THREAD,
+        tail=tail,
+        pr=pr,
+        ci=None,
+        proposer=proposer,
+    )
+    assert got == lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=pr,
+        proposer=proposer,
+    )
 
 
 def test_pr_facts_of_is_still_reexported_by_the_runner() -> None:
@@ -239,7 +303,14 @@ async def test_settled_pr_posts_the_fact_once_and_never_reaches_admission(
     assert len(mcp.posts) == 1
     posted = mcp.posts[0]
     assert posted["author"] == PR_EVENT_RELAY_AUTHOR
-    expected = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=_facts(state), proposer="Bohr")
+    expected = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project=_PR_PROJECT,
+        pr_ref=_REF,
+        pr=_facts(state),
+        proposer="Bohr",
+    )
     assert expected is not None
     assert posted["content"] == expected.render()
     assert outcome.last_msg_id == mcp._messages[-1]["msg_id"]
@@ -274,7 +345,12 @@ async def test_a_settled_post_handing_to_the_proposer_is_not_read_by_1b() -> Non
     tail = mcp._messages[-1]
     assert parse_next_token(tail["content"]) == "Bohr"
     outcome = await advance_thread(
-        mcp=mcp, gh=_StateSource(_MERGED), project="p", thread_id=_THREAD, proposer="Bohr"
+        repo_map=_REPO_MAP,
+        mcp=mcp,
+        gh=_StateSource(_MERGED),
+        project="p",
+        thread_id=_THREAD,
+        proposer="Bohr",
     )
     assert (outcome.action, outcome.reason) == ("noop", "not-relay-tail")
     assert len(mcp.posts) == 1
@@ -438,10 +514,20 @@ async def test_conductor_first_then_1b_reports_a_merge_exactly_once() -> None:
     assert [p["author"] for p in mcp.posts] == ["pr-gate-relay"]  # the R6 note
 
     first = await advance_thread(
-        mcp=mcp, gh=_StateSource(_MERGED), project="p", thread_id=_THREAD, proposer="Bohr"
+        repo_map=_REPO_MAP,
+        mcp=mcp,
+        gh=_StateSource(_MERGED),
+        project="p",
+        thread_id=_THREAD,
+        proposer="Bohr",
     )
     second = await advance_thread(
-        mcp=mcp, gh=_StateSource(_MERGED), project="p", thread_id=_THREAD, proposer="Bohr"
+        repo_map=_REPO_MAP,
+        mcp=mcp,
+        gh=_StateSource(_MERGED),
+        project="p",
+        thread_id=_THREAD,
+        proposer="Bohr",
     )
     assert first.action == "posted"
     assert (second.action, second.reason) == ("noop", "not-relay-tail")
@@ -502,3 +588,72 @@ async def test_every_conductor_relay_post_is_a_1b_tail_and_never_ends_pr_review(
     token = parse_next_token(body)
     assert token is not None
     assert not token.lower().startswith("pr-review")
+
+
+# --------------------------------------------------------------------------- #
+# The conductor resolves the PR's project from clones (msg-8030 / msg-8032 / msg-8034).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("table", "why"),
+    [
+        (
+            RepoProjectMap(candidates={"acme/widgets": frozenset({"app", "spirrow-mindwire"})}),
+            "multiple: app, spirrow-mindwire",
+        ),
+        (
+            RepoProjectMap(
+                candidates={"acme/widgets": frozenset({"spirrow-mindwire"})},
+                unresolved=frozenset({"app"}),
+            ),
+            "incomplete: app",
+        ),
+    ],
+    ids=["multiple", "incomplete"],
+)
+async def test_conductor_does_not_close_on_a_bare_id_it_cannot_resolve(
+    table: RepoProjectMap, why: str
+) -> None:
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content=f"pushed\n\nNEXT: pr-review {_REF}")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    merged = _state(PrResolution.CLOSED, merged=True, body=f"Closes-thread: {_THREAD}\n")
+    cond = _settled_conductor(mcp, state=_StateSource(merged), gate=gate)
+    cond._repo_projects = lambda: table
+    outcome = await cond.run()
+    assert outcome.stop_reason is StopReason.PR_SETTLED
+    content = mcp.posts[-1]["content"]
+    assert f"（{why}）" in content  # noqa: RUF001
+    assert parse_next_token(content) != "none"
+    assert gate.fired == []
+
+
+@pytest.mark.anyio
+async def test_conductor_closes_on_a_qualified_id_even_when_unresolved() -> None:
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content=f"pushed\n\nNEXT: pr-review {_REF}")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    body = f"Closes-thread: {_thread_ref().project_id}/{_THREAD}\n"
+    merged = _state(PrResolution.CLOSED, merged=True, body=body)
+    cond = _settled_conductor(mcp, state=_StateSource(merged), gate=gate)
+    cond._repo_projects = lambda: RepoProjectMap(unresolved=frozenset({"app"}))
+    await cond.run()
+    assert parse_next_token(mcp.posts[-1]["content"]) == "none"
+
+
+def test_conductor_without_a_table_or_with_a_broken_one_resolves_nothing() -> None:
+    mcp = _FakeChatroomMcp()
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    cond = _settled_conductor(mcp, state=None, gate=gate)
+    cond._repo_projects = None
+    assert cond._resolve_pr_project(_ref()) == PrProject(None, "none")
+
+    def broken() -> RepoProjectMap:
+        raise RuntimeError("sweep.json unreadable")
+
+    cond._repo_projects = broken
+    assert cond._resolve_pr_project(_ref()) == PrProject(None, "none")
+    cond._repo_projects = lambda: _CONDUCTOR_REPO_MAP
+    assert cond._resolve_pr_project(_ref()) == PrProject(_thread_ref().project_id)

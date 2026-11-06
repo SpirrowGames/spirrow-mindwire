@@ -18,8 +18,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
-import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -28,6 +26,7 @@ from typing import Any
 from ...config import load_settings
 from ...github.client import GitHubClient
 from ...magickit.client import StreamableHttpChatroomMcp
+from ...repo_projects import RepoProjectMap, build_repo_project_map
 from .runner import (
     DEFAULT_DAILY_CAP,
     DEFAULT_GATE_BASES,
@@ -39,18 +38,9 @@ from .runner import (
     run_pass,
 )
 
-_GITHUB_REMOTE_RE = re.compile(
-    r"github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
-)
-
 
 class AutoGateConfigError(ValueError):
     """``sweep.json`` cannot be used. Reported; nothing is posted."""
-
-
-def parse_remote_url(url: str) -> tuple[str, str] | None:
-    match = _GITHUB_REMOTE_RE.search(url.strip())
-    return (match.group("owner"), match.group("repo")) if match else None
 
 
 def parse_auto_gate_config(sweep: dict[str, Any]) -> AutoGateConfig:
@@ -75,39 +65,36 @@ def parse_auto_gate_config(sweep: dict[str, Any]) -> AutoGateConfig:
     return AutoGateConfig(live=mode == "on", daily_cap=cap, gate_bases=tuple(bases))
 
 
-def _origin_url(clone: str) -> str:
-    return subprocess.run(
-        ["git", "-C", clone, "remote", "get-url", "origin"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    ).stdout
-
-
 def resolve_targets(
-    sweep: dict[str, Any], projects: list[str]
+    repo_map: RepoProjectMap, projects: list[str]
 ) -> tuple[list[RepoTarget], list[dict[str, str]]]:
-    """Each project's repo from its clone's ``origin``. One bad clone costs only that project."""
-    clones = sweep.get("clones")
-    clone_map = clones if isinstance(clones, dict) else {}
+    """Each requested project's repo, from the shared ``clones`` table (msg-8032 §1).
+
+    One bad clone costs only that project here; for bare-id resolution it makes the whole table
+    incomplete (:meth:`RepoProjectMap.resolve`).
+    """
+    by_project = {target.project: target for target in repo_map.targets}
     targets: list[RepoTarget] = []
     errors: list[dict[str, str]] = []
     for project in projects:
-        clone = clone_map.get(project)
-        if not isinstance(clone, str) or not clone:
-            errors.append({"project": project, "error": "no clones entry"})
+        target = by_project.get(project)
+        if target is None:
+            errors.append(
+                {"project": project, "error": repo_map.errors.get(project, "no clones entry")}
+            )
             continue
-        try:
-            parsed = parse_remote_url(_origin_url(clone))
-        except (OSError, subprocess.SubprocessError) as exc:
-            errors.append({"project": project, "error": f"origin unreadable: {exc}"})
-            continue
-        if parsed is None:
-            errors.append({"project": project, "error": "origin is not a GitHub remote"})
-            continue
-        targets.append(RepoTarget(project, parsed[0], parsed[1]))
+        targets.append(target)
     return targets, errors
+
+
+def known_projects(sweep: dict[str, Any]) -> frozenset[str]:
+    """Every project ``clones`` names, held or not: what a qualified ``Thread:`` may point at."""
+    clones = sweep.get("clones")
+    return (
+        frozenset(k for k in clones if isinstance(k, str))
+        if isinstance(clones, dict)
+        else frozenset()
+    )
 
 
 def cap_digest_line(report: PassReport, now: datetime) -> str | None:
@@ -125,8 +112,9 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(sweep, dict):
         raise AutoGateConfigError("sweep.json must be an object")
     config = parse_auto_gate_config(sweep)
+    repo_map = build_repo_project_map(sweep.get("clones"))
     targets, target_errors = resolve_targets(
-        sweep, sorted({p for p in args.projects.split(",") if p})
+        repo_map, sorted({p for p in args.projects.split(",") if p})
     )
     now = datetime.now(UTC)
     async with GitHubClient() as gh:
@@ -138,8 +126,12 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             store=DailyCounterStore(args.state_file),
             review_login=load_settings().naysayer_gating.review_login,
             now=now,
+            known_projects=known_projects(sweep),
+            repo_map=repo_map,
         )
     out = report.as_dict()
+    if not repo_map.complete:
+        out["repo_map_unresolved"] = sorted(repo_map.unresolved)
     if target_errors:
         out["target_errors"] = target_errors
     line = cap_digest_line(report, now)

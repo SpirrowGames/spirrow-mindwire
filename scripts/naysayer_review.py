@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import sys
 
 from spirrow_mindwire.conductor.roster import RoleResolutionError, derive_identity_by_role
@@ -59,6 +60,7 @@ from spirrow_mindwire.design_conditions import build_policy as build_design_cond
 from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
 from spirrow_mindwire.orchestrator import PrReviewOrchestrator
+from spirrow_mindwire.repo_projects import load_repo_project_map
 from spirrow_mindwire.value_objects import Role
 
 # Windows consoles default to legacy codepages (cp932) that can't encode the naysayer's reply /
@@ -106,6 +108,9 @@ async def main() -> None:
         settings.naysayer_gating.conditional_proceed,
         settings.conductor.roster,
         human_identity=settings.conductor.human_identity,
+        repo_projects=functools.partial(
+            load_repo_project_map, settings.paths.config_dir / "sweep.json"
+        ),
     )
     orchestrator = PrReviewOrchestrator(mcp, driver=driver, design_conditions=design_conditions)
 

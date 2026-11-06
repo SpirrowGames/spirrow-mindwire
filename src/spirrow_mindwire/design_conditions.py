@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -49,6 +49,7 @@ from .naysayer.conditions_check import (
 from .naysayer.pr_review import ObjectionParse, parse_objections
 from .naysayer.review_rounds import CONDITIONS_HEADING_RE, has_conditions_heading
 from .pr_event_advance.auto_gate.decide import resolve_thread_link
+from .repo_projects import NONE, PrProject, RepoProjectMap
 from .value_objects import Role
 
 logger = logging.getLogger(__name__)
@@ -392,8 +393,29 @@ class DesignConditionsPolicy:
     modes: Mapping[str, str] = field(default_factory=dict)
     roster: Mapping[str, Role] = field(default_factory=dict)
     human_identity: str = "human"
+    #: ``owner/repo -> project`` (:mod:`.repo_projects`); ``None``: the PR is the gate's project.
+    repo_projects: Callable[[], RepoProjectMap] | None = None
 
-    def resolver(self, mcp: McpToolCaller, *, project: str) -> ConditionsResolver | None:
+    def pr_project(self, *, project: str, owner: str | None, repo: str | None) -> PrProject:
+        """The PR repo's project, not the gate's (#525 RC); unresolvable: no project."""
+        if self.repo_projects is None:
+            return PrProject(project)
+        if owner is None or repo is None:
+            return PrProject(None, NONE)
+        try:
+            return self.repo_projects().resolve(owner, repo)
+        except Exception as exc:  # fail-closed: an unreadable table resolves nothing
+            logger.warning("design conditions: repo table unreadable: %s", exc)
+            return PrProject(None, NONE)
+
+    def resolver(
+        self,
+        mcp: McpToolCaller,
+        *,
+        project: str,
+        pr_owner: str | None = None,
+        pr_repo: str | None = None,
+    ) -> ConditionsResolver | None:
         """``None`` when ``project`` never enabled the setting — the gate then builds no check."""
         if not mode_for(self.modes, project).verifies:
             return None
@@ -401,20 +423,31 @@ class DesignConditionsPolicy:
 
         async def resolve(pr_body: str | None) -> DesignConditionsCheck:
             return await resolve_design_conditions(
-                mcp, project=project, pr_body=pr_body, policy=thread_policy
+                mcp,
+                project=project,
+                pr_body=pr_body,
+                policy=thread_policy,
+                pr_project=self.pr_project(project=project, owner=pr_owner, repo=pr_repo),
             )
 
         return resolve
 
 
 def build_policy(
-    modes: Mapping[str, str], roster: Mapping[str, Role], *, human_identity: str
+    modes: Mapping[str, str],
+    roster: Mapping[str, Role],
+    *,
+    human_identity: str,
+    repo_projects: Callable[[], RepoProjectMap] | None = None,
 ) -> DesignConditionsPolicy | None:
     """The orchestrator's policy, or ``None`` when no project names the setting at all."""
     if not modes:
         return None
     return DesignConditionsPolicy(
-        modes=dict(modes), roster=dict(roster), human_identity=human_identity
+        modes=dict(modes),
+        roster=dict(roster),
+        human_identity=human_identity,
+        repo_projects=repo_projects,
     )
 
 
@@ -441,12 +474,22 @@ def _validated_messages(raw: list[Any]) -> tuple[list[ThreadMessage], str | None
 
 
 async def resolve_design_conditions(
-    mcp: McpToolCaller, *, project: str, pr_body: str | None, policy: ThreadPolicy
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    pr_body: str | None,
+    policy: ThreadPolicy,
+    pr_project: PrProject | None = None,
 ) -> DesignConditionsCheck:
-    """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD."""
+    """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD.
+
+    ``pr_project`` is the PR repo's project (``project`` is the gate's), as in the auto-gate.
+    """
     if pr_body is None:
         return _hold("the PR body could not be read, so its design thread is unknown")
-    link = resolve_thread_link(pr_body)
+    if pr_project is None:
+        pr_project = PrProject(project)
+    link = resolve_thread_link(pr_body, pr_project.project)
     if link.thread_id is None:
         return _hold(
             "the PR body names no single design thread (`Thread:` line "
@@ -454,12 +497,22 @@ async def resolve_design_conditions(
             "verifies design conditions, so a PR whose thread is unknown cannot be approved"
         )
     thread_id = link.thread_id
+    if pr_project.project is None and link.has_bare:
+        return _hold(
+            f"the PR body names {thread_id} without a project, and the PR's own project could "
+            f"not be resolved ({pr_project.describe()}); qualify it as `<project>/{thread_id}`",
+            thread_id=thread_id,
+        )
+    # A ``Thread: <project>/T-...`` line is read in the project it names (msg-8022 / msg-8024),
+    # the same rule the auto-gate follows; an unqualified one in the PR's own project.
+    thread_project = link.thread_project or pr_project.project or project
     try:
         payload: Any = await mcp.call_tool(
-            "chatroom_get_thread", {"project": project, "thread_id": thread_id, "mode": "full"}
+            "chatroom_get_thread",
+            {"project": thread_project, "thread_id": thread_id, "mode": "full"},
         )
     except MagickitMcpError as exc:
-        logger.warning("design conditions: cannot read %s/%s: %s", project, thread_id, exc)
+        logger.warning("design conditions: cannot read %s/%s: %s", thread_project, thread_id, exc)
         return _hold(f"the design thread {thread_id} could not be read", thread_id=thread_id)
     raw = payload.get("messages") if isinstance(payload, dict) else None
     if not isinstance(raw, list):
@@ -472,7 +525,7 @@ async def resolve_design_conditions(
     check = check_pr_body(evaluate_thread(messages, policy), pr_body, thread_id=thread_id)
     logger.info(
         "design conditions %s/%s: outcome=%s go=%s conditions=%d reasons=%d",
-        project,
+        thread_project,
         thread_id,
         check.outcome.value,
         check.go_msg_id or "-",

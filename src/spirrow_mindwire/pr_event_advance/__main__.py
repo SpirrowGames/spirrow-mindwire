@@ -25,6 +25,7 @@ from ..conductor.roster import RoleResolutionError, derive_identity_by_role
 from ..config import load_settings
 from ..github.client import GitHubClient
 from ..magickit.client import StreamableHttpChatroomMcp
+from ..repo_projects import load_repo_project_map
 from ..tail_cache import TailCache, load_heads
 from ..value_objects import Role
 from .runner import run_tick
@@ -74,6 +75,8 @@ def open_cache(args: argparse.Namespace) -> TailCache | None:
 
 async def _main(args: argparse.Namespace) -> dict[str, Any]:
     proposer, roster_error = resolve_proposer()
+    # Built once per tick from the same ``clones`` the auto-gate reads (msg-8030 §1).
+    repo_map = load_repo_project_map(args.sweep_config)
     async with GitHubClient() as gh:
         report = await run_tick(
             mcp=StreamableHttpChatroomMcp(args.url),
@@ -82,8 +85,11 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             proposer=proposer,
             registered=registered_threads(args.sweep_config, args.project),
             cache=open_cache(args),
+            repo_map=repo_map,
         )
     out = report.as_dict()
+    if not repo_map.complete:
+        out["repo_map_unresolved"] = sorted(repo_map.unresolved)
     if roster_error is not None:
         out["roster_error"] = roster_error
     return out

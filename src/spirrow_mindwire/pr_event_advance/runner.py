@@ -40,6 +40,7 @@ from typing import Any, Protocol, assert_never
 from ..chatroom.status import FINISHED_STATUSES
 from ..github.client import CiState, CiStatus, PrRef, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
+from ..repo_projects import RepoProjectMap
 from ..tail_cache import CachedTail, TailCache
 from .decide import (
     PR_EVENT_RELAY_AUTHOR,
@@ -205,9 +206,14 @@ async def advance_thread(
     project: str,
     thread_id: str,
     proposer: str | None,
+    repo_map: RepoProjectMap,
     cache: TailCache | None = None,
 ) -> ThreadOutcome:
-    """Read one thread's tail and its PR, decide, and write at most one message."""
+    """Read one thread's tail and its PR, decide, and write at most one message.
+
+    ``repo_map`` names the PR's project for an unqualified ``Closes-thread:`` (msg-8030 /
+    msg-8032 / msg-8034); the design thread's own project is never used in its place.
+    """
     try:
         tail_msg = await _read_tail(mcp, project, thread_id, cache)
     except MagickitMcpError as exc:
@@ -246,7 +252,15 @@ async def advance_thread(
         # this tick's CI answer is about a different diff — wait for the next tick.
         if status.head_sha and facts.head_sha and status.head_sha.lower() != facts.head_sha.lower():
             ci = CiState.PENDING
-    decision = decide(thread_id=thread_id, tail=tail, pr=facts, ci=ci, proposer=proposer)
+    decision = decide(
+        thread_project=project,
+        thread_id=thread_id,
+        pr_project=repo_map.resolve(pr.owner, pr.repo),
+        tail=tail,
+        pr=facts,
+        ci=ci,
+        proposer=proposer,
+    )
     match decision:
         case Noop(reason=reason):
             return ThreadOutcome(thread_id, "noop", reason.value, pr_ref=tail.pr_ref)
@@ -297,6 +311,7 @@ async def run_tick(
     gh: PrSource,
     project: str,
     proposer: str | None,
+    repo_map: RepoProjectMap,
     registered: frozenset[str] | None = None,
     cache: TailCache | None = None,
 ) -> TickReport:
@@ -311,7 +326,13 @@ async def run_tick(
     thread_ids = await list_open_threads(mcp, project)
     for thread_id in thread_ids:
         outcome = await advance_thread(
-            mcp=mcp, gh=gh, project=project, thread_id=thread_id, proposer=proposer, cache=cache
+            mcp=mcp,
+            gh=gh,
+            project=project,
+            thread_id=thread_id,
+            proposer=proposer,
+            repo_map=repo_map,
+            cache=cache,
         )
         if outcome.action == "posted" and registered is not None:
             outcome.unregistered = thread_id not in registered

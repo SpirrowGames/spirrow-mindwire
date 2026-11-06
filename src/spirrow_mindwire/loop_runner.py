@@ -151,6 +151,7 @@ from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .preflight import PreflightError, preflight_gate
+from .repo_projects import load_repo_project_map
 from .spec_pin import SpecPinWriter
 from .value_objects import Capability, Event, Role, ThreadRef
 
@@ -584,6 +585,10 @@ def _design_conditions_policy(settings: MindwireSettings) -> DesignConditionsPol
         settings.naysayer_gating.conditional_proceed,
         settings.conductor.roster,
         human_identity=settings.conductor.human_identity,
+        # The PR repo's project for a bare ``Thread:`` id (#525 RC), as 1b / 1c read it.
+        repo_projects=functools.partial(
+            load_repo_project_map, settings.paths.config_dir / "sweep.json"
+        ),
     )
 
 
@@ -1143,6 +1148,12 @@ def build_conductor(
             # purpose, exactly as ``rollup_source`` above: each read resolves
             # :func:`naysayer_github_token` at call time (tests/test_loop_runner.py pins both).
             pr_state_source=_PerCallPrStateSource(),
+            # T-gate-fires-on-pr-open (msg-8030 §1): the PR's project for an unqualified
+            # ``Closes-thread:``, from the ``clones`` of the same ``<data_dir>/config/sweep.json``
+            # the sweep wrapper hands to 1b and 1c. Read at call time, only on a settled PR.
+            repo_projects=functools.partial(
+                load_repo_project_map, settings.paths.config_dir / "sweep.json"
+            ),
             review_login=settings.naysayer_gating.review_login,
             decider=decider,
             tierc_annotations_path=tierc_annotations_path,

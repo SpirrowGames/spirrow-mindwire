@@ -30,6 +30,7 @@ from spirrow_mindwire.design_conditions import (
     design_conditions_section,
     evaluate_thread,
     mode_for,
+    resolve_design_conditions,
 )
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError
@@ -42,6 +43,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     _build_messages,
 )
 from spirrow_mindwire.orchestrator import PrReviewOrchestrator
+from spirrow_mindwire.repo_projects import PrProject
 from spirrow_mindwire.value_objects import Role
 
 PROJECT = "spirrow-playproof"
@@ -729,3 +731,168 @@ def test_the_scoped_driver_caps_its_approve_where_the_setting_is_in_use(
     )
     asyncio.run(module.main())
     assert _ScopedGitHub.last.submitted == [expected]
+
+
+# ---- a project-qualified ``Thread:`` line (T-gate-fires-on-pr-open, msg-8022 / msg-8024) ---- #
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body", "read_in"),
+    [
+        ("Thread: spirrow-mindwire/T-cond", "spirrow-mindwire"),
+        (f"Thread: {PROJECT}/T-cond", PROJECT),
+        ("Thread: T-cond", PROJECT),
+    ],
+)
+async def test_qualified_thread_line_is_read_in_the_project_it_names(
+    body: str, read_in: str
+) -> None:
+    chat = _Chatroom([])
+    await resolve_design_conditions(chat, project=PROJECT, pr_body=body, policy=POLICY)
+    assert [(r["project"], r["thread_id"]) for r in chat.reads] == [(read_in, "T-cond")]
+
+
+# ---- the PR's own project, not the gate's (PR #525 gate RC, design_conditions.py:449) ---- #
+
+
+def _map(**repos: str) -> Any:
+    """``clones`` whose origins are ``github.com/<repo>``; ``repos``: project -> ``owner/repo``."""
+    from spirrow_mindwire.repo_projects import build_repo_project_map
+
+    return build_repo_project_map(
+        {p: f"/clone/{p}" for p in repos},
+        origin_url=lambda clone: f"https://github.com/{repos[clone.rsplit('/', 1)[1]]}.git",
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "pr_project",
+    [PrProject("proj"), PrProject(None, "none"), PrProject(None, "multiple", ("a", "b"))],
+)
+async def test_qualified_plus_bare_on_another_projects_pr_is_ambiguous_not_collapsed(
+    pr_project: PrProject,
+) -> None:
+    """The gate's RC: gate ``hub``, PR of ``proj`` (or unresolved) -> two links, a HOLD."""
+    chat = _Chatroom([])
+    check = await resolve_design_conditions(
+        chat,
+        project="hub",
+        pr_body="Thread: hub/T-1\nCloses-thread: T-1",
+        policy=POLICY,
+        pr_project=pr_project,
+    )
+    assert check.outcome is ConditionsOutcome.HOLD
+    assert "ambiguous" in check.reasons[0]
+    assert chat.reads == []
+
+
+@pytest.mark.anyio
+async def test_qualified_plus_bare_is_one_link_when_the_pr_belongs_to_the_named_project() -> None:
+    chat = _Chatroom([])
+    await resolve_design_conditions(
+        chat,
+        project="gate",
+        pr_body="Thread: hub/T-1\nCloses-thread: T-1",
+        policy=POLICY,
+        pr_project=PrProject("hub"),
+    )
+    assert [(r["project"], r["thread_id"]) for r in chat.reads] == [("hub", "T-1")]
+
+
+@pytest.mark.anyio
+async def test_a_bare_id_is_read_in_the_prs_project_not_the_gates() -> None:
+    chat = _Chatroom([])
+    await resolve_design_conditions(
+        chat, project="hub", pr_body="Thread: T-cond", policy=POLICY, pr_project=PrProject("proj")
+    )
+    assert [(r["project"], r["thread_id"]) for r in chat.reads] == [("proj", "T-cond")]
+
+
+@pytest.mark.anyio
+async def test_a_bare_id_with_an_unresolved_pr_project_holds_without_reading() -> None:
+    chat = _Chatroom([])
+    check = await resolve_design_conditions(
+        chat,
+        project="hub",
+        pr_body="Thread: T-cond",
+        policy=POLICY,
+        pr_project=PrProject(None, "incomplete", ("app",)),
+    )
+    assert check.outcome is ConditionsOutcome.HOLD
+    assert "incomplete: app" in check.reasons[0]
+    assert check.thread_id == "T-cond"
+    assert chat.reads == []
+
+
+@pytest.mark.anyio
+async def test_a_qualified_id_needs_no_pr_project() -> None:
+    chat = _Chatroom([])
+    await resolve_design_conditions(
+        chat,
+        project="gate",
+        pr_body="Thread: hub/T-cond",
+        policy=POLICY,
+        pr_project=PrProject(None, "none"),
+    )
+    assert [(r["project"], r["thread_id"]) for r in chat.reads] == [("hub", "T-cond")]
+
+
+def test_the_policy_resolves_the_pr_project_from_the_repo_table() -> None:
+    policy = DesignConditionsPolicy(
+        roster=ROSTER, repo_projects=lambda: _map(proj="org/repo", hub="org/hub")
+    )
+    assert policy.pr_project(project="hub", owner="org", repo="repo") == PrProject("proj")
+    assert policy.pr_project(project="hub", owner="org", repo="else").project is None
+    assert policy.pr_project(project="hub", owner=None, repo=None).project is None
+    # Two projects on one repo: unresolved, never the gate's project.
+    shared = DesignConditionsPolicy(
+        roster=ROSTER, repo_projects=lambda: _map(hub="org/repo", proj="org/repo")
+    )
+    assert shared.pr_project(project="hub", owner="org", repo="repo").reason == "multiple"
+    # No table wired: the pre-#525 reading (the gate's project).
+    assert DesignConditionsPolicy(roster=ROSTER).pr_project(
+        project="hub", owner="org", repo="repo"
+    ) == PrProject("hub")
+
+
+def test_an_unreadable_repo_table_resolves_nothing() -> None:
+    def boom() -> Any:
+        raise RuntimeError("sweep.json gone")
+
+    policy = DesignConditionsPolicy(roster=ROSTER, repo_projects=boom)
+    assert policy.pr_project(project="hub", owner="org", repo="repo").project is None
+
+
+@pytest.mark.anyio
+async def test_the_orchestrator_hands_the_prs_repo_to_the_resolver() -> None:
+    """End to end: gate project ``hub``, PR ``org/repo#5`` of ``proj``, bare ``Thread:``."""
+    seen: list[tuple[str, str]] = []
+
+    class _Table:
+        def resolve(self, owner: str, repo: str) -> PrProject:
+            seen.append((owner, repo))
+            return PrProject("proj")
+
+    mcp = _FakeMcp()
+    driver = _RecordingDriver()
+    orch = PrReviewOrchestrator(
+        mcp,
+        driver=driver,  # type: ignore[arg-type]
+        design_conditions=build_policy(
+            {"hub": "issuing"},
+            ROSTER,
+            human_identity="human",
+            repo_projects=lambda: _Table(),  # type: ignore[arg-type,return-value]
+        ),
+    )
+    await orch.fire_pr_review(
+        project="hub", pr_ref="org/repo#5", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+    )
+    resolver = driver.kwargs[0]["design_conditions"]
+    mcp.calls.clear()
+    await resolver("Thread: T-cond")
+    assert seen == [("org", "repo")]
+    reads = [(a["project"], a["thread_id"]) for n, a in mcp.calls if n == "chatroom_get_thread"]
+    assert reads == [("proj", "T-cond")]

@@ -20,6 +20,7 @@ import asyncio
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Never
 
 import pytest
@@ -59,6 +60,7 @@ class _StubSettings:
     def __init__(self, roster: dict[str, Role]) -> None:
         self.conductor = _StubConductorConfig(roster)
         self.naysayer_gating = _StubNaysayerGating()
+        self.paths = SimpleNamespace(config_dir=Path("unused-config-dir"))
 
 
 class _FakeDriver:
