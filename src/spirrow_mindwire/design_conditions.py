@@ -393,17 +393,11 @@ class DesignConditionsPolicy:
     modes: Mapping[str, str] = field(default_factory=dict)
     roster: Mapping[str, Role] = field(default_factory=dict)
     human_identity: str = "human"
-    #: The ``owner/repo -> project`` table (:mod:`.repo_projects`), read at call time. ``None``
-    #: (tests, library callers that wire no table) keeps the pre-#525 reading: the PR is taken to
-    #: belong to the gate's project. Wired in production by ``loop_runner``.
+    #: ``owner/repo -> project`` (:mod:`.repo_projects`); ``None``: the PR is the gate's project.
     repo_projects: Callable[[], RepoProjectMap] | None = None
 
     def pr_project(self, *, project: str, owner: str | None, repo: str | None) -> PrProject:
-        """The project the PR's repo belongs to — NOT the gate's project (PR #525 gate RC).
-
-        No table wired: the gate's project (legacy). A table that raises, an unknown repo, or a
-        repo the table cannot resolve uniquely: unresolved, so an unqualified id gets no project.
-        """
+        """The PR repo's project, not the gate's (#525 RC); unresolvable: no project."""
         if self.repo_projects is None:
             return PrProject(project)
         if owner is None or repo is None:
@@ -422,11 +416,7 @@ class DesignConditionsPolicy:
         pr_owner: str | None = None,
         pr_repo: str | None = None,
     ) -> ConditionsResolver | None:
-        """``None`` when ``project`` never enabled the setting — the gate then builds no check.
-
-        ``project`` is the gate's project (whose setting applies). ``pr_owner`` / ``pr_repo`` name
-        the PR's repo, from which the PR's own project is resolved for unqualified ids.
-        """
+        """``None`` when ``project`` never enabled the setting — the gate then builds no check."""
         if not mode_for(self.modes, project).verifies:
             return None
         thread_policy = ThreadPolicy(roster=self.roster, human_identity=self.human_identity)
@@ -493,12 +483,7 @@ async def resolve_design_conditions(
 ) -> DesignConditionsCheck:
     """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD.
 
-    ``project`` is the gate's project; ``pr_project`` is the project the PR's REPO belongs to
-    (PR #525 gate RC). The link is resolved with ``pr_project`` exactly as the auto-gate resolves
-    it, so ``Thread: hub/T-1`` + ``Closes-thread: T-1`` on a PR of another project is ambiguous
-    here too. When ``pr_project`` is unresolved an unqualified id stays unresolved: beside a
-    qualified one it is ambiguous, and alone it is a HOLD (nothing guesses its project). ``None``
-    keeps the pre-#525 reading (the PR belongs to the gate's project).
+    ``pr_project`` is the PR repo's project (``project`` is the gate's), as in the auto-gate.
     """
     if pr_body is None:
         return _hold("the PR body could not be read, so its design thread is unknown")

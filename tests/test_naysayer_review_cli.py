@@ -60,7 +60,6 @@ class _StubSettings:
     def __init__(self, roster: dict[str, Role]) -> None:
         self.conductor = _StubConductorConfig(roster)
         self.naysayer_gating = _StubNaysayerGating()
-        # The script reads ``<config_dir>/sweep.json`` lazily for the PR-project table (#525).
         self.paths = SimpleNamespace(config_dir=Path("unused-config-dir"))
 
 

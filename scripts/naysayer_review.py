@@ -108,8 +108,6 @@ async def main() -> None:
         settings.naysayer_gating.conditional_proceed,
         settings.conductor.roster,
         human_identity=settings.conductor.human_identity,
-        # The PR's own project for an unqualified ``Thread:`` id (PR #525 gate RC), from the
-        # same ``sweep.json`` table the conductor's gate reads.
         repo_projects=functools.partial(
             load_repo_project_map, settings.paths.config_dir / "sweep.json"
         ),
