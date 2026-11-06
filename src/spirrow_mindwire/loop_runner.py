@@ -93,6 +93,7 @@ from .conductor.core import (
     ConductorStopSnapshot,
     StopReason,
 )
+from .conductor.handoff import conditional_proceed_notice
 from .conductor.retry_notice import RetryOf, parse_retry_of
 from .conductor.run_budget import (
     RunPhase,
@@ -118,6 +119,7 @@ from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .design_conditions import DesignConditionsPolicy
 from .design_conditions import build_policy as build_design_conditions_policy
+from .design_conditions import mode_for as conditional_proceed_mode_for
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
@@ -583,6 +585,18 @@ def _design_conditions_policy(settings: MindwireSettings) -> DesignConditionsPol
         settings.conductor.roster,
         human_identity=settings.conductor.human_identity,
     )
+
+
+def _conditional_proceed_notice(settings: MindwireSettings, project: str) -> str | None:
+    """The naysayer's conditional-exit notice for ``project``, or ``None`` (not offered).
+
+    Offered only while the project's ``[naysayer_gating].conditional_proceed`` is ``issuing``;
+    absent, ``verify_only`` and any unknown value offer nothing (msg-7960 Obj-5-1). The PR gate
+    reads the same key through :func:`_design_conditions_policy` and keeps verifying in every
+    state but absent, so stopping issuance never stops verification.
+    """
+    mode = conditional_proceed_mode_for(settings.naysayer_gating.conditional_proceed, project)
+    return conditional_proceed_notice(mode.issues)
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
@@ -1086,6 +1100,10 @@ def build_conductor(
             # default 3 when this project has no key) and the D-3 continuation ledger.
             continue_cap=_resolve_continue_cap(cond_cfg.continue_cap_for(loop_cfg.project)),
             continuation_ledger_path=resolve_continuation_ledger_path(settings),
+            # T-naysayer-conditional-proceed-on-small-fixmin (PR 2): the naysayer is offered the
+            # conditional exit only while this project's setting is ``issuing``; every other state
+            # (absent, ``verify_only``, unknown) offers nothing (msg-7960 Obj-5-1).
+            conditional_proceed_notice=_conditional_proceed_notice(settings, loop_cfg.project),
             thread_ref=thread_ref,
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,

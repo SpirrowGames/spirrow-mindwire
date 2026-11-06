@@ -51,6 +51,18 @@ _CLOSE_FENCE_RE = re.compile(r"^[ \t]*```.*$", re.MULTILINE)
 ReviewScope = Literal["full", "delta", "full-fallback"]
 _FIX_WEIGHTS = ("small", "large")
 
+# T-naysayer-conditional-proceed-on-small-fixmin: the line that makes a naysayer go conditional.
+# Owned here (the naysayer side) and read by both the round log (T4) and the PR gate
+# (``spirrow_mindwire.design_conditions``), so the one format has one spelling. Anchored at the
+# start of its line, so prose that mentions it inline is not read as the thing itself.
+CONDITIONS_HEADING_RE = re.compile(r"^\s*Conditions \((?P<k>\d+)\):\s*$")
+
+
+def has_conditions_heading(content: str) -> bool:
+    """``True`` when ``content`` carries a ``Conditions (k):`` line of its own."""
+    return any(CONDITIONS_HEADING_RE.match(line) for line in content.splitlines())
+
+
 # ── Rule text (D1) ────────────────────────────────────────────────────────────────────────────
 
 REVIEW_ROUND_RULES = """\
@@ -277,8 +289,13 @@ def log_round(
     scope: ReviewScope,
     counts: RoundCounts | None,
     out_tokens: object,
+    conditional_proceed: bool | None = None,
 ) -> None:
     """D5: one ``naysayer.round`` line per naysayer post, on the operator-side log.
+
+    ``conditional_proceed`` (T4 of T-naysayer-conditional-proceed-on-small-fixmin) is ``1`` when
+    the post carries a ``Conditions (k):`` line, ``0`` when it does not, and ``-`` where the
+    question does not arise (a PR-gate round). Observation only: nothing routes on it.
 
     Naysayer-side facts only (msg-7474 Obj-2-2); the author's ``Obj-`` lines do not exist yet when
     this fires and are read offline by ``scripts/naysayer_round_stats.py``. ``counts`` of ``None``
@@ -290,7 +307,8 @@ def log_round(
 
     logger.info(
         "naysayer.round thread=%s pr=%s backend=%s model=%s round=%s scope=%s blocking=%s "
-        "advisory=%s late=%s late_advisory=%s fix_missing=%s objections_unparsed=%d out_tokens=%s",
+        "advisory=%s late=%s late_advisory=%s fix_missing=%s objections_unparsed=%d out_tokens=%s "
+        "conditional_proceed=%s",
         show(thread),
         show(pr),
         show(backend),
@@ -304,6 +322,7 @@ def log_round(
         show(counts.fix_missing if counts else None),
         0 if counts else 1,
         show(out_tokens),
+        "-" if conditional_proceed is None else int(conditional_proceed),
     )
 
 
@@ -344,12 +363,14 @@ def log_design_round(
         scope=scope_for_design_round(round_number),
         counts=counts,
         out_tokens=out_tokens,
+        conditional_proceed=has_conditions_heading(body),
     )
 
 
 __all__ = [
     "AUTHOR_OBJECTION_LINE_RULE",
     "AUTHOR_OBJECTION_LINE_RULE_PR",
+    "CONDITIONS_HEADING_RE",
     "DESIGN_OBJECTION_FORMAT",
     "OBJECTIONS_SENTINEL",
     "OBJECTION_ELEMENT_KEYS",
@@ -360,6 +381,7 @@ __all__ = [
     "RoundCounts",
     "count_round",
     "facts_from_element",
+    "has_conditions_heading",
     "log_design_round",
     "log_round",
     "read_objection_block",

@@ -633,31 +633,99 @@ def test_inline_mentions_of_the_formats_are_not_markers() -> None:
 # ─── the scoped hand-run driver (no chatroom): fail-closed where the setting is in use ──────
 
 
-def test_the_scoped_driver_caps_its_approve_where_the_setting_is_in_use() -> None:
-    """Parsed, never imported: ``scripts/`` is not a package (as in test_scoped_driver_marker).
+def _load_scoped_driver() -> Any:
+    """Import ``scripts/naysayer_review_scoped.py`` for real (``scripts/`` is not a package).
 
-    It cannot be imported today anyway — on origin/main it already imports a name
-    (``_DEFAULT_MAX_TOKENS``) that ``pr_review`` no longer defines. What is pinned here is that
-    the APPROVE it would post passes through the conditions cap, and that unreadable settings
-    count as "in use".
+    PR 1 could only parse it: on origin/main it imported ``_DEFAULT_MAX_TOKENS``, a name
+    ``pr_review`` no longer defines, so the fail-closed cap below had never been able to run.
     """
-    import ast
+    import importlib.util
     from pathlib import Path
 
     path = Path(__file__).resolve().parent.parent / "scripts" / "naysayer_review_scoped.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    funcs = {
-        n.name: n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
-    }
-    probe = funcs["_conditional_proceed_configured"]
-    handlers = [n for n in ast.walk(probe) if isinstance(n, ast.ExceptHandler)]
-    assert handlers and all(
-        isinstance(h.body[-1], ast.Return)
-        and isinstance(h.body[-1].value, ast.Constant)
-        and h.body[-1].value.value is True
-        for h in handlers
+    spec = importlib.util.spec_from_file_location("naysayer_review_scoped_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_scoped_driver_imports() -> None:
+    module = _load_scoped_driver()
+    assert callable(module.main)
+
+
+class _ScopedLexora:
+    def __init__(self, **_: Any) -> None:
+        pass
+
+    async def chat_completion(self, **_: Any) -> Any:
+        from spirrow_mindwire.lexora.client import ChatCompletion
+
+        body = "Looks fine.\n\n<!-- mindwire:objections v1 -->\n[]\n\nVERDICT: APPROVE"
+        return ChatCompletion(body, None, "stop", "m", {"completion_tokens": 7})
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _ScopedGitHub:
+    submitted: list[ReviewEvent]
+
+    def __init__(self, *_: Any) -> None:
+        self.submitted = []
+        _ScopedGitHub.last = self
+
+    async def fetch_ci_status(self, _pr: PrRef) -> CiStatus:
+        return CiStatus(state=CiState.SUCCESS, head_sha="abc123", failing=[])
+
+    async def fetch_pr_diff(self, _pr: PrRef) -> str:
+        return "diff --git a/x b/x\n+one line\n"
+
+    async def submit_review(self, _pr: PrRef, *, event: ReviewEvent, body: str) -> None:
+        self.submitted.append(event)
+
+    async def aclose(self) -> None:
+        pass
+
+    last: _ScopedGitHub
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({"spirrow-playproof": "issuing"}, ReviewEvent.COMMENT),
+        ({"spirrow-playproof": "verify_only"}, ReviewEvent.COMMENT),
+        ({}, ReviewEvent.APPROVE),
+        (None, ReviewEvent.COMMENT),  # unreadable settings count as "in use"
+    ],
+)
+def test_the_scoped_driver_caps_its_approve_where_the_setting_is_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    settings: dict[str, str] | None,
+    expected: ReviewEvent,
+) -> None:
+    """The real ``main()``: the model says APPROVE, CI is green; what reaches GitHub?"""
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+
+    module = _load_scoped_driver()
+
+    def load_settings() -> Any:
+        if settings is None:
+            raise RuntimeError("settings unreadable")
+        return SimpleNamespace(naysayer_gating=SimpleNamespace(conditional_proceed=settings))
+
+    scope = tmp_path / "scope.txt"
+    scope.write_text("only this", encoding="utf-8")
+    monkeypatch.setattr(module, "load_settings", load_settings)
+    monkeypatch.setattr(module, "LexoraClient", _ScopedLexora)
+    monkeypatch.setattr(module, "GitHubClient", _ScopedGitHub)
+    monkeypatch.setattr(module, "naysayer_github_token", lambda: "token")
+    monkeypatch.setattr(
+        sys, "argv", ["naysayer_review_scoped.py", "--pr", "o/r#1", "--scope-file", str(scope)]
     )
-    main_src = ast.unparse(funcs["main"])
-    assert "_conditional_proceed_configured()" in main_src
-    assert "_SCOPED_CONDITIONS_HOLD.cap(decision.gate_verdict)" in main_src
-    assert main_src.index("_SCOPED_CONDITIONS_HOLD") < main_src.index("submit_review")
+    asyncio.run(module.main())
+    assert _ScopedGitHub.last.submitted == [expected]
