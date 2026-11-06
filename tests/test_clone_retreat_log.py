@@ -202,6 +202,84 @@ def test_failed_record_keeps_branch_and_detail(tmp_path: Path) -> None:
     assert "could not switch back" in render_notice(row)
 
 
+_CLEANED_CLAIM = "not in the working tree"
+_INSPECT_CLAIM = "Inspect the current clone state"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "kw"),
+    [
+        (
+            RetreatOutcome.FAILED,
+            {
+                "branch": "wip/T-sample-x",
+                "pushed": True,
+                "files": 1,
+                "insertions": 1,
+                "deletions": 0,
+                "detail": "committed to wip/T-sample-x but could not switch back to main",
+            },
+        ),
+        (RetreatOutcome.FAILED, {"detail": "CalledProcessError: git add failed"}),
+        (
+            RetreatOutcome.DISCARD_INCOMPLETE,
+            {
+                "patch": "state/x.patch",
+                "untracked": "state/x.untracked.txt",
+                "marker": "MERGE_HEAD",
+            },
+        ),
+    ],
+)
+def test_incomplete_cleanup_notice_does_not_claim_the_clone_is_clean(
+    outcome: RetreatOutcome, kw: dict[str, Any], tmp_path: Path
+) -> None:
+    """PR-gate #526 objection 1: a failed / incomplete cleanup must not say the work is gone."""
+    row = build_record(_result(outcome, **kw), repo_dir=tmp_path, head_msg="msg-9", stop_reason="x")
+    assert row is not None
+    text = render_notice(row)
+    assert _CLEANED_CLAIM not in text
+    assert "cleaned it up" not in text
+    assert "attempted to clean it up" in text
+    assert _INSPECT_CLAIM in text
+    # The inspection instruction comes before the recovery locations.
+    first_location = min(
+        i
+        for i in (text.find("- branch:"), text.find("- patch:"), text.find("- outcome:"))
+        if i >= 0
+    )
+    assert text.find(_INSPECT_CLAIM) < first_location
+
+
+@pytest.mark.parametrize(
+    ("outcome", "kw"),
+    [
+        (
+            RetreatOutcome.RETREATED,
+            {
+                "branch": "wip/T-sample-x",
+                "pushed": True,
+                "files": 1,
+                "insertions": 1,
+                "deletions": 0,
+            },
+        ),
+        (
+            RetreatOutcome.DISCARDED,
+            {"patch": "state/x.patch", "untracked": "state/x.untracked.txt"},
+        ),
+    ],
+)
+def test_completed_cleanup_notice_says_the_work_is_saved_elsewhere(
+    outcome: RetreatOutcome, kw: dict[str, Any], tmp_path: Path
+) -> None:
+    row = build_record(_result(outcome, **kw), repo_dir=tmp_path, head_msg="msg-9", stop_reason="x")
+    assert row is not None
+    text = render_notice(row)
+    assert _CLEANED_CLAIM in text
+    assert _INSPECT_CLAIM not in text
+
+
 def test_record_write_failure_does_not_change_the_exit_code(
     clone: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -404,6 +482,8 @@ async def test_record_is_delivered_once(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_a_newer_record_is_delivered_after_an_older_one(tmp_path: Path) -> None:
+    # Both records are written with no clock tick between them, as on Windows' coarse clock:
+    # the newer one must still be pending after the older one is delivered.
     log = tmp_path / CLONE_RETREAT_LOG_FILENAME
     _write(log, _retreated())
     await _run(log)
@@ -506,3 +586,14 @@ async def test_routing_is_unchanged_by_the_record(
     assert without == with_record
     # Nothing is posted to the thread because of the record (option (b)).
     assert m0.writes == m1.writes
+
+
+def test_records_with_the_same_timestamp_get_distinct_ids(tmp_path: Path) -> None:
+    at = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
+    rows = [
+        build_record(_retreated(), repo_dir=tmp_path, head_msg="msg-9", stop_reason="x", at=at)
+        for _ in range(2)
+    ]
+    assert rows[0] is not None and rows[1] is not None
+    assert rows[0]["at"] == rows[1]["at"]
+    assert rows[0]["record_id"] != rows[1]["record_id"]

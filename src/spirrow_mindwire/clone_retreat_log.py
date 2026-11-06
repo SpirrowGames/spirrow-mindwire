@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,7 +96,10 @@ def build_record(
     stamp = _now_iso(at)
     return {
         "kind": RETREAT_KIND,
-        "record_id": f"{result.thread_id}@{stamp}",
+        # The uuid suffix keeps two records of one thread distinct when the clock gives them the
+        # same timestamp (Windows' coarse clock does, within one tick), so a newer record is
+        # never mistaken for an already-delivered one.
+        "record_id": f"{result.thread_id}@{stamp}#{uuid.uuid4().hex[:12]}",
         "at": stamp,
         "thread_id": result.thread_id,
         "repo_dir": str(repo_dir),
@@ -197,11 +201,35 @@ def _outcome_line(record: dict[str, Any]) -> str:
     return f"{outcome} ({record.get('detail') or 'no detail'})"
 
 
+# Outcomes after which the clone is known to be clean again (the cleanup completed).
+CLEANED_OUTCOMES = frozenset({"retreated", "discarded"})
+
+
+def _opening_state(record: dict[str, Any]) -> str:
+    """What the notice may assert about the clone: only a completed cleanup says the work is gone.
+
+    For ``failed`` / ``discard_incomplete`` (or any outcome this module does not know) the
+    cleanup was only attempted, so the clone may still be on the wip/ branch or still hold the
+    changes: the notice says so and sends the implementer to inspect the clone first.
+    """
+    if record.get("outcome") in CLEANED_OUTCOMES:
+        return (
+            "The wrapper cleaned it up after that launch, so your work from then is not in the "
+            "working tree; it is saved where the lines below say."
+        )
+    return (
+        "The wrapper attempted to clean it up after that launch, but the cleanup did not "
+        "complete, so the clone may still be on another branch or still hold that work. "
+        "Inspect the current clone state (`git status`, `git branch --show-current`, "
+        "`git log -1`) before recovering anything below."
+    )
+
+
 def render_notice(record: dict[str, Any]) -> str:
     """The prompt block for one ``retreat`` row. Information for the turn, not a rule."""
     lines = [
-        f"{NOTICE_TAG} A previous launch on this thread left the shared clone dirty, and the "
-        f"wrapper cleaned it up after that launch. Your work from then is not in the working tree.",
+        f"{NOTICE_TAG} A previous launch on this thread left the shared clone dirty. "
+        f"{_opening_state(record)}",
         f"- when: {record.get('at')}  head msg: {record.get('head_msg')}  "
         f"stop reason: {record.get('stop_reason')}",
         f"- repo: {record.get('repo_dir')}",
@@ -251,6 +279,7 @@ def load_pending_notice(path: Path | None, thread_id: str) -> PendingNotice | No
 
 
 __all__ = [
+    "CLEANED_OUTCOMES",
     "CLONE_RETREAT_LOG_FILENAME",
     "DELIVERED_KIND",
     "NOTICE_TAG",
