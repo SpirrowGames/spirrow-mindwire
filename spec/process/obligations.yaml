@@ -732,3 +732,21 @@ obligations:
     body_sha256: f7d5642383fc31895a51a20835d19ad3af243d68eda8cf2c2a002cfdf5d5557c
     body: |
       LEAVE THE SHARED CLONE CLEAN AND ON THE DEFAULT BRANCH AT THE END OF EVERY TURN. The working directory you run in is shared by every thread and every role, and before each dispatch the loop refuses to start anyone in it unless it is clean (no tracked, staged, unmerged or non-ignored untracked changes, no merge / rebase / cherry-pick / revert part-way through) and HEAD is on the default branch (`origin/HEAD`'s target, `main` if that ref is absent). So, as the last thing you do in a turn: commit any work you want to keep to your own feature branch (push it if it should survive this host), then `git switch` back to the default branch. Do not leave uncommitted edits, scratch files in the working tree, or HEAD on your feature branch. `.mindwire/` is written by the loop, and the loop keeps it git-ignored in every clone (through the clone's `info/exclude`): do not commit, delete, or edit it, and do not treat it as a scratch file to tidy away. Work that spans several turns resumes by switching to your feature branch again at the start of the next turn. Never `stash`, `reset --hard` or `clean` to get there: that is how WIP is lost, and history rewriting is Tier-C anyway. If you cannot reach a clean default-branch state without discarding something, stop and say so in your reply; the next dispatch will refuse the clone and an operator decides.
+
+  - id: OBL-DESIGN-CONDITIONS
+    role: implementer
+    # Net-new formulation (no origin). T-naysayer-conditional-proceed-on-small-fixmin: D3 (Bohr
+    # msg-7950), the PR body section and the `not applied` hand-back to the naysayer (msg-7952
+    # Obj-1-1 / Obj-1-2), the canonical source = the go's objections block (msg-7952 Obj-1-4),
+    # one PR per go and `not applied — split` (msg-7956 Obj-3-1); endorsed by Einstein msg-7961.
+    # The formats are the ones the PR gate reads (src/spirrow_mindwire/design_conditions.py)
+    # and the naysayer is taught (conductor/handoff.py NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE).
+    # Basis for placing it here: ADR-2026-05-29-13 (see the header) — a named, extractable entry
+    # beside OBL-READBACK-*, which it does not touch.
+    body_sha256: a73c8e4659dec057f09d7df871ec849c1582e3bd333c85615e02b6dcafffa61a
+    body: |
+      DESIGN CONDITIONS FROM A CONDITIONAL GO: if the naysayer's go that handed you this work carries a line `Conditions (k):` followed by k lines `Cond-<r>-<n>`, that go is conditional. Each id names objection <n> of the objections block in that same post, and that objection's `fix_min` is a condition you must apply; the go's objections block is the one source of each condition's text. A go without that line carries no conditions and this obligation does not apply.
+      (1) Apply every condition, and do all the work of the go in one pull request: do not split the conditions across PRs. The PR gate checks every PR of the thread against every condition.
+      (2) In that PR's body keep the `Thread:` line and add a section headed exactly `## Design conditions`. Under it put one line per condition, `Cond-<r>-<n>: <its fix_min, copied verbatim from the go's objections block> — applied: <file, place or test name>`: k lines in total, and no other line in the section that starts with `Cond-`. The PR gate reads the go from the thread and checks these lines against it; a missing, extra or reworded line holds the PR.
+      (3) If a condition cannot be applied as written — it conflicts with what a human decided or with the design's intent, or what you copied does not match the go — do not apply it and do not settle the design yourself: reply in the thread with `Cond-<r>-<n>: not applied — <reason>` and hand to the naysayer (`NEXT: <naysayer persona>`). The naysayer decides what happens to it.
+      (4) If the work cannot fit one pull request (the measured diff exceeds the gate's warn threshold), do not split it, whatever the size rule says for ordinary work: reply with `Cond-<r>-<n>: not applied — split` for the conditions concerned and hand to the naysayer the same way.

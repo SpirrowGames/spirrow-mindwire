@@ -120,3 +120,34 @@ transport は judge ではない（ADR-05 §5）ので本決定は独立性に�
 - **(+)** 独立性は分布差で担保され、full context 注入と両立（元設計の意図に整合）。
 - **(−)** orchestrator 層の複雑性が増える（relay / context 組み立て / 召喚タイミング）。N-1/N-2 で最小実装を設計。
 - **(−)** design-time に独立 review を挟む分、収束までの latency が増えうる（原則3で過剰反対を抑え、advisory で進行を止めない設計で緩和）。
+---
+
+## 追記（2026-11-06）: 条件付き proceed — naysayer の第 3 の出口と、その PR-gate 照合
+
+- **由来**: `T-naysayer-conditional-proceed-on-small-fixmin`（operator 起票 msg-7949 = Takahito 指示、設計 Bohr msg-7950 → msg-7960、Einstein go msg-7961、PR 2 の範囲 msg-7979 / Einstein 支持）。実装 = PR #520（PR-gate 側の照合）と、その後の PR（naysayer の出口・`OBL-DESIGN-CONDITIONS`・本追記）。
+- **変えないもの**: conductor のルーティング、design→implement の Tier-C gate（guard (i)、その carve-out の条件）、human による main merge。コードへ進めるかを決めるのは今までどおり naysayer の `NEXT:` だけで、conductor は objections JSON を読んでルーティングしない。canonical principles（`spec/NAYSAYER_PRINCIPLES.md`）も変えない。
+- **足したもの（naysayer の判断基準）**: 残る blocking objection がすべて small で `fix_min` が一つに決まり、受入基準・スコープ・テスト境界・公開 interface を変えず、human の決定や proposer が退けた案と衝突せず、Tier-C 型でないとき、naysayer は proposer に差し戻す代わりに、その objection を条件として implementer に渡せる（`Conditions (k):` + `Cond-<round>-<n>`、本文は同じ投稿の objections block の `fix_min` が唯一の正本）。条件付き go は 1 thread に 1 回だけ。implementer が `not applied`（`split` を含む）で戻したら、naysayer は通常の差し戻しか Tier-C のどちらかを選び、同じ投稿に `Conditions-aborted: <go の msg-id>` を書く。文面 = `src/spirrow_mindwire/conductor/handoff.py::NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE`、implementer 側 = `spec/process/obligations.yaml::OBL-DESIGN-CONDITIONS`。
+- **足したもの（PR-gate の入力）**: PR body の `Thread:` 行から design thread を読み、下表で判定し、正本の条件と PR body の `## Design conditions` 節を決定論的に照合する（節がない・ID 欠落・`fix_min` 不一致・行数不一致 → REQUEST_CHANGES、読めない → human）。判定の箇所は `src/spirrow_mindwire/design_conditions.py`。上から順に最初に当たった行を適用する:
+
+| # | thread の状態 | PR-gate |
+|---|---|---|
+| 1 | 条件付き go が 2 件以上 | APPROVE にしない（曖昧） |
+| 2 | 無効な `Conditions-aborted:`（author が naysayer でない、ID 不一致、go より前） | APPROVE にしない（曖昧） |
+| 3 | 有効な中止があり、中止より後に有効な go がない | APPROVE にしない（再開待ち） |
+| 4 | 有効な中止があり、中止より後に有効な go がある | 旧 go は無効。条件は照合しない |
+| 5 | 中止がなく、条件付き go の後に有効な go がある | APPROVE にしない（曖昧） |
+| 6 | 中止がなく、条件付き go が 1 件で後続 go がない | それを正本として照合する |
+| 7 | 条件付き go がない | 従来どおり |
+
+- **承認判定に使う設定**: project ごとの `[naysayer_gating].conditional_proceed`。これは観測用ではなく、APPROVE の可否を変える設定である。
+
+| 値 | naysayer への出口の提示 | PR-gate |
+|---|---|---|
+| キーなし | しない | 従来と byte-identical |
+| `issuing` | する | 照合する。Thread 不明の PR は APPROVE にしない |
+| `verify_only` | しない | `issuing` と同じ |
+| それ以外・読めない | しない | 照合する（fail-closed） |
+
+- **運用の契約**: 一度使い始めた project のキーは削除しない。止めるときは `verify_only` にする。PR-gate は状態を持たないので、「キーを消した」と「一度も使っていない」を見分けられない。この 1 点は機械ではなく設定管理の契約で守る。
+- **状態を持たない設計の弱点**: 対応は毎回 PR の `Thread:` 行 → thread → 条件付き go と導き直すので、別 PR の merge や thread の resolve で検証義務は消えない。残る弱点は、`Thread:` 行が誤った thread を指す場合である（書き忘れは上の規則で止まる）。これは既存の auto-gate の `Thread:` 規約と同じ信頼の扱いとする。
+- **Tier-C 該当性**: 内部手順と検証経路の変更であり、cost・goal・irreversible のいずれにも当たらない（Bohr D5、Einstein msg-7961 で異議なし）。

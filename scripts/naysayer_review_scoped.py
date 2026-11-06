@@ -56,9 +56,9 @@ from spirrow_mindwire.lexora.client import (
 )
 from spirrow_mindwire.naysayer.conditions_check import ConditionsOutcome, DesignConditionsCheck
 from spirrow_mindwire.naysayer.pr_review import (
-    _DEFAULT_MAX_TOKENS,
     _DEFAULT_TIMEOUT_SECONDS,
     _PR_REVIEW_SYSTEM_PROMPT,
+    DEFAULT_REVIEW_MAX_TOKENS,
     SCOPED_REVIEW_BODY_MARKER,
     _ci_gate_response,
     _make_diff_view,
@@ -192,7 +192,7 @@ async def main() -> None:
             completion = await lexora.chat_completion(
                 model=NAYSAYER_MODEL_TIER,
                 messages=_build_messages(view.text, pr.slug, scope),
-                max_tokens=_DEFAULT_MAX_TOKENS,
+                max_tokens=DEFAULT_REVIEW_MAX_TOKENS,
             )
         except LexoraTimeoutError as exc:
             print(f"[scoped-naysayer] TIMEOUT (fail-closed REQUEST_CHANGES): {exc}")

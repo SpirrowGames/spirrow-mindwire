@@ -211,6 +211,8 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     blocks = [head]
     if event.review_round_notice:
         blocks.append(event.review_round_notice)
+    if event.conditional_proceed_notice:
+        blocks.append(event.conditional_proceed_notice)
     if history:
         blocks.append(history)
     blocks.append(f"New message from {payload.author}:\n\n{payload.body}")

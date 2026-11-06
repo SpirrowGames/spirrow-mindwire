@@ -1307,6 +1307,70 @@ def build_handoff_protocol_block(role: Role) -> str:
     return f"{_HANDOFF_PROTOCOL_CORE}\n\n{_ROLE_HANDOFF_GUIDANCE[role]}\n"
 
 
+# T-naysayer-conditional-proceed-on-small-fixmin (design Bohr msg-7950 → msg-7960, Einstein's go
+# msg-7961; PR 2 of 2). The naysayer's third exit, "conditional proceed": a go to the implementer
+# that carries the remaining small blocking objections as conditions. It is deliberately NOT part
+# of the static Role.NAYSAYER block above: it is offered per turn, by the conductor, and only
+# when the project's ``[naysayer_gating].conditional_proceed`` is ``issuing``
+# (:func:`conditional_proceed_notice`). Absent / ``verify_only`` / an unknown value → no notice,
+# so the naysayer's prompt is byte-identical to before and the exit simply does not exist
+# (msg-7960 Obj-5-1). The formats below are the ones the PR gate reads
+# (``spirrow_mindwire.design_conditions``): change one, change both.
+NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE = (
+    "CONDITIONAL PROCEED (offered in this project): a third exit, besides handing back to the "
+    "proposer and handing a sound design to the implementer. When every blocking objection you "
+    "raise in this reply is small and its fix is already fully determined, you may hand to the "
+    "implementer with those objections as conditions to apply, instead of handing back to the "
+    "proposer for another round. You may use it only when ALL FIVE of these hold; if any one "
+    "does not, hand back to the proposer as usual:\n"
+    "(1) every blocking objection in this reply has `fix_weight: small` and a non-empty "
+    "`fix_min`;\n"
+    "(2) each `fix_min` admits exactly one way to apply it: the implementer does not have to "
+    "choose between alternatives;\n"
+    "(3) no `fix_min` changes acceptance criteria, scope, a test boundary or a public interface "
+    "(narrowing what will be accepted, or moving where it is tested, is a design change, not a "
+    "condition);\n"
+    "(4) no `fix_min` conflicts with what a human decided in this thread, or re-imposes an "
+    "option the proposer explicitly rejected with `採用=cut` or `採用=own`; such a conflict goes "
+    "through the normal hand-back path, and its two-hand-back bound;\n"
+    "(5) none of them is a Tier-C type: the `TIER-C-CHECK` line below is required as for any "
+    "go.\n"
+    "At most one conditional go per thread, ever: do not issue one in a thread that already "
+    "carries a go to the implementer (conditional or not), and never issue a second one, "
+    "including after an abort. Hand back as usual instead.\n"
+    "Form of a conditional go: your reply carries its objections block as usual (it is the one "
+    "canonical source of each condition's text), and, on lines of their own, `Conditions (k):` "
+    "followed by exactly k lines `Cond-<round>-<n>`, one per blocking objection of this reply "
+    "and none for an advisory one, where <round> is your review round and <n> is the "
+    "objection's 1-based position in the objections array. List the ids only; do not restate "
+    "the `fix_min`. End as any go does: "
+    f"`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` directly above `NEXT: <implementer persona>`."
+    " For example, with two blocking objections in round 3:\n\n"
+    "    Conditions (2):\n"
+    "    Cond-3-1\n"
+    "    Cond-3-2\n\n"
+    "If the implementer hands a condition back to you as `Cond-<r>-<n>: not applied — <reason>` "
+    "(`not applied — split` included), you have exactly two choices: (c) hand back to the "
+    "proposer as an ordinary hand-back, which counts towards the two-hand-back bound, or (d) if "
+    "it is a Tier-C type, hand to the human with the label. In that same reply put, on a line of "
+    "its own, `Conditions-aborted: <msg-id of the conditional go>`, naming that go's msg-id "
+    "exactly. The aborted go's objections return to the ordinary hand-back path; you may not "
+    "drop a condition, replace it with another, or turn it into an unconditional go. Write the "
+    "`Conditions (k):` and `Conditions-aborted:` lines only for these purposes: the PR gate reads "
+    "them from the thread and holds any pull request of a thread where they are ambiguous."
+)
+
+
+def conditional_proceed_notice(issuing: bool) -> str | None:
+    """The per-turn naysayer notice offering the conditional exit, or ``None`` (not offered).
+
+    ``issuing`` is ``ConditionalProceedMode.issues`` for the thread's project: true only for the
+    value ``issuing``. Every other state — key absent, ``verify_only``, an unknown value, an
+    unreadable setting — offers nothing (msg-7960 Obj-5-1: fail towards not issuing).
+    """
+    return NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE if issuing else None
+
+
 def _resolve_participant(roster: Mapping[str, Role], token: str) -> Handoff:
     """Resolve a non-sentinel token: identity name first, then a role name (D1).
 
@@ -1376,6 +1440,7 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 __all__ = [
     "HUMAN_TOKEN",
+    "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
     "NONE_TOKEN",
     "OPERATOR_FORM_EXAMPLE",
     "OPERATOR_TASK_KEYWORD",
@@ -1394,6 +1459,7 @@ __all__ = [
     "StopLine",
     "StopStatus",
     "build_handoff_protocol_block",
+    "conditional_proceed_notice",
     "declares_no_tier_c",
     "declares_tier_c",
     "parse_next_token",

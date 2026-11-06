@@ -47,6 +47,7 @@ from .naysayer.conditions_check import (
     DesignConditionsCheck,
 )
 from .naysayer.pr_review import ObjectionParse, parse_objections
+from .naysayer.review_rounds import CONDITIONS_HEADING_RE, has_conditions_heading
 from .pr_event_advance.auto_gate.decide import resolve_thread_link
 from .value_objects import Role
 
@@ -96,7 +97,6 @@ def mode_for(modes: Mapping[str, str], project: str) -> ConditionalProceedMode:
 # Every marker is anchored at the start of its line, so prose that mentions the format inline
 # (in backticks, mid-sentence) is not read as the thing itself.
 
-CONDITIONS_HEADING_RE = re.compile(r"^\s*Conditions \((?P<k>\d+)\):\s*$")
 _GO_COND_ID_RE = re.compile(r"^\s*(?:[-*]\s+)?(?P<id>Cond-(?P<round>\d+)-(?P<n>\d+))\s*$")
 CONDITIONS_ABORTED_RE = re.compile(r"^\s*Conditions-aborted:\s*(?P<target>\S+)\s*$")
 _SECTION_HEADING_RE = re.compile(r"^##\s+Design conditions\s*$")
@@ -160,10 +160,6 @@ class ThreadVerdict:
     reasons: tuple[str, ...] = ()
     go_msg_id: str = ""
     conditions: tuple[DesignCondition, ...] = ()
-
-
-def _has_conditions_heading(content: str) -> bool:
-    return any(CONDITIONS_HEADING_RE.match(line) for line in content.splitlines())
 
 
 def canonical_conditions(content: str) -> tuple[tuple[DesignCondition, ...], str | None]:
@@ -235,7 +231,7 @@ def evaluate_thread(messages: Sequence[ThreadMessage], policy: ThreadPolicy) -> 
         i
         for i, m in enumerate(messages)
         if policy.is_naysayer(m.author)
-        and _has_conditions_heading(m.content)
+        and has_conditions_heading(m.content)
         and policy.is_valid_go(m.author, m.content)
     ]
     if len(conditional) >= 2:

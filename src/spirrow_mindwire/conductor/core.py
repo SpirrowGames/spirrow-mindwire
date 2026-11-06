@@ -606,6 +606,7 @@ class Conductor:
         resume_notice: ResumeNotice | None = None,
         continue_cap: int = DEFAULT_CONTINUE_CAP,
         continuation_clone_check: Callable[[], None] | None = None,
+        conditional_proceed_notice: str | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -619,6 +620,11 @@ class Conductor:
             )
         self._mcp = mcp
         self._dispatcher = dispatcher
+        # T-naysayer-conditional-proceed-on-small-fixmin (PR 2): the notice offering the
+        # naysayer its conditional exit, built by the caller only when this project's setting is
+        # ``issuing`` (``handoff.conditional_proceed_notice``). Prompt content only: it rides on
+        # naysayer dispatches and is read by nothing that routes (D1, msg-7950).
+        self._conditional_proceed_notice = conditional_proceed_notice
         # T-implementer-self-continuation (Bohr msg-7881 / msg-7887): the per-chain CONTINUE cap and
         # the clone check of condition 4. The check raises DirtyCloneError (CloneGuard.check +
         # check_pushed). ``None`` = not wired: fail-closed, every continuation is refused.
@@ -3561,6 +3567,7 @@ class Conductor:
         resume_notice: str | None = None,
         review_round: int | None = None,
         review_round_notice: str | None = None,
+        conditional_proceed_notice: str | None = None,
     ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
@@ -3596,6 +3603,7 @@ class Conductor:
             resume_notice=resume_notice,
             review_round=review_round,
             review_round_notice=review_round_notice,
+            conditional_proceed_notice=conditional_proceed_notice,
         )
 
     def _review_round(
@@ -3736,6 +3744,9 @@ class Conductor:
                         resume_notice=resume_text,
                         review_round=review_round,
                         review_round_notice=review_round_notice,
+                        conditional_proceed_notice=(
+                            self._conditional_proceed_notice if role is Role.NAYSAYER else None
+                        ),
                     ),
                 )
         except asyncio.CancelledError:
