@@ -27,6 +27,7 @@ from spirrow_mindwire.magickit.client import MagickitMcpError, ThreadResolvedErr
 from spirrow_mindwire.pr_event_advance.auto_gate.__main__ import (
     AutoGateConfigError,
     cap_digest_line,
+    known_projects,
     parse_auto_gate_config,
     parse_remote_url,
 )
@@ -168,6 +169,7 @@ async def _run(
         store=DailyCounterStore(tmp_path / "state" / "auto-gate-daily.json"),
         review_login=_LOGIN,
         now=now,
+        known_projects={"proj"},
     )
 
 
@@ -716,6 +718,7 @@ async def test_one_repos_listing_failure_costs_only_that_repo(tmp_path: Path) ->
         store=DailyCounterStore(tmp_path / "c.json"),
         review_login=_LOGIN,
         now=_NOW,
+        known_projects={"proj"},
     )
     assert report.list_errors[0]["repo"] == "acme/broken"
     assert len(mcp.posts) == 1
@@ -913,3 +916,217 @@ def test_gate_listing_failure_is_loud() -> None:
     )
     with pytest.raises(OpenPrListingError):
         asyncio.run(client.list_open_gate_prs("acme", "widgets"))
+
+
+# ---- project-qualified Thread: / Closes-thread: (msg-8022 / msg-8024 / msg-8025) ---------- #
+
+
+def test_qualified_thread_line_reads_as_a_project_and_id_pair() -> None:
+    link = resolve_thread_link("Thread: spirrow-mindwire/T-n3-route", "spirrow-lexora")
+    assert link.noop is None
+    assert (link.thread_project, link.thread_id) == ("spirrow-mindwire", "T-n3-route")
+    assert link.ids == ("spirrow-mindwire/T-n3-route",)
+
+
+def test_unqualified_thread_line_is_the_prs_own_project() -> None:
+    link = resolve_thread_link("Thread: T-x", "proj")
+    assert (link.thread_project, link.thread_id) == (None, "T-x")
+    assert resolve_thread_link("Thread: T-x").thread_project is None
+
+
+def test_qualified_closes_thread_line_reads_as_a_pair() -> None:
+    link = resolve_thread_link("Closes-thread: spirrow-mindwire/T-1", "spirrow-lexora")
+    assert (link.thread_project, link.thread_id) == ("spirrow-mindwire", "T-1")
+
+
+def test_same_qualified_id_on_both_lines_is_one_link() -> None:
+    body = "Thread: spirrow-mindwire/T-1\nCloses-thread: spirrow-mindwire/T-1"
+    link = resolve_thread_link(body, "spirrow-lexora")
+    assert (link.thread_project, link.thread_id) == ("spirrow-mindwire", "T-1")
+
+
+def test_naming_the_prs_own_project_is_the_same_as_leaving_it_out() -> None:
+    # msg-8025: the PR's own project, qualified or not, is one link.
+    for body in ("Thread: proj/T-1\nCloses-thread: T-1", "Thread: T-1\nCloses-thread: proj/T-1"):
+        link = resolve_thread_link(body, "proj")
+        assert link.noop is None
+        assert (link.thread_project, link.thread_id) == (None, "T-1")
+
+
+def test_qualified_and_unqualified_in_different_projects_are_ambiguous() -> None:
+    # msg-8024: a PR in spirrow-lexora naming spirrow-mindwire/T-1 and a bare T-1 names two threads.
+    body = "Thread: spirrow-mindwire/T-1\nCloses-thread: T-1"
+    link = resolve_thread_link(body, "spirrow-lexora")
+    assert link.noop is AutoGateNoop.AMBIGUOUS
+    assert link.ids == ("spirrow-mindwire/T-1", "T-1")
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Closes-thread:", "Closes-thread: soon", "Closes-thread: T-1 and T-2", "Closes-thread: t-1"],
+)
+def test_closes_thread_line_that_does_not_read_is_unparsed_not_dropped(line: str) -> None:
+    link = resolve_thread_link(f"Thread: T-x\n{line}", "proj")
+    assert link.noop is AutoGateNoop.THREAD_LINE_UNPARSED
+    assert link.unparsed_lines == (line,)
+
+
+def test_doubly_qualified_id_is_not_read_as_a_bare_id() -> None:
+    # Before msg-8022 ``a/b/T-x`` silently became ``T-x`` in the PR's own project.
+    link = resolve_thread_link("Thread: a/b/T-x", "proj")
+    assert link.noop is AutoGateNoop.THREAD_LINE_UNPARSED
+
+
+class ProjectMcp:
+    """A chatroom keyed by (project, thread id), recording every call."""
+
+    def __init__(self, threads: dict[tuple[str, str], list[dict[str, Any]]]) -> None:
+        self.threads = threads
+        self.reads: list[tuple[str, str]] = []
+        self.posts: list[dict[str, Any]] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        key = (arguments["project"], arguments["thread_id"])
+        if name == "chatroom_get_thread":
+            self.reads.append(key)
+            if key not in self.threads:
+                raise MagickitMcpError("thread not found")
+            return {"messages": self.threads[key], "thread": {"status": "active"}}
+        assert name == "chatroom_post_message"
+        self.posts.append(arguments)
+        return {"msg": {"msg_id": "msg-200"}}
+
+
+class OneRepoGh(FakeGh):
+    """Only ``acme/widgets`` has open PRs; every other target lists none."""
+
+    async def list_open_gate_prs(self, owner: str, repo: str) -> GatePrListing:
+        if repo != "widgets":
+            return GatePrListing(prs=(), examined=0)
+        return await super().list_open_gate_prs(owner, repo)
+
+
+def _idle() -> list[dict[str, Any]]:
+    return [_msg("done\n\nNEXT: none")]
+
+
+async def _run_cross(
+    mcp: ProjectMcp,
+    body: str,
+    tmp_path: Path,
+    *,
+    config: AutoGateConfig = _LIVE,
+) -> PassReport:
+    """``proj`` (the PR) and ``hub`` pass this tick; ``held`` is in ``clones`` but held out."""
+    return await run_pass(
+        mcp=mcp,
+        gh=OneRepoGh([_pr(body=body)]),
+        targets=[_TARGET, RepoTarget("hub", "acme", "hub-repo")],
+        config=config,
+        store=DailyCounterStore(tmp_path / "c.json"),
+        review_login=_LOGIN,
+        now=_NOW,
+        known_projects=frozenset({"proj", "hub", "held"}),
+    )
+
+
+async def test_own_project_thread_never_reads_another_project(tmp_path: Path) -> None:
+    mcp = ProjectMcp({("proj", "T-x"): _idle(), ("hub", "T-x"): _idle()})
+    report = await _run_cross(mcp, "Thread: T-x", tmp_path)
+    assert mcp.reads == [("proj", "T-x")]
+    assert [(p["project"], p["thread_id"]) for p in mcp.posts] == [("proj", "T-x")]
+    assert report.posted[0]["thread_id"] == "T-x"
+
+
+async def test_qualified_thread_in_a_passing_project_is_judged_and_posted_there(
+    tmp_path: Path,
+) -> None:
+    mcp = ProjectMcp({("hub", "T-n3"): _idle()})
+    report = await _run_cross(mcp, "Thread: hub/T-n3", tmp_path)
+    assert mcp.reads == [("hub", "T-n3")]
+    assert [(p["project"], p["thread_id"]) for p in mcp.posts] == [("hub", "T-n3")]
+    assert mcp.posts[0]["content"].endswith(f"NEXT: pr-review {_REPO}#7")
+    assert report.fired == 1
+
+
+async def test_qualified_thread_dry_run_reports_the_thread_project(tmp_path: Path) -> None:
+    mcp = ProjectMcp({("hub", "T-n3"): _idle()})
+    report = await _run_cross(mcp, "Thread: hub/T-n3", tmp_path, config=AutoGateConfig())
+    assert mcp.posts == []
+    assert report.decisions == [
+        {
+            "pr_ref": f"{_REPO}#7",
+            "result": "would-fire",
+            "thread_id": "T-n3",
+            "thread_project": "hub",
+        }
+    ]
+
+
+async def test_qualified_thread_in_an_unknown_project_is_skipped_unread(tmp_path: Path) -> None:
+    mcp = ProjectMcp({})
+    report = await _run_cross(mcp, "Thread: nowhere/T-n3", tmp_path)
+    assert mcp.reads == []
+    assert mcp.posts == []
+    assert report.failures == [
+        {
+            "pr_ref": f"{_REPO}#7",
+            "thread_id": "T-n3",
+            "reason": "thread-project-unknown: nowhere",
+            "thread_project": "nowhere",
+        }
+    ]
+
+
+async def test_qualified_thread_in_a_held_project_is_held_and_unread(tmp_path: Path) -> None:
+    mcp = ProjectMcp({("held", "T-n3"): _idle()})
+    report = await _run_cross(mcp, "Thread: held/T-n3", tmp_path)
+    assert mcp.reads == []
+    assert mcp.posts == []
+    assert report.noops == {"thread-project-held": [f"{_REPO}#7"]}
+    assert report.details == [
+        {"pr_ref": f"{_REPO}#7", "reason": "thread-project-held", "thread_project": "held"}
+    ]
+
+
+async def test_qualified_thread_not_found_is_unreadable_without_any_fallback(
+    tmp_path: Path,
+) -> None:
+    # The thread exists only in the PR's own project, while the qualified line names ``hub``.
+    mcp = ProjectMcp({("proj", "T-n3"): _idle()})
+    report = await _run_cross(mcp, "Thread: hub/T-n3", tmp_path)
+    assert mcp.reads == [("hub", "T-n3")]
+    assert mcp.posts == []
+    assert report.failures[0]["reason"].startswith("thread-unreadable:")
+    assert report.failures[0]["thread_project"] == "hub"
+
+
+async def test_unqualified_thread_missing_from_own_project_is_not_searched_for(
+    tmp_path: Path,
+) -> None:
+    mcp = ProjectMcp({("hub", "T-n3"): _idle()})
+    report = await _run_cross(mcp, "Thread: T-n3", tmp_path)
+    assert mcp.reads == [("proj", "T-n3")]
+    assert report.failures[0]["reason"].startswith("thread-unreadable:")
+
+
+async def test_other_read_errors_in_a_named_project_fail_closed(tmp_path: Path) -> None:
+    class Down(ProjectMcp):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            if name == "chatroom_get_thread":
+                self.reads.append((arguments["project"], arguments["thread_id"]))
+                raise MagickitMcpError("timeout")
+            return await super().call_tool(name, arguments)
+
+    mcp = Down({})
+    report = await _run_cross(mcp, "Thread: hub/T-n3", tmp_path)
+    assert mcp.reads == [("hub", "T-n3")]
+    assert mcp.posts == []
+    assert report.failures[0]["reason"] == "thread-unreadable: timeout"
+
+
+def test_known_projects_is_every_clones_key_held_or_not() -> None:
+    sweep = {"clones": {"proj": "C:/a", "held": "C:/b"}}
+    assert known_projects(sweep) == frozenset({"proj", "held"})
+    assert known_projects({}) == frozenset()
+    assert known_projects({"clones": ["proj"]}) == frozenset()

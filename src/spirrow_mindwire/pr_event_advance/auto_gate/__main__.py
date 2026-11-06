@@ -110,6 +110,16 @@ def resolve_targets(
     return targets, errors
 
 
+def known_projects(sweep: dict[str, Any]) -> frozenset[str]:
+    """Every project ``clones`` names, held or not: what a qualified ``Thread:`` may point at."""
+    clones = sweep.get("clones")
+    return (
+        frozenset(k for k in clones if isinstance(k, str))
+        if isinstance(clones, dict)
+        else frozenset()
+    )
+
+
 def cap_digest_line(report: PassReport, now: datetime) -> str | None:
     """The digest's line for a capped day: today's or yesterday's, as the digest is daily."""
     if report.capped_on is None:
@@ -138,6 +148,7 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             store=DailyCounterStore(args.state_file),
             review_login=load_settings().naysayer_gating.review_login,
             now=now,
+            known_projects=known_projects(sweep),
         )
     out = report.as_dict()
     if target_errors:

@@ -246,7 +246,9 @@ async def advance_thread(
         # this tick's CI answer is about a different diff — wait for the next tick.
         if status.head_sha and facts.head_sha and status.head_sha.lower() != facts.head_sha.lower():
             ci = CiState.PENDING
-    decision = decide(thread_id=thread_id, tail=tail, pr=facts, ci=ci, proposer=proposer)
+    decision = decide(
+        thread_project=project, thread_id=thread_id, tail=tail, pr=facts, ci=ci, proposer=proposer
+    )
     match decision:
         case Noop(reason=reason):
             return ThreadOutcome(thread_id, "noop", reason.value, pr_ref=tail.pr_ref)

@@ -135,7 +135,9 @@ def _facts(state: PrState) -> PrFacts:
 
 def test_merged_with_closes_thread_naming_this_thread_settles() -> None:
     pr = _facts(_state(PrResolution.CLOSED, merged=True, body=f"x\nCloses-thread: {_THREAD}\n"))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p", thread_id=_THREAD, pr_project="p", pr_ref=_REF, pr=pr, proposer="Bohr"
+    )
     assert post is not None
     assert post.next_line == "NEXT: none"
     assert _MERGE_SHA in post.body
@@ -144,21 +146,32 @@ def test_merged_with_closes_thread_naming_this_thread_settles() -> None:
 @pytest.mark.parametrize("body", ["", "Closes-thread: T-some-other-thread\n"])
 def test_merged_without_closes_thread_for_this_thread_goes_to_the_proposer(body: str) -> None:
     pr = _facts(_state(PrResolution.CLOSED, merged=True, body=body))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p", thread_id=_THREAD, pr_project="p", pr_ref=_REF, pr=pr, proposer="Bohr"
+    )
     assert post is not None
     assert post.next_line == "NEXT: Bohr"
 
 
 def test_closed_unmerged_always_goes_to_the_proposer_even_with_closes_thread() -> None:
     pr = _facts(_state(PrResolution.CLOSED, body=f"Closes-thread: {_THREAD}\n"))
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr")
+    post = lifecycle_post(
+        thread_project="p", thread_id=_THREAD, pr_project="p", pr_ref=_REF, pr=pr, proposer="Bohr"
+    )
     assert post is not None
     assert post.next_line == "NEXT: Bohr"
     assert "close された" in post.body
 
 
 def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
-    post = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=_facts(_MERGED), proposer=None)
+    post = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project="p",
+        pr_ref=_REF,
+        pr=_facts(_MERGED),
+        proposer=None,
+    )
     assert post is not None
     lines = post.next_line.splitlines()
     assert len(lines) == 3
@@ -173,7 +186,17 @@ def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
     ids=["open", "not-found", "unknown"],
 )
 def test_open_or_unknown_pr_has_no_post(pr: PrFacts) -> None:
-    assert lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer="Bohr") is None
+    assert (
+        lifecycle_post(
+            thread_project="p",
+            thread_id=_THREAD,
+            pr_project="p",
+            pr_ref=_REF,
+            pr=pr,
+            proposer="Bohr",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("state", [_MERGED, _CLOSED], ids=["merged", "closed"])
@@ -186,8 +209,12 @@ def test_decide_rows_3_and_4_are_exactly_lifecycle_post(
         "pr-gate-relay", f"{render_relay_heading(_REF, _HEAD)}\n\nVERDICT: approve\n\nNEXT: human"
     )
     pr = _facts(state)
-    got = decide(thread_id=_THREAD, tail=tail, pr=pr, ci=None, proposer=proposer)
-    assert got == lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=pr, proposer=proposer)
+    got = decide(
+        thread_project="p", thread_id=_THREAD, tail=tail, pr=pr, ci=None, proposer=proposer
+    )
+    assert got == lifecycle_post(
+        thread_project="p", thread_id=_THREAD, pr_project="p", pr_ref=_REF, pr=pr, proposer=proposer
+    )
 
 
 def test_pr_facts_of_is_still_reexported_by_the_runner() -> None:
@@ -239,7 +266,14 @@ async def test_settled_pr_posts_the_fact_once_and_never_reaches_admission(
     assert len(mcp.posts) == 1
     posted = mcp.posts[0]
     assert posted["author"] == PR_EVENT_RELAY_AUTHOR
-    expected = lifecycle_post(thread_id=_THREAD, pr_ref=_REF, pr=_facts(state), proposer="Bohr")
+    expected = lifecycle_post(
+        thread_project="p",
+        thread_id=_THREAD,
+        pr_project="p",
+        pr_ref=_REF,
+        pr=_facts(state),
+        proposer="Bohr",
+    )
     assert expected is not None
     assert posted["content"] == expected.render()
     assert outcome.last_msg_id == mcp._messages[-1]["msg_id"]

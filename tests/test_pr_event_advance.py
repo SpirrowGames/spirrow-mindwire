@@ -92,7 +92,7 @@ def _pr(state: str, *, head: str | None = _HEAD, body: str = "") -> PrFacts:
 def _decide(
     tail: Any, pr: PrFacts, ci: CiState | None = None, proposer: str | None = "Bohr"
 ) -> Noop | Post:
-    return decide(thread_id=_THREAD, tail=tail, pr=pr, ci=ci, proposer=proposer)
+    return decide(thread_project="p", thread_id=_THREAD, tail=tail, pr=pr, ci=ci, proposer=proposer)
 
 
 # --------------------------------------------------------------------------- R1: the 9 rows
@@ -275,10 +275,10 @@ def test_row9_unexpected_state_does_nothing(state: str) -> None:
 
 
 def test_closes_thread_is_line_anchored() -> None:
-    assert closes_thread(f"Closes-thread: {_THREAD}", _THREAD)
-    assert closes_thread(f"a\nCloses-thread: T-x\nCloses-thread: {_THREAD}\n", _THREAD)
-    assert not closes_thread(f"see Closes-thread: {_THREAD}", _THREAD)
-    assert not closes_thread(f"Closes-thread: {_THREAD}-v2", _THREAD)
+    assert closes_thread(f"Closes-thread: {_THREAD}", "p", _THREAD, "p")
+    assert closes_thread(f"a\nCloses-thread: T-x\nCloses-thread: {_THREAD}\n", "p", _THREAD, "p")
+    assert not closes_thread(f"see Closes-thread: {_THREAD}", "p", _THREAD, "p")
+    assert not closes_thread(f"Closes-thread: {_THREAD}-v2", "p", _THREAD, "p")
 
 
 # --------------------------------------------------------------------------- R13: totality
@@ -794,3 +794,34 @@ async def test_row2b_tick_writes_nothing_then_the_implementer_report_ends_it(mer
     assert second.as_dict()["posted"] == 0
     assert second.outcomes[0].reason == NoopReason.NOT_RELAY_TAIL.value
     assert gh.ci_reads == 0
+
+
+# ---- project-qualified Closes-thread (T-gate-fires-on-pr-open, msg-8024 §2 / §4) ---------- #
+
+
+@pytest.mark.parametrize(
+    ("body", "pr_project", "expected"),
+    [
+        # Unqualified: exactly as before, when the PR's project is this thread's.
+        (f"Closes-thread: {_THREAD}", "p", True),
+        # Qualified with this thread's project: closes, whichever repo the PR is in.
+        (f"Closes-thread: p/{_THREAD}", "q", True),
+        (f"Closes-thread: p/{_THREAD}", "p", True),
+        # Qualified with another project: not this thread.
+        (f"Closes-thread: q/{_THREAD}", "p", False),
+        # Unqualified from a PR of another project names that project's thread, not this one.
+        (f"Closes-thread: {_THREAD}", "q", False),
+        # A value that does not read is never a close.
+        (f"Closes-thread: a/b/{_THREAD} trailing", "p", False),
+    ],
+)
+def test_closes_thread_compares_project_and_id(body: str, pr_project: str, expected: bool) -> None:
+    assert closes_thread(body, "p", _THREAD, pr_project) is expected
+
+
+def test_row3_merged_closes_thread_naming_another_project_goes_to_the_proposer() -> None:
+    other = _decide(_tail(), _pr("merged", body=f"Closes-thread: other/{_THREAD}"))
+    assert isinstance(other, Post) and other.next_line == "NEXT: Bohr"
+    # _decide runs in project "p": naming it explicitly settles, as the bare id does.
+    mine = _decide(_tail(), _pr("merged", body=f"Closes-thread: p/{_THREAD}"))
+    assert isinstance(mine, Post) and mine.next_line == "NEXT: none"

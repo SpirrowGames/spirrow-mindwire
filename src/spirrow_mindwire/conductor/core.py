@@ -3558,7 +3558,12 @@ class Conductor:
         except RoleResolutionError:
             proposer = None
         post = lifecycle_post(
-            thread_id=self._thread_ref.thread_id, pr_ref=pr.slug, pr=facts, proposer=proposer
+            thread_project=self._thread_ref.project_id,
+            thread_id=self._thread_ref.thread_id,
+            pr_project=self._thread_ref.project_id,  # no repo -> project map here (lifecycle_post)
+            pr_ref=pr.slug,
+            pr=facts,
+            proposer=proposer,
         )
         if post is None:
             return None

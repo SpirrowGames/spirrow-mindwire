@@ -30,6 +30,7 @@ from spirrow_mindwire.design_conditions import (
     design_conditions_section,
     evaluate_thread,
     mode_for,
+    resolve_design_conditions,
 )
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError
@@ -729,3 +730,23 @@ def test_the_scoped_driver_caps_its_approve_where_the_setting_is_in_use(
     )
     asyncio.run(module.main())
     assert _ScopedGitHub.last.submitted == [expected]
+
+
+# ---- a project-qualified ``Thread:`` line (T-gate-fires-on-pr-open, msg-8022 / msg-8024) ---- #
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body", "read_in"),
+    [
+        ("Thread: spirrow-mindwire/T-cond", "spirrow-mindwire"),
+        (f"Thread: {PROJECT}/T-cond", PROJECT),
+        ("Thread: T-cond", PROJECT),
+    ],
+)
+async def test_qualified_thread_line_is_read_in_the_project_it_names(
+    body: str, read_in: str
+) -> None:
+    chat = _Chatroom([])
+    await resolve_design_conditions(chat, project=PROJECT, pr_body=body, policy=POLICY)
+    assert [(r["project"], r["thread_id"]) for r in chat.reads] == [(read_in, "T-cond")]

@@ -116,8 +116,88 @@ _VERDICT_HEADING_RE = re.compile(
 _ADMISSION_HEADING_RE = re.compile(r"^PR-gate admission(?:\s*\([^)]*\))?\s*[—-]\s*(?P<ref>\S+)\s*$")
 _HEADING_RES = (_VERDICT_HEADING_RE, _ADMISSION_HEADING_RE)
 
-#: ``Closes-thread: <thread_id>`` at the start of a line of the PR body. Several are allowed.
-_CLOSES_THREAD_RE = re.compile(r"^Closes-thread:[ \t]*(T-\S+)[ \t]*\r?$", re.MULTILINE)
+#: The project qualifier of ``[<project>/]T-...`` (T-gate-fires-on-pr-open, Bohr msg-8022 /
+#: msg-8024): the same spelling as the protocol trigger ``thread:<project>/<thread-id>``.
+_PROJECT_PART = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+#: One ``[<project>/]T-...`` inside a ``Thread:`` line (msg-7493 / msg-7495 id grammar). ``/`` is
+#: in the lookbehind so ``a/b/T-x`` yields nothing rather than ``b/T-x`` or a bare ``T-x``: before
+#: msg-8022 a qualified id silently lost its project here and was looked up in the PR's own.
+THREAD_REF_RE = re.compile(
+    rf"(?<![A-Za-z0-9_/-])(?:(?P<project>{_PROJECT_PART})/)?"
+    r"(?P<id>T-[A-Za-z0-9_-]+)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+)
+#: msg-7493 / msg-7495. Only the keyword ignores case, so ``t-foo`` stays unparsed.
+THREAD_LINE_RE = re.compile(r"^(?i:thread):\s*(?P<rest>.*)$")
+#: ``Closes-thread:`` at the very start of a raw body line, so a ``>`` quote never matches.
+_CLOSES_THREAD_LINE_RE = re.compile(r"^Closes-thread:(?P<rest>[^\r\n]*?)\r?$", re.MULTILINE)
+#: The whole value of a ``Closes-thread:`` line: one ``[<project>/]T-\S+`` and nothing else.
+_CLOSES_THREAD_VALUE_RE = re.compile(rf"(?:(?P<project>{_PROJECT_PART})/)?(?P<id>T-\S+)")
+_BOM = "﻿"
+
+
+@dataclass(frozen=True)
+class ThreadRef:
+    """One ``[<project>/]T-...`` a PR body declares. ``project=None``: the PR's own project."""
+
+    project: str | None
+    thread_id: str
+
+    def resolved(self, pr_project: str | None) -> tuple[str | None, str]:
+        """The ``(project, id)`` pair compared everywhere: unqualified means ``pr_project``."""
+        return (self.project if self.project is not None else pr_project, self.thread_id)
+
+
+@dataclass(frozen=True)
+class ThreadRefs:
+    """Every thread a PR body declares, by line kind, and the lines that declare nothing legible."""
+
+    thread_lines: tuple[ThreadRef, ...] = ()
+    closes: tuple[ThreadRef, ...] = ()
+    unparsed_lines: tuple[str, ...] = ()
+
+
+def body_lines(body: str) -> list[str]:
+    """msg-7489 O6: unify newlines, strip each line, drop quotes. Each line stands alone (O3).
+
+    ``str.strip`` does not remove U+FEFF, so it is stripped explicitly (msg-7485 lists BOM).
+    """
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    lines = (line.strip().strip(_BOM).strip() for line in text.split("\n"))
+    return [line for line in lines if not line.startswith(">")]
+
+
+def _ref(match: re.Match[str]) -> ThreadRef:
+    return ThreadRef(match.group("project"), match.group("id"))
+
+
+def thread_refs(body: str) -> ThreadRefs:
+    """THE parser of ``Thread:`` and ``Closes-thread:`` lines, shared by 1b and 1c (msg-8024 §1).
+
+    Both kinds read ``[<project>/]T-...`` as a :class:`ThreadRef`. Each keeps the line grammar it
+    already had: a ``Thread:`` line is the preprocessed line (:func:`body_lines`) scanned for every
+    id in it; a ``Closes-thread:`` line is anchored on the raw body and holds exactly one value.
+    A ``Closes-thread:`` line whose value does not read goes to ``unparsed_lines`` instead of
+    being dropped in silence, as it was before msg-8024.
+    """
+    thread_lines: list[ThreadRef] = []
+    unparsed: list[str] = []
+    for line in body_lines(body):
+        match = THREAD_LINE_RE.match(line)
+        if match is None:
+            continue
+        found = [_ref(m) for m in THREAD_REF_RE.finditer(match.group("rest"))]
+        if not found:
+            unparsed.append(line)
+        thread_lines.extend(found)
+    closes: list[ThreadRef] = []
+    for match in _CLOSES_THREAD_LINE_RE.finditer(body):
+        value = _CLOSES_THREAD_VALUE_RE.fullmatch(match.group("rest").strip(" \t"))
+        if value is None:
+            unparsed.append(match.group(0).rstrip("\r"))
+        else:
+            closes.append(_ref(value))
+    return ThreadRefs(tuple(thread_lines), tuple(closes), tuple(unparsed))
+
 
 #: The CI states that count as "CI has reached a terminal state". ``UNKNOWN`` is not one: it is
 #: the fail-closed value for a read that did not answer, so it waits like ``PENDING``.
@@ -266,9 +346,13 @@ def needs_ci(tail: RelayTail | None, pr: PrFacts) -> bool:
     return lifecycle_of(pr) is PrLifecycle.OPEN and _same_head(tail.hold_head, pr.head_sha)
 
 
-def closes_thread(pr_body: str, thread_id: str) -> bool:
-    """True iff the PR body declares ``Closes-thread: <thread_id>`` for THIS thread."""
-    return any(match == thread_id for match in _CLOSES_THREAD_RE.findall(pr_body))
+def closes_thread(pr_body: str, thread_project: str, thread_id: str, pr_project: str) -> bool:
+    """True iff the PR body declares ``Closes-thread:`` for THIS thread, its project included.
+
+    An unqualified value names ``pr_project``; a qualified one names its own (msg-8024 §2).
+    """
+    want = (thread_project, thread_id)
+    return any(ref.resolved(pr_project) == want for ref in thread_refs(pr_body).closes)
 
 
 def operator_handoff(thread_id: str) -> str:
@@ -294,7 +378,13 @@ def _heading(pr_ref: str) -> str:
 
 
 def lifecycle_post(
-    *, thread_id: str, pr_ref: str, pr: PrFacts, proposer: str | None
+    *,
+    thread_project: str,
+    thread_id: str,
+    pr_project: str,
+    pr_ref: str,
+    pr: PrFacts,
+    proposer: str | None,
 ) -> Post | None:
     """Rows 3 and 4 alone: a MERGED / CLOSED PR → the :class:`Post`; OPEN or unknown → ``None``.
 
@@ -303,12 +393,17 @@ def lifecycle_post(
     settled PR's fact is written — and where it hands to — lives in exactly one place. The two
     callers take disjoint tails: 1b reads a :data:`RELAY_AUTHOR` heading, the conductor a
     ``NEXT: pr-review <ref>`` nomination, and no relay post ever ends in ``pr-review``.
+
+    ``thread_project`` / ``pr_project`` feed :func:`closes_thread`. Neither caller can map a PR's
+    repo to its project (no ``clones`` table reaches them), so both pass the design thread's own
+    project as ``pr_project``: an unqualified ``Closes-thread:`` keeps meaning "this thread", as
+    it did before msg-8024, and a qualified one settles only when it names this thread's project.
     """
     match lifecycle_of(pr):
         case PrLifecycle.MERGED:  # row 3
             sha = pr.merge_commit_sha or "merge commit 不明"
             body = f"{_heading(pr_ref)}\n\nPR {pr_ref} が merge された（{sha}）。"  # noqa: RUF001 (§F.1.1 wording)
-            if closes_thread(pr.body, thread_id):
+            if closes_thread(pr.body, thread_project, thread_id, pr_project):
                 return Post(body=body, next_line=f"NEXT: {NONE_TOKEN}")
             return Post(body=body, next_line=_to_proposer(thread_id, proposer))
         case PrLifecycle.CLOSED:  # row 4 — the Closes-thread declaration is ignored here
@@ -326,6 +421,7 @@ def lifecycle_post(
 
 def decide(
     *,
+    thread_project: str,
     thread_id: str,
     tail: RelayTail | None,
     pr: PrFacts,
@@ -348,7 +444,14 @@ def decide(
     if tail.merge_self and lifecycle in (PrLifecycle.MERGED, PrLifecycle.CLOSED):
         return Noop(NoopReason.MERGE_OWNED_BY_TURN)  # row 2b
     ref = tail.pr_ref
-    settled = lifecycle_post(thread_id=thread_id, pr_ref=ref, pr=pr, proposer=proposer)
+    settled = lifecycle_post(
+        thread_project=thread_project,
+        thread_id=thread_id,
+        pr_project=thread_project,  # no repo -> project map reaches 1b (see lifecycle_post)
+        pr_ref=ref,
+        pr=pr,
+        proposer=proposer,
+    )
     if settled is not None:  # rows 3 / 4
         return settled
     # Row 9 was excluded above and lifecycle_post answered every settled PR, so this is OPEN.
@@ -369,6 +472,8 @@ def decide(
 
 __all__ = [
     "PR_EVENT_RELAY_AUTHOR",
+    "THREAD_LINE_RE",
+    "THREAD_REF_RE",
     "Decision",
     "Noop",
     "NoopReason",
@@ -376,6 +481,9 @@ __all__ = [
     "PrFacts",
     "PrLifecycle",
     "RelayTail",
+    "ThreadRef",
+    "ThreadRefs",
+    "body_lines",
     "closes_thread",
     "decide",
     "heading_ref",
@@ -386,4 +494,5 @@ __all__ = [
     "pr_facts_of",
     "precheck",
     "read_relay_tail",
+    "thread_refs",
 ]

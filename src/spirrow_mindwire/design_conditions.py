@@ -446,7 +446,7 @@ async def resolve_design_conditions(
     """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD."""
     if pr_body is None:
         return _hold("the PR body could not be read, so its design thread is unknown")
-    link = resolve_thread_link(pr_body)
+    link = resolve_thread_link(pr_body, project)
     if link.thread_id is None:
         return _hold(
             "the PR body names no single design thread (`Thread:` line "
@@ -454,12 +454,16 @@ async def resolve_design_conditions(
             "verifies design conditions, so a PR whose thread is unknown cannot be approved"
         )
     thread_id = link.thread_id
+    # A ``Thread: <project>/T-...`` line is read in the project it names (msg-8022 / msg-8024),
+    # the same rule the auto-gate follows; an unqualified one stays in the gate's project.
+    thread_project = link.thread_project or project
     try:
         payload: Any = await mcp.call_tool(
-            "chatroom_get_thread", {"project": project, "thread_id": thread_id, "mode": "full"}
+            "chatroom_get_thread",
+            {"project": thread_project, "thread_id": thread_id, "mode": "full"},
         )
     except MagickitMcpError as exc:
-        logger.warning("design conditions: cannot read %s/%s: %s", project, thread_id, exc)
+        logger.warning("design conditions: cannot read %s/%s: %s", thread_project, thread_id, exc)
         return _hold(f"the design thread {thread_id} could not be read", thread_id=thread_id)
     raw = payload.get("messages") if isinstance(payload, dict) else None
     if not isinstance(raw, list):
@@ -472,7 +476,7 @@ async def resolve_design_conditions(
     check = check_pr_body(evaluate_thread(messages, policy), pr_body, thread_id=thread_id)
     logger.info(
         "design conditions %s/%s: outcome=%s go=%s conditions=%d reasons=%d",
-        project,
+        thread_project,
         thread_id,
         check.outcome.value,
         check.go_msg_id or "-",
