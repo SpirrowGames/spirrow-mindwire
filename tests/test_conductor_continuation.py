@@ -242,6 +242,11 @@ def _git(repo: Path, *args: str) -> str:
 @pytest.fixture
 def pushed_clone(tmp_path: Path) -> Path:
     """A clone of a bare origin, on main, with a feature branch pushed and tracking."""
+    return build_pushed_clone(tmp_path)
+
+
+def build_pushed_clone(tmp_path: Path) -> Path:
+    """The ``pushed_clone`` fixture's body, callable from other test modules."""
     origin = tmp_path / "origin.git"
     _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
     r = tmp_path / "clone"
@@ -481,6 +486,9 @@ async def test_5b_unwired_clone_check_is_fail_closed() -> None:
         ("ex:\n```\nCONTINUE: x\n`````\ndone\nCONTINUE: real\nNEXT: Heisenberg", "real"),
         # a ``` line with an info string cannot close a fence
         ("Example:\n```\n```text\nCONTINUE: example only\nNEXT: Heisenberg", None),
+        # a ``` run whose info string holds a backtick is not a fence line at all (CommonMark),
+        # so it opens nothing and the declaration below it counts (PR #519 gate advisory, msg-7948)
+        ("ex:\n```a`b\nCONTINUE: real\nNEXT: Heisenberg", "real"),
         # NEXT is the first line: empty walk
         ("NEXT: Heisenberg", None),
         # no NEXT at the end

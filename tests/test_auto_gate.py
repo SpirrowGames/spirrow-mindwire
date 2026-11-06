@@ -831,6 +831,42 @@ async def test_hitting_the_cap_records_the_day_for_the_digest(tmp_path: Path) ->
     assert state["capped_on"] == _TODAY
 
 
+def test_a_cap_day_older_than_yesterday_is_dropped_on_load(tmp_path: Path) -> None:
+    # PR #512 review (msg-7820 #2): the stale day must not ride along in the state file forever.
+    store = DailyCounterStore(tmp_path / "c.json")
+    (tmp_path / "c.json").write_text(
+        json.dumps({"date_jst": "2026-10-30", "fired": 30, "capped_on": "2026-10-30"}),
+        encoding="utf-8",
+    )
+    counter = store.load(_TODAY)
+    assert (counter.fired, counter.capped_on) == (0, None)
+    store.save(counter)
+    assert _json_file(tmp_path / "c.json")["capped_on"] is None
+
+
+def test_yesterdays_cap_day_survives_the_date_change(tmp_path: Path) -> None:
+    store = DailyCounterStore(tmp_path / "c.json")
+    (tmp_path / "c.json").write_text(
+        json.dumps({"date_jst": "2026-10-31", "fired": 30, "capped_on": "2026-10-31"}),
+        encoding="utf-8",
+    )
+    counter = store.load(_TODAY)
+    assert (counter.fired, counter.capped_on) == (0, "2026-10-31")
+
+
+async def test_the_cap_day_leaves_the_state_file_two_days_on(tmp_path: Path) -> None:
+    _seed(tmp_path, 29)
+    await _run(FakeMcp(), FakeGh([_pr()]), tmp_path)
+    assert _fired_state(tmp_path)["capped_on"] == _TODAY
+    await _run(FakeMcp(), FakeGh([_pr()]), tmp_path, now=_NOW + timedelta(days=2))
+    state = _fired_state(tmp_path)
+    assert (state["fired"], state["capped_on"]) == (1, None)
+
+
+def _json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 # ---- the GitHub listing ---------------------------------------------------------------------- #
 
 

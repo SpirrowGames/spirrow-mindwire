@@ -31,6 +31,11 @@ makes the release decision.
 --state-dir <dir>`` (same thread, PR-1a) runs after a launch: WIP to a ``wip/`` branch, or export a
 patch to ``--state-dir`` and discard; see :mod:`spirrow_mindwire.clone_retreat`. Exit 0 clean /
 retreated / discarded, 4 discard incomplete (still parked), 1 failed.
+
+``mindwire continue-report [--days 7] [--config PATH]`` (T-implementer-self-continuation PR-2,
+D-3) prints the weekly view of implementer self-continuations, read from the continuation ledger
+(``<data_dir>/state/continuation_ledger.jsonl``) and nothing else: per thread, the admitted
+continuations, the highest ``n``, the cap hits and the clone refusals. Exit 0.
 """
 
 from __future__ import annotations
@@ -101,6 +106,17 @@ def _build_parser() -> argparse.ArgumentParser:
     retreat.add_argument("--stop-reason", default="-", help="how the launch ended")
     retreat.add_argument(
         "--state-dir", required=True, type=Path, help="where discard patches are written"
+    )
+    cont = sub.add_parser(
+        "continue-report",
+        help="weekly view of implementer self-continuations, from the continuation ledger",
+    )
+    cont.add_argument("--days", type=int, default=7, help="window length in days (default 7)")
+    cont.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="mindwire.toml to resolve the ledger path from (default: the standard location)",
     )
     iso = sub.add_parser(
         "turn-isolation-check",
@@ -178,6 +194,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 state_dir=args.state_dir,
             )
         )
+    if args.command == "continue-report":
+        from .conductor.continuation_ledger import report_text
+        from .config import resolve_continuation_ledger_path
+
+        if args.days < 1:
+            print("continue-report: --days must be >= 1", file=sys.stderr)
+            raise SystemExit(2)
+        path = resolve_continuation_ledger_path(load_settings(args.config))
+        print(report_text(path, days=args.days))
+        raise SystemExit(0)
     if args.command == "turn-isolation-check":
         from .turn_isolation.check import run as run_isolation_check
 
