@@ -24,6 +24,7 @@ import pytest
 
 from spirrow_mindwire.naysayer import principles
 from spirrow_mindwire.naysayer.n3_routing import (
+    DEFAULT_GLOBS,
     GlobLoad,
     N3Request,
     TierDecision,
@@ -106,22 +107,114 @@ async def test_03_populated_list_no_match_no_marker_routes_to_codex() -> None:
 @pytest.mark.anyio
 async def test_04_explicit_empty_list_no_marker_routes_to_codex() -> None:
     globs = await _globs(_toml())
-    assert globs.globs == frozenset()
+    assert globs.globs == DEFAULT_GLOBS  # "[]" adds nothing beyond the org defaults (ADR-14 §8)
+    assert not globs.repo_config_absent
     assert _route(globs, "src/app.py") == _CODEX
 
 
+# 05 / 06 changed meaning with ADR-14 §8 (2026-11-07, Takahito): a trusted side with no key or
+# no file is judged by the org defaults instead of sending everything to Gemini.
+
+
 @pytest.mark.anyio
-async def test_05_key_missing_at_base_routes_to_gemini() -> None:
+async def test_05_key_missing_at_base_uses_the_org_defaults() -> None:
     globs = await _globs("other_key = 1\n")
-    assert globs.trusted_unresolved
-    assert _route(globs, "src/app.py") == _GEMINI
+    assert not globs.trusted_unresolved
+    assert globs.repo_config_absent
+    assert globs.globs == DEFAULT_GLOBS
+    assert _route(globs, "src/app.py") == _CODEX
+    assert _route(globs, "deploy/app.service") == _GEMINI
 
 
 @pytest.mark.anyio
-async def test_06_file_missing_at_base_routes_to_gemini() -> None:
+async def test_06_file_missing_at_base_uses_the_org_defaults() -> None:
     globs = await _globs(None)
-    assert globs.trusted_unresolved
-    assert _route(globs, "src/app.py") == _GEMINI
+    assert not globs.trusted_unresolved
+    assert globs.repo_config_absent
+    assert globs.globs == DEFAULT_GLOBS
+    assert _route(globs, "src/app.py") == _CODEX
+    assert _route(globs, ".github/workflows/ci.yml") == _GEMINI
+
+
+@pytest.mark.anyio
+async def test_06b_defaults_only_decision_says_so() -> None:
+    """The reason names the defaults-only case, so the PR-gate's routing log line shows it."""
+    absent = route_tier(
+        N3Request(marker=False, paths=("src/app.py",), globs=await _globs(None), prompt_chars=1)
+    )
+    present = route_tier(
+        N3Request(marker=False, paths=("src/app.py",), globs=await _globs(_toml()), prompt_chars=1)
+    )
+    assert absent.tier == present.tier == _CODEX
+    assert "org default globs only" in absent.reason
+    assert present.reason == "codex tier"
+
+
+@pytest.mark.anyio
+async def test_06c_head_adding_a_file_where_base_has_none_still_counts() -> None:
+    """The working side may only add, also on top of the defaults alone."""
+    globs = await _globs(trusted=None, working=_toml("keys/*"))
+    assert globs.repo_config_absent
+    assert _route(globs, "keys/signing.txt") == _GEMINI
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "deploy/lexora.service",
+        "deploy/systemd/spirrow-conclair-backup.timer",
+        "spec/deploy/per-project-deploy-rule.md",
+        ".github/workflows/ci.yml",
+        "spirrow-magickit-mcp.service",
+        ".env",
+        ".env.example",
+        "config/prod.env",
+        "tests/test_secrets.py",
+        "src/app/credentials.json",
+        "certs/server.pem",
+        "certs/server.key",
+        "home/.ssh/authorized_keys",
+        "src/magickit/auth/jwt.py",
+        "app/auth.py",
+        "scripts/init_google_auth.py",
+        "etc/sudoers.d/sgadmin",
+        "etc/apparmor.d/bwrap",
+        "infra/firewall.ps1",
+        "docs/tailscale-serve.md",
+        "ops/vaultwarden/compose.yml",
+    ],
+)
+async def test_org_defaults_route_common_sensitive_paths_to_gemini(path: str) -> None:
+    globs = await _globs(_toml())  # the repo adds nothing: the defaults alone decide
+    assert _route(globs, path) == _GEMINI, path
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/app.py",
+        "src/lexora/services/cost_tracker.py",
+        "tests/test_author.py",
+        "README.md",
+        "docs/architecture.md",
+        "pyproject.toml",
+        "src/magickit/dashboard/templates/prs.html",
+    ],
+)
+async def test_org_defaults_leave_ordinary_source_on_codex(path: str) -> None:
+    globs = await _globs(None)
+    assert _route(globs, path) == _CODEX, path
+
+
+def test_org_defaults_live_in_principles_only() -> None:
+    """One copy (principles.py): the routing module reads it, and every default is normalised."""
+    assert principles.N3_DEFAULT_SENSITIVE_PATHS
+    expected = frozenset(normalize_path(g) for g in principles.N3_DEFAULT_SENSITIVE_PATHS)
+    assert expected == DEFAULT_GLOBS
+    text = (_SRC / "naysayer" / "n3_routing.py").read_text(encoding="utf-8")
+    assert "N3_DEFAULT_SENSITIVE_PATHS" in text
 
 
 @pytest.mark.anyio
@@ -180,7 +273,7 @@ async def test_13_design_time_reference_to_the_config_file_routes_to_gemini() ->
 @pytest.mark.anyio
 async def test_14_head_glob_matching_a_new_file_counts_even_if_base_lacks_it() -> None:
     globs = await _globs(trusted=_toml("deploy/*"), working=_toml("deploy/*", "keys/*"))
-    assert globs.globs == frozenset({"deploy/*", "keys/*"})
+    assert globs.globs == frozenset({"deploy/*", "keys/*"}) | DEFAULT_GLOBS
     assert _route(globs, "keys/new.pem") == _GEMINI
 
 
@@ -205,12 +298,17 @@ async def test_16b_working_side_negation_pattern_cannot_cancel_a_trusted_match()
     config file itself is not referenced, so rule 2 does not fire) must not strip a
     trusted match. ADR-14 §7.3 pins: no exclusion syntax; ``!`` is a literal.
     """
-    globs = await _globs(trusted=_toml("keys/*"), working=_toml("keys/*", "!keys/secret.pem"))
-    assert _route(globs, "keys/secret.pem") == _GEMINI
+    # ``signing.txt``, not ``secret.pem``: the org defaults (ADR-14 §8) already match the latter,
+    # which would make the second half pass for the wrong reason.
+    globs = await _globs(trusted=_toml("keys/*"), working=_toml("keys/*", "!keys/signing.txt"))
+    assert _route(globs, "keys/signing.txt") == _GEMINI
     # the `!` pattern is a literal: it only ever ADDS a match, for a path spelt with `!`
+    globs = await _globs(trusted=_toml(), working=_toml("!keys/signing.txt"))
+    assert _route(globs, "keys/signing.txt") == _CODEX
+    assert _route(globs, "!keys/signing.txt") == _GEMINI
+    # nor can a `!` pattern cancel an org-default match
     globs = await _globs(trusted=_toml(), working=_toml("!keys/secret.pem"))
-    assert _route(globs, "keys/secret.pem") == _CODEX
-    assert _route(globs, "!keys/secret.pem") == _GEMINI
+    assert _route(globs, "keys/secret.pem") == _GEMINI
 
 
 @pytest.mark.anyio
@@ -240,7 +338,7 @@ async def test_17b_unreadable_working_config_routes_to_gemini() -> None:
 @pytest.mark.parametrize("working", [None, "other_key = 1\n"])
 async def test_18_absent_working_side_does_not_fail_closed(working: str | None) -> None:
     globs = await _globs(trusted=_toml("deploy/*"), working=working)
-    assert globs.globs == frozenset({"deploy/*"})
+    assert globs.globs == frozenset({"deploy/*"}) | DEFAULT_GLOBS
     assert _route(globs, "src/app.py") == _CODEX
 
 
