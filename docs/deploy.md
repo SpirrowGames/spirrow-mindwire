@@ -258,14 +258,20 @@ A request goes to `naysayer-gemini` when **any** of these holds:
   `filename` and `previous_filename` are matched;
 - it touches `.mindwire-n3.toml`, the per-repo config file at the repository **root**, whatever the
   globs say;
-- a changed or referenced file matches a glob in that file's `n3_sensitive_paths` list. The globs are the
-  union of a trusted side, which is always enforced, and a working side, which may only add globs:
-  - PR-gate: the PR's **base** ref is trusted; its **head** is the working side;
-  - design time: the HOST_REPO's remote **default branch** is trusted, read through the contents API;
-    the working side is `.mindwire-n3.toml` at the local repository root, never the current directory;
-- the config can't be resolved: file or key missing on the trusted side, either side unreadable or
-  malformed, or no repository root. **Leaving the key out sends everything to Gemini.** Writing
-  `n3_sensitive_paths = []` explicitly is the only way to say "no sensitive paths";
+- a changed or referenced file matches a glob. The globs are the union of three sets (ADR-14 §8):
+  - the **org-wide defaults**, `N3_DEFAULT_SENSITIVE_PATHS` in `naysayer/principles.py`, applied to every
+    repo: deploy, CI workflows, systemd units, env files, keys and credentials, auth code, and host
+    security configuration. They live in MindWire's install, so no PR in the judged repo can loosen them;
+  - a trusted side, the repo's own `n3_sensitive_paths` list, which is always enforced;
+  - a working side, which may only add globs:
+    - PR-gate: the PR's **base** ref is trusted; its **head** is the working side;
+    - design time: the HOST_REPO's remote **default branch** is trusted, read through the contents API;
+      the working side is `.mindwire-n3.toml` at the local repository root, never the current directory.
+
+  A repo needs no `.mindwire-n3.toml` at all: without one (or without the key) the defaults alone decide,
+  and the routing log line says `org default globs only`. Add the file only to list paths the defaults
+  miss; `n3_sensitive_paths = []` means "nothing beyond the defaults";
+- the config can't be resolved: either side unreadable or malformed, or no repository root;
 - the prompt is over the codex tier's limit (`CODEX_TIER_PROMPT_CHAR_LIMIT`, §7.5). The value is
   provisional until Lexora pins its `model_catalog_json` / `context_window`. Raising the output
   reserve to 65,536 moved prompts of 145,537-179,072 chars from codex to Gemini. `mindwire

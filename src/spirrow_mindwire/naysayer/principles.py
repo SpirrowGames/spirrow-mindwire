@@ -72,6 +72,43 @@ N3_SENSITIVE_MARKER = "n3-sensitive"
 N3_CONFIG_PATH = ".mindwire-n3.toml"
 # The key inside :data:`N3_CONFIG_PATH`: a list of globs over repo-relative POSIX paths.
 N3_SENSITIVE_PATHS_KEY = "n3_sensitive_paths"
+# ADR-14 §8 (amendment 2026-11-07, Takahito): the org-wide default globs. They apply to EVERY
+# HOST_REPO, unioned with that repo's own :data:`N3_SENSITIVE_PATHS_KEY` (which may only add). A
+# repo with no :data:`N3_CONFIG_PATH` (or no key in it) is judged by these alone — before the
+# amendment that case sent every request to Gemini, and every repo except mindwire was in it.
+# They live here, in mindwire's install, so a PR in the judged repo cannot loosen them; this file
+# is itself in mindwire's own N-3 list. Measured against each repo's default-branch tree
+# (2026-11-07): 1-10 files per product (deploy, CI, units, env, auth code), no ordinary source.
+N3_DEFAULT_SENSITIVE_PATHS: tuple[str, ...] = (
+    # deploy and infrastructure configuration
+    "deploy/*",
+    "spec/deploy/*",
+    ".github/workflows/*",
+    "*.service",
+    "*.timer",
+    "*.socket",
+    # credentials and key material
+    "*.env",
+    "*.env.*",
+    "*secret*",
+    "*credential*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*id_rsa*",
+    "*id_ed25519*",
+    "*.ssh/*",
+    # authentication code
+    "*auth.py",
+    "*auth/*",
+    # host security configuration (ADR-14 D-4 trigger (ii) names these)
+    "*sudoers*",
+    "*apparmor*",
+    "*firewall*",
+    "*tailscale*",
+    "*vaultwarden*",
+)
 
 # ADR-14 §7.5: the codex tier's prompt limit, in characters. Rule (thread msg-6612, replacing
 # msg-6471 §3): ``context_window - harness reserve - output reserve``, every term counted as one
@@ -334,6 +371,7 @@ __all__ = [
     "GEMINI_BACKEND",
     "GEMINI_FALLBACK_BACKEND",
     "N3_CONFIG_PATH",
+    "N3_DEFAULT_SENSITIVE_PATHS",
     "N3_SENSITIVE_MARKER",
     "N3_SENSITIVE_PATHS_KEY",
     "NAYSAYER_GEMINI_TIER",
