@@ -164,7 +164,7 @@ foreach ($name in 'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update
                   'Get-DirtyCloneDigestLines', 'New-DailyDigest', 'Get-FingerprintHint',
                   'Get-DerivedQuarantineState', 'Format-DurationDigest', 'Get-ParkedRowTag', 'ConvertTo-UtcInstant',
                   'Get-QuarantineReproHint', 'ConvertFrom-AlertIso', 'Get-DirtyCloneAlertStage',
-                  'Get-LatestRetreatRecordForRepo', 'Format-RetreatRecordAlertLine', 'Get-DirtyCloneStagedAlert') {
+                  'Get-LatestRetreatRecordForRepo', 'Read-LatestRetreatRecordsByRepo', 'Find-RetreatRecordForRepo', 'Format-RetreatRecordAlertLine', 'Get-DirtyCloneStagedAlert') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text

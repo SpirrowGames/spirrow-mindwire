@@ -3319,6 +3319,8 @@ function Update-DirtyCloneParking {
     $nowDt = ConvertFrom-AlertIso -Iso $NowIso
     if ($null -eq $nowDt) { $nowDt = (Get-Date).ToUniversalTime() }
     $released = @()
+    # Read the retreat records once per call, not once per parked clone (PR-2 gate advisory).
+    $recordsByRepo = if ($Parked.Count -gt 0) { Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath } else { @{} }
     foreach ($key in @($Parked.Keys)) {
         $rec = $Parked[$key]
         $repoDir = "$($rec.repo_dir)"
@@ -3347,7 +3349,7 @@ function Update-DirtyCloneParking {
             $notice = Get-DirtyCloneNotice -RepoDir $repoDir -CandidateKey '(clone-check)' -Output $res.output -ExitCode $code
             Set-DirtyCloneParked -Parked $Parked -RepoDir $repoDir -Notice $notice -NowIso $NowIso
             $staged = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message -RepoDir $repoDir `
-                -SinceIso "$($Parked[$key].since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath
+                -SinceIso "$($Parked[$key].since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
             Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $staged.signature -Message $staged.message
             Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($staged.signature) (since $($Parked[$key].since))"
             continue
@@ -3363,7 +3365,7 @@ function Update-DirtyCloneParking {
         $body = ("MindWire: 駐機中の共有 clone を再判定できませんでした（mindwire clone-check exit=$code）。駐機は続けます。`n" +
                  "clone: $repoDir`n$tailText")
         $staged = Get-DirtyCloneStagedAlert -Signature $sig -Message $body -RepoDir $repoDir `
-            -SinceIso "$($rec.since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath
+            -SinceIso "$($rec.since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
         Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $staged.signature -Message $staged.message
         Write-Log "dirty-clone-probe-failed ${repoDir}: clone-check exit=$code — stays parked"
     }
@@ -3457,18 +3459,36 @@ function Get-CandidateCountsByRepo {
 # not errors: the alert then simply has no record line (v2.1: never fill the gap with a guess).
 function Get-LatestRetreatRecordForRepo {
     param([string]$RecordsPath, [string]$RepoDir)
-    if (-not $RecordsPath -or -not (Test-Path -LiteralPath $RecordsPath)) { return $null }
-    try { $want = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } catch { return $null }
-    try { $lines = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8 -ErrorAction Stop) } catch { return $null }
-    $latest = $null
+    $byRepo = Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath
+    return (Find-RetreatRecordForRepo -RecordsByRepo $byRepo -RepoDir $RepoDir)
+}
+
+# Read state/clone-retreats.jsonl once and keep, per repo key, its latest `retreat` row. Callers that
+# build several alerts in one tick (Update-DirtyCloneParking) read the file once with this and pass
+# the table down, instead of re-reading the whole file per parked clone. Same tolerance as above:
+# a missing or unreadable file gives an empty table, malformed lines are skipped.
+function Read-LatestRetreatRecordsByRepo {
+    param([string]$RecordsPath)
+    $byRepo = @{}
+    if (-not $RecordsPath -or -not (Test-Path -LiteralPath $RecordsPath)) { return $byRepo }
+    try { $lines = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8 -ErrorAction Stop) } catch { return $byRepo }
     foreach ($line in $lines) {
         if (-not "$line".Trim()) { continue }
         try { $row = "$line" | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if ($null -eq $row -or "$($row.kind)" -ne 'retreat' -or -not $row.repo_dir) { continue }
         try { $k = ConvertTo-DirtyCloneRepoKey -RepoDir "$($row.repo_dir)" } catch { continue }
-        if ($k -eq $want) { $latest = $row }  # file order is append order: the last match is newest
+        $byRepo[$k] = $row  # file order is append order: the last match is newest
     }
-    return $latest
+    return $byRepo
+}
+
+# The latest record for $RepoDir in a table from Read-LatestRetreatRecordsByRepo, or $null.
+function Find-RetreatRecordForRepo {
+    param([hashtable]$RecordsByRepo, [string]$RepoDir)
+    if ($null -eq $RecordsByRepo -or $RecordsByRepo.Count -eq 0) { return $null }
+    try { $want = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } catch { return $null }
+    if ($RecordsByRepo.ContainsKey($want)) { return $RecordsByRepo[$want] }
+    return $null
 }
 
 # The one line an alert carries for a retreat record. Its heading says it is not the cause.
@@ -3490,7 +3510,7 @@ function Format-RetreatRecordAlertLine {
 # @{ signature; message; stage }.
 function Get-DirtyCloneStagedAlert {
     param([string]$Signature, [string]$Message, [string]$RepoDir, [string]$SinceIso, [datetime]$Now,
-          [int]$ParkedCount, [string]$RecordsPath)
+          [int]$ParkedCount, [string]$RecordsPath, [hashtable]$RecordsByRepo = $null)
     $since = ConvertFrom-AlertIso -Iso $SinceIso
     $age = if ($null -ne $since) { $Now.ToUniversalTime() - $since } else { [TimeSpan]::Zero }
     if ($age -lt [TimeSpan]::Zero) { $age = [TimeSpan]::Zero }
@@ -3501,7 +3521,9 @@ function Get-DirtyCloneStagedAlert {
         "parked candidates: $ParkedCount",
         'cause: unknown'
     )
-    $rec = Get-LatestRetreatRecordForRepo -RecordsPath $RecordsPath -RepoDir $RepoDir
+    # $RecordsByRepo, when given, is the table the caller already read this tick; otherwise read the file.
+    $rec = if ($null -ne $RecordsByRepo) { Find-RetreatRecordForRepo -RecordsByRepo $RecordsByRepo -RepoDir $RepoDir }
+           else { Get-LatestRetreatRecordForRepo -RecordsPath $RecordsPath -RepoDir $RepoDir }
     if ($null -ne $rec) { $lines += (Format-RetreatRecordAlertLine -Record $rec) }
     return @{ signature = "$Signature|stage=$stage"; message = ($Message + "`n" + ($lines -join "`n")); stage = $stage }
 }

@@ -31,7 +31,7 @@ foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Test-DirtyCloneSkip', 'Get-Dir
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged', 'ConvertTo-DirtyCloneParking',
                   'Set-DirtyCloneParked', 'Update-DirtyCloneParking', 'Format-DurationDigest',
                   'ConvertFrom-AlertIso', 'Get-DirtyCloneAlertStage', 'Get-LaunchWaitAlertStage',
-                  'Get-CandidateCountsByRepo', 'Get-LatestRetreatRecordForRepo', 'Format-RetreatRecordAlertLine',
+                  'Get-CandidateCountsByRepo', 'Get-LatestRetreatRecordForRepo', 'Read-LatestRetreatRecordsByRepo', 'Find-RetreatRecordForRepo', 'Format-RetreatRecordAlertLine',
                   'Get-DirtyCloneStagedAlert', 'Get-LaunchWaitStarvedAlert', 'Update-LaunchWaitStarvedAlert') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
@@ -224,6 +224,20 @@ try {
         -RecordsPath (Join-Path $tmp 'missing.jsonl')
     Check 'missing records file and unparseable since: stage 0, no record line' $true (($m.signature -eq 's|stage=0') -and ($m.message -notlike '*latest retreat record*'))
 
+    # one read per tick (PR-2 gate advisory): a table read once gives the same alert as the file path
+    $table = Read-LatestRetreatRecordsByRepo -RecordsPath $records
+    Check 'records table: one entry per repo' 2 $table.Count
+    $dT = Get-DirtyCloneStagedAlert -Signature $base.signature -Message $base.message -RepoDir $repoA `
+        -SinceIso '2026-10-29T04:21:00Z' -Now $now -ParkedCount 3 -RecordsPath (Join-Path $tmp 'missing.jsonl') -RecordsByRepo $table
+    Check 'records table: same alert text as reading the file (newest record of the repo)' $d.message $dT.message
+    $eB = Get-DirtyCloneStagedAlert -Signature 's' -Message 'm' -RepoDir $repoB -SinceIso '' -Now $now -ParkedCount 0 `
+        -RecordsPath '' -RecordsByRepo $table
+    Check 'records table: the other repo gets its own record' $true ($eB.message -like '*thread=T-Z *')
+    $eN = Get-DirtyCloneStagedAlert -Signature 's' -Message 'm' -RepoDir $repoA -SinceIso '' -Now $now -ParkedCount 0 `
+        -RecordsPath $records -RecordsByRepo @{}
+    Check 'records table: an empty table means no record line (the file is not re-read)' $false ($eN.message -like '*latest retreat record*')
+    Check 'records table: a missing file gives an empty table' 0 (Read-LatestRetreatRecordsByRepo -RecordsPath (Join-Path $tmp 'missing.jsonl')).Count
+
     # --- parked candidate counts ---------------------------------------------------------------------
     $counts = Get-CandidateCountsByRepo -Candidates @(
         @{ key = 'p::T-1'; repo_dir = $repoA }, @{ key = 'p::T-2'; repo_dir = ($repoA.ToUpperInvariant() + '\') },
@@ -275,6 +289,10 @@ try {
     $updSends = [regex]::Matches($upd.Extent.Text, 'Send-NotificationIfChanged[^\r\n]*')
     Check 'Update-DirtyCloneParking sends on two paths' 2 $updSends.Count
     Check 'every send in Update-DirtyCloneParking uses the staged signature' 2 @($updSends | Where-Object { $_.Value -match '-Signature \$staged\.signature -Message \$staged\.message' }).Count
+    $updLoop = $upd.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true) | Select-Object -First 1
+    Check 'Update-DirtyCloneParking reads the records file once, before its loop' 1 ([regex]::Matches($upd.Extent.Text, 'Read-LatestRetreatRecordsByRepo')).Count
+    Check 'the records file is not read inside the loop' $false ($updLoop.Body.Extent.Text -match 'Read-LatestRetreatRecordsByRepo|Get-LatestRetreatRecordForRepo')
+    Check 'both alert paths pass the table read once' 2 ([regex]::Matches($updLoop.Body.Extent.Text, '-RecordsByRepo \$recordsByRepo')).Count
     $loop = $ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.ForEachStatementAst] -and
             $n.Variable.Extent.Text -eq '$cand' -and $n.Body.Extent.Text -match 'Invoke-HeadSkipCommitLaunch' }, $true) |
