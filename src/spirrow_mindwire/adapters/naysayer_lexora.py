@@ -161,6 +161,7 @@ def _build_messages(event: ChatroomEvent, own_role: Role, system_prompt: str) ->
         f"You are acting as the {own_role.value} role in thread "
         f"{event.thread_ref.thread_id}.\n\n"
         + (f"{event.review_round_notice}\n\n" if event.review_round_notice else "")
+        + (f"{event.conditional_proceed_notice}\n\n" if event.conditional_proceed_notice else "")
         + (f"{history}\n\n" if history else "")
         + f"The {payload.author} posted the following message. Critique it, "
         f"quoting the specific passages you object to:\n\n"
