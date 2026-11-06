@@ -5198,6 +5198,9 @@ function Invoke-AutoGateTick {
 # Only `clones` widens the scan, because a project's repo is read from its clone. Control first and
 # the same HOLD skip as the candidate loop, so a held project gets no 1c write. As in
 # Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject.
+# -Clones is $sweepIntakeConfig.clones: the OrderedDictionary ConvertFrom-SweepIntakeConfig builds
+# from sweep.json, not ConvertFrom-Json's PSCustomObject, so `.Keys` names the projects (PR #512
+# review msg-7820 #1; Test-SweepDigest.ps1 pins it on the sweep.json path).
 function Get-AutoGateProjects {
     param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones)
 

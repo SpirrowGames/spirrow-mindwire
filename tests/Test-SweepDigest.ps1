@@ -1079,6 +1079,28 @@ Check "1c keeps a candidate project with no clones entry, so its error is report
 Check "1c with no candidate project passing and no clones -> nothing to scan" `
     0 @(Get-AutoGateProjects -PassedHold @() -CandidateProjects @('p') -Clones ([ordered]@{})).Count
 
+# PR #512 review (msg-7820 #1): the `-Clones` production hands over, built the way production builds
+# it — sweep.json text through ConvertFrom-Json, then ConvertFrom-SweepIntakeConfig (the
+# $sweepIntakeConfig.clones of the 1c call site). The review read the PSCustomObject straight out of
+# ConvertFrom-Json as the input; the reader turns it into an OrderedDictionary first, so `.Keys`
+# names the projects. Fed this way, the cases above must give the same answers.
+. (Join-Path $repoRoot 'deploy/lib/UnregisteredIntake.ps1')
+function ConvertTo-ProductionClones {
+    param([string]$Json)
+    return (ConvertFrom-SweepIntakeConfig -Raw ($Json | ConvertFrom-Json) -Source 'test').clones
+}
+$agProdClones = ConvertTo-ProductionClones '{"clones":{"p-cand":"C:/c/a","p-idle":"C:/c/b","p-held":"C:/c/c","p-cand-held":"C:/c/d"}}'
+CheckTrue "1c production clones are a dictionary, not the ConvertFrom-Json PSCustomObject" `
+    ($agProdClones -is [System.Collections.IDictionary]) ($agProdClones.GetType().FullName)
+Check "1c (sweep.json path) scans an idle clones project, not a held one or a candidate that failed HOLD" `
+    'p-cand,p-idle' ((Get-AutoGateProjects -PassedHold @('p-cand') -CandidateProjects @('p-cand', 'p-cand-held') -Clones $agProdClones) -join ',')
+Check "1c (sweep.json path) keeps a candidate project with no clones entry" `
+    'p-idle,p-noclone' ((Get-AutoGateProjects -PassedHold @('p-noclone') -CandidateProjects @('p-noclone') -Clones (ConvertTo-ProductionClones '{"clones":{"p-idle":"C:/c/b"}}')) -join ',')
+Check "1c (sweep.json path) with an empty clones object and no candidate passing -> nothing to scan" `
+    0 @(Get-AutoGateProjects -PassedHold @() -CandidateProjects @('p') -Clones (ConvertTo-ProductionClones '{"clones":{}}')).Count
+Check "1c (sweep.json path) with no clones key at all -> nothing to scan" `
+    0 @(Get-AutoGateProjects -PassedHold @() -CandidateProjects @('p') -Clones (ConvertTo-ProductionClones '{}')).Count
+
 # =============================================================================================
 # T-D8-codex-backend-adr14-15-amendment (Bohr msg-6582 gap 1, Einstein msg-6587): the N-3
 # router's fail-safe token reaches the digest, so "always Gemini" cannot go unnoticed (msg-6477).

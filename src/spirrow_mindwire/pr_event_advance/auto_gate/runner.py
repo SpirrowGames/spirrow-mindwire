@@ -75,6 +75,15 @@ class DailyCounter:
     capped_on: str | None = None
 
 
+def _cap_window(today: str) -> tuple[str, str]:
+    """The JST dates whose cap the digest still shows: today and yesterday."""
+    try:
+        day = datetime.strptime(today, "%Y-%m-%d").date()
+    except ValueError:
+        return (today, today)
+    return (today, (day - timedelta(days=1)).isoformat())
+
+
 class DailyCounterStore:
     """``<data_dir>/state/auto-gate-daily.json``, replaced atomically on every write."""
 
@@ -98,6 +107,11 @@ class DailyCounterStore:
             raise CounterUnreadableError(f"{self.path}: unexpected shape")
         capped = raw.get("capped_on")
         capped_on = capped if isinstance(capped, str) else None
+        # PR #512 review (msg-7820 #2): a cap day older than yesterday is one the daily digest has
+        # already shown (cap_digest_line reads today and yesterday only), so it is dropped here and
+        # the next save stops carrying it. Yesterday's is kept: the digest has yet to show it.
+        if capped_on is not None and capped_on not in _cap_window(today):
+            capped_on = None
         fired = raw["fired"] if raw["date_jst"] == today else 0
         return DailyCounter(today, fired, capped_on)
 
