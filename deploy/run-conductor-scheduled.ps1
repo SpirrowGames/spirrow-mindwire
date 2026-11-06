@@ -167,6 +167,9 @@ $GitSyncDeferredExitCode = 9
 # Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
 # guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
 $CloneCheckTimeoutSeconds = 60
+# PR-1a (T-dirty-clone-wip-retreat-and-silent-stall-alerts): the launch-end clone-retreat. Worst
+# case is five bounded aborts plus reset/clean/switch (20 s each) and one push (40 s).
+$CloneRetreatTimeoutSeconds = 240
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -3238,6 +3241,65 @@ function Invoke-CloneRecover {
     return @{ code = [int]$r.code; row = $row; stderr = "$($r.stderr)" }
 }
 
+# T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1a (design v1.5, Bohr msg-7913; go msg-7914;
+# human Tier-C decision 2026-11-06 on msg-7916, re-confirming msg-7863 §1). After a launch that ran a
+# session, whatever its stop reason: `mindwire clone-retreat` commits a dirty clone's WIP to
+# wip/<thread_id>-<UTC ts>, tries to push it and switches back to the default branch; when that
+# cannot run (op in progress, unmerged paths) it first writes state/<repo>-discarded-<thread>-<ts>
+# .patch + .untracked.txt, then runs the five --abort commands unconditionally, then reset --hard +
+# clean -fd. It never posts to a thread. Returns @{ code; row; stderr } like Invoke-CloneRecover.
+function Invoke-CloneRetreat {
+    param([string]$RepoDir, [string]$ThreadId, [string]$HeadMsg, [string]$StopReason, [string]$StateDir)
+    $head = if ($HeadMsg) { $HeadMsg } else { '-' }
+    $stop = if ($StopReason) { $StopReason } else { '-' }
+    $r = Invoke-BoundedUvProbe -Label 'clone-retreat' -TimeoutSeconds $CloneRetreatTimeoutSeconds `
+        -Environment @{ GIT_EDITOR = 'true' } `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-retreat', '--repo-dir', $RepoDir,
+                     '--thread-id', $ThreadId, '--head-msg', $head, '--stop-reason', $stop,
+                     '--state-dir', $StateDir)
+    if (-not $r.ok) { return @{ code = -1; row = ''; stderr = "$($r.error)" } }
+    $row = ''
+    foreach ($line in @("$($r.stdout)" -split "`r?`n")) {
+        if ($line.StartsWith('MINDWIRE_CLONE_RETREAT ')) { $row = $line.Substring(23) }
+    }
+    return @{ code = [int]$r.code; row = $row; stderr = "$($r.stderr)" }
+}
+
+# PR-1a: run $Retreat (Invoke-CloneRetreat in production, a stub in tests) once for a finished launch
+# and write its tick-log line. The exit-8 (dirty clone refused, no session ran) and exit-9 (git-sync
+# deferred, no session ran) launches are skipped: whatever dirt the clone has, this launch did not
+# make it. The one-line kinds are dirty-clone-retreated / dirty-clone-discarded thread=<id>
+# patch=<path> / dirty-clone-discard-incomplete thread=<id> marker=<name> patch=<path>; the full
+# row (with every git step's stderr) follows it so 4b stops can be investigated. Returns the outcome.
+function Invoke-LaunchEndRetreat {
+    param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
+          [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat)
+    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode) { return 'skipped' }
+    $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
+    $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
+    $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
+    $p = $null
+    if ($rrow) { try { $p = $rrow | ConvertFrom-Json -ErrorAction Stop } catch { $p = $null } }
+    if ($null -eq $p) {
+        Write-Log "dirty-clone-retreat-failed ${RepoDir}: thread=$ThreadId clone-retreat exit=$rcode, no row — $($rr.stderr)"
+        return 'failed'
+    }
+    $outcome = "$($p.outcome)"
+    switch ($outcome) {
+        'clean' { return 'clean' }
+        'not_eligible' { Write-Log "dirty-clone-retreat-skipped ${RepoDir}: thread=$ThreadId $($p.detail)"; return $outcome }
+        'retreated' {
+            $pushNote = if ($p.pushed) { 'pushed' } else { 'NOT pushed (local branch only)' }
+            Write-Log "dirty-clone-retreated ${RepoDir}: thread=$ThreadId ($CandidateKey) stop=$StopReason branch=$($p.branch) files=$($p.files) +$($p.insertions)/-$($p.deletions) $pushNote — back on the default branch"
+        }
+        'discarded' { Write-Log "dirty-clone-discarded thread=$ThreadId patch=$($p.patch) repo=$RepoDir untracked=$($p.untracked) stop=$StopReason" }
+        'discard_incomplete' { Write-Log "dirty-clone-discard-incomplete thread=$ThreadId marker=$($p.marker) patch=$($p.patch) repo=$RepoDir — parking stays; .git/ left as is" }
+        default { Write-Log "dirty-clone-retreat-failed ${RepoDir}: thread=$ThreadId outcome=$outcome exit=$rcode" }
+    }
+    Write-Log "clone-retreat row ${RepoDir}: $rrow"
+    return $outcome
+}
+
 # D-3c: re-judge every parked repo once. $Probe is a scriptblock taking the repo_dir and returning
 # Invoke-CloneCheck's shape (Invoke-CloneCheck in production, a stub in tests). Returns the repo
 # keys released this tick. Mutates $Parked and $NotifyState.
@@ -6248,6 +6310,12 @@ try {
             Add-Content -LiteralPath $logPath -Value $output -Encoding utf8
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
+        # PR-1a: the launch is over, so leave the shared clone clean for the next one (see
+        # Invoke-LaunchEndRetreat). Before every exit-code branch, so every way a run ends is covered.
+        $null = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
+            -HeadMsg "$probeHead" -StopReason "$($verdict.reason)" -ExitCode $code `
+            -StateDir (Join-Path $dataDir 'state') `
+            -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s }
         $n3Count = Get-N3UnresolvedCount -Output $output
         if ($n3Count -gt 0) {
             Confirm-LogWorthKeeping

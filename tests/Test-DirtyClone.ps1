@@ -534,5 +534,61 @@ Check 'PR-0: the sweep passes Invoke-CloneRecover to the re-judge' $true ($scrip
 $crv = $functions | Where-Object { $_.Name -eq 'Invoke-CloneRecover' } | Select-Object -First 1
 Check 'Invoke-CloneRecover runs the clone-recover subcommand' $true ($crv.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-recover', '--repo-dir'")
 
+# --- PR-1a: launch-end clone-retreat ----------------------------------------------------------------
+foreach ($name in 'Invoke-LaunchEndRetreat', 'Invoke-CloneRetreat') {
+    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $fn) { throw "function not found in sweep script: $name" }
+    Invoke-Expression $fn.Extent.Text
+}
+$GitSyncDeferredExitCode = 9
+function New-RetreatStub { param([string]$Row, [int]$Code = 0)
+    $script:retreatCalls = @(); $script:stubRow = $Row; $script:stubCode = $Code
+    return { param($d, $t, $h, $r, $s) $script:retreatCalls += "$d|$t|$h|$r|$s"; @{ code = $script:stubCode; row = $script:stubRow; stderr = 'e' } } }
+$rowRet = '{"outcome":"retreated","thread_id":"T-x","branch":"wip/T-x-20261106T000000Z","pushed":false,"files":2,"insertions":5,"deletions":1,"patch":null,"untracked":null,"marker":null,"detail":"","steps":[]}'
+$rowDis = '{"outcome":"discarded","thread_id":"T-x","branch":null,"pushed":null,"files":null,"insertions":null,"deletions":null,"patch":"S/c-discarded-T-x.patch","untracked":"S/c-discarded-T-x.untracked.txt","marker":null,"detail":"","steps":["git merge --abort -> 128: fatal: no merge"]}'
+$rowInc = '{"outcome":"discard_incomplete","thread_id":"T-x","branch":null,"pushed":null,"files":null,"insertions":null,"deletions":null,"patch":"S/p.patch","untracked":null,"marker":"BISECT_START","detail":"","steps":[]}'
+$rowClean = '{"outcome":"clean","thread_id":"T-x","steps":[]}'
+
+$script:logLines = @()
+$stub = New-RetreatStub -Row $rowRet
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'msg-1' -StopReason 'no_handoff_to_human' -ExitCode 1 -StateDir 'S' -Retreat $stub
+Check 'PR-1a: retreated outcome returned' 'retreated' $o
+Check 'PR-1a: retreat gets repo, thread, head, stop reason, state dir' 'C:\c|T-x|msg-1|no_handoff_to_human|S' ($script:retreatCalls -join ';')
+Check 'PR-1a: retreated line names branch, size, and the unpushed state' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-retreated C:\c: thread=T-x*branch=wip/T-x-20261106T000000Z files=2 +5/-1 NOT pushed*' }).Count -eq 1)
+Check 'PR-1a: the full row is logged too (stderr of each step)' $true (@($script:logLines | Where-Object { $_ -like 'clone-retreat row *' }).Count -eq 1)
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowDis)
+Check 'PR-1a: discarded line has the fixed form' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-discarded thread=T-x patch=S/c-discarded-T-x.patch *' }).Count -eq 1)
+Check 'PR-1a: abort stderr reaches the tick log' $true (@($script:logLines | Where-Object { $_ -like '*fatal: no merge*' }).Count -eq 1)
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowInc -Code 4)
+Check 'PR-1a: incomplete line names marker and patch' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-discard-incomplete thread=T-x marker=BISECT_START patch=S/p.patch *' }).Count -eq 1)
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowClean)
+Check 'PR-1a: a clean clone logs nothing' 0 $script:logLines.Count
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row '' -Code -1)
+Check 'PR-1a: a probe with no row is logged as failed' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-retreat-failed *' }).Count -eq 1)
+
+foreach ($skipCode in @($DirtyCloneExitCode, $GitSyncDeferredExitCode)) {
+    $stub = New-RetreatStub -Row $rowRet
+    $o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode $skipCode -StateDir 'S' -Retreat $stub
+    Check "PR-1a: exit $skipCode (no session ran) is not retreated" 'skipped' $o
+    Check "PR-1a: exit $skipCode never calls clone-retreat" 0 $script:retreatCalls.Count
+}
+
+$posRetreat = $body.IndexOf('Invoke-LaunchEndRetreat')
+Check 'PR-1a: retreat runs after the launch' $true ($posRetreat -gt $posInner)
+Check 'PR-1a: retreat runs before the exit-8 branch' $true ($posRetreat -ge 0 -and $posRetreat -lt $posDirtyBranch)
+Check 'PR-1a: retreat runs before the generic non-zero branch' $true ($posRetreat -lt $posNonZero)
+$irt = $functions | Where-Object { $_.Name -eq 'Invoke-CloneRetreat' } | Select-Object -First 1
+Check 'PR-1a: Invoke-CloneRetreat runs the clone-retreat subcommand' $true ($irt.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-retreat', '--repo-dir'")
+Check 'PR-1a: Invoke-CloneRetreat sets GIT_EDITOR=true for the child' $true ($irt.Extent.Text -match "GIT_EDITOR = 'true'")
+Check 'PR-1a: the wrapper never posts from the retreat' $false ($irt.Extent.Text -match 'chatroom|Send-Notification')
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all dirty-clone checks passed"

@@ -26,6 +26,11 @@ PR-0) switches a ``wrong_head`` clone back to its default branch when every comm
 already on the remote; see :mod:`spirrow_mindwire.clone_recover`. Exit 0 recovered, 3 not
 eligible (nothing changed), 1 failed. The wrapper calls it before ``clone-check``, which still
 makes the release decision.
+
+``mindwire clone-retreat --repo-dir <dir> --thread-id <id> --head-msg <msg> --stop-reason <r>
+--state-dir <dir>`` (same thread, PR-1a) runs after a launch: WIP to a ``wip/`` branch, or export a
+patch to ``--state-dir`` and discard; see :mod:`spirrow_mindwire.clone_retreat`. Exit 0 clean /
+retreated / discarded, 4 discard incomplete (still parked), 1 failed.
 """
 
 from __future__ import annotations
@@ -86,6 +91,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="switch a wrong_head clone back to its default branch if that loses no commit",
     )
     recover.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
+    retreat = sub.add_parser(
+        "clone-retreat",
+        help="after a launch: move a dirty clone's WIP to a wip/ branch, or export and discard it",
+    )
+    retreat.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
+    retreat.add_argument("--thread-id", required=True, help="the thread the launch ran")
+    retreat.add_argument("--head-msg", default="-", help="the head msg the launch ran on")
+    retreat.add_argument("--stop-reason", default="-", help="how the launch ended")
+    retreat.add_argument(
+        "--state-dir", required=True, type=Path, help="where discard patches are written"
+    )
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -150,6 +166,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .clone_recover import run as run_clone_recover
 
         raise SystemExit(run_clone_recover(args.repo_dir))
+    if args.command == "clone-retreat":
+        from .clone_retreat import run as run_clone_retreat
+
+        raise SystemExit(
+            run_clone_retreat(
+                args.repo_dir,
+                thread_id=args.thread_id,
+                head_msg=args.head_msg,
+                stop_reason=args.stop_reason,
+                state_dir=args.state_dir,
+            )
+        )
     if args.command == "turn-isolation-check":
         from .turn_isolation.check import run as run_isolation_check
 
