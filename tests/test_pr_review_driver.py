@@ -5387,7 +5387,33 @@ async def test_routing_reads_globs_at_base_and_head() -> None:
 
 
 @pytest.mark.anyio
-async def test_routing_missing_base_config_goes_to_gemini_and_notifies(
+async def test_routing_missing_base_config_uses_org_defaults_without_notifying(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ADR-14 §8 (2026-11-07): a repo with no ``.mindwire-n3.toml`` is judged by the org
+    defaults. That is the normal state of most repos, not a failure, so nothing is notified."""
+    told: list[str] = []
+
+    async def notifier(line: str) -> None:
+        told.append(line)
+
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_routed_github(base_cfg=None), n3_notifier=notifier
+    )
+    with caplog.at_level("INFO"):
+        await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {"naysayer"}
+    assert "n3-routing-unresolved" not in caplog.text
+    assert "org default globs only" in caplog.text
+    assert told == []
+    workflow = _routed_github(base_cfg=None, paths=(".github/workflows/ci.yml",))
+    assert await _pass1_model(workflow) == "naysayer-gemini"
+
+
+@pytest.mark.anyio
+async def test_routing_malformed_base_config_goes_to_gemini_and_notifies(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     told: list[str] = []
@@ -5398,7 +5424,9 @@ async def test_routing_missing_base_config_goes_to_gemini_and_notifies(
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(
-        lexora=lexora, github=_routed_github(base_cfg=None), n3_notifier=notifier
+        lexora=lexora,
+        github=_routed_github(base_cfg="this is = = not toml"),
+        n3_notifier=notifier,
     )
     with caplog.at_level("WARNING"):
         await driver.review(_pr(), post_critique=post)

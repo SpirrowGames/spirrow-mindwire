@@ -21,14 +21,18 @@ to Gemini:
 2. **The config file itself** — any input path equal to
    :data:`~.principles.N3_CONFIG_PATH`, unconditionally and before any glob is
    evaluated: the file that defines the boundary is security configuration.
-3. **Path globs** — :data:`~.principles.N3_SENSITIVE_PATHS_KEY` from that file.
-   The globs are the UNION of a *trusted* side (PR base / remote default branch:
-   always enforced, so a change cannot loosen the rules it is judged by) and a
-   *working* side (PR head / the prompt builder's source: may only ADD globs).
-4. **Unresolvable config** — trusted side unreadable, file or key missing there,
-   either side malformed, or (design time) no repository root. Forgetting the key
-   never sends anything to codex; only an explicitly written ``[]`` means "no
-   sensitive paths".
+3. **Path globs** — the UNION of the org-wide defaults
+   (:data:`~.principles.N3_DEFAULT_SENSITIVE_PATHS`, mindwire's install: always
+   enforced, and no PR in the judged repo can touch them), a *trusted* side
+   (:data:`~.principles.N3_SENSITIVE_PATHS_KEY` at the PR base / remote default
+   branch: always enforced, so a change cannot loosen the rules it is judged by) and
+   a *working* side (PR head / the prompt builder's source: may only ADD globs).
+   A repo file can only add to the defaults; ``[]`` means "nothing beyond them".
+4. **Unresolvable config** — trusted side unreadable, either side malformed, or
+   (design time) no repository root. A trusted side with no file or no key is NOT
+   unresolvable (ADR-14 §8, 2026-11-07): the defaults alone judge it, and the
+   decision's reason says so. Before that amendment it sent every request to Gemini,
+   which silently kept every repo but mindwire off the codex tier.
 5. **Path boundary** (msg-6575 → msg-6579) — a path that cannot be placed inside
    the repository. The PR-gate checks GitHub's file list *lexically*
    (:func:`lexical_path_problem`, no disk: a deleted file is just a path) and counts
@@ -67,6 +71,7 @@ from .principles import (
     CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT,
     CODEX_TIER_PROMPT_CHAR_LIMIT,
     N3_CONFIG_PATH,
+    N3_DEFAULT_SENSITIVE_PATHS,
     N3_SENSITIVE_MARKER,
     N3_SENSITIVE_PATHS_KEY,
     NAYSAYER_GEMINI_TIER,
@@ -90,21 +95,27 @@ def normalize_path(path: str) -> str:
 
 
 _NORMALIZED_CONFIG_PATH = normalize_path(N3_CONFIG_PATH)
+DEFAULT_GLOBS: frozenset[str] = frozenset(normalize_path(g) for g in N3_DEFAULT_SENSITIVE_PATHS)
+"""The org-wide defaults, normalised: part of every resolved :class:`GlobLoad` (ADR-14 §8)."""
 
 
 @dataclass(frozen=True)
 class GlobLoad:
-    """The union of both sides' globs, or why it could not be formed.
+    """The union of the defaults' and both sides' globs, or why it could not be formed.
 
     ``globs is None`` means "unresolvable" — :func:`route_tier` sends the request to
     Gemini and ``failure`` says why (``trusted_unresolved`` marks the case a caller
     must also notify about, msg-6477: a persistent resolution failure must not
     quietly become "always Gemini").
+
+    ``repo_config_absent``: the trusted side had no file or no key, so only the
+    defaults (plus anything the working side adds) judge the request. Not a failure.
     """
 
     globs: frozenset[str] | None
     failure: str | None = None
     trusted_unresolved: bool = False
+    repo_config_absent: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,7 +143,7 @@ def _parse(text: str | None) -> _Side:
 
 
 async def load_n3_globs(*, trusted: ConfigReader, working: ConfigReader | None) -> GlobLoad:
-    """Return the union of the trusted and working globs, failing safe per side (msg-6479).
+    """Return the union of the default, trusted and working globs, failing safe per side (msg-6479).
 
     The ONE loader for both request types; they differ only in what the readers read:
 
@@ -143,8 +154,10 @@ async def load_n3_globs(*, trusted: ConfigReader, working: ConfigReader | None) 
     design-time   remote default branch      the prompt builder's source (§7.5)
     ============  =========================  ====================================
 
-    - trusted unreadable / file absent / key absent / malformed → unresolvable
-      (``trusted_unresolved``);
+    - :data:`DEFAULT_GLOBS` are always in the union (ADR-14 §8);
+    - trusted unreadable / malformed → unresolvable (``trusted_unresolved``);
+    - trusted file absent / key absent → the defaults stand in for it
+      (``repo_config_absent``); not a failure, nothing to notify;
     - working unreadable / malformed → unresolvable (it can only push toward Gemini);
     - working file or key absent → contributes nothing; the trusted side decides;
     - ``working=None`` → no working side.
@@ -157,13 +170,9 @@ async def load_n3_globs(*, trusted: ConfigReader, working: ConfigReader | None) 
         return GlobLoad(
             None, f"trusted config malformed: {trusted_side.malformed}", trusted_unresolved=True
         )
-    if trusted_side.globs is None:
-        return GlobLoad(
-            None,
-            f"trusted config has no {N3_CONFIG_PATH} or no {N3_SENSITIVE_PATHS_KEY} key",
-            trusted_unresolved=True,
-        )
-    globs = set(trusted_side.globs)
+    repo_config_absent = trusted_side.globs is None
+    globs = set(DEFAULT_GLOBS)
+    globs.update(trusted_side.globs or ())
     if working is not None:
         try:
             working_side = _parse(await working())
@@ -172,7 +181,7 @@ async def load_n3_globs(*, trusted: ConfigReader, working: ConfigReader | None) 
         if working_side.malformed:
             return GlobLoad(None, f"working config malformed: {working_side.malformed}")
         globs.update(working_side.globs or ())
-    return GlobLoad(frozenset(globs))
+    return GlobLoad(frozenset(globs), repo_config_absent=repo_config_absent)
 
 
 @dataclass(frozen=True)
@@ -295,7 +304,10 @@ def route_tier(request: N3Request) -> TierDecision:
             f"{CODEX_TIER_PROMPT_CHAR_LIMIT}",
             in_codex_limit_band=request.prompt_chars <= CODEX_TIER_PRE_RAISE_PROMPT_CHAR_LIMIT,
         )
-    return TierDecision(NAYSAYER_MODEL_TIER, allowed_backends(NAYSAYER_MODEL_TIER), "codex tier")
+    reason = "codex tier"
+    if request.globs.repo_config_absent:
+        reason += f" (org default globs only: no {N3_SENSITIVE_PATHS_KEY} on the trusted side)"
+    return TierDecision(NAYSAYER_MODEL_TIER, allowed_backends(NAYSAYER_MODEL_TIER), reason)
 
 
 UnresolvedNotifier = Callable[[str], Awaitable[None]]
@@ -329,6 +341,7 @@ def has_marker(names: Iterable[str]) -> bool:
 
 __all__ = [
     "CODEX_LIMIT_BAND_TRACE_MARKER",
+    "DEFAULT_GLOBS",
     "ConfigReader",
     "GlobLoad",
     "N3Request",
