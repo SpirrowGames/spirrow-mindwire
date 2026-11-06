@@ -2,8 +2,9 @@
 
 A naysayer request goes either to the codex tier (``naysayer``: codex primary,
 gemini-fallback backup) or to the Gemini-only tier (``naysayer-gemini``). The codex
-path is a personal ChatGPT Pro subscription and has **no ZDR**; ADR-15 C-2 keeps
-"ZDR is mandatory" for the N-3 subset, so §7.3 requires that this function never
+path is a personal ChatGPT Pro subscription whose no-training setting is a toggle that can
+change without notice; the Gemini path's is a paid-key contract (ADR-14 §9: neither has ZDR,
+which the Developer API does not offer). §7.3 therefore requires that this function never
 returns the codex tier for a request it can identify as N-3.
 
 :func:`route_tier` is the only code that makes that choice, and the attestation's

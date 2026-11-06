@@ -30,9 +30,10 @@ import yaml
 #
 # - ``naysayer`` — Lexora's fallback wrapper: ``codex`` primary, ``gemini-fallback`` backup.
 #   The name is the pre-existing one on purpose, so an existing caller lands on the codex tier.
-# - ``naysayer-gemini`` — Gemini only. Serves the N-3 subset (ADR-14 §7.3, ADR-15 C-2: ZDR is
-#   mandatory there and the ChatGPT Pro codex path has none) and requests over the codex
-#   tier's prompt limit (§7.5).
+# - ``naysayer-gemini`` — Gemini only. Serves the N-3 subset (ADR-14 §7.3 / §9: paid key, project
+#   logging off and plain generateContent — the Developer API offers no ZDR, but its no-training
+#   term is contractual, unlike the ChatGPT Pro codex path's data-controls toggle) and requests
+#   over the codex tier's prompt limit (§7.5).
 NAYSAYER_MODEL_TIER = "naysayer"
 NAYSAYER_GEMINI_TIER = "naysayer-gemini"
 NAYSAYER_UPSTREAM_MODEL = "gemini-3.1-pro-preview"
