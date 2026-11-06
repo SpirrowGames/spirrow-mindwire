@@ -411,3 +411,53 @@ def test_cli_continue_report_reads_the_configured_ledger(
 
     assert ei.value.code == 0
     assert "p/T-a admitted=1 max_n=1" in capsys.readouterr().out
+
+
+# --- PR #521 gate round 1 -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("outcome", [[], {}, ["dirty"], {"dirty": 1}, 1, None])
+def test_non_string_outcome_is_malformed_not_a_crash(tmp_path: Path, outcome: object) -> None:
+    """Obj-1-1: an unhashable (or otherwise non-string) outcome marks the row malformed."""
+    ledger = tmp_path / "l.jsonl"
+    bad = {"kind": "continue_attempt", "project": "p", "thread": "T-a", "msg_id": "m-1"}
+    bad["outcome"] = outcome  # type: ignore[assignment]
+    ledger.write_text(json.dumps(bad) + "\n", encoding="utf-8")
+
+    assert read_ledger(ledger).malformed == 1
+    assert "threads=0 malformed=1" in report_text(ledger, days=7, now=_NOW)
+    # ... and the conductor's next write still works, since every append reads first.
+    assert record_attempt(
+        ledger, project="p", thread="T-a", msg_id="m-1", outcome=AttemptOutcome.DIRTY, n=1, cap=3
+    )
+    read = read_ledger(ledger)
+    assert (len(read.rows), read.malformed) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        '{"kind": "continue_admitted", "project": "p", "thr',
+        # cut off inside a multi-byte character (the ledger is written with ensure_ascii=False)
+        '{"kind": "continue_admitted", "thread": "T-例'.encode()[:-1],
+    ],
+)
+def test_append_after_truncated_tail_keeps_the_new_row(
+    tmp_path: Path, fragment: str | bytes
+) -> None:
+    """Obj-1-2: a truncated last line stays one malformed line; the next row is still readable."""
+    ledger = tmp_path / "l.jsonl"
+    record_admitted(
+        ledger, project="p", thread="T-a", relay_msg_id="r-1", report_msg_id="m-1", n=1, cap=3
+    )
+    with ledger.open("ab") as fh:
+        fh.write(fragment if isinstance(fragment, bytes) else fragment.encode())
+
+    assert record_admitted(
+        ledger, project="p", thread="T-a", relay_msg_id="r-2", report_msg_id="m-2", n=2, cap=3
+    )
+
+    read = read_ledger(ledger)
+    assert read.malformed == 1
+    assert [r["relay_msg_id"] for r in read.rows] == ["r-1", "r-2"]
+    assert ledger.read_bytes().endswith(b"\n")

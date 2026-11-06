@@ -67,6 +67,8 @@ class AttemptOutcome(StrEnum):
 
 RowKey = tuple[str, ...]
 
+_OUTCOME_VALUES = frozenset(o.value for o in AttemptOutcome)
+
 
 def row_key(row: dict[str, Any]) -> RowKey | None:
     """The dedup key of a row; ``None`` for a row that is not a well-formed ledger row."""
@@ -83,7 +85,9 @@ def row_key(row: dict[str, Any]) -> RowKey | None:
         outcome = row.get("outcome")
         if not isinstance(msg_id, str) or not msg_id:
             return None
-        if outcome not in {o.value for o in AttemptOutcome}:
+        # String check first: a list/object outcome is unhashable, and a set-membership test on
+        # it would raise instead of marking the row malformed (PR #521 gate round 1, Obj-1-1).
+        if not isinstance(outcome, str) or outcome not in _OUTCOME_VALUES:
             return None
         return (kind, project, thread, msg_id, outcome)
     return None
@@ -106,7 +110,9 @@ def read_ledger(path: Path) -> LedgerRead:
     read = LedgerRead()
     if not path.exists():
         return read
-    with path.open("r", encoding="utf-8") as fh:
+    # ``errors="replace"``: a write cut off mid-character leaves invalid UTF-8 in the tail; that
+    # line must count as malformed, not abort the whole read (PR #521 gate round 1, Obj-1-2).
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if not line.strip():
                 continue
@@ -131,9 +137,24 @@ def _append_once(path: Path, row: dict[str, Any]) -> bool:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(row, ensure_ascii=False, sort_keys=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    # An interrupted earlier write can leave a fragment with no terminating newline. Start the new
+    # row on its own line, so the fragment stays one malformed line and this row stays readable
+    # instead of being glued onto it (PR #521 gate round 1, Obj-1-2).
+    prefix = "" if _ends_with_newline_or_empty(path) else "\n"
+    with path.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(prefix + line + "\n")
     return True
+
+
+def _ends_with_newline_or_empty(path: Path) -> bool:
+    if not path.exists():
+        return True
+    with path.open("rb") as fh:
+        fh.seek(0, 2)
+        if fh.tell() == 0:
+            return True
+        fh.seek(-1, 2)
+        return fh.read(1) == b"\n"
 
 
 def _now_iso(at: datetime | None) -> str:
