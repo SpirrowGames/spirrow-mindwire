@@ -585,6 +585,12 @@ def _design_conditions_policy(settings: MindwireSettings) -> DesignConditionsPol
         settings.naysayer_gating.conditional_proceed,
         settings.conductor.roster,
         human_identity=settings.conductor.human_identity,
+        # T-gate-fires-on-pr-open (PR #525 gate RC): the PR's own project for an unqualified
+        # ``Thread:`` / ``Closes-thread:`` id, from the same ``sweep.json`` ``clones`` table 1b,
+        # 1c and the conductor read. Read at call time, only when a check runs.
+        repo_projects=functools.partial(
+            load_repo_project_map, settings.paths.config_dir / "sweep.json"
+        ),
     )
 
 

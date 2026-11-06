@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -49,6 +49,7 @@ from .naysayer.conditions_check import (
 from .naysayer.pr_review import ObjectionParse, parse_objections
 from .naysayer.review_rounds import CONDITIONS_HEADING_RE, has_conditions_heading
 from .pr_event_advance.auto_gate.decide import resolve_thread_link
+from .repo_projects import NONE, PrProject, RepoProjectMap
 from .value_objects import Role
 
 logger = logging.getLogger(__name__)
@@ -392,29 +393,71 @@ class DesignConditionsPolicy:
     modes: Mapping[str, str] = field(default_factory=dict)
     roster: Mapping[str, Role] = field(default_factory=dict)
     human_identity: str = "human"
+    #: The ``owner/repo -> project`` table (:mod:`.repo_projects`), read at call time. ``None``
+    #: (tests, library callers that wire no table) keeps the pre-#525 reading: the PR is taken to
+    #: belong to the gate's project. Wired in production by ``loop_runner``.
+    repo_projects: Callable[[], RepoProjectMap] | None = None
 
-    def resolver(self, mcp: McpToolCaller, *, project: str) -> ConditionsResolver | None:
-        """``None`` when ``project`` never enabled the setting — the gate then builds no check."""
+    def pr_project(self, *, project: str, owner: str | None, repo: str | None) -> PrProject:
+        """The project the PR's repo belongs to — NOT the gate's project (PR #525 gate RC).
+
+        No table wired: the gate's project (legacy). A table that raises, an unknown repo, or a
+        repo the table cannot resolve uniquely: unresolved, so an unqualified id gets no project.
+        """
+        if self.repo_projects is None:
+            return PrProject(project)
+        if owner is None or repo is None:
+            return PrProject(None, NONE)
+        try:
+            return self.repo_projects().resolve(owner, repo)
+        except Exception as exc:  # fail-closed: an unreadable table resolves nothing
+            logger.warning("design conditions: repo table unreadable: %s", exc)
+            return PrProject(None, NONE)
+
+    def resolver(
+        self,
+        mcp: McpToolCaller,
+        *,
+        project: str,
+        pr_owner: str | None = None,
+        pr_repo: str | None = None,
+    ) -> ConditionsResolver | None:
+        """``None`` when ``project`` never enabled the setting — the gate then builds no check.
+
+        ``project`` is the gate's project (whose setting applies). ``pr_owner`` / ``pr_repo`` name
+        the PR's repo, from which the PR's own project is resolved for unqualified ids.
+        """
         if not mode_for(self.modes, project).verifies:
             return None
         thread_policy = ThreadPolicy(roster=self.roster, human_identity=self.human_identity)
 
         async def resolve(pr_body: str | None) -> DesignConditionsCheck:
             return await resolve_design_conditions(
-                mcp, project=project, pr_body=pr_body, policy=thread_policy
+                mcp,
+                project=project,
+                pr_body=pr_body,
+                policy=thread_policy,
+                pr_project=self.pr_project(project=project, owner=pr_owner, repo=pr_repo),
             )
 
         return resolve
 
 
 def build_policy(
-    modes: Mapping[str, str], roster: Mapping[str, Role], *, human_identity: str
+    modes: Mapping[str, str],
+    roster: Mapping[str, Role],
+    *,
+    human_identity: str,
+    repo_projects: Callable[[], RepoProjectMap] | None = None,
 ) -> DesignConditionsPolicy | None:
     """The orchestrator's policy, or ``None`` when no project names the setting at all."""
     if not modes:
         return None
     return DesignConditionsPolicy(
-        modes=dict(modes), roster=dict(roster), human_identity=human_identity
+        modes=dict(modes),
+        roster=dict(roster),
+        human_identity=human_identity,
+        repo_projects=repo_projects,
     )
 
 
@@ -441,12 +484,27 @@ def _validated_messages(raw: list[Any]) -> tuple[list[ThreadMessage], str | None
 
 
 async def resolve_design_conditions(
-    mcp: McpToolCaller, *, project: str, pr_body: str | None, policy: ThreadPolicy
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    pr_body: str | None,
+    policy: ThreadPolicy,
+    pr_project: PrProject | None = None,
 ) -> DesignConditionsCheck:
-    """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD."""
+    """PR body → ``Thread:`` → thread → table → (i)-(iv). Every unreadable step is a HOLD.
+
+    ``project`` is the gate's project; ``pr_project`` is the project the PR's REPO belongs to
+    (PR #525 gate RC). The link is resolved with ``pr_project`` exactly as the auto-gate resolves
+    it, so ``Thread: hub/T-1`` + ``Closes-thread: T-1`` on a PR of another project is ambiguous
+    here too. When ``pr_project`` is unresolved an unqualified id stays unresolved: beside a
+    qualified one it is ambiguous, and alone it is a HOLD (nothing guesses its project). ``None``
+    keeps the pre-#525 reading (the PR belongs to the gate's project).
+    """
     if pr_body is None:
         return _hold("the PR body could not be read, so its design thread is unknown")
-    link = resolve_thread_link(pr_body, project)
+    if pr_project is None:
+        pr_project = PrProject(project)
+    link = resolve_thread_link(pr_body, pr_project.project)
     if link.thread_id is None:
         return _hold(
             "the PR body names no single design thread (`Thread:` line "
@@ -454,9 +512,15 @@ async def resolve_design_conditions(
             "verifies design conditions, so a PR whose thread is unknown cannot be approved"
         )
     thread_id = link.thread_id
+    if pr_project.project is None and link.has_bare:
+        return _hold(
+            f"the PR body names {thread_id} without a project, and the PR's own project could "
+            f"not be resolved ({pr_project.describe()}); qualify it as `<project>/{thread_id}`",
+            thread_id=thread_id,
+        )
     # A ``Thread: <project>/T-...`` line is read in the project it names (msg-8022 / msg-8024),
-    # the same rule the auto-gate follows; an unqualified one stays in the gate's project.
-    thread_project = link.thread_project or project
+    # the same rule the auto-gate follows; an unqualified one in the PR's own project.
+    thread_project = link.thread_project or pr_project.project or project
     try:
         payload: Any = await mcp.call_tool(
             "chatroom_get_thread",
