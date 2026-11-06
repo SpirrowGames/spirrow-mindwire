@@ -109,6 +109,7 @@ from .config import (
     NaysayerGatingConfig,
     Stage3LoopConfig,
     load_settings,
+    resolve_clone_retreat_log_path,
     resolve_continuation_ledger_path,
     resolve_tier_c_decisions_log_path,
     resolve_tierc_annotations_path,
@@ -1105,6 +1106,9 @@ def build_conductor(
             # default 3 when this project has no key) and the D-3 continuation ledger.
             continue_cap=_resolve_continue_cap(cond_cfg.continue_cap_for(loop_cfg.project)),
             continuation_ledger_path=resolve_continuation_ledger_path(settings),
+            # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1b: where the last retreat of
+            # this thread's clone put the WIP, shown to the run's first implementer turn.
+            clone_retreat_log_path=resolve_clone_retreat_log_path(settings),
             # T-naysayer-conditional-proceed-on-small-fixmin (PR 2): the naysayer is offered the
             # conditional exit only while this project's setting is ``issuing``; every other state
             # (absent, ``verify_only``, unknown) offers nothing (msg-7960 Obj-5-1).

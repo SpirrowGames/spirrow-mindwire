@@ -268,6 +268,11 @@ class ChatroomEvent:
     # meanwhile". Same placement rules as ``retry_notice``; set only by the conductor
     # (:mod:`spirrow_mindwire.conductor.summon`). ``None`` leaves the prompt unchanged.
     resume_notice: str | None = None
+    # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1b (v1.7): where the last retreat of
+    # this thread's dirty clone put the WIP (:mod:`spirrow_mindwire.clone_retreat_log`). Set only by
+    # the conductor, only on the first implementer dispatch of a run that finds an undelivered
+    # record. Same placement rules as ``retry_notice``; ``None`` leaves the prompt unchanged.
+    clone_retreat_notice: str | None = None
 
 
 # --------------------------------------------------------------------------- #

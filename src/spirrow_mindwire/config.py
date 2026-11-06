@@ -878,6 +878,17 @@ def resolve_continuation_ledger_path(settings: MindwireSettings) -> Path:
     return settings.paths.data_dir / "state" / CONTINUATION_LEDGER_FILENAME
 
 
+CLONE_RETREAT_LOG_FILENAME = "clone-retreats.jsonl"
+"""The clone-retreat record under ``<data_dir>/state/`` (T-dirty-clone-wip-retreat PR-1b)."""
+
+
+def resolve_clone_retreat_log_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/clone-retreats.jsonl`` — written by ``mindwire clone-retreat`` (the
+    wrapper passes ``--state-dir <data_dir>/state``), read by the conductor for the next implementer
+    turn's prompt (see :mod:`spirrow_mindwire.clone_retreat_log`)."""
+    return settings.paths.data_dir / "state" / CLONE_RETREAT_LOG_FILENAME
+
+
 TIERC_ANNOTATIONS_FILENAME = "tierc_annotations.jsonl"
 """The Jev annotation log under ``<data_dir>/state/`` (2e-2). The sweep reads the same path."""
 

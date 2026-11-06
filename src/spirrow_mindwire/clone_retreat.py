@@ -32,8 +32,10 @@ tree (PR-0's ``clone-recover`` handles that), is left alone. Otherwise:
    nothing under ``.git/`` is removed by hand, the clone stays parked by the guard, and PR-2's
    staged re-notification tells a person.
 
-This command never posts to a chatroom thread (v1.1: the wrapper does not post). Its only reader
-is the wrapper's tick log, through the one :data:`RETREAT_PREFIX` row it prints.
+This command never posts to a chatroom thread (v1.1: the wrapper does not post). Its readers are
+the wrapper's tick log, through the one :data:`RETREAT_PREFIX` row it prints, and (PR-1b, v1.7)
+the thread's next implementer turn, through the row :func:`run` appends to
+``<state_dir>/clone-retreats.jsonl`` (see :mod:`spirrow_mindwire.clone_retreat_log`).
 
 Exit codes: 0 ``clean`` / ``not_eligible`` / ``retreated`` / ``discarded``, 4
 ``discard_incomplete``, 1 ``failed`` (the clone's state could not be judged).
@@ -59,6 +61,7 @@ from .clone_guard import (
     DirtyCloneReason,
     GitResult,
 )
+from .clone_retreat_log import CLONE_RETREAT_LOG_FILENAME, record_result
 
 RETREAT_PREFIX = "MINDWIRE_CLONE_RETREAT "
 OK_EXIT = 0
@@ -403,8 +406,13 @@ class CloneRetreater:
         return patch_out, list_out, notes
 
     def _discard(self, default: str, why: str) -> RetreatResult:
-        # Step 3 first: nothing destructive has run yet (the retreat attempt only switched branch,
-        # which carries the tree and the index unchanged).
+        # Step 3 first: nothing destructive has run yet. A failed retreat attempt may have switched
+        # to the wip branch (the tree is carried over unchanged) and, when it failed at ``commit``,
+        # already run ``git add -A``: then the index holds every change, new files included, and
+        # those staged new files are no longer "untracked". ``git diff --binary HEAD`` compares
+        # HEAD with the working tree, index entries included, so it still writes them into the
+        # patch (pinned by test_failed_commit_keeps_staged_new_file_in_patch); the .untracked.txt
+        # list names only what ``git add -A`` had not staged.
         patch, untracked, notes = self._export()
         for args in ABORT_COMMANDS:  # Step 4: all five, exit codes ignored
             self._step(args)
@@ -448,6 +456,18 @@ def run(repo_dir: Path, *, thread_id: str, head_msg: str, stop_reason: str, stat
         )
     sys.stdout.write(result.row() + "\n")
     sys.stdout.flush()
+    # PR-1b (v1.7): the durable record the thread's next implementer turn is shown. Observation,
+    # never gating: a failed write is one stderr line and the exit code stays the outcome's.
+    try:
+        record_result(
+            state_dir / CLONE_RETREAT_LOG_FILENAME,
+            result,
+            repo_dir=repo_dir,
+            head_msg=head_msg,
+            stop_reason=stop_reason,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"clone-retreat: writing the retreat record failed: {exc}\n")
     return result.exit_code
 
 
