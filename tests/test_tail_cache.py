@@ -23,8 +23,13 @@ from spirrow_mindwire.github.client import PrRef, PrResolution, PrState
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.park_wake import runner as park_runner
 from spirrow_mindwire.pr_event_advance import runner as pr_runner
+from spirrow_mindwire.repo_projects import PrProject, RepoProjectMap
 from spirrow_mindwire.tail_cache import SCHEMA_VERSION, CachedTail, TailCache, load_heads
 from spirrow_mindwire.value_objects import Role
+
+#: T-gate-fires-on-pr-open (msg-8030): acme/widgets belongs to "p" only.
+_REPO_MAP = RepoProjectMap(candidates={"acme/widgets": frozenset({"p"})})
+_PR_PROJECT = PrProject("p")
 
 _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
 _HEAD_SHA = "703b836737f29fe0f4139d86d2d02077c662ce5f"
@@ -201,7 +206,12 @@ async def test_1b_a_hit_costs_no_read_and_still_decides(tmp_path: Path) -> None:
     path = tmp_path / "p.json"
     gh = _Gh(_merged())
     first = await pr_runner.run_tick(
-        mcp=chat, gh=gh, project="p", proposer="Bohr", cache=TailCache.open(path, _heads(chat))
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=gh,
+        project="p",
+        proposer="Bohr",
+        cache=TailCache.open(path, _heads(chat)),
     )
     assert sorted(chat.reads) == ["T-quiet", "T-relay"]
     assert first.as_dict()["posted"] == 1
@@ -210,7 +220,12 @@ async def test_1b_a_hit_costs_no_read_and_still_decides(tmp_path: Path) -> None:
 
     chat.reads.clear()
     second = await pr_runner.run_tick(
-        mcp=chat, gh=gh, project="p", proposer="Bohr", cache=TailCache.open(path, _heads(chat))
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=gh,
+        project="p",
+        proposer="Bohr",
+        cache=TailCache.open(path, _heads(chat)),
     )
     # T-quiet did not move: served from the cache. T-relay moved (our post): read again.
     assert chat.reads == ["T-relay"]
@@ -219,7 +234,12 @@ async def test_1b_a_hit_costs_no_read_and_still_decides(tmp_path: Path) -> None:
 
     chat.reads.clear()
     await pr_runner.run_tick(
-        mcp=chat, gh=gh, project="p", proposer="Bohr", cache=TailCache.open(path, _heads(chat))
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=gh,
+        project="p",
+        proposer="Bohr",
+        cache=TailCache.open(path, _heads(chat)),
     )
     assert chat.reads == []
 
@@ -235,6 +255,7 @@ async def test_1b_a_decision_from_a_cached_tail_still_posts(tmp_path: Path) -> N
         ref=PrRef("acme", "widgets", 7), resolution=PrResolution.OPEN, head_sha=_HEAD_SHA
     )
     await pr_runner.run_tick(
+        repo_map=_REPO_MAP,
         mcp=chat,
         gh=_Gh(open_pr),
         project="p",
@@ -243,6 +264,7 @@ async def test_1b_a_decision_from_a_cached_tail_still_posts(tmp_path: Path) -> N
     )
     chat.reads.clear()
     report = await pr_runner.run_tick(
+        repo_map=_REPO_MAP,
         mcp=chat,
         gh=_Gh(_merged()),
         project="p",
@@ -263,7 +285,9 @@ async def test_1b_posted_heads_is_blank_when_the_id_is_unknown_or_the_post_faile
     )
     chat.blank_msg_id.add("T-blank")
     chat.post_fails.add("T-fail")
-    report = await pr_runner.run_tick(mcp=chat, gh=_Gh(_merged()), project="p", proposer="Bohr")
+    report = await pr_runner.run_tick(
+        repo_map=_REPO_MAP, mcp=chat, gh=_Gh(_merged()), project="p", proposer="Bohr"
+    )
     assert report.as_dict()["posted_heads"] == {"T-blank": "", "T-fail": ""}
     assert "tail_cache" not in report.as_dict()  # no cache asked for: unchanged output
 
@@ -350,13 +374,22 @@ async def test_a_1b_post_reaches_park_wake_as_a_moved_head(tmp_path: Path) -> No
     path = tmp_path / "p.json"
     heads = _heads(chat)
     one_b = await pr_runner.run_tick(
-        mcp=chat, gh=_Gh(_merged()), project="p", proposer="Bohr", cache=TailCache.open(path, heads)
+        repo_map=_REPO_MAP,
+        mcp=chat,
+        gh=_Gh(_merged()),
+        project="p",
+        proposer="Bohr",
+        cache=TailCache.open(path, heads),
     )
     heads.update(one_b.as_dict()["posted_heads"])  # what Update-HeadsFromPosted does
     assert heads["T-relay"] == chat.threads["T-relay"][-1]["msg_id"]
     chat.reads.clear()
     await park_runner.run_tick(
-        mcp=chat, gh=_Gh(_merged()), project="p", roster=_ROSTER, cache=TailCache.open(path, heads)
+        mcp=chat,
+        gh=_Gh(_merged()),
+        project="p",
+        roster=_ROSTER,
+        cache=TailCache.open(path, heads),
     )
     assert chat.reads == ["T-relay"]  # re-read at the new head, not the stale cached tail
 

@@ -29,7 +29,7 @@ from spirrow_mindwire.pr_event_advance.auto_gate.__main__ import (
     cap_digest_line,
     known_projects,
     parse_auto_gate_config,
-    parse_remote_url,
+    resolve_targets,
 )
 from spirrow_mindwire.pr_event_advance.auto_gate.decide import (
     THREAD_LINE_RE,
@@ -51,6 +51,12 @@ from spirrow_mindwire.pr_event_advance.auto_gate.runner import (
     run_pass,
 )
 from spirrow_mindwire.pr_event_advance.decide import PR_EVENT_RELAY_AUTHOR, Post
+from spirrow_mindwire.repo_projects import (
+    RepoProjectMap,
+    build_repo_project_map,
+    parse_remote_url,
+    repo_key,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -59,6 +65,13 @@ _LOGIN = "spirrowgames-ops"
 _NOW = datetime(2026, 11, 1, 3, 0, tzinfo=UTC)  # 12:00 JST on 2026-11-01
 _TODAY = "2026-11-01"
 _TARGET = RepoTarget("proj", "acme", "widgets")
+#: acme/widgets belongs to "proj" only, and hub-repo to "hub" (msg-8032: the shared table).
+_REPO_MAP = RepoProjectMap(
+    candidates={
+        repo_key("acme", "widgets"): frozenset({"proj"}),
+        repo_key("acme", "hub-repo"): frozenset({"hub"}),
+    }
+)
 _LIVE = AutoGateConfig(live=True)
 _HEAD = "703b836737f29fe0f4139d86d2d02077c662ce5f"
 _OLD = "1111111111111111111111111111111111111111"
@@ -170,6 +183,7 @@ async def _run(
         review_login=_LOGIN,
         now=now,
         known_projects={"proj"},
+        repo_map=_REPO_MAP,
     )
 
 
@@ -719,6 +733,7 @@ async def test_one_repos_listing_failure_costs_only_that_repo(tmp_path: Path) ->
         review_login=_LOGIN,
         now=_NOW,
         known_projects={"proj"},
+        repo_map=_REPO_MAP,
     )
     assert report.list_errors[0]["repo"] == "acme/broken"
     assert len(mcp.posts) == 1
@@ -1027,6 +1042,7 @@ async def _run_cross(
         review_login=_LOGIN,
         now=_NOW,
         known_projects=frozenset({"proj", "hub", "held"}),
+        repo_map=_REPO_MAP,
     )
 
 
@@ -1130,3 +1146,109 @@ def test_known_projects_is_every_clones_key_held_or_not() -> None:
     assert known_projects(sweep) == frozenset({"proj", "held"})
     assert known_projects({}) == frozenset()
     assert known_projects({"clones": ["proj"]}) == frozenset()
+
+
+# ---- the PR's project from the shared clones table (msg-8032 §4 / msg-8034 §4) ------------- #
+
+
+async def _run_shared(
+    mcp: ProjectMcp,
+    body: str,
+    tmp_path: Path,
+    *,
+    repo_map: RepoProjectMap,
+    targets: list[RepoTarget],
+) -> tuple[PassReport, FakeGh]:
+    gh = OneRepoGh([_pr(body=body)])
+    report = await run_pass(
+        mcp=mcp,
+        gh=gh,
+        targets=targets,
+        config=_LIVE,
+        store=DailyCounterStore(tmp_path / "c.json"),
+        review_login=_LOGIN,
+        now=_NOW,
+        known_projects=frozenset({"proj", "app", "hub"}),
+        repo_map=repo_map,
+    )
+    return report, gh
+
+
+_SHARED = RepoProjectMap(candidates={repo_key("acme", "widgets"): frozenset({"proj", "app"})})
+_SHARED_TARGETS = [RepoTarget("app", "acme", "widgets"), RepoTarget("proj", "acme", "widgets")]
+
+
+async def test_two_projects_on_one_repo_judge_the_pr_once_and_skip_a_bare_id(
+    tmp_path: Path,
+) -> None:
+    mcp = ProjectMcp({("proj", "T-x"): _idle(), ("app", "T-x"): _idle()})
+    report, gh = await _run_shared(
+        mcp, "Thread: T-x", tmp_path, repo_map=_SHARED, targets=_SHARED_TARGETS
+    )
+    assert gh.list_calls == 1
+    assert report.examined == 1
+    assert mcp.reads == []
+    assert mcp.posts == []
+    assert report.failures == [
+        {
+            "pr_ref": f"{_REPO}#7",
+            "reason": "pr-project-ambiguous: app, proj",
+            "pr_project": "multiple: app, proj",
+        }
+    ]
+
+
+async def test_two_projects_on_one_repo_still_fire_a_qualified_id(tmp_path: Path) -> None:
+    mcp = ProjectMcp({("proj", "T-x"): _idle()})
+    report, _ = await _run_shared(
+        mcp, "Thread: proj/T-x", tmp_path, repo_map=_SHARED, targets=_SHARED_TARGETS
+    )
+    assert mcp.reads == [("proj", "T-x")]
+    assert [(p["project"], p["thread_id"]) for p in mcp.posts] == [("proj", "T-x")]
+    assert report.fired == 1
+
+
+_INCOMPLETE = RepoProjectMap(
+    candidates={repo_key("acme", "widgets"): frozenset({"proj"})},
+    unresolved=frozenset({"app"}),
+)
+
+
+async def test_an_unread_clone_skips_a_bare_id(tmp_path: Path) -> None:
+    # msg-8034 §5: app's origin could not be read, so proj is not provably the only candidate.
+    mcp = ProjectMcp({("proj", "T-x"): _idle()})
+    report, _ = await _run_shared(
+        mcp, "Thread: T-x\nCloses-thread: T-x", tmp_path, repo_map=_INCOMPLETE, targets=[_TARGET]
+    )
+    assert mcp.reads == []
+    assert report.failures == [
+        {
+            "pr_ref": f"{_REPO}#7",
+            "reason": "pr-project-incomplete: app",
+            "pr_project": "incomplete: app",
+        }
+    ]
+
+
+async def test_an_unread_clone_still_fires_a_qualified_id(tmp_path: Path) -> None:
+    mcp = ProjectMcp({("proj", "T-x"): _idle()})
+    report, _ = await _run_shared(
+        mcp, "Thread: proj/T-x", tmp_path, repo_map=_INCOMPLETE, targets=[_TARGET]
+    )
+    assert [(p["project"], p["thread_id"]) for p in mcp.posts] == [("proj", "T-x")]
+    assert report.fired == 1
+
+
+def test_resolve_targets_reads_the_shared_table() -> None:
+    def origin(clone: str) -> str:
+        if clone == "C:/bad":
+            raise OSError("gone")
+        return {"C:/w": "https://github.com/acme/widgets", "C:/gl": "https://gitlab.com/a/b"}[clone]
+
+    table = build_repo_project_map({"proj": "C:/w", "bad": "C:/bad", "gl": "C:/gl"}, origin)
+    targets, errors = resolve_targets(table, ["bad", "gl", "missing", "proj"])
+    assert targets == [_TARGET]
+    assert [e["project"] for e in errors] == ["bad", "gl", "missing"]
+    assert errors[0]["error"].startswith("origin unreadable:")
+    assert errors[1]["error"] == "origin is not a GitHub remote"
+    assert errors[2]["error"] == "no clones entry"

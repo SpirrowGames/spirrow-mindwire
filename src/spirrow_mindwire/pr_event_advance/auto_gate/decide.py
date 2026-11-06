@@ -17,6 +17,9 @@ Evaluation order, first match wins:
 3   base not in ``gate_bases``               Noop(stacked)
 4   ``Gate: hold`` line                      Noop(hold)
 5   thread link missing / bad                Noop(no-thread / thread-line-unparsed / ambiguous)
+5a  a bare id, PR project unresolved         (runner, msg-8032 §4 / msg-8034 §4)
+    some clone origin unread                 skip pr-project-incomplete
+    repo in no / several projects            skip pr-project-ambiguous
 5b  link names another project:              (runner, msg-8022 §2)
     not in ``clones``                        skip thread-project-unknown
     in ``clones``, held out of this pass     Noop(thread-project-held)
@@ -95,6 +98,8 @@ class ThreadLink:
     noop: AutoGateNoop | None = None
     ids: tuple[str, ...] = ()
     unparsed_lines: tuple[str, ...] = ()
+    #: Some ``Thread:`` / ``Closes-thread:`` id carried no project, so it needs the PR's project.
+    has_bare: bool = False
 
 
 def has_gate_hold(body: str) -> bool:
@@ -124,6 +129,7 @@ def resolve_thread_link(body: str, pr_project: str | None = None) -> ThreadLink:
     ``pr_project`` was given and the id was unqualified); otherwise the project the body named.
     """
     refs = thread_refs(body)
+    has_bare = any(ref.project is None for ref in (*refs.thread_lines, *refs.closes))
     keys: dict[tuple[str | None, str], None] = dict.fromkeys(
         ref.resolved(pr_project) for ref in (*refs.thread_lines, *refs.closes)
     )
@@ -131,10 +137,15 @@ def resolve_thread_link(body: str, pr_project: str | None = None) -> ThreadLink:
     labels = tuple(_label(key, pr_project) for key in unique)
     unparsed = refs.unparsed_lines
     if len(unique) >= 2:
-        return ThreadLink(noop=AutoGateNoop.AMBIGUOUS, ids=labels, unparsed_lines=unparsed)
+        return ThreadLink(
+            noop=AutoGateNoop.AMBIGUOUS, ids=labels, unparsed_lines=unparsed, has_bare=has_bare
+        )
     if unparsed:
         return ThreadLink(
-            noop=AutoGateNoop.THREAD_LINE_UNPARSED, ids=labels, unparsed_lines=unparsed
+            noop=AutoGateNoop.THREAD_LINE_UNPARSED,
+            ids=labels,
+            unparsed_lines=unparsed,
+            has_bare=has_bare,
         )
     if not unique:
         return ThreadLink(noop=AutoGateNoop.NO_THREAD)
@@ -143,6 +154,7 @@ def resolve_thread_link(body: str, pr_project: str | None = None) -> ThreadLink:
         thread_id=thread_id,
         thread_project=None if project == pr_project else project,
         ids=labels,
+        has_bare=has_bare,
     )
 
 

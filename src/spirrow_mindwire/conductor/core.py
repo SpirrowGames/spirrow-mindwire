@@ -106,6 +106,7 @@ from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..naysayer.review_rounds import render_review_round_line
+from ..repo_projects import PrProject, RepoProjectMap
 from ..routing import (
     GuardIClosure,
     GuardICondition,
@@ -590,6 +591,7 @@ class Conductor:
         review_source: ReviewSource | None = None,
         head_source: PrHeadSource | None = None,
         pr_state_source: PrStateSource | None = None,
+        repo_projects: Callable[[], RepoProjectMap] | None = None,
         review_login: str = DEFAULT_REVIEW_LOGIN,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
@@ -697,6 +699,10 @@ class Conductor:
         # read before admission on every ``NEXT: pr-review``, so a merged / closed PR is reported
         # instead of re-gated. ``None`` (a bare Conductor) skips the check, as does a failed read.
         self._pr_state_source = pr_state_source
+        # T-gate-fires-on-pr-open (msg-8030 / msg-8032 / msg-8034): ``clones`` read at the
+        # settled-PR check, so an unqualified ``Closes-thread:`` is resolved against the PR's own
+        # repo. ``None`` (tests, library callers) resolves nothing: a bare id then never closes.
+        self._repo_projects = repo_projects
         self._review_login = review_login
         # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1' / msg-6316). Set only
         # by the sweep's gate-lane launch (``--gate-only``); a hand run and a role-lane launch keep
@@ -3519,6 +3525,16 @@ class Conductor:
         )
         return await self._post_as_relay(body)
 
+    def _resolve_pr_project(self, pr: PrRef) -> PrProject:
+        """The PR's project from ``clones``; unresolved when no table is wired or it fails."""
+        if self._repo_projects is None:
+            return PrProject(None, "none")
+        try:
+            return self._repo_projects().resolve(pr.owner, pr.repo)
+        except Exception as exc:  # a table that cannot be read resolves nothing (fail closed)
+            logger.warning("settled-PR check: repo -> project table unreadable: %r", exc)
+            return PrProject(None, "none")
+
     async def _post_if_pr_settled(self, pr: PrRef) -> dict[str, Any] | None:
         """Post the merged / closed fact for ``pr`` and return the post, or ``None`` to go on.
 
@@ -3560,7 +3576,7 @@ class Conductor:
         post = lifecycle_post(
             thread_project=self._thread_ref.project_id,
             thread_id=self._thread_ref.thread_id,
-            pr_project=self._thread_ref.project_id,  # no repo -> project map here (lifecycle_post)
+            pr_project=self._resolve_pr_project(pr),
             pr_ref=pr.slug,
             pr=facts,
             proposer=proposer,

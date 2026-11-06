@@ -99,6 +99,7 @@ from ..conductor.handoff import (
     parse_next_token,
 )
 from ..github.client import CiState, PrResolution, PrState, parse_pr_ref
+from ..repo_projects import PrProject
 
 #: The author 1b writes under. Distinct from :data:`RELAY_AUTHOR` on purpose: the gate-records
 #: readers (``verdict_heads`` / ``ci_route_heads`` / ``prior_advisory_approvals``) narrow to that
@@ -346,10 +347,14 @@ def needs_ci(tail: RelayTail | None, pr: PrFacts) -> bool:
     return lifecycle_of(pr) is PrLifecycle.OPEN and _same_head(tail.hold_head, pr.head_sha)
 
 
-def closes_thread(pr_body: str, thread_project: str, thread_id: str, pr_project: str) -> bool:
+def closes_thread(
+    pr_body: str, thread_project: str, thread_id: str, pr_project: str | None
+) -> bool:
     """True iff the PR body declares ``Closes-thread:`` for THIS thread, its project included.
 
     An unqualified value names ``pr_project``; a qualified one names its own (msg-8024 §2).
+    ``pr_project=None`` (the PR's project is not provably unique, msg-8032 / msg-8034): an
+    unqualified value names no thread, and only a qualified one can match.
     """
     want = (thread_project, thread_id)
     return any(ref.resolved(pr_project) == want for ref in thread_refs(pr_body).closes)
@@ -377,11 +382,28 @@ def _heading(pr_ref: str) -> str:
     return f"PR event (1b, {PR_EVENT_RELAY_AUTHOR}) — {pr_ref}"
 
 
+def _withheld_close_line(
+    pr_body: str, thread_id: str, pr_ref: str, pr_project: PrProject
+) -> str | None:
+    """Why a bare ``Closes-thread: <this id>`` did not close, or ``None`` when it was not that."""
+    if pr_project.project is not None:
+        return None
+    if not any(
+        ref.project is None and ref.thread_id == thread_id for ref in thread_refs(pr_body).closes
+    ):
+        return None
+    repo = pr_ref.split("#", 1)[0]
+    return (
+        f"Closes-thread: {thread_id} はプロジェクト名が無く、{repo} のプロジェクトを"
+        f"1 つに決められないので閉じない（{pr_project.describe()}）。"  # noqa: RUF001
+    )
+
+
 def lifecycle_post(
     *,
     thread_project: str,
     thread_id: str,
-    pr_project: str,
+    pr_project: PrProject,
     pr_ref: str,
     pr: PrFacts,
     proposer: str | None,
@@ -394,17 +416,22 @@ def lifecycle_post(
     callers take disjoint tails: 1b reads a :data:`RELAY_AUTHOR` heading, the conductor a
     ``NEXT: pr-review <ref>`` nomination, and no relay post ever ends in ``pr-review``.
 
-    ``thread_project`` / ``pr_project`` feed :func:`closes_thread`. Neither caller can map a PR's
-    repo to its project (no ``clones`` table reaches them), so both pass the design thread's own
-    project as ``pr_project``: an unqualified ``Closes-thread:`` keeps meaning "this thread", as
-    it did before msg-8024, and a qualified one settles only when it names this thread's project.
+    ``pr_project`` is the PR's repo looked up in ``clones``
+    (:meth:`~spirrow_mindwire.repo_projects.RepoProjectMap.resolve`, msg-8030 / msg-8032 /
+    msg-8034), never the design thread's project. When it is unresolved (``incomplete`` /
+    ``none`` / ``multiple``) an unqualified ``Closes-thread:`` does not close; the merge fact is
+    still written, with one line saying why the thread stayed open. A qualified one still closes
+    on an exact (project, id) match.
     """
     match lifecycle_of(pr):
         case PrLifecycle.MERGED:  # row 3
             sha = pr.merge_commit_sha or "merge commit 不明"
             body = f"{_heading(pr_ref)}\n\nPR {pr_ref} が merge された（{sha}）。"  # noqa: RUF001 (§F.1.1 wording)
-            if closes_thread(pr.body, thread_project, thread_id, pr_project):
+            if closes_thread(pr.body, thread_project, thread_id, pr_project.project):
                 return Post(body=body, next_line=f"NEXT: {NONE_TOKEN}")
+            withheld = _withheld_close_line(pr.body, thread_id, pr_ref, pr_project)
+            if withheld is not None:
+                body = f"{body}\n{withheld}"
             return Post(body=body, next_line=_to_proposer(thread_id, proposer))
         case PrLifecycle.CLOSED:  # row 4 — the Closes-thread declaration is ignored here
             closed_at = pr.closed_at.isoformat() if pr.closed_at else "closed_at 不明"
@@ -423,6 +450,7 @@ def decide(
     *,
     thread_project: str,
     thread_id: str,
+    pr_project: PrProject,
     tail: RelayTail | None,
     pr: PrFacts,
     ci: CiState | None,
@@ -447,7 +475,7 @@ def decide(
     settled = lifecycle_post(
         thread_project=thread_project,
         thread_id=thread_id,
-        pr_project=thread_project,  # no repo -> project map reaches 1b (see lifecycle_post)
+        pr_project=pr_project,
         pr_ref=ref,
         pr=pr,
         proposer=proposer,

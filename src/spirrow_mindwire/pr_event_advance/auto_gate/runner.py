@@ -39,6 +39,7 @@ from ...conductor.gate_records import RELAY_AUTHOR, normalize_sha, verdict_heads
 from ...conductor.handoff import parse_next_token
 from ...github.client import GatePr, GatePrListing, OpenPrListingError, PrRef, ReviewInfo
 from ...magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
+from ...repo_projects import INCOMPLETE, PrProject, RepoProjectMap, RepoTarget, repo_key
 from ..decide import PR_EVENT_RELAY_AUTHOR, Post
 from .decide import AutoGateNoop, ThreadLink, already_fired, prefilter, tail_decision
 
@@ -125,17 +126,6 @@ class DailyCounterStore:
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, self.path)
-
-
-@dataclass(frozen=True)
-class RepoTarget:
-    project: str
-    owner: str
-    repo: str
-
-    @property
-    def slug(self) -> str:
-        return f"{self.owner}/{self.repo}"
 
 
 @dataclass(frozen=True)
@@ -231,13 +221,28 @@ async def _judge(
     pr: GatePr,
     config: AutoGateConfig,
     review_login: str,
+    pr_project: PrProject,
     known_projects: Collection[str],
     pass_projects: Collection[str],
 ) -> _Judged:
-    pre = prefilter(pr, config.gate_bases, target.project)
+    own = pr_project.project
+    pre = prefilter(pr, config.gate_bases, own)
     if isinstance(pre, AutoGateNoop):
         return _Judged(noop=pre)
     link: ThreadLink = pre
+    if link.has_bare and own is None:
+        # msg-8032 §4 / msg-8034 §4: a bare id needs the PR's project, and the repo does not name
+        # exactly one with every clone read. A qualified id below needs no such lookup. ``none``
+        # (no clone names the repo) cannot arise for a target built from the same table, and is
+        # reported with the multiple-candidate code: either way no single project is named.
+        kind = (
+            "pr-project-incomplete" if pr_project.reason == INCOMPLETE else "pr-project-ambiguous"
+        )
+        listed = ", ".join(pr_project.projects) or (pr_project.reason or "")
+        return _Judged(
+            skip=f"{kind}: {listed}",
+            detail={"pr_project": pr_project.describe(), "ids": list(link.ids)},
+        )
     if link.noop is not None:
         detail: dict[str, Any] | None = None
         if link.noop is not AutoGateNoop.NO_THREAD:
@@ -246,8 +251,9 @@ async def _judge(
     thread_id = link.thread_id
     assert thread_id is not None  # resolve_thread_link sets exactly one of thread_id / noop
     # msg-8022 §2-3: a project is taken only when the body names it; nothing is searched for.
-    project = link.thread_project or target.project
-    if project != target.project:
+    project = link.thread_project or own
+    assert project is not None  # no bare id when own is None, so the body named the project
+    if project != own:
         cross = {"thread_project": project}
         if project not in known_projects:
             return _Judged(
@@ -270,7 +276,7 @@ async def _judge(
         thread_id=thread_id,
         review_login=review_login,
     )
-    if project != target.project:
+    if project != own:
         judged.detail = {**(judged.detail or {}), "thread_project": project}
     return judged
 
@@ -383,11 +389,12 @@ def _decision_row(ref: str, judged: _Judged) -> dict[str, Any]:
 
 
 def _failure_row(ref: str, judged: _Judged, reason: str) -> dict[str, Any]:
-    row = {"pr_ref": ref, "thread_id": judged.thread_id, "reason": reason}
-    project = (judged.detail or {}).get("thread_project")
-    if project is not None:
-        row["thread_project"] = project
-    return row
+    row: dict[str, Any] = {"pr_ref": ref, "thread_id": judged.thread_id, "reason": reason}
+    for key in ("thread_project", "pr_project"):
+        value = (judged.detail or {}).get(key)
+        if value is not None:
+            row[key] = value
+    return {k: v for k, v in row.items() if v is not None}
 
 
 async def run_pass(
@@ -400,14 +407,26 @@ async def run_pass(
     review_login: str,
     now: datetime,
     known_projects: Collection[str],
+    repo_map: RepoProjectMap,
 ) -> PassReport:
     """One 1c pass. One repo's or one PR's failure is reported and costs only that row.
 
     ``known_projects`` is every project in ``sweep.json``'s ``clones``; ``targets`` are the ones
     the wrapper let through its control HOLD this tick. A ``Thread:`` line naming a project in
     the first but not the second is :attr:`AutoGateNoop.THREAD_PROJECT_HELD` (msg-8022 §2).
+
+    ``repo_map`` gives each repo's own project for a bare id. Targets sharing one repo are judged
+    once (msg-8032 §4): judging the same PR under two projects would read a bare id twice, as two
+    different threads.
     """
     pass_projects = frozenset(target.project for target in targets)
+    seen: set[str] = set()
+    unique_targets: list[RepoTarget] = []
+    for target in targets:
+        key = repo_key(target.owner, target.repo)
+        if key not in seen:
+            seen.add(key)
+            unique_targets.append(target)
     today = jst_date(now)
     report = PassReport(
         mode="live" if config.live else "dry-run", date_jst=today, cap=config.daily_cap
@@ -429,7 +448,8 @@ async def run_pass(
         )
         return report
     slots = min(MAX_FIRES_PER_TICK, config.daily_cap - counter.fired)
-    for target in targets:
+    for target in unique_targets:
+        pr_project = repo_map.resolve(target.owner, target.repo)
         try:
             listing = await gh.list_open_gate_prs(target.owner, target.repo)
         except OpenPrListingError as exc:
@@ -450,6 +470,7 @@ async def run_pass(
                 pr=pr,
                 config=config,
                 review_login=review_login,
+                pr_project=pr_project,
                 known_projects=known_projects,
                 pass_projects=pass_projects,
             )
