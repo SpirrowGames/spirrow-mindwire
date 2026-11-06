@@ -163,7 +163,8 @@ Check 'exit 2 branch still precedes the generic non-zero branch' $true ($posEnv2
 foreach ($name in 'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update-DirtyCloneParking',
                   'Get-DirtyCloneDigestLines', 'New-DailyDigest', 'Get-FingerprintHint',
                   'Get-DerivedQuarantineState', 'Format-DurationDigest', 'Get-ParkedRowTag', 'ConvertTo-UtcInstant',
-                  'Get-QuarantineReproHint') {
+                  'Get-QuarantineReproHint', 'ConvertFrom-AlertIso', 'Get-DirtyCloneAlertStage',
+                  'Get-LatestRetreatRecordForRepo', 'Format-RetreatRecordAlertLine', 'Get-DirtyCloneStagedAlert') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -200,7 +201,10 @@ function Invoke-SimTick {
             $script:sim.reverts++
             $notice = Get-DirtyCloneNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $r.output -ExitCode 8
             Set-DirtyCloneParked -Parked $Parked -RepoDir $cand.repo_dir -Notice $notice -NowIso $Now
-            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $notice.signature -Message $notice.message
+            # PR-2: the real exit-8 branch stages the signature the same way the re-judge does.
+            $staged = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message -RepoDir $cand.repo_dir `
+                -SinceIso "$($Parked[$notice.repo_key].since)" -Now (ConvertFrom-AlertIso $Now) -ParkedCount 2 -RecordsPath ''
+            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $staged.signature -Message $staged.message
             $disp[$cand.key] = 'dirty-clone'
             continue
         }
@@ -241,12 +245,12 @@ Write-Host ''
 Write-Host 'parking — the state changes while parked (wrong_head -> dirty_tree)'
 $dirtyTree = @{ code = 8; output = @(New-Payload -Reason 'dirty_tree' -Head 'main'); stderr = '' }
 $sinceBefore = $parked[$repoKeyP].since
-$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T01:00:00.0000000Z'
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T00:30:00.0000000Z'
 Check 'changed state: a second notification' 2 $script:sent.Count
 Check 'changed state: reason rewritten' 'dirty_tree' $parked[$repoKeyP].reason
 Check 'changed state: signature rewritten' 'dirty-clone:dirty_tree:main' $parked[$repoKeyP].signature
 Check 'changed state: since unchanged' $sinceBefore $parked[$repoKeyP].since
-$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T01:05:00.0000000Z'
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($d) $dirtyTree } -NowIso '2026-10-03T00:35:00.0000000Z'
 Check 'unchanged state: no further notification' 2 $script:sent.Count
 
 Write-Host ''
@@ -254,7 +258,7 @@ Write-Host 'parking — clone-check could not judge (exit 1)'
 $probeFail = @{ code = 1; output = @(); stderr = "clone-check: cannot judge x: RuntimeError: boom" }
 $script:sim.daemonRuns = 0
 foreach ($i in 1..2) {
-    $d = Invoke-SimTick -Parked $parked -NotifyState $notify -Probe { param($x) $probeFail } -Daemon $daemonWrong -Now '2026-10-03T02:00:00.0000000Z'
+    $d = Invoke-SimTick -Parked $parked -NotifyState $notify -Probe { param($x) $probeFail } -Daemon $daemonWrong -Now '2026-10-03T00:40:00.0000000Z'
 }
 Check 'probe-failed: repo stays parked' $true $parked.ContainsKey($repoKeyP)
 Check 'probe-failed: candidates parked, no launch' 'dirty-clone-parked' $d['p::T-1']
@@ -267,7 +271,7 @@ Check 'probe-failed: since unchanged' $sinceBefore $parked[$repoKeyP].since
 Write-Host ''
 Write-Host 'parking — unparseable clone-check payload stays parked (parse-failed)'
 $bad = @{ code = 8; output = @('MINDWIRE_DIRTY_CLONE_PAYLOAD {nope'); stderr = '' }
-$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($x) $bad } -NowIso '2026-10-03T02:30:00.0000000Z'
+$null = Update-DirtyCloneParking -Parked $parked -NotifyState $notify -Probe { param($x) $bad } -NowIso '2026-10-03T00:45:00.0000000Z'
 Check 'parse-failed: still parked' $true $parked.ContainsKey($repoKeyP)
 Check 'parse-failed: signature' 'dirty-clone:parse-failed' $parked[$repoKeyP].signature
 
