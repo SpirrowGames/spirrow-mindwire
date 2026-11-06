@@ -191,18 +191,26 @@ def test_the_conductor_attaches_the_notice_to_a_naysayer_dispatch_only() -> None
     assert event.conditional_proceed_notice is None
 
 
+_BASELINE_DIR = Path(__file__).parent / "data" / "conditional_proceed_baseline"
+
+
+def _baseline(name: str) -> str:
+    """A naysayer prompt rendered by the pre-change code (origin/main df82e82)."""
+    return (_BASELINE_DIR / name).read_bytes().decode("utf-8")
+
+
 def test_without_the_notice_the_naysayer_prompt_is_unchanged() -> None:
     role, event = _dispatch(_thread("Bohr", "design\n\nNEXT: Einstein"), None)
     assert role is Role.NAYSAYER
     assert event.conditional_proceed_notice is None
     prompt = build_turn_prompt(event, Role.NAYSAYER, "closing")
     assert "CONDITIONAL PROCEED" not in prompt
-    # The SDK prompt with the field unset equals the prompt of an event that never had it.
-    from dataclasses import replace
-
-    assert prompt == build_turn_prompt(
-        replace(event, conditional_proceed_notice=None), Role.NAYSAYER, "closing"
-    )
+    # Independent baseline: the same event rendered by the pre-change code on ``main``
+    # (df82e82, before the field existed), checked in as a golden file. A change to
+    # prompt assembly reds this even if it affects both sides of an in-process compare.
+    assert build_turn_prompt(
+        _event(None, "design\n\nNEXT: Einstein"), Role.NAYSAYER, "closing"
+    ) == _baseline("naysayer_sdk_prompt.txt")
     # The static system prompt never carries the exit: it is a per-turn notice only.
     assert "CONDITIONAL PROCEED" not in build_handoff_protocol_block(Role.NAYSAYER)
 
@@ -224,6 +232,10 @@ def test_the_lexora_naysayer_renders_the_notice_and_is_unchanged_without_it() ->
     without = lexora_messages(_event(None), Role.NAYSAYER, "sys")[1].content
     assert notice in with_notice
     assert with_notice.replace(f"{notice}\n\n", "") == without
+    # Independent baseline rendered by the pre-change code on ``main`` (df82e82).
+    baseline_event = _event(None, "design\n\nNEXT: Einstein")
+    rendered = lexora_messages(baseline_event, Role.NAYSAYER, "sys")[1].content
+    assert rendered == _baseline("naysayer_lexora_user.txt")
     assert "CONDITIONAL PROCEED" not in without
 
 

@@ -1,0 +1,9 @@
+You are acting as the naysayer role in thread T-x.
+
+New message from Bohr:
+
+design
+
+NEXT: Einstein
+
+closing
