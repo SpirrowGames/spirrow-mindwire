@@ -240,7 +240,7 @@ The naysayer answers through one of two Lexora tiers, chosen per request by
 | tier | answered by | the attestation accepts |
 |---|---|---|
 | `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
-| `naysayer-gemini` | Gemini only | `gemini` |
+| `naysayer-gemini` | Gemini only (paid key, project logging off; no ZDR on this API — ADR-14 §9) | `gemini` |
 
 A request goes to `naysayer-gemini` when **any** of these holds:
 

@@ -74,6 +74,7 @@ Claude Code の自動化は「種類としてはクリーン」だが、OAuth/�
   - **再必須化トリガー（二本立て、N-1/N-3 取り込み）**: 以下の **いずれか** に該当する LLM 経路は ZDR 必須（or 外部 naysayer 不使用で内部処理）とする——
     - **(i) 他人の個人データを LLM 経路に載せる用途**（例: Thirdy の顧客ミーティング処理、ゲーム内 UGC のモデレーション）。
     - **(ii) セキュリティ構成・未公開脆弱性が naysay 対象の中心になる経路**（例: 認証設計・インフラ構成・Vaultwarden/Tailscale/firewall 構成の議論、PR レビューで脆弱性箇所を記述する naysay）。これは「他人の個人データ」ではないが実害度が異なり、かつ **T15 認証4軸議論のように naysayer 経路を実際に通っている**（再帰構造）。Takahito 本人の認証材料・個人開発環境の機密も (ii) で拾う（「他人の」限定が本人機密を除外しないため）。
+      - **§9（2026-11-07）で改訂**: Gemini Developer API では ZDR を取れないため、(ii) の Gemini 経路は ZDR の代わりに「paid 鍵・project のログ保存オフ・素の `generateContent` だけ」を要件とします。(i) は変えていません。
   - **検知点（N-2 取り込み）**: トリガーは静的条件だけでなく **評価タイミング** とセットで持つ。**新規 service/機能が Lexora 経由で LLM を呼ぶ設計をするとき、その設計 ADR の段階で「この経路に (i)(ii) のいずれかが載るか」を必須チェック項目にする**。「条件は書いたが検知が無主で暗黙運用に落ちる」を防ぐ。
 - **素の `generateContent` のみ**。grounding（検索/マップ、30日保持・無効化不可）/ File API / 明示的コンテキストキャッシュ / Live API / Interactions API は呼ばない（adapter 層で gate）。この gate は ZDR の要否と独立した surface 強制であり、ZDR 格下げの影響を受けない（PR spirrow-lexora#1）。
 
@@ -471,3 +472,36 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 ### 8.6 計測
 
 - 2026-11-07 に、各リポジトリの既定ブランチのファイル一覧に既定 glob を当てました。当たるのは 1 リポジトリあたり 1〜10 ファイルで、どれも deploy・CI・ユニット・env・認証のコードでした。通常のソースには当たりません。
+
+## 9. Amendment (2026-11-07): Gemini の経路では ZDR を取れない — 再必須化トリガー (ii) の要件を実態に合わせる（Takahito の判断）
+
+- **決めた人**: Takahito。Claude Code の operator セッションで直接指示したもので、ループと chatroom は通していません。
+- **変えるところ**: D-4 の再必須化トリガー (ii)（N-3 の部分集合）について、Gemini の経路の要件だけです。(i)（他人の個人データ）は変えません。
+
+### 9.1 事実（2026-11-07 に確認）
+
+- **ZDR は申請していませんでした。** 5/31（`T-T15-poc-h-phase1-kickoff` msg-367）で「申請は Takahito の残タスク」とされ、6 月の格下げ（`T-zdr-invariant-downgrade` msg-376）で任意になりました。その後は誰も申請も確認もしていません。Takahito のメールにも、Google とのやり取りはありません。
+- **Gemini Developer API では、いま ZDR を申請する手順がありません。** Lexora の `gemini` backend が使っている経路（AI Studio の API キー）です。公式の ZDR ページには何が保持されるかは書いてありますが、申請の手順は無く、確実な ZDR が要るなら Vertex AI（Gemini Enterprise Agent Platform）を使うよう案内しています。Google のフォーラムでも、6 月以降に申請手順を尋ねた投稿へ、手順の回答は出ていません。そのため、この経路では ZDR を取れないものとして扱います。
+- **この経路で残るもの**: 不正利用を監視するためのログです。Google は「限られた期間」とだけ書いています（第三者の資料では 55 日）。paid なので、学習や製品の改善には使われません。
+- **ログ保存の設定**: Lexora の鍵の project で、AI Studio の「Generate Content API logging」がオフであることを、Takahito が確認しました（2026-11-07）。オンだと、prompt と response の全文が最大 55 日保存されます。
+
+### 9.2 決定
+
+1. (ii) の経路（N-3 の部分集合）について、Gemini では「ZDR 必須」を外します。代わりに、次の 3 つがそろっていることを要件にします。
+   - paid 鍵であること。D-4 の最上位の不変条件で、Lexora の `paid_key_acknowledged` で構造的に担保しています。
+   - 鍵の project で、Generate Content API logging がオフであること。
+   - naysayer の要求が素の `generateContent` だけであること。grounding・File API・明示的なキャッシュ・Live API・Interactions API は使いません。§6 で gate そのものは外しましたが、naysayer はこれらを呼びません。
+2. 不正利用監視のログが限られた期間残ることは、残るリスクとして受け入れます。
+3. **N-3 を Gemini に固定する規則（§7.3）は変えません。** ZDR が無い点は Gemini も codex も同じです。ただし Gemini の「学習に使わない」は paid の契約にもとづくので、予告なしには変わりません。codex の「学習に使わない」は data controls のトグルにもとづくので、予告なく変わりえます（§7.3）。この差は残ります。
+4. (i)（他人の個人データを載せる経路）は、これまでどおり ZDR 必須（または内部での処理）です。Gemini Developer API ではそもそも満たせないので、(i) に当たる経路を作るときは、Vertex AI の ZDR か、内部での処理にします。
+
+### 9.3 運用上の条件（守らないと 9.2 の 1 が崩れるもの）
+
+- **鍵を別の project のものに替えるときは、その project のログ保存をオフにします。** 2026-10-26 以降に作られた project では、既定でオンです。
+- ログ保存の設定は project のトグルなので、予告なく変わりえます（data controls と同じ性質です）。機械的に読み取る手段は確認していません。Lexora が要求ごとに `store=false` を付ければ、project の設定によらずオフにできます（要求ごとの指定が project の設定より優先されます）。これは別の変更として検討します。
+- 確認の手順: aistudio.google.com/logs で project を選び、Settings を開きます。
+
+### 9.4 変えないこと
+
+- §7.3 の振り分け（N-3 は Gemini 固定）、attestation（§7.6）、§8 の既定 glob、paid 鍵の不変条件、§6。
+- ZDR は「推奨」のままです。Gemini の経路で取れるようになったら（または Vertex AI に移したら）、有効にします。
