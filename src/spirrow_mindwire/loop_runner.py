@@ -86,6 +86,7 @@ from .clone_guard import (
     emit_dirty_clone_payload,
 )
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
+from .conductor.continuation import DEFAULT_CONTINUE_CAP
 from .conductor.core import (
     CONDUCTOR_RELAY_AUTHOR,
     ConductorStopSlot,
@@ -108,6 +109,7 @@ from .config import (
     NaysayerGatingConfig,
     Stage3LoopConfig,
     load_settings,
+    resolve_continuation_ledger_path,
     resolve_tier_c_decisions_log_path,
     resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
@@ -955,6 +957,11 @@ class _PerCallPrStateSource:
             return await client.fetch_pr_state(pr)
 
 
+def _resolve_continue_cap(configured: int | None) -> int:
+    """The project's configured cap, or :data:`DEFAULT_CONTINUE_CAP` when it has no key."""
+    return DEFAULT_CONTINUE_CAP if configured is None else configured
+
+
 def build_conductor(
     settings: MindwireSettings,
     *,
@@ -1089,6 +1096,10 @@ def build_conductor(
             # T-implementer-self-continuation condition 4: clean tree AND nothing unpushed, judged
             # by the same guard the dispatcher runs before every dispatch.
             continuation_clone_check=_continuation_clone_check(dispatcher),
+            # PR-2 (Bohr msg-7971 §1 / msg-7973): the per-project cap ([conductor].continue_cap,
+            # default 3 when this project has no key) and the D-3 continuation ledger.
+            continue_cap=_resolve_continue_cap(cond_cfg.continue_cap_for(loop_cfg.project)),
+            continuation_ledger_path=resolve_continuation_ledger_path(settings),
             # T-naysayer-conditional-proceed-on-small-fixmin (PR 2): the naysayer is offered the
             # conditional exit only while this project's setting is ``issuing``; every other state
             # (absent, ``verify_only``, unknown) offers nothing (msg-7960 Obj-5-1).
