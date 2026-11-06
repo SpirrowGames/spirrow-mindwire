@@ -220,6 +220,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     # closing, so it is never mistaken for part of the author's message. Absent → no block.
     if event.retry_notice:
         blocks.append(event.retry_notice)
+    # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1b: where the previous launch's WIP
+    # went. Its own block, like the retry notice; absent -> no block.
+    if event.clone_retreat_notice:
+        blocks.append(event.clone_retreat_notice)
     # ADR-2026-10-09-23 unit 1: the branch the git-sync hook checked out. Its own block, like the
     # retry notice; absent → no block, so a sync-off prompt is unchanged.
     if event.git_branch:

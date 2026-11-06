@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..clone_guard import DirtyCloneError
+from ..clone_retreat_log import PendingNotice, load_pending_notice, mark_delivered
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS, NaysayerGatingConfig
 from ..decider.annotation import (
     ANNOTATING_TIERC_MODES,
@@ -609,6 +610,7 @@ class Conductor:
         continuation_clone_check: Callable[[], None] | None = None,
         continuation_ledger_path: Path | None = None,
         conditional_proceed_notice: str | None = None,
+        clone_retreat_log_path: Path | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -637,6 +639,11 @@ class Conductor:
         # D-3 (PR-2, msg-7973 Obj-1-2): the continuation ledger. ``None`` = not recorded; the
         # routing is identical either way (see :mod:`.continuation_ledger`).
         self._continuation_ledger_path = continuation_ledger_path
+        # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1b (v1.7): the clone-retreat record.
+        # Read only by ``_dispatch_recording``, for the first implementer dispatch of the run; the
+        # routing never reads it. ``None`` = not wired: no notice, the prompt is unchanged.
+        self._clone_retreat_log_path = clone_retreat_log_path
+        self._clone_retreat_checked = False
         # Set by ``_route`` on an admitted / capped CONTINUE; consumed by ``run`` right after.
         self._continuation: tuple[ContinueVerdict, ContinuePlan] | None = None
         self._thread_ref = thread_ref
@@ -3640,6 +3647,7 @@ class Conductor:
         *,
         retry_notice: str | None = None,
         resume_notice: str | None = None,
+        clone_retreat_notice: str | None = None,
         review_round: int | None = None,
         review_round_notice: str | None = None,
         conditional_proceed_notice: str | None = None,
@@ -3676,6 +3684,7 @@ class Conductor:
             retry_notice=retry_notice,
             thread_tags=self._thread_tags,
             resume_notice=resume_notice,
+            clone_retreat_notice=clone_retreat_notice,
             review_round=review_round,
             review_round_notice=review_round_notice,
             conditional_proceed_notice=conditional_proceed_notice,
@@ -3785,6 +3794,7 @@ class Conductor:
         T-retry-once-before-quarantine notice: see :func:`.retry_notice.retry_notice_for`.
         """
         notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
+        retreat = self._pending_clone_retreat(role)
         # Resume notice (v1.4): only on the first role turn this run sends, and only once.
         resume_text: str | None = None
         first_resume_dispatch = False
@@ -3817,6 +3827,7 @@ class Conductor:
                         messages,
                         retry_notice=notice,
                         resume_notice=resume_text,
+                        clone_retreat_notice=retreat.text if retreat is not None else None,
                         review_round=review_round,
                         review_round_notice=review_round_notice,
                         conditional_proceed_notice=(
@@ -3847,7 +3858,39 @@ class Conductor:
         if first_resume_dispatch:
             # The turn was sent (the dispatch returned): the sweep may now clear its record.
             self._resume_notice_delivered = True
+        if retreat is not None:
+            self._clone_retreat_delivered(retreat, role)
         return None
+
+    def _pending_clone_retreat(self, role: Role) -> PendingNotice | None:
+        """PR-1b: the thread's undelivered clone-retreat record, for the run's first implementer
+        dispatch only. Observation, never gating: a read failure is ``None`` (logged inside)."""
+        if role is not Role.IMPLEMENTER or self._clone_retreat_checked:
+            return None
+        self._clone_retreat_checked = True
+        pending = load_pending_notice(self._clone_retreat_log_path, self._thread_ref.thread_id)
+        if pending is not None:
+            logger.info(
+                "clone-retreat record %s: attached to the implementer dispatch",
+                pending.record.get("record_id"),
+            )
+        return pending
+
+    def _clone_retreat_delivered(self, retreat: PendingNotice, role: Role) -> None:
+        """The dispatch returned, so the record reached a turn: mark it, so the next run's turn
+        does not get it again. A dispatch that raised never gets here and the record stays
+        pending for the retry. A failed write is a WARNING (the notice may then repeat once)."""
+        path = self._clone_retreat_log_path
+        if path is None:
+            return
+        try:
+            mark_delivered(path, retreat.record, session_role=role.value)
+        except Exception:
+            logger.warning(
+                "clone-retreat log: marking %s delivered failed",
+                retreat.record.get("record_id"),
+                exc_info=True,
+            )
 
     async def _post_git_sync_park(self, park: GitSyncParkError) -> str:
         """Post the git-sync park notice into this thread; return its ``msg_id``.
