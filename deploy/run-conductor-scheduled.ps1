@@ -3512,6 +3512,8 @@ function Format-RetreatRecordAlertLine {
 # on all three paths (exit 8 after a launch, clone-check exit 8, clone-check probe-failed). Returns
 # @{ signature; message; stage }.
 function Get-DirtyCloneStagedAlert {
+    # -RecordsByRepo is declared here (since PR-2, fcce3ea); the exit-8 branch and the parking sweep both
+    # pass it. tests/Test-DirtyCloneStagedAlerts.ps1 checks every named argument of the exit-8 call against this block.
     param([string]$Signature, [string]$Message, [string]$RepoDir, [string]$SinceIso, [datetime]$Now,
           [int]$ParkedCount, [string]$RecordsPath, [hashtable]$RecordsByRepo = $null)
     $since = ConvertFrom-AlertIso -Iso $SinceIso
