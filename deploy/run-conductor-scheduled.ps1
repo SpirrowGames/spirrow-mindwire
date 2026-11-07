@@ -188,6 +188,12 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 # Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
 # D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
 $dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
+# PR-1b's retreat records (written by `mindwire clone-retreat`, CLONE_RETREAT_LOG_FILENAME). The
+# sweep only reads it, for the PR-2 dirty-clone alert's "latest retreat record" line.
+$cloneRetreatRecordsPath = Join-Path $dataDir "state\clone-retreats.jsonl"
+# PR-3: the discard-alert cursor (Update-CloneDiscardAlerts). Separate from notified.json and never
+# handled by Send-NotificationIfChanged: a discard is an event the digest cannot bring back.
+$cloneDiscardNotifyStatePath = Join-Path $dataDir "state\clone-discard-notify.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
@@ -3306,10 +3312,18 @@ function Invoke-LaunchEndRetreat {
 # $Recover (optional; Invoke-CloneRecover in production) runs first, and only for a repo parked as
 # wrong_head (PR-0). It only logs. The probe that follows still decides whether to release, so a
 # recovery that did nothing, or failed, leaves the parking exactly as it was before PR-0.
+# PR-2 (D-2): every alert sent here goes through Get-DirtyCloneStagedAlert, so the signature carries
+# the parking stage (0 / 1h / 6h / 24h from `since`) and the body names the repo_dir, how long it has
+# been parked, $ParkedCounts[<repo key>] parked candidates, `cause: unknown`, and the latest retreat
+# record of $RecordsPath for the repo when there is one.
 function Update-DirtyCloneParking {
     param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [string]$NowIso,
-          [scriptblock]$Recover = $null)
+          [scriptblock]$Recover = $null, [hashtable]$ParkedCounts = @{}, [string]$RecordsPath = '')
+    $nowDt = ConvertFrom-AlertIso -Iso $NowIso
+    if ($null -eq $nowDt) { $nowDt = (Get-Date).ToUniversalTime() }
     $released = @()
+    # Read the retreat records once per call, not once per parked clone (PR-2 gate advisory).
+    $recordsByRepo = if ($Parked.Count -gt 0) { Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath } else { @{} }
     foreach ($key in @($Parked.Keys)) {
         $rec = $Parked[$key]
         $repoDir = "$($rec.repo_dir)"
@@ -3337,8 +3351,10 @@ function Update-DirtyCloneParking {
             # An unparseable payload falls into Get-DirtyCloneNotice's existing parse-failed path.
             $notice = Get-DirtyCloneNotice -RepoDir $repoDir -CandidateKey '(clone-check)' -Output $res.output -ExitCode $code
             Set-DirtyCloneParked -Parked $Parked -RepoDir $repoDir -Notice $notice -NowIso $NowIso
-            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $notice.signature -Message $notice.message
-            Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($notice.signature) (since $($Parked[$key].since))"
+            $staged = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message -RepoDir $repoDir `
+                -SinceIso "$($Parked[$key].since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
+            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $staged.signature -Message $staged.message
+            Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($staged.signature) (since $($Parked[$key].since))"
             continue
         }
         # Exit 1 (could not judge), a timeout, or anything else: stay parked — an unjudgeable clone
@@ -3351,7 +3367,9 @@ function Update-DirtyCloneParking {
         $tailText = if ($tailLines.Count -gt 0) { $tailLines -join "`n" } else { '(stderr なし)' }
         $body = ("MindWire: 駐機中の共有 clone を再判定できませんでした（mindwire clone-check exit=$code）。駐機は続けます。`n" +
                  "clone: $repoDir`n$tailText")
-        Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $sig -Message $body
+        $staged = Get-DirtyCloneStagedAlert -Signature $sig -Message $body -RepoDir $repoDir `
+            -SinceIso "$($rec.since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
+        Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $staged.signature -Message $staged.message
         Write-Log "dirty-clone-probe-failed ${repoDir}: clone-check exit=$code — stays parked"
     }
     return , $released
@@ -3374,6 +3392,535 @@ function Get-DirtyCloneDigestLines {
     $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
     $lines += ""
     return , $lines
+}
+
+# --- staged re-alerts (T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-2, D-2) ---------------
+# Design v2.0 (Bohr msg-8091) as revised by v2.1 (Bohr msg-8093); naysayer go Einstein on the reply
+# to msg-8093 (objections []). On 10/29 the dirty-clone alert fired once and then
+# `notification suppressed (unchanged since last alert)` ran for 9.5 hours (msg-7637 §0): the
+# signature never changed, so nothing told a person the loop was still stopped. These helpers add a
+# STAGE to the signature, so the same fault alerts again once it has lasted longer:
+#   * a parked clone (`__dirty_clone__/<repo>`): stages 0 (under 1h), 1h, 6h, 24h, nothing after.
+#     The stage stays at 24h from then on, so the signature stops changing; the daily digest
+#     (Get-DirtyCloneDigestLines) keeps listing the clone once a day after that (v2.1 Obj-10-2).
+#   * launch-wait starved threads (`__launch_wait_starved__`, one key for all of them): stages 6h
+#     and 24h, nothing after. The key is cleared when no thread is starved any more.
+# Reader: the operator, through the notification webhook. Nothing here posts into a thread.
+#
+# The alert never names a cause (v2.1 Obj-10-1): a retreat record for the same repo_dir does not
+# show who dirtied the clone — a retreat that succeeded left it clean, so it cannot be the cause of
+# the dirt that is there now. When a record exists it is shown on its own line, marked as not
+# confirmed as the cause.
+
+# Parse an ISO-8601 timestamp into a UTC [datetime]; $null when empty or unparseable.
+function ConvertFrom-AlertIso {
+    param([string]$Iso)
+    if (-not $Iso) { return $null }
+    $dto = [DateTimeOffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([DateTimeOffset]::TryParse($Iso, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dto)) {
+        return $dto.UtcDateTime
+    }
+    return $null
+}
+
+# Stage of a parked clone from how long it has been parked: '0', '1h', '6h' or '24h' (and '24h'
+# for ever after — there is no 48h stage, v2.1 requirement 1).
+function Get-DirtyCloneAlertStage {
+    param([TimeSpan]$Age)
+    if ($Age -ge [TimeSpan]::FromHours(24)) { return '24h' }
+    if ($Age -ge [TimeSpan]::FromHours(6)) { return '6h' }
+    if ($Age -ge [TimeSpan]::FromHours(1)) { return '1h' }
+    return '0'
+}
+
+# Stage of a launch-wait starved thread: '6h' until it has waited 24h, then '24h' for ever after.
+# Get-LaunchWaitStarved only returns threads past $LaunchWaitStarvedThreshold (6h), so there is no
+# earlier stage (v2.1 requirement 3).
+function Get-LaunchWaitAlertStage {
+    param([TimeSpan]$Age)
+    if ($Age -ge [TimeSpan]::FromHours(24)) { return '24h' }
+    return '6h'
+}
+
+# How many sweep candidates use each repo_dir, keyed by ConvertTo-DirtyCloneRepoKey: while a repo
+# is parked every one of them is skipped, so this is the alert's "parked candidates" count.
+function Get-CandidateCountsByRepo {
+    param($Candidates)
+    $counts = @{}
+    foreach ($c in @($Candidates)) {
+        if ($null -eq $c -or -not $c.repo_dir) { continue }
+        try { $k = ConvertTo-DirtyCloneRepoKey -RepoDir "$($c.repo_dir)" } catch { continue }
+        $prev = if ($counts.ContainsKey($k)) { [int]$counts[$k] } else { 0 }
+        $counts[$k] = $prev + 1
+    }
+    return $counts
+}
+
+# The latest `retreat` row of state/clone-retreats.jsonl (written by `mindwire clone-retreat`,
+# PR-1b) whose repo_dir is this repo, or $null. A missing or unreadable file and malformed lines are
+# not errors: the alert then simply has no record line (v2.1: never fill the gap with a guess).
+function Get-LatestRetreatRecordForRepo {
+    param([string]$RecordsPath, [string]$RepoDir)
+    $byRepo = Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath
+    return (Find-RetreatRecordForRepo -RecordsByRepo $byRepo -RepoDir $RepoDir)
+}
+
+# Read state/clone-retreats.jsonl once and keep, per repo key, its latest `retreat` row. Callers that
+# build several alerts in one tick (Update-DirtyCloneParking) read the file once with this and pass
+# the table down, instead of re-reading the whole file per parked clone. Same tolerance as above:
+# a missing or unreadable file gives an empty table, malformed lines are skipped.
+function Read-LatestRetreatRecordsByRepo {
+    param([string]$RecordsPath)
+    $byRepo = @{}
+    if (-not $RecordsPath -or -not (Test-Path -LiteralPath $RecordsPath)) { return $byRepo }
+    try { $lines = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8 -ErrorAction Stop) } catch { return $byRepo }
+    foreach ($line in $lines) {
+        if (-not "$line".Trim()) { continue }
+        try { $row = "$line" | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($null -eq $row -or "$($row.kind)" -ne 'retreat' -or -not $row.repo_dir) { continue }
+        try { $k = ConvertTo-DirtyCloneRepoKey -RepoDir "$($row.repo_dir)" } catch { continue }
+        $byRepo[$k] = $row  # file order is append order: the last match is newest
+    }
+    return $byRepo
+}
+
+# The latest record for $RepoDir in a table from Read-LatestRetreatRecordsByRepo, or $null.
+function Find-RetreatRecordForRepo {
+    param([hashtable]$RecordsByRepo, [string]$RepoDir)
+    if ($null -eq $RecordsByRepo -or $RecordsByRepo.Count -eq 0) { return $null }
+    try { $want = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } catch { return $null }
+    if ($RecordsByRepo.ContainsKey($want)) { return $RecordsByRepo[$want] }
+    return $null
+}
+
+# The one line an alert carries for a retreat record. Its heading says it is not the cause.
+function Format-RetreatRecordAlertLine {
+    param($Record)
+    # ConvertFrom-Json turns an ISO string into a [datetime]; print it back as UTC ISO, not in the
+    # host's locale format.
+    $at = $Record.at
+    $atText = if ($at -is [datetime]) { $at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { "$at" }
+    $parts = @("at=$atText", "thread=$($Record.thread_id)", "stop=$($Record.stop_reason)",
+               "outcome=$($Record.outcome)")
+    if ($Record.branch) { $parts += "branch=$($Record.branch)" }
+    if ($Record.patch) { $parts += "patch=$($Record.patch)" }
+    return 'latest retreat record for this repo (not confirmed as the cause of this parking): ' + ($parts -join ' ')
+}
+
+# Add the stage to one `__dirty_clone__/<repo>` alert and the v2.1 context lines to its body. Used
+# on all three paths (exit 8 after a launch, clone-check exit 8, clone-check probe-failed). Returns
+# @{ signature; message; stage }.
+function Get-DirtyCloneStagedAlert {
+    # -RecordsByRepo is declared here (since PR-2, fcce3ea); the exit-8 branch and the parking sweep both
+    # pass it. tests/Test-DirtyCloneStagedAlerts.ps1 checks every named argument of the exit-8 call against this block.
+    param([string]$Signature, [string]$Message, [string]$RepoDir, [string]$SinceIso, [datetime]$Now,
+          [int]$ParkedCount, [string]$RecordsPath, [hashtable]$RecordsByRepo = $null)
+    $since = ConvertFrom-AlertIso -Iso $SinceIso
+    $age = if ($null -ne $since) { $Now.ToUniversalTime() - $since } else { [TimeSpan]::Zero }
+    if ($age -lt [TimeSpan]::Zero) { $age = [TimeSpan]::Zero }
+    $stage = Get-DirtyCloneAlertStage -Age $age
+    $lines = @(
+        "repo_dir: $RepoDir",
+        "parked for: $(Format-DurationDigest -Span $age) (since $SinceIso, stage=$stage)",
+        "parked candidates: $ParkedCount",
+        'cause: unknown'
+    )
+    # $RecordsByRepo, when given, is the table the caller already read this tick; otherwise read the file.
+    $rec = if ($null -ne $RecordsByRepo) { Find-RetreatRecordForRepo -RecordsByRepo $RecordsByRepo -RepoDir $RepoDir }
+           else { Get-LatestRetreatRecordForRepo -RecordsPath $RecordsPath -RepoDir $RepoDir }
+    if ($null -ne $rec) { $lines += (Format-RetreatRecordAlertLine -Record $rec) }
+    return @{ signature = "$Signature|stage=$stage"; message = ($Message + "`n" + ($lines -join "`n")); stage = $stage }
+}
+
+# The `__launch_wait_starved__` alert for this tick, or $null when no thread is starved. $Starved is
+# Get-LaunchWaitStarved's output ({ key; age }); $RepoDirByKey maps a candidate key to its
+# repo_dir; $Parked is the dirty-clone parking table. The signature is the sorted
+# `<thread key>@<stage>` list, so a new thread, a thread leaving, or a thread reaching 24h re-alerts.
+function Get-LaunchWaitStarvedAlert {
+    param($Starved, [hashtable]$Parked, [hashtable]$RepoDirByKey)
+    $rows = @($Starved | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { return $null }
+    $sigParts = @()
+    $lines = @()
+    foreach ($r in $rows) {
+        $stage = Get-LaunchWaitAlertStage -Age $r.age
+        $sigParts += "$($r.key)@$stage"
+        $blocked = 'not parked (cause unknown)'
+        $repoDir = ''
+        if ($null -ne $RepoDirByKey -and $RepoDirByKey.ContainsKey("$($r.key)")) { $repoDir = "$($RepoDirByKey["$($r.key)"])" }
+        if ($repoDir -and (Test-DirtyCloneSkip -RepoDir $repoDir -DirtyRepoDirs $Parked)) {
+            $blocked = "parked clone $repoDir"
+        }
+        $lines += "  $($r.key) — waited $(Format-DurationDigest -Span $r.age) (stage=$stage) — blocked by: $blocked"
+    }
+    $sig = 'launch-wait-starved:' + ((@($sigParts | Sort-Object)) -join ',')
+    $body = ("MindWire: LAUNCH と判定されたのに起動されていないスレッドが $($rows.Count) 件あります（launch-wait starved）。`n" +
+             ($lines -join "`n"))
+    return @{ key = '__launch_wait_starved__'; signature = $sig; message = $body }
+}
+
+# Send the launch-wait alert when its signature changed, or clear its key when nothing is starved
+# (so starvation coming back later alerts again). Returns $true when $NotifyState changed.
+function Update-LaunchWaitStarvedAlert {
+    param([hashtable]$NotifyState, $Starved, [hashtable]$Parked, [hashtable]$RepoDirByKey)
+    $alert = Get-LaunchWaitStarvedAlert -Starved $Starved -Parked $Parked -RepoDirByKey $RepoDirByKey
+    if ($null -eq $alert) {
+        if ($NotifyState.ContainsKey('__launch_wait_starved__')) {
+            $NotifyState.Remove('__launch_wait_starved__')
+            return $true
+        }
+        return $false
+    }
+    if (Test-NotificationSuppressed -State $NotifyState -Key $alert.key -Signature $alert.signature) { return $false }
+    Send-NotificationIfChanged -State $NotifyState -Key $alert.key -Signature $alert.signature -Message $alert.message
+    return $true
+}
+
+# --- discard alerts (T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-3, Bohr v3.3 msg-8121) ---
+# msg-7863 §1: a discard the wrapper does at the end of a launch must reach the alert channel. A
+# discard leaves the clone clean, so it never parks and the D-2 parking alert never fires for it;
+# before PR-3 it reached the tick log only. Reader: the operator watching the Discord alert channel.
+# These functions post to the webhook only, never into a chatroom thread.
+#
+# Why NOT Send-NotificationIfChanged: that helper marks an alert as sent on every outcome (#138,
+# msg-2099 D-4) because the daily digest re-lists the current STATE, so a lost alert comes back.
+# A discard is an EVENT: the clone is already clean and the digest never shows it again. So the
+# cursor in state/clone-discard-notify.json moves past a record only once a message about it has
+# reached the channel (status=sent). When the webhook cannot deliver, the fallback surface is that
+# durable state file plus one tick-log line per hold: the records wait there, from the cursor on.
+#
+# State: { initialized: true, cursor_record_id: <record_id or "">,
+#          hold: null | { kind: "no-webhook" | "payload-rejected", record_ids: [<id>],
+#                         payload_sha256, webhook_sha256, since } }
+# Order is the LINE ORDER of state/clone-retreats.jsonl; record ids are never compared by value.
+
+# The `retreat` rows of the records file, in file order, as @{ line = <1-based line>; row }. Rows
+# without a string record_id and malformed lines are skipped. A missing file is no rows; a file
+# that exists but cannot be read gives $null, so the caller skips the tick instead of mistaking an
+# unreadable file for an empty one (which would lose the cursor).
+function Read-CloneRetreatRecordLines {
+    param([string]$RecordsPath)
+    $out = New-Object System.Collections.Generic.List[object]
+    if (-not $RecordsPath -or -not (Test-Path -LiteralPath $RecordsPath)) { return , $out.ToArray() }
+    try { $lines = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8 -ErrorAction Stop) } catch { return $null }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = "$($lines[$i])"
+        if (-not $line.Trim()) { continue }
+        try { $row = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($null -eq $row -or "$($row.kind)" -ne 'retreat') { continue }
+        if ($row.record_id -isnot [string] -or -not $row.record_id) { continue }
+        $out.Add(@{ line = $i + 1; row = $row })
+    }
+    return , $out.ToArray()
+}
+
+# The random suffix of a record_id (`<thread>@<at>#<12 hex>`, clone_retreat_log.build_record): ASCII
+# and short, unlike the thread part. 'none' when the id has no such suffix.
+function Get-CloneDiscardRecordUuid {
+    param([string]$RecordId)
+    $m = [regex]::Match($RecordId, '#([0-9A-Za-z-]{1,64})$')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return 'none'
+}
+
+function Get-CloneDiscardSha256 {
+    param([string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) } finally { $sha.Dispose() }
+    return (-join ($hash | ForEach-Object { $_.ToString('x2') }))
+}
+
+# The lines one discard record contributes to an alert. Each outcome has its own wording (PR-1b
+# fixed the same outcome/wording mismatch): only `discarded` says the discard completed. Neither
+# wording claims a cause.
+function Format-CloneDiscardRecordLines {
+    param($Record)
+    $thread = "$($Record.thread_id)"
+    $at = $Record.at
+    $atText = if ($at -is [datetime]) { $at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { "$at" }
+    $detail = "  repo_dir=$($Record.repo_dir) thread=$thread stop=$($Record.stop_reason) outcome=$($Record.outcome) at=$atText"
+    $patch = if ($Record.patch) { "  patch: $($Record.patch)" } else { '  patch: (none recorded)' }
+    $idLine = "  record: $($Record.record_id)"
+    if ("$($Record.outcome)" -eq 'discarded') {
+        return , @("- discarded by wrapper at end of launch $thread (completed; the clone is clean)", $detail, $patch, $idLine)
+    }
+    return , @("- the wrapper tried to discard at end of launch $thread, but the discard did not complete",
+               $detail, $patch, $idLine,
+               '  check the clone (git status / current branch) and check whether the patch exists before recovering')
+}
+
+# The lines every discard alert message starts with. The cursor-missing notice comes first.
+function Get-CloneDiscardPrefix {
+    param([switch]$CursorMissing)
+    $p = @()
+    if ($CursorMissing) { $p += 'cursor not found — re-sending every discard record; some may repeat' }
+    $p += "MindWire: discard record(s) from the wrapper's end-of-launch clone cleanup (state/clone-retreats.jsonl)"
+    return , $p
+}
+
+# Cut $Text into pieces of at most $Max characters, nothing dropped, never between a surrogate pair.
+function Split-CloneDiscardText {
+    param([string]$Text, [int]$Max)
+    $pieces = @()
+    $s = $Text
+    while ($s.Length -gt $Max) {
+        $cut = $Max
+        if ([char]::IsHighSurrogate($s[$cut - 1])) { $cut-- }
+        $pieces += $s.Substring(0, $cut)
+        $s = $s.Substring($cut)
+    }
+    $pieces += $s
+    return , $pieces
+}
+
+# The message(s) for ONE record. One message when it fits in $Budget; otherwise `(part i/n)` parts,
+# split at line boundaries where possible and inside a line (a long patch path) at character
+# boundaries, so the full record_id and path survive across the parts. Every message, prefix and
+# marker included, is at most $Budget characters.
+function New-CloneDiscardRecordMessages {
+    param([string[]]$Prefix, [string[]]$Lines, [int]$Budget)
+    $head = $Prefix -join "`n"
+    $whole = $head + "`n" + ($Lines -join "`n")
+    if ($whole.Length -le $Budget) { return , @($whole) }
+    $markerReserve = '(part 9999/9999)'.Length
+    $body = $Budget - $head.Length - 1 - $markerReserve - 1
+    if ($body -lt 16) { throw "discard alert budget $Budget is too small for its prefix" }
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $cur = $null
+    foreach ($ln in $Lines) {
+        foreach ($piece in (Split-CloneDiscardText -Text $ln -Max $body)) {
+            if ($null -eq $cur) { $cur = $piece }
+            elseif (($cur.Length + 1 + $piece.Length) -le $body) { $cur += "`n" + $piece }
+            else { $chunks.Add($cur); $cur = $piece }
+        }
+    }
+    if ($null -ne $cur) { $chunks.Add($cur) }
+    $n = $chunks.Count
+    $msgs = @()
+    for ($k = 0; $k -lt $n; $k++) { $msgs += ($head + "`n(part $($k + 1)/$n)`n" + $chunks[$k]) }
+    return , $msgs
+}
+
+# The fallback for a record whose own message the webhook rejected as a payload: fixed text plus
+# three values of known format (HTTP status, line number, record uuid). No repo_dir, no thread_id,
+# no full record_id — those have no length limit and may be non-ASCII (Obj-13-2).
+function New-CloneDiscardFallback {
+    param([int]$HttpStatus, [int]$LineNo, [string]$RecordId)
+    return "discard alert rejected by webhook (http=$HttpStatus); see state/clone-retreats.jsonl line $LineNo, record uuid $(Get-CloneDiscardRecordUuid -RecordId $RecordId)"
+}
+
+# Pre-send check of a fallback: printable ASCII and within the budget. Can only fail on a bug.
+function Test-CloneDiscardFallbackSafe {
+    param([string]$Text, [int]$Budget)
+    return ($Text.Length -gt 0 -and $Text.Length -le $Budget -and $Text -cmatch '^[\x20-\x7E]+$')
+}
+
+# The hash a payload-rejected hold is keyed on: the record's own message(s) and its fallback, as the
+# current code builds them. A code fix that changes either changes the hash and lifts the hold.
+function Get-CloneDiscardPayloadHash {
+    param($Entry, [int]$Budget)
+    $msgs = New-CloneDiscardRecordMessages -Prefix (Get-CloneDiscardPrefix) -Lines (Format-CloneDiscardRecordLines -Record $Entry.row) -Budget $Budget
+    $fb = New-CloneDiscardFallback -HttpStatus 0 -LineNo $Entry.line -RecordId "$($Entry.row.record_id)"
+    $sep = "`n" + [char]0x1e + "`n"
+    return (Get-CloneDiscardSha256 -Text (($msgs -join $sep) + $sep + $fb))
+}
+
+# Send-Notification's return as one word: sent / skipped / <failure class>, plus the HTTP status.
+function Resolve-CloneDiscardSendResult {
+    param($Result)
+    if ($null -eq $Result) { return @{ kind = 'unknown'; http = 0 } }
+    $http = if ($null -ne $Result.http_status) { [int]$Result.http_status } else { 0 }
+    switch ("$($Result.status)") {
+        'sent' { return @{ kind = 'sent'; http = $http } }
+        'skipped' { return @{ kind = 'skipped'; http = $http } }
+    }
+    $class = if ($Result.class) { "$($Result.class)" } else { 'unknown' }
+    return @{ kind = $class; http = $http }
+}
+
+# Deliver ONE record: its message(s), or, when the webhook rejects one of them as a payload, its
+# fallback. Returns @{ outcome = 'delivered' | 'stop'; hold = $null | <hold> }. 'stop' with no hold
+# means retry next tick (transient and every other failure class).
+function Send-CloneDiscardRecord {
+    param($Entry, [string[]]$Prefix, [int]$Budget, [scriptblock]$Send, [string]$NowIso, [string]$WebhookFingerprint)
+    $id = "$($Entry.row.record_id)"
+    $msgs = New-CloneDiscardRecordMessages -Prefix $Prefix -Lines (Format-CloneDiscardRecordLines -Record $Entry.row) -Budget $Budget
+    $rejectedHttp = $null
+    foreach ($m in $msgs) {
+        $res = Resolve-CloneDiscardSendResult (& $Send $m)
+        if ($res.kind -eq 'sent') { continue }
+        if ($res.kind -eq 'skipped') {
+            return @{ outcome = 'stop'; hold = @{ kind = 'no-webhook'; record_ids = @($id); payload_sha256 = $null; webhook_sha256 = $null; since = $NowIso } }
+        }
+        if ($res.kind -ne 'deterministic-payload') { return @{ outcome = 'stop'; hold = $null } }
+        $rejectedHttp = $res.http
+        break
+    }
+    if ($null -eq $rejectedHttp) { return @{ outcome = 'delivered'; hold = $null } }
+    $rejHold = @{ kind = 'payload-rejected'; record_ids = @($id); since = $NowIso; webhook_sha256 = $WebhookFingerprint
+                  payload_sha256 = (Get-CloneDiscardPayloadHash -Entry $Entry -Budget $Budget) }
+    $fb = New-CloneDiscardFallback -HttpStatus $rejectedHttp -LineNo $Entry.line -RecordId $id
+    if (-not (Test-CloneDiscardFallbackSafe -Text $fb -Budget $Budget)) {
+        Write-Log "discard-alert-held: the fallback for $id failed its pre-send check (ASCII, <= $Budget chars) — not sent; held (payload-rejected) until the payload or webhook changes"
+        return @{ outcome = 'stop'; hold = $rejHold }
+    }
+    $res = Resolve-CloneDiscardSendResult (& $Send $fb)
+    if ($res.kind -eq 'sent') {
+        Write-Log "discard-alert-fallback-sent: record $id was rejected by the webhook (http=$rejectedHttp); the short fallback was delivered"
+        return @{ outcome = 'delivered'; hold = $null }
+    }
+    if ($res.kind -eq 'deterministic-payload') {
+        Write-Log "discard-alert-held: record $id and its fallback were both rejected by the webhook (http=$($res.http)) — held (payload-rejected) until the payload or webhook changes"
+        return @{ outcome = 'stop'; hold = $rejHold }
+    }
+    if ($res.kind -eq 'skipped') {
+        return @{ outcome = 'stop'; hold = @{ kind = 'no-webhook'; record_ids = @($id); payload_sha256 = $null; webhook_sha256 = $null; since = $NowIso } }
+    }
+    return @{ outcome = 'stop'; hold = $null }
+}
+
+# Once per tick: alert every `discarded` / `discard_incomplete` record after the cursor. $Send takes
+# one message and returns Send-Notification's shape (Send-Notification in production, a stub in
+# tests). $WebhookConfigured / $WebhookFingerprint describe MINDWIRE_NOTIFY_DISCORD_WEBHOOK (the
+# fingerprint is a hash; the URL itself is never stored or logged).
+function Update-CloneDiscardAlerts {
+    param([string]$RecordsPath, [string]$StatePath, [string]$NowIso, [bool]$WebhookConfigured,
+          [string]$WebhookFingerprint, [scriptblock]$Send, [int]$Budget = $DecisionMessageDiscordBudget)
+    # The records file is read once per tick, as one ordered list (not the per-repo table of PR-2,
+    # which keeps one record per repo and would drop the second of two discards in the same repo).
+    $entries = Read-CloneRetreatRecordLines -RecordsPath $RecordsPath
+    if ($null -eq $entries) { Write-Log "discard-alert-deferred: $RecordsPath could not be read this tick"; return }
+    $lastId = if ($entries.Count -gt 0) { "$($entries[$entries.Count - 1].row.record_id)" } else { '' }
+    $state = @{ cursor = ''; hold = $null }
+    $persist = { Save-JsonState -Path $StatePath -State @{ initialized = $true; cursor_record_id = $state.cursor; hold = $state.hold } }
+
+    # First run (no state file): take the last existing record as the baseline and send nothing, so
+    # records written before this code was deployed are not alerted. The state file is written even
+    # when the records file is empty or missing (cursor ""), so this suppression happens exactly
+    # once: the first discard written after it is alerted (Obj-11-2).
+    if (-not (Test-Path -LiteralPath $StatePath)) {
+        $state.cursor = $lastId
+        & $persist
+        Write-Log "discard-alert-baseline: no $StatePath yet — cursor set to the last existing record ('$lastId'); records already in the file are not alerted"
+        return
+    }
+    $stateOk = $false
+    try {
+        $st = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $st -and $st.initialized -eq $true -and $st.cursor_record_id -is [string]) {
+            $state.cursor = $st.cursor_record_id
+            $state.hold = $st.hold
+            $stateOk = $true
+        }
+    } catch { $stateOk = $false }
+
+    # Where to start. A cursor that is not in the file (truncated, replaced, edited) re-sends every
+    # discard record, with a notice: repeats are better than silence.
+    $missing = $false
+    $start = 0
+    if (-not $stateOk) {
+        $missing = $true
+        Write-Log "discard-cursor-missing: $StatePath is unreadable — re-sending every discard record"
+    } elseif ($state.cursor -ne '') {
+        $pos = -1
+        for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+            if ("$($entries[$i].row.record_id)" -ceq $state.cursor) { $pos = $i; break }
+        }
+        if ($pos -lt 0) {
+            $missing = $true
+            Write-Log "discard-cursor-missing: cursor '$($state.cursor)' is not in $RecordsPath — re-sending every discard record"
+        } else { $start = $pos + 1 }
+    }
+    $targets = @()
+    for ($i = $start; $i -lt $entries.Count; $i++) {
+        if ("$($entries[$i].row.outcome)" -in @('discarded', 'discard_incomplete')) { $targets += $entries[$i] }
+    }
+    if ($targets.Count -eq 0) {
+        # Nothing to alert: rows after the cursor (if any) are not discards, so the cursor may skip them.
+        if (-not $stateOk -or $state.cursor -cne $lastId -or $null -ne $state.hold) {
+            $state.cursor = $lastId
+            $state.hold = $null
+            & $persist
+        }
+        return
+    }
+
+    # Holds. Neither moves the cursor; each writes one log line when it starts, none per tick.
+    $holdKind = if ($null -ne $state.hold) { "$($state.hold.kind)" } else { '' }
+    if (-not $WebhookConfigured) {
+        if ($holdKind -ne 'no-webhook') {
+            $state.hold = @{ kind = 'no-webhook'; record_ids = @("$($targets[0].row.record_id)"); payload_sha256 = $null; webhook_sha256 = $null; since = $NowIso }
+            & $persist
+            Write-Log "discard-alert-held: no webhook configured — $($targets.Count) discard record(s) wait from the cursor and are sent once MINDWIRE_NOTIFY_DISCORD_WEBHOOK is set"
+        }
+        return
+    }
+    if ($holdKind -eq 'no-webhook') {
+        Write-Log "discard-alert-hold-ended: a webhook is configured — sending the held discard record(s)"
+        $state.hold = $null
+        & $persist
+    } elseif ($holdKind -eq 'payload-rejected') {
+        $heldId = "$(@($state.hold.record_ids)[0])"
+        $hash = Get-CloneDiscardPayloadHash -Entry $targets[0] -Budget $Budget
+        if ($heldId -ceq "$($targets[0].row.record_id)" -and "$($state.hold.payload_sha256)" -eq $hash -and
+            "$($state.hold.webhook_sha256)" -eq $WebhookFingerprint) {
+            return  # same payload to the same webhook: do not resend
+        }
+        Write-Log "discard-alert-hold-ended: the payload-rejected hold on $heldId is lifted (payload, webhook or record changed) — sending again"
+        $state.hold = $null
+        & $persist
+    }
+
+    $prefix = Get-CloneDiscardPrefix -CursorMissing:$missing
+    $i = 0
+    while ($i -lt $targets.Count) {
+        # Group as many whole records as fit in one message.
+        $text = $prefix -join "`n"
+        $group = @()
+        $j = $i
+        while ($j -lt $targets.Count) {
+            $block = (Format-CloneDiscardRecordLines -Record $targets[$j].row) -join "`n"
+            if (($text.Length + 1 + $block.Length) -gt $Budget) { break }
+            $text += "`n" + $block
+            $group += $targets[$j]
+            $j++
+        }
+        if ($group.Count -ge 2) {
+            $res = Resolve-CloneDiscardSendResult (& $Send $text)
+            if ($res.kind -eq 'sent') {
+                $state.cursor = "$($group[$group.Count - 1].row.record_id)"
+                & $persist
+                $i = $j
+                continue
+            }
+            if ($res.kind -eq 'skipped') {
+                $state.hold = @{ kind = 'no-webhook'; record_ids = @("$($group[0].row.record_id)"); payload_sha256 = $null; webhook_sha256 = $null; since = $NowIso }
+                & $persist
+                return
+            }
+            if ($res.kind -ne 'deterministic-payload') { return }  # retry next tick; the cursor stays
+            Write-Log "discard-alert-batch-rejected: $($group.Count) records in one message were rejected (http=$($res.http)) — resending one record per message"
+            $singles = $group
+        } else {
+            # One record: on its own, split into parts when it does not fit (Obj-12-2).
+            $singles = @($targets[$i])
+            $j = $i + 1
+        }
+        foreach ($t in $singles) {
+            $r = Send-CloneDiscardRecord -Entry $t -Prefix $prefix -Budget $Budget -Send $Send -NowIso $NowIso -WebhookFingerprint $WebhookFingerprint
+            if ($r.outcome -ne 'delivered') {
+                if ($null -ne $r.hold) { $state.hold = $r.hold; & $persist }
+                return
+            }
+            $state.cursor = "$($t.row.record_id)"
+            & $persist
+        }
+        $i = $j
+    }
+    # Everything delivered: rows after the last discard are not discards, so move to the last row.
+    $state.cursor = $lastId
+    & $persist
 }
 
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
@@ -5986,11 +6533,16 @@ try {
     # releases it (its candidates launch this tick, launches_same_head starting at 1 because the
     # refused launches were reverted), anything else keeps it parked.
     $dirtyClonesParked = ConvertTo-DirtyCloneParking -State (Get-JsonState -Path $dirtyClonesStatePath)
+    # PR-2 (D-2): per-repo candidate counts for the dirty-clone alert's "parked candidates" line.
+    $candidateCountsByRepo = Get-CandidateCountsByRepo -Candidates $candidates
+    # PR-3: the exit-8 path's per-tick retreat-record table, read lazily (see the exit-8 branch).
+    $recordsByRepoTick = $null
     if ($dirtyClonesParked.Count -gt 0) {
         $nowIsoPark = (Get-Date).ToUniversalTime().ToString('o')
         $null = Update-DirtyCloneParking -Parked $dirtyClonesParked -NotifyState $notifyState `
             -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark `
-            -Recover { param($d) Invoke-CloneRecover -RepoDir $d }
+            -Recover { param($d) Invoke-CloneRecover -RepoDir $d } `
+            -ParkedCounts $candidateCountsByRepo -RecordsPath $cloneRetreatRecordsPath
         Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
         # Persist the notification state in the same breath as the parking state (PR #435 gate,
         # round 1): a release removes the repo's alert signature from $notifyState, and the only
@@ -6315,10 +6867,13 @@ try {
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
         # PR-1a: the launch is over, so leave the shared clone clean for the next one (see
         # Invoke-LaunchEndRetreat). Before every exit-code branch, so every way a run ends is covered.
-        $null = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
+        $retreatOutcome = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
             -HeadMsg "$probeHead" -StopReason "$($verdict.reason)" -ExitCode $code `
             -StateDir (Join-Path $dataDir 'state') `
             -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s }
+        # PR-3: a retreat that may have appended a record invalidates the per-tick table, so the
+        # exit-8 alert below never shows a record older than the file. Only no-op outcomes keep it.
+        if ("$retreatOutcome" -notin @('skipped', 'clean', 'not_eligible')) { $recordsByRepoTick = $null }
         $n3Count = Get-N3UnresolvedCount -Output $output
         if ($n3Count -gt 0) {
             Confirm-LogWorthKeeping
@@ -6420,11 +6975,19 @@ try {
             if ($revert.ok) { Write-Log "dirty-clone $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
             else { Write-Log "WARN dirty-clone $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
             # D-3b: park the repo until a clone-check says it is clean.
+            $nowDirty = (Get-Date).ToUniversalTime()
             Set-DirtyCloneParked -Parked $dirtyClonesParked -RepoDir $cand.repo_dir -Notice $notice `
-                -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+                -NowIso $nowDirty.ToString('o')
             Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
+            # PR-2 (D-2): the same staged signature and context lines as the re-judge path.
+            # PR-3 (msg-8104 advisory): read the records into the per-tick table at most once, not
+            # once per exit-8 candidate; a launch that wrote a record clears it (above).
+            if ($null -eq $recordsByRepoTick) { $recordsByRepoTick = Read-LatestRetreatRecordsByRepo -RecordsPath $cloneRetreatRecordsPath }
+            $stagedDirty = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message `
+                -RepoDir $cand.repo_dir -SinceIso "$($dirtyClonesParked[$notice.repo_key].since)" -Now $nowDirty `
+                -ParkedCount ([int]$candidateCountsByRepo[$notice.repo_key]) -RecordsPath $cloneRetreatRecordsPath -RecordsByRepo $recordsByRepoTick
             Send-NotificationIfChanged -State $notifyState -Key $notice.key `
-                -Signature $notice.signature -Message $notice.message
+                -Signature $stagedDirty.signature -Message $stagedDirty.message
             # Same pairing as the re-judge block above: parking and its alert signature persist together.
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; repo parked; other candidates on this repo_dir are skipped until clone-check passes, other repos CONTINUE"
@@ -6740,6 +7303,23 @@ try {
         Confirm-LogWorthKeeping
         Write-Log ("launch-wait starved threads (>=$(Format-DurationDigest -Span $LaunchWaitStarvedThreshold) LAUNCH without a launch): " +
                    (($launchWaitStarved | ForEach-Object { "$($_.key) ($(Format-DurationDigest -Span $_.age))" }) -join ', '))
+    }
+    # PR-2 (D-2, v2.1 requirement 3): the same list as an alert on one key, staged 6h / 24h, cleared
+    # when the list is empty. Saved with the rest of $notifyState at the end of the sweep.
+    $repoDirByKey = @{}
+    foreach ($c in @($candidates)) { if ($null -ne $c -and $c.key) { $repoDirByKey["$($c.key)"] = "$($c.repo_dir)" } }
+    $null = Update-LaunchWaitStarvedAlert -NotifyState $notifyState -Starved $launchWaitStarved `
+        -Parked $dirtyClonesParked -RepoDirByKey $repoDirByKey
+    # PR-3 (msg-7863 §1): alert the discards the launches above (or earlier ticks) recorded. After
+    # the candidate loop so this tick's discards go out this tick. A throw here must not sink the
+    # rest of the sweep; the cursor has not moved past anything undelivered, so the next tick retries.
+    try {
+        $null = Update-CloneDiscardAlerts -RecordsPath $cloneRetreatRecordsPath -StatePath $cloneDiscardNotifyStatePath `
+            -NowIso ((Get-Date).ToUniversalTime().ToString('o')) -WebhookConfigured ([bool]$notifyWebhook) `
+            -WebhookFingerprint (Get-CloneDiscardSha256 -Text "$notifyWebhook") `
+            -Send { param($m) Send-Notification -Message $m } -Budget $DecisionMessageDiscordBudget
+    } catch {
+        Write-Log "WARN discard-alert failed (non-fatal, retried next tick): $($_.Exception.Message)"
     }
 
     # T-decision-request-composer S4 (D-32). Poll for threads currently parked on a human
