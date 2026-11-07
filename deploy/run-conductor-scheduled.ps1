@@ -188,6 +188,9 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 # Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
 # D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
 $dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
+# PR-1b's retreat records (written by `mindwire clone-retreat`, CLONE_RETREAT_LOG_FILENAME). The
+# sweep only reads it, for the PR-2 dirty-clone alert's "latest retreat record" line.
+$cloneRetreatRecordsPath = Join-Path $dataDir "state\clone-retreats.jsonl"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
@@ -3306,10 +3309,18 @@ function Invoke-LaunchEndRetreat {
 # $Recover (optional; Invoke-CloneRecover in production) runs first, and only for a repo parked as
 # wrong_head (PR-0). It only logs. The probe that follows still decides whether to release, so a
 # recovery that did nothing, or failed, leaves the parking exactly as it was before PR-0.
+# PR-2 (D-2): every alert sent here goes through Get-DirtyCloneStagedAlert, so the signature carries
+# the parking stage (0 / 1h / 6h / 24h from `since`) and the body names the repo_dir, how long it has
+# been parked, $ParkedCounts[<repo key>] parked candidates, `cause: unknown`, and the latest retreat
+# record of $RecordsPath for the repo when there is one.
 function Update-DirtyCloneParking {
     param([hashtable]$Parked, [hashtable]$NotifyState, [scriptblock]$Probe, [string]$NowIso,
-          [scriptblock]$Recover = $null)
+          [scriptblock]$Recover = $null, [hashtable]$ParkedCounts = @{}, [string]$RecordsPath = '')
+    $nowDt = ConvertFrom-AlertIso -Iso $NowIso
+    if ($null -eq $nowDt) { $nowDt = (Get-Date).ToUniversalTime() }
     $released = @()
+    # Read the retreat records once per call, not once per parked clone (PR-2 gate advisory).
+    $recordsByRepo = if ($Parked.Count -gt 0) { Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath } else { @{} }
     foreach ($key in @($Parked.Keys)) {
         $rec = $Parked[$key]
         $repoDir = "$($rec.repo_dir)"
@@ -3337,8 +3348,10 @@ function Update-DirtyCloneParking {
             # An unparseable payload falls into Get-DirtyCloneNotice's existing parse-failed path.
             $notice = Get-DirtyCloneNotice -RepoDir $repoDir -CandidateKey '(clone-check)' -Output $res.output -ExitCode $code
             Set-DirtyCloneParked -Parked $Parked -RepoDir $repoDir -Notice $notice -NowIso $NowIso
-            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $notice.signature -Message $notice.message
-            Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($notice.signature) (since $($Parked[$key].since))"
+            $staged = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message -RepoDir $repoDir `
+                -SinceIso "$($Parked[$key].since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
+            Send-NotificationIfChanged -State $NotifyState -Key $notice.key -Signature $staged.signature -Message $staged.message
+            Write-Log "dirty-clone-parked ${repoDir}: clone-check exit 8 sig=$($staged.signature) (since $($Parked[$key].since))"
             continue
         }
         # Exit 1 (could not judge), a timeout, or anything else: stay parked — an unjudgeable clone
@@ -3351,7 +3364,9 @@ function Update-DirtyCloneParking {
         $tailText = if ($tailLines.Count -gt 0) { $tailLines -join "`n" } else { '(stderr なし)' }
         $body = ("MindWire: 駐機中の共有 clone を再判定できませんでした（mindwire clone-check exit=$code）。駐機は続けます。`n" +
                  "clone: $repoDir`n$tailText")
-        Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $sig -Message $body
+        $staged = Get-DirtyCloneStagedAlert -Signature $sig -Message $body -RepoDir $repoDir `
+            -SinceIso "$($rec.since)" -Now $nowDt -ParkedCount ([int]$ParkedCounts[$key]) -RecordsPath $RecordsPath -RecordsByRepo $recordsByRepo
+        Send-NotificationIfChanged -State $NotifyState -Key "__dirty_clone__/$key" -Signature $staged.signature -Message $staged.message
         Write-Log "dirty-clone-probe-failed ${repoDir}: clone-check exit=$code — stays parked"
     }
     return , $released
@@ -3374,6 +3389,187 @@ function Get-DirtyCloneDigestLines {
     $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
     $lines += ""
     return , $lines
+}
+
+# --- staged re-alerts (T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-2, D-2) ---------------
+# Design v2.0 (Bohr msg-8091) as revised by v2.1 (Bohr msg-8093); naysayer go Einstein on the reply
+# to msg-8093 (objections []). On 10/29 the dirty-clone alert fired once and then
+# `notification suppressed (unchanged since last alert)` ran for 9.5 hours (msg-7637 §0): the
+# signature never changed, so nothing told a person the loop was still stopped. These helpers add a
+# STAGE to the signature, so the same fault alerts again once it has lasted longer:
+#   * a parked clone (`__dirty_clone__/<repo>`): stages 0 (under 1h), 1h, 6h, 24h, nothing after.
+#     The stage stays at 24h from then on, so the signature stops changing; the daily digest
+#     (Get-DirtyCloneDigestLines) keeps listing the clone once a day after that (v2.1 Obj-10-2).
+#   * launch-wait starved threads (`__launch_wait_starved__`, one key for all of them): stages 6h
+#     and 24h, nothing after. The key is cleared when no thread is starved any more.
+# Reader: the operator, through the notification webhook. Nothing here posts into a thread.
+#
+# The alert never names a cause (v2.1 Obj-10-1): a retreat record for the same repo_dir does not
+# show who dirtied the clone — a retreat that succeeded left it clean, so it cannot be the cause of
+# the dirt that is there now. When a record exists it is shown on its own line, marked as not
+# confirmed as the cause.
+
+# Parse an ISO-8601 timestamp into a UTC [datetime]; $null when empty or unparseable.
+function ConvertFrom-AlertIso {
+    param([string]$Iso)
+    if (-not $Iso) { return $null }
+    $dto = [DateTimeOffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([DateTimeOffset]::TryParse($Iso, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dto)) {
+        return $dto.UtcDateTime
+    }
+    return $null
+}
+
+# Stage of a parked clone from how long it has been parked: '0', '1h', '6h' or '24h' (and '24h'
+# for ever after — there is no 48h stage, v2.1 requirement 1).
+function Get-DirtyCloneAlertStage {
+    param([TimeSpan]$Age)
+    if ($Age -ge [TimeSpan]::FromHours(24)) { return '24h' }
+    if ($Age -ge [TimeSpan]::FromHours(6)) { return '6h' }
+    if ($Age -ge [TimeSpan]::FromHours(1)) { return '1h' }
+    return '0'
+}
+
+# Stage of a launch-wait starved thread: '6h' until it has waited 24h, then '24h' for ever after.
+# Get-LaunchWaitStarved only returns threads past $LaunchWaitStarvedThreshold (6h), so there is no
+# earlier stage (v2.1 requirement 3).
+function Get-LaunchWaitAlertStage {
+    param([TimeSpan]$Age)
+    if ($Age -ge [TimeSpan]::FromHours(24)) { return '24h' }
+    return '6h'
+}
+
+# How many sweep candidates use each repo_dir, keyed by ConvertTo-DirtyCloneRepoKey: while a repo
+# is parked every one of them is skipped, so this is the alert's "parked candidates" count.
+function Get-CandidateCountsByRepo {
+    param($Candidates)
+    $counts = @{}
+    foreach ($c in @($Candidates)) {
+        if ($null -eq $c -or -not $c.repo_dir) { continue }
+        try { $k = ConvertTo-DirtyCloneRepoKey -RepoDir "$($c.repo_dir)" } catch { continue }
+        $prev = if ($counts.ContainsKey($k)) { [int]$counts[$k] } else { 0 }
+        $counts[$k] = $prev + 1
+    }
+    return $counts
+}
+
+# The latest `retreat` row of state/clone-retreats.jsonl (written by `mindwire clone-retreat`,
+# PR-1b) whose repo_dir is this repo, or $null. A missing or unreadable file and malformed lines are
+# not errors: the alert then simply has no record line (v2.1: never fill the gap with a guess).
+function Get-LatestRetreatRecordForRepo {
+    param([string]$RecordsPath, [string]$RepoDir)
+    $byRepo = Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath
+    return (Find-RetreatRecordForRepo -RecordsByRepo $byRepo -RepoDir $RepoDir)
+}
+
+# Read state/clone-retreats.jsonl once and keep, per repo key, its latest `retreat` row. Callers that
+# build several alerts in one tick (Update-DirtyCloneParking) read the file once with this and pass
+# the table down, instead of re-reading the whole file per parked clone. Same tolerance as above:
+# a missing or unreadable file gives an empty table, malformed lines are skipped.
+function Read-LatestRetreatRecordsByRepo {
+    param([string]$RecordsPath)
+    $byRepo = @{}
+    if (-not $RecordsPath -or -not (Test-Path -LiteralPath $RecordsPath)) { return $byRepo }
+    try { $lines = @(Get-Content -LiteralPath $RecordsPath -Encoding UTF8 -ErrorAction Stop) } catch { return $byRepo }
+    foreach ($line in $lines) {
+        if (-not "$line".Trim()) { continue }
+        try { $row = "$line" | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($null -eq $row -or "$($row.kind)" -ne 'retreat' -or -not $row.repo_dir) { continue }
+        try { $k = ConvertTo-DirtyCloneRepoKey -RepoDir "$($row.repo_dir)" } catch { continue }
+        $byRepo[$k] = $row  # file order is append order: the last match is newest
+    }
+    return $byRepo
+}
+
+# The latest record for $RepoDir in a table from Read-LatestRetreatRecordsByRepo, or $null.
+function Find-RetreatRecordForRepo {
+    param([hashtable]$RecordsByRepo, [string]$RepoDir)
+    if ($null -eq $RecordsByRepo -or $RecordsByRepo.Count -eq 0) { return $null }
+    try { $want = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } catch { return $null }
+    if ($RecordsByRepo.ContainsKey($want)) { return $RecordsByRepo[$want] }
+    return $null
+}
+
+# The one line an alert carries for a retreat record. Its heading says it is not the cause.
+function Format-RetreatRecordAlertLine {
+    param($Record)
+    # ConvertFrom-Json turns an ISO string into a [datetime]; print it back as UTC ISO, not in the
+    # host's locale format.
+    $at = $Record.at
+    $atText = if ($at -is [datetime]) { $at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { "$at" }
+    $parts = @("at=$atText", "thread=$($Record.thread_id)", "stop=$($Record.stop_reason)",
+               "outcome=$($Record.outcome)")
+    if ($Record.branch) { $parts += "branch=$($Record.branch)" }
+    if ($Record.patch) { $parts += "patch=$($Record.patch)" }
+    return 'latest retreat record for this repo (not confirmed as the cause of this parking): ' + ($parts -join ' ')
+}
+
+# Add the stage to one `__dirty_clone__/<repo>` alert and the v2.1 context lines to its body. Used
+# on all three paths (exit 8 after a launch, clone-check exit 8, clone-check probe-failed). Returns
+# @{ signature; message; stage }.
+function Get-DirtyCloneStagedAlert {
+    param([string]$Signature, [string]$Message, [string]$RepoDir, [string]$SinceIso, [datetime]$Now,
+          [int]$ParkedCount, [string]$RecordsPath, [hashtable]$RecordsByRepo = $null)
+    $since = ConvertFrom-AlertIso -Iso $SinceIso
+    $age = if ($null -ne $since) { $Now.ToUniversalTime() - $since } else { [TimeSpan]::Zero }
+    if ($age -lt [TimeSpan]::Zero) { $age = [TimeSpan]::Zero }
+    $stage = Get-DirtyCloneAlertStage -Age $age
+    $lines = @(
+        "repo_dir: $RepoDir",
+        "parked for: $(Format-DurationDigest -Span $age) (since $SinceIso, stage=$stage)",
+        "parked candidates: $ParkedCount",
+        'cause: unknown'
+    )
+    # $RecordsByRepo, when given, is the table the caller already read this tick; otherwise read the file.
+    $rec = if ($null -ne $RecordsByRepo) { Find-RetreatRecordForRepo -RecordsByRepo $RecordsByRepo -RepoDir $RepoDir }
+           else { Get-LatestRetreatRecordForRepo -RecordsPath $RecordsPath -RepoDir $RepoDir }
+    if ($null -ne $rec) { $lines += (Format-RetreatRecordAlertLine -Record $rec) }
+    return @{ signature = "$Signature|stage=$stage"; message = ($Message + "`n" + ($lines -join "`n")); stage = $stage }
+}
+
+# The `__launch_wait_starved__` alert for this tick, or $null when no thread is starved. $Starved is
+# Get-LaunchWaitStarved's output ({ key; age }); $RepoDirByKey maps a candidate key to its
+# repo_dir; $Parked is the dirty-clone parking table. The signature is the sorted
+# `<thread key>@<stage>` list, so a new thread, a thread leaving, or a thread reaching 24h re-alerts.
+function Get-LaunchWaitStarvedAlert {
+    param($Starved, [hashtable]$Parked, [hashtable]$RepoDirByKey)
+    $rows = @($Starved | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { return $null }
+    $sigParts = @()
+    $lines = @()
+    foreach ($r in $rows) {
+        $stage = Get-LaunchWaitAlertStage -Age $r.age
+        $sigParts += "$($r.key)@$stage"
+        $blocked = 'not parked (cause unknown)'
+        $repoDir = ''
+        if ($null -ne $RepoDirByKey -and $RepoDirByKey.ContainsKey("$($r.key)")) { $repoDir = "$($RepoDirByKey["$($r.key)"])" }
+        if ($repoDir -and (Test-DirtyCloneSkip -RepoDir $repoDir -DirtyRepoDirs $Parked)) {
+            $blocked = "parked clone $repoDir"
+        }
+        $lines += "  $($r.key) — waited $(Format-DurationDigest -Span $r.age) (stage=$stage) — blocked by: $blocked"
+    }
+    $sig = 'launch-wait-starved:' + ((@($sigParts | Sort-Object)) -join ',')
+    $body = ("MindWire: LAUNCH と判定されたのに起動されていないスレッドが $($rows.Count) 件あります（launch-wait starved）。`n" +
+             ($lines -join "`n"))
+    return @{ key = '__launch_wait_starved__'; signature = $sig; message = $body }
+}
+
+# Send the launch-wait alert when its signature changed, or clear its key when nothing is starved
+# (so starvation coming back later alerts again). Returns $true when $NotifyState changed.
+function Update-LaunchWaitStarvedAlert {
+    param([hashtable]$NotifyState, $Starved, [hashtable]$Parked, [hashtable]$RepoDirByKey)
+    $alert = Get-LaunchWaitStarvedAlert -Starved $Starved -Parked $Parked -RepoDirByKey $RepoDirByKey
+    if ($null -eq $alert) {
+        if ($NotifyState.ContainsKey('__launch_wait_starved__')) {
+            $NotifyState.Remove('__launch_wait_starved__')
+            return $true
+        }
+        return $false
+    }
+    if (Test-NotificationSuppressed -State $NotifyState -Key $alert.key -Signature $alert.signature) { return $false }
+    Send-NotificationIfChanged -State $NotifyState -Key $alert.key -Signature $alert.signature -Message $alert.message
+    return $true
 }
 
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
@@ -5986,11 +6182,14 @@ try {
     # releases it (its candidates launch this tick, launches_same_head starting at 1 because the
     # refused launches were reverted), anything else keeps it parked.
     $dirtyClonesParked = ConvertTo-DirtyCloneParking -State (Get-JsonState -Path $dirtyClonesStatePath)
+    # PR-2 (D-2): per-repo candidate counts for the dirty-clone alert's "parked candidates" line.
+    $candidateCountsByRepo = Get-CandidateCountsByRepo -Candidates $candidates
     if ($dirtyClonesParked.Count -gt 0) {
         $nowIsoPark = (Get-Date).ToUniversalTime().ToString('o')
         $null = Update-DirtyCloneParking -Parked $dirtyClonesParked -NotifyState $notifyState `
             -Probe { param($d) Invoke-CloneCheck -RepoDir $d } -NowIso $nowIsoPark `
-            -Recover { param($d) Invoke-CloneRecover -RepoDir $d }
+            -Recover { param($d) Invoke-CloneRecover -RepoDir $d } `
+            -ParkedCounts $candidateCountsByRepo -RecordsPath $cloneRetreatRecordsPath
         Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
         # Persist the notification state in the same breath as the parking state (PR #435 gate,
         # round 1): a release removes the repo's alert signature from $notifyState, and the only
@@ -6420,11 +6619,16 @@ try {
             if ($revert.ok) { Write-Log "dirty-clone $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
             else { Write-Log "WARN dirty-clone $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
             # D-3b: park the repo until a clone-check says it is clean.
+            $nowDirty = (Get-Date).ToUniversalTime()
             Set-DirtyCloneParked -Parked $dirtyClonesParked -RepoDir $cand.repo_dir -Notice $notice `
-                -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+                -NowIso $nowDirty.ToString('o')
             Save-JsonState -Path $dirtyClonesStatePath -State $dirtyClonesParked
+            # PR-2 (D-2): the same staged signature and context lines as the re-judge path.
+            $stagedDirty = Get-DirtyCloneStagedAlert -Signature $notice.signature -Message $notice.message `
+                -RepoDir $cand.repo_dir -SinceIso "$($dirtyClonesParked[$notice.repo_key].since)" -Now $nowDirty `
+                -ParkedCount ([int]$candidateCountsByRepo[$notice.repo_key]) -RecordsPath $cloneRetreatRecordsPath
             Send-NotificationIfChanged -State $notifyState -Key $notice.key `
-                -Signature $notice.signature -Message $notice.message
+                -Signature $stagedDirty.signature -Message $stagedDirty.message
             # Same pairing as the re-judge block above: parking and its alert signature persist together.
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "dirty-clone $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine; repo parked; other candidates on this repo_dir are skipped until clone-check passes, other repos CONTINUE"
@@ -6741,6 +6945,12 @@ try {
         Write-Log ("launch-wait starved threads (>=$(Format-DurationDigest -Span $LaunchWaitStarvedThreshold) LAUNCH without a launch): " +
                    (($launchWaitStarved | ForEach-Object { "$($_.key) ($(Format-DurationDigest -Span $_.age))" }) -join ', '))
     }
+    # PR-2 (D-2, v2.1 requirement 3): the same list as an alert on one key, staged 6h / 24h, cleared
+    # when the list is empty. Saved with the rest of $notifyState at the end of the sweep.
+    $repoDirByKey = @{}
+    foreach ($c in @($candidates)) { if ($null -ne $c -and $c.key) { $repoDirByKey["$($c.key)"] = "$($c.repo_dir)" } }
+    $null = Update-LaunchWaitStarvedAlert -NotifyState $notifyState -Starved $launchWaitStarved `
+        -Parked $dirtyClonesParked -RepoDirByKey $repoDirByKey
 
     # T-decision-request-composer S4 (D-32). Poll for threads currently parked on a human
     # decision, once per distinct project, and aggregate. Same order as the sweep candidate list
