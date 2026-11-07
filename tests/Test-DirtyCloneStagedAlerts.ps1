@@ -304,6 +304,23 @@ try {
     Check 'exit-8 branch stages its alert' $true ($branchText -match 'Get-DirtyCloneStagedAlert')
     Check 'exit-8 branch sends the staged signature' $true ($branchText -match '-Signature \$stagedDirty\.signature -Message \$stagedDirty\.message')
     Check 'exit-8 branch reads the retreat records' $true ($branchText -match '-RecordsPath \$cloneRetreatRecordsPath')
+    # PR-3 (msg-8104 advisory): the exit-8 path passes the per-tick table instead of re-reading the file.
+    Check 'exit-8 branch passes the per-tick table (-RecordsByRepo)' $true ($branchText -match '-RecordsByRepo \$recordsByRepoTick')
+    # PR-3 gate advisory (#530 @ f25978f): the caller-side match above cannot see the callee, so check the
+    # binding itself — every named parameter the exit-8 call passes is declared by Get-DirtyCloneStagedAlert
+    # (an undeclared one would throw ParameterBindingException at run time).
+    $stagedFn = $functions | Where-Object { $_.Name -eq 'Get-DirtyCloneStagedAlert' } | Select-Object -First 1
+    $declared = @($stagedFn.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $exit8Call = $branch.Clauses[0].Item2.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DirtyCloneStagedAlert' }, $true) |
+        Select-Object -First 1
+    $passed = @($exit8Call.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+        ForEach-Object { $_.ParameterName })
+    Check 'exit-8 call passes -RecordsByRepo (from the call AST)' $true ($passed -contains 'RecordsByRepo')
+    Check 'every parameter of the exit-8 call is declared by Get-DirtyCloneStagedAlert' '' (($passed | Where-Object { $_ -notin $declared }) -join ',')
+    Check 'exit-8 branch reads the table only when it is not yet read' $true ($branchText -match 'if \(\$null -eq \$recordsByRepoTick\) \{ \$recordsByRepoTick = Read-LatestRetreatRecordsByRepo')
+    Check 'a launch that may have written a record clears the table' $true ($loop.Body.Extent.Text -match "if \(`"\`$retreatOutcome`" -notin @\('skipped', 'clean', 'not_eligible'\)\) \{ \`$recordsByRepoTick = \`$null \}")
+    Check 'the table starts empty before the candidate loop' $true ($scriptText.IndexOf('$recordsByRepoTick = $null') -ge 0 -and $scriptText.IndexOf('$recordsByRepoTick = $null') -lt $loop.Extent.StartOffset)
     Check 're-judge passes counts and records' $true ($scriptText -match '-ParkedCounts \$candidateCountsByRepo -RecordsPath \$cloneRetreatRecordsPath')
     $posCounts = $scriptText.IndexOf('$candidateCountsByRepo = Get-CandidateCountsByRepo -Candidates $candidates')
     $posUpdate = $scriptText.IndexOf('Update-DirtyCloneParking -Parked $dirtyClonesParked')
