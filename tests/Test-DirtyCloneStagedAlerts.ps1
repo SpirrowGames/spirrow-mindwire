@@ -304,6 +304,11 @@ try {
     Check 'exit-8 branch stages its alert' $true ($branchText -match 'Get-DirtyCloneStagedAlert')
     Check 'exit-8 branch sends the staged signature' $true ($branchText -match '-Signature \$stagedDirty\.signature -Message \$stagedDirty\.message')
     Check 'exit-8 branch reads the retreat records' $true ($branchText -match '-RecordsPath \$cloneRetreatRecordsPath')
+    # PR-3 (msg-8104 advisory): the exit-8 path passes the per-tick table instead of re-reading the file.
+    Check 'exit-8 branch passes the per-tick table (-RecordsByRepo)' $true ($branchText -match '-RecordsByRepo \$recordsByRepoTick')
+    Check 'exit-8 branch reads the table only when it is not yet read' $true ($branchText -match 'if \(\$null -eq \$recordsByRepoTick\) \{ \$recordsByRepoTick = Read-LatestRetreatRecordsByRepo')
+    Check 'a launch that may have written a record clears the table' $true ($loop.Body.Extent.Text -match "if \(`"\`$retreatOutcome`" -notin @\('skipped', 'clean', 'not_eligible'\)\) \{ \`$recordsByRepoTick = \`$null \}")
+    Check 'the table starts empty before the candidate loop' $true ($scriptText.IndexOf('$recordsByRepoTick = $null') -ge 0 -and $scriptText.IndexOf('$recordsByRepoTick = $null') -lt $loop.Extent.StartOffset)
     Check 're-judge passes counts and records' $true ($scriptText -match '-ParkedCounts \$candidateCountsByRepo -RecordsPath \$cloneRetreatRecordsPath')
     $posCounts = $scriptText.IndexOf('$candidateCountsByRepo = Get-CandidateCountsByRepo -Candidates $candidates')
     $posUpdate = $scriptText.IndexOf('Update-DirtyCloneParking -Parked $dirtyClonesParked')
