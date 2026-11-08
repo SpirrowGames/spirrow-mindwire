@@ -3150,6 +3150,81 @@ function Get-SlotPrepVerdict {
               detail = "$($payload.detail)"; record = $payload.record }
 }
 
+# --- slot-mode tick lock (T-ephemeral-impl-clone-slot-per-thread, Bohr msg-8249 / msg-8251) -------
+# In slot mode the wrapper holds state\conductor-tick.lock for the whole tick, so two wrappers (a
+# direct run, a task registered under another name) can never prep the same slot at once. IgnoreNew
+# on the registered task is the outer guard; this lock is the one the slot's safety rests on.
+# OFF (no slots_root, INV-0): never opened, never created — the caller does not reach these.
+#   - contended (the OS answers ERROR_SHARING_VIOLATION 32 / ERROR_LOCK_VIOLATION 33 in the low 16
+#     bits of HResult): one log line, exit 0, no park, no notice — the earlier tick is still
+#     running and leaves its own record, exactly like IgnoreNew dropping a start.
+#   - any other failure (access denied, missing state\ directory, other IOException): the type,
+#     HResult and absolute path are logged, the notice goes out on Send-NotificationIfChanged, and
+#     the wrapper exits $ConductorTickLockFailedExitCode, prep and conductor uncalled. The missing
+#     directory is NOT created: it is a deployment fault to surface, not to hide. The notice state
+#     lives under state\ too, so delivery is best effort; what is guaranteed is that a failure never
+#     ends as a normal contention exit 0 (Einstein msg-8250 / msg-8252).
+# The file is never deleted (the OS handle is the lock, as with exclusive_lock()), and the .NET
+# FileStream default (HandleInheritability.None) keeps an orphan child from holding it.
+# Not yet called by the sweep loop: wired with the rest of slot mode.
+$ConductorTickLockFileName = 'conductor-tick.lock'
+# Wrapper exit code for a tick-lock failure other than contention. 1 is the init trap's, 5-10 are
+# the daemon's / budget's codes, so 11 is free on either side.
+$ConductorTickLockFailedExitCode = 11
+$ConductorTickLockNoticeKey = '__conductor_tick_lock__'
+
+function Test-TickLockContention {
+    param([int]$HResult)
+    $win32 = $HResult -band 0xFFFF
+    return ($win32 -eq 32 -or $win32 -eq 33)
+}
+
+# Returns @{ status = 'acquired'; stream } | @{ status = 'contended'; detail } |
+# @{ status = 'failed'; exception_type; hresult; path; detail }.
+function Enter-ConductorTickLock {
+    param([string]$Path)
+    $full = [System.IO.Path]::GetFullPath($Path)
+    try {
+        $stream = [System.IO.FileStream]::new($full, [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return @{ status = 'acquired'; stream = $stream; path = $full }
+    } catch {
+        $ex = $_.Exception
+        while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) {
+            $ex = $ex.InnerException
+        }
+        $hr = [int]$ex.HResult
+        $type = $ex.GetType().FullName
+        if ($ex -is [System.IO.IOException] -and
+            $ex -isnot [System.IO.DirectoryNotFoundException] -and
+            $ex -isnot [System.IO.FileNotFoundException] -and
+            (Test-TickLockContention -HResult $hr)) {
+            return @{ status = 'contended'; path = $full
+                      detail = ('tick lock held by another run: {0}' -f $full) }
+        }
+        return @{ status = 'failed'; exception_type = $type; hresult = $hr; path = $full
+                  detail = ('tick lock failed: {0} HResult=0x{1:X8} path={2}: {3}' -f $type, $hr, $full, $ex.Message) }
+    }
+}
+
+# Handles a 'failed' acquisition: log, notify (best effort), return the exit code. A throwing
+# notifier never stops the log line or the non-zero exit (Einstein msg-8252).
+function Complete-TickLockFailure {
+    param([hashtable]$State, [hashtable]$Failure)
+    Write-Log $Failure.detail
+    $sig = '{0}:{1}:0x{2:X8}' -f $ConductorTickLockNoticeKey, $Failure.exception_type, $Failure.hresult
+    $hx = '0x{0:X8}' -f $Failure.hresult
+    $body = "MindWire: slot モードの tick ロックを取れなかったため、この tick は何も起動せずに異常終了しました（exit $ConductorTickLockFailedExitCode）。`n" +
+            "path: $($Failure.path)`n$($Failure.exception_type) HResult=$hx`n" +
+            "ロックの競合ではありません。``state`` ディレクトリの有無とアクセス権を確認してください。直るまで毎 tick 同じ理由で止まります（通知は原因が変わるまで 1 回だけ）。"
+    try {
+        Send-NotificationIfChanged -State $State -Key $ConductorTickLockNoticeKey -Signature $sig -Message $body
+    } catch {
+        try { Write-Log "tick lock failure notice could not be sent: $($_.Exception.Message)" } catch { }
+    }
+    return $ConductorTickLockFailedExitCode
+}
+
 # --- git-sync deferral (ADR-2026-10-09-23 unit 1, design v1.2 B-2) ---
 # The daemon exits $GitSyncDeferredExitCode when the git-sync hook could not name the thread's
 # branch because the GitHub API stayed transiently unavailable (5xx / timeout / rate limit) through
