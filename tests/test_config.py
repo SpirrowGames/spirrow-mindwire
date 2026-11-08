@@ -570,5 +570,10 @@ def test_slots_root_is_refused_until_the_loop_wiring_lands(tmp_path: Path) -> No
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValidationError, match="slots_root is not accepted yet"):
+    with pytest.raises(ValidationError, match="slots_root is not accepted yet") as exc:
         load_settings(cfg)
+    # msg-8229 condition 1: names the field, says it is not wired, says unset keeps repo_dir.
+    text = str(exc.value)
+    assert "[loop].slots_root" in text
+    assert "not wired into the loop" in text
+    assert "Leave it unset to keep the single shared repo_dir clone" in text

@@ -32,6 +32,11 @@ makes the release decision.
 patch to ``--state-dir`` and discard; see :mod:`spirrow_mindwire.clone_retreat`. Exit 0 clean /
 retreated / discarded, 4 discard incomplete (still parked), 1 failed.
 
+``mindwire slot-prep --slots-root <dir> --repo <name> --thread-id <id> --thread-branch <b>
+--origin-url <url> --state-dir <dir>`` (T-ephemeral-impl-clone-slot-per-thread, PR-A) runs the
+turn-pre procedure for one thread's clone slot; see :mod:`spirrow_mindwire.clone_slot_cli`. Exit 0
+launch, 3 skip, 4 park (one payload row each), 1 failed.
+
 ``mindwire continue-report [--days 7] [--config PATH]`` (T-implementer-self-continuation PR-2,
 D-3) prints the weekly view of implementer self-continuations, read from the continuation ledger
 (``<data_dir>/state/continuation_ledger.jsonl``) and nothing else: per thread, the admitted
@@ -111,6 +116,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--slot-mode",
         action="store_true",
         help="[loop].slots_root is set: never discard; leave the WIP for the turn-pre procedure",
+    )
+    slot = sub.add_parser(
+        "slot-prep",
+        help="turn-pre procedure for one thread's clone slot: exit 0 launch, 3 skip, 4 park",
+    )
+    slot.add_argument("--slots-root", required=True, type=Path, help="[loop].slots_root")
+    slot.add_argument("--repo", required=True, help="repo name (the slot / mirror directory)")
+    slot.add_argument("--thread-id", required=True, help="the thread the turn is for")
+    slot.add_argument("--thread-branch", required=True, help="the thread's loop/... branch")
+    slot.add_argument("--origin-url", required=True, help="GitHub remote for the slot's origin")
+    slot.add_argument("--default-branch", default="main", help="the repo's default branch")
+    slot.add_argument(
+        "--state-dir", required=True, type=Path, help="where preserved artefacts and rows go"
+    )
+    slot.add_argument(
+        "--refresh-mirror",
+        action="store_true",
+        help="fetch the repo's bare mirror first (the wrapper's once-per-tick-per-repo call)",
     )
     cont = sub.add_parser(
         "continue-report",
@@ -198,6 +221,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 stop_reason=args.stop_reason,
                 state_dir=args.state_dir,
                 slot_mode=args.slot_mode,
+            )
+        )
+    if args.command == "slot-prep":
+        from .clone_slot_cli import claude_sessions_under
+        from .clone_slot_cli import run as run_slot_prep
+        from .clone_slot_prep import SlotPrep
+
+        raise SystemExit(
+            run_slot_prep(
+                SlotPrep(
+                    slots_root=args.slots_root,
+                    repo=args.repo,
+                    thread_id=args.thread_id,
+                    origin_url=args.origin_url,
+                    thread_branch=args.thread_branch,
+                    default_branch=args.default_branch,
+                    state_dir=args.state_dir,
+                    sessions_under=claude_sessions_under(),
+                ),
+                refresh=args.refresh_mirror,
             )
         )
     if args.command == "continue-report":
