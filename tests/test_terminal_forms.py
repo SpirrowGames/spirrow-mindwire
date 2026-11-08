@@ -3,9 +3,10 @@
 T-done-disposition-auto-close, design v2.4 (Bohr msg-8185, approved by Einstein msg-8186). The
 grammar is v1 §1 with the v1.1 / v2 / v2.1 / v2.2 corrections: the final control line, the n-1
 rule for ``BLOCKED-ON``, the msg-8175 §2 field/body table, and the CommonMark fence rule of
-msg-8179 §B (its seven cases are pinned here one by one). ``handoff.ACCEPT_NEW_FORMS`` is off in
-this boundary, so every well-formed new form must be MALFORMED with a notice, and nothing about
-``NEXT: none`` may change.
+msg-8179 §B (its seven cases are pinned here one by one). Boundary 3 (Bohr msg-8328 §2 3-A) turned
+``handoff.ACCEPT_NEW_FORMS`` on; the OFF column is still pinned through the ``rejecting`` fixture,
+where every well-formed new form must be MALFORMED with a notice. Nothing about ``NEXT: none`` may
+change in either column (its retirement is boundary 5).
 """
 
 from __future__ import annotations
@@ -54,19 +55,34 @@ BLOCKED = "x\n\nBLOCKED-ON: pr SpirrowGames/spirrow-lexora#104\nNEXT: Bohr"
 
 @pytest.fixture
 def accepting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Turn the forms on for one test (boundary 3 flips the constant itself)."""
+    """The forms on, explicitly (the shipped default since boundary 3; kept so a test says it)."""
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
 
 
-def test_the_forms_ship_switched_off() -> None:
-    assert handoff_mod.ACCEPT_NEW_FORMS is False
+@pytest.fixture
+def rejecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The forms off: the pre-boundary-3 column, which a revert of boundary 3 returns to."""
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", False)
+
+
+def test_the_forms_ship_switched_on() -> None:
+    """Boundary 3 (msg-8328 §2 3-A): the one commit that turns every reader on at once."""
+    assert handoff_mod.ACCEPT_NEW_FORMS is True
+
+
+@pytest.mark.parametrize("body", [DONE, BLOCKED])
+def test_the_shipped_default_accepts_the_forms(body: str) -> None:
+    """No fixture: the module default itself settles both forms, roster or not."""
+    assert settles_by_terminal_form(body)
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.kind is HandoffKind.NONE and handoff.malformed is None
 
 
 # --------------------------------------------------------------------------- grammar
 
 
 @pytest.mark.parametrize("body", [DONE, BLOCKED])
-def test_a_well_formed_new_form_is_malformed_while_off(body: str) -> None:
+def test_a_well_formed_new_form_is_malformed_while_off(rejecting: None, body: str) -> None:
     handoff = resolve_handoff(body, _ROSTER)
     assert handoff.kind is HandoffKind.ABSENT
     assert handoff.malformed is MalformedHandoff.NEW_FORM_NOT_ACCEPTED
@@ -241,7 +257,7 @@ def test_a_backtick_info_string_with_a_backtick_is_not_a_fence() -> None:
 # --------------------------------------------------------------------------- sweep / 1b / 1c
 
 
-def test_head_skip_launches_new_forms_while_off() -> None:
+def test_head_skip_launches_new_forms_while_off(rejecting: None) -> None:
     # LAUNCH is what gets the MALFORMED notice posted (the notice moves the head).
     assert not stage1_skips(DONE)
     assert not stage1_skips(BLOCKED)
@@ -272,6 +288,7 @@ def _gate(body: str, roster: object = _ROSTER, field: str | None = None) -> obje
 
 
 def test_auto_gate_tail_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", False)
     assert _gate(DONE) is AutoGateNoop.QUEUED_BEHIND
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
     assert isinstance(_gate(DONE), Post)
@@ -321,7 +338,7 @@ def test_auto_gate_without_a_roster_still_fires_on_a_legacy_idle_tail(roster: ob
 # --------------------------------------------------------------------------- gateway disposition
 
 
-def test_no_disposition_is_sent_for_a_new_form_while_off() -> None:
+def test_no_disposition_is_sent_for_a_new_form_while_off(rejecting: None) -> None:
     assert body_disposition(DONE, _ROSTER) is None
     assert body_disposition(BLOCKED, _ROSTER) is None
 
@@ -340,7 +357,7 @@ def test_the_disposition_of_an_accepted_form(accepting: None) -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("body", [DONE, BLOCKED, "x\nSTOP: done\nNEXT: Bohr"])
-async def test_conductor_stops_on_a_refused_form_with_a_notice(body: str) -> None:
+async def test_conductor_stops_on_a_refused_form_with_a_notice(rejecting: None, body: str) -> None:
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Bohr", content=body)
     disp = _ScriptedDispatcher(mcp, {})

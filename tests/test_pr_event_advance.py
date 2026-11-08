@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.conductor.disposition import body_disposition
 from spirrow_mindwire.conductor.gate_records import (
     MERGE_SELF_INSTRUCTION,
     RELAY_AUTHOR,
@@ -25,7 +26,14 @@ from spirrow_mindwire.conductor.gate_records import (
     render_relay_heading,
     verdict_heads,
 )
-from spirrow_mindwire.conductor.handoff import HandoffKind, HumanAsk, resolve_handoff
+from spirrow_mindwire.conductor.handoff import (
+    HandoffKind,
+    HumanAsk,
+    StopStatus,
+    resolve_handoff,
+    settles_by_terminal_form,
+)
+from spirrow_mindwire.conductor.head_skip import stage1_skips
 from spirrow_mindwire.github.client import (
     CiState,
     CiStatus,
@@ -180,7 +188,7 @@ def test_r14_admission_tail_rows() -> None:
         closed = _decide(tail, _pr("closed"))
         assert isinstance(closed, Post) and closed.next_line == "NEXT: Bohr"
         settled = _decide(tail, _pr("merged", body=f"Closes-thread: {_THREAD}"))
-        assert isinstance(settled, Post) and settled.next_line == "NEXT: none"
+        assert isinstance(settled, Post) and settled.next_line == "STOP: done"
         assert _decide(tail, _pr("open"), ci=CiState.SUCCESS) == Noop(NoopReason.OPEN_NO_HOLD)
 
 
@@ -202,8 +210,32 @@ def test_row2_a_settled_thread_is_never_reopened() -> None:
 def test_row3_merged_with_closes_thread_for_this_thread_is_none() -> None:
     d = _decide(_tail(), _pr("merged", body=f"Fix.\r\n\r\nCloses-thread: {_THREAD}\r\n"))
     assert isinstance(d, Post)
-    assert d.next_line == "NEXT: none"
+    assert d.next_line == "STOP: done"
     assert f"PR {_REF} が merge された（{_MERGE}）" in d.body  # noqa: RUF001
+
+
+def test_row3_stop_done_is_read_as_settled_by_every_reader() -> None:
+    """Boundary 3 (T-done-disposition-auto-close msg-8328 §2 3-B): 1b's ``Closes-thread:`` merge
+    post ends in the terminal ``STOP: done`` with no NEXT line, and every reader of the head reads
+    that post as settled: head_skip SKIPs it, the conductor resolves it to NONE / DONE, and the
+    gateway's disposition is ``done``. 1b itself does not read it again (row 1: its author is
+    not the verdict relay), and a verdict relay that ever ended the same way is row 2."""
+    d = _decide(_tail(), _pr("merged", body=f"Closes-thread: {_THREAD}"))
+    assert isinstance(d, Post)
+    rendered = d.render()
+    assert rendered.rstrip().endswith("\n\nSTOP: done")
+    assert "NEXT:" not in rendered
+    assert settles_by_terminal_form(rendered)
+    assert stage1_skips(rendered)
+    handoff = resolve_handoff(rendered, {"Bohr": Role.PROPOSER})
+    assert handoff.kind is HandoffKind.NONE and handoff.malformed is None
+    assert handoff.stop_line is not None and handoff.stop_line.status is StopStatus.DONE
+    assert body_disposition(rendered, {"Bohr": Role.PROPOSER}) == {"kind": "done"}
+    assert read_relay_tail(PR_EVENT_RELAY_AUTHOR, rendered) is None
+    relay_settled = read_relay_tail(
+        RELAY_AUTHOR, f"{render_relay_heading(_REF, _HEAD)}\n\ncritique\n\nSTOP: done"
+    )
+    assert _decide(relay_settled, _pr("merged")) == Noop(NoopReason.SETTLED)
 
 
 def test_row3_merged_without_closes_thread_goes_to_the_proposer() -> None:
@@ -217,9 +249,9 @@ def test_row3_closes_thread_naming_another_thread_counts_as_absent() -> None:
 
 
 def test_row3_closes_thread_merge_never_reads_the_roster() -> None:
-    # B2: NEXT: none needs no persona, so a broken roster must not turn it into an operator task.
+    # B2: STOP: done needs no persona, so a broken roster must not turn it into an operator task.
     d = _decide(_tail(), _pr("merged", body=f"Closes-thread: {_THREAD}"), proposer=None)
-    assert isinstance(d, Post) and d.next_line == "NEXT: none"
+    assert isinstance(d, Post) and d.next_line == "STOP: done"
 
 
 def test_row3_merged_with_unresolved_roster_writes_the_fact_and_hands_to_operator() -> None:
@@ -328,7 +360,8 @@ def test_r13_decide_returns_a_value_for_every_input_combination() -> None:
         d = _decide(tail, _pr(state, head=head, body=body), ci=ci, proposer=proposer)
         assert isinstance(d, Noop | Post), (author, kind, token, state, hold, head, ci)
         if isinstance(d, Post):
-            assert d.next_line.splitlines()[-1].startswith("NEXT: ")
+            last = d.next_line.splitlines()[-1]
+            assert last.startswith("NEXT: ") or last == "STOP: done", last
         n += 1
     assert n == 2 * 5 * 3 * 4 * 2 * 2 * 5 * 2 * 2
 
@@ -667,7 +700,7 @@ async def test_r10_the_close_api_is_never_called() -> None:
         project="p",
         proposer="Bohr",
     )
-    assert chat.threads[_THREAD][-1]["content"].endswith("NEXT: none")
+    assert chat.threads[_THREAD][-1]["content"].endswith("STOP: done")
     assert set(chat.calls) <= TOOLS_USED
     assert not any("close" in name for name in chat.calls)
 
@@ -869,7 +902,7 @@ def test_row3_merged_closes_thread_naming_another_project_goes_to_the_proposer()
     assert isinstance(other, Post) and other.next_line == "NEXT: Bohr"
     # _decide runs in project "p": naming it explicitly settles, as the bare id does.
     mine = _decide(_tail(), _pr("merged", body=f"Closes-thread: p/{_THREAD}"))
-    assert isinstance(mine, Post) and mine.next_line == "NEXT: none"
+    assert isinstance(mine, Post) and mine.next_line == "STOP: done"
 
 
 # ---- the PR's project from clones, not from the design thread (msg-8030 / 8032 / 8034) ----- #
@@ -890,7 +923,7 @@ def _merged_post(body: str, *, thread_project: str, pr_project: PrProject) -> Po
 
 def test_same_repo_bare_closes_thread_still_closes() -> None:
     post = _merged_post(f"Closes-thread: {_THREAD}", thread_project="p", pr_project=PrProject("p"))
-    assert post.next_line == "NEXT: none"
+    assert post.next_line == "STOP: done"
 
 
 def test_cross_repo_bare_closes_thread_names_the_prs_project_and_does_not_close() -> None:
@@ -904,7 +937,7 @@ def test_cross_repo_bare_closes_thread_names_the_prs_project_and_does_not_close(
 def test_cross_repo_qualified_on_both_lines_closes() -> None:
     body = f"Thread: hub/{_THREAD}\nCloses-thread: hub/{_THREAD}"
     post = _merged_post(body, thread_project="hub", pr_project=PrProject("proj"))
-    assert post.next_line == "NEXT: none"
+    assert post.next_line == "STOP: done"
 
 
 @pytest.mark.parametrize(
@@ -937,7 +970,7 @@ def test_unresolved_pr_project_bare_does_not_close_and_says_why(
 )
 def test_unresolved_pr_project_qualified_exact_match_still_closes(pr_project: PrProject) -> None:
     post = _merged_post(f"Closes-thread: p/{_THREAD}", thread_project="p", pr_project=pr_project)
-    assert post.next_line == "NEXT: none"
+    assert post.next_line == "STOP: done"
 
 
 def test_unresolved_without_a_bare_close_for_this_thread_adds_no_line() -> None:
@@ -969,6 +1002,6 @@ async def test_1b_with_one_unread_clone_does_not_close_a_bare_id(body: str, clos
         proposer="Bohr",
     )
     assert out.action == "posted"
-    assert (out.next_line == "NEXT: none") is closes
+    assert (out.next_line == "STOP: done") is closes
     posted = chat.threads[_THREAD][-1]["content"]
     assert ("incomplete: app" in posted) is not closes

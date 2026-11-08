@@ -40,7 +40,7 @@
 | PR の状態 | 動作 | `NEXT` |
 |---|---|---|
 | **merged** | (i) 作業スレッドに「PR #N が merge された（sha）」と 1 本書く | 本文に `Closes-thread: <thread_id>` があれば `none`。無ければ proposer |
-| **closed（merge されていない）** | 「PR #N が merge されずに close された（closed_at、最終 head sha）。本スレッドの作業はこの PR では landing していない」と 1 本書く | **`Closes-thread:` の有無に関係なく必ず proposer**。`NEXT: none` は書かない |
+| **closed（merge されていない）** | 「PR #N が merge されずに close された（closed_at、最終 head sha）。本スレッドの作業はこの PR では landing していない」と 1 本書く | **`Closes-thread:` の有無に関係なく必ず proposer**。決着の形（`STOP: done`、旧 `NEXT: none`）は書かない |
 | **open**、かつ直前の gate 結果が CI pending による COMMENT で、同じ head の CI が終端 | (ii) gate を 1 回だけ撃ち直す | gate relay が決める |
 
 - **closed-unmerged で宣言を無視する理由**: `Closes-thread:` は「この PR が landing したらスレッドの目的は果たされる」という条件付きの宣言で、merge されずに close されたならその条件は満たされていない。放棄・差し替え・スレッドごと中止のどれかは判断が要るので、機械は決める主体（proposer）に渡すだけにする。スレッドごとやめるなら proposer 自身が書く。失敗の向き: 誤って閉じる経路は無く、最悪でも proposer が閉じる 1 手が余分にかかるだけ。
@@ -247,7 +247,7 @@ ALTER TABLE project_control ADD COLUMN desired_expires_at TIMESTAMPTZ NULL;
 | `implementing` | Heisenberg のターン中／指名 | `NEXT: Heisenberg`（human か naysayer の指名によるもの。guard (i) と整合） |
 | `gate` | PR gate 発火中／verdict 待ち | push 検出後、verdict が現 head に付くまで |
 | `ready_for_human` | Tier-C | APPROVE が現 head に紐づき CI 緑 / `NEXT: human` / 選択肢あり |
-| `waiting` | 条件付き待機 | `NEXT: none` + 着手条件、他スレッドのレビュー待ち、hold、resource 待ち |
+| `waiting` | 条件付き待機 | `BLOCKED-ON: <arm> <ref>` + `NEXT: <wake>`（旧 `NEXT: none` + 着手条件）、他スレッドのレビュー待ち、hold、resource 待ち |
 | `post_merge` | merged 検出後の後処理中 | sync-repo、台帳 close、次の proposer ターン |
 | `stalled` | 止まっている | quarantine、head 不動、rounds=0 human の反復、starvation |
 | `done` | 解決 | thread resolved かつ PR merged（または PR 無し） |
@@ -272,8 +272,8 @@ ALTER TABLE project_control ADD COLUMN desired_expires_at TIMESTAMPTZ NULL;
 | R-POSTMERGE-NEXT | post_merge | 後処理完了 ∧ thread active | `proposing` | Bohr を起こす | |
 | **R-RELAY-STOP** | any | head が `conductor-relay` の停止通知で `mindwire:stop v1` マーカーを持つ（**R-HUMAN より先に評価**）【v0.3.6 §18.4】 | `stalled` | `facts.stop_kind` / `facts.stop_event` をマーカーから設定。composer は呼ばない | |
 | R-HUMAN | any | `NEXT: human`（役の Tier-C 依頼） | `ready_for_human` | composer で material 生成、`presented_hash` 記録 | J-ESCALATE（依頼段落に選択肢が無い／operator 権限で済む内容なら差し戻し） |
-| R-NONE-COND | any | `NEXT: none` ∧ 本文に着手条件 | `waiting` | `waiting_on` を構造化して保存 | J-COND（条件の抽出） |
-| R-NONE-SETTLED | any | `NEXT: none` ∧ thread resolved | `done` | | |
+| R-NONE-COND | any | `BLOCKED-ON:` + `NEXT: <wake>`、または旧 `NEXT: none` ∧ 本文に着手条件 | `waiting` | `waiting_on` を構造化して保存 | J-COND（条件の抽出） |
+| R-NONE-SETTLED | any | `STOP: done`（旧 `NEXT: none`）∧ thread resolved | `done` | | |
 | R-WAIT-FIRE | waiting | `waiting_on` が成立 | 成立時の指定列 | 指定された行為（例: sweep 登録、Bohr 起こし） | |
 | R-HOLD | any | control = hold（期限内） | `waiting` | 何もしない。期限切れで自動復帰 | |
 | R-QUAR | any | conductor exit≠0 | `stalled` | quarantine 相当を `facts.failure` に保存、Discord | J-STALL（原因分類: 外部障害 / 資格情報 / スレッド固有） |
