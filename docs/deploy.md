@@ -5,7 +5,8 @@
 How to run the NEXT-driven design-loop **conductor** (`mindwire-loop --mode conductor`) as an
 unattended daemon. The conductor reads one design thread and serially dispatches the single
 `NEXT:`-named role each turn (proposer → implementer → naysayer), driving it to a stop condition
-(`NEXT: human` / `NEXT: none` / round cap).
+(`NEXT: human` / a settle — `STOP: done`, `BLOCKED-ON:` + `NEXT: <wake>`, or the legacy
+`NEXT: none` — / round cap).
 
 > Scope: this is the *operational* wiring — how the loop is launched, kept fed with work, kept
 > affordable, and how it tells a human it is stuck. The loop code (conductor, the three role
@@ -321,7 +322,7 @@ with Task Scheduler. The wrapper picks the thread, keeps a log, and decides when
 conductor is worth it at all.
 
 > Do not register `run-conductor.ps1` directly. It was the original wiring and it fails silently: it
-> drives whatever thread was left in the config, and if that thread has settled (`NEXT: none`) every
+> drives whatever thread was left in the config, and if that thread has settled (`STOP: done` / `NEXT: none`) every
 > fire is a 0-round no-op that still exits 0 and still shows green in the task history. Observed for
 > an unknown number of days before the wrapper made it visible.
 
@@ -685,7 +686,8 @@ launched for 2.5h without any alert. Two things were added (`deploy/lib/PreLoopB
 Launching the conductor is not uniformly cheap:
 
 - a **settled or human-parked** thread costs one MCP read and **no inference** — the conductor reads
-  the head message, resolves `NEXT: none` / `NEXT: human`, and stops;
+  the head message, resolves a settle (`STOP: done` / `BLOCKED-ON:` / legacy `NEXT: none`) or
+  `NEXT: human`, and stops;
 - a thread whose `NEXT:` names a **role** costs a real role dispatch. When that role then posts
   nothing (`no_progress_to_human`), the tick has bought nothing and billed for it.
 
@@ -840,6 +842,13 @@ Run it as the same user as the sweep task, so the tick sees the same data dir. T
 the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`): Task Scheduler
 does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
 without writing a line. Registration stops if no absolute path can be resolved.
+
+Re-running it replaces an existing `mindwire-stall-ledger` task with this script's definition
+(`-Force`). Success is decided by reading the task back, not by whether `Register-ScheduledTask`
+threw: the script compares Execute / Arguments / RepetitionInterval / ExecutionTimeLimit of the
+registered task with what it meant to register, prints `verified mindwire-stall-ledger ...` only when
+all four match, and throws on a missing task or any mismatch. If the registration itself failed but
+the existing task already matches, the `verified` line says so and nothing was replaced.
 
 **GitHub token.** Set `MINDWIRE_STALL_LEDGER_GITHUB_TOKEN` in that user's **User** environment to
 the implementer PAT (`takahito-spirrowgames`; the ledger only reads). Never use the naysayer token.

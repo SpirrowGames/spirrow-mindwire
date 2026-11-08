@@ -29,7 +29,7 @@ Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c
 | D7 | `typesafe-ai` skill をこの repo に置かない、`/v1/decide` のみを呼ぶ（依存を増やさない側に倒す） | msg-3404 §5 / v3 |
 | D8 | 問いセット v3.4: **genuine 3 + spurious 3 + computed feature 0**。合成規則: genuine=和 / spurious=max | msg-3822, msg-3824 |
 | D9 | computed feature は全廃。`routing_artifact` は Conductor `rule_stop_reason` が既に捕捉するため二重管理禁止（Principle 2）。`protected_merge` は admission-gate の `merge-protected` ラベルが担うため Decider に持たない | msg-3820, msg-3822 |
-| D10 | bounce の応答は **3 択**: (a) self-resolve `NEXT: <role>` / (b) stand_down `NEXT: none` / (c) reassert `NEXT: human`。**構文的引用検査は入れない**（意味的幻覚を止められず、副作用のみ大きいため） | msg-3822, msg-3824, msg-3826 |
+| D10 | bounce の応答は **3 択**: (a) self-resolve `NEXT: <role>` / (b) stand_down `STOP: done`（`T-done-disposition-auto-close` 境界 3 以前は `NEXT: none`。legacy として境界 5 まで受け付ける） / (c) reassert `NEXT: human`。**構文的引用検査は入れない**（意味的幻覚を止められず、副作用のみ大きいため） | msg-3822, msg-3824, msg-3826 |
 | D11 | safety story は「構造 + 経験 + 観測」の 3 層。invariant「構造的に不可能」は撤回する | msg-3824 |
 | D12 | 実装順は shadow 先行デプロイ（`stop is None` ガード下で log-only、Takahito 承認不要 — 実動作を変えないため）。オフライン replay と live shadow JSONL 蓄積は並行 | msg-3820 |
 | D13 | 評価は **A-pre / A-post / live shadow** の 3 面で出す。A-post 母数不足なら shadow が JSONL を貯め続ける | msg-3818 §6, msg-3820 |
@@ -302,7 +302,7 @@ Conductor は human に上げる前に呼び出し元 agent へ **1 回だけ**�
 >
 > **(a) self-resolve** — スレッド内の情報から答えを組み立て、次の作業担当を指す `NEXT: <role>` を出す（正常系）。差し戻し理由と結論は本文に短く残してください。
 >
-> **(b) stand_down** — 判断保留が不要になったと認める場合、応答本文にその旨を記し、末尾を `NEXT: none` で締める。JSONL には `BOUNCE_ACCEPTED` として記録される。スレッドに未処理の別作業が残っており自分がそれを引き取る場合は (a) を選ぶこと。
+> **(b) stand_down** — 判断保留が不要になったと認める場合、応答本文にその旨を記し、最後の制御行を `STOP: done` にする（その後に `NEXT:` 行を書かない。旧形の `NEXT: none` は境界 5 まで受け付ける）。JSONL には `BOUNCE_ACCEPTED` として記録される。スレッドに未処理の別作業が残っており自分がそれを引き取る場合は (a) を選ぶこと。
 >
 > **(c) reassert NEXT: human** — Tier-C 判断が実際に必要な場合、Tier-C 該当理由（goal / cost / irreversible / merge-protected のどれか）を本文に明記して再度 `NEXT: human`。**2 回目ルールにより Decider を経由せず必ず human に届く**。
 

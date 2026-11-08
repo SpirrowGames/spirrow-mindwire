@@ -45,8 +45,8 @@
 #   'pr_settled' — a `NEXT: pr-review` named a PR that GitHub already reports merged or closed
 #               (T-merged-pr-fact-never-reaches-design-thread, Bohr msg-7560 v0.4). The conductor
 #               posted that fact under pr-event-relay instead of re-gating, and the post's own
-#               NEXT (none / the proposer / the 3-line operator form) is the hand-off. A person
-#               who must act is reached through that NEXT, not through this stop.
+#               control line (STOP: done / NEXT: <proposer> / the 3-line operator form) is the
+#               hand-off. A person who must act is reached through that NEXT, not through this stop.
 #   'resume_retry' — the conductor found a PR-gate post at the head that would resume the
 #               implementer, but could not read GitHub or the PR head had moved past it
 #               (T-sweep-starves-deep-candidates, Bohr msg-6318). Nothing is posted; the next tick
