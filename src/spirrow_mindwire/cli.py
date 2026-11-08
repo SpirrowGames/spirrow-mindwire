@@ -227,6 +227,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .clone_slot_cli import claude_sessions_under
         from .clone_slot_cli import run as run_slot_prep
         from .clone_slot_prep import SlotPrep
+        from .clone_slot_trust import trust_preparer
 
         raise SystemExit(
             run_slot_prep(
@@ -239,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     default_branch=args.default_branch,
                     state_dir=args.state_dir,
                     sessions_under=claude_sessions_under(),
+                    prepare_slot=trust_preparer(),
                 ),
                 refresh=args.refresh_mirror,
             )
