@@ -424,7 +424,7 @@ Stage 3 は 3 層で、 **層ごとに設定ファイルと責務が分かれる
 | reason | 意味 |
 |---|---|
 | `human` | `NEXT: human` — Tier-C 判断点 |
-| `none` | `NEXT: none` — スレッド決着。 sweep は次候補へ進む |
+| `none` | 決着・待ち — 終端形 `STOP: done`（`NEXT:` 行なし）または `BLOCKED-ON: <arm> <ref>` + `NEXT: <wake>`（`T-done-disposition-auto-close` 境界 3 以降）。legacy の `NEXT: none` も境界 5 までは同じ扱い。sweep は次候補へ進む |
 | `no_handoff_to_human` | `NEXT:` が読めない / 名簿に無い → human へ fallback (Obj3) |
 | `no_progress_to_human` | dispatch した role が何も投稿しなかった |
 | `round_cap` | `max_rounds` 到達 (暴走バックストップ) |

@@ -3,9 +3,10 @@
 T-done-disposition-auto-close, design v2.4 (Bohr msg-8185, approved by Einstein msg-8186). The
 grammar is v1 §1 with the v1.1 / v2 / v2.1 / v2.2 corrections: the final control line, the n-1
 rule for ``BLOCKED-ON``, the msg-8175 §2 field/body table, and the CommonMark fence rule of
-msg-8179 §B (its seven cases are pinned here one by one). ``handoff.ACCEPT_NEW_FORMS`` is off in
-this boundary, so every well-formed new form must be MALFORMED with a notice, and nothing about
-``NEXT: none`` may change.
+msg-8179 §B (its seven cases are pinned here one by one). Boundary 3 (Bohr msg-8328 §2 3-A) turned
+``handoff.ACCEPT_NEW_FORMS`` on; the OFF column is still pinned through the ``rejecting`` fixture,
+where every well-formed new form must be MALFORMED with a notice. Nothing about ``NEXT: none`` may
+change in either column (its retirement is boundary 5).
 """
 
 from __future__ import annotations
@@ -54,19 +55,34 @@ BLOCKED = "x\n\nBLOCKED-ON: pr SpirrowGames/spirrow-lexora#104\nNEXT: Bohr"
 
 @pytest.fixture
 def accepting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Turn the forms on for one test (boundary 3 flips the constant itself)."""
+    """The forms on, explicitly (the shipped default since boundary 3; kept so a test says it)."""
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
 
 
-def test_the_forms_ship_switched_off() -> None:
-    assert handoff_mod.ACCEPT_NEW_FORMS is False
+@pytest.fixture
+def rejecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The forms off: the pre-boundary-3 column, which a revert of boundary 3 returns to."""
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", False)
+
+
+def test_the_forms_ship_switched_on() -> None:
+    """Boundary 3 (msg-8328 §2 3-A): the one commit that turns every reader on at once."""
+    assert handoff_mod.ACCEPT_NEW_FORMS is True
+
+
+@pytest.mark.parametrize("body", [DONE, BLOCKED])
+def test_the_shipped_default_accepts_the_forms(body: str) -> None:
+    """No fixture: the module default itself settles both forms, roster or not."""
+    assert settles_by_terminal_form(body)
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.kind is HandoffKind.NONE and handoff.malformed is None
 
 
 # --------------------------------------------------------------------------- grammar
 
 
 @pytest.mark.parametrize("body", [DONE, BLOCKED])
-def test_a_well_formed_new_form_is_malformed_while_off(body: str) -> None:
+def test_a_well_formed_new_form_is_malformed_while_off(rejecting: None, body: str) -> None:
     handoff = resolve_handoff(body, _ROSTER)
     assert handoff.kind is HandoffKind.ABSENT
     assert handoff.malformed is MalformedHandoff.NEW_FORM_NOT_ACCEPTED
@@ -157,9 +173,120 @@ def test_a_field_contradicting_the_form_is_malformed(accepting: None) -> None:
     assert agreeing.kind is HandoffKind.NONE and agreeing.malformed is None
 
 
-def test_indented_code_is_not_a_control_line(accepting: None) -> None:
-    assert resolve_handoff("x\n\n    STOP: done", _ROSTER).kind is HandoffKind.ABSENT
-    assert resolve_handoff("x\n\n    STOP: done", _ROSTER).malformed is None
+# --------------------------------------------------------------------------- indentation (Slice I)
+#
+# msg-8455 §1 I-2: at a control-line position an indented line that is a well-formed terminal form
+# once dedented is MALFORMED (``indented_terminal_form``), never ROLE and never ABSENT. Before
+# Slice I the first cell was ABSENT with no notice and the next three routed to the wake at once,
+# silently dropping the wait.
+
+_INDENTED = MalformedHandoff.INDENTED_TERMINAL_FORM
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n    STOP: done",
+        "x\n\n    BLOCKED-ON: pr o/r#1\n    NEXT: Bohr",
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: Bohr",  # only BLOCKED-ON indented (msg-8455 §1)
+        "x\n\n\tSTOP: done",
+        "x\n\n\tBLOCKED-ON: pr o/r#1\nNEXT: Bohr",
+        "x\n\n  \tBLOCKED-ON: thread T-a\nNEXT: Einstein",
+        "x\n\n    STOP: done\n<!-- source: tools=3 -->\n",  # footer skipped, as for the plain form
+        "x\n\n    STOP: done\n\n<!-- source: tools=3 -->\n<!-- attest: y -->\n",
+        # A wake the plain form would refuse, or a reserved word: still the indentation reason.
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: none",
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: Heisenberg",
+        "x\n\n    BLOCKED-ON: self job-1\nNEXT: Bohr",
+    ],
+)
+def test_an_indented_terminal_form_at_a_control_position_is_malformed(
+    monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    for on in (False, True):
+        monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", on)
+        handoff = resolve_handoff(body, _ROSTER)
+        assert (handoff.kind, handoff.malformed) == (HandoffKind.ABSENT, _INDENTED), on
+        assert handoff_mod.refused_by_terminal_form(body)
+        # head_skip LAUNCHes it (UNRESOLVED), so the conductor posts the notice — the same path
+        # as every other MALFORMED form; its NEXT token is never read.
+        assert parse_head_token(body) == ""
+        assert not stage1_skips(body)
+
+
+def test_the_indented_notice_says_to_write_it_unindented() -> None:
+    notice = malformed_notice(_INDENTED)
+    assert "`indented_terminal_form`" in notice
+    assert "字下げせず" in notice
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n   STOP: done",  # three spaces is not indented code
+        "x\n\n   BLOCKED-ON: pr o/r#1\nNEXT: Bohr",
+        "x\n\n   BLOCKED-ON: pr o/r#1\n   NEXT: Bohr",
+    ],
+)
+def test_three_spaces_is_not_indented_code(accepting: None, body: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert handoff.kind is HandoffKind.NONE
+    assert handoff.stop_line is not None and handoff.stop_line.terminal
+
+
+@pytest.mark.parametrize(
+    ("body", "identity"),
+    [
+        # An indented example in the middle of the body is still an example.
+        ("x\n\n    STOP: done\n\nmore prose\n\nNEXT: Bohr", "Bohr"),
+        ("x\n\n    BLOCKED-ON: pr o/r#1\n    NEXT: Einstein\n\nprose\nNEXT: Bohr", "Bohr"),
+        # Not the line directly above the final NEXT: not a control position.
+        ("x\n\n    BLOCKED-ON: pr o/r#1\n\nNEXT: Bohr", "Bohr"),
+        ("x\n    BLOCKED-ON: pr o/r#1\nprose\nNEXT: Bohr", "Bohr"),
+    ],
+)
+def test_an_indented_form_elsewhere_is_still_an_example(body: str, identity: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert (handoff.kind, handoff.identity) == (HandoffKind.ROLE, identity)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"x\n{F3}\n    STOP: done\n{F3}\n",
+        f"x\n{F3}\n    STOP: done",
+        f"x\n{F3}\n    BLOCKED-ON: pr o/r#1\n    NEXT: Bohr\n{F3}\n",
+    ],
+)
+def test_an_indented_form_inside_a_fence_is_not_a_control_line(body: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert handoff.kind is HandoffKind.ABSENT
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n    STOP: finished",  # not a well-formed form once dedented
+        "x\n\n    stop: done",
+        "x\n\n    BLOCKED-ON: soon\nNEXT: Bohr",
+    ],
+)
+def test_an_indented_line_that_is_not_a_form_keeps_its_reading(body: str) -> None:
+    # Only a line that is a well-formed form once dedented is refused for its indentation; any
+    # other indented line is code, as before.
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+
+
+def test_an_indented_stop_above_a_next_keeps_its_reading() -> None:
+    # Not in Slice I's scope (msg-8455 §1 lists the final line and BLOCKED-ON above NEXT only):
+    # the legacy reading of a line above ``NEXT: none`` and the ROLE route are unchanged.
+    assert resolve_handoff("x\n    STOP: done\nNEXT: Bohr", _ROSTER).identity == "Bohr"
+    legacy = resolve_handoff("x\n    STOP: done\nNEXT: none", _ROSTER)
+    assert legacy.kind is HandoffKind.NONE and legacy.malformed is None
 
 
 # --------------------------------------------------------------------------- fences (msg-8179 §B)
@@ -241,7 +368,7 @@ def test_a_backtick_info_string_with_a_backtick_is_not_a_fence() -> None:
 # --------------------------------------------------------------------------- sweep / 1b / 1c
 
 
-def test_head_skip_launches_new_forms_while_off() -> None:
+def test_head_skip_launches_new_forms_while_off(rejecting: None) -> None:
     # LAUNCH is what gets the MALFORMED notice posted (the notice moves the head).
     assert not stage1_skips(DONE)
     assert not stage1_skips(BLOCKED)
@@ -272,6 +399,7 @@ def _gate(body: str, roster: object = _ROSTER, field: str | None = None) -> obje
 
 
 def test_auto_gate_tail_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", False)
     assert _gate(DONE) is AutoGateNoop.QUEUED_BEHIND
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
     assert isinstance(_gate(DONE), Post)
@@ -321,7 +449,7 @@ def test_auto_gate_without_a_roster_still_fires_on_a_legacy_idle_tail(roster: ob
 # --------------------------------------------------------------------------- gateway disposition
 
 
-def test_no_disposition_is_sent_for_a_new_form_while_off() -> None:
+def test_no_disposition_is_sent_for_a_new_form_while_off(rejecting: None) -> None:
     assert body_disposition(DONE, _ROSTER) is None
     assert body_disposition(BLOCKED, _ROSTER) is None
 
@@ -340,7 +468,7 @@ def test_the_disposition_of_an_accepted_form(accepting: None) -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("body", [DONE, BLOCKED, "x\nSTOP: done\nNEXT: Bohr"])
-async def test_conductor_stops_on_a_refused_form_with_a_notice(body: str) -> None:
+async def test_conductor_stops_on_a_refused_form_with_a_notice(rejecting: None, body: str) -> None:
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Bohr", content=body)
     disp = _ScriptedDispatcher(mcp, {})
@@ -476,8 +604,16 @@ def _matrix_bodies() -> list[tuple[str, str]]:
         cells.append((f"stop-done/{name}", f"{lead}STOP: done"))
         cells.append((f"stop-not-done/{name}", f"{lead}STOP: nope"))
         cells.append((f"stop-spaced/{name}", f"{lead}STOP : done"))
+        cells.append((f"stop-done-indented/{name}", f"{lead}    STOP: done"))  # Slice I
         if token is None:
             continue
+        # Slice I (msg-8455 §1): BLOCKED-ON indented, with and without its NEXT indented too.
+        cells.append(
+            (f"blocked-on-indented/{name}", f"x\n    BLOCKED-ON: pr a/b#1\n    NEXT: {token}")
+        )
+        cells.append(
+            (f"blocked-on-indented-above/{name}", f"x\n    BLOCKED-ON: pr a/b#1\nNEXT: {token}")
+        )
         cells.append((f"blocked-on-bad-form/{name}", f"x\nBLOCKED-ON: soon\nNEXT: {token}"))
         cells.append((f"blocked-on-self/{name}", f"x\nBLOCKED-ON: self job-1\nNEXT: {token}"))
         cells.append((f"blocked-on-lowercase/{name}", f"x\nblocked-on: pr a/b#1\nNEXT: {token}"))

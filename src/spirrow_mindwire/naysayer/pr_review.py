@@ -496,6 +496,18 @@ _VERDICT_RE = re.compile(
 #     column-0 APPROVE ban nor the quoted-echo defence introduced above is weakened.
 #   * "You may additionally" — permissive, not mandatory. A blocking objection alone still counts
 #     as a complete review; the affordance exists to remove pressure, not to add a checklist item.
+#
+# ---- Transport-redaction placeholders (T-gate-input-entropy-redaction-mangles-identifiers) ----
+#
+# Something on the Lexora/gateway path (not mindwire — nothing in this repo emits it) rewrites
+# long identifiers into ``[REDACTED:entropy#N]`` before the model sees them; the model then read
+# ``def [REDACTED:entropy#2]():`` as a SyntaxError and blocked a green PR (voxelworld#333). The
+# paragraph below tells the model the placeholder is a transport artefact. It lives in THIS task
+# prompt only — never in the principles SOT / preamble, which is injected verbatim and is a
+# governed artefact (Einstein msg-7135 Obj.1). No verdict-side detection of the placeholder is
+# added (D1/D1' withdrawn, msg-7136): string matching cannot tell a hallucinated objection from a
+# real bug that merely quotes a redacted line. Pinned by
+# test_redaction_placeholder_guidance_is_in_the_task_prompt_not_the_preamble.
 _PR_REVIEW_SYSTEM_PROMPT = (
     """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
@@ -520,6 +532,13 @@ For every objection, quote the specific hunk/line you object to and explain the 
 concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
+
+A placeholder of the form `[REDACTED:...]` in the diff or anywhere else in your \
+input was inserted by the transport path that carried this review to you; it is \
+not part of the pull request's source. Do not raise a correctness or syntax \
+objection on the strength of the placeholder itself (for example, treating \
+`def [REDACTED:...]():` as invalid code). A real defect in the code around a \
+placeholder is still a real defect: object to it as you normally would.
 
 Then, at the very END of your reply and immediately BEFORE the verdict line, \
 emit exactly one machine-readable objection block: the marker below at the \
@@ -1579,6 +1598,51 @@ _MARKER_F_CONDITIONS = "<!-- mindwire:note F-conditions -->"
 _WHERE_SINGLE_LINE_RE = re.compile(r"^(?P<path>[^:\n]+):(?P<line>\d+)$")
 _EMPTY_LINE_RE = re.compile(r"^\s*$")
 
+# v1.1 (T-gate-blocks-on-miscounted-line-numbers, Bohr msg-8349 D-1 → msg-8355 D-1‴,
+# Einstein go after msg-8355). v1 demoted on the shape of the citation alone, and so
+# silenced a CORRECT blocking objection whose coordinate merely slipped onto a blank line
+# (msg-4792, #359: ``tests/test_script_writers_lf.py:108``, the claim held). What separates
+# #79 (false) from #359 (true) is whether the objection's ASSERTION is about the line
+# number, or the line number is only a coordinate. v1.1 adds a fourth conjunct (4‴): the
+# ``evidence`` must itself assert a miscount, in one of two structurally fixed shapes.
+#
+# P-1: "line 287 (not 288)" — and the FIRST number must equal the ``where`` N, so the
+#      objection claims "the right line is N" while N is blank at head: the claim is refuted
+#      on the spot. Every match is scanned (``finditer``), not just the first, so an earlier
+#      unrelated "line 10 (not 11)" cannot hide a later matching one (msg-8354 Obj-3-2).
+#      Whitespace and the colon are accepted in either order (msg-8355 Obj-3-1).
+# P-2: "pointing at (a|an|the) empty/blank line" — the claim is that the reference itself
+#      lands on nothing. No number check, so a plain ``search`` suffices.
+#
+# Deliberately NOT included (msg-8351 / msg-8353): bare "line N", "L123", ":N" (a
+# coordinate restated in prose), "off by N" (a real off-by-one bug report), "line number
+# references" (a parser-domain term), and a bare "blank line" (CRLF / fixture-writer PRs).
+# Adding a conjunct can only shrink the demoted set: v1.1 ⊆ v1 (D-2 monotonicity).
+_MISCOUNT_P1_RE = re.compile(
+    r"\blines?\s*:?\s*(?P<a>\d+)\s*\(\s*not\s+:?\s*\d+\s*\)", re.IGNORECASE
+)
+_MISCOUNT_P2_RE = re.compile(
+    r"\bpoint(?:s|ing)?\s+(?:at|to)\s+(?:(?:a|an|the)\s+)?(?:empty|blank)\s+lines?\b",
+    re.IGNORECASE,
+)
+
+
+def _miscount_assertion(evidence: str, line_no: int) -> str | None:
+    """Return the fragment of ``evidence`` that asserts a miscount at ``line_no``, else None.
+
+    (4‴) of the v1.1 demotion predicate (msg-8355 D-1‴). P-1 first: the first ``finditer``
+    match whose ``a`` equals ``line_no`` is returned. Failing that, P-2's matched substring.
+    The fragment is what the C-DEMOTED note quotes (D-4), so a human can check on the spot
+    that the objection really was about the line number.
+    """
+    for m in _MISCOUNT_P1_RE.finditer(evidence):
+        if int(m.group("a")) == line_no:
+            return m.group(0)
+    m2 = _MISCOUNT_P2_RE.search(evidence)
+    if m2 is not None:
+        return m2.group(0)
+    return None
+
 
 def _parse_single_line_where(where: str) -> tuple[str, int] | None:
     """Return ``(path, line)`` iff ``where`` is exactly ``path:N`` for a positive integer N.
@@ -1634,7 +1698,8 @@ async def verify_citations(
     head_sha: str,
 ) -> tuple[ObjectionReport, tuple[Objection, ...]]:
     """Read the head tree for each single-line ``path:N`` citation; demote blocking→advisory
-    iff line N is blank.
+    iff line N is blank AND the evidence asserts a miscount at N (v1.1 (4‴), see
+    :func:`_miscount_assertion`).
 
     Returns ``(report', demoted)`` where ``report'`` carries the same objections in the same
     order, with any that met the v1 demotion predicate replaced by their ``blocks=False``
@@ -1679,6 +1744,13 @@ async def verify_citations(
             new_objs.append(o)
             continue
         path, line_no = parsed
+        if _miscount_assertion(o.evidence, line_no) is None:
+            # v1.1 (4‴): the evidence does not assert a miscount, so the line number is a
+            # coordinate, not the claim — a blank line there says nothing about whether the
+            # objection holds (msg-4792 / msg-4178). Keep blocking. Checked BEFORE the read:
+            # it is pure, and it spares the API call in the common coordinate-only case.
+            new_objs.append(o)
+            continue
         cache_key = (path, head_sha)
         if cache_key not in cache:
             # Fail-loud: any non-404 HTTP error propagates and the whole review fails
@@ -1857,9 +1929,22 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"at head `{head_short}`.** {len(demoted)} blocking objection"
             f"{'s' if len(demoted) != 1 else ''} demoted to advisory because the cited "
             f"line(s) — {wheres} — are composed entirely of whitespace in the reviewed "
-            f"tree. The objection text is preserved in the advisory bucket below; "
-            f"only its blocking classification was withdrawn."
+            f"tree and each objection's own evidence asserts a miscount there. The "
+            f"objection text is preserved in the advisory bucket below; only its "
+            f"blocking classification was withdrawn."
         )
+        # v1.1 D-4 (msg-8349 / msg-8355): quote the evidence fragment that satisfied (4‴),
+        # so a human can confirm on the spot that the claim really was about the line
+        # number. Recomputed from the preserved original objection with the same pure
+        # function the demotion used, so the quote cannot disagree with the decision.
+        for o in demoted:
+            parsed_where = _parse_single_line_where(o.where)
+            fragment = _miscount_assertion(o.evidence, parsed_where[1]) if parsed_where else None
+            if fragment is not None:
+                # \s* in the patterns can span a newline; collapse whitespace so the
+                # quote stays inside this one blockquote list item.
+                fragment = " ".join(fragment.split())
+                lines.append(f"> - `{o.where}` — miscount asserted: “{fragment}”")
         if decision.gate_verdict_overridden:
             lines.append(
                 "> Because every blocking objection was demoted and the model wrote "
@@ -2058,8 +2143,118 @@ class DiffView:
 
 
 # The previous critique is context for the scoped round, and only that; a long one is cut rather
-# than allowed to crowd out the diff under review.
+# than allowed to crowd out the diff under review. The cap bounds the WHOLE assembled
+# ``<previous-review>`` body (verdict record + objections block + prose, after defanging); see
+# :func:`_render_prior_review` for how the budget is split.
 _MAX_PRIOR_REVIEW_CHARS = 20_000
+
+# ---- Defanging the injected previous review (#115 required item, msg-1978 §5 (ii) / msg-7223) ----
+#
+# The previous review is the gate's OWN earlier output, so it carries exactly the strings the
+# output parsers key on: a column-zero verdict line, the objections sentinel, and the verdict
+# footer. Placed verbatim in the prompt they are a copy source: a model that "summarises its
+# previous review" can echo one onto column 0 of the NEW critique. The injection side removes the
+# copy source. It cannot stop the model from retyping a verdict line on its own (the system
+# prompt asks for one); that residue belongs to the output side (D-1: two-plus column-zero
+# verdict lines fail closed, :func:`_scan_verdict_lines`). Four layers, stacked on purpose
+# (T-naysayer-ledger-visibility msg-8391 Obj-1):
+#
+# 1. the footer is stripped (:func:`_body_without_footer`) and the previous verdict is rewritten
+#    by the driver as :data:`_PRIOR_VERDICT_RECORD`, which carries no ``VERDICT:`` token;
+# 2. every ``VERDICT:`` (any case, any position) becomes ``PAST-VERDICT:``;
+# 3. the objections sentinel becomes the plain label :data:`_PRIOR_OBJECTIONS_LABEL` (the JSON
+#    payload stays: the previous objections are the point of showing the review at all);
+# 4. every line gets :data:`_PRIOR_LINE_PREFIX`, so nothing that slipped past 2/3 sits on column 0.
+_PRIOR_VERDICT_RECORD = "Previous verdict (driver record): {event} at {sha}"
+_PRIOR_OBJECTIONS_LABEL = "[previous objections]"
+_PRIOR_LINE_PREFIX = "| "
+_PRIOR_VERDICT_TOKEN_RE = re.compile(r"verdict:", re.IGNORECASE)
+_PRIOR_PROSE_TRUNCATED = "[previous critique prose truncated: {shown} of {total} chars shown]"
+_PRIOR_OBJECTIONS_OMITTED = (
+    "[previous objections omitted: the block ({chars} chars) does not fit the "
+    "previous-review budget, and a cut JSON block would misstate it]"
+)
+_FENCE_CLOSE_RE = re.compile(r"\s*```[^\n]*")
+
+
+def _defang_prior(text: str) -> str:
+    """Apply layers 2-4 of the defang above to one part of the previous review."""
+    text = _PRIOR_VERDICT_TOKEN_RE.sub("PAST-VERDICT:", text)
+    text = text.replace(_OBJECTIONS_SENTINEL, _PRIOR_OBJECTIONS_LABEL)
+    return "\n".join(_PRIOR_LINE_PREFIX + line for line in text.split("\n"))
+
+
+def _split_objections_block(body: str) -> tuple[str, str]:
+    """Return ``(block, prose)``: the column-zero objections block, and the body without it.
+
+    The block runs from the sentinel to the end of the JSON array, plus the closing fence when the
+    array was fenced. A body whose block cannot be located (not exactly one column-zero sentinel,
+    no decodable array) returns ``("", body)``: the sentinel then stays in the prose, where
+    :func:`_defang_prior` still neutralises it. Nothing is guessed; the only cost is that the
+    objections are budgeted as prose.
+    """
+    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(body))
+    if len(matches) != 1:
+        return "", body
+    start, rest = matches[0].start(), body[matches[0].end() :]
+    offset = len(rest) - len(rest.lstrip())
+    fenced = rest.startswith("```", offset)
+    if fenced:
+        newline = rest.find("\n", offset)
+        if newline < 0:
+            return "", body
+        offset = newline + 1
+        offset += len(rest[offset:]) - len(rest[offset:].lstrip())
+    if not rest.startswith("[", offset) or _nesting_exceeds(rest[offset:]):
+        return "", body
+    try:
+        _value, end = json.JSONDecoder().raw_decode(rest, offset)
+    except ValueError:
+        return "", body
+    if fenced and (close := _FENCE_CLOSE_RE.match(rest, end)) is not None:
+        end = close.end()
+    stop = matches[0].end() + end
+    prose = (body[:start].rstrip() + "\n\n" + body[stop:].lstrip()).strip()
+    return body[start:stop], prose
+
+
+def _render_prior_review(prior_review: str, prev_sha: str) -> str:
+    """Assemble the ``<previous-review>`` body: (i) verdict record, (ii) objections, (iii) prose.
+
+    Budget (msg-8391 Obj-2): (i) and (ii) are never cut; (iii) gets what is left of
+    :data:`_MAX_PRIOR_REVIEW_CHARS`, kept from the start, and a cut is labelled; when what is left
+    cannot hold even the label, the prose is left out. When (i) and (ii) alone do not fit, the
+    block is left out and named as omitted, and no prose is shown: a JSON block cut part-way
+    would be a false whole. Lengths are counted after defanging, so the cap bounds what the model
+    actually reads. An empty ``prior_review`` renders as ``""``, exactly as
+    before this change.
+    """
+    if not prior_review:
+        return ""
+    footer = parse_verdict_footer(prior_review)
+    event = footer[1].value if footer is not None else "unrecorded"
+    record = _defang_prior(_PRIOR_VERDICT_RECORD.format(event=event, sha=prev_sha[:12]))
+    block, prose = _split_objections_block(_body_without_footer(prior_review))
+    block = _defang_prior(block) if block else ""
+    budget = _MAX_PRIOR_REVIEW_CHARS - len(record) - 2  # the blank line after the record
+    if block:
+        if len(block) > budget:
+            omitted = _defang_prior(_PRIOR_OBJECTIONS_OMITTED.format(chars=len(block)))
+            return f"{record}\n\n{omitted}"
+        budget -= len(block) + 2
+    prose = _defang_prior(prose)
+    if len(prose) > budget:
+        total = len(prose)
+        reserve = len(_defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=total, total=total)))
+        if budget < reserve + 1:
+            # No room left even for the label: the prose is dropped whole rather than labelled
+            # past the cap (PR #538 gate round 1). (i) and (ii) are still shown in full.
+            prose = ""
+        else:
+            shown = budget - reserve - 1
+            label = _defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=shown, total=total))
+            prose = f"{prose[:shown]}\n{label}"
+    return "\n\n".join(part for part in (record, block, prose) if part)
 
 
 @dataclass(frozen=True)
@@ -2079,7 +2274,7 @@ class PrRoundContext:
     def render(self) -> str:
         if self.scope != "delta":
             return ""
-        prior = self.prior_review[:_MAX_PRIOR_REVIEW_CHARS]
+        prior = _render_prior_review(self.prior_review, self.prev_sha)
         return (
             f"REVIEW ROUND: {self.round_number} / SCOPE: the delta below, from your previous "
             f"review at {self.prev_sha[:12]}, plus the existing parts it affects. The whole-PR "

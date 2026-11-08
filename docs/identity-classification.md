@@ -238,8 +238,9 @@ on the head a CI-pending hold named, so the gate is re-fired once. The body rest
 and nothing else, so no role spoke it: `kind = machine`, `legitimate = ∅`, and no
 `independence_class` in the yaml (registration derives it from kind). It is a separate author from
 `pr-gate-relay` for the same reason `conductor-relay` is: the gate-records readers narrow to
-`pr-gate-relay`, and a 1b post must never be read as a gate record. 1b's `NEXT: none` is a handoff
-token, not a `chatroom_close_thread` status change, so this identity needs no closeable role
+`pr-gate-relay`, and a 1b post must never be read as a gate record. 1b's `STOP: done` (its `NEXT: none` before
+`T-done-disposition-auto-close` boundary 3) is a terminal form of the conductor protocol, not a
+`chatroom_close_thread` status change, so this identity needs no closeable role
 (msg-5906; R10 pins that the module never calls the close API).
 
 ## Names written outside this repo

@@ -226,7 +226,13 @@ async def test_n2_body_without_a_target_gets_the_field_copied(body: str, field: 
     (post,) = mcp.posts
     content = str(post["content"])
     assert parse_stop_marker(content) is None
-    assert content.rstrip("\n").splitlines()[-1] == f"NEXT: {field}"
+    # Boundary 3 (T-done-disposition-auto-close msg-8328 §2 3-B): a field ``none`` is copied as the
+    # terminal ``STOP: done`` with no NEXT line; a field ``human`` stays ``NEXT: human``.
+    expected = "STOP: done" if field == "none" else f"NEXT: {field}"
+    assert content.rstrip("\n").splitlines()[-1] == expected
+    if field == "none":
+        assert "\nNEXT:" not in content
+        assert resolve_handoff(content, {}).kind is HandoffKind.NONE
     assert _decide(content) is Decision.SKIP
     assert outcome.last_msg_id == mcp._messages[-1]["msg_id"]
 

@@ -392,19 +392,22 @@ _STOP_BLOCKED_ON_RE = re.compile(
 #     BLOCKED-ON: <arm> <ref>           <- directly above the final NEXT
 #     NEXT: <wake>                         (the wake is the participant who acts once <arm> holds)
 #
-# Boundary 2 ships the READING side only, switched off. ``ACCEPT_NEW_FORMS`` is a module constant,
-# not a per-process config value, on purpose: the sweep (head_skip), the conductor, the gateway,
-# the park-wake tick and 1b/1c each read a head in their own process, and the design's condition
-# for turning the forms on is that every one of those readers accepts them in the SAME deploy
-# (msg-8175 §4). A config key could be true in one process and false in another; a constant
-# changes in exactly one reviewed commit (boundary 3), which is also where the relays start
-# writing ``STOP: done``.
+# Boundary 2 shipped the READING side switched off; boundary 3 (Bohr msg-8328 §2 3-A) turned it on
+# here, in the same commit in which the relays start writing ``STOP: done`` and the protocol prompt
+# starts teaching the forms. ``ACCEPT_NEW_FORMS`` is a module constant, not a per-process config
+# value, on purpose: the sweep (head_skip), the conductor, the gateway, the park-wake tick and
+# 1b/1c each read a head in their own process, and the design's condition for turning the forms on
+# is that every one of those readers accepts them in the SAME deploy (msg-8175 §4). A config key
+# could be true in one process and false in another; a constant changes in exactly one reviewed
+# commit, and rolling it back is reverting that commit.
 #
-# While it is ``False`` a well-formed new form is MALFORMED (``NEW_FORM_NOT_ACCEPTED``): the
-# conductor stops with a notice that ends ``NEXT: human``, so nothing settles silently and no
-# naysayer is force-summoned for it (msg-8171 B-1 — the path a bare ``STOP: done`` takes on the
-# pre-change main). ``NEXT: none`` keeps its meaning either way; its retirement is boundary 5.
-ACCEPT_NEW_FORMS: bool = False
+# With it ``False`` a well-formed new form is MALFORMED (``NEW_FORM_NOT_ACCEPTED``): the conductor
+# stops with a notice that ends ``NEXT: human``, so nothing settles silently and no naysayer is
+# force-summoned for it (msg-8171 B-1). The tests keep pinning that OFF column through the explicit
+# ``accept_new_forms`` argument. ``NEXT: none`` (with or without the legacy ``STOP:`` line above
+# it) is still accepted and keeps its meaning; it becomes MALFORMED only at boundary 5
+# (``none_malformed_after``).
+ACCEPT_NEW_FORMS: bool = True
 
 BLOCKED_ON_KEYWORD = "BLOCKED-ON"
 STOP_DONE = "done"
@@ -428,6 +431,16 @@ _BLOCKED_ON_FORM_RE = re.compile(
 
 # A line indented four or more columns is an indented code block, not a control line. Applied to
 # the two new forms only: the ``NEXT:`` line grammar above (and its corpus) is unchanged.
+#
+# Slice I (T-done-disposition-auto-close, Bohr msg-8455 §1 I-2): "not a control line" is not the
+# same as "ignored" at the two positions a terminal form can occupy. ``NEXT:`` tolerates
+# indentation and the terminal forms do not, so an indented terminal form there used to be read
+# as if it were absent: ``    STOP: done`` as the final line fell to ABSENT with no notice, and an
+# indented ``BLOCKED-ON:`` above the final ``NEXT:`` let that ``NEXT:`` route at once, silently
+# dropping the wait. At those two positions an indented line that would be a well-formed terminal
+# form once its indentation is removed is refused (``INDENTED_TERMINAL_FORM``). It is never
+# accepted after removing the indentation: the author has to write it again. Elsewhere in the body
+# an indented form is still an example, and fences are unchanged.
 _INDENTED_CODE_RE = re.compile(r"\A(?: {4}|\t| {0,3}\t)")
 _HTML_COMMENT_LINE_RE = re.compile(r"\A\s*<!--.*-->\s*\Z")
 
@@ -512,6 +525,11 @@ class MalformedHandoff(StrEnum):
     # The structured ``next_participant`` field contradicts the terminal form (msg-8175 §2): a
     # field on a ``STOP: done`` head, or a field naming someone other than the ``BLOCKED-ON`` wake.
     FIELD_CONFLICT = "field_conflict"
+    # At a control-line position (the final control line, or directly above the final ``NEXT:``)
+    # an indented line that is a well-formed ``STOP: done`` / ``BLOCKED-ON: <arm> <ref>`` once its
+    # indentation is removed (Slice I, msg-8455 §1 I-2). Indented code is not a control line, so
+    # without this the form was read as absent: a wait was dropped and its wake routed at once.
+    INDENTED_TERMINAL_FORM = "indented_terminal_form"
 
 
 class StopStatus(StrEnum):
@@ -762,6 +780,40 @@ def _is_control_candidate(text: str) -> bool:
     return _INDENTED_CODE_RE.match(text) is None
 
 
+def _is_stop_done(stop: re.Match[str]) -> bool:
+    """Is a :data:`_STOP_KEYWORD_RE` match exactly ``STOP: done``?"""
+    return (
+        stop.group("keyword") == "STOP"
+        and not stop.group("gap")
+        and stop.group("rest") == STOP_DONE
+    )
+
+
+def _dedented(text: str) -> str:
+    return text.lstrip(" \t")
+
+
+def _is_indented_stop_done(text: str) -> bool:
+    """Indented code that is a well-formed ``STOP: done`` once its indentation is removed."""
+    if _is_control_candidate(text):
+        return False
+    stop = _STOP_KEYWORD_RE.match(_dedented(text))
+    return stop is not None and _is_stop_done(stop)
+
+
+def _is_indented_blocked_on(text: str) -> bool:
+    """Indented code that is a well-formed ``BLOCKED-ON: <arm> <ref>`` once dedented."""
+    if _is_control_candidate(text):
+        return False
+    blocked = _BLOCKED_ON_KEYWORD_RE.match(_dedented(text))
+    return (
+        blocked is not None
+        and blocked.group("keyword") == BLOCKED_ON_KEYWORD
+        and not blocked.group("gap")
+        and _BLOCKED_ON_FORM_RE.match(blocked.group("rest")) is not None
+    )
+
+
 def _terminal_form(
     body: str, roster: Mapping[str, Role], *, check_roster: bool
 ) -> StopLine | MalformedHandoff | None:
@@ -770,6 +822,8 @@ def _terminal_form(
     - The final control line is a ``STOP:`` line → ``STOP: done`` is DONE, anything else is
       :attr:`MalformedHandoff.STOP_NOT_DONE`. The line must be the last meaningful line
       (:func:`_last_meaningful_line`), outside any fence and not indented code.
+    - At either position, an indented line that is a well-formed form once dedented is
+      :attr:`MalformedHandoff.INDENTED_TERMINAL_FORM` (Slice I) — never accepted, never ignored.
     - Otherwise the line directly above the final ``NEXT:`` is looked at (the same n-1 rule as
       ``TIER-C:`` / legacy ``STOP:``): a ``BLOCKED-ON:`` line makes the ``NEXT:`` its wake; a
       ``STOP:`` line above a ``NEXT:`` naming a participant is a contradiction. A ``STOP:`` line
@@ -784,23 +838,24 @@ def _terminal_form(
     if last is not None:
         start, text = last
         stop = _STOP_KEYWORD_RE.match(text) if _is_control_candidate(text) else None
-        if stop is not None and not (
+        indented = stop is None and _is_indented_stop_done(text)
+        if (stop is not None or indented) and not (
             ("```" in body or "~~~" in body) and start in _fenced_line_starts(body)
         ):
-            raw = text.strip()
-            if (
-                stop.group("keyword") == "STOP"
-                and not stop.group("gap")
-                and stop.group("rest") == STOP_DONE
-            ):
-                return StopLine(StopStatus.DONE, raw=raw, terminal=True)
+            if stop is None:
+                return MalformedHandoff.INDENTED_TERMINAL_FORM
+            if _is_stop_done(stop):
+                return StopLine(StopStatus.DONE, raw=text.strip(), terminal=True)
             return MalformedHandoff.STOP_NOT_DONE
     raw_next = _last_next_raw(body)
     if raw_next is None:
         return None
     above = _line_above_last_next(body)
-    if above is None or not _is_control_candidate(above):
+    if above is None:
         return None
+    if not _is_control_candidate(above):
+        # Whether or not the ``NEXT:`` below it is indented too (msg-8455 §1, both cells).
+        return MalformedHandoff.INDENTED_TERMINAL_FORM if _is_indented_blocked_on(above) else None
     name = _name_from_raw(raw_next)
     blocked = _BLOCKED_ON_KEYWORD_RE.match(above)
     if blocked is None:
@@ -934,6 +989,10 @@ _MALFORMED_CAUSES: dict[MalformedHandoff, str] = {
     MalformedHandoff.FIELD_CONFLICT: (
         "構造化フィールド `next_participant` が本文の決着・待ちの形と食い違っています。"
     ),
+    MalformedHandoff.INDENTED_TERMINAL_FORM: (
+        "`STOP: done` / `BLOCKED-ON:` 行が字下げされています。字下げした行はコードとして読まれ、"
+        "制御行になりません。字下げせず、行頭から書いて投稿し直してください。"
+    ),
 }
 
 
@@ -952,7 +1011,9 @@ def malformed_notice(reason: MalformedHandoff) -> str:
         f"Conductor stand-down — 決着・待ちの書き方を受け付けませんでした\n\n"
         f"理由 (`{reason.value}`): {_MALFORMED_CAUSES[reason]}\n\n"
         f"∴ 誰も spawn せず停止しました。次にやること: 次に動く人がいるなら `NEXT: <persona>`、"
-        f"決着・待ちなら現行の `STOP:` 行 + `NEXT: {NONE_TOKEN}` の形で投稿し直してください。\n\n"
+        f"決着なら最後の制御行を `STOP: {STOP_DONE}` にして (その後に `NEXT:` 行を書かない)、"
+        f"待ちなら `{BLOCKED_ON_KEYWORD}: <arm> <ref>` の直下に `NEXT: <wake>` を置き、"
+        f"人の判断が要るなら `NEXT: {HUMAN_TOKEN}` で投稿し直してください。\n\n"
         f"head が動くまでループは再開しません。\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
@@ -1464,26 +1525,33 @@ OPERATOR_FORM_EXAMPLE = (
 )
 _OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
 
-# Slice 3 (T-next-line-carries-who-not-why, Bohr msg-5175 §3 / msg-4716 §2): the two STOP forms
-# the protocol teaches. Like OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each
-# through the parser and requires an accepted status, so the prompt cannot teach a form the
-# parser reads as MALFORMED.
-STOP_FORM_EXAMPLES: tuple[str, ...] = (
-    "STOP: done",
-    "STOP: blocked-on <trigger> wake:<persona>",
-)
-_STOP_FORMS_INDENTED = "\n".join(f"    {line}" for line in STOP_FORM_EXAMPLES)
+# T-done-disposition-auto-close boundary 3 (Bohr msg-8328 §2 3-D): the two terminal forms the
+# protocol teaches, replacing Slice 3's ``STOP:`` line above ``NEXT: none``. Like
+# OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each through the parser and requires
+# DONE / BLOCKED_ON, so the prompt cannot teach a form the parser reads as MALFORMED. Built from the
+# keyword constants the parser reads. ``BLOCKED-ON: self`` is deliberately not taught: it is
+# refused (``blocked_on_self_unsupported``) until something observes the implementer's own job.
+# The prompt embeds them NOT indented (Slice I, msg-8455 §1 I-1): an indented terminal form is
+# refused as ``indented_terminal_form``, and an example that looks indented invites a reply that
+# copies the indentation (PR-gate advisory msg-8443). ``OPERATOR_FORM_EXAMPLE`` stays indented:
+# the ``NEXT:`` grammar tolerates indentation, so copying it there is harmless. Because an example
+# at column 0 closes any Markdown list around it, the two forms are flat paragraphs, not list
+# items, and the prose after each example is not indented either: otherwise it would render as a
+# root-level indented code block (PR-gate msg-8461).
+STOP_DONE_EXAMPLE = f"STOP: {STOP_DONE}"
+BLOCKED_ON_EXAMPLE = f"{BLOCKED_ON_KEYWORD}: <arm> <ref>\nNEXT: <wake>"
+STOP_FORM_EXAMPLES: tuple[str, ...] = (STOP_DONE_EXAMPLE, BLOCKED_ON_EXAMPLE)
 #: What each trigger arm waits for, in the words the prompt uses. Keyed in
 #: :data:`STOP_TRIGGER_ARMS` order and checked against it at import, so an arm added to the parser
 #: without a sentence here fails the import instead of being accepted but never taught.
 _STOP_TRIGGER_MEANINGS: dict[str, str] = {
-    "thread": "`thread:<thread-id>` or `thread:<project>/<thread-id>` (that thread is resolved)",
-    "pr": "`pr:<owner/repo#n>` (that pull request is merged or closed)",
+    "thread": "`thread <thread-id>` or `thread <project>/<thread-id>` (that thread is resolved)",
+    "pr": "`pr <owner/repo#n>` (that pull request is merged or closed)",
     "deploy": (
-        "`deploy:<request_id>` (that deploy request has succeeded, failed or been interrupted)"
+        "`deploy <request_id>` (that deploy request has succeeded, failed or been interrupted)"
     ),
     "queue-empty": (
-        "`queue-empty:<project>` or `queue-empty:<project>:<role>` (no open thread of that "
+        "`queue-empty <project>` or `queue-empty <project>:<role>` (no open thread of that "
         "project hands to a participant, or to one holding that role)"
     ),
 }
@@ -1501,9 +1569,13 @@ Conductor handoff protocol (REQUIRED)
 
 A conductor drives this thread one turn at a time: after your reply is posted it \
 reads the LAST line of your message to decide who acts next. So end EVERY reply \
-with exactly one handoff line, and make it the FINAL line of your reply:
+with exactly one control line, and make it the FINAL line of your reply: either a \
+handoff line
 
     NEXT: <name>
+
+or, when the work this thread exists for is finished, the settle line `STOP: {STOP_DONE}` \
+(see below).
 
 `<name>` is either another participant's persona name (spelled exactly as it \
 appears as a message author in this thread — the persona name, not a role name: \
@@ -1518,24 +1590,9 @@ refactor extent, work order, splitting PRs or threads, approving an internal \
 mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
-  - `NEXT: {NONE_TOKEN}` — nobody acts next on this thread. Say why on the line directly \
-above it, in exactly one of these two forms:
-
-{_STOP_FORMS_INDENTED}
-
-    `STOP: done` means the work this thread exists for is finished. It is recorded as done \
-and waits for its owner to close it.
-    `STOP: blocked-on <trigger> wake:<persona>` means work remains, but it can start only \
-once something happens that the sweep can see. When `<trigger>` holds, the sweep posts a \
-wake message into this thread ending in `NEXT: <persona>`, and the conductor routes it \
-exactly as it would route that handoff written now (the same gates apply). `<persona>` is \
-a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never the \
-implementer: to resume implementation, wake the proposer, who checks the scope and hands \
-it on. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
-`{HUMAN_TOKEN}` trigger or wake: a stop that needs a person is `NEXT: {HUMAN_TOKEN}`.
-    Write the line exactly so: `STOP` in capitals, single spaces, nothing else on the \
-line. A `NEXT: {NONE_TOKEN}` without a valid `STOP:` line directly above it is recorded \
-as unclassified — a stop nobody explained.
+  - `NEXT: {NONE_TOKEN}` — still accepted, but do NOT write it any more (with or without a \
+`STOP:` line above it). It will be refused as malformed once the legacy forms are retired. \
+Write one of the two forms below instead.
   - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
 of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
 comes first: if the work is, or could be, any of those types, hand it to \
@@ -1548,8 +1605,36 @@ A `NEXT: {OPERATOR_TOKEN}` without the `{OPERATOR_TASK_KEYWORD}:` line, without 
 `{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` directly above it, or in a reply that \
 also declares a Tier-C type, is refused and the conductor stops.
 
-The handoff line is part of your verbatim reply, not meta-commentary: write it \
-out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
+When nobody acts next on this thread, say why with one of these two forms:
+
+Finished — the work this thread exists for is done. Make this the final control line \
+of your reply and write NO `NEXT:` line after it:
+
+{STOP_DONE_EXAMPLE}
+
+It is recorded as done and waits for its owner to close it.
+Waiting — work remains, but it can start only once something happens that the sweep \
+can see. Put the `{BLOCKED_ON_KEYWORD}:` line directly above the final `NEXT:` line:
+
+{BLOCKED_ON_EXAMPLE}
+
+`<arm> <ref>` is one of: {_STOP_TRIGGER_PROSE}. Nobody is started now. When it holds, \
+the sweep posts a wake message into this thread ending in `NEXT: <wake>`, and the conductor \
+routes it exactly as it would route that handoff written now (the same gates apply). \
+`<wake>` is a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never \
+the implementer: to resume implementation, wake the proposer, who checks the scope and hands \
+it on. There is no `{HUMAN_TOKEN}` arm or wake, and no `self` arm: a stop that needs a person \
+is `NEXT: {HUMAN_TOKEN}`.
+
+Write both forms exactly so: the keyword in capitals, single spaces, nothing else on the \
+line, not indented and not inside a code block. A misspelled `STOP:` or \
+`{BLOCKED_ON_KEYWORD}:` line is refused and the conductor stops with a notice, and so is \
+`STOP: {STOP_DONE}` directly above a `NEXT:` that names a participant (finished and "this \
+person acts next" contradict each other).
+
+The control line is part of your verbatim reply, not meta-commentary: write it \
+out literally (for example `NEXT: {HUMAN_TOKEN}` or `STOP: {STOP_DONE}`) and put \
+nothing after it."""
 
 # U2 (T-tier-c-admission-gate msg-4768): the label list taught to proposer and implementer is the
 # admission gate's closed set, rendered from :data:`TIER_C_LABELS` (itself derived from
@@ -1849,6 +1934,7 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 __all__ = [
     "ACCEPT_NEW_FORMS",
+    "BLOCKED_ON_EXAMPLE",
     "BLOCKED_ON_KEYWORD",
     "HUMAN_TOKEN",
     "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
@@ -1857,6 +1943,9 @@ __all__ = [
     "OPERATOR_TASK_KEYWORD",
     "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
+    "STOP_DONE",
+    "STOP_DONE_EXAMPLE",
+    "STOP_FORM_EXAMPLES",
     "STOP_TRIGGER_ARMS",
     "STOP_WAKE_ROLES",
     "TIER_C_CHECK_KEYWORD",

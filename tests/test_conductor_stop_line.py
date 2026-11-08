@@ -9,9 +9,10 @@ What this file pins, item by item:
    ``STOP``-less ``NEXT: none`` shows up as ``stop_line=absent`` — and routes identically;
 3. the Decider is not affected: whether a ``STOP:`` line exists does not change whether the
    author's ``NEXT: human`` enters the tierc hook;
-4. the emission prompt (``_HANDOFF_PROTOCOL_CORE``) teaches ``STOP:`` only from Slice 3 on, and
-   only in forms the parser accepts (item 4 below; Slice 3's own pins are in
-   ``tests/test_stop_disposition_slice3.py``).
+4. the emission prompt (``_HANDOFF_PROTOCOL_CORE``) teaches only forms the parser accepts: Slice
+   3's ``STOP:`` line until boundary 3 of T-done-disposition-auto-close, the terminal forms
+   (``STOP: done`` / ``BLOCKED-ON:`` + ``NEXT: <wake>``) from then on (item 4 below; Slice 3's
+   own pins are in ``tests/test_stop_disposition_slice3.py``).
 """
 
 from __future__ import annotations
@@ -173,13 +174,21 @@ def test_only_the_line_above_the_last_next_counts() -> None:
         "STOP: done\nNEXT: human",
         "STOP: done\nNEXT: pr-review acme/widgets#7",
         "STOP: done\nNEXT: Schrodinger",
-        "STOP: done",
     ],
 )
 def test_stop_line_is_measured_only_on_none(body: str) -> None:
     h = resolve_handoff(body, _ROSTER)
     assert h.kind is not HandoffKind.NONE
     assert h.stop_line is None
+
+
+def test_a_bare_stop_done_is_a_terminal_settle() -> None:
+    """Boundary 3 (msg-8328 §2 3-A): ``STOP: done`` as the final control line, with no ``NEXT:``
+    line, settles on the shipped default and carries the terminal DONE disposition. With the
+    forms off it is MALFORMED (``new_form_not_accepted``), pinned in test_terminal_forms.py."""
+    h = resolve_handoff("STOP: done", _ROSTER)
+    assert h.kind is HandoffKind.NONE
+    assert h.stop_line == StopLine(StopStatus.DONE, raw="STOP: done", terminal=True)
 
 
 def test_stop_line_does_not_change_the_rest_of_the_handoff() -> None:
@@ -325,27 +334,70 @@ def test_decider_files_do_not_read_the_stop_line() -> None:
 
 @pytest.mark.parametrize("role", list(Role))
 def test_protocol_block_teaches_only_forms_the_parser_accepts(role: Role) -> None:
-    """Slice 3 (msg-5175 §3) ships the prompt with the mechanism, so the block now teaches the two
-    forms — and every concrete instance of what it teaches must parse as accepted, never as
-    MALFORMED (the Slice 1 pin that the prompt is silent is retired with this)."""
+    """Boundary 3 (T-done-disposition-auto-close msg-8328 §2 3-D) replaces Slice 3's ``STOP:``
+    line above ``NEXT: none`` with the two terminal forms. Every concrete instance of what the
+    block teaches must resolve, on the shipped default of ``ACCEPT_NEW_FORMS``, to the settle it
+    names (DONE / BLOCKED_ON) and never to MALFORMED."""
     block = build_handoff_protocol_block(role)
     for form in handoff_mod.STOP_FORM_EXAMPLES:
-        assert form in block
+        # Slice I (msg-8455 §1 I-1): the examples are embedded NOT indented, because an indented
+        # terminal form is refused (``indented_terminal_form``). The whole example starts a line
+        # of the block, and no indented copy of it is taught anywhere.
+        assert f"\n{form}\n" in block, form
+        for line in form.splitlines():
+            assert f"    {line}" not in block, line
     for arm in STOP_TRIGGER_ARMS:
-        assert f"`{arm}:" in block
+        assert f"`{arm} <" in block
+    # The legacy line is no longer taught, and neither is the refused ``self`` arm.
+    assert "STOP: blocked-on" not in block
+    assert "BLOCKED-ON: self" not in block
+    assert _settle_status("x\n\nSTOP: done") is StopStatus.DONE
+    assert _settle_status("x\n\nSTOP: done\n<!-- source: tools=3 -->\n") is StopStatus.DONE
     concrete = [
-        "STOP: done",
-        "STOP: blocked-on thread:T-foo wake:Einstein",
-        "STOP: blocked-on thread:spirrow-magickit/T-foo wake:Einstein",
-        "STOP: blocked-on pr:acme/widgets#7 wake:Einstein",
-        "STOP: blocked-on deploy:req-123 wake:Bohr",
-        "STOP: blocked-on queue-empty:spirrow-mindwire wake:Bohr",
-        "STOP: blocked-on queue-empty:spirrow-mindwire:implementer wake:Bohr",
+        "BLOCKED-ON: thread T-foo\nNEXT: Einstein",
+        "BLOCKED-ON: thread spirrow-magickit/T-foo\nNEXT: Einstein",
+        "BLOCKED-ON: pr acme/widgets#7\nNEXT: Bohr",
+        "BLOCKED-ON: deploy req-123\nNEXT: Bohr",
+        "BLOCKED-ON: queue-empty spirrow-mindwire\nNEXT: Bohr",
+        "BLOCKED-ON: queue-empty spirrow-mindwire:implementer\nNEXT: Bohr",
     ]
-    for line in concrete:
-        stop = _stop(f"x\n\n{line}\nNEXT: none")
-        assert stop is not None
-        assert stop.status in (StopStatus.DONE, StopStatus.BLOCKED_ON), line
+    for tail in concrete:
+        assert _settle_status(f"x\n\n{tail}") is StopStatus.BLOCKED_ON, tail
+    stop = _stop("x\n\nBLOCKED-ON: pr acme/widgets#7\nNEXT: Bohr")
+    assert stop is not None
+    assert (stop.trigger_arm, stop.trigger_operand, stop.wake) == ("pr", "acme/widgets#7", "Bohr")
+
+
+def _settle_status(body: str) -> StopStatus | None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None, (body, handoff.malformed)
+    assert handoff.kind is HandoffKind.NONE, body
+    return handoff.stop_line.status if handoff.stop_line is not None else None
+
+
+def test_protocol_block_indents_only_its_code_examples() -> None:
+    """PR-gate msg-8461: an example at column 0 closes the Markdown list around it, so prose that
+    stays indented after it renders as a root-level indented code block. In CommonMark only a line
+    indented four spaces or a tab can open such a block, so every such line of the protocol block
+    must be one of the examples meant to render as code, never prose."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    meant_as_code = {"    NEXT: <name>"} | {
+        f"    {line}" for line in handoff_mod.OPERATOR_FORM_EXAMPLE.splitlines()
+    }
+    indented = [
+        line for line in core.splitlines() if line.startswith(("    ", "\t")) and line.strip()
+    ]
+    assert indented, "the NEXT: example is expected to stay indented"
+    assert set(indented) <= meant_as_code, set(indented) - meant_as_code
+
+
+def test_protocol_block_says_next_none_is_legacy() -> None:
+    """``NEXT: none`` is still accepted until boundary 5, so the block names it, but only to say
+    it is no longer written (msg-8328 §2 3-D). The opening rule names both control lines."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    assert "do NOT write it any more" in core
+    assert "exactly one control line" in core
+    assert "write NO `NEXT:` line after it" in core
 
 
 def test_protocol_block_does_not_promise_a_close_or_a_park() -> None:

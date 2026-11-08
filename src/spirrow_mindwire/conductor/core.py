@@ -174,9 +174,9 @@ from .gate_resume import (
 )
 from .handoff import (
     HUMAN_TOKEN,
-    NONE_TOKEN,
     OPERATOR_FORM_EXAMPLE,
     OPERATOR_TOKEN,
+    STOP_DONE,
     Handoff,
     HandoffKind,
     HumanAsk,
@@ -2520,7 +2520,7 @@ class Conductor:
 
         - Intended reader: the human who owns the target thread (N1: realign the field and the
           body and repost; N2: the decision the field already stated), and head_skip on the next
-          tick, which reads the final ``NEXT:`` and SKIPs.
+          tick, which reads the final control line (``NEXT: human`` / ``STOP: done``) and SKIPs.
         - Fallback when the thread is gone: disposition **(3) fail loudly**. ``_post_as_relay``
           turns a :class:`ThreadResolvedError` into an empty ``msg_id``. N1 then raises
           :class:`StandDownError` (non-zero exit → wrapper quarantine + Discord); N2 logs at ERROR
@@ -2577,13 +2577,20 @@ class Conductor:
             if not posted_id:
                 raise StandDownError(stand_down)
             return posted_id
-        terminal = NONE_TOKEN if stop_reason is StopReason.SETTLED else HUMAN_TOKEN
+        # T-done-disposition-auto-close boundary 3 (Bohr msg-8328 §2 3-B): a settle is copied as
+        # the terminal form ``STOP: done`` (no NEXT line after it), a human stop as
+        # ``NEXT: human``. The notice is posted as conductor-relay, which holds no role, so this
+        # ``STOP: done`` classifies and notifies but never closes the thread (Conclair (e) /
+        # magickit ``role_not_eligible``, msg-8182).
+        terminal = (
+            f"STOP: {STOP_DONE}" if stop_reason is StopReason.SETTLED else f"NEXT: {HUMAN_TOKEN}"
+        )
         notice = (
             "Conductor stop — `next_participant` field の判断を head に書き写します\n\n"
             f"この投稿の field は `{field}` で、本文は {body_label} です。Conductor は field に"
             "従って止まりましたが、sweep は本文だけを読むため、このままでは同じ head を"
             "起動し続けます。field の判断をそのまま最終行に書き写します。\n\n"
-            f"NEXT: {terminal}"
+            f"{terminal}"
         )
         posted = await self._post_as_relay(notice)
         posted_id = _msg_id(posted)

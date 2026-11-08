@@ -5942,7 +5942,8 @@ function Invoke-ParkWakeTick {
 }
 
 # The digest's stop-reason line (T-next-line-carries-who-not-why Slice 3; magickit msg-1015 v11 §1):
-# why each open `NEXT: none` thread stopped, summed over the projects whose park-wake tick ran this
+# why each open settled thread (`STOP: done` / `BLOCKED-ON:` + `NEXT: <wake>`, or the legacy
+# `NEXT: none`) stopped, summed over the projects whose park-wake tick ran this
 # tick, plus the unclassified ones by name — those are the candidates for "nobody nominated anyone"
 # (msg-2014 §1 (4)). A project whose tick failed is named instead of being counted as zero. Returns
 # @() when no project reported, so the digest is unchanged.
@@ -5957,7 +5958,7 @@ function Get-StopClassDigestLines {
         $unclassified += [int]$c.unclassified; $humanClose += [int]$c.human_close
         $names += @($ByProject[$proj].unclassified | ForEach-Object { "$proj/$_" })
     }
-    $line = "停止理由（NEXT: none）: 決着 $done / 着手条件待ち $blocked / 未分類 $unclassified / 人の close $humanClose"
+    $line = "停止理由（決着・待ち）: 決着 $done / 着手条件待ち $blocked / 未分類 $unclassified / 人の close $humanClose"
     if ($Failed.Count -gt 0) { $line += "（取得失敗: $(($Failed | Sort-Object) -join ', ')）" }
     $lines = @($line)
     if ($names.Count -gt 0) {
