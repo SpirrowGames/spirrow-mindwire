@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,8 +40,16 @@ from ...conductor.handoff import parse_next_token
 from ...github.client import GatePr, GatePrListing, OpenPrListingError, PrRef, ReviewInfo
 from ...magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ...repo_projects import INCOMPLETE, PrProject, RepoProjectMap, RepoTarget, repo_key
+from ...value_objects import Role
 from ..decide import PR_EVENT_RELAY_AUTHOR, Post
-from .decide import AutoGateNoop, ThreadLink, already_fired, prefilter, tail_decision
+from .decide import (
+    AutoGateNoop,
+    ThreadLink,
+    already_fired,
+    prefilter,
+    settled_tail_refusal,
+    tail_decision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +232,7 @@ async def _judge(
     pr_project: PrProject,
     known_projects: Collection[str],
     pass_projects: Collection[str],
+    roster: Mapping[str, Role] | None,
 ) -> _Judged:
     own = pr_project.project
     pre = prefilter(pr, config.gate_bases, own)
@@ -275,6 +284,7 @@ async def _judge(
         project=project,
         thread_id=thread_id,
         review_login=review_login,
+        roster=roster,
     )
     if project != own:
         judged.detail = {**(judged.detail or {}), "thread_project": project}
@@ -289,6 +299,7 @@ async def _judge_thread(
     project: str,
     thread_id: str,
     review_login: str,
+    roster: Mapping[str, Role] | None,
 ) -> _Judged:
     """Rows 6-10, read in ``project`` — the design thread's project, not necessarily the PR's.
 
@@ -323,20 +334,29 @@ async def _judge_thread(
         return _Judged(thread_id=thread_id, project=project, skip=f"gh-error: {exc!r}")
     tail = messages[-1]
     tail_body = str(tail.get("content", ""))
-    decision = tail_decision(tail_body, repo=repo_slug, number=pr.ref.number)
+    raw_np = tail.get("next_participant")
+    tail_np = raw_np if isinstance(raw_np, str) and raw_np else None
+    decision = tail_decision(
+        tail_body,
+        repo=repo_slug,
+        number=pr.ref.number,
+        roster=roster,
+        next_participant=tail_np,
+    )
     if isinstance(decision, Post):
         return _Judged(thread_id=thread_id, project=project, post=decision)
-    return _Judged(
-        thread_id=thread_id,
-        project=project,
-        noop=decision,
-        detail={
-            "thread_id": thread_id,
-            "tail_next": parse_next_token(tail_body),
-            "tail_msg_id": tail.get("msg_id"),
-            "waiting_since": _waiting_since(pr, tail.get("timestamp")),
-        },
-    )
+    detail: dict[str, Any] = {
+        "thread_id": thread_id,
+        "tail_next": parse_next_token(tail_body),
+        "tail_msg_id": tail.get("msg_id"),
+        "waiting_since": _waiting_since(pr, tail.get("timestamp")),
+    }
+    # Why a tail the sweep reads as settled was still held (msg-8218 §2b-2): the roster refused
+    # it (the park-wake tick owns its notice), or there was no roster to check it with.
+    refusal = settled_tail_refusal(tail_body, roster=roster, next_participant=tail_np)
+    if refusal is not None:
+        detail["tail_refusal"] = refusal
+    return _Judged(thread_id=thread_id, project=project, noop=decision, detail=detail)
 
 
 async def _post(
@@ -408,12 +428,17 @@ async def run_pass(
     now: datetime,
     known_projects: Collection[str],
     repo_map: RepoProjectMap,
+    roster: Mapping[str, Role] | None,
 ) -> PassReport:
     """One 1c pass. One repo's or one PR's failure is reported and costs only that row.
 
     ``known_projects`` is every project in ``sweep.json``'s ``clones``; ``targets`` are the ones
     the wrapper let through its control HOLD this tick. A ``Thread:`` line naming a project in
     the first but not the second is :attr:`AutoGateNoop.THREAD_PROJECT_HELD` (msg-8022 §2).
+
+    ``roster`` is the conductor's identity-to-role roster. It is read only for a design-thread
+    tail in an accepted terminal form; ``None`` or empty makes 1c hold such a tail rather than
+    fire on it unchecked (:func:`~.decide.settled_tail_refusal`).
 
     ``repo_map`` gives each repo's own project for a bare id. Targets sharing one repo are judged
     once (msg-8032 §4): judging the same PR under two projects would read a bare id twice, as two
@@ -473,6 +498,7 @@ async def run_pass(
                 pr_project=pr_project,
                 known_projects=known_projects,
                 pass_projects=pass_projects,
+                roster=roster,
             )
             if not config.live:
                 report.decisions.append(_decision_row(ref, judged))

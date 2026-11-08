@@ -10,6 +10,8 @@ this boundary, so every well-formed new form must be MALFORMED with a notice, an
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher
 from test_decider_step2 import _conductor_with
@@ -35,7 +37,12 @@ from spirrow_mindwire.conductor.head_skip import (
 )
 from spirrow_mindwire.park_wake.decide import PARK_WAKE_RELAY_AUTHOR
 from spirrow_mindwire.park_wake.runner import run_tick
-from spirrow_mindwire.pr_event_advance.auto_gate.decide import AutoGateNoop, tail_decision
+from spirrow_mindwire.pr_event_advance.auto_gate.decide import (
+    ROSTER_UNAVAILABLE,
+    AutoGateNoop,
+    settled_tail_refusal,
+    tail_decision,
+)
 from spirrow_mindwire.pr_event_advance.decide import Post
 
 F3 = "`" * 3
@@ -179,6 +186,36 @@ def test_a_fenced_next_is_not_the_handoff() -> None:
     assert resolve_handoff(f"x\n{F3}\nNEXT: Bohr\n{F3}\n", _ROSTER).kind is HandoffKind.ABSENT
 
 
+def test_the_next_line_regex_is_anchored_at_line_start() -> None:
+    # msg-8210 advisory / msg-8218 §2b-1. Not what fence exclusion depends on any more (the next
+    # test), but the NEXT grammar itself is line-anchored, and a change to that is a grammar
+    # change that must be made on purpose.
+    regex = handoff_mod._NEXT_LINE_RE
+    assert regex.pattern.startswith("^"), (
+        "_NEXT_LINE_RE must stay anchored at the start of a line: the NEXT grammar is a "
+        "whole-line control line, and the corpus is written against that"
+    )
+    assert regex.flags & re.MULTILINE, "_NEXT_LINE_RE must be MULTILINE so ^ means line start"
+
+
+def test_fence_exclusion_survives_an_unanchored_next_regex(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _fenced_line_starts holds line-start offsets, and _control_next_matches normalises each
+    # match to its line's start before comparing. With an unanchored regex a fenced match starts
+    # mid-line; without the normalisation it would not be found in the set and the fenced
+    # example would become the control line.
+    anchored = handoff_mod._NEXT_LINE_RE
+    unanchored = re.compile(anchored.pattern.removeprefix("^"), anchored.flags)
+    monkeypatch.setattr(handoff_mod, "_NEXT_LINE_RE", unanchored)
+    body = f"x\n{F3}\nsee NEXT: Bohr\n{F3}\n"
+    (match,) = unanchored.finditer(body)
+    line_start = body.rfind("\n", 0, match.start()) + 1
+    assert match.start() != line_start  # the match really is mid-line
+    assert handoff_mod._control_next_matches(body) == []
+    # And a mid-line match outside any fence is kept.
+    outside = f"x\n{F3}\ncode\n{F3}\nsee NEXT: Bohr"
+    assert len(handoff_mod._control_next_matches(outside)) == 1
+
+
 def test_a_real_next_after_a_closed_fence_is_the_handoff() -> None:
     # v2.1 §C and 6.
     for body in (
@@ -224,11 +261,61 @@ def test_malformed_handoff_is_a_terminal_stop_reason() -> None:
     assert StopReason.MALFORMED_HANDOFF.value in TERMINAL_STOP_REASONS
 
 
+def _gate(body: str, roster: object = _ROSTER, field: str | None = None) -> object:
+    return tail_decision(
+        body,
+        repo="a/b",
+        number=1,
+        roster=roster,  # type: ignore[arg-type]
+        next_participant=field,
+    )
+
+
 def test_auto_gate_tail_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert tail_decision(DONE, repo="a/b", number=1) is AutoGateNoop.QUEUED_BEHIND
+    assert _gate(DONE) is AutoGateNoop.QUEUED_BEHIND
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
-    assert isinstance(tail_decision(DONE, repo="a/b", number=1), Post)
-    assert isinstance(tail_decision(BLOCKED, repo="a/b", number=1), Post)
+    assert isinstance(_gate(DONE), Post)
+    assert isinstance(_gate(BLOCKED), Post)
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "reason"),
+    [
+        ("x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg", None, "blocked_on_bad_wake"),
+        ("x\nBLOCKED-ON: pr a/b#1\nNEXT: Nobody", None, "blocked_on_bad_wake"),
+        ("x\nBLOCKED-ON: pr a/b#1\nNEXT: Bohr", "Einstein", "field_conflict"),
+        (DONE, "Bohr", "field_conflict"),
+    ],
+)
+def test_auto_gate_holds_a_settled_tail_the_roster_refuses(
+    accepting: None, body: str, field: str | None, reason: str
+) -> None:
+    # msg-8218 §2b-2: the sweep parks this head as settled, and its notice is the park-wake
+    # tick's. If 1c fired the gate first, the head would move and the refused form would never
+    # be reported. So 1c reads it with the roster and the field, and holds it.
+    assert stage1_skips(body)
+    assert _gate(body, field=field) is AutoGateNoop.QUEUED_BEHIND
+    assert settled_tail_refusal(body, roster=_ROSTER, next_participant=field) == (
+        f"terminal-form-refused: {reason}"
+    )
+
+
+@pytest.mark.parametrize("roster", [None, {}])
+@pytest.mark.parametrize("body", [DONE, BLOCKED])
+def test_auto_gate_without_a_roster_holds_every_settled_tail(
+    accepting: None, body: str, roster: object
+) -> None:
+    # Firing without the check could bury a refused head, so no roster means no fire on a
+    # settled tail; the detail says why.
+    assert _gate(body, roster=roster) is AutoGateNoop.QUEUED_BEHIND
+    assert settled_tail_refusal(body, roster=roster) == ROSTER_UNAVAILABLE  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("roster", [None, {}])
+def test_auto_gate_without_a_roster_still_fires_on_a_legacy_idle_tail(roster: object) -> None:
+    # The roster is read for terminal forms only; ``NEXT: none`` keeps its pre-change reading.
+    assert isinstance(_gate("x\n\nNEXT: none", roster=roster), Post)
+    assert settled_tail_refusal("x\n\nNEXT: none", roster=roster) is None  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- gateway disposition
@@ -364,10 +451,11 @@ def test_the_conductor_and_the_tick_post_the_same_notice() -> None:
 #
 # - refused (``resolve_handoff`` with the roster sets ``malformed``): the MALFORMED notice is
 #   posted EXACTLY ONCE between the two readers that can say it — the conductor (when the sweep
-#   LAUNCHes) and the park-wake tick (when the sweep SKIPs) — and 1c does not fire on the
-#   conductor's share;
+#   LAUNCHes) and the park-wake tick (when the sweep SKIPs) — and 1c fires on NEITHER share, with
+#   or without a roster (msg-8218 §2b-2: on the tick's share a fire would move the head before a
+#   tick that failed could retry, and the refusal would never be said);
 # - accepted: the sweep SKIPs (also on the cached token), the tick posts nothing, and nothing is
-#   launched — a valid wait never relaunches.
+#   launched — a valid wait never relaunches. 1c fires on it (it is idle) only with a roster.
 
 _TOKENS: dict[str, str | None] = {
     "participant": "Bohr",
@@ -447,14 +535,17 @@ async def test_no_cell_of_the_matrix_is_silent(
             assert outcome.stop_reason is StopReason.MALFORMED_HANDOFF
         conductor_notices = [p["content"] for p in mcp.posts]
 
+    # 1c, with the roster the pass loads and with none (an empty or unloadable roster).
+    gate_with = _gate(body, field=field)
+    gate_without = _gate(body, roster=None, field=field)
+
     if refused is not None:
         notices = tick_notices + conductor_notices
         assert notices == [malformed_notice(refused)], "a refused form must be said exactly once"
-        if not sweep_skips:
-            # The conductor's share: 1c must not fire the gate onto the head the conductor is
-            # answering. (The tick's share is a head 1c, field- and roster-blind like the sweep,
-            # reads as settled — the same reading as before this PR for ``NEXT: none``.)
-            assert tail_decision(body, repo="a/b", number=1) is AutoGateNoop.QUEUED_BEHIND
+        # Neither share is an idle tail for 1c: the conductor is answering it, or the tick owns
+        # its notice (and a fire would bury the head before a failed tick could retry).
+        assert gate_with is AutoGateNoop.QUEUED_BEHIND
+        assert gate_without is AutoGateNoop.QUEUED_BEHIND
         # The notice moves the head to one the sweep parks and that is not itself a form.
         assert stage1_skips(notices[0])
         assert handoff_mod.terminal_form_view(notices[0]) is handoff_mod.TerminalView.LEGACY
@@ -463,6 +554,9 @@ async def test_no_cell_of_the_matrix_is_silent(
         assert sweep_skips and parse_head_token(body) == NONE_TOKEN
         assert tick_notices == [] and report["notices"] == []
         assert conductor_notices == []
+        # Accepted and idle: 1c fires, but only once the roster has confirmed it.
+        assert isinstance(gate_with, Post)
+        assert gate_without is AutoGateNoop.QUEUED_BEHIND
 
 
 def test_the_matrix_covers_every_token_and_both_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:

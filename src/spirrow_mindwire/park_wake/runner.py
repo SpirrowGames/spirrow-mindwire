@@ -379,6 +379,10 @@ async def run_tick(
                 # ends ``NEXT: human``, which moves the head off the form: posted once per head.
                 # A form refused WITHOUT the roster is not settled here: head_skip LAUNCHes it and
                 # the conductor says it (handoff.TerminalView), so the two never both post.
+                # If this tick cannot run (a failed post is retried next tick, a probe timeout, an
+                # empty roster), the notice is late but never lost: the tick keeps no state and
+                # re-reads every head. The one machine writer that could move the head meanwhile
+                # is 1c's gate fire, and 1c holds such a tail (msg-8218 §2b-2 / §2b-3).
                 handoff = resolve_handoff(
                     head.content, roster, next_participant=head.next_participant
                 )
