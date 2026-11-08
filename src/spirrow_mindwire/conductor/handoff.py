@@ -1613,6 +1613,7 @@ of your reply and write NO `NEXT:` line after it:
 {STOP_DONE_EXAMPLE}
 
 It is recorded as done and waits for its owner to close it.
+
 Waiting — work remains, but it can start only once something happens that the sweep \
 can see. Put the `{BLOCKED_ON_KEYWORD}:` line directly above the final `NEXT:` line:
 
