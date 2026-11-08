@@ -863,6 +863,33 @@ newest line of the day's `stall-ledger-*.jsonl` is a `heartbeat`. In that line,
 `budget_exhausted: true` together with a `pending_markers` count that keeps growing means body
 fetches are falling behind (see `deferred_fetches`).
 
+**Thread heads (D-16d-1).** The tick reads a chatroom thread's head message only when the
+thread's `(last_msg_id, last_activity_at)` in the listing differs from the cached read. The
+cache is the store's top-level `thread_heads` object. Each read is one `chatroom_get_thread`
+call, taken from the same fetch budget as marker fetches, so a tick reads at most the threads
+that had a new post since the last read. The head is sorted into a group, and the group sets
+the thread's `N`:
+
+| Group | Head | `N` |
+|---|---|---|
+| A | `NEXT: <persona>` / `NEXT: pr-review`, and the `next_participant` field (if set) agrees | 6h |
+| B | `STOP: done` | never opens; an open record closes |
+| C | anything else: `NEXT: none` without `STOP:`, no `NEXT:`, a refused form, field ≠ body | 6h |
+| D | `BLOCKED-ON:` (any trigger, never evaluated), `NEXT: human`, a well-formed `NEXT: operator` | 72h for now; D-16d-2 sets `T_WAIT_AUTO` / `T_WAIT_MANUAL` |
+
+A head the tick could not read yet is treated as C with the old 72h. It is counted in the
+heartbeat's `pending_heads` and read on a later tick; `head_fetches` is the number of reads this
+tick. Only a failed read is retried: a thread read in full whose head message is absent or has no
+text body is cached as C (`head_missing` / `head_malformed`) under the same key, so it is not
+fetched again until a new post changes the key. A cache entry is dropped when the listing shows the thread `resolved`, or when the thread is
+missing from a listing that was read in full on a tick with no failing source. A failed or partial
+listing drops nothing. A legacy `STOP: blocked-on … wake:<x>` line above `NEXT: none` needs the
+roster to check its wake, which the tick does not have, so it reads as C.
+
+Known limit: the chatroom offers no way to edit a message (no edit tool on the MCP surface, and no
+edit field on a message, checked 2026-11-09). If one is added and an edit does not move
+`last_activity_at`, the tick will not see the edit. To correct a head, post a new message.
+
 To stop it, disable the `mindwire-stall-ledger` task. The store survives a stop; quarantined
 ledger records are listed and cleared with `scripts/stall_ledger_tick.py --list-quarantined` /
 `--clear-quarantined`.
