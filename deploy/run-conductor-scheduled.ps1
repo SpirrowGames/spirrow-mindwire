@@ -5885,7 +5885,7 @@ function Invoke-ParkWakeTick {
             Write-Log "park-wake [$Project]: tick failed (exit=$($r.code)): $($obj.error)"
             return $null
         }
-        if (@($obj.woken).Count -gt 0 -or @($obj.errors).Count -gt 0) {
+        if (@($obj.woken).Count -gt 0 -or @($obj.notices).Count -gt 0 -or @($obj.errors).Count -gt 0) {
             Write-Log "park-wake [$Project]: $json"
         }
         return $obj

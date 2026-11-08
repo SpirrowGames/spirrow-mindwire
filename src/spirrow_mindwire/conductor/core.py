@@ -177,15 +177,13 @@ from .handoff import (
     NONE_TOKEN,
     OPERATOR_FORM_EXAMPLE,
     OPERATOR_TOKEN,
-    STOP_TRIGGER_ARMS,
-    STOP_WAKE_ROLES,
     Handoff,
     HandoffKind,
     HumanAsk,
-    MalformedHandoff,
     MismatchReason,
     OperatorFault,
     declares_no_tier_c,
+    malformed_notice,
     parse_next_token,
     resolve_handoff,
 )
@@ -321,51 +319,6 @@ def _operator_fault_notice(fault: OperatorFault) -> str:
         f"Conductor stand-down — `NEXT: {OPERATOR_TOKEN}` を受け付けませんでした\n\n"
         f"理由 (`{fault.value}`): {cause}\n\n"
         f"∴ 誰も spawn せず停止しました。{fix}\n\n"
-        f"head が動くまでループは再開しません。\n\n"
-        f"NEXT: {HUMAN_TOKEN}"
-    )
-
-
-_MALFORMED_CAUSES: dict[MalformedHandoff, str] = {
-    MalformedHandoff.NEW_FORM_NOT_ACCEPTED: (
-        "`STOP: done` / `BLOCKED-ON:` の形はまだ受け付けていません (受け付け側の配備前)。"
-    ),
-    MalformedHandoff.STOP_NOT_DONE: (
-        "最後の制御行が `STOP:` ですが、`STOP: done` ちょうどではありません。"
-    ),
-    MalformedHandoff.STOP_ABOVE_NEXT: (
-        "`STOP:` 行の直下に参加者を指す `NEXT:` があります (決着と次の担当者が矛盾します)。"
-    ),
-    MalformedHandoff.BLOCKED_ON_MALFORMED: (
-        "`BLOCKED-ON:` 行が `BLOCKED-ON: <arm> <ref>` の形ではありません。"
-        f"arm は {' / '.join(STOP_TRIGGER_ARMS)} のどれかです。"
-    ),
-    MalformedHandoff.BLOCKED_ON_SELF_UNSUPPORTED: (
-        "`BLOCKED-ON: self` は、まだ終了を観測する仕組みが無いので受け付けていません。"
-    ),
-    MalformedHandoff.BLOCKED_ON_BAD_WAKE: (
-        "`BLOCKED-ON:` の下の `NEXT:` が起こせる参加者ではありません"
-        f" ({' / '.join(role.value for role in STOP_WAKE_ROLES)} の role を持つ参加者だけです。"
-        "human / none / operator / pr-review は不可)。"
-    ),
-    MalformedHandoff.FIELD_CONFLICT: (
-        "構造化フィールド `next_participant` が本文の決着・待ちの形と食い違っています。"
-    ),
-}
-
-
-def _malformed_notice(reason: MalformedHandoff) -> str:
-    """The stand-down notice for a refused terminal form (design v2.4 §1, ``malformed_handoff``).
-
-    Says which rule refused the head and how to write it in the forms the conductor reads today.
-    The body ends ``NEXT: human`` so head_skip parks the thread on it; its own lines are not a
-    terminal form (no ``STOP:`` / ``BLOCKED-ON:`` line at the end or above that ``NEXT:``).
-    """
-    return (
-        f"Conductor stand-down — 決着・待ちの書き方を受け付けませんでした\n\n"
-        f"理由 (`{reason.value}`): {_MALFORMED_CAUSES[reason]}\n\n"
-        f"∴ 誰も spawn せず停止しました。次にやること: 次に動く人がいるなら `NEXT: <persona>`、"
-        f"決着・待ちなら現行の `STOP:` 行 + `NEXT: {NONE_TOKEN}` の形で投稿し直してください。\n\n"
         f"head が動くまでループは再開しません。\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
@@ -510,7 +463,9 @@ class StopReason(StrEnum):
     # field, or well-formed while the forms are not yet accepted (``handoff.ACCEPT_NEW_FORMS``).
     # Nothing is spawned, no naysayer is force-summoned, and a notice ending ``NEXT: human`` says
     # which rule refused it. Terminal in head_skip (the same head refuses the same way) and
-    # notifying in StopReason.ps1: a refused stop must never be silent (msg-8172 §1).
+    # notifying in StopReason.ps1: a refused stop must never be silent (msg-8172 §1). A head the
+    # roster-free sweep parks as settled but the roster refuses never reaches the conductor; the
+    # park-wake tick posts the same notice for it (park_wake/runner.py, PR #531 gate msg-8190).
     MALFORMED_HANDOFF = "malformed_handoff"
 
 
@@ -2461,7 +2416,7 @@ class Conductor:
         input.
         """
         if reason is StopReason.MALFORMED_HANDOFF and handoff.malformed is not None:
-            return _malformed_notice(handoff.malformed)
+            return malformed_notice(handoff.malformed)
         if reason is StopReason.SELF_HANDOFF:
             return (
                 f"Conductor stop — 自己ハンドオフ (author == next)\n\n"

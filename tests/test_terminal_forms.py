@@ -24,6 +24,7 @@ from spirrow_mindwire.conductor.handoff import (
     HandoffKind,
     MalformedHandoff,
     StopStatus,
+    malformed_notice,
     resolve_handoff,
     settles_by_terminal_form,
 )
@@ -32,6 +33,7 @@ from spirrow_mindwire.conductor.head_skip import (
     parse_head_token,
     stage1_skips,
 )
+from spirrow_mindwire.park_wake.decide import PARK_WAKE_RELAY_AUTHOR
 from spirrow_mindwire.park_wake.runner import run_tick
 from spirrow_mindwire.pr_event_advance.auto_gate.decide import AutoGateNoop, tail_decision
 from spirrow_mindwire.pr_event_advance.decide import Post
@@ -291,17 +293,62 @@ async def test_tick_classifies_accepted_forms(accepting: None) -> None:
 
 
 @pytest.mark.anyio
-async def test_tick_reports_a_form_the_sweep_parks_but_the_roster_refuses(
-    accepting: None,
+@pytest.mark.parametrize(
+    ("body", "field", "reason"),
+    [
+        # A wake outside STOP_WAKE_ROLES (an implementer).
+        ("x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg", None, "blocked_on_bad_wake"),
+        # A structured field that contradicts the form.
+        ("x\nBLOCKED-ON: pr a/b#1\nNEXT: Bohr", "Einstein", "field_conflict"),
+        (DONE, "Bohr", "field_conflict"),
+    ],
+)
+async def test_tick_posts_the_notice_for_a_form_the_sweep_parks_but_the_roster_refuses(
+    accepting: None, body: str, field: str | None, reason: str
 ) -> None:
-    # head_skip has no roster, so it parks this head as settled; the conductor never runs to post
-    # the notice. The tick, which has the roster, must not let it disappear.
-    body = "x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg"
+    # head_skip has no roster (nor the field), so it parks this head as settled and the conductor
+    # is never launched to post the notice. A refused stop must never be silent (PR #531 gate
+    # msg-8190): the tick, which has the roster, posts the conductor's notice itself.
     assert stage1_skips(body)
     mcp = _TickMcp()
-    mcp.thread("p", "T-bad", content=body)
+    mcp.thread("p", "T-bad", content=body, msg_id="msg-7")
+    if field is not None:
+        mcp.threads[("p", "T-bad")]["messages"][0]["next_participant"] = field
     report = (await run_tick(mcp=mcp, gh=_Gh({}), project="p", roster=_ROSTER)).as_dict()
     assert report["unclassified"] == ["T-bad"]
+    assert report["errors"] == []
+    (post,) = mcp.posts
+    assert post["thread_id"] == "T-bad"
+    assert post["author"] == PARK_WAKE_RELAY_AUTHOR
+    assert post["content"] == malformed_notice(MalformedHandoff(reason))
+    assert "role" not in post
+    # The notice moves the head to a NEXT: human the sweep parks on, and is not itself a form.
+    assert stage1_skips(post["content"]) and not settles_by_terminal_form(post["content"])
+    (notice,) = report["notices"]
+    assert notice["refused_msg"] == "msg-7" and notice["malformed"] == reason
+    assert notice["action"] == "posted"
+    assert report["posted_heads"] == {"T-bad": notice["msg_id"]}
+
+
+@pytest.mark.anyio
+async def test_a_notice_that_fails_to_land_is_an_error_row(accepting: None) -> None:
+    mcp = _TickMcp()
+    mcp.thread("p", "T-bad", content="x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg")
+    mcp.resolved_on_post.add("T-bad")
+    report = (await run_tick(mcp=mcp, gh=_Gh({}), project="p", roster=_ROSTER)).as_dict()
+    assert report["notices"][0]["action"] == "skipped"
     assert report["errors"] == [
-        {"thread_id": "T-bad", "reason": "terminal-form-refused: blocked_on_bad_wake"}
+        {
+            "thread_id": "T-bad",
+            "reason": "terminal-form-refused: blocked_on_bad_wake: thread-resolved",
+        }
     ]
+    assert report["posted_heads"] == {}
+
+
+def test_the_conductor_and_the_tick_post_the_same_notice() -> None:
+    # One text, owned by handoff.py; the conductor no longer keeps its own copy.
+    from spirrow_mindwire.conductor import core
+
+    assert not hasattr(core, "_malformed_notice")
+    assert vars(core)["malformed_notice"] is malformed_notice

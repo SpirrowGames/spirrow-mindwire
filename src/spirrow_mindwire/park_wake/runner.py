@@ -1,7 +1,7 @@
 """The thin I/O half of the park-wake tick: read every open thread, classify, wake, report.
 
 One pass per project per sweep tick (``python -m spirrow_mindwire.park_wake``, called by
-``deploy/run-conductor-scheduled.ps1`` next to the 1b tick). Two jobs on the same read:
+``deploy/run-conductor-scheduled.ps1`` next to the 1b tick). Three jobs on the same read:
 
 1. **Classify every ``NEXT: none`` head** (magickit msg-1015 v11 §1, moved to mindwire from
    magickit): ``done`` / ``blocked_on`` from a valid ``STOP:`` line; otherwise ``unclassified``
@@ -10,6 +10,10 @@ One pass per project per sweep tick (``python -m spirrow_mindwire.park_wake``, c
    drives through the conductor (msg-2014 §2 (4), the magickit n=1 threads) is classified too.
 2. **Wake fired parks** (D-7): :func:`~.decide.select_wakes` over the facts read this tick, then
    one post per woken park.
+3. **Say a refused terminal form** (T-done-disposition-auto-close, PR #531 gate msg-8190): a head
+   the roster-free sweep parks as settled (``handoff.settles_by_terminal_form``) but the roster
+   refuses gets the conductor's MALFORMED notice (``handoff.malformed_notice``, ``NEXT: human``),
+   because the conductor is never launched on it. ``notices`` in the JSON lists them.
 
 Stateless, like 1b (:mod:`~spirrow_mindwire.pr_event_advance.runner`): every fact is read fresh
 and nothing is remembered between ticks. Fail closed: a fact that could not be read writes
@@ -44,7 +48,9 @@ from typing import Any, Protocol, assert_never
 from ..conductor.disposition import StopClass, classify_stop, stop_line_of
 from ..conductor.handoff import (
     HandoffKind,
+    MalformedHandoff,
     StopStatus,
+    malformed_notice,
     resolve_handoff,
     settles_by_terminal_form,
 )
@@ -107,14 +113,17 @@ class TickReport:
     threads: int = 0
     classes: dict[str, list[str]] = field(default_factory=dict)
     woken: list[dict[str, Any]] = field(default_factory=list)
+    # MALFORMED notices this tick posted for a terminal form the sweep parks but the roster refuses.
+    notices: list[dict[str, Any]] = field(default_factory=list)
     held: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
     tail_cache: dict[str, Any] | None = None
 
     def posted_heads(self) -> dict[str, str]:
-        """``{thread_id: msg_id}`` for every wake that landed or may have (``""`` = id unknown)."""
+        """``{thread_id: msg_id}`` for every wake or notice that landed or may have (``""`` = id
+        unknown)."""
         out: dict[str, str] = {}
-        for w in self.woken:
+        for w in [*self.woken, *self.notices]:
             if w.get("action") == "posted":
                 out[str(w["thread_id"])] = str(w.get("msg_id") or "")
             elif str(w.get("reason", "")).startswith("post-failed"):
@@ -131,6 +140,7 @@ class TickReport:
             "counts": {c.value: len(self.classes.get(c.value, [])) for c in StopClass},
             "unclassified": self.classes.get(StopClass.UNCLASSIFIED.value, []),
             "woken": self.woken,
+            "notices": self.notices,
             "held": self.held,
             "errors": self.errors,
             "posted_heads": self.posted_heads(),
@@ -363,16 +373,28 @@ async def run_tick(
             if settles_by_terminal_form(head.content):
                 # The sweep reads this head without a roster and parks it as settled, but with the
                 # roster it is refused (a BLOCKED-ON wake outside STOP_WAKE_ROLES, or a field that
-                # contradicts it), so the conductor never runs to post its MALFORMED notice. It is
-                # counted where a stall is counted, by thread, instead of disappearing.
+                # contradicts it), so the conductor is never launched to post its MALFORMED notice.
+                # A refused stop must never be silent (msg-8172 §1; PR #531 gate msg-8190), so
+                # this tick, the one reader with the roster, posts that same notice itself. It
+                # ends ``NEXT: human``, which moves the head off the form: posted once per head.
                 handoff = resolve_handoff(
                     head.content, roster, next_participant=head.next_participant
                 )
-                reason = handoff.malformed.value if handoff.malformed is not None else "unknown"
                 report.classify(StopClass.UNCLASSIFIED, head.thread_id)
-                report.errors.append(
-                    {"thread_id": head.thread_id, "reason": f"terminal-form-refused: {reason}"}
-                )
+                if handoff.malformed is None:
+                    report.errors.append(
+                        {"thread_id": head.thread_id, "reason": "terminal-form-refused: unknown"}
+                    )
+                    continue
+                if cache is not None:
+                    cache.forget(head.thread_id)  # its tail is about to be the notice
+                outcome = await _post_malformed_notice(mcp, project, head, handoff.malformed)
+                report.notices.append(outcome)
+                if outcome.get("action") != "posted":
+                    reason = f"terminal-form-refused: {handoff.malformed.value}"
+                    report.errors.append(
+                        {"thread_id": head.thread_id, "reason": f"{reason}: {outcome['reason']}"}
+                    )
             continue
         # The author matters only when there is no valid line (classify_stop), so only then is
         # the registry asked.
@@ -458,6 +480,41 @@ async def _post_wake(mcp: McpToolCaller, project: str, park: Park) -> dict[str, 
     except ThreadResolvedError as exc:
         # Disposition (1) — the tick's JSON / wrapper log. See module docstring.
         logger.warning("park wake dropped (thread %r resolved): %s", park.thread_id, exc)
+        return {**base, "action": "skipped", "reason": "thread-resolved"}
+    except MagickitMcpError as exc:
+        return {**base, "action": "skipped", "reason": f"post-failed: {exc}"}
+    msg = result.get("msg") if isinstance(result, dict) else None
+    msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
+    return {**base, "action": "posted", "msg_id": msg_id}
+
+
+async def _post_malformed_notice(
+    mcp: McpToolCaller, project: str, head: Head, reason: MalformedHandoff
+) -> dict[str, Any]:
+    """Post the conductor's MALFORMED notice on ``head`` (the same text, :func:`malformed_notice`).
+
+    The outcome rows mirror :func:`_post_wake`, so :meth:`TickReport.posted_heads` moves the
+    sweep's head for a notice exactly as for a wake.
+    """
+    base: dict[str, Any] = {
+        "thread_id": head.thread_id,
+        "refused_msg": head.msg_id,
+        "malformed": reason.value,
+    }
+    try:
+        result = await mcp.call_tool(
+            "chatroom_post_message",
+            {
+                "project": project,
+                "thread_id": head.thread_id,
+                "msg_type": "report",
+                "author": PARK_WAKE_RELAY_AUTHOR,
+                "content": malformed_notice(reason),
+                # No ``role``: a machine restating a refusal holds none (I-6), as for a wake.
+            },
+        )
+    except ThreadResolvedError as exc:
+        logger.warning("malformed notice dropped (thread %r resolved): %s", head.thread_id, exc)
         return {**base, "action": "skipped", "reason": "thread-resolved"}
     except MagickitMcpError as exc:
         return {**base, "action": "skipped", "reason": f"post-failed: {exc}"}
