@@ -1,4 +1,4 @@
-"""Tests for T19 ``ImplementerSdkAdapter`` + the SDK-tool classifier.
+"""Tests for T19 ``ImplementerSdkAdapter``.
 
 The adapter lifecycle is exercised with a fake SDK client, so it is covered
 without the real CLI. There is no per-call tool guard to drive (see the
