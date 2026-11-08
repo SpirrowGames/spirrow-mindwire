@@ -69,15 +69,21 @@ def test_read_back_checks_the_four_fields() -> None:
     for field, source in [
         ("Execute", r"\$task\.Actions\[0\]\.Execute"),
         ("Arguments", r"\$task\.Actions\[0\]\.Arguments"),
+    ]:
+        assert re.search(rf"{field}\s*=\s*\[string\]{source}", text), field
+    # The two durations come back as ISO 8601 text that the scheduler may spell differently
+    # (PT60M vs PT1H): they are compared as TimeSpan, never as strings (PR #537 gate).
+    for field, source in [
         ("RepetitionInterval", r"\$task\.Triggers\[0\]\.Repetition\.Interval"),
         ("ExecutionTimeLimit", r"\$task\.Settings\.ExecutionTimeLimit"),
     ]:
-        assert re.search(rf"{field}\s*=\s*\[string\]{source}", text), field
+        assert re.search(rf"{field}\s*=\s*ConvertTo-Duration\s*\(\[string\]{source}\)", text), field
+    assert re.search(r"\[System\.Xml\.XmlConvert\]::ToTimeSpan\(\$Iso\)", text)
     for field, intended in [
         ("Execute", r"\$pwshPath"),
         ("Arguments", r"\$argString"),
-        ("RepetitionInterval", r"\$HeartbeatInterval"),
-        ("ExecutionTimeLimit", r"\$ExecutionTimeLimit"),
+        ("RepetitionInterval", r"\$interval"),
+        ("ExecutionTimeLimit", r"\$limit"),
     ]:
         assert re.search(rf"^\s*{field}\s*=\s*{intended}\s*$", text, re.MULTILINE), field
     # A missing task and a mismatch both refuse.

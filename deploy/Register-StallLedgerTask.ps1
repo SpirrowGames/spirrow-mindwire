@@ -87,17 +87,23 @@ $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
     throw "task $TaskName does not exist after registration; not registered (register error: $registerError)"
 }
+# The two durations come back as ISO 8601 strings, and the scheduler may store them in a different
+# but equal spelling (PT60M vs PT1H). Compare them as TimeSpan, never as text (PR #537 gate). A value
+# that does not parse stays as its raw text and so mismatches instead of throwing a parse error.
+function ConvertTo-Duration([string]$Iso) {
+    try { return [System.Xml.XmlConvert]::ToTimeSpan($Iso) } catch { return "unparseable '$Iso'" }
+}
 $actual = [ordered]@{
     Execute            = [string]$task.Actions[0].Execute
     Arguments          = [string]$task.Actions[0].Arguments
-    RepetitionInterval = [string]$task.Triggers[0].Repetition.Interval
-    ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit
+    RepetitionInterval = ConvertTo-Duration ([string]$task.Triggers[0].Repetition.Interval)
+    ExecutionTimeLimit = ConvertTo-Duration ([string]$task.Settings.ExecutionTimeLimit)
 }
 $expected = [ordered]@{
     Execute            = $pwshPath
     Arguments          = $argString
-    RepetitionInterval = $HeartbeatInterval
-    ExecutionTimeLimit = $ExecutionTimeLimit
+    RepetitionInterval = $interval
+    ExecutionTimeLimit = $limit
 }
 $mismatch = @($expected.Keys | Where-Object { $actual[$_] -ne $expected[$_] } |
         ForEach-Object { "$_ expected '$($expected[$_])' got '$($actual[$_])'" })
