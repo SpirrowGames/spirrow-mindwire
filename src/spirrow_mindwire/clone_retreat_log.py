@@ -56,6 +56,10 @@ DELIVERED_KIND = "delivered"
 # procedure's one row per decided outcome. A new kind, so no ``retreat`` field changes meaning.
 SLOT_QUARANTINE_KIND = "slot_quarantine"
 NOTICE_KINDS = frozenset({RETREAT_KIND, SLOT_QUARANTINE_KIND})
+# Bohr msg-8198 判断 4 (Einstein go): a bundle made in step 2 whose commits the rescue push
+# published, with the slot launched un-quarantined. Recorded, never noticed: it is not in
+# NOTICE_KINDS, so pending_record skips it, and it is not a quarantine for the D-7 counts.
+SLOT_PRESERVE_KIND = "slot_preserve"
 SLOT_ACTION_REBUILT = "rebuilt"
 SLOT_ACTION_PARKED = "parked"
 # D-7 reasons (msg-8061, plus quarantine_unconfirmed from msg-8088).
@@ -237,6 +241,41 @@ def append_slot_quarantine(path: Path, row: dict[str, Any]) -> None:
     """Append a row built by :func:`build_slot_quarantine_record`."""
     if row.get("kind") != SLOT_QUARANTINE_KIND:
         raise ValueError("not a slot_quarantine row")
+    _append(path, row)
+
+
+def build_slot_preserve_record(
+    *,
+    thread_id: str,
+    repo: str,
+    bundle_path: Path,
+    pushed_ref: str,
+    commits: int,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """One ``slot_preserve`` row (msg-8198 判断 4): repo, thread_id, at, bundle_path, pushed_ref,
+    commits. ``bundle_path`` is a real path (this row exists only because a bundle was made)."""
+    if not pushed_ref.startswith("refs/heads/"):
+        raise ValueError(f"pushed_ref must be refs/heads/<name>, got {pushed_ref!r}")
+    if commits < 1:
+        raise ValueError("a slot_preserve row needs at least one bundled commit")
+    stamp = _now_iso(at)
+    return {
+        "kind": SLOT_PRESERVE_KIND,
+        "record_id": f"{thread_id}@{stamp}#{uuid.uuid4().hex[:12]}",
+        "at": stamp,
+        "thread_id": thread_id,
+        "repo": repo,
+        "bundle_path": str(bundle_path),
+        "pushed_ref": pushed_ref,
+        "commits": commits,
+    }
+
+
+def append_slot_preserve(path: Path, row: dict[str, Any]) -> None:
+    """Append a row built by :func:`build_slot_preserve_record`."""
+    if row.get("kind") != SLOT_PRESERVE_KIND:
+        raise ValueError("not a slot_preserve row")
     _append(path, row)
 
 

@@ -6,6 +6,7 @@ builds ``<slots_root>/<repo>.git`` from it, and :class:`SlotPrep` runs steps 0-7
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import subprocess
@@ -15,7 +16,15 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.clone_retreat_log import render_slot_notice
+from spirrow_mindwire.clone_guard import CloneGuard
+from spirrow_mindwire.clone_retreat_log import (
+    append_slot_preserve,
+    append_slot_quarantine,
+    build_slot_preserve_record,
+    build_slot_quarantine_record,
+    pending_record,
+    render_slot_notice,
+)
 from spirrow_mindwire.clone_slot import (
     PARK_GIT_DIVERGED,
     PARK_GIT_PUSH_FAILED,
@@ -367,7 +376,124 @@ def test_rescue_push_on_thread_branch_then_launch(world: dict[str, Path]) -> Non
     res = _prep(world).run()
     assert res.action is PrepAction.LAUNCH, res
     assert _git(world["origin"], "rev-parse", TB) == sha
-    assert res.record is None  # pushed and clean: no quarantine
+    # msg-8198 判断 4: pushed and clean -> one slot_preserve row, no slot_quarantine row.
+    row = res.record
+    assert row is not None and row["kind"] == "slot_preserve"
+    assert row["pushed_ref"] == f"refs/heads/{TB}" and row["commits"] == 1
+    assert sha in _bundle_commits(world, str(row["bundle_path"]))
+    assert set(row) == {
+        "kind",
+        "record_id",
+        "at",
+        "thread_id",
+        "repo",
+        "bundle_path",
+        "pushed_ref",
+        "commits",
+    }
+    assert [r["kind"] for r in _rows(world)] == ["slot_preserve"]
+    assert pending_record(world["state"] / "clone-retreats.jsonl", THREAD) is None  # no notice
+
+
+def test_slot_preserve_row_does_not_hide_an_undelivered_notice_row(
+    world: dict[str, Path],
+) -> None:
+    log = world["state"] / "clone-retreats.jsonl"
+    world["state"].mkdir(parents=True, exist_ok=True)
+    earlier = build_slot_quarantine_record(
+        thread_id=THREAD,
+        repo=REPO,
+        slot_path=_paths(world).slot_dir,
+        action="parked",
+        quarantine_reason="unpublished",
+        park_code=PARK_UNPUBLISHED,
+    )
+    append_slot_quarantine(log, earlier)
+    retreat = {"kind": "retreat", "record_id": f"{THREAD}@r#1", "thread_id": THREAD}
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(retreat) + "\n")
+    append_slot_preserve(
+        log,
+        build_slot_preserve_record(
+            thread_id=THREAD,
+            repo=REPO,
+            bundle_path=world["state"] / "b.bundle",
+            pushed_ref=f"refs/heads/{TB}",
+            commits=2,
+        ),
+    )
+    picked = pending_record(log, THREAD)
+    assert picked is not None and picked["record_id"] == retreat["record_id"]
+
+
+def test_rescue_push_then_quarantine_records_bundle_once(world: dict[str, Path]) -> None:
+    slot = _slot_on_tb(world)
+    _commit(slot, "x.txt", "x\n")
+    (slot / "stray.txt").write_text("u\n", encoding="utf-8")
+    res = _prep(world).run()
+    assert res.action is PrepAction.LAUNCH
+    row = res.record
+    assert row is not None and row["kind"] == "slot_quarantine" and row["bundle"]
+    assert row["quarantine_reason"] == "untracked_only"
+    assert [r["kind"] for r in _rows(world)] == ["slot_quarantine"]  # no slot_preserve
+
+
+# -- msg-8198 判断 1 / 2 ---------------------------------------------------------------------------
+
+
+def test_fetch_failure_counter_resets_on_success(world: dict[str, Path], tmp_path: Path) -> None:
+    slot = _ready(world)
+    bad, good = str(tmp_path / "nope.git"), str(world["origin"])
+    _git(slot, "remote", "set-url", "origin", bad)
+    assert _prep(world).run().action is PrepAction.SKIP
+    _git(slot, "remote", "set-url", "origin", good)
+    assert _prep(world).run().action is PrepAction.LAUNCH
+    assert "fetch_failures" not in _owner(world)
+    _git(slot, "remote", "set-url", "origin", bad)
+    assert _prep(world).run().action is PrepAction.SKIP
+    assert _prep(world).run().action is PrepAction.SKIP  # 1 fail, ok, 2 fails: not 3 in a row
+    assert _owner(world)["fetch_failures"] == 2 and _rows(world) == []
+
+
+def test_provision_failure_counter_resets_on_success(world: dict[str, Path]) -> None:
+    def boom(_s: Path) -> None:
+        raise RuntimeError("trust")
+
+    assert _prep(world, prepare_slot=boom).run().action is PrepAction.SKIP
+    assert _owner(world)["provision_failures"] == 1
+    slot = _ready(world)
+    assert "provision_failures" not in _owner(world)
+    (slot / "a.txt").write_text("edit\n", encoding="utf-8")
+    assert _prep(world, prepare_slot=boom).run().action is PrepAction.SKIP
+    assert _prep(world, prepare_slot=boom).run().action is PrepAction.SKIP
+    assert _owner(world)["provision_failures"] == 2
+    assert [r for r in _rows(world) if r.get("action") == "parked"] == []
+
+
+def test_pin_not_ignored_is_provision_failed_with_guard_detail(world: dict[str, Path]) -> None:
+    slot = _ready(world)
+    (slot / ".mindwire").mkdir(exist_ok=True)
+    (slot / ".mindwire" / "pin").write_text("x\n", encoding="utf-8")
+    _git(slot, "add", "-f", ".mindwire/pin")
+    res = _prep(world).run()
+    assert res.action is PrepAction.LAUNCH
+    row = res.record
+    assert row is not None and row["quarantine_reason"] == "provision_failed"
+    assert "pin is tracked in this repo" in str(row["detail"])
+
+
+def test_index_lock_skips_without_quarantine(world: dict[str, Path]) -> None:
+    slot = _ready(world)
+    git_dir = Path(_git(slot, "rev-parse", "--absolute-git-dir"))
+    (git_dir / "index.lock").write_text("", encoding="utf-8")
+    tick = itertools.count(0, 10)
+
+    def fast_guard(p: Path) -> CloneGuard:
+        return CloneGuard(p, sleep=lambda _s: None, monotonic=lambda: float(next(tick)))
+
+    res = _prep(world, guard_factory=fast_guard).run()
+    assert res.action is PrepAction.SKIP and "clone busy" in res.detail
+    assert slot.exists() and _quarantined(world) == [] and _rows(world) == []
 
 
 def test_rescue_push_failure_parks_with_bundle(world: dict[str, Path], tmp_path: Path) -> None:

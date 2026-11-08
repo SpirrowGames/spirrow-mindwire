@@ -52,7 +52,9 @@ from spirrow_mindwire.clone_guard import (
 from spirrow_mindwire.clone_retreat_log import (
     SLOT_ACTION_PARKED,
     SLOT_ACTION_REBUILT,
+    append_slot_preserve,
     append_slot_quarantine,
+    build_slot_preserve_record,
     build_slot_quarantine_record,
 )
 from spirrow_mindwire.clone_slot import (
@@ -220,13 +222,12 @@ def _reason_for_guard(exc: DirtyCloneError) -> str:
         return "modified"
     if exc.reason is DirtyCloneReason.OP_IN_PROGRESS:
         return "merge_in_progress"
-    if exc.reason is DirtyCloneReason.CLONE_BUSY:
-        return "index_lock"
     if exc.reason is DirtyCloneReason.WRONG_HEAD:
         return "wrong_head"
-    if exc.reason is DirtyCloneReason.PIN_NOT_IGNORED:
-        return "modified"
-    return "provision_failed"  # git_unavailable: the slot's git itself is unusable
+    # pin_not_ignored (exclude write failed / pin tracked) and git_unavailable say nothing about
+    # the slot's work: they are set-up faults (Bohr msg-8198 判断 2). clone_busy never gets here —
+    # it skips the tick instead of quarantining.
+    return "provision_failed"
 
 
 def _dir_bytes(root: Path) -> int:
@@ -435,13 +436,32 @@ class SlotPrep:
         try:
             self._guard(slot)
         except DirtyCloneError as exc:
+            if exc.reason is DirtyCloneReason.CLONE_BUSY:
+                # msg-8198 判断 2: a held index.lock is not a quarantine reason; skip the tick.
+                return self._result(PrepAction.SKIP, paths, detail=f"clone busy: {exc.detail}")
             reason = _reason_for_guard(exc)
             self._steps.append(f"guard: {exc.reason.value} -> {reason}")
-            return self._preserve_and_quarantine(paths, owner, reason, bundle)
-        if bundle is not None:
-            # Rescued by push and now clean: still tell the next implementer where the bundle is.
-            self._steps.append("rescued by push")
-        return self._launch(paths, owner)
+            detail = f"{exc.reason.value}: {exc.detail}" if exc.detail else exc.reason.value
+            return self._preserve_and_quarantine(paths, owner, reason, bundle, detail=detail)
+        result = self._launch(paths, owner)
+        if bundle is not None and result.action is PrepAction.LAUNCH:
+            # msg-8198 判断 4: rescued by push, launching without a quarantine -> one
+            # slot_preserve row (no notice). A quarantine after the push records the bundle in
+            # its slot_quarantine row instead, so this row is written on this path only.
+            row = build_slot_preserve_record(
+                thread_id=self.thread_id,
+                repo=self.repo,
+                bundle_path=bundle,
+                pushed_ref=f"refs/heads/{self.thread_branch}",
+                commits=len(unpublished),
+                at=self.now(),
+            )
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            append_slot_preserve(self.log_path, row)
+            result = PrepResult(
+                result.action, result.slot_dir, record=row, steps=tuple(self._steps)
+            )
+        return result
 
     def _unpublished(self, slot: Path) -> list[str] | None:
         head = self._git(slot, ["rev-parse", "--verify", "-q", "HEAD"])
@@ -529,7 +549,13 @@ class SlotPrep:
             raise
 
     def _preserve_and_quarantine(
-        self, paths: SlotPaths, owner: dict[str, Any], reason: str, bundle: Path | None
+        self,
+        paths: SlotPaths,
+        owner: dict[str, Any],
+        reason: str,
+        bundle: Path | None,
+        *,
+        detail: str = "",
     ) -> PrepResult:
         slot = paths.slot_dir
         # Step 4: patch and untracked list; a missing artefact is None (R-7), not a failure.
@@ -547,6 +573,7 @@ class SlotPrep:
             "patch": None if patch is None else str(patch),
             "untracked": None if untracked is None else str(untracked),
             "bundle": None if bundle is None else str(bundle),
+            "detail": detail,
         }
         dest = self._rename_with_retry(paths, owner=owner)
         if dest is None:
@@ -557,7 +584,7 @@ class SlotPrep:
                 patch=patch,
                 untracked=untracked,
                 bundle=bundle,
-                detail=f"rename failed twice: {slot}",
+                detail=f"rename failed twice: {slot} ({detail})",
             )
         owner = self._confirm_quarantine(paths, owner, dest)
         return self._provision(paths, owner)
@@ -671,6 +698,7 @@ class SlotPrep:
                 bundle=ctx.get("bundle"),
                 clone_seconds=seconds,
                 slot_bytes=_dir_bytes(paths.slot_dir),
+                detail=str(ctx.get("detail") or ""),
             )
         for k in ("original_quarantine_path", "quarantine_context", "provision_failures"):
             owner.pop(k, None)
