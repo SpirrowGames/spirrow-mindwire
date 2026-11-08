@@ -173,9 +173,120 @@ def test_a_field_contradicting_the_form_is_malformed(accepting: None) -> None:
     assert agreeing.kind is HandoffKind.NONE and agreeing.malformed is None
 
 
-def test_indented_code_is_not_a_control_line(accepting: None) -> None:
-    assert resolve_handoff("x\n\n    STOP: done", _ROSTER).kind is HandoffKind.ABSENT
-    assert resolve_handoff("x\n\n    STOP: done", _ROSTER).malformed is None
+# --------------------------------------------------------------------------- indentation (Slice I)
+#
+# msg-8455 §1 I-2: at a control-line position an indented line that is a well-formed terminal form
+# once dedented is MALFORMED (``indented_terminal_form``), never ROLE and never ABSENT. Before
+# Slice I the first cell was ABSENT with no notice and the next three routed to the wake at once,
+# silently dropping the wait.
+
+_INDENTED = MalformedHandoff.INDENTED_TERMINAL_FORM
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n    STOP: done",
+        "x\n\n    BLOCKED-ON: pr o/r#1\n    NEXT: Bohr",
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: Bohr",  # only BLOCKED-ON indented (msg-8455 §1)
+        "x\n\n\tSTOP: done",
+        "x\n\n\tBLOCKED-ON: pr o/r#1\nNEXT: Bohr",
+        "x\n\n  \tBLOCKED-ON: thread T-a\nNEXT: Einstein",
+        "x\n\n    STOP: done\n<!-- source: tools=3 -->\n",  # footer skipped, as for the plain form
+        "x\n\n    STOP: done\n\n<!-- source: tools=3 -->\n<!-- attest: y -->\n",
+        # A wake the plain form would refuse, or a reserved word: still the indentation reason.
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: none",
+        "x\n\n    BLOCKED-ON: pr o/r#1\nNEXT: Heisenberg",
+        "x\n\n    BLOCKED-ON: self job-1\nNEXT: Bohr",
+    ],
+)
+def test_an_indented_terminal_form_at_a_control_position_is_malformed(
+    monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    for on in (False, True):
+        monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", on)
+        handoff = resolve_handoff(body, _ROSTER)
+        assert (handoff.kind, handoff.malformed) == (HandoffKind.ABSENT, _INDENTED), on
+        assert handoff_mod.refused_by_terminal_form(body)
+        # head_skip LAUNCHes it (UNRESOLVED), so the conductor posts the notice — the same path
+        # as every other MALFORMED form; its NEXT token is never read.
+        assert parse_head_token(body) == ""
+        assert not stage1_skips(body)
+
+
+def test_the_indented_notice_says_to_write_it_unindented() -> None:
+    notice = malformed_notice(_INDENTED)
+    assert "`indented_terminal_form`" in notice
+    assert "字下げせず" in notice
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n   STOP: done",  # three spaces is not indented code
+        "x\n\n   BLOCKED-ON: pr o/r#1\nNEXT: Bohr",
+        "x\n\n   BLOCKED-ON: pr o/r#1\n   NEXT: Bohr",
+    ],
+)
+def test_three_spaces_is_not_indented_code(accepting: None, body: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert handoff.kind is HandoffKind.NONE
+    assert handoff.stop_line is not None and handoff.stop_line.terminal
+
+
+@pytest.mark.parametrize(
+    ("body", "identity"),
+    [
+        # An indented example in the middle of the body is still an example.
+        ("x\n\n    STOP: done\n\nmore prose\n\nNEXT: Bohr", "Bohr"),
+        ("x\n\n    BLOCKED-ON: pr o/r#1\n    NEXT: Einstein\n\nprose\nNEXT: Bohr", "Bohr"),
+        # Not the line directly above the final NEXT: not a control position.
+        ("x\n\n    BLOCKED-ON: pr o/r#1\n\nNEXT: Bohr", "Bohr"),
+        ("x\n    BLOCKED-ON: pr o/r#1\nprose\nNEXT: Bohr", "Bohr"),
+    ],
+)
+def test_an_indented_form_elsewhere_is_still_an_example(body: str, identity: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert (handoff.kind, handoff.identity) == (HandoffKind.ROLE, identity)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"x\n{F3}\n    STOP: done\n{F3}\n",
+        f"x\n{F3}\n    STOP: done",
+        f"x\n{F3}\n    BLOCKED-ON: pr o/r#1\n    NEXT: Bohr\n{F3}\n",
+    ],
+)
+def test_an_indented_form_inside_a_fence_is_not_a_control_line(body: str) -> None:
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+    assert handoff.kind is HandoffKind.ABSENT
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x\n\n    STOP: finished",  # not a well-formed form once dedented
+        "x\n\n    stop: done",
+        "x\n\n    BLOCKED-ON: soon\nNEXT: Bohr",
+    ],
+)
+def test_an_indented_line_that_is_not_a_form_keeps_its_reading(body: str) -> None:
+    # Only a line that is a well-formed form once dedented is refused for its indentation; any
+    # other indented line is code, as before.
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.malformed is None
+
+
+def test_an_indented_stop_above_a_next_keeps_its_reading() -> None:
+    # Not in Slice I's scope (msg-8455 §1 lists the final line and BLOCKED-ON above NEXT only):
+    # the legacy reading of a line above ``NEXT: none`` and the ROLE route are unchanged.
+    assert resolve_handoff("x\n    STOP: done\nNEXT: Bohr", _ROSTER).identity == "Bohr"
+    legacy = resolve_handoff("x\n    STOP: done\nNEXT: none", _ROSTER)
+    assert legacy.kind is HandoffKind.NONE and legacy.malformed is None
 
 
 # --------------------------------------------------------------------------- fences (msg-8179 §B)
@@ -493,8 +604,16 @@ def _matrix_bodies() -> list[tuple[str, str]]:
         cells.append((f"stop-done/{name}", f"{lead}STOP: done"))
         cells.append((f"stop-not-done/{name}", f"{lead}STOP: nope"))
         cells.append((f"stop-spaced/{name}", f"{lead}STOP : done"))
+        cells.append((f"stop-done-indented/{name}", f"{lead}    STOP: done"))  # Slice I
         if token is None:
             continue
+        # Slice I (msg-8455 §1): BLOCKED-ON indented, with and without its NEXT indented too.
+        cells.append(
+            (f"blocked-on-indented/{name}", f"x\n    BLOCKED-ON: pr a/b#1\n    NEXT: {token}")
+        )
+        cells.append(
+            (f"blocked-on-indented-above/{name}", f"x\n    BLOCKED-ON: pr a/b#1\nNEXT: {token}")
+        )
         cells.append((f"blocked-on-bad-form/{name}", f"x\nBLOCKED-ON: soon\nNEXT: {token}"))
         cells.append((f"blocked-on-self/{name}", f"x\nBLOCKED-ON: self job-1\nNEXT: {token}"))
         cells.append((f"blocked-on-lowercase/{name}", f"x\nblocked-on: pr a/b#1\nNEXT: {token}"))
