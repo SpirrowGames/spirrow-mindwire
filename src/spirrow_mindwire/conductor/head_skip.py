@@ -109,8 +109,10 @@ from .handoff import (
     NONE_TOKEN,
     OPERATOR_TOKEN,
     HumanAsk,
+    TerminalView,
     parse_next_token,
     resolve_handoff,
+    terminal_form_view,
 )
 
 # --- Constants (policy calls, not derived values) ------------------------------------------------
@@ -227,8 +229,13 @@ def stage1_skips(head_body: str) -> bool:
 # notice lands moves the head (to a ``NEXT: human`` notice that Stage 1 skips anyway); one whose
 # notice fails to land stops retrying the post, the same property ``self_handoff_to_human``
 # already accepts.
+#
+# ``malformed_handoff`` joined with T-done-disposition-auto-close (design v2.4 msg-8185, boundary
+# 2): a refused terminal form is decided by the head alone, exactly like ``no_handoff_to_human``,
+# so running the same head again refuses it again. Its notice moves the head when it lands.
 TERMINAL_STOP_REASONS: frozenset[str] = frozenset(
     {
+        "malformed_handoff",
         "no_handoff_to_human",
         "no_progress_to_human",
         "self_handoff_to_human",
@@ -398,7 +405,25 @@ def parse_head_token(body: str) -> str:
     ``parse_next_token`` returned ``None``. All three fall through Stage 1 (they are not in
     :data:`STOP_TOKENS`) and Stage 2 fails open into LAUNCH — the sweep sees a live-looking thread
     it cannot interpret and tries the conductor rather than silently parking it (Obj3 spirit).
+
+    An ACCEPTED terminal form (``STOP: done``, or ``BLOCKED-ON:`` above ``NEXT: <wake>``) reads as
+    ``none`` (T-done-disposition-auto-close, design v2.4): it stops the loop the way ``NEXT: none``
+    did, Stage 1 SKIPs it through :data:`STOP_TOKENS` unchanged, and the head cache — which keeps
+    only this token — replays it as ``NEXT: none`` and SKIPs again.
+
+    A REFUSED terminal form (``handoff.TerminalView.REFUSED``: a broken form, or any new form
+    while ``handoff.ACCEPT_NEW_FORMS`` is off) is UNRESOLVED, whatever its ``NEXT:`` says. Its
+    token may be a stop token — ``BLOCKED-ON: pr a/b#1`` above ``NEXT: none`` reads ``none`` —
+    and reading it would park the head silently (PR #531 gate msg-8201). As UNRESOLVED it
+    LAUNCHes, the conductor posts the MALFORMED notice that moves it, and the stop is terminal
+    (``malformed_handoff``), so the same head is not launched twice; the cache replays ``""``,
+    which Stage 1b keeps parked.
     """
+    view = terminal_form_view(body)
+    if view is TerminalView.SETTLES:
+        return NONE_TOKEN
+    if view is TerminalView.REFUSED:
+        return ""
     raw = parse_next_token(body)
     if raw is None:
         return ""

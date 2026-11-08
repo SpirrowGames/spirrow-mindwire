@@ -79,6 +79,10 @@
 # heard (note 1) — but it is not a decision, so its phrase does not say 判断待ち, and
 # Send-HumanParkAlert does not ask the decision composer to write a question for it (D4').
 #
+# 2026-11-08 (T-done-disposition-auto-close, design v2.4 msg-8185): 'malformed_handoff' joined the
+# MAP. A refused terminal form (STOP: done / BLOCKED-ON:) stops with a notice ending NEXT: human;
+# the design requires that a refused stop is never silent (msg-8172 §1), so it is heard (note 1).
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
@@ -105,6 +109,7 @@ function Get-StopReasonPhraseMap {
         'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
         'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
         'operator_work_to_human' = "operator の手作業待ちで停止しました"
+        'malformed_handoff'     = "決着・待ちの書き方（STOP: done / BLOCKED-ON:）が受け付けられず停止しました"
         'round_cap'             = "ラウンド上限で停止しました（暴走バックストップ発動）"
         'empty_thread'          = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }

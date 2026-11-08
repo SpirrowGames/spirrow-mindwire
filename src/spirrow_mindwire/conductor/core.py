@@ -183,6 +183,7 @@ from .handoff import (
     MismatchReason,
     OperatorFault,
     declares_no_tier_c,
+    malformed_notice,
     parse_next_token,
     resolve_handoff,
 )
@@ -457,6 +458,15 @@ class StopReason(StrEnum):
     # the proposer, or the 3-line operator form — is the new head. The gate was not fired, and
     # this stop notifies nobody: the post's own ``NEXT:`` is the hand-off.
     PR_SETTLED = "pr_settled"
+    # T-done-disposition-auto-close (design v2.4 msg-8185, boundary 2): the head is written in a
+    # terminal form (``STOP: done`` / ``BLOCKED-ON:``) that was refused — broken, contradicting its
+    # field, or well-formed while the forms are not yet accepted (``handoff.ACCEPT_NEW_FORMS``).
+    # Nothing is spawned, no naysayer is force-summoned, and a notice ending ``NEXT: human`` says
+    # which rule refused it. Terminal in head_skip (the same head refuses the same way) and
+    # notifying in StopReason.ps1: a refused stop must never be silent (msg-8172 §1). A head the
+    # roster-free sweep parks as settled but the roster refuses never reaches the conductor; the
+    # park-wake tick posts the same notice for it (park_wake/runner.py, PR #531 gate msg-8190).
+    MALFORMED_HANDOFF = "malformed_handoff"
 
 
 class SummonOwnerSource(Protocol):
@@ -1792,6 +1802,26 @@ class Conductor:
         author = _author(messages[-1])
         author_role = self._roster_role(author)
 
+        # A refused terminal form (design v2.4 §1): stop and say why, before every other branch.
+        # Its ``NEXT:`` (a BLOCKED-ON wake) must not be spawned, and it is not an un-routed turn
+        # for the guard (ii) consult either — the fix is the author's, in one turn, like a refused
+        # ``NEXT: operator``.
+        if handoff.malformed is not None:
+            logger.info(
+                "conductor malformed terminal form: author=%s author_role=%s reason=%s",
+                author,
+                author_role.value if author_role is not None else None,
+                handoff.malformed.value,
+            )
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.MALFORMED_HANDOFF,
+            )
+
         # Spawnability (ADR-2026-09-14-21 D-2 / D-3), decided BEFORE every other branch so it
         # cannot be reached around: an identity whose embodiment is not ``terminal_coding_agent``
         # has no adapter that could run it, and writing one for ``web_ai_chat`` is the ガワ方式
@@ -2347,7 +2377,7 @@ class Conductor:
         for an identity that is deliberately NOT in the roster — which is the normal case for a
         web identity, since a roster entry means "this daemon drives this persona".
         """
-        if handoff.kind in (HandoffKind.NONE, HandoffKind.PR_REVIEW):
+        if handoff.kind in (HandoffKind.NONE, HandoffKind.PR_REVIEW) or handoff.malformed:
             return None
         name = handoff.identity or handoff.token or ""
         embodiment = blocked_embodiment(name, self._embodiments)
@@ -2385,6 +2415,8 @@ class Conductor:
         token is a stop token, so this post ends the retry loop instead of becoming its next
         input.
         """
+        if reason is StopReason.MALFORMED_HANDOFF and handoff.malformed is not None:
+            return malformed_notice(handoff.malformed)
         if reason is StopReason.SELF_HANDOFF:
             return (
                 f"Conductor stop — 自己ハンドオフ (author == next)\n\n"

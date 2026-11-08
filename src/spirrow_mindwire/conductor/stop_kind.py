@@ -80,6 +80,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     # Not in §6.3 (T-next-operator-is-silent). A valid ``NEXT: operator`` park, not a stall: the
     # head ends on the reserved token, so the board reads it as operator work via ``parked_lane``.
     StopReason.OPERATOR_WORK: None,
+    # Not in §6.3 (T-done-disposition-auto-close). A refused STOP: done / BLOCKED-ON: form; like
+    # SELF_HANDOFF its notice ends ``NEXT: human``, so it is read as a human stop.
+    StopReason.MALFORMED_HANDOFF: None,
     # Its notice carries the stop marker, so R-RELAY-STOP gives the same value.
     StopReason.STALLED: StopKind.STALLED,
     # Never returned by ``Conductor.run``: the run exits 1, and R-QUAR's log tail decides.
