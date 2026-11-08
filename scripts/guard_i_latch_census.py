@@ -65,7 +65,12 @@ from spirrow_mindwire.conductor.core import (
     GUARD_I_REDIRECT_TITLE,
     roster_role,
 )
-from spirrow_mindwire.conductor.handoff import HandoffKind, declares_no_tier_c, resolve_handoff
+from spirrow_mindwire.conductor.handoff import (
+    HandoffKind,
+    declares_no_tier_c,
+    posted_at_of,
+    resolve_handoff,
+)
 from spirrow_mindwire.conductor.human_identity import is_human_identity
 from spirrow_mindwire.conductor.tier_c_segment import scan_tier_c_segment
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
@@ -130,7 +135,7 @@ def census_thread(
         if _is_guard_i_relay(msg):
             relays.append(str(msg.get("msg_id") or ""))
     relays.reverse()
-    handoff = resolve_handoff(head_body, {})
+    handoff = resolve_handoff(head_body, {}, posted_at=posted_at_of(head))
     stopped = _is_guard_i_relay(head) or (handoff.kind is HandoffKind.HUMAN and bool(relays))
     head_is_naysayer = bool(naysayer) and head_author.casefold() == naysayer.casefold()
     closed = diagnose_carve_out_iii(

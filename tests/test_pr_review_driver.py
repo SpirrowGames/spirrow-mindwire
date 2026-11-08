@@ -2116,10 +2116,10 @@ async def test_make_diff_view_is_called_exactly_once_per_review(
     call_count = 0
     real_make_view = pr_review_module._make_diff_view
 
-    def counting_make_view(diff: str) -> pr_review_module.DiffView:
+    def counting_make_view(diff: str, **kwargs: Any) -> pr_review_module.DiffView:
         nonlocal call_count
         call_count += 1
-        return real_make_view(diff)
+        return real_make_view(diff, **kwargs)
 
     monkeypatch.setattr(pr_review_module, "_make_diff_view", counting_make_view)
 

@@ -44,6 +44,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from ...conductor.handoff import (
@@ -51,6 +52,7 @@ from ...conductor.handoff import (
     OPERATOR_TOKEN,
     PR_REVIEW_TOKEN,
     HandoffKind,
+    none_refused_after_cutoff,
     parse_next_token,
     refused_by_terminal_form,
     resolve_handoff,
@@ -254,6 +256,7 @@ def settled_tail_refusal(
     *,
     roster: Mapping[str, Role] | None,
     next_participant: str | None = None,
+    posted_at: datetime | None = None,
 ) -> str | None:
     """Why a tail the sweep reads as settled must still not be treated as idle, or ``None``.
 
@@ -273,7 +276,9 @@ def settled_tail_refusal(
         return None
     if not roster:
         return ROSTER_UNAVAILABLE
-    handoff = resolve_handoff(tail_body, roster, next_participant=next_participant)
+    handoff = resolve_handoff(
+        tail_body, roster, next_participant=next_participant, posted_at=posted_at
+    )
     if handoff.malformed is not None:
         return f"{TERMINAL_FORM_REFUSED}: {handoff.malformed.value}"
     return None
@@ -286,12 +291,14 @@ def tail_decision(
     number: int,
     roster: Mapping[str, Role] | None,
     next_participant: str | None = None,
+    posted_at: datetime | None = None,
 ) -> AutoGateNoop | Post:
     """Rows 9-10. One thread carries one token, so a later PR waits its turn (msg-7485 O1).
 
     ``roster`` is the conductor's identity→role roster and ``next_participant`` the tail's
     structured field. Both matter only for a tail in an accepted terminal form
     (:func:`settled_tail_refusal`); ``roster`` is required so that no caller can leave it out.
+    ``posted_at`` is the tail's posting time, for the boundary-5 ``NEXT: none`` cutoff.
     """
     # An accepted terminal form (``STOP: done`` / ``BLOCKED-ON:``) settles like ``NEXT: none``
     # (T-done-disposition-auto-close design v2.4): the thread is not waiting on anyone's turn.
@@ -300,9 +307,16 @@ def tail_decision(
     # answer with its MALFORMED notice (PR #531 gate msg-8201). It waits like a live turn.
     if refused_by_terminal_form(tail_body):
         return AutoGateNoop.QUEUED_BEHIND
+    # Boundary 5: a legacy ``NEXT: none`` the cutoff refuses is not idle either. head_skip
+    # LAUNCHes it and the conductor answers it with the MALFORMED notice; a gate fired first
+    # would bury that head the same way.
+    if none_refused_after_cutoff(tail_body, posted_at=posted_at):
+        return AutoGateNoop.QUEUED_BEHIND
     # The same holds for a form only the roster refuses: its notice is the park-wake tick's, and
     # a gate fired first would bury it (msg-8218 §2b-2). So does a settled tail 1c cannot check.
-    if settled_tail_refusal(tail_body, roster=roster, next_participant=next_participant):
+    if settled_tail_refusal(
+        tail_body, roster=roster, next_participant=next_participant, posted_at=posted_at
+    ):
         return AutoGateNoop.QUEUED_BEHIND
     token = NONE_TOKEN if settles_by_terminal_form(tail_body) else parse_next_token(tail_body)
     if token is None or token.casefold() not in (NONE_TOKEN, OPERATOR_TOKEN):

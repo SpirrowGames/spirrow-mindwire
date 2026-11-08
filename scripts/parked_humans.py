@@ -113,7 +113,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
+from spirrow_mindwire.conductor.handoff import HandoffKind, posted_at_of, resolve_handoff
 from spirrow_mindwire.conductor.parked_lane import classify_parked
 from spirrow_mindwire.decider.annotation import TierCAnnotation, annotation_line, read_annotations
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
@@ -236,7 +236,7 @@ async def _poll(
         # tries again.
         if expected_head and actual_msg_id != expected_head:
             continue
-        handoff = resolve_handoff(body, {})
+        handoff = resolve_handoff(body, {}, posted_at=posted_at_of({"timestamp": raw_timestamp}))
         if handoff.kind is HandoffKind.HUMAN:
             # D7 (T-next-role-name-stands-down-to-human): which board lane this park belongs in.
             # Decided by the grammar owner's modules, never re-spelled here or in the wrapper.
