@@ -36,6 +36,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from ..routing import ContinueVerdict, continuation_admissible
+from ..source_marker import (
+    ATTESTATION_MARKER_PREFIX,
+    ATTESTATION_MARKER_SUFFIX,
+    SOURCE_MARKER_PREFIX,
+    SOURCE_MARKER_SUFFIX,
+)
 
 __all__ = [
     "DEFAULT_CONTINUE_CAP",
@@ -76,8 +82,13 @@ def find_continue_declaration(body: str) -> str | None:
 
     The trailing block (msg-7885, start position fixed by msg-7887):
 
-    * ``i_next`` is the last non-blank line, and it must be a ``NEXT:`` line. Trailing blank lines
-      after it are ignored, as the handoff parser ignores them.
+    * ``i_next`` is the last line that is neither blank nor a harness marker, and it must be a
+      ``NEXT:`` line. Trailing blank lines after it are ignored, as the handoff parser ignores
+      them. So are the ``<!-- source: … -->`` / ``<!-- attest: … -->`` lines the dispatcher
+      appends after every reply (:func:`~spirrow_mindwire.source_marker.append_markers`): the
+      stored body never ends on the author's ``NEXT:``, and without this skip no production
+      report could declare a continuation (spirrow-mindwire msg-8109 / msg-8151, both stopped
+      as SELF_HANDOFF with no ``conductor continue`` log line).
     * The walk starts at ``i_next - 1``. The ``NEXT:`` line itself is neither in the block nor a
       reason to stop the walk.
     * Each line, leading whitespace stripped, is in the block if it is blank, a known control line
@@ -92,7 +103,7 @@ def find_continue_declaration(body: str) -> str | None:
     """
     lines = body.splitlines()
     i_next = len(lines) - 1
-    while i_next >= 0 and not lines[i_next].strip():
+    while i_next >= 0 and (not lines[i_next].strip() or _is_harness_marker(lines[i_next])):
         i_next -= 1
     if i_next < 0 or not _NEXT_RE.match(lines[i_next].strip()):
         return None
@@ -110,6 +121,17 @@ def find_continue_declaration(body: str) -> str | None:
         # Walking upward, the first CONTINUE: met is the one nearest NEXT:.
         return m.group("body").strip()
     return None
+
+
+def _is_harness_marker(line: str) -> bool:
+    """Is ``line`` one of the marker lines the dispatcher appends after a reply's handoff?"""
+    stripped = line.strip()
+    return (
+        stripped.startswith(SOURCE_MARKER_PREFIX) and stripped.endswith(SOURCE_MARKER_SUFFIX)
+    ) or (
+        stripped.startswith(ATTESTATION_MARKER_PREFIX)
+        and stripped.endswith(ATTESTATION_MARKER_SUFFIX)
+    )
 
 
 def _fence_open_before(lines: list[str], end: int) -> bool:
