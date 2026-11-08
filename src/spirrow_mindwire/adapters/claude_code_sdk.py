@@ -150,6 +150,10 @@ class _Session:
     own_role: Role
     state: SessionState
     last_active_at: datetime
+    # D-1' turn telemetry (T-implementer-context-drop-unexplained): the in-flight trigger id the
+    # PreCompact hook reads, and the session's cumulative prompt bytes. Required (no default):
+    # ``spawn`` is the only constructor and always passes the instance its PreCompact hook holds.
+    telemetry: TurnTelemetryState
     # The exact ``ClaudeAgentOptions`` instance passed to the SDK client on
     # spawn — kept so :meth:`ClaudeCodeSdkAdapter.source_marker_options` can
     # hand the harness that same object (msg-834 §2 (a)). ``Any`` typing so
@@ -162,9 +166,6 @@ class _Session:
     # ``SystemMessage(subtype="init")``. Not ``session_id`` — that name belongs to
     # mindwire's per-spawn ULID on the handle (Bohr msg-4884 §2).
     cc_session_uuid: str | None = None
-    # D-1' turn telemetry (T-implementer-context-drop-unexplained): the in-flight trigger id the
-    # PreCompact hook reads, and the session's cumulative prompt bytes.
-    telemetry: TurnTelemetryState = field(default_factory=TurnTelemetryState)
 
 
 class ClaudeCodeSdkSpawnError(AdapterSpawnError):
