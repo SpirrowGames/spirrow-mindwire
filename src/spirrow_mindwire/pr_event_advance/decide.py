@@ -307,6 +307,9 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
     if ref is None:
         return None
     # An accepted terminal form settles like ``NEXT: none`` (T-done-disposition-auto-close v2.4).
+    # Unlike 1c, 1b needs no roster re-read here even for a form the roster would refuse: ``none``
+    # ends in ``precheck``'s SETTLED noop, which writes nothing, so it cannot bury the head whose
+    # notice the park-wake tick owns (msg-8218 §2b-2).
     token = NONE_TOKEN if settles_by_terminal_form(body) else parse_next_token(body)
     return RelayTail(
         pr_ref=ref,

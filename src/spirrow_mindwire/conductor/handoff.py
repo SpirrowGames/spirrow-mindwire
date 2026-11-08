@@ -442,7 +442,16 @@ _FENCE_CLOSE_RE = re.compile(r"\A {0,3}(?P<fence>`{3,}|~{3,})[ \t]*\Z")
 
 
 def _fenced_line_starts(body: str) -> frozenset[int]:
-    """The start offsets of every line of ``body`` that lies inside a fenced code block."""
+    """The start offsets of every line of ``body`` that lies inside a fenced code block.
+
+    The set holds **line-start offsets only**. A caller that holds a position somewhere inside a
+    line must normalise it to its line's start (``body.rfind("\\n", 0, pos) + 1``) before the
+    membership test; comparing a mid-line position would always miss, and a fenced line would be
+    read as a control line. :func:`_control_next_matches` normalises its regex matches, so its
+    correctness does not depend on ``_NEXT_LINE_RE`` staying anchored at ``^`` (msg-8210
+    advisory / msg-8218 §2b-1). The ``STOP:`` check in :func:`_terminal_form` already holds a
+    line start (:func:`_last_meaningful_line` returns one), so it meets the same rule as is.
+    """
     fenced: set[int] = set()
     open_char: str | None = None
     open_len = 0
@@ -473,7 +482,9 @@ def _control_next_matches(body: str) -> list[re.Match[str]]:
     if not matches or ("```" not in body and "~~~" not in body):
         return matches
     fenced = _fenced_line_starts(body)
-    return [m for m in matches if m.start() not in fenced]
+    # Normalise each match to the start of its line before the membership test: ``fenced`` holds
+    # line-start offsets only (see :func:`_fenced_line_starts`).
+    return [m for m in matches if body.rfind("\n", 0, m.start()) + 1 not in fenced]
 
 
 class MalformedHandoff(StrEnum):

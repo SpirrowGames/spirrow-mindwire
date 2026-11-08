@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
+from spirrow_mindwire.conductor import handoff as handoff_mod
 from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR, render_relay_heading
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.github.client import (
@@ -57,6 +58,7 @@ from spirrow_mindwire.repo_projects import (
     parse_remote_url,
     repo_key,
 )
+from spirrow_mindwire.value_objects import Role
 
 pytestmark = pytest.mark.anyio
 
@@ -73,6 +75,7 @@ _REPO_MAP = RepoProjectMap(
     }
 )
 _LIVE = AutoGateConfig(live=True)
+_ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
 _HEAD = "703b836737f29fe0f4139d86d2d02077c662ce5f"
 _OLD = "1111111111111111111111111111111111111111"
 
@@ -173,6 +176,7 @@ async def _run(
     *,
     config: AutoGateConfig = _LIVE,
     now: datetime = _NOW,
+    roster: dict[str, Role] | None = _ROSTER,
 ) -> PassReport:
     return await run_pass(
         mcp=mcp,
@@ -184,6 +188,7 @@ async def _run(
         now=now,
         known_projects={"proj"},
         repo_map=_REPO_MAP,
+        roster=roster,
     )
 
 
@@ -421,7 +426,7 @@ def test_manual_line_for_another_pr_does_not_count() -> None:
 
 
 def test_post_has_marker_directly_above_next_and_routes_to_the_gate() -> None:
-    decision = tail_decision("NEXT: none", repo=_REPO, number=7)
+    decision = tail_decision("NEXT: none", repo=_REPO, number=7, roster=_ROSTER)
     assert isinstance(decision, Post)
     lines = decision.render().splitlines()
     assert lines[-1] == "NEXT: pr-review acme/widgets#7"
@@ -433,7 +438,7 @@ def test_post_has_marker_directly_above_next_and_routes_to_the_gate() -> None:
 
 @pytest.mark.parametrize("token", ["none", "operator", "None"])
 def test_idle_tail_fires(token: str) -> None:
-    assert isinstance(tail_decision(f"NEXT: {token}", repo=_REPO, number=7), Post)
+    assert isinstance(tail_decision(f"NEXT: {token}", repo=_REPO, number=7, roster=_ROSTER), Post)
 
 
 @pytest.mark.parametrize(
@@ -441,7 +446,7 @@ def test_idle_tail_fires(token: str) -> None:
     ["NEXT: human", "MERGE-WAIT: x\nNEXT: human", "NEXT: Heisenberg", "NEXT: pr-review a/b#1", "x"],
 )
 def test_busy_tail_queues(tail: str) -> None:
-    assert tail_decision(tail, repo=_REPO, number=7) is AutoGateNoop.QUEUED_BEHIND
+    assert tail_decision(tail, repo=_REPO, number=7, roster=_ROSTER) is AutoGateNoop.QUEUED_BEHIND
 
 
 # ---- the pass: msg-7735 table ------------------------------------------------------------------ #
@@ -716,6 +721,70 @@ async def test_queued_behind_reports_the_fields_msg_7485_names(tmp_path: Path) -
     assert detail["waiting_since"].startswith("2026-10-31")
 
 
+# ---- a settled tail the roster refuses (T-done-disposition-auto-close msg-8218 §2b-2) -------- #
+
+
+@pytest.mark.parametrize(
+    ("content", "field", "refusal"),
+    [
+        (
+            "x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg",
+            None,
+            "terminal-form-refused: blocked_on_bad_wake",
+        ),
+        ("x\n\nSTOP: done", "Bohr", "terminal-form-refused: field_conflict"),
+    ],
+)
+async def test_a_settled_tail_the_roster_refuses_is_held_not_fired(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    content: str,
+    field: str | None,
+    refusal: str,
+) -> None:
+    # The pass reads the tail's own ``next_participant`` field and the roster; the head is left
+    # for the park-wake tick's notice instead of being buried under a gate fire.
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
+    tail = _msg(content, msg_id="msg-60")
+    if field is not None:
+        tail["next_participant"] = field
+    mcp = FakeMcp({"T-x": [tail]})
+    report = await _run(mcp, FakeGh([_pr()]), tmp_path)
+    assert mcp.posts == []
+    assert report.noops["queued-behind"] == ["acme/widgets#7"]
+    (detail,) = report.details
+    assert detail["tail_refusal"] == refusal
+    assert detail["tail_msg_id"] == "msg-60"
+
+
+@pytest.mark.parametrize("roster", [None, {}])
+async def test_without_a_roster_a_settled_tail_is_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, roster: dict[str, Role] | None
+) -> None:
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
+    mcp = FakeMcp({"T-x": [_msg("x\n\nSTOP: done")]})
+    report = await _run(mcp, FakeGh([_pr()]), tmp_path, roster=roster)
+    assert mcp.posts == []
+    assert report.details[0]["tail_refusal"] == "roster-unavailable"
+
+
+async def test_a_settled_tail_the_roster_accepts_still_fires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
+    mcp = FakeMcp({"T-x": [_msg("x\n\nSTOP: done")]})
+    report = await _run(mcp, FakeGh([_pr()]), tmp_path)
+    assert len(mcp.posts) == 1
+    assert report.posted[0]["pr_ref"] == "acme/widgets#7"
+
+
+async def test_without_a_roster_a_legacy_idle_tail_still_fires(tmp_path: Path) -> None:
+    # The roster is read only for a terminal form; ``NEXT: none`` keeps its pre-change reading.
+    mcp = FakeMcp()
+    await _run(mcp, FakeGh([_pr()]), tmp_path, roster=None)
+    assert len(mcp.posts) == 1
+
+
 async def test_one_repos_listing_failure_costs_only_that_repo(tmp_path: Path) -> None:
     class Flaky(FakeGh):
         async def list_open_gate_prs(self, owner: str, repo: str) -> GatePrListing:
@@ -734,6 +803,7 @@ async def test_one_repos_listing_failure_costs_only_that_repo(tmp_path: Path) ->
         now=_NOW,
         known_projects={"proj"},
         repo_map=_REPO_MAP,
+        roster=_ROSTER,
     )
     assert report.list_errors[0]["repo"] == "acme/broken"
     assert len(mcp.posts) == 1
@@ -1043,6 +1113,7 @@ async def _run_cross(
         now=_NOW,
         known_projects=frozenset({"proj", "hub", "held"}),
         repo_map=_REPO_MAP,
+        roster=_ROSTER,
     )
 
 
@@ -1170,6 +1241,7 @@ async def _run_shared(
         now=_NOW,
         known_projects=frozenset({"proj", "app", "hub"}),
         repo_map=repo_map,
+        roster=_ROSTER,
     )
     return report, gh
 
