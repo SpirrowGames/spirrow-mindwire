@@ -2222,10 +2222,11 @@ def _render_prior_review(prior_review: str, prev_sha: str) -> str:
     """Assemble the ``<previous-review>`` body: (i) verdict record, (ii) objections, (iii) prose.
 
     Budget (msg-8391 Obj-2): (i) and (ii) are never cut; (iii) gets what is left of
-    :data:`_MAX_PRIOR_REVIEW_CHARS`, kept from the start, and a cut is labelled. When (i) and (ii)
-    alone do not fit, the block is left out and named as omitted, and no prose is shown: a JSON
-    block cut part-way would be a false whole. Lengths are counted after defanging, so the cap
-    bounds what the model actually reads. An empty ``prior_review`` renders as ``""``, exactly as
+    :data:`_MAX_PRIOR_REVIEW_CHARS`, kept from the start, and a cut is labelled; when what is left
+    cannot hold even the label, the prose is left out. When (i) and (ii) alone do not fit, the
+    block is left out and named as omitted, and no prose is shown: a JSON block cut part-way
+    would be a false whole. Lengths are counted after defanging, so the cap bounds what the model
+    actually reads. An empty ``prior_review`` renders as ``""``, exactly as
     before this change.
     """
     if not prior_review:
@@ -2245,10 +2246,15 @@ def _render_prior_review(prior_review: str, prev_sha: str) -> str:
     if len(prose) > budget:
         total = len(prose)
         reserve = len(_defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=total, total=total)))
-        shown = max(budget - reserve - 1, 0)
-        label = _defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=shown, total=total))
-        prose = f"{prose[:shown]}\n{label}"
-    return "\n\n".join([record, block, prose] if block else [record, prose])
+        if budget < reserve + 1:
+            # No room left even for the label: the prose is dropped whole rather than labelled
+            # past the cap (PR #538 gate round 1). (i) and (ii) are still shown in full.
+            prose = ""
+        else:
+            shown = budget - reserve - 1
+            label = _defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=shown, total=total))
+            prose = f"{prose[:shown]}\n{label}"
+    return "\n\n".join(part for part in (record, block, prose) if part)
 
 
 @dataclass(frozen=True)

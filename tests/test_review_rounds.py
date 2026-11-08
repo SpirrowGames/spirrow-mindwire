@@ -707,6 +707,32 @@ def test_an_objections_block_over_budget_is_omitted_not_cut() -> None:
     assert block.split("\n")[0].startswith("| Previous verdict (driver record): REQUEST_CHANGES")
 
 
+def test_the_cap_holds_when_the_block_leaves_no_room_for_the_prose_label() -> None:
+    # PR #538 gate round 1: a block that fits but leaves less than the truncation label's room
+    # used to get the label anyway, past the cap. Sweep the block size across that boundary.
+    from spirrow_mindwire.naysayer.pr_review import _MAX_PRIOR_REVIEW_CHARS
+
+    seen = {"labelled": 0, "dropped": 0, "omitted": 0}
+    for n in range(19_700, 20_000):
+        items = [{**BLOCKING_ITEM, "evidence": "e" * n}]
+        prior = _review_post(A_SHA, extra="x" * 3_000).replace(
+            f"{M}\n[]", f"{M}\n{json.dumps(items)}"
+        )
+        block = _previous_review_block(_scoped(prior))
+        assert len(block) <= _MAX_PRIOR_REVIEW_CHARS, n
+        if "[previous objections omitted: " in block:
+            seen["omitted"] += 1
+            continue
+        assert "e" * n in block, n
+        if "[previous critique prose truncated: " in block:
+            seen["labelled"] += 1
+        else:
+            assert "critique of" not in block and "xxx" not in block, n
+            assert not block.endswith("\n"), n
+            seen["dropped"] += 1
+    assert all(seen.values()), seen
+
+
 def test_an_echo_of_the_previous_review_does_not_add_a_verdict_line() -> None:
     from spirrow_mindwire.naysayer.pr_review import ModelVerdict, _parse_model_verdict
 
