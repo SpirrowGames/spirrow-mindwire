@@ -5,7 +5,7 @@ touching any core (watcher / dispatcher / adapter):
 
 - **role resolution**: with the three production adapters registered, the
   registry routes PROPOSER → read-only ``Stage3ProposerAdapter``, IMPLEMENTER →
-  the allow-list-gated ``ImplementerSdkAdapter``, NAYSAYER → the independent
+  ``ImplementerSdkAdapter``, NAYSAYER → the independent
   design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
   unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
   the wrinkle the runner solves: the base ``ClaudeCodeSdkAdapter`` declares
