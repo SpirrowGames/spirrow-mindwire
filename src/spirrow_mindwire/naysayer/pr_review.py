@@ -1929,7 +1929,7 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"at head `{head_short}`.** {len(demoted)} blocking objection"
             f"{'s' if len(demoted) != 1 else ''} demoted to advisory because the cited "
             f"line(s) — {wheres} — are composed entirely of whitespace in the reviewed "
-            f"tree and the objection's own evidence asserts a miscount there. The "
+            f"tree and each objection's own evidence asserts a miscount there. The "
             f"objection text is preserved in the advisory bucket below; only its "
             f"blocking classification was withdrawn."
         )
@@ -1941,6 +1941,9 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             parsed_where = _parse_single_line_where(o.where)
             fragment = _miscount_assertion(o.evidence, parsed_where[1]) if parsed_where else None
             if fragment is not None:
+                # \s* in the patterns can span a newline; collapse whitespace so the
+                # quote stays inside this one blockquote list item.
+                fragment = " ".join(fragment.split())
                 lines.append(f"> - `{o.where}` — miscount asserted: “{fragment}”")
         if decision.gate_verdict_overridden:
             lines.append(

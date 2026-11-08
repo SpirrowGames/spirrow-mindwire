@@ -5971,3 +5971,38 @@ async def test_pr_gate_timeout_degrade_skips_the_backend_read_back(
     assert "VERDICT: COMMENT" in posted[0]
     assert reads == []
     assert _attest_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_ac_v11_d4_fragment_with_newline_stays_in_one_blockquote_item() -> None:
+    """D-4 polish (PR-gate advisory on #535): a P-1 match spanning a newline is quoted
+    on one line, so the blockquote list item does not break."""
+    payload = json.dumps(
+        [
+            {
+                "class": _blocking_class(),
+                "where": "Docs/T07.md:287",
+                "evidence": "Q-A is on line 287\n(not 288)",
+            },
+            {
+                "class": _blocking_class(),
+                "where": "Docs/T07.md:290",
+                "evidence": "Q-B is on line 290 (not 291)",
+            },
+        ]
+    )
+    critique = _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+    lines = ["content"] * 300
+    lines[286] = ""
+    lines[289] = ""
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-v11-d4nl", []),
+        files={("Docs/T07.md", "sha-v11-d4nl"): "\n".join(lines) + "\n"},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content=critique), github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    assert "`Docs/T07.md:287` — miscount asserted: “line 287 (not 288)”" in body
+    assert "each objection's own evidence" in body
