@@ -16,6 +16,7 @@ import pytest
 
 from spirrow_mindwire.conductor.gate_records import (
     MERGE_WAIT_LINE,
+    RELAY_AUTHOR,
     RelayRoute,
     render_relay_heading,
     verdict_heads,
@@ -1178,6 +1179,67 @@ async def test_one_fire_lands_in_both_the_ledger_and_the_design_thread() -> None
     assert relay["route"] is RelayRoute.HUMAN
     assert relay["author"] == "pr-gate-relay"
     assert relay["content"] == design["content"]
+
+
+@pytest.mark.anyio
+async def test_a_relay_dropped_on_a_resolved_design_thread_returns_the_empty_msg_id_stub() -> None:
+    # T-relay-drop-stub-pinned-only-against-the-fake (Bohr msg-2777 / msg-8407 / msg-8409 /
+    # msg-8411): the empty ``msg_id`` that ``_post_design_relay`` returns when the design thread
+    # is resolved is the ONLY observable that the verdict did not land there — the conductor
+    # fails safe to the human on it and the driver exits 2 (D-5). Until this test, that value
+    # was pinned only against the conductor's fake ``_ScriptedPrGate``, so production could
+    # have returned a non-empty ``msg_id`` with the whole suite green.
+    #
+    # Targeted by ``thread_id``, not by tool name: only the design-thread post is refused, the
+    # ledger post succeeds. The callable goes through ``_FakeMcp``, so the envelope is elevated
+    # to ThreadResolvedError at ``raise_if_envelope`` — the same point production elevates it.
+    ledger_thread = "T-pr-review-r-7"
+
+    def _post(*, drop_relay: bool) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def answer(arguments: dict[str, Any]) -> dict[str, Any]:
+            thread_id = arguments["thread_id"]
+            if drop_relay and thread_id == _DESIGN_THREAD:
+                return _error_envelope(
+                    "ChatroomStateError",
+                    f"Cannot post to thread '{thread_id}' in status='resolved'",
+                    project="p",
+                    thread_id=thread_id,
+                )
+            return {"msg": {"msg_id": f"msg-for-{thread_id}"}}
+
+        return answer
+
+    async def fire(*, drop_relay: bool) -> tuple[_FakeMcp, _SubmittingDriver, dict[str, Any]]:
+        mcp = _FakeMcp(results={"chatroom_post_message": _post(drop_relay=drop_relay)})
+        driver = _SubmittingDriver()
+        orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+        _ref, _outcome, relay = await orch.fire_pr_review(
+            project="p", pr_ref="o/r#7", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+        )
+        return mcp, driver, relay
+
+    _mcp_ok, _driver_ok, relay_ok = await fire(drop_relay=False)
+    mcp, driver, relay_dropped = await fire(drop_relay=True)
+
+    # 1. Premise: the landed relay carries a real msg_id, else the equality in 3. means nothing.
+    assert relay_ok["msg_id"] != ""
+
+    # 2. Absolute contract (Obj-2-1): the keys downstream reads exist on BOTH paths, so a change
+    #    that drops one from the success and the stub together cannot hide behind 3.
+    for relay in (relay_ok, relay_dropped):
+        assert {"msg_id", "author", "content", "route"} <= set(relay)
+        assert relay["author"] == RELAY_AUTHOR
+        assert relay["content"]
+
+    # 3. Relative contract (Obj-1-1): the stub is the landed relay with msg_id emptied — every
+    #    other key, including any added to the success path later, must match.
+    assert relay_dropped == {**relay_ok, "msg_id": ""}
+
+    # Disposition (1): the drop did not roll back the ledger post, and the GitHub review — the
+    # primary artifact — was still submitted.
+    posts = [args["thread_id"] for name, args in mcp.calls if name == "chatroom_post_message"]
+    assert posts == [ledger_thread, _DESIGN_THREAD]
+    assert driver.submitted is True
 
 
 @pytest.mark.anyio
