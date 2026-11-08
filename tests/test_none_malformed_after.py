@@ -297,3 +297,18 @@ def test_the_tail_cache_carries_the_timestamp() -> None:
     )
     assert posted_at_of(tail.as_message()) == datetime(2026, 11, 8, 22, 30, 41, tzinfo=UTC)
     assert CachedTail.from_message(tail.as_message()) == tail
+
+
+def test_the_tail_cache_keeps_a_datetime_timestamp() -> None:
+    """PR-gate on #548: a datetime ``timestamp`` is kept, not dropped to "after the cutoff"."""
+    stamp = datetime(2026, 11, 8, 22, 30, 41, tzinfo=UTC)
+    tail = CachedTail.from_message(
+        {"msg_id": "m1", "author": "a", "content": "c", "timestamp": stamp}
+    )
+    assert tail.timestamp is not None
+    assert posted_at_of(tail.as_message()) == stamp
+    assert CachedTail.from_message(tail.as_message()) == tail
+    naive = CachedTail.from_message(
+        {"msg_id": "m1", "author": "a", "content": "c", "timestamp": NAIVE}
+    )
+    assert posted_at_of(naive.as_message()) is None  # no timezone stays unknown, as posted_at_of

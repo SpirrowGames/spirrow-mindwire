@@ -35,6 +35,7 @@ import json
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,11 @@ class CachedTail:
     def from_message(cls, msg: Mapping[str, Any]) -> CachedTail:
         np = msg.get("next_participant")
         ts = msg.get("timestamp")
+        if isinstance(ts, datetime):
+            # Every live caller hands a JSON-decoded chatroom row, whose ``timestamp`` is a string;
+            # a datetime is kept (as ISO text) rather than dropped, because a dropped time reads as
+            # "after the cutoff" (PR-gate on #548).
+            ts = ts.isoformat()
         return cls(
             msg_id=str(msg.get("msg_id") or ""),
             author=str(msg.get("author", "")),
