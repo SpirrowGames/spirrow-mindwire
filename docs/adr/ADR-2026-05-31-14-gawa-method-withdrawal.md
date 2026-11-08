@@ -244,7 +244,7 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
     - 5 語のすぐ後ろが区切り文字（下線・ハイフン・ドット）で、そのあとに次の語が来て語が終わる場合: re・regex・pattern・rx・count・len・length・limit・max・min・type・kind・name・names・label・ref・path・file・env・var・header・field・id。
     - 5 語のすぐ後ろに大文字で始まる語が来て語が終わり、その語の先頭の 1 文字を小文字にすると上のリストの語になる場合（secretName、passwordRegex など）。
     - 1 行に候補が複数あるときは、外されない候補が 1 つでもあれば key line とします。
-    - **本文テキストの行の JSON メンバー:** 本文テキストの行に書かれた JSON メンバーも key line として扱う。名前が camelCase の除外に当たる場合、その名前を根拠とする代入検出では値を伏せない。値そのものが既知の鍵の形やエントロピーの規則に当たれば、ほかの検出器で伏せられる（spirrow-lexora 同スレッド msg-988 / msg-990。回帰テストは spirrow-lexora#107）。
+    - **本文テキストの行の JSON メンバー:** 本文テキストの行に書かれた JSON メンバーも key line の候補として扱う。名前が camelCase の除外に当たる場合、その名前を根拠とする代入検出では値を伏せない。値そのものが既知の鍵の形やエントロピーの規則に当たれば、ほかの検出器で伏せられる（spirrow-lexora 同スレッド msg-988 / msg-990。回帰テストは spirrow-lexora#107）。
   - **これで弱まる検出**（受け入れたもの。下の「受け入れる残りのリスク」を参照）
     - エントロピーの判定で漏れるもの: `_` を含み `-` を含まない base64url と、`/` を含み `+` を含まない標準 base64 のうち、区切りのない連続がどれも 32 文字未満のもの。測定結果は Lexora PR-1 の property test の記録を正とします。
     - key line の外にある、`_` でつないだパスフレーズ。
