@@ -843,6 +843,13 @@ the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`
 does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
 without writing a line. Registration stops if no absolute path can be resolved.
 
+Re-running it replaces an existing `mindwire-stall-ledger` task with this script's definition
+(`-Force`). Success is decided by reading the task back, not by whether `Register-ScheduledTask`
+threw: the script compares Execute / Arguments / RepetitionInterval / ExecutionTimeLimit of the
+registered task with what it meant to register, prints `verified mindwire-stall-ledger ...` only when
+all four match, and throws on a missing task or any mismatch. If the registration itself failed but
+the existing task already matches, the `verified` line says so and nothing was replaced.
+
 **GitHub token.** Set `MINDWIRE_STALL_LEDGER_GITHUB_TOKEN` in that user's **User** environment to
 the implementer PAT (`takahito-spirrowgames`; the ledger only reads). Never use the naysayer token.
 `run-stall-ledger-tick.ps1` hands it to the tick process only, as `MINDWIRE_GITHUB_TOKEN`, and drops

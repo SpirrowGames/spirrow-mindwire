@@ -209,6 +209,13 @@ def _code_lines(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
+def _line_of(pattern: str, code: str) -> int:
+    """Index of the one code line matching ``pattern``; fails when none or several match."""
+    hits = [i for i, line in enumerate(code.splitlines()) if re.search(pattern, line)]
+    assert len(hits) == 1, f"expected exactly one line matching {pattern!r}, got {hits}"
+    return hits[0]
+
+
 def test_wrapper_passes_the_stall_ledger_token_as_mindwire_github_token() -> None:
     code = _code_lines(_ps1("run-stall-ledger-tick.ps1"))
     assert re.search(
@@ -218,9 +225,11 @@ def test_wrapper_passes_the_stall_ledger_token_as_mindwire_github_token() -> Non
     # chosen for it (or under none, which fails loud as auth_missing).
     assert re.search(r"Remove-Item\s+Env:MINDWIRE_GITHUB_TOKEN", code)
     assert re.search(r"Remove-Item\s+Env:GITHUB_TOKEN", code)
-    drop = code.index("Remove-Item Env:MINDWIRE_GITHUB_TOKEN")
-    assign = code.index("$env:MINDWIRE_GITHUB_TOKEN =")
-    run = code.index("& uv")
+    # Order by the line numbers of anchored, unique matches -- not by substring offsets,
+    # which a stray "& uv" elsewhere would silently satisfy (msg-6425 advisory, D-16d-0).
+    drop = _line_of(r"^\s*Remove-Item\s+Env:MINDWIRE_GITHUB_TOKEN\b", code)
+    assign = _line_of(r"^\s*\$env:MINDWIRE_GITHUB_TOKEN\s*=", code)
+    run = _line_of(r"^\s*&\s*uv\s+@tickArgs\b", code)
     assert drop < assign < run
     # A blank value is not copied over (it would read as a token-shaped nothing).
     assert ".Trim()" in code
