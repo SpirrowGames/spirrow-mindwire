@@ -10,6 +10,11 @@ The status / debug commands are still deferred to a later phase.
 measures a PR's diff exactly as the naysayer gate does and prints ``decision=fix-now`` (exit 0)
 or ``decision=split`` (exit 3); see :mod:`spirrow_mindwire.naysayer.pr_diff_size`.
 
+``mindwire settled-close --dry-run [--include-legacy] [--projects a,b] [--format table]``
+(T-done-disposition-auto-close boundary 6) lists, read-only, which open threads magickit's
+settled-disposition carve-out would close; ``--tick`` is the sweep's call and does nothing unless
+``sweep.json``'s ``settled_close.enabled`` is true. See :mod:`spirrow_mindwire.settled_close`.
+
 ``mindwire clone-check --repo-dir <dir>`` (T-clone-guard-pin-ignored-only-in-mindwire, design
 v2.1 D-3c, Bohr msg-6162 / msg-6164) re-judges a shared clone the sweep wrapper has parked after a
 dirty-clone exit 8. It runs exactly what the dispatcher runs before a dispatch —
@@ -118,6 +123,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="mindwire.toml to resolve the ledger path from (default: the standard location)",
     )
+    settled = sub.add_parser(
+        "settled-close",
+        help="settled_close: --dry-run lists what would close (read only); --tick is the sweep's",
+    )
+    from .settled_close.__main__ import add_arguments as add_settled_close_arguments
+
+    add_settled_close_arguments(settled)
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -178,6 +190,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(run_band_count(args.limit))
     if args.command == "clone-check":
         raise SystemExit(clone_check(args.repo_dir))
+    if args.command == "settled-close":
+        from .settled_close.__main__ import run as run_settled_close
+
+        raise SystemExit(run_settled_close(args))
     if args.command == "clone-recover":
         from .clone_recover import run as run_clone_recover
 

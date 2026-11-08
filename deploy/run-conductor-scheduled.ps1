@@ -267,6 +267,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # Invoke-OperatorLanePass / Publish-OperatorLaneResult. Calls Write-Log and Send-NotificationIfChanged
 # at call time, so they may be defined further down.
 . (Join-Path $PSScriptRoot 'lib/OperatorLane.ps1')
+# settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
+# Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
+. (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -6202,11 +6205,19 @@ try {
     }
 
     $phaseStartUtc = Get-SweepNowUtc
-    $autoGate = Invoke-AutoGateTick -Projects (Get-AutoGateProjects -PassedHold $autoGateProjects `
+    $passedHoldProjects = Get-AutoGateProjects -PassedHold $autoGateProjects `
         -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
-        -Clones $sweepIntakeConfig.clones)
+        -Clones $sweepIntakeConfig.clones
+    $autoGate = Invoke-AutoGateTick -Projects $passedHoldProjects
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'autogate' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+
+    # settled_close (boundary 6): the same projects as 1c. Off by default, and off it spawns nothing.
+    $phaseStartUtc = Get-SweepNowUtc
+    $null = Invoke-SettledCloseTick -Projects $passedHoldProjects -SweepConfigPath $sweepConfigPath `
+        -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+        -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }
+    Add-PreLoopPhase -Phases $preLoopPhases -Name 'settledclose' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
 
     # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
     # are classified too. See Invoke-DeclaredProjectsParkWake.

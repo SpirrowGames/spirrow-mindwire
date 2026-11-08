@@ -391,6 +391,16 @@ def test_protocol_block_indents_only_its_code_examples() -> None:
     assert set(indented) <= meant_as_code, set(indented) - meant_as_code
 
 
+def test_protocol_block_keeps_finished_and_waiting_in_separate_paragraphs() -> None:
+    """PR-gate msg-8483 advisory: once the list markers went, the line ending the Finished
+    explanation and the line opening Waiting were adjacent, and adjacent lines are one Markdown
+    paragraph. Each of the two forms must open its own paragraph (a blank line above it)."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    for opener in ("Finished — ", "Waiting — "):
+        index = core.index(opener)
+        assert core[:index].endswith("\n\n"), f"{opener!r} does not start a paragraph"
+
+
 def test_protocol_block_says_next_none_is_legacy() -> None:
     """``NEXT: none`` is still accepted until boundary 5, so the block names it, but only to say
     it is no longer written (msg-8328 §2 3-D). The opening rule names both control lines."""
