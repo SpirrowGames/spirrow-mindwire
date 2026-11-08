@@ -251,6 +251,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     )
     head = f"You are acting as the {own_role.value} role in thread {event.thread_ref.thread_id}."
     blocks = [head]
+    # T-naysayer-invents-next-participant D-1: the names a NEXT: line may address, right after
+    # the role line. Absent -> no block, so the prompt is unchanged.
+    if event.roster_notice:
+        blocks.append(event.roster_notice)
     if event.review_round_notice:
         blocks.append(event.review_round_notice)
     if event.conditional_proceed_notice:

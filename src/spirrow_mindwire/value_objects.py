@@ -256,6 +256,10 @@ class ChatroomEvent:
     # naysayer dispatch, and only when the project's ``conditional_proceed`` is ``issuing``: the
     # notice offering the conditional exit. ``None`` everywhere else; the prompt is unchanged.
     conditional_proceed_notice: str | None = None
+    # T-naysayer-invents-next-participant D-1. Set only by the conductor, on every dispatch, for
+    # every role: the participants a NEXT: line may name (``handoff.build_roster_notice``).
+    # ``None`` off the conductor path or for an empty roster; the prompt is unchanged.
+    roster_notice: str | None = None
     # The thread's tags, as the reader saw them (``chatroom_get_thread`` ``thread.tags``).
     # ``None`` = not read. The naysayer's tier routing reads the ``n3-sensitive`` marker
     # here and treats ``None`` as "marked" (ADR-14 §7.3, fail-safe to the Gemini tier).
