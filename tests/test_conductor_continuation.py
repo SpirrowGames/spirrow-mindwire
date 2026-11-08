@@ -94,6 +94,32 @@ async def test_1_relay_ends_on_next_implementer_and_dispatches_it() -> None:
 
 
 @pytest.mark.anyio
+async def test_1a_report_carrying_harness_markers_is_continued() -> None:
+    """Production shape: a human decide enters, and the stored report ends on the markers.
+
+    spirrow-mindwire msg-8150 → msg-8151: the dispatcher appends ``<!-- source: … -->`` after the
+    implementer's ``NEXT:``, so the stored body's last non-blank line is the marker. That report
+    must still be continued, not stopped as SELF_HANDOFF.
+    """
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="A: 最後まで終えてから PR を開く。\n\nNEXT: Heisenberg")
+    mcp.seed(
+        author="Heisenberg",
+        content=_report("write tests")
+        + "\n\n<!-- source: tools=11 · mcp=1 · setting_sources=empty · route=api.anthropic.com"
+        " · tier=claude-opus-5-5 -->",
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["all done\n\nNEXT: Bohr"]})
+
+    await _conductor(mcp, disp).run()
+
+    relays = _relays(mcp)
+    assert len(relays) == 1
+    assert relays[0]["content"].splitlines()[0] == "[continue 1/3] write tests"
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m3")
+
+
+@pytest.mark.anyio
 async def test_1b_relay_head_passes_guard_i_by_carve_out_iv() -> None:
     """A relay left at the head (the run ended after posting it) relaunches the implementer."""
     mcp = _FakeChatroomMcp()
@@ -493,6 +519,25 @@ async def test_5b_unwired_clone_check_is_fail_closed() -> None:
         ("NEXT: Heisenberg", None),
         # no NEXT at the end
         ("CONTINUE: a\nNEXT: Heisenberg\nafterword", None),
+        # the dispatcher's source marker after NEXT (production shape, msg-8151)
+        (
+            "work\nCONTINUE: a\nNEXT: Heisenberg\n\n"
+            "<!-- source: tools=11 · mcp=1 · setting_sources=empty · route=api.anthropic.com"
+            " · tier=claude-opus-5-5 -->",
+            "a",
+        ),
+        # source + attestation markers, with trailing blank lines
+        (
+            "work\nCONTINUE: a\nNEXT: Heisenberg\n\n<!-- source: tools=0 · mcp=0 -->\n"
+            "<!-- attest: tier=naysayer · backend=codex -->\n\n",
+            "a",
+        ),
+        # an arbitrary HTML comment after NEXT is not a harness marker: still no declaration
+        ("CONTINUE: a\nNEXT: Heisenberg\n<!-- note -->", None),
+        # a marker does not hide prose after NEXT
+        ("CONTINUE: a\nNEXT: Heisenberg\nafterword\n<!-- source: tools=0 -->", None),
+        # a marker is not a NEXT line: the walk still needs a real NEXT above it
+        ("work\nCONTINUE: a\n<!-- source: tools=0 -->", None),
     ],
 )
 def test_6_find_continue_declaration(body: str, expected: str | None) -> None:
