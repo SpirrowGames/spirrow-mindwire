@@ -340,8 +340,12 @@ def test_protocol_block_teaches_only_forms_the_parser_accepts(role: Role) -> Non
     names (DONE / BLOCKED_ON) and never to MALFORMED."""
     block = build_handoff_protocol_block(role)
     for form in handoff_mod.STOP_FORM_EXAMPLES:
+        # Slice I (msg-8455 §1 I-1): the examples are embedded NOT indented, because an indented
+        # terminal form is refused (``indented_terminal_form``). The whole example starts a line
+        # of the block, and no indented copy of it is taught anywhere.
+        assert f"\n{form}\n" in block, form
         for line in form.splitlines():
-            assert f"    {line}\n" in block, line
+            assert f"    {line}" not in block, line
     for arm in STOP_TRIGGER_ARMS:
         assert f"`{arm} <" in block
     # The legacy line is no longer taught, and neither is the refused ``self`` arm.
@@ -369,6 +373,22 @@ def _settle_status(body: str) -> StopStatus | None:
     assert handoff.malformed is None, (body, handoff.malformed)
     assert handoff.kind is HandoffKind.NONE, body
     return handoff.stop_line.status if handoff.stop_line is not None else None
+
+
+def test_protocol_block_indents_only_its_code_examples() -> None:
+    """PR-gate msg-8461: an example at column 0 closes the Markdown list around it, so prose that
+    stays indented after it renders as a root-level indented code block. In CommonMark only a line
+    indented four spaces or a tab can open such a block, so every such line of the protocol block
+    must be one of the examples meant to render as code, never prose."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    meant_as_code = {"    NEXT: <name>"} | {
+        f"    {line}" for line in handoff_mod.OPERATOR_FORM_EXAMPLE.splitlines()
+    }
+    indented = [
+        line for line in core.splitlines() if line.startswith(("    ", "\t")) and line.strip()
+    ]
+    assert indented, "the NEXT: example is expected to stay indented"
+    assert set(indented) <= meant_as_code, set(indented) - meant_as_code
 
 
 def test_protocol_block_says_next_none_is_legacy() -> None:

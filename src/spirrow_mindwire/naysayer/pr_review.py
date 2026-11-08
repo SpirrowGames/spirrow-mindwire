@@ -2143,8 +2143,118 @@ class DiffView:
 
 
 # The previous critique is context for the scoped round, and only that; a long one is cut rather
-# than allowed to crowd out the diff under review.
+# than allowed to crowd out the diff under review. The cap bounds the WHOLE assembled
+# ``<previous-review>`` body (verdict record + objections block + prose, after defanging); see
+# :func:`_render_prior_review` for how the budget is split.
 _MAX_PRIOR_REVIEW_CHARS = 20_000
+
+# ---- Defanging the injected previous review (#115 required item, msg-1978 §5 (ii) / msg-7223) ----
+#
+# The previous review is the gate's OWN earlier output, so it carries exactly the strings the
+# output parsers key on: a column-zero verdict line, the objections sentinel, and the verdict
+# footer. Placed verbatim in the prompt they are a copy source: a model that "summarises its
+# previous review" can echo one onto column 0 of the NEW critique. The injection side removes the
+# copy source. It cannot stop the model from retyping a verdict line on its own (the system
+# prompt asks for one); that residue belongs to the output side (D-1: two-plus column-zero
+# verdict lines fail closed, :func:`_scan_verdict_lines`). Four layers, stacked on purpose
+# (T-naysayer-ledger-visibility msg-8391 Obj-1):
+#
+# 1. the footer is stripped (:func:`_body_without_footer`) and the previous verdict is rewritten
+#    by the driver as :data:`_PRIOR_VERDICT_RECORD`, which carries no ``VERDICT:`` token;
+# 2. every ``VERDICT:`` (any case, any position) becomes ``PAST-VERDICT:``;
+# 3. the objections sentinel becomes the plain label :data:`_PRIOR_OBJECTIONS_LABEL` (the JSON
+#    payload stays: the previous objections are the point of showing the review at all);
+# 4. every line gets :data:`_PRIOR_LINE_PREFIX`, so nothing that slipped past 2/3 sits on column 0.
+_PRIOR_VERDICT_RECORD = "Previous verdict (driver record): {event} at {sha}"
+_PRIOR_OBJECTIONS_LABEL = "[previous objections]"
+_PRIOR_LINE_PREFIX = "| "
+_PRIOR_VERDICT_TOKEN_RE = re.compile(r"verdict:", re.IGNORECASE)
+_PRIOR_PROSE_TRUNCATED = "[previous critique prose truncated: {shown} of {total} chars shown]"
+_PRIOR_OBJECTIONS_OMITTED = (
+    "[previous objections omitted: the block ({chars} chars) does not fit the "
+    "previous-review budget, and a cut JSON block would misstate it]"
+)
+_FENCE_CLOSE_RE = re.compile(r"\s*```[^\n]*")
+
+
+def _defang_prior(text: str) -> str:
+    """Apply layers 2-4 of the defang above to one part of the previous review."""
+    text = _PRIOR_VERDICT_TOKEN_RE.sub("PAST-VERDICT:", text)
+    text = text.replace(_OBJECTIONS_SENTINEL, _PRIOR_OBJECTIONS_LABEL)
+    return "\n".join(_PRIOR_LINE_PREFIX + line for line in text.split("\n"))
+
+
+def _split_objections_block(body: str) -> tuple[str, str]:
+    """Return ``(block, prose)``: the column-zero objections block, and the body without it.
+
+    The block runs from the sentinel to the end of the JSON array, plus the closing fence when the
+    array was fenced. A body whose block cannot be located (not exactly one column-zero sentinel,
+    no decodable array) returns ``("", body)``: the sentinel then stays in the prose, where
+    :func:`_defang_prior` still neutralises it. Nothing is guessed; the only cost is that the
+    objections are budgeted as prose.
+    """
+    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(body))
+    if len(matches) != 1:
+        return "", body
+    start, rest = matches[0].start(), body[matches[0].end() :]
+    offset = len(rest) - len(rest.lstrip())
+    fenced = rest.startswith("```", offset)
+    if fenced:
+        newline = rest.find("\n", offset)
+        if newline < 0:
+            return "", body
+        offset = newline + 1
+        offset += len(rest[offset:]) - len(rest[offset:].lstrip())
+    if not rest.startswith("[", offset) or _nesting_exceeds(rest[offset:]):
+        return "", body
+    try:
+        _value, end = json.JSONDecoder().raw_decode(rest, offset)
+    except ValueError:
+        return "", body
+    if fenced and (close := _FENCE_CLOSE_RE.match(rest, end)) is not None:
+        end = close.end()
+    stop = matches[0].end() + end
+    prose = (body[:start].rstrip() + "\n\n" + body[stop:].lstrip()).strip()
+    return body[start:stop], prose
+
+
+def _render_prior_review(prior_review: str, prev_sha: str) -> str:
+    """Assemble the ``<previous-review>`` body: (i) verdict record, (ii) objections, (iii) prose.
+
+    Budget (msg-8391 Obj-2): (i) and (ii) are never cut; (iii) gets what is left of
+    :data:`_MAX_PRIOR_REVIEW_CHARS`, kept from the start, and a cut is labelled; when what is left
+    cannot hold even the label, the prose is left out. When (i) and (ii) alone do not fit, the
+    block is left out and named as omitted, and no prose is shown: a JSON block cut part-way
+    would be a false whole. Lengths are counted after defanging, so the cap bounds what the model
+    actually reads. An empty ``prior_review`` renders as ``""``, exactly as
+    before this change.
+    """
+    if not prior_review:
+        return ""
+    footer = parse_verdict_footer(prior_review)
+    event = footer[1].value if footer is not None else "unrecorded"
+    record = _defang_prior(_PRIOR_VERDICT_RECORD.format(event=event, sha=prev_sha[:12]))
+    block, prose = _split_objections_block(_body_without_footer(prior_review))
+    block = _defang_prior(block) if block else ""
+    budget = _MAX_PRIOR_REVIEW_CHARS - len(record) - 2  # the blank line after the record
+    if block:
+        if len(block) > budget:
+            omitted = _defang_prior(_PRIOR_OBJECTIONS_OMITTED.format(chars=len(block)))
+            return f"{record}\n\n{omitted}"
+        budget -= len(block) + 2
+    prose = _defang_prior(prose)
+    if len(prose) > budget:
+        total = len(prose)
+        reserve = len(_defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=total, total=total)))
+        if budget < reserve + 1:
+            # No room left even for the label: the prose is dropped whole rather than labelled
+            # past the cap (PR #538 gate round 1). (i) and (ii) are still shown in full.
+            prose = ""
+        else:
+            shown = budget - reserve - 1
+            label = _defang_prior(_PRIOR_PROSE_TRUNCATED.format(shown=shown, total=total))
+            prose = f"{prose[:shown]}\n{label}"
+    return "\n\n".join(part for part in (record, block, prose) if part)
 
 
 @dataclass(frozen=True)
@@ -2164,7 +2274,7 @@ class PrRoundContext:
     def render(self) -> str:
         if self.scope != "delta":
             return ""
-        prior = self.prior_review[:_MAX_PRIOR_REVIEW_CHARS]
+        prior = _render_prior_review(self.prior_review, self.prev_sha)
         return (
             f"REVIEW ROUND: {self.round_number} / SCOPE: the delta below, from your previous "
             f"review at {self.prev_sha[:12]}, plus the existing parts it affects. The whole-PR "
