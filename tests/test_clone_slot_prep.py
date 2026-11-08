@@ -544,6 +544,28 @@ def test_index_lock_counter_resets_when_the_lock_goes(world: dict[str, Path]) ->
     assert _owner(world)["index_lock_ticks"] == 2 and _rows(world) == []
 
 
+def test_unpark_with_lock_still_present_recounts_and_reparks(world: dict[str, Path]) -> None:
+    """msg-8212: park clears index_lock_ticks, so an unpark that leaves the lock
+    in place counts 3 ticks again and parks again with a second row."""
+    slot = _ready(world)
+    lock = _stale_index_lock(slot)
+    for _ in range(3):
+        last = _prep(world, guard_factory=_fast_guard).run()
+    assert last.action is PrepAction.PARK and last.park_code == PARK_INDEX_LOCK_STALE
+    assert "index_lock_ticks" not in _owner(world) and len(_rows(world)) == 1
+    # unpark: the loop launches prep again for this thread, lock untouched
+    for n in (1, 2):
+        res = _prep(world, guard_factory=_fast_guard).run()
+        assert res.action is PrepAction.SKIP, res
+        assert _owner(world)["index_lock_ticks"] == n and len(_rows(world)) == 1
+    res = _prep(world, guard_factory=_fast_guard).run()
+    assert res.action is PrepAction.PARK and res.park_code == PARK_INDEX_LOCK_STALE
+    rows = _rows(world)
+    assert len(rows) == 2 and rows[1] == res.record
+    assert rows[1]["quarantine_reason"] == "index_lock" and rows[1]["action"] == "parked"
+    assert lock.exists() and slot.exists() and _quarantined(world) == []
+
+
 def test_stale_index_lock_park_leaves_other_slot_of_repo_launching(
     world: dict[str, Path],
 ) -> None:

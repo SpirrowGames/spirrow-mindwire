@@ -526,3 +526,49 @@ def test_naysayer_gating_shadow_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     assert MindwireSettings().naysayer_gating.shadow is False
     monkeypatch.setenv("MINDWIRE_NAYSAYER_GATING__SHADOW", "true")
     assert MindwireSettings().naysayer_gating.shadow is True
+
+
+# --- [loop].slots_root (T-ephemeral-impl-clone-slot-per-thread, msg-8061 INV-0 / R-7) ---------
+
+
+def test_slots_root_defaults_to_unset_keeping_single_repo_dir(tmp_path: Path) -> None:
+    """INV-0: no slots_root → None, and repo_dir is the one clone exactly as before."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            f"""
+            schema_version = 1
+
+            [loop]
+            repo_dir = {str(tmp_path).replace(chr(92), "/")!r}
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.loop.slots_root is None
+    assert s.loop.repo_dir == tmp_path
+
+
+def test_slots_root_blank_reads_as_unset(tmp_path: Path) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text('schema_version = 1\n\n[loop]\nslots_root = "  "\n', encoding="utf-8")
+    assert load_settings(cfg).loop.slots_root is None
+
+
+def test_slots_root_is_refused_until_the_loop_wiring_lands(tmp_path: Path) -> None:
+    """msg-8055 R-7: a set value is refused at load, never silently ignored."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            f"""
+            schema_version = 1
+
+            [loop]
+            slots_root = {str(tmp_path / "slots").replace(chr(92), "/")!r}
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="slots_root is not accepted yet"):
+        load_settings(cfg)
