@@ -67,6 +67,42 @@ $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -Worki
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $interval
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit $limit `
     -StartWhenAvailable
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description 'MindWire stall ledger: one log-only heartbeat (D-16c)' | Out-Null
-Write-Output "registered $TaskName ($pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)"
+# Success is decided by reading the task back, never by whether Register-ScheduledTask threw
+# (T-stalled-pr-has-no-detector msg-8361 Obj-1-3). Register-ScheduledTask is a CDXML function: the
+# script's $ErrorActionPreference does not reach inside it, and without -Force an existing task made
+# it fail ("already exists") while this script still printed "registered" (msg-7374). -Force makes
+# this script's definition replace whatever is there; -ErrorAction Stop surfaces what it can; and the
+# read-back below is the only thing allowed to print success.
+$registerError = $null
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
+        -Description 'MindWire stall ledger: one log-only heartbeat (D-16c)' -Force -ErrorAction Stop |
+        Out-Null
+} catch {
+    $registerError = $_
+    Write-Warning "Register-ScheduledTask failed: $($_.Exception.Message); checking the existing task"
+}
+
+$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $task) {
+    throw "task $TaskName does not exist after registration; not registered (register error: $registerError)"
+}
+$actual = [ordered]@{
+    Execute            = [string]$task.Actions[0].Execute
+    Arguments          = [string]$task.Actions[0].Arguments
+    RepetitionInterval = [string]$task.Triggers[0].Repetition.Interval
+    ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit
+}
+$expected = [ordered]@{
+    Execute            = $pwshPath
+    Arguments          = $argString
+    RepetitionInterval = $HeartbeatInterval
+    ExecutionTimeLimit = $ExecutionTimeLimit
+}
+$mismatch = @($expected.Keys | Where-Object { $actual[$_] -ne $expected[$_] } |
+        ForEach-Object { "$_ expected '$($expected[$_])' got '$($actual[$_])'" })
+if ($mismatch.Count -gt 0) {
+    throw "task $TaskName does not match this script's definition: $($mismatch -join '; ')"
+}
+$note = if ($registerError) { ' (registration failed, but the existing definition already matches; nothing replaced)' } else { '' }
+Write-Output "verified $TaskName ($pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)$note"
