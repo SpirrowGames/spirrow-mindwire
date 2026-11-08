@@ -375,6 +375,22 @@ def _settle_status(body: str) -> StopStatus | None:
     return handoff.stop_line.status if handoff.stop_line is not None else None
 
 
+def test_protocol_block_indents_only_its_code_examples() -> None:
+    """PR-gate msg-8461: an example at column 0 closes the Markdown list around it, so prose that
+    stays indented after it renders as a root-level indented code block. In CommonMark only a line
+    indented four spaces or a tab can open such a block, so every such line of the protocol block
+    must be one of the examples meant to render as code, never prose."""
+    core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    meant_as_code = {"    NEXT: <name>"} | {
+        f"    {line}" for line in handoff_mod.OPERATOR_FORM_EXAMPLE.splitlines()
+    }
+    indented = [
+        line for line in core.splitlines() if line.startswith(("    ", "\t")) and line.strip()
+    ]
+    assert indented, "the NEXT: example is expected to stay indented"
+    assert set(indented) <= meant_as_code, set(indented) - meant_as_code
+
+
 def test_protocol_block_says_next_none_is_legacy() -> None:
     """``NEXT: none`` is still accepted until boundary 5, so the block names it, but only to say
     it is no longer written (msg-8328 §2 3-D). The opening rule names both control lines."""

@@ -1534,7 +1534,10 @@ _OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAM
 # The prompt embeds them NOT indented (Slice I, msg-8455 §1 I-1): an indented terminal form is
 # refused as ``indented_terminal_form``, and an example that looks indented invites a reply that
 # copies the indentation (PR-gate advisory msg-8443). ``OPERATOR_FORM_EXAMPLE`` stays indented:
-# the ``NEXT:`` grammar tolerates indentation, so copying it there is harmless.
+# the ``NEXT:`` grammar tolerates indentation, so copying it there is harmless. Because an example
+# at column 0 closes any Markdown list around it, the two forms are flat paragraphs, not list
+# items, and the prose after each example is not indented either: otherwise it would render as a
+# root-level indented code block (PR-gate msg-8461).
 STOP_DONE_EXAMPLE = f"STOP: {STOP_DONE}"
 BLOCKED_ON_EXAMPLE = f"{BLOCKED_ON_KEYWORD}: <arm> <ref>\nNEXT: <wake>"
 STOP_FORM_EXAMPLES: tuple[str, ...] = (STOP_DONE_EXAMPLE, BLOCKED_ON_EXAMPLE)
@@ -1604,18 +1607,18 @@ also declares a Tier-C type, is refused and the conductor stops.
 
 When nobody acts next on this thread, say why with one of these two forms:
 
-  - Finished — the work this thread exists for is done. Make this the final control line \
+Finished — the work this thread exists for is done. Make this the final control line \
 of your reply and write NO `NEXT:` line after it:
 
 {STOP_DONE_EXAMPLE}
 
-    It is recorded as done and waits for its owner to close it.
-  - Waiting — work remains, but it can start only once something happens that the sweep \
+It is recorded as done and waits for its owner to close it.
+Waiting — work remains, but it can start only once something happens that the sweep \
 can see. Put the `{BLOCKED_ON_KEYWORD}:` line directly above the final `NEXT:` line:
 
 {BLOCKED_ON_EXAMPLE}
 
-    `<arm> <ref>` is one of: {_STOP_TRIGGER_PROSE}. Nobody is started now. When it holds, \
+`<arm> <ref>` is one of: {_STOP_TRIGGER_PROSE}. Nobody is started now. When it holds, \
 the sweep posts a wake message into this thread ending in `NEXT: <wake>`, and the conductor \
 routes it exactly as it would route that handoff written now (the same gates apply). \
 `<wake>` is a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never \
