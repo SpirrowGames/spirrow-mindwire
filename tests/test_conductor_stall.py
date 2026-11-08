@@ -159,6 +159,8 @@ def test_stalled_is_terminal_like_the_other_dead_head_reasons() -> None:
         StopReason.NO_PROGRESS.value,
         StopReason.SELF_HANDOFF.value,
         StopReason.STALLED.value,
+        # T-done-disposition-auto-close: a refused terminal form is decided by the head alone.
+        StopReason.MALFORMED_HANDOFF.value,
     } == TERMINAL_STOP_REASONS
     # And it parks the posted notice's id like the other dead-head reasons.
     rec = commit_terminal(reason=StopReason.STALLED.value, head_msg_id="m10", record=None)

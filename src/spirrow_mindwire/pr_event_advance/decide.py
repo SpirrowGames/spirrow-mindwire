@@ -97,6 +97,7 @@ from ..conductor.handoff import (
     TIER_C_CHECK_KEYWORD,
     TIER_C_CHECK_NONE,
     parse_next_token,
+    settles_by_terminal_form,
 )
 from ..github.client import CiState, PrResolution, PrState, parse_pr_ref
 from ..repo_projects import PrProject
@@ -305,7 +306,8 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
     ref = heading_ref(first_line)
     if ref is None:
         return None
-    token = parse_next_token(body)
+    # An accepted terminal form settles like ``NEXT: none`` (T-done-disposition-auto-close v2.4).
+    token = NONE_TOKEN if settles_by_terminal_form(body) else parse_next_token(body)
     return RelayTail(
         pr_ref=ref,
         token=token,
