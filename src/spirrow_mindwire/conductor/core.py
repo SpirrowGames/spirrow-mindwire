@@ -117,7 +117,7 @@ from ..routing import (
     guard_proposer_to_implementer,
 )
 from ..source_marker import attestation_agrees, parse_attestation_marker
-from ..thread_context import build_thread_context
+from ..thread_context import build_thread_context, with_appended_trigger
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
@@ -1064,7 +1064,7 @@ class Conductor:
                             sessions,
                             implementer_identity,
                             route_msg,
-                            [*messages, route_msg],
+                            with_appended_trigger(messages, route_msg),
                             round_index=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -1113,7 +1113,7 @@ class Conductor:
                     sessions,
                     implementer_identity,
                     relay_msg,
-                    [*messages, relay_msg],
+                    with_appended_trigger(messages, relay_msg),
                     round_index=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
@@ -1251,7 +1251,7 @@ class Conductor:
                     parked = await self._dispatch_recording(
                         handle,
                         bounce_msg,
-                        [*messages, bounce_msg],
+                        with_appended_trigger(messages, bounce_msg),
                         role=author_role,
                         rounds=round_index,
                         forced=forced,
@@ -2359,7 +2359,7 @@ class Conductor:
             sessions,
             plan.implementer,
             posted,
-            [*messages, posted],
+            with_appended_trigger(messages, posted),
             round_index=round_index,
             forced=forced,
             forced_saveable=forced_saveable,

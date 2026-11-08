@@ -87,6 +87,12 @@ from ._sdk_result import (
     emit_sdk_error_marker,
 )
 from ._session_isolation import session_isolation_kwargs
+from ._turn_telemetry import (
+    TurnTelemetryState,
+    log_context_usage,
+    log_prompt,
+    precompact_hooks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,10 @@ class _Session:
     own_role: Role
     state: SessionState
     last_active_at: datetime
+    # D-1' turn telemetry (T-implementer-context-drop-unexplained): the in-flight trigger id the
+    # PreCompact hook reads, and the session's cumulative prompt bytes. Required (no default):
+    # ``spawn`` is the only constructor and always passes the instance its PreCompact hook holds.
+    telemetry: TurnTelemetryState
     # The exact ``ClaudeAgentOptions`` instance passed to the SDK client on
     # spawn — kept so :meth:`ClaudeCodeSdkAdapter.source_marker_options` can
     # hand the harness that same object (msg-834 §2 (a)). ``Any`` typing so
@@ -477,6 +487,7 @@ class ClaudeCodeSdkAdapter:
         role: Role,
         ctx: SpawnContext,
     ) -> SessionHandle:
+        telemetry = TurnTelemetryState()
         options = ClaudeAgentOptions(
             cwd=self._cwd,
             # Through a file, as the other two roles do (see ``_command_line``).
@@ -499,6 +510,8 @@ class ClaudeCodeSdkAdapter:
             # Model / CLI binary, omitted entirely when the composition root chose
             # neither (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
+            # D-1' Point-4: observe auto-compaction of this reused session (primary path only).
+            hooks=precompact_hooks(telemetry),
         )
         connect_started = time.monotonic()
         client: _SdkClient | None = None
@@ -547,6 +560,7 @@ class ClaudeCodeSdkAdapter:
             # so the harness can derive the source marker from it on every
             # reply without asking the agent to declare it (D3 / msg-805).
             options=options,
+            telemetry=telemetry,
         )
         # T43: connect() has returned, so this handle is usable now.
         await _emit_observational(
@@ -626,8 +640,11 @@ class ClaudeCodeSdkAdapter:
         # adapter, not the drain.
         observed_uuid: list[str] = []
         try:
-            await session.client.query(_build_prompt(event, session.own_role))
+            prompt = _build_prompt(event, session.own_role)
+            log_prompt(event, prompt, session.telemetry)
+            await session.client.query(prompt)
             body = await _drain_reply(session.client, on_init=observed_uuid.append)
+            await log_context_usage(session.client, session.telemetry)
         except SdkIsErrorSignal as sig:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
