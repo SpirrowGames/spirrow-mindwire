@@ -12,6 +12,17 @@ limits this work to PR-A/PR-B; D-6 (deleting quarantined slots) is out of scope.
 Every failure that this procedure cannot settle leaves the original where it is and either skips
 the tick (:attr:`PrepAction.SKIP`, no row) or parks only this thread (:attr:`PrepAction.PARK`).
 
+Order within one tick (Bohr msg-8244, replacing the v2.3 order): slot lock -> fetch -> read-only
+check (unpublished commits, guard) -> session check -> step 2 (bundle, rescue push) -> step 4
+(patch / untracked list) -> rename (v2.7 pending -> rename -> confirm) -> provision. A clean slot
+with nothing unpublished launches without the session check. The check-to-rename window is safe
+because the sweep task never overlaps itself (``MultipleInstancesPolicy IgnoreNew``) and runs
+prep -> conductor -> exit code synchronously per candidate (msg-8246); ``<slot>.lock`` only
+excludes prep from prep (msg-8206). Those premises hold only for the registered sweep task: a
+direct run of the wrapper, or a second task registered under another name, is not excluded
+(Einstein advisory after msg-8246), so the operational premise is that the slots are used by that
+one task only.
+
 What the caller supplies (so the module stays testable without the loop):
 
 * ``origin_url`` — the GitHub remote the slot's ``origin`` is pointed back to after the clone;
@@ -427,13 +438,34 @@ class SlotPrep:
         if owner.pop("fetch_failures", None) is not None:
             self._write_owner(paths, owner)
 
-        # Step 2 (v2.3): unpublished commits -> bundle first, then rescue push or park.
+        # Read-only look first: does this slot need anything done to it at all?
         unpublished = self._unpublished(slot)
         bundle: Path | None = None
         if unpublished is None:
             return self._park(
                 paths, PARK_PRESERVE_FAILED, "preserve_failed", detail="rev-list failed"
             )
+        try:
+            self._guard(slot)
+            refused: DirtyCloneError | None = None
+        except DirtyCloneError as exc:
+            refused = exc
+        if refused is not None and refused.reason is DirtyCloneReason.CLONE_BUSY:
+            return self._index_lock_held(paths, owner, refused)
+        if unpublished or refused is not None:
+            # Bohr msg-8244: the session check comes BEFORE step 2 and step 4. A slot with a live
+            # (or unknown) session gets no bundle, no rescue push, no preserve and no rename on
+            # this tick, so a skipped tick writes nothing and a working implementer's branch is
+            # never pushed under it. Nothing is lost by the later preserve: a skip or a
+            # session-unknown park moves and deletes nothing (Einstein go after msg-8244).
+            # Why no new session can start between this check and the rename (msg-8246): the
+            # sweep task never overlaps itself (MultipleInstancesPolicy IgnoreNew) and runs
+            # prep -> conductor -> exit code synchronously per candidate; <slot>.lock covers
+            # prep-vs-prep only (msg-8206).
+            gate = self._session_gate(paths, owner)
+            if gate is not None:
+                return gate
+        # Step 2 (v2.3): unpublished commits -> bundle first, then rescue push or park.
         if unpublished:
             bundle = self._make_bundle(slot, unpublished)
             if bundle is None:
@@ -671,10 +703,8 @@ class SlotPrep:
             return self._park(
                 paths, PARK_PRESERVE_FAILED, "preserve_failed", bundle=bundle, detail=str(exc)
             )
-        # Step 5: no live session in the slot, then pending -> rename -> confirm (v2.7).
-        gate = self._session_gate(paths, owner)
-        if gate is not None:
-            return gate
+        # Step 5: the session check already ran before step 2 (msg-8244); pending -> rename ->
+        # confirm (v2.7).
         owner["quarantine_context"] = {
             "quarantine_reason": reason,
             "patch": None if patch is None else str(patch),

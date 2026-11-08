@@ -860,3 +860,76 @@ def test_index_lock_with_unreadable_list_counts_session_unknown_not_lock_ticks(
 
 def test_session_unknown_park_code_constant_matches_log_module() -> None:
     assert PARK_SESSION_UNKNOWN == SESSION_UNKNOWN_PARK_CODE
+
+
+# -- msg-8244: the session check runs before step 2 / step 4 ------------------------------------
+
+
+def _artefacts(world: dict[str, Path]) -> list[Path]:
+    d = world["state"] / "clone-retreats"
+    return sorted(d.iterdir()) if d.exists() else []
+
+
+def _remote_tb(world: dict[str, Path]) -> str | None:
+    res = subprocess.run(
+        ["git", "-C", str(world["origin"]), "rev-parse", "--verify", "-q", TB],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def _dirty_with_unpublished(world: dict[str, Path]) -> Path:
+    slot = _slot_on_tb(world)
+    _commit(slot, "x.txt", "x\n")  # unpublished commit on the thread branch
+    (slot / "stray.txt").write_text("u\n", encoding="utf-8")  # and a dirty tree
+    return slot
+
+
+def test_live_session_slot_gets_no_bundle_push_or_preserve_for_five_ticks(
+    world: dict[str, Path],
+) -> None:
+    slot = _dirty_with_unpublished(world)
+    before = _remote_tb(world)
+    for _ in range(5):  # a fresh Clock each tick: every tick has the SAME timestamp
+        res = _prep(world, sessions_under=lambda _p: 1).run()
+        assert res.action is PrepAction.SKIP, res
+        assert not any(st.startswith("git bundle") or st.startswith("git push") for st in res.steps)
+    assert _artefacts(world) == [] and _rows(world) == []
+    assert _remote_tb(world) == before  # no rescue push under a working session
+    assert (slot / "stray.txt").exists() and _quarantined(world) == []
+
+
+def test_unknown_session_list_writes_nothing_up_to_and_including_the_park(
+    world: dict[str, Path],
+) -> None:
+    _dirty_with_unpublished(world)
+    before = _remote_tb(world)
+    for _ in range(2):
+        assert _prep(world, sessions_under=_unknown).run().action is PrepAction.SKIP
+        assert _artefacts(world) == []
+    res = _prep(world, sessions_under=_unknown).run()
+    assert res.action is PrepAction.PARK and res.park_code == PARK_SESSION_UNKNOWN
+    assert _artefacts(world) == [] and _remote_tb(world) == before
+    row = res.record
+    assert row is not None
+    assert row["patch"] is None and row["untracked"] is None and row["bundle"] is None
+
+
+def test_first_tick_without_a_session_does_each_step_once(world: dict[str, Path]) -> None:
+    _dirty_with_unpublished(world)
+    for _ in range(3):
+        assert _prep(world, sessions_under=lambda _p: 1).run().action is PrepAction.SKIP
+    res = _prep(world).run()
+    assert res.action is PrepAction.LAUNCH, res
+    steps = res.steps
+    assert sum(st.startswith("git bundle create") for st in steps) == 1
+    assert sum(st.startswith("git push") for st in steps) == 1
+    assert sum(st.startswith("rename ") for st in steps) == 1
+    assert len(_quarantined(world)) == 1
+    rows = _rows(world)
+    assert len(rows) == 1 and rows[0]["kind"] == "slot_quarantine" and rows[0]["bundle"]
+    names = [p.name for p in _artefacts(world)]
+    assert sum(n.endswith(".bundle") for n in names) == 1
+    assert sum(n.endswith(".untracked.txt") for n in names) == 1

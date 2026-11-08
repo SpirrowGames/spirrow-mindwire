@@ -215,3 +215,18 @@ def test_wrapper_crash_park_code_matches_clone_slot_constant() -> None:
     root = Path(__file__).resolve().parents[1]
     text = (root / "deploy" / "run-conductor-scheduled.ps1").read_text(encoding="utf-8")
     assert f"$SlotPrepCrashedParkCode = '{PARK_PREP_CRASHED}'" in text
+
+
+def test_sweep_task_registration_spec_keeps_ignore_new() -> None:
+    """msg-8246 premise: the slot check-to-rename window is safe because sweep ticks never overlap.
+
+    There is no registration script for the sweep task; docs/deploy.md's settings table is the
+    registration spec, so it is what this pins. It cannot see the live task: the operational
+    premise (one registered task, IgnoreNew, no direct runs of the wrapper while slots are in
+    use) is recorded in the PR read-back (Einstein advisory after msg-8246).
+    """
+    root = Path(__file__).resolve().parents[1]
+    deploy = (root / "docs" / "deploy.md").read_text(encoding="utf-8")
+    assert "| `MultipleInstancesPolicy` | `IgnoreNew` |" in deploy
+    wrapper = (root / "deploy" / "run-conductor-scheduled.ps1").read_text(encoding="utf-8")
+    assert "MultipleInstancesPolicy=IgnoreNew" in wrapper
