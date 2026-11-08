@@ -8,18 +8,22 @@ from pathlib import Path
 import pytest
 
 from spirrow_mindwire.clone_slot_trust import (
+    CHANGED_DURING_UPDATE,
+    MAX_ATTEMPTS,
     TrustRegistrationError,
     claude_config_file,
     ensure_trusted,
     is_trusted,
     project_key,
+    remove_project_entries,
     trust_preparer,
 )
 
 
 def _cfg(tmp_path: Path, data: object) -> Path:
     p = tmp_path / ".claude.json"
-    p.write_text(json.dumps(data), encoding="utf-8")
+    # Claude Code's own shape (indent=2, no trailing newline), which the writer reproduces.
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     return p
 
 
@@ -71,7 +75,7 @@ def test_missing_config_raises_and_creates_nothing(tmp_path: Path) -> None:
 @pytest.mark.parametrize("text", ["{not json", "[]", '{"projects": []}'])
 def test_unusable_config_raises_and_is_left_unchanged(tmp_path: Path, text: str) -> None:
     cfg = tmp_path / ".claude.json"
-    cfg.write_text(text, encoding="utf-8")
+    cfg.write_text(text, encoding="utf-8", newline="\n")
     with pytest.raises(TrustRegistrationError):
         ensure_trusted(tmp_path / "slot", cfg)
     assert cfg.read_text(encoding="utf-8") == text
@@ -91,3 +95,125 @@ def test_trust_preparer_resolves_config_at_call_time(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     prepare(tmp_path / "slot")
     assert is_trusted(tmp_path / "slot", cfg)
+
+
+# -- Bohr msg-8505 / msg-8507 (Obj-22-1): key shape and the guarded write ----------------------
+
+
+def test_project_key_upper_cases_the_drive_letter() -> None:
+    key = project_key(Path("c:/workspace/slots/demo/abc"))
+    if key[1:2] == ":":  # Windows: the measured shape is ``C:/workspace``
+        assert key.startswith("C:/") and "\\" not in key
+
+
+def test_other_keys_keep_every_byte(tmp_path: Path) -> None:
+    data = {
+        "numStartups": 12,
+        "ratio": 1.5,
+        "name": "日本語 ✓",
+        "projects": {"C:/x": {"hasTrustDialogAccepted": False, "allowedTools": []}},
+        "z": None,
+    }
+    cfg = _cfg(tmp_path, data)
+    before = cfg.read_text(encoding="utf-8")
+    assert ensure_trusted(tmp_path / "slot", cfg) is True
+    after = json.loads(cfg.read_text(encoding="utf-8"))
+    del after["projects"][project_key(tmp_path / "slot")]
+    assert json.dumps(after, ensure_ascii=False, indent=2) == before
+
+
+def test_trailing_newline_is_kept(tmp_path: Path) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"projects": {}}, indent=2) + "\n", encoding="utf-8", newline="\n")
+    ensure_trusted(tmp_path / "slot", cfg)
+    assert cfg.read_text(encoding="utf-8").endswith("}\n")
+
+
+def test_file_in_another_shape_is_refused_unchanged(tmp_path: Path) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        '{"projects": {}}', encoding="utf-8", newline="\n"
+    )  # compact: would be reformatted
+    with pytest.raises(TrustRegistrationError, match="byte for byte"):
+        ensure_trusted(tmp_path / "slot", cfg)
+    assert cfg.read_text(encoding="utf-8") == '{"projects": {}}'
+
+
+def test_concurrent_write_is_detected_and_kept_on_retry(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, {"projects": {}})
+    calls = {"n": 0}
+
+    def other_writer() -> None:  # a running Claude Code writes between our read and replace
+        calls["n"] += 1
+        if calls["n"] == 1:
+            d = json.loads(cfg.read_text(encoding="utf-8"))
+            d["projects"]["C:/other"] = {"hasTrustDialogAccepted": True}
+            cfg.write_text(json.dumps(d, indent=2), encoding="utf-8", newline="\n")
+
+    assert ensure_trusted(tmp_path / "slot", cfg, before_replace=other_writer) is True
+    projects = json.loads(cfg.read_text(encoding="utf-8"))["projects"]
+    assert projects["C:/other"] == {"hasTrustDialogAccepted": True}  # not clobbered
+    assert projects[project_key(tmp_path / "slot")] == {"hasTrustDialogAccepted": True}
+    assert calls["n"] == 2
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_file_changing_every_attempt_fails_and_keeps_the_other_writes(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, {"projects": {}})
+    calls = {"n": 0}
+
+    def busy_writer() -> None:
+        calls["n"] += 1
+        d = json.loads(cfg.read_text(encoding="utf-8"))
+        d["projects"][f"C:/other{calls['n']}"] = {}
+        cfg.write_text(json.dumps(d, indent=2), encoding="utf-8", newline="\n")
+
+    with pytest.raises(TrustRegistrationError, match=CHANGED_DURING_UPDATE):
+        ensure_trusted(tmp_path / "slot", cfg, before_replace=busy_writer)
+    assert calls["n"] == MAX_ATTEMPTS == 3
+    projects = json.loads(cfg.read_text(encoding="utf-8"))["projects"]
+    assert sorted(projects) == ["C:/other1", "C:/other2", "C:/other3"]  # only theirs
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_unchanged_file_is_written_in_one_attempt(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, {"projects": {}})
+    calls = {"n": 0}
+
+    def quiet() -> None:
+        calls["n"] += 1
+
+    assert ensure_trusted(tmp_path / "slot", cfg, before_replace=quiet) is True
+    assert calls["n"] == 1
+
+
+def test_registered_slot_reads_only(tmp_path: Path) -> None:
+    slot = tmp_path / "slot"
+    cfg = _cfg(tmp_path, {"projects": {project_key(slot): {"hasTrustDialogAccepted": True}}})
+    calls = {"n": 0}
+
+    def hook() -> None:
+        calls["n"] += 1
+
+    assert ensure_trusted(slot, cfg, before_replace=hook) is False
+    assert calls["n"] == 0  # never reached the write
+
+
+def test_remove_project_entries_drops_only_matching_keys(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        {
+            "keep": 1,
+            "projects": {
+                "C:/a/.git/mindwire-scratch/trust-probe-1/slot": {"hasTrustDialogAccepted": True},
+                "C:/workspace": {"hasTrustDialogAccepted": True},
+            },
+        },
+    )
+    dropped = remove_project_entries(cfg, lambda k: "/.git/mindwire-scratch/trust-probe-" in k)
+    assert dropped == ["C:/a/.git/mindwire-scratch/trust-probe-1/slot"]
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data == {"keep": 1, "projects": {"C:/workspace": {"hasTrustDialogAccepted": True}}}
+    before = cfg.read_text(encoding="utf-8")
+    assert remove_project_entries(cfg, lambda k: "trust-probe-" in k) == []
+    assert cfg.read_text(encoding="utf-8") == before

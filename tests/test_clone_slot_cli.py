@@ -189,7 +189,10 @@ def test_cli_slot_prep_end_to_end(
     monkeypatch.setattr(mod, "claude_sessions_under", lambda: lambda _p: 0)
     cfg_dir = world["slots"].parent / "claude-cfg"  # never the real ~/.claude.json
     cfg_dir.mkdir()
-    (cfg_dir / ".claude.json").write_text('{"projects": {}}', encoding="utf-8")
+    # Claude Code's own shape (indent=2, LF), which the guarded writer reproduces byte for byte.
+    (cfg_dir / ".claude.json").write_text(
+        json.dumps({"projects": {}}, indent=2), encoding="utf-8", newline="\n"
+    )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     argv = [
         "slot-prep",
