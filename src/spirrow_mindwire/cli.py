@@ -107,6 +107,11 @@ def _build_parser() -> argparse.ArgumentParser:
     retreat.add_argument(
         "--state-dir", required=True, type=Path, help="where discard patches are written"
     )
+    retreat.add_argument(
+        "--slot-mode",
+        action="store_true",
+        help="[loop].slots_root is set: never discard; leave the WIP for the turn-pre procedure",
+    )
     cont = sub.add_parser(
         "continue-report",
         help="weekly view of implementer self-continuations, from the continuation ledger",
@@ -192,6 +197,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 head_msg=args.head_msg,
                 stop_reason=args.stop_reason,
                 state_dir=args.state_dir,
+                slot_mode=args.slot_mode,
             )
         )
     if args.command == "continue-report":

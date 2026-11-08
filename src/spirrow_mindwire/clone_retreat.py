@@ -109,6 +109,9 @@ class RetreatOutcome(StrEnum):
     DISCARDED = "discarded"
     DISCARD_INCOMPLETE = "discard_incomplete"
     FAILED = "failed"
+    # R-9 (T-ephemeral-impl-clone-slot-per-thread, Bohr msg-8084): in slot mode a dirty slot that
+    # could not be retreated is left as it is; the next turn-pre procedure saves and quarantines it.
+    LEFT_FOR_SLOT = "left_for_slot"
 
 
 @dataclass
@@ -206,8 +209,10 @@ class CloneRetreater:
         git: RetreatGit = _subprocess_git,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         guard_factory: Callable[[Path], CloneGuard] = CloneGuard,
+        slot_mode: bool = False,
     ) -> None:
         self._repo_dir = repo_dir
+        self._slot_mode = slot_mode
         self._thread_id = thread_id
         self._head_msg = head_msg or "-"
         self._stop_reason = stop_reason or "-"
@@ -278,7 +283,20 @@ class CloneRetreater:
             if isinstance(done, RetreatResult):
                 return done
             why_not = done
+        if self._slot_mode:
+            return self._leave_for_slot(why_not)
         return self._discard(default, why_not)
+
+    def _leave_for_slot(self, why: str) -> RetreatResult:
+        """R-9: slot mode never exports, aborts, resets, cleans or deletes a branch.
+
+        The work stays in the slot exactly as the failed retreat left it; the next turn-pre
+        procedure (``clone_slot_prep``) bundles / exports it and quarantines the slot by rename.
+        """
+        return self._result(
+            RetreatOutcome.LEFT_FOR_SLOT,
+            detail=f"retreat not possible: {why}; left in the slot for the turn-pre procedure",
+        )
 
     def _retreat_blocker(self, verdict: DirtyCloneError) -> str | None:
         if verdict.reason is DirtyCloneReason.OP_IN_PROGRESS:
@@ -328,6 +346,18 @@ class CloneRetreater:
             }
             files, ins, dels = nums.get("f", 0), nums.get("i", 0), nums.get("d", 0)
         pushed = self._ok(self._step(["push", "origin", branch]))
+        if self._slot_mode and not pushed:
+            # R-9: commit and push only. The commit stays on the local wip branch; the next
+            # turn-pre procedure bundles it before it decides anything (v2.3 step 2).
+            return self._result(
+                RetreatOutcome.LEFT_FOR_SLOT,
+                branch=branch,
+                pushed=False,
+                files=files,
+                insertions=ins,
+                deletions=dels,
+                detail=f"committed to {branch} but the push failed; left in the slot",
+            )
         if not self._ok(self._step(["switch", default])):
             # The WIP is safe in a commit; the guard keeps the clone parked as wrong_head.
             return self._result(
@@ -439,8 +469,19 @@ class CloneRetreater:
         )
 
 
-def run(repo_dir: Path, *, thread_id: str, head_msg: str, stop_reason: str, state_dir: Path) -> int:
-    """``mindwire clone-retreat``: print one row, return the outcome's exit code."""
+def run(
+    repo_dir: Path,
+    *,
+    thread_id: str,
+    head_msg: str,
+    stop_reason: str,
+    state_dir: Path,
+    slot_mode: bool = False,
+) -> int:
+    """``mindwire clone-retreat``: print one row, return the outcome's exit code.
+
+    ``slot_mode`` (``--slot-mode``, passed when ``[loop].slots_root`` is set) is R-9: no discard.
+    """
     try:
         result = CloneRetreater(
             repo_dir,
@@ -448,6 +489,7 @@ def run(repo_dir: Path, *, thread_id: str, head_msg: str, stop_reason: str, stat
             head_msg=head_msg,
             stop_reason=stop_reason,
             state_dir=state_dir,
+            slot_mode=slot_mode,
         ).retreat()
     except Exception as exc:
         summary = " ".join(str(exc).split()) or "-"

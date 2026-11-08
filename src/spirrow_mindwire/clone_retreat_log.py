@@ -52,6 +52,28 @@ logger = logging.getLogger(__name__)
 
 RETREAT_KIND = "retreat"
 DELIVERED_KIND = "delivered"
+# T-ephemeral-impl-clone-slot-per-thread R-7' (Bohr msg-8086 / msg-8088): the turn-pre slot
+# procedure's one row per decided outcome. A new kind, so no ``retreat`` field changes meaning.
+SLOT_QUARANTINE_KIND = "slot_quarantine"
+NOTICE_KINDS = frozenset({RETREAT_KIND, SLOT_QUARANTINE_KIND})
+SLOT_ACTION_REBUILT = "rebuilt"
+SLOT_ACTION_PARKED = "parked"
+# D-7 reasons (msg-8061, plus quarantine_unconfirmed from msg-8088).
+QUARANTINE_REASONS = frozenset(
+    {
+        "untracked_only",
+        "modified",
+        "wrong_head",
+        "index_lock",
+        "merge_in_progress",
+        "provision_failed",
+        "unpublished",
+        "owner_unknown",
+        "preserve_failed",
+        "quarantine_unconfirmed",
+    }
+)
+SLOT_NOTICE_TAG = "[slot の記録 / clone-slot record]"
 # clone_retreat.RetreatOutcome values that are a no-op: the clone was left alone, nothing to tell.
 NO_OP_OUTCOMES = frozenset({"clean", "not_eligible"})
 NOTICE_TAG = "[退避の記録 / clone-retreat record]"
@@ -151,14 +173,85 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def build_slot_quarantine_record(
+    *,
+    thread_id: str,
+    repo: str,
+    slot_path: Path,
+    action: str,
+    quarantine_reason: str,
+    quarantine_path: Path | None = None,
+    park_code: str | None = None,
+    patch: Path | None = None,
+    untracked: Path | None = None,
+    bundle: Path | None = None,
+    clone_seconds: float | None = None,
+    slot_bytes: int | None = None,
+    quarantine_candidates: list[Path] | None = None,
+    detail: str = "",
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """One ``slot_quarantine`` row (R-7', msg-8086; ``quarantine_candidates`` from msg-8088).
+
+    ``action`` is the thread's outcome (``rebuilt`` / ``parked``); ``quarantine_path`` is where the
+    *original* slot was renamed to, whatever the action, or ``None`` when it was not renamed. A
+    saved artefact that does not exist is ``None`` — never the string ``none`` (msg-8084 R-7).
+    ``clone_seconds`` / ``slot_bytes`` carry numbers only for ``rebuilt``.
+    """
+    if action not in (SLOT_ACTION_REBUILT, SLOT_ACTION_PARKED):
+        raise ValueError(f"unknown slot action {action!r}")
+    if quarantine_reason not in QUARANTINE_REASONS:
+        raise ValueError(f"unknown quarantine_reason {quarantine_reason!r}")
+    if (action == SLOT_ACTION_PARKED) != (park_code is not None):
+        raise ValueError("park_code is set exactly when action is 'parked'")
+
+    def _p(v: Path | None) -> str | None:
+        return None if v is None else str(v)
+
+    rebuilt = action == SLOT_ACTION_REBUILT
+    stamp = _now_iso(at)
+    row: dict[str, Any] = {
+        "kind": SLOT_QUARANTINE_KIND,
+        "record_id": f"{thread_id}@{stamp}#{uuid.uuid4().hex[:12]}",
+        "at": stamp,
+        "thread_id": thread_id,
+        "repo": repo,
+        "slot_path": str(slot_path),
+        "action": action,
+        "quarantine_path": _p(quarantine_path),
+        "quarantine_reason": quarantine_reason,
+        "park_code": park_code,
+        "patch": _p(patch),
+        "untracked": _p(untracked),
+        "bundle": _p(bundle),
+        "clone_seconds": clone_seconds if rebuilt else None,
+        "slot_bytes": slot_bytes if rebuilt else None,
+        "detail": detail,
+    }
+    if quarantine_candidates is not None:
+        row["quarantine_candidates"] = [str(c) for c in quarantine_candidates]
+    return row
+
+
+def append_slot_quarantine(path: Path, row: dict[str, Any]) -> None:
+    """Append a row built by :func:`build_slot_quarantine_record`."""
+    if row.get("kind") != SLOT_QUARANTINE_KIND:
+        raise ValueError("not a slot_quarantine row")
+    _append(path, row)
+
+
 def pending_record(path: Path, thread_id: str) -> dict[str, Any] | None:
-    """The thread's latest ``retreat`` row, unless a ``delivered`` row names it already."""
+    """The thread's latest ``retreat`` / ``slot_quarantine`` row, unless already ``delivered``.
+
+    R-8 (msg-8084) widened the kinds read here to :data:`NOTICE_KINDS`; the choice (the latest
+    undelivered one) and the ``delivered`` marking are unchanged.
+    """
     latest: dict[str, Any] | None = None
     delivered: set[str] = set()
     for row in _rows(path):
         if row.get("thread_id") != thread_id:
             continue
-        if row.get("kind") == RETREAT_KIND:
+        if row.get("kind") in NOTICE_KINDS:
             latest = row
         elif row.get("kind") == DELIVERED_KIND:
             delivered.add(row["record_id"])
@@ -193,6 +286,11 @@ def _outcome_line(record: dict[str, Any]) -> str:
         return f"retreated to a wip/ branch ({pushed})"
     if outcome == "discarded":
         return "discarded after exporting a patch (the retreat could not run)"
+    if outcome == "left_for_slot":
+        return (
+            "left in the slot: the changes that could not be retreated are still in the slot; "
+            "the next turn-pre procedure saves them and then quarantines the slot"
+        )
     if outcome == "discard_incomplete":
         return (
             f"discard incomplete (marker {record.get('marker') or '-'} still present; "
@@ -225,8 +323,74 @@ def _opening_state(record: dict[str, Any]) -> str:
     )
 
 
+def _saved_artefact_lines(record: dict[str, Any]) -> list[str]:
+    """Only non-null artefacts are shown (msg-8084 R-8 / msg-8086 R-8')."""
+    lines: list[str] = []
+    if record.get("patch"):
+        lines.append(f"- patch: {record['patch']} (recover with `git apply`)")
+    if record.get("bundle"):
+        lines.append(f"- bundle: {record['bundle']} (recover with `git fetch <bundle>`)")
+    if record.get("untracked"):
+        lines.append(f"- untracked list: {record['untracked']} (listed, not saved)")
+    return lines
+
+
+def render_slot_notice(record: dict[str, Any]) -> str:
+    """The prompt block for one ``slot_quarantine`` row, worded per ``action`` (R-8', msg-8086).
+
+    ``parked`` never says the slot was rebuilt or is clean. With ``quarantine_candidates`` the
+    original's place is undetermined and both paths are named instead (msg-8088).
+    """
+    qpath = record.get("quarantine_path")
+    head = (
+        f"- when: {record.get('at')}  repo: {record.get('repo')}  "
+        f"reason: {record.get('quarantine_reason')}"
+    )
+    if record.get("action") == SLOT_ACTION_REBUILT:
+        lines = [
+            f"{SLOT_NOTICE_TAG} Before this turn the thread's clone slot was not in a state a "
+            "turn may start from. It was quarantined (renamed, nothing deleted) and rebuilt from "
+            "the mirror, so the working directory you are in now is clean.",
+            head,
+            f"- original slot moved to: {qpath}",
+            *_saved_artefact_lines(record),
+        ]
+        if record.get("patch") or record.get("bundle"):
+            lines.append(
+                "Check the saved work above before redoing anything: it holds the previous "
+                "slot's uncommitted changes (patch) and unpublished commits (bundle)."
+            )
+        return "\n".join(lines)
+    candidates = record.get("quarantine_candidates")
+    lines = [
+        f"{SLOT_NOTICE_TAG} This thread was parked by the clone-slot procedure before a turn "
+        "could start.",
+        head,
+        f"- park code: {record.get('park_code')}",
+    ]
+    if candidates:
+        lines.append(
+            "- where the original slot is: NOT determined; check both of these paths: "
+            + ", ".join(str(c) for c in candidates)
+        )
+    elif qpath:
+        lines.append(f"- original slot: moved to {qpath}")
+    else:
+        lines.append(f"- original slot: left untouched at {record.get('slot_path')}")
+    if record.get("detail"):
+        lines.append(f"- detail: {record['detail']}")
+    lines.extend(_saved_artefact_lines(record))
+    return "\n".join(lines)
+
+
 def render_notice(record: dict[str, Any]) -> str:
-    """The prompt block for one ``retreat`` row. Information for the turn, not a rule."""
+    """The prompt block for one ``retreat`` row. Information for the turn, not a rule.
+
+    A ``slot_quarantine`` row goes to :func:`render_slot_notice` (R-8'); the ``retreat`` wording
+    below is unchanged (INV-0).
+    """
+    if record.get("kind") == SLOT_QUARANTINE_KIND:
+        return render_slot_notice(record)
     lines = [
         f"{NOTICE_TAG} A previous launch on this thread left the shared clone dirty. "
         f"{_opening_state(record)}",
@@ -282,14 +446,23 @@ __all__ = [
     "CLEANED_OUTCOMES",
     "CLONE_RETREAT_LOG_FILENAME",
     "DELIVERED_KIND",
+    "NOTICE_KINDS",
     "NOTICE_TAG",
     "NO_OP_OUTCOMES",
+    "QUARANTINE_REASONS",
     "RETREAT_KIND",
+    "SLOT_ACTION_PARKED",
+    "SLOT_ACTION_REBUILT",
+    "SLOT_NOTICE_TAG",
+    "SLOT_QUARANTINE_KIND",
     "PendingNotice",
+    "append_slot_quarantine",
     "build_record",
+    "build_slot_quarantine_record",
     "load_pending_notice",
     "mark_delivered",
     "pending_record",
     "record_result",
     "render_notice",
+    "render_slot_notice",
 ]
