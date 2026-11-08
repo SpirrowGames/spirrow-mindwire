@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import sys
@@ -33,6 +34,8 @@ from typing import Any, TextIO, assert_never
 from spirrow_mindwire.stall_ledger.adapters import (
     ADAPTER_FORMAT_VERSION,
     Adapter,
+    HeadReader,
+    HeadRow,
     Marked,
     MarkerCheck,
     MotionEvent,
@@ -43,6 +46,13 @@ from spirrow_mindwire.stall_ledger.adapters import (
     Unverifiable,
 )
 from spirrow_mindwire.stall_ledger.classifier import classify
+from spirrow_mindwire.stall_ledger.heads import (
+    CachedHead,
+    HeadClass,
+    HeadKey,
+    apply_head,
+    classify_head,
+)
 from spirrow_mindwire.stall_ledger.heartbeat import HeartbeatRecord, derive_state
 from spirrow_mindwire.stall_ledger.lock import LOCK_FILENAME, LedgerLock
 from spirrow_mindwire.stall_ledger.model import (
@@ -50,6 +60,8 @@ from spirrow_mindwire.stall_ledger.model import (
     OriginKind,
     RemedyAttempt,
     StallRecord,
+    Unit,
+    UnitKind,
 )
 from spirrow_mindwire.stall_ledger.origin import origin
 from spirrow_mindwire.stall_ledger.predicates import stalled
@@ -162,6 +174,10 @@ class TickCounters:
     opened: int = 0
     closed: int = 0
     markers_resolved: int = 0
+    # D-16d-1 (msg-8368 ①, msg-8480).
+    head_fetches: int = 0
+    pending_heads: int = 0
+    heads_evicted: int = 0
 
 
 class FetchBudget:
@@ -230,6 +246,95 @@ async def _judge_e(
         return _EVerdict(tuple(extra), reason)
     log({"kind": "unknown_motion_type", "unit": obs.unit.key, "type": e.type})
     return _EVerdict((FLAG_ORIGIN_UNKNOWN,), None)
+
+
+async def resolve_heads(
+    *,
+    store: LoadedStore,
+    results: Sequence[SourceResult],
+    now: datetime,
+    budget: FetchBudget,
+    counters: TickCounters,
+) -> list[SourceResult]:
+    """D-16d-1: give each listed thread its head's ``N`` (msg-8368 ①, msg-8370, msg-8480).
+
+    ``store`` must be writable. For every listed thread of a source with ``head_rows``:
+
+    * listing status ``resolved`` -> its cache entry is evicted this tick, and it is not read;
+    * the cached ``(last_msg_id, last_activity_at)`` equals the listing's -> the cached head is
+      used and nothing is fetched;
+    * otherwise the head is read once, if :class:`FetchBudget` lets the fetch start, and the
+      cache is rewritten. A refused or failed read leaves the thread unread: it counts in
+      ``pending_heads`` and keeps the listing's 72h (group C). A later tick reads it.
+
+    A thread missing from the listing is evicted only when the tick read every source in full
+    (no source failing, this listing complete). A failed or partial listing evicts nothing, so a
+    live thread's head is never thrown away and re-read (msg-8480).
+
+    Heads are read before ``evaluate``, so they draw on the budget ahead of owed marker fetches.
+    That is bounded: a head is fetched only when its thread had a new post since the last read.
+    """
+    clean_tick = all(not r.report.is_failure(ADAPTER_FORMAT_VERSION) for r in results)
+    out: list[SourceResult] = []
+    for result in results:
+        rows = result.head_rows
+        reader = result.head_reader
+        if rows is None or reader is None:
+            out.append(result)
+            continue
+        observations: list[UnitObservation] = []
+        for obs in result.observations:
+            key = obs.unit.key
+            row = rows.get(key)
+            if row is None:
+                observations.append(obs)
+                continue
+            if row.status == "resolved":
+                if store.evict_head(key):
+                    counters.heads_evicted += 1
+                observations.append(obs)
+                continue
+            head = await _head_for(store, key, obs, row, reader, now, budget, counters)
+            observations.append(apply_head(obs, head))
+        if result.complete and clean_tick:
+            listed = set(rows) | set(result.unobservable)
+            for key in list(store.thread_heads):
+                if key in listed:
+                    continue
+                kind, _, identifier = key.partition(":")
+                if kind != UnitKind.THREAD.value:
+                    continue
+                if result.scope(Unit(UnitKind.THREAD, identifier)) and store.evict_head(key):
+                    counters.heads_evicted += 1
+        out.append(dataclasses.replace(result, observations=tuple(observations)))
+    return out
+
+
+async def _head_for(
+    store: LoadedStore,
+    key: str,
+    obs: UnitObservation,
+    row: HeadRow,
+    reader: HeadReader,
+    now: datetime,
+    budget: FetchBudget,
+    counters: TickCounters,
+) -> HeadClass | None:
+    wanted = HeadKey(row.last_msg_id, row.last_activity_at)
+    cached = CachedHead.from_json(store.thread_heads.get(key))
+    if cached is not None and cached.key == wanted:
+        return cached.head
+    if not budget.try_start():
+        counters.pending_heads += 1
+        return None
+    counters.head_fetches += 1
+    body = await reader.read_head(obs.unit, row.last_msg_id)
+    if body is None:
+        counters.pending_heads += 1
+        return None
+    head = classify_head(body.content, next_participant=body.next_participant)
+    store.cache_head(key, CachedHead(wanted, head, body.next_participant, utc_iso(now)).to_json())
+    return head
 
 
 async def evaluate(
@@ -600,6 +705,9 @@ async def _locked_tick(
             applied_requests.append(req.path)
 
     if store.writable:
+        results = await resolve_heads(
+            store=store, results=results, now=tick_now, budget=budget, counters=outcome.counters
+        )
         await evaluate(
             store=store,
             results=results,
@@ -613,7 +721,16 @@ async def _locked_tick(
         elapsed = timedelta(seconds=clock.monotonic() - started)
         if elapsed > t_tick_max:
             outcome.aborted = "deadline"
-            _heartbeat(log, results, tick_now, store, budget, evaluated=False, aborted="deadline")
+            _heartbeat(
+                log,
+                results,
+                tick_now,
+                store,
+                budget,
+                evaluated=False,
+                aborted="deadline",
+                counters=outcome.counters,
+            )
             return
         assert store.envelope is not None
         save_store(paths.store, store.envelope)
@@ -633,9 +750,27 @@ async def _locked_tick(
                 }
             )
         outcome.evaluated = True
-        _heartbeat(log, results, tick_now, store, budget, evaluated=True, aborted=None)
+        _heartbeat(
+            log,
+            results,
+            tick_now,
+            store,
+            budget,
+            evaluated=True,
+            aborted=None,
+            counters=outcome.counters,
+        )
     else:
-        _heartbeat(log, results, tick_now, store, budget, evaluated=False, aborted=None)
+        _heartbeat(
+            log,
+            results,
+            tick_now,
+            store,
+            budget,
+            evaluated=False,
+            aborted=None,
+            counters=outcome.counters,
+        )
 
 
 def _move_invalid_request_aside(path: Path) -> str | None:
@@ -661,6 +796,7 @@ def _heartbeat(
     *,
     evaluated: bool,
     aborted: str | None,
+    counters: TickCounters,
 ) -> None:
     """The level line (msg-4685 §6, msg-4689 §2, msg-4695 §3-4, msg-4697 §1).
 
@@ -711,6 +847,10 @@ def _heartbeat(
             if store.writable and evaluated
             else None
         ),
+        # D-16d-1 (msg-8368 ①): listed thread heads this tick could not read (budget, or a
+        # failed read). They stay C / 72h until read. Counted only when the store write landed.
+        "pending_heads": counters.pending_heads if store.writable and evaluated else None,
+        "head_fetches": counters.head_fetches,
     }
     if aborted is not None:
         line["tick_aborted"] = aborted

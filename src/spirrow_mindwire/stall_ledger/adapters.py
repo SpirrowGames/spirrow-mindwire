@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -223,6 +223,34 @@ class SourceResult:
     complete: bool
     scope: Callable[[Unit], bool]
     checker: MarkerChecker
+    #: D-16d-1 (msg-8368 ①): the listing's thread rows by unit key, and the reader that
+    #: fetches one head. Only the chatroom source sets them; the driver resolves the heads
+    #: against the store's cache before evaluating (``driver.resolve_heads``).
+    head_rows: Mapping[str, HeadRow] | None = None
+    head_reader: HeadReader | None = None
+
+
+@dataclass(frozen=True)
+class HeadRow:
+    """What the listing says about one thread: the cache key and the status (msg-8480)."""
+
+    last_msg_id: str
+    last_activity_at: str  # the listing's string, used verbatim as half the cache key
+    status: str
+
+
+@dataclass(frozen=True)
+class HeadBody:
+    """The head message as read: its body and its ``next_participant`` field."""
+
+    content: str
+    next_participant: str | None
+
+
+class HeadReader(Protocol):
+    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | None:
+        """The message ``last_msg_id`` of the thread, or ``None`` if it could not be read."""
+        ...
 
 
 T = TypeVar("T")
@@ -524,11 +552,12 @@ class ChatroomThreadAdapter:
     * ``ThreadState.status`` = the listing's ``status``; ``dormant_until_expired`` is
       always True, because the listing carries no dormant-until pin -- reading every
       thread as un-pinned is the loud side.
-    * ``N`` = ``other_thread`` (72h). **This is the quiet side** for a thread that was
-      actually nominated (``thread_with_nomination`` = 6h): such a stall opens up to
-      66h late. Telling the two apart needs the last message's ``next_participant``,
-      i.e. one body fetch per thread per heartbeat, which the listing-only contract
-      (msg-4683 §3-1) does not allow. Recorded as a known quiet-side residual.
+    * ``N`` = ``other_thread`` (72h) as the listing builds it. D-16d-1 (msg-8368 ①) refines
+      it from the thread head: the listing only reports ``head_rows`` and this adapter is the
+      ``head_reader``; the driver reads a head only when its ``(last_msg_id,
+      last_activity_at)`` changed since the cached read, spends :class:`FetchBudget` on it,
+      and sets ``N`` by the head's group (``heads.apply_head``). A head not read yet keeps
+      the 72h here. The listing itself still carries no body (msg-4683 §3-1).
     * motion: the thread head as one ``chatroom_msg`` event (``last_msg_id`` at
       ``last_activity_at``). That is the newest motion, which is all E needs.
     * ``ClassifierInput`` is all-False -> ``unclassified``.
@@ -578,11 +607,18 @@ class ChatroomThreadAdapter:
 
         observations: list[UnitObservation] = []
         unobservable: set[str] = set()
+        head_rows: dict[str, HeadRow] = {}
         unkeyed = 0
         for item in items:
             obs = self._thread_row(item)
             if obs is not None:
                 observations.append(obs)
+                assert isinstance(item, dict)  # _thread_row returns None otherwise
+                head_rows[obs.unit.key] = HeadRow(
+                    last_msg_id=item["last_msg_id"],
+                    last_activity_at=item["last_activity_at"],
+                    status=item["status"],
+                )
                 continue
             # Malformed row: never "absent" (close rule (a)). Keyed -> unobservable;
             # unkeyed -> the whole listing is not complete (see SourceResult).
@@ -606,7 +642,39 @@ class ChatroomThreadAdapter:
             complete=unkeyed == 0,
             scope=self.scope,
             checker=self,
+            head_rows=head_rows,
+            head_reader=self,
         )
+
+    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | None:
+        """One ``chatroom_get_thread`` for the head (D-16d-1). ``None`` on any failure.
+
+        The message read is the one the listing named, not merely the newest one returned:
+        the cache key and the body must describe the same message, so a post that lands
+        between the listing and this read is picked up by the next tick's key change.
+        """
+        project, _, thread_id = unit.identifier.partition("/")
+        try:
+            result = await _bounded(
+                self._mcp.call_tool(
+                    "chatroom_get_thread",
+                    {"project": project, "thread_id": thread_id, "mode": "full"},
+                ),
+                self._timeout,
+            )
+        except Exception:
+            return None
+        messages = result.get("messages") if isinstance(result, dict) else None
+        if not isinstance(messages, list):
+            return None
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("msg_id") == last_msg_id:
+                content = msg.get("content")
+                field_value = msg.get("next_participant")
+                if not isinstance(content, str):
+                    return None
+                return HeadBody(content, field_value if isinstance(field_value, str) else None)
+        return None
 
     def _row_key(self, item: object) -> str | None:
         """The unit key of a listing row, or ``None`` if the row carries no usable id."""

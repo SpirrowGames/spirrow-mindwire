@@ -888,6 +888,19 @@ def terminal_form_view(body: str, *, accept_new_forms: bool | None = None) -> Te
     return TerminalView.SETTLES
 
 
+def terminal_form_roster_free(body: str) -> StopLine | MalformedHandoff | None:
+    """The terminal-form parse of ``body`` as a roster-free reader sees it; ``None`` if neither.
+
+    The same parse :func:`terminal_form_view` makes (``check_roster=False``), returned whole so a
+    roster-free reader that needs the disposition itself -- ``done`` vs ``blocked_on`` and the
+    trigger arm -- reads it from this module's one parser instead of a second one. The stall
+    ledger's head classifier (``stall_ledger.heads``, T-stalled-pr-has-no-detector D-16d-1) is
+    that reader. It does not apply :data:`ACCEPT_NEW_FORMS`; a caller that must honour the switch
+    asks :func:`terminal_form_view` first.
+    """
+    return _terminal_form(body, {}, check_roster=False)
+
+
 def settles_by_terminal_form(body: str, *, accept_new_forms: bool | None = None) -> bool:
     """Does ``body`` stop the loop through an ACCEPTED terminal form? Roster-free (sweep's view).
 
@@ -1908,5 +1921,6 @@ __all__ = [
     "refused_by_terminal_form",
     "resolve_handoff",
     "settles_by_terminal_form",
+    "terminal_form_roster_free",
     "terminal_form_view",
 ]
