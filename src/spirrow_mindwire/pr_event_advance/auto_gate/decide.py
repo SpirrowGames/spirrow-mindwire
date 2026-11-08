@@ -27,6 +27,9 @@ Evaluation order, first match wins:
 7   fired before (marker or manual NEXT)     Noop(already-auto-fired), any head
 8   a verdict on the CURRENT head            Noop(already-gated)
 9   tail token is ``none`` / ``operator``    Post ``NEXT: pr-review <ref>``
+    (an accepted terminal form reads as
+    ``none`` only if the roster also accepts
+    it, see :func:`settled_tail_refusal`)
 10  any other tail token                     Noop(queued-behind)
 ==  =======================================  ==============================================
 
@@ -54,6 +57,7 @@ from ...conductor.handoff import (
     settles_by_terminal_form,
 )
 from ...github.client import GatePr
+from ...value_objects import Role
 from ..decide import (
     PR_EVENT_RELAY_AUTHOR,
     THREAD_LINE_RE,
@@ -238,14 +242,67 @@ def already_fired(messages: Iterable[Mapping[str, object]], *, repo: str, number
     return False
 
 
-def tail_decision(tail_body: str, *, repo: str, number: int) -> AutoGateNoop | Post:
-    """Rows 9-10. One thread carries one token, so a later PR waits its turn (msg-7485 O1)."""
+#: :func:`settled_tail_refusal` when 1c has no roster to read a settled tail with.
+ROSTER_UNAVAILABLE = "roster-unavailable"
+#: Prefix of :func:`settled_tail_refusal` when the roster (or the field) refuses the tail. The
+#: same words the park-wake tick logs for a notice it could not post.
+TERMINAL_FORM_REFUSED = "terminal-form-refused"
+
+
+def settled_tail_refusal(
+    tail_body: str,
+    *,
+    roster: Mapping[str, Role] | None,
+    next_participant: str | None = None,
+) -> str | None:
+    """Why a tail the sweep reads as settled must still not be treated as idle, or ``None``.
+
+    ``terminal_form_view`` is roster-free, so a tail it calls SETTLES may still be refused once
+    the roster and the ``next_participant`` field are applied (a ``BLOCKED-ON`` wake outside
+    ``STOP_WAKE_ROLES``, a field that contradicts the body). The notice for such a head is the
+    park-wake tick's (``park_wake/runner.py``); if 1c fired the gate on it first, the head would
+    move and the next tick would never see the refused form, so it would never be reported
+    (T-done-disposition-auto-close msg-8218 §2b-2). Read with the roster first, then:
+
+    - no roster (``None`` or empty) → :data:`ROSTER_UNAVAILABLE`. Firing without the check could
+      bury the head, so this side does not fire;
+    - the roster or the field refuses it → ``"terminal-form-refused: <reason>"``;
+    - accepted, or not a SETTLES tail at all → ``None``.
+    """
+    if not settles_by_terminal_form(tail_body):
+        return None
+    if not roster:
+        return ROSTER_UNAVAILABLE
+    handoff = resolve_handoff(tail_body, roster, next_participant=next_participant)
+    if handoff.malformed is not None:
+        return f"{TERMINAL_FORM_REFUSED}: {handoff.malformed.value}"
+    return None
+
+
+def tail_decision(
+    tail_body: str,
+    *,
+    repo: str,
+    number: int,
+    roster: Mapping[str, Role] | None,
+    next_participant: str | None = None,
+) -> AutoGateNoop | Post:
+    """Rows 9-10. One thread carries one token, so a later PR waits its turn (msg-7485 O1).
+
+    ``roster`` is the conductor's identity→role roster and ``next_participant`` the tail's
+    structured field. Both matter only for a tail in an accepted terminal form
+    (:func:`settled_tail_refusal`); ``roster`` is required so that no caller can leave it out.
+    """
     # An accepted terminal form (``STOP: done`` / ``BLOCKED-ON:``) settles like ``NEXT: none``
     # (T-done-disposition-auto-close design v2.4): the thread is not waiting on anyone's turn.
     # A refused one is not an idle tail whatever its ``NEXT:`` token says (``BLOCKED-ON: pr a/b#1``
     # above ``NEXT: none``): firing the gate on it would bury the head the conductor is about to
     # answer with its MALFORMED notice (PR #531 gate msg-8201). It waits like a live turn.
     if refused_by_terminal_form(tail_body):
+        return AutoGateNoop.QUEUED_BEHIND
+    # The same holds for a form only the roster refuses: its notice is the park-wake tick's, and
+    # a gate fired first would bury it (msg-8218 §2b-2). So does a settled tail 1c cannot check.
+    if settled_tail_refusal(tail_body, roster=roster, next_participant=next_participant):
         return AutoGateNoop.QUEUED_BEHIND
     token = NONE_TOKEN if settles_by_terminal_form(tail_body) else parse_next_token(tail_body)
     if token is None or token.casefold() not in (NONE_TOKEN, OPERATOR_TOKEN):
@@ -262,6 +319,8 @@ def tail_decision(tail_body: str, *, repo: str, number: int) -> AutoGateNoop | P
 
 __all__ = [
     "GATE_HOLD_RE",
+    "ROSTER_UNAVAILABLE",
+    "TERMINAL_FORM_REFUSED",
     "THREAD_LINE_RE",
     "THREAD_REF_RE",
     "AutoGateNoop",
@@ -272,5 +331,6 @@ __all__ = [
     "prefilter",
     "render_marker",
     "resolve_thread_link",
+    "settled_tail_refusal",
     "tail_decision",
 ]

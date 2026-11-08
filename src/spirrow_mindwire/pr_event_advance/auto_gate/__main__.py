@@ -117,6 +117,11 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
         repo_map, sorted({p for p in args.projects.split(",") if p})
     )
     now = datetime.now(UTC)
+    settings = load_settings()
+    # The same roster park-wake reads (park_wake/__main__.py). An empty one is passed on, not
+    # raised: 1c then holds every tail in an accepted terminal form (roster-unavailable) and
+    # still judges the rest (msg-8218 §2b-2).
+    roster = dict(settings.conductor.roster)
     async with GitHubClient() as gh:
         report = await run_pass(
             mcp=StreamableHttpChatroomMcp(args.url),
@@ -124,10 +129,11 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             targets=targets,
             config=config,
             store=DailyCounterStore(args.state_file),
-            review_login=load_settings().naysayer_gating.review_login,
+            review_login=settings.naysayer_gating.review_login,
             now=now,
             known_projects=known_projects(sweep),
             repo_map=repo_map,
+            roster=roster,
         )
     out = report.as_dict()
     if not repo_map.complete:
