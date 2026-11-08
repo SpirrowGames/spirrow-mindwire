@@ -1598,6 +1598,51 @@ _MARKER_F_CONDITIONS = "<!-- mindwire:note F-conditions -->"
 _WHERE_SINGLE_LINE_RE = re.compile(r"^(?P<path>[^:\n]+):(?P<line>\d+)$")
 _EMPTY_LINE_RE = re.compile(r"^\s*$")
 
+# v1.1 (T-gate-blocks-on-miscounted-line-numbers, Bohr msg-8349 D-1 → msg-8355 D-1‴,
+# Einstein go after msg-8355). v1 demoted on the shape of the citation alone, and so
+# silenced a CORRECT blocking objection whose coordinate merely slipped onto a blank line
+# (msg-4792, #359: ``tests/test_script_writers_lf.py:108``, the claim held). What separates
+# #79 (false) from #359 (true) is whether the objection's ASSERTION is about the line
+# number, or the line number is only a coordinate. v1.1 adds a fourth conjunct (4‴): the
+# ``evidence`` must itself assert a miscount, in one of two structurally fixed shapes.
+#
+# P-1: "line 287 (not 288)" — and the FIRST number must equal the ``where`` N, so the
+#      objection claims "the right line is N" while N is blank at head: the claim is refuted
+#      on the spot. Every match is scanned (``finditer``), not just the first, so an earlier
+#      unrelated "line 10 (not 11)" cannot hide a later matching one (msg-8354 Obj-3-2).
+#      Whitespace and the colon are accepted in either order (msg-8355 Obj-3-1).
+# P-2: "pointing at (a|an|the) empty/blank line" — the claim is that the reference itself
+#      lands on nothing. No number check, so a plain ``search`` suffices.
+#
+# Deliberately NOT included (msg-8351 / msg-8353): bare "line N", "L123", ":N" (a
+# coordinate restated in prose), "off by N" (a real off-by-one bug report), "line number
+# references" (a parser-domain term), and a bare "blank line" (CRLF / fixture-writer PRs).
+# Adding a conjunct can only shrink the demoted set: v1.1 ⊆ v1 (D-2 monotonicity).
+_MISCOUNT_P1_RE = re.compile(
+    r"\blines?\s*:?\s*(?P<a>\d+)\s*\(\s*not\s+:?\s*\d+\s*\)", re.IGNORECASE
+)
+_MISCOUNT_P2_RE = re.compile(
+    r"\bpoint(?:s|ing)?\s+(?:at|to)\s+(?:(?:a|an|the)\s+)?(?:empty|blank)\s+lines?\b",
+    re.IGNORECASE,
+)
+
+
+def _miscount_assertion(evidence: str, line_no: int) -> str | None:
+    """Return the fragment of ``evidence`` that asserts a miscount at ``line_no``, else None.
+
+    (4‴) of the v1.1 demotion predicate (msg-8355 D-1‴). P-1 first: the first ``finditer``
+    match whose ``a`` equals ``line_no`` is returned. Failing that, P-2's matched substring.
+    The fragment is what the C-DEMOTED note quotes (D-4), so a human can check on the spot
+    that the objection really was about the line number.
+    """
+    for m in _MISCOUNT_P1_RE.finditer(evidence):
+        if int(m.group("a")) == line_no:
+            return m.group(0)
+    m2 = _MISCOUNT_P2_RE.search(evidence)
+    if m2 is not None:
+        return m2.group(0)
+    return None
+
 
 def _parse_single_line_where(where: str) -> tuple[str, int] | None:
     """Return ``(path, line)`` iff ``where`` is exactly ``path:N`` for a positive integer N.
@@ -1653,7 +1698,8 @@ async def verify_citations(
     head_sha: str,
 ) -> tuple[ObjectionReport, tuple[Objection, ...]]:
     """Read the head tree for each single-line ``path:N`` citation; demote blocking→advisory
-    iff line N is blank.
+    iff line N is blank AND the evidence asserts a miscount at N (v1.1 (4‴), see
+    :func:`_miscount_assertion`).
 
     Returns ``(report', demoted)`` where ``report'`` carries the same objections in the same
     order, with any that met the v1 demotion predicate replaced by their ``blocks=False``
@@ -1698,6 +1744,13 @@ async def verify_citations(
             new_objs.append(o)
             continue
         path, line_no = parsed
+        if _miscount_assertion(o.evidence, line_no) is None:
+            # v1.1 (4‴): the evidence does not assert a miscount, so the line number is a
+            # coordinate, not the claim — a blank line there says nothing about whether the
+            # objection holds (msg-4792 / msg-4178). Keep blocking. Checked BEFORE the read:
+            # it is pure, and it spares the API call in the common coordinate-only case.
+            new_objs.append(o)
+            continue
         cache_key = (path, head_sha)
         if cache_key not in cache:
             # Fail-loud: any non-404 HTTP error propagates and the whole review fails
@@ -1876,9 +1929,19 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"at head `{head_short}`.** {len(demoted)} blocking objection"
             f"{'s' if len(demoted) != 1 else ''} demoted to advisory because the cited "
             f"line(s) — {wheres} — are composed entirely of whitespace in the reviewed "
-            f"tree. The objection text is preserved in the advisory bucket below; "
-            f"only its blocking classification was withdrawn."
+            f"tree and the objection's own evidence asserts a miscount there. The "
+            f"objection text is preserved in the advisory bucket below; only its "
+            f"blocking classification was withdrawn."
         )
+        # v1.1 D-4 (msg-8349 / msg-8355): quote the evidence fragment that satisfied (4‴),
+        # so a human can confirm on the spot that the claim really was about the line
+        # number. Recomputed from the preserved original objection with the same pure
+        # function the demotion used, so the quote cannot disagree with the decision.
+        for o in demoted:
+            parsed_where = _parse_single_line_where(o.where)
+            fragment = _miscount_assertion(o.evidence, parsed_where[1]) if parsed_where else None
+            if fragment is not None:
+                lines.append(f"> - `{o.where}` — miscount asserted: “{fragment}”")
         if decision.gate_verdict_overridden:
             lines.append(
                 "> Because every blocking objection was demoted and the model wrote "

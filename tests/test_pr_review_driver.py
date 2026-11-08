@@ -63,6 +63,8 @@ from spirrow_mindwire.naysayer.pr_review import (
     _build_messages,
     _ci_gate_response,
     _format_b_a_marker,
+    _line_is_empty,
+    _miscount_assertion,
     _nesting_exceeds,
     _parse_model_verdict,
     _parse_single_line_where,
@@ -4592,7 +4594,14 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
 # design's §5 receipt table.
 
 
-def _blocking_where(where: str, evidence: str = "n is 0") -> str:
+# v1.1 (msg-8355 D-1‴): demotion now also needs the evidence to assert a miscount. The v1
+# tests below pin the citation-shape half of the predicate, so their default evidence is a
+# P-2 miscount assertion (N-independent) — the v1 behaviour they pin is unchanged for
+# objections that do claim a miscount. The AC-v11 tests further down vary the evidence.
+_MISCOUNT_EVIDENCE = "the citation is pointing at an empty line"
+
+
+def _blocking_where(where: str, evidence: str = _MISCOUNT_EVIDENCE) -> str:
     return f'{{"class": "{_blocking_class()}", "where": "{where}", "evidence": "{evidence}"}}'
 
 
@@ -4982,6 +4991,210 @@ async def test_gate_notice_absent_when_no_demotion_fires() -> None:
     await driver.review(_pr(), post_critique=post)
     body = posted[0]
     assert _MARKER_C_DEMOTED not in body
+
+
+# ---------- v1.1: (4‴) the evidence must assert a miscount -------------------------
+#
+# Bohr msg-8349 → msg-8355 (D-1‴), Einstein go on msg-8355. v1 demoted on citation shape
+# alone and silenced a correct blocking objection (msg-4792, #359). v1.1 additionally needs
+# the evidence to assert a miscount: P-1 "line N (not M)" with N == the where's line, or
+# P-2 "pointing at (a|an|the) empty/blank line". Tests are AC-v11-1 … AC-v11-13 from
+# msg-8353 / msg-8355 (numbered there so they do not collide with v1's AC-n).
+
+_LINE_287_FILE = _empty_line_file(287)
+_LINE_108_FILE = _empty_line_file(108)
+
+
+def _critique_blocking_with(where: str, evidence: str) -> str:
+    payload = json.dumps([{"class": _blocking_class(), "where": where, "evidence": evidence}])
+    return _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+
+
+async def _verify_one(where: str, evidence: str, content: str | None) -> tuple[int, int]:
+    """Run verify_citations on one blocking objection; return (blocking, demoted) counts."""
+    report = parse_objections(_critique_blocking_with(where, evidence))
+    assert len(report.blocking) == 1
+    path = where.rsplit(":", 1)[0]
+    github = _FakeGitHub(files={(path, "sha-v11"): content})
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-v11"
+    )
+    return len(new_report.blocking), len(demoted)
+
+
+@pytest.mark.anyio
+async def test_ac_v11_1_p1_assertion_matching_where_is_demoted() -> None:
+    """AC-v11-1 (#79 shape). Blank :287, evidence claims "line 287 (not 288)" → demoted."""
+    assert await _verify_one("Docs/T07.md:287", "Q-A is on line 287 (not 288)", _LINE_287_FILE) == (
+        0,
+        1,
+    )
+
+
+@pytest.mark.anyio
+async def test_ac_v11_2_359_coordinate_only_stays_blocking_and_rc() -> None:
+    """AC-v11-2 (#359 / msg-4792). Blank :108, evidence makes no line-number claim → the
+    objection stays blocking and the gate verdict is NOT rewritten RC → COMMENT."""
+    evidence = (
+        "_named_targets uses ast.walk over every ast.Name, so reads such as d[m] = 1 "
+        "are counted as bindings"
+    )
+    critique = _critique_blocking_with("tests/test_script_writers_lf.py:108", evidence)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-v11-2", []),
+        files={("tests/test_script_writers_lf.py", "sha-v11-2"): _LINE_108_FILE},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content=critique), github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert github.submitted[0][1] is ReviewEvent.REQUEST_CHANGES
+    assert _MARKER_C_DEMOTED not in posted[0]
+
+
+# (where, evidence, file) cases for the monotonicity check: the v1 shapes (blank, non-blank,
+# past EOF, range, missing path) crossed with asserting / non-asserting evidence, plus every
+# AC-v11 evidence string.
+_V11_CORPUS: list[tuple[str, str, str | None]] = [
+    ("Docs/T07.md:287", "Q-A is on line 287 (not 288)", _LINE_287_FILE),
+    ("Docs/T07.md:287", "n is 0", _LINE_287_FILE),
+    ("Docs/T07.md:287", _MISCOUNT_EVIDENCE, _LINE_287_FILE),
+    ("Docs/T07.md:287", "Q-A is on line 287 (not 288)", _non_empty_line_file(287)),
+    ("Docs/T07.md:287", _MISCOUNT_EVIDENCE, "one\ntwo\n"),
+    ("Docs/T07.md:287-289", "Q-A is on line 287 (not 288)", _LINE_287_FILE),
+    ("Docs/T07.md:287", "Q-A is on line 287 (not 288)", None),
+    ("Docs/T07.md:287", "line: 287 (not 288)", _LINE_287_FILE),
+    (
+        "Docs/T07.md:287",
+        "See valid line 10 (not 11). Bug is Q-A on line 287 (not 288)",
+        _LINE_287_FILE,
+    ),
+    ("t.py:108", "line 108 uses ast.walk without checking the node type", _LINE_108_FILE),
+    ("t.py:108", "the bug is at :108", _LINE_108_FILE),
+    ("t.py:108", "see L108", _LINE_108_FILE),
+    ("t.py:108", "the writer emits CRLF on every blank line of the fixture", _LINE_108_FILE),
+    ("t.py:108", "the loop upper bound is off by 1", _LINE_108_FILE),
+    ("t.py:108", "array index is off by exactly +1", _LINE_108_FILE),
+    ("t.py:108", "the AST visitor fails to update line number references", _LINE_108_FILE),
+    ("t.py:108", "the parser reports line 5 (not 6)", _LINE_108_FILE),
+    ("t.py:108", "the citation is pointing at the empty line", _LINE_108_FILE),
+    ("t.py:108", "the citation is pointing at the empty line", _non_empty_line_file(108)),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("where", "evidence", "content"), _V11_CORPUS)
+async def test_ac_v11_3_v11_demotions_are_a_subset_of_v1(
+    where: str, evidence: str, content: str | None
+) -> None:
+    """AC-v11-3 (D-2 monotonicity). Whenever v1.1 demotes, the v1 predicate (single-line
+    where, file read, line blank or past EOF — evidence ignored) also demotes."""
+    parsed = _parse_single_line_where(where)
+    v1_demotes = parsed is not None and content is not None and _line_is_empty(content, parsed[1])
+    _blocking, demoted = await _verify_one(where, evidence, content)
+    if demoted:
+        assert v1_demotes
+
+
+@pytest.mark.anyio
+async def test_ac_v11_4_only_the_asserting_blocker_is_demoted_verdict_stays_rc() -> None:
+    """AC-v11-4. Two blockers on blank lines, only one asserts a miscount → one demoted,
+    the other stays blocking, gate verdict is not rewritten."""
+    payload = json.dumps(
+        [
+            {
+                "class": _blocking_class(),
+                "where": "Docs/T07.md:287",
+                "evidence": "Q-A is on line 287 (not 288)",
+            },
+            {
+                "class": _blocking_class(),
+                "where": "Docs/T07.md:290",
+                "evidence": "the invariant is broken by the unconditional assignment",
+            },
+        ]
+    )
+    critique = _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+    lines = ["content"] * 300
+    lines[286] = ""
+    lines[289] = ""
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-v11-4", []),
+        files={("Docs/T07.md", "sha-v11-4"): "\n".join(lines) + "\n"},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content=critique), github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    body = posted[0]
+    assert _MARKER_C_DEMOTED in body
+    assert "1 blocking objection demoted" in body
+    # D-4: the note quotes the matched fragment, for the demoted objection only.
+    assert "`Docs/T07.md:287` — miscount asserted: “line 287 (not 288)”" in body
+    assert "`Docs/T07.md:290` — miscount asserted" not in body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "line 108 uses ast.walk without checking the node type",  # AC-v11-5
+        "the bug is at :108",  # AC-v11-6
+        "see L108",  # AC-v11-6
+        "the writer emits CRLF on every blank line",  # AC-v11-7
+        "the loop upper bound is off by 1",  # AC-v11-8
+        "array index is off by exactly +1",  # AC-v11-8
+        "the AST visitor fails to update line number references",  # AC-v11-9
+        "the parser reports line 5 (not 6)",  # AC-v11-10
+    ],
+)
+async def test_ac_v11_5_to_10_coordinate_and_domain_phrasing_stays_blocking(
+    evidence: str,
+) -> None:
+    """AC-v11-5 … AC-v11-10. Blank :108; coordinate restatements, off-by-one bug reports,
+    parser-domain terms and a P-1 whose number is not the where's N all stay blocking."""
+    assert await _verify_one("t.py:108", evidence, _LINE_108_FILE) == (1, 0)
+    assert _miscount_assertion(evidence, 108) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "evidence",
+    ["line: 287 (not 288)", "line :287 (not :288)", "line:287 (not 288)", "Line 287 (Not 288)"],
+)
+async def test_ac_v11_11_p1_accepts_colon_and_space_in_either_order(evidence: str) -> None:
+    """AC-v11-11 (msg-8354 Obj-3-1). The colon may attach to the word or to the number."""
+    assert await _verify_one("Docs/T07.md:287", evidence, _LINE_287_FILE) == (0, 1)
+
+
+@pytest.mark.anyio
+async def test_ac_v11_12_p1_scans_every_match_not_only_the_first() -> None:
+    """AC-v11-12 (msg-8354 Obj-3-2). The second match satisfies a == N → demoted; against
+    :108 no match has a == N → stays blocking."""
+    evidence = "See valid line 10 (not 11). Bug is Q-A on line 287 (not 288)"
+    assert await _verify_one("Docs/T07.md:287", evidence, _LINE_287_FILE) == (0, 1)
+    assert _miscount_assertion(evidence, 287) == "line 287 (not 288)"
+    assert await _verify_one("t.py:108", evidence, _LINE_108_FILE) == (1, 0)
+
+
+@pytest.mark.anyio
+async def test_ac_v11_13_p2_accepts_the_definite_article() -> None:
+    """AC-v11-13 (msg-8354 advisory, msg-8355 Obj-3-3)."""
+    assert await _verify_one(
+        "t.py:108", "the citation is pointing at the empty line", _LINE_108_FILE
+    ) == (0, 1)
+
+
+@pytest.mark.anyio
+async def test_v11_coordinate_only_objection_costs_no_read() -> None:
+    """(4‴) is pure and checked before the head read, so a coordinate-only blocker on a
+    single-line where costs zero ``fetch_file_at`` calls."""
+    report = parse_objections(_critique_blocking_with("t.py:108", "n is 0"))
+    github = _FakeGitHub(files={("t.py", "sha"): _LINE_108_FILE})
+    await verify_citations(report, github=github, pr=_pr(), head_sha="sha")
+    assert github.file_reads == []
 
 
 # ---------- T-gate-review-submit-failure-handling PR-B': in-run submit retry ----------
