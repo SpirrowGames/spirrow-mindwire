@@ -25,7 +25,8 @@ Optional owner-file fields this module adds beyond the v2.4 required four (all o
 classification in :mod:`clone_slot` is unchanged): ``pending_quarantine`` and
 ``original_quarantine_path`` (v2.7), plus three bookkeeping fields the spec needs persisted across
 ticks but does not name — ``fetch_failures`` / ``provision_failures`` (the "3 tick 続けて"
-counters) and ``quarantine_context`` (the reason and saved artefacts of the original, so the row
+counters, reset on the tick the step succeeds: Bohr msg-8198 判断 1), ``index_lock_ticks``
+(msg-8206) and ``quarantine_context`` (the reason and saved artefacts of the original, so the row
 written when the outcome is finally decided carries them, msg-8086 "行を書くタイミング").
 """
 
@@ -60,6 +61,7 @@ from spirrow_mindwire.clone_retreat_log import (
 from spirrow_mindwire.clone_slot import (
     PARK_GIT_DIVERGED,
     PARK_GIT_PUSH_FAILED,
+    PARK_INDEX_LOCK_STALE,
     PARK_OWNER_UNKNOWN,
     PARK_PRESERVE_FAILED,
     PARK_PROVISION_FAILED,
@@ -437,12 +439,13 @@ class SlotPrep:
             self._guard(slot)
         except DirtyCloneError as exc:
             if exc.reason is DirtyCloneReason.CLONE_BUSY:
-                # msg-8198 判断 2: a held index.lock is not a quarantine reason; skip the tick.
-                return self._result(PrepAction.SKIP, paths, detail=f"clone busy: {exc.detail}")
+                return self._index_lock_held(paths, owner, exc)
+            self._clear_index_lock_ticks(paths, owner)
             reason = _reason_for_guard(exc)
             self._steps.append(f"guard: {exc.reason.value} -> {reason}")
             detail = f"{exc.reason.value}: {exc.detail}" if exc.detail else exc.reason.value
             return self._preserve_and_quarantine(paths, owner, reason, bundle, detail=detail)
+        self._clear_index_lock_ticks(paths, owner)
         result = self._launch(paths, owner)
         if bundle is not None and result.action is PrepAction.LAUNCH:
             # msg-8198 判断 4: rescued by push, launching without a quarantine -> one
@@ -462,6 +465,51 @@ class SlotPrep:
                 result.action, result.slot_dir, record=row, steps=tuple(self._steps)
             )
         return result
+
+    def _index_lock_held(
+        self, paths: SlotPaths, owner: dict[str, Any], exc: DirtyCloneError
+    ) -> PrepResult:
+        """``index.lock`` outlived ``LOCK_WAIT_S`` (Bohr msg-8206, fix_cut of Obj-16-1).
+
+        Never moved, never deleted: nothing proves the lock has no live owner (a git child of a
+        finished session, an operator's git), because only prep takes ``<slot>.lock``. With a
+        live ``claude_bg`` session (the same :attr:`sessions_under` steps 3-5 use) the tick is
+        skipped and the counter left alone. Without one, ``index_lock_ticks`` counts consecutive
+        such ticks; the third parks this thread with ``clone_slot_index_lock_stale`` and one
+        ``parked`` row, so the skip can never go on silently (Einstein go after msg-8206).
+        """
+        slot = paths.slot_dir
+        if self.sessions_under(slot) > 0:
+            return self._result(
+                PrepAction.SKIP, paths, detail=f"clone busy with a live session: {exc.detail}"
+            )
+        lock = self._index_lock_path(slot)
+        n = int(owner.get("index_lock_ticks", 0)) + 1
+        if n < FAILURE_TICKS_TO_PARK:
+            owner["index_lock_ticks"] = n
+            self._write_owner(paths, owner)
+            return self._result(
+                PrepAction.SKIP, paths, detail=f"index.lock held ({n}/{FAILURE_TICKS_TO_PARK})"
+            )
+        # The episode ends with the park; after an unpark a lock still there counts afresh.
+        owner.pop("index_lock_ticks", None)
+        self._write_owner(paths, owner)
+        return self._park(
+            paths,
+            PARK_INDEX_LOCK_STALE,
+            "index_lock",
+            detail=f"index.lock still present for {n} ticks: {lock}",
+        )
+
+    def _index_lock_path(self, slot: Path) -> Path:
+        res = self._git(slot, ["rev-parse", "--absolute-git-dir"])
+        git_dir = Path(res.stdout.strip()) if res.returncode == 0 else slot / ".git"
+        return (git_dir / "index.lock").resolve()
+
+    def _clear_index_lock_ticks(self, paths: SlotPaths, owner: dict[str, Any]) -> None:
+        """The guard got past the index lock this tick: the lock is gone, the run is broken."""
+        if owner.pop("index_lock_ticks", None) is not None:
+            self._write_owner(paths, owner)
 
     def _unpublished(self, slot: Path) -> list[str] | None:
         head = self._git(slot, ["rev-parse", "--verify", "-q", "HEAD"])

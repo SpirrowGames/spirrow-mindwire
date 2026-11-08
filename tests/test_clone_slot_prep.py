@@ -18,6 +18,7 @@ import pytest
 
 from spirrow_mindwire.clone_guard import CloneGuard
 from spirrow_mindwire.clone_retreat_log import (
+    INDEX_LOCK_STALE_PARK_CODE,
     append_slot_preserve,
     append_slot_quarantine,
     build_slot_preserve_record,
@@ -28,6 +29,7 @@ from spirrow_mindwire.clone_retreat_log import (
 from spirrow_mindwire.clone_slot import (
     PARK_GIT_DIVERGED,
     PARK_GIT_PUSH_FAILED,
+    PARK_INDEX_LOCK_STALE,
     PARK_OWNER_UNKNOWN,
     PARK_PRESERVE_FAILED,
     PARK_PROVISION_FAILED,
@@ -482,18 +484,81 @@ def test_pin_not_ignored_is_provision_failed_with_guard_detail(world: dict[str, 
     assert "pin is tracked in this repo" in str(row["detail"])
 
 
-def test_index_lock_skips_without_quarantine(world: dict[str, Path]) -> None:
-    slot = _ready(world)
-    git_dir = Path(_git(slot, "rev-parse", "--absolute-git-dir"))
-    (git_dir / "index.lock").write_text("", encoding="utf-8")
+def _fast_guard(p: Path) -> CloneGuard:
+    """CloneGuard whose LOCK_WAIT_S elapses at once (no real 5 s wait per tick)."""
     tick = itertools.count(0, 10)
+    return CloneGuard(p, sleep=lambda _s: None, monotonic=lambda: float(next(tick)))
 
-    def fast_guard(p: Path) -> CloneGuard:
-        return CloneGuard(p, sleep=lambda _s: None, monotonic=lambda: float(next(tick)))
 
-    res = _prep(world, guard_factory=fast_guard).run()
-    assert res.action is PrepAction.SKIP and "clone busy" in res.detail
-    assert slot.exists() and _quarantined(world) == [] and _rows(world) == []
+def _stale_index_lock(slot: Path) -> Path:
+    lock = Path(_git(slot, "rev-parse", "--absolute-git-dir")) / "index.lock"
+    lock.write_text("", encoding="utf-8")
+    return lock
+
+
+def test_index_lock_with_live_session_skips_forever_without_counting(
+    world: dict[str, Path],
+) -> None:
+    slot = _ready(world)
+    lock = _stale_index_lock(slot)
+    for _ in range(5):
+        res = _prep(world, guard_factory=_fast_guard, sessions_under=lambda _p: 1).run()
+        assert res.action is PrepAction.SKIP and "live session" in res.detail
+    assert "index_lock_ticks" not in _owner(world)
+    assert lock.exists() and slot.exists() and _quarantined(world) == [] and _rows(world) == []
+
+
+def test_stale_index_lock_parks_on_third_tick_without_moving_anything(
+    world: dict[str, Path],
+) -> None:
+    slot = _ready(world)
+    lock = _stale_index_lock(slot)
+    for n in (1, 2):
+        res = _prep(world, guard_factory=_fast_guard).run()
+        assert res.action is PrepAction.SKIP, res
+        assert _owner(world)["index_lock_ticks"] == n and _rows(world) == []
+    res = _prep(world, guard_factory=_fast_guard).run()
+    assert res.action is PrepAction.PARK and res.park_code == PARK_INDEX_LOCK_STALE
+    row = res.record
+    assert row is not None and _rows(world) == [row]
+    assert row["action"] == "parked" and row["quarantine_reason"] == "index_lock"
+    assert row["quarantine_path"] is None
+    assert row["patch"] is None and row["untracked"] is None and row["bundle"] is None
+    assert lock.exists() and slot.exists() and _quarantined(world) == []  # nothing moved
+    notice = render_slot_notice(row)
+    assert str(lock.resolve()) in notice and "not moved or changed" in notice
+    assert "rebuilt" not in notice and "clean" not in notice
+
+
+def test_index_lock_counter_resets_when_the_lock_goes(world: dict[str, Path]) -> None:
+    slot = _ready(world)
+    lock = _stale_index_lock(slot)
+    for _ in range(2):
+        assert _prep(world, guard_factory=_fast_guard).run().action is PrepAction.SKIP
+    os.rename(lock, lock.with_name("index.lock.gone"))  # the lock disappears
+    assert _prep(world, guard_factory=_fast_guard).run().action is PrepAction.LAUNCH
+    assert "index_lock_ticks" not in _owner(world)
+    os.rename(lock.with_name("index.lock.gone"), lock)
+    for _ in range(2):
+        assert _prep(world, guard_factory=_fast_guard).run().action is PrepAction.SKIP
+    assert _owner(world)["index_lock_ticks"] == 2 and _rows(world) == []
+
+
+def test_stale_index_lock_park_leaves_other_slot_of_repo_launching(
+    world: dict[str, Path],
+) -> None:
+    mine = _ready(world)
+    _ready(world, thread=OTHER, tb="loop/t-slot-prep-other")
+    _stale_index_lock(mine)
+    for _ in range(3):
+        last = _prep(world, guard_factory=_fast_guard).run()
+    assert last.park_code == PARK_INDEX_LOCK_STALE
+    other = _prep(world, thread=OTHER, tb="loop/t-slot-prep-other").run()
+    assert other.action is PrepAction.LAUNCH
+
+
+def test_index_lock_park_code_constant_matches_log_module() -> None:
+    assert PARK_INDEX_LOCK_STALE == INDEX_LOCK_STALE_PARK_CODE
 
 
 def test_rescue_push_failure_parks_with_bundle(world: dict[str, Path], tmp_path: Path) -> None:

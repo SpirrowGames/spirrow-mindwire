@@ -47,6 +47,7 @@ PARK_PRESERVE_FAILED = "clone_slot_preserve_failed"
 PARK_PROVISION_FAILED = "clone_slot_provision_failed"
 PARK_UNRECOVERABLE = "clone_slot_unrecoverable"
 PARK_QUARANTINE_UNCONFIRMED = "clone_slot_quarantine_unconfirmed"
+PARK_INDEX_LOCK_STALE = "clone_slot_index_lock_stale"  # Bohr msg-8206
 PARK_GIT_DIVERGED = "git.diverged"
 PARK_GIT_PUSH_FAILED = "git.push_failed"
 

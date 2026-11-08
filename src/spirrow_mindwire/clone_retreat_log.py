@@ -77,6 +77,8 @@ QUARANTINE_REASONS = frozenset(
         "quarantine_unconfirmed",
     }
 )
+# clone_slot.PARK_INDEX_LOCK_STALE, repeated so this module does not import the slot module.
+INDEX_LOCK_STALE_PARK_CODE = "clone_slot_index_lock_stale"
 SLOT_NOTICE_TAG = "[slot の記録 / clone-slot record]"
 # clone_retreat.RetreatOutcome values that are a no-op: the clone was left alone, nothing to tell.
 NO_OP_OUTCOMES = frozenset({"clean", "not_eligible"})
@@ -418,6 +420,12 @@ def render_slot_notice(record: dict[str, Any]) -> str:
         lines.append(f"- original slot: left untouched at {record.get('slot_path')}")
     if record.get("detail"):
         lines.append(f"- detail: {record['detail']}")
+    if record.get("park_code") == INDEX_LOCK_STALE_PARK_CODE:
+        # msg-8206: the lock may still have a live owner, so nothing was moved or changed.
+        lines.append(
+            "- the slot was not moved or changed. To resume: confirm no git process is still "
+            "running in it, remove the index.lock named in the detail above, then unpark."
+        )
     lines.extend(_saved_artefact_lines(record))
     return "\n".join(lines)
 
