@@ -879,7 +879,9 @@ the thread's `N`:
 
 A head the tick could not read yet is treated as C with the old 72h. It is counted in the
 heartbeat's `pending_heads` and read on a later tick; `head_fetches` is the number of reads this
-tick. A cache entry is dropped when the listing shows the thread `resolved`, or when the thread is
+tick. Only a failed read is retried: a thread read in full whose head message is absent or has no
+text body is cached as C (`head_missing` / `head_malformed`) under the same key, so it is not
+fetched again until a new post changes the key. A cache entry is dropped when the listing shows the thread `resolved`, or when the thread is
 missing from a listing that was read in full on a tick with no failing source. A failed or partial
 listing drops nothing. A legacy `STOP: blocked-on … wake:<x>` line above `NEXT: none` needs the
 roster to check its wake, which the tick does not have, so it reads as C.

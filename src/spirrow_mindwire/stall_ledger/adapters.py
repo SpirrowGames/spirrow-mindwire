@@ -247,9 +247,27 @@ class HeadBody:
     next_participant: str | None
 
 
+@dataclass(frozen=True)
+class HeadMissing:
+    """The read succeeded, but the head named by the listing is not usable (PR #541 Obj-1-1).
+
+    ``reason`` is ``"missing"`` (the thread came back without ``last_msg_id``) or
+    ``"malformed"`` (the message is there but its ``content`` is not a string). Unlike
+    ``None`` (a failed read, retried next tick) this is a definite answer: the driver caches
+    it as an unexplained head under the same key, so it is not fetched again until the
+    listing's key changes, and a permanently missing head cannot burn the fetch budget.
+    """
+
+    reason: str
+
+
 class HeadReader(Protocol):
-    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | None:
-        """The message ``last_msg_id`` of the thread, or ``None`` if it could not be read."""
+    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | HeadMissing | None:
+        """The message ``last_msg_id`` of the thread.
+
+        ``HeadMissing`` if the thread was read but that message is absent or malformed;
+        ``None`` if the read itself failed (transport, timeout, or an unrecognisable reply).
+        """
         ...
 
 
@@ -646,8 +664,12 @@ class ChatroomThreadAdapter:
             head_reader=self,
         )
 
-    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | None:
-        """One ``chatroom_get_thread`` for the head (D-16d-1). ``None`` on any failure.
+    async def read_head(self, unit: Unit, last_msg_id: str) -> HeadBody | HeadMissing | None:
+        """One ``chatroom_get_thread`` for the head (D-16d-1).
+
+        ``None`` when the call fails or the reply has no message list (retried next tick);
+        ``HeadMissing`` when the reply is a message list without a usable ``last_msg_id``
+        (cached, not retried -- PR #541 Obj-1-1).
 
         The message read is the one the listing named, not merely the newest one returned:
         the cache key and the body must describe the same message, so a post that lands
@@ -672,9 +694,9 @@ class ChatroomThreadAdapter:
                 content = msg.get("content")
                 field_value = msg.get("next_participant")
                 if not isinstance(content, str):
-                    return None
+                    return HeadMissing("malformed")
                 return HeadBody(content, field_value if isinstance(field_value, str) else None)
-        return None
+        return HeadMissing("missing")
 
     def _row_key(self, item: object) -> str | None:
         """The unit key of a listing row, or ``None`` if the row carries no usable id."""

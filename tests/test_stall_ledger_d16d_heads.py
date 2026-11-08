@@ -157,6 +157,7 @@ class FakeChatroom:
     fail_listing: bool = False
     extra_rows: list[Any] = field(default_factory=list)
     read_seconds: float = 0.0
+    fail_reads: bool = False
 
     def put(
         self,
@@ -193,6 +194,8 @@ class FakeChatroom:
             tid = arguments["thread_id"]
             self.reads[tid] = self.reads.get(tid, 0) + 1
             self.clock.t += self.read_seconds
+            if self.fail_reads:
+                raise RuntimeError("get_thread down")
             return {"messages": self.threads[tid]["messages"]}
         raise AssertionError(name)
 
@@ -313,14 +316,52 @@ def test_head_over_budget_is_pending_and_keeps_72h(tmp_path: Path) -> None:
     assert _key(unread) in _store(tmp_path)["records"]
 
 
-def test_failed_head_read_is_pending(tmp_path: Path) -> None:
-    room = FakeChatroom(FakeClock())
+def test_failed_head_read_is_pending_and_retried(tmp_path: Path) -> None:
+    room = FakeChatroom(FakeClock(), fail_reads=True)
     room.put("T-a", "x\n\nNEXT: Bohr")
-    room.threads["T-a"]["messages"] = [{"msg_id": "other", "content": "?"}]
     out = _tick(tmp_path, room, LAST + timedelta(hours=7))
     assert _heartbeat(out)["pending_heads"] == 1
     assert out.counters.opened == 0
     assert _heads(tmp_path) == {}
+    # A transient failure is retried on the next tick.
+    room.fail_reads = False
+    out = _tick(tmp_path, room, LAST + timedelta(hours=8))
+    assert room.reads == {"T-a": 2}
+    assert _heartbeat(out)["pending_heads"] == 0
+
+
+@pytest.mark.parametrize(
+    ("messages", "detail"),
+    [
+        ([{"msg_id": "other", "content": "?"}], "head_missing"),
+        ([], "head_missing"),
+        ([{"msg_id": "m-1", "content": None}], "head_malformed"),
+    ],
+)
+def test_missing_or_malformed_head_is_cached_as_c_not_retried(
+    tmp_path: Path, messages: list[Any], detail: str
+) -> None:
+    # PR #541 Obj-1-1: a read that succeeds without a usable head is a definite answer.
+    room = FakeChatroom(FakeClock())
+    room.put("T-a", "x\n\nNEXT: Bohr")
+    room.threads["T-a"]["messages"] = messages
+    out = _tick(tmp_path, room, LAST + timedelta(hours=7))
+    hb = _heartbeat(out)
+    assert hb["pending_heads"] == 0
+    assert hb["head_fetches"] == 1
+    assert out.counters.opened == 1  # C opens at 6h
+    assert _heads(tmp_path)[_key("T-a")]["group"] == HeadGroup.UNEXPLAINED.value
+    assert _heads(tmp_path)[_key("T-a")]["detail"] == detail
+    # Same key: the head is not fetched again, so it cannot keep spending the budget.
+    for hours in (8, 9, 10):
+        out = _tick(tmp_path, room, LAST + timedelta(hours=hours))
+        assert _heartbeat(out)["head_fetches"] == 0
+        assert _heartbeat(out)["pending_heads"] == 0
+    # A new post changes the key and the head is read once.
+    room.put("T-a", "done\n\nSTOP: done", msg="m-2")
+    out = _tick(tmp_path, room, LAST + timedelta(hours=11))
+    assert _heartbeat(out)["head_fetches"] == 1
+    assert _heads(tmp_path)[_key("T-a")]["group"] == HeadGroup.DONE.value
 
 
 # ─── Eviction (msg-8480) ───────────────────────────────────────────────────────────────

@@ -34,6 +34,7 @@ from typing import Any, TextIO, assert_never
 from spirrow_mindwire.stall_ledger.adapters import (
     ADAPTER_FORMAT_VERSION,
     Adapter,
+    HeadMissing,
     HeadReader,
     HeadRow,
     Marked,
@@ -49,6 +50,7 @@ from spirrow_mindwire.stall_ledger.classifier import classify
 from spirrow_mindwire.stall_ledger.heads import (
     CachedHead,
     HeadClass,
+    HeadGroup,
     HeadKey,
     apply_head,
     classify_head,
@@ -332,6 +334,12 @@ async def _head_for(
     if body is None:
         counters.pending_heads += 1
         return None
+    if isinstance(body, HeadMissing):
+        # A definite answer, not a failure: cache it as C so it is not re-fetched every
+        # tick until the key changes (PR #541 Obj-1-1).
+        head = HeadClass(HeadGroup.UNEXPLAINED, f"head_{body.reason}")
+        store.cache_head(key, CachedHead(wanted, head, None, utc_iso(now)).to_json())
+        return head
     head = classify_head(body.content, next_participant=body.next_participant)
     store.cache_head(key, CachedHead(wanted, head, body.next_participant, utc_iso(now)).to_json())
     return head
