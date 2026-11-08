@@ -16,18 +16,23 @@ What the caller supplies (so the module stays testable without the loop):
 
 * ``origin_url`` — the GitHub remote the slot's ``origin`` is pointed back to after the clone;
 * ``thread_branch`` — the thread's ``loop/...`` name (``git_sync.branch.generation_name``);
-* ``sessions_under(slot_dir) -> int`` — the ``claude_bg`` sessions whose cwd is under the slot
-  (step 5 refuses to rename while one is alive);
+* ``sessions_under(slot_dir) -> int | SessionsUnknown`` — the ``claude_bg`` sessions whose cwd
+  is under the slot (step 5 refuses to rename while one is alive); :class:`SessionsUnknown` =
+  the session list could not be read (its ``detail`` says why). Unknown is treated as "maybe
+  in use" (skip), but only for ``FAILURE_TICKS_TO_PARK`` consecutive ticks: then this thread
+  parks with ``clone_slot_session_unknown`` and the slot is left as it is (Bohr msg-8234 判断 2,
+  ``session_unknown_ticks``);
 * ``prepare_slot(slot_dir)`` — the A-4 preparation beyond ``ensure_pin_ignored`` (gate bootstrap,
   hooks preflight P3 reads, trust registration). Raising from it fails the provision.
 
-Optional owner-file fields this module adds beyond the v2.4 required four (all optional, so the
-classification in :mod:`clone_slot` is unchanged): ``pending_quarantine`` and
-``original_quarantine_path`` (v2.7), plus three bookkeeping fields the spec needs persisted across
-ticks but does not name — ``fetch_failures`` / ``provision_failures`` (the "3 tick 続けて"
-counters, reset on the tick the step succeeds: Bohr msg-8198 判断 1), ``index_lock_ticks``
-(msg-8206) and ``quarantine_context`` (the reason and saved artefacts of the original, so the row
-written when the outcome is finally decided carries them, msg-8086 "行を書くタイミング").
+Optional owner-file fields this module adds beyond the v2.4 required four (all optional,
+so the classification in :mod:`clone_slot` is unchanged): ``pending_quarantine`` and
+``original_quarantine_path`` (v2.7), plus bookkeeping fields the spec needs persisted
+across ticks but does not name — ``fetch_failures`` / ``provision_failures`` (the "3 tick
+続けて" counters, reset on the tick the step succeeds: Bohr msg-8198 判断 1),
+``index_lock_ticks`` (msg-8206), ``session_unknown_ticks`` (msg-8234 判断 2) and
+``quarantine_context`` (the reason and saved artefacts of the original, so the row written
+when the outcome is finally decided carries them, msg-8086 "行を書くタイミング").
 """
 
 from __future__ import annotations
@@ -66,6 +71,7 @@ from spirrow_mindwire.clone_slot import (
     PARK_PRESERVE_FAILED,
     PARK_PROVISION_FAILED,
     PARK_QUARANTINE_UNCONFIRMED,
+    PARK_SESSION_UNKNOWN,
     PARK_UNPUBLISHED,
     PARK_UNRECOVERABLE,
     EntryRoute,
@@ -103,6 +109,13 @@ class PrepResult:
     detail: str = ""
     record: dict[str, Any] | None = None
     steps: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SessionsUnknown:
+    """``sessions_under`` could not read the session list; ``detail`` is the failure, one line."""
+
+    detail: str
 
 
 GitCall = Callable[[Path, Sequence[str], float], GitResult]
@@ -264,7 +277,7 @@ class SlotPrep:
     thread_branch: str
     default_branch: str
     state_dir: Path
-    sessions_under: Callable[[Path], int]
+    sessions_under: Callable[[Path], int | SessionsUnknown]
     prepare_slot: Callable[[Path], None] = lambda _slot: None
     git: GitCall = _subprocess_git
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
@@ -369,8 +382,9 @@ class SlotPrep:
         if route is EntryRoute.QUARANTINE_INCOMPLETE_THEN_PROVISION:
             # v2.3/v2.7: an incomplete slot is mirror content only — no preserve, no pending,
             # original_quarantine_path untouched.
-            if self.sessions_under(paths.slot_dir) > 0:
-                return self._result(PrepAction.SKIP, paths, detail="claude_bg session in slot")
+            gate = self._session_gate(paths, owner)
+            if gate is not None:
+                return gate
             moved = self._rename_with_retry(paths)
             if moved is None:
                 return self._park(
@@ -479,10 +493,9 @@ class SlotPrep:
         ``parked`` row, so the skip can never go on silently (Einstein go after msg-8206).
         """
         slot = paths.slot_dir
-        if self.sessions_under(slot) > 0:
-            return self._result(
-                PrepAction.SKIP, paths, detail=f"clone busy with a live session: {exc.detail}"
-            )
+        gate = self._session_gate(paths, owner, busy=exc.detail)
+        if gate is not None:
+            return gate
         lock = self._index_lock_path(slot)
         n = int(owner.get("index_lock_ticks", 0)) + 1
         if n < FAILURE_TICKS_TO_PARK:
@@ -499,6 +512,51 @@ class SlotPrep:
             PARK_INDEX_LOCK_STALE,
             "index_lock",
             detail=f"index.lock still present for {n} ticks: {lock}",
+        )
+
+    def _session_gate(
+        self, paths: SlotPaths, owner: dict[str, Any], *, busy: str | None = None
+    ) -> PrepResult | None:
+        """``None`` = no session in the slot, go on; otherwise the SKIP / PARK to return.
+
+        The one session check for step 5, the incomplete-slot quarantine and the ``index.lock``
+        branch (msg-8204: one function, one criterion). A live session skips and touches no
+        counter. An unreadable list (:class:`SessionsUnknown`) skips too, but counts
+        ``session_unknown_ticks``; the third consecutive one parks this thread with
+        ``clone_slot_session_unknown`` without moving anything (Bohr msg-8234 判断 2). A list that
+        could be read, whatever it says, resets the count.
+        """
+        n = self.sessions_under(paths.slot_dir)
+        if not isinstance(n, SessionsUnknown):
+            if owner.pop("session_unknown_ticks", None) is not None:
+                self._write_owner(paths, owner)
+            if n > 0:
+                detail = (
+                    f"clone busy with a live session: {busy}"
+                    if busy is not None
+                    else "claude_bg session in slot"
+                )
+                return self._result(PrepAction.SKIP, paths, detail=detail)
+            return None
+        k = int(owner.get("session_unknown_ticks", 0)) + 1
+        if k < FAILURE_TICKS_TO_PARK:
+            owner["session_unknown_ticks"] = k
+            self._write_owner(paths, owner)
+            return self._result(
+                PrepAction.SKIP,
+                paths,
+                detail=f"session list unreadable ({k}/{FAILURE_TICKS_TO_PARK})",
+            )
+        owner.pop("session_unknown_ticks", None)
+        self._write_owner(paths, owner)
+        return self._park(
+            paths,
+            PARK_SESSION_UNKNOWN,
+            "provision_failed",
+            detail=(
+                f"`claude agents --json --all` could not be read for {k} ticks "
+                f"({n.detail}); slot left in place: {paths.slot_dir}"
+            ),
         )
 
     def _index_lock_path(self, slot: Path) -> Path:
@@ -614,8 +672,9 @@ class SlotPrep:
                 paths, PARK_PRESERVE_FAILED, "preserve_failed", bundle=bundle, detail=str(exc)
             )
         # Step 5: no live session in the slot, then pending -> rename -> confirm (v2.7).
-        if self.sessions_under(slot) > 0:
-            return self._result(PrepAction.SKIP, paths, detail="claude_bg session in slot")
+        gate = self._session_gate(paths, owner)
+        if gate is not None:
+            return gate
         owner["quarantine_context"] = {
             "quarantine_reason": reason,
             "patch": None if patch is None else str(patch),
@@ -896,6 +955,7 @@ __all__ = [
     "FAILURE_TICKS_TO_PARK",
     "PrepAction",
     "PrepResult",
+    "SessionsUnknown",
     "SlotLockBusyError",
     "SlotPrep",
     "exclusive_lock",

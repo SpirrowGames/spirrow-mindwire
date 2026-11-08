@@ -19,6 +19,7 @@ import pytest
 from spirrow_mindwire.clone_guard import CloneGuard
 from spirrow_mindwire.clone_retreat_log import (
     INDEX_LOCK_STALE_PARK_CODE,
+    SESSION_UNKNOWN_PARK_CODE,
     append_slot_preserve,
     append_slot_quarantine,
     build_slot_preserve_record,
@@ -34,6 +35,7 @@ from spirrow_mindwire.clone_slot import (
     PARK_PRESERVE_FAILED,
     PARK_PROVISION_FAILED,
     PARK_QUARANTINE_UNCONFIRMED,
+    PARK_SESSION_UNKNOWN,
     PARK_UNPUBLISHED,
     PARK_UNRECOVERABLE,
     SlotPaths,
@@ -43,6 +45,7 @@ from spirrow_mindwire.clone_slot import (
 )
 from spirrow_mindwire.clone_slot_prep import (
     PrepAction,
+    SessionsUnknown,
     SlotLockBusyError,
     SlotPrep,
     exclusive_lock,
@@ -775,3 +778,85 @@ def test_pending_unresolvable_parks_unconfirmed(world: dict[str, Path], both: bo
     assert row["quarantine_candidates"] == [str(slot), str(dest)]
     notice = render_slot_notice(row)
     assert str(slot) in notice and str(dest) in notice
+
+
+# -- msg-8234 判断 2: an unreadable session list skips for at most 3 ticks, then parks ------------
+
+
+def _unknown(_p: Path) -> SessionsUnknown:
+    return SessionsUnknown("exit 1: agents list broke")
+
+
+def test_unreadable_session_list_parks_dirty_slot_on_third_tick_without_moving_it(
+    world: dict[str, Path],
+) -> None:
+    clock = Clock()  # one clock across ticks, as in production (distinct preserve stamps)
+    slot = _ready(world)
+    (slot / "new.txt").write_text("x\n", encoding="utf-8")  # needs a quarantine
+    for n in (1, 2):
+        res = _prep(world, sessions_under=_unknown, now=clock).run()
+        assert res.action is PrepAction.SKIP and "session list unreadable" in res.detail
+        assert _owner(world)["session_unknown_ticks"] == n and _rows(world) == []
+    res = _prep(world, sessions_under=_unknown, now=clock).run()
+    assert res.action is PrepAction.PARK and res.park_code == PARK_SESSION_UNKNOWN
+    row = res.record
+    assert row is not None and _rows(world) == [row]
+    assert row["action"] == "parked" and row["quarantine_reason"] == "provision_failed"
+    assert row["quarantine_path"] is None and "agents list broke" in str(row["detail"])
+    assert "session_unknown_ticks" not in _owner(world)
+    assert (slot / "new.txt").exists() and _quarantined(world) == []  # nothing moved
+    notice = render_slot_notice(row)
+    assert "not moved or changed" in notice and "claude agents --json --all" in notice
+    assert "rebuilt" not in notice and "clean" not in notice
+
+
+def test_session_unknown_counter_resets_when_the_list_reads_again(
+    world: dict[str, Path],
+) -> None:
+    clock = Clock()  # one clock across ticks, as in production (distinct preserve stamps)
+    slot = _ready(world)
+    (slot / "new.txt").write_text("x\n", encoding="utf-8")
+    for _ in range(2):
+        assert _prep(world, sessions_under=_unknown, now=clock).run().action is PrepAction.SKIP
+    # readable, but a live session: SKIP, and the unknown count is reset
+    assert _prep(world, sessions_under=lambda _p: 1, now=clock).run().action is PrepAction.SKIP
+    assert "session_unknown_ticks" not in _owner(world)
+    for _ in range(2):
+        assert _prep(world, sessions_under=_unknown, now=clock).run().action is PrepAction.SKIP
+    assert _owner(world)["session_unknown_ticks"] == 2 and _rows(world) == []
+
+
+def test_live_session_never_counts_session_unknown(world: dict[str, Path]) -> None:
+    clock = Clock()  # one clock across ticks, as in production (distinct preserve stamps)
+    slot = _ready(world)
+    (slot / "new.txt").write_text("x\n", encoding="utf-8")
+    for _ in range(5):
+        assert _prep(world, sessions_under=lambda _p: 1, now=clock).run().action is PrepAction.SKIP
+    assert "session_unknown_ticks" not in _owner(world) and _rows(world) == []
+
+
+def test_clean_slot_launches_with_unreadable_session_list(world: dict[str, Path]) -> None:
+    clock = Clock()
+    _ready(world)
+    for _ in range(4):
+        assert _prep(world, sessions_under=_unknown, now=clock).run().action is PrepAction.LAUNCH
+    assert "session_unknown_ticks" not in _owner(world)
+
+
+def test_index_lock_with_unreadable_list_counts_session_unknown_not_lock_ticks(
+    world: dict[str, Path],
+) -> None:
+    clock = Clock()
+    slot = _ready(world)
+    lock = _stale_index_lock(slot)
+    for _ in range(2):
+        prep = _prep(world, guard_factory=_fast_guard, sessions_under=_unknown, now=clock)
+        assert prep.run().action is PrepAction.SKIP
+    assert "index_lock_ticks" not in _owner(world)
+    res = _prep(world, guard_factory=_fast_guard, sessions_under=_unknown, now=clock).run()
+    assert res.park_code == PARK_SESSION_UNKNOWN
+    assert lock.exists() and slot.exists() and _quarantined(world) == []
+
+
+def test_session_unknown_park_code_constant_matches_log_module() -> None:
+    assert PARK_SESSION_UNKNOWN == SESSION_UNKNOWN_PARK_CODE

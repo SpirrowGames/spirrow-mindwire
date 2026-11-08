@@ -22,12 +22,11 @@ from spirrow_mindwire.clone_slot_cli import (
     EXIT_PARK,
     EXIT_SKIP,
     SLOT_PREP_PAYLOAD_PREFIX,
-    UNKNOWN_SESSIONS,
     claude_sessions_under,
     count_sessions_under,
     run,
 )
-from spirrow_mindwire.clone_slot_prep import SlotPrep
+from spirrow_mindwire.clone_slot_prep import SessionsUnknown, SlotPrep
 
 REPO = "demo"
 THREAD = "T-slot-cli-demo"
@@ -177,7 +176,8 @@ def test_count_sessions_under_matches_slot_and_children_only(tmp_path: Path) -> 
 
 def test_unreadable_agent_list_counts_as_a_live_session(tmp_path: Path) -> None:
     missing = str(tmp_path / "no-such-claude.exe")
-    assert claude_sessions_under(missing)(tmp_path) == UNKNOWN_SESSIONS
+    got = claude_sessions_under(missing)(tmp_path)
+    assert isinstance(got, SessionsUnknown) and got.detail
 
 
 def test_cli_slot_prep_end_to_end(
@@ -206,3 +206,12 @@ def test_cli_slot_prep_end_to_end(
         cli.main(argv)
     assert exc.value.code == EXIT_LAUNCH
     assert _payload(capsys.readouterr().out)["action"] == "launch"
+
+
+def test_wrapper_crash_park_code_matches_clone_slot_constant() -> None:
+    """The wrapper parks a crashed slot-prep with clone_slot.PARK_PREP_CRASHED (msg-8236)."""
+    from spirrow_mindwire.clone_slot import PARK_PREP_CRASHED
+
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "run-conductor-scheduled.ps1").read_text(encoding="utf-8")
+    assert f"$SlotPrepCrashedParkCode = '{PARK_PREP_CRASHED}'" in text

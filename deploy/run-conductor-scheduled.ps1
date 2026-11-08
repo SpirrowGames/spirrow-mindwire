@@ -3108,6 +3108,48 @@ function Get-DirtyCloneNotice {
               reason = $reason; head = $head; detail = $detail }
 }
 
+# --- per-thread clone slot: reading `mindwire slot-prep` (T-ephemeral-impl-clone-slot-per-thread) ---
+# `mindwire slot-prep` exits 0 launch / 3 skip / 4 park and prints one MINDWIRE_SLOT_PREP_PAYLOAD
+# row (src/spirrow_mindwire/clone_slot_cli.py). Exit 1, any code it does not define, or a launch
+# without a readable slot_dir is a CRASH: the thread is parked on THAT tick with
+# clone_slot_prep_crashed (detail = exit code + first stderr line). No crash counter exists anywhere
+# (Bohr msg-8236, Obj-18-1), and a crash never falls back to the shared repo_dir: the verdict
+# carries no repo_dir to launch in, only a park. Pure: reads its arguments, touches nothing.
+# Not yet called by the sweep loop: the wiring lands with the slot-scoped park key (msg-8229 cond. 2).
+$SlotPrepCrashedParkCode = 'clone_slot_prep_crashed'
+function Get-SlotPrepVerdict {
+    param([int]$ExitCode, $Output, $Stderr)
+    $payload = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_SLOT_PREP_PAYLOAD\s+(.*)$') {
+            try { $payload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
+            break
+        }
+    }
+    $errLine = @(@($Stderr) | ForEach-Object { "$_" } | Where-Object { $_.Trim() }) | Select-Object -First 1
+    if (-not $errLine) { $errLine = '-' }
+    $crash = @{ action = 'park'; crashed = $true; slot_dir = $null; park_code = $SlotPrepCrashedParkCode
+                detail = "slot-prep exit=${ExitCode}: $errLine"; record = $null }
+    $want = @{ 0 = 'launch'; 3 = 'skip'; 4 = 'park' }
+    if (-not $want.ContainsKey($ExitCode) -or $null -eq $payload) { return $crash }
+    if ("$($payload.action)" -ne $want[$ExitCode]) {
+        $crash.detail = "slot-prep exit=${ExitCode} but payload action=$($payload.action): $errLine"
+        return $crash
+    }
+    if ($ExitCode -eq 0 -and -not $payload.slot_dir) {
+        $crash.detail = "slot-prep exit=0 without a slot_dir: $errLine"
+        return $crash
+    }
+    if ($ExitCode -eq 4 -and -not $payload.park_code) {
+        $crash.detail = "slot-prep exit=4 without a park_code: $errLine"
+        return $crash
+    }
+    return @{ action = $want[$ExitCode]; crashed = $false
+              slot_dir = $(if ($payload.slot_dir) { "$($payload.slot_dir)" } else { $null })
+              park_code = $(if ($payload.park_code) { "$($payload.park_code)" } else { $null })
+              detail = "$($payload.detail)"; record = $payload.record }
+}
+
 # --- git-sync deferral (ADR-2026-10-09-23 unit 1, design v1.2 B-2) ---
 # The daemon exits $GitSyncDeferredExitCode when the git-sync hook could not name the thread's
 # branch because the GitHub API stayed transiently unavailable (5xx / timeout / rate limit) through

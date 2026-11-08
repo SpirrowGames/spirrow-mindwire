@@ -48,6 +48,10 @@ PARK_PROVISION_FAILED = "clone_slot_provision_failed"
 PARK_UNRECOVERABLE = "clone_slot_unrecoverable"
 PARK_QUARANTINE_UNCONFIRMED = "clone_slot_quarantine_unconfirmed"
 PARK_INDEX_LOCK_STALE = "clone_slot_index_lock_stale"  # Bohr msg-8206
+PARK_SESSION_UNKNOWN = "clone_slot_session_unknown"  # Bohr msg-8234 判断 2
+# Written by the sweep wrapper (not SlotPrep) when `mindwire slot-prep` exits 1 or with a code it
+# does not define: parked on that tick, no counter anywhere (Bohr msg-8236, Obj-18-1).
+PARK_PREP_CRASHED = "clone_slot_prep_crashed"
 PARK_GIT_DIVERGED = "git.diverged"
 PARK_GIT_PUSH_FAILED = "git.push_failed"
 
