@@ -109,9 +109,10 @@ from .handoff import (
     NONE_TOKEN,
     OPERATOR_TOKEN,
     HumanAsk,
+    TerminalView,
     parse_next_token,
     resolve_handoff,
-    settles_by_terminal_form,
+    terminal_form_view,
 )
 
 # --- Constants (policy calls, not derived values) ------------------------------------------------
@@ -408,12 +409,21 @@ def parse_head_token(body: str) -> str:
     An ACCEPTED terminal form (``STOP: done``, or ``BLOCKED-ON:`` above ``NEXT: <wake>``) reads as
     ``none`` (T-done-disposition-auto-close, design v2.4): it stops the loop the way ``NEXT: none``
     did, Stage 1 SKIPs it through :data:`STOP_TOKENS` unchanged, and the head cache — which keeps
-    only this token — replays it as ``NEXT: none`` and SKIPs again. While the forms are off
-    (``handoff.ACCEPT_NEW_FORMS``) nothing is rewritten, so such a head LAUNCHes and the conductor
-    posts the MALFORMED notice that moves it.
+    only this token — replays it as ``NEXT: none`` and SKIPs again.
+
+    A REFUSED terminal form (``handoff.TerminalView.REFUSED``: a broken form, or any new form
+    while ``handoff.ACCEPT_NEW_FORMS`` is off) is UNRESOLVED, whatever its ``NEXT:`` says. Its
+    token may be a stop token — ``BLOCKED-ON: pr a/b#1`` above ``NEXT: none`` reads ``none`` —
+    and reading it would park the head silently (PR #531 gate msg-8201). As UNRESOLVED it
+    LAUNCHes, the conductor posts the MALFORMED notice that moves it, and the stop is terminal
+    (``malformed_handoff``), so the same head is not launched twice; the cache replays ``""``,
+    which Stage 1b keeps parked.
     """
-    if settles_by_terminal_form(body):
+    view = terminal_form_view(body)
+    if view is TerminalView.SETTLES:
         return NONE_TOKEN
+    if view is TerminalView.REFUSED:
+        return ""
     raw = parse_next_token(body)
     if raw is None:
         return ""

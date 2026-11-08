@@ -377,6 +377,8 @@ async def run_tick(
                 # A refused stop must never be silent (msg-8172 §1; PR #531 gate msg-8190), so
                 # this tick, the one reader with the roster, posts that same notice itself. It
                 # ends ``NEXT: human``, which moves the head off the form: posted once per head.
+                # A form refused WITHOUT the roster is not settled here: head_skip LAUNCHes it and
+                # the conductor says it (handoff.TerminalView), so the two never both post.
                 handoff = resolve_handoff(
                     head.content, roster, next_participant=head.next_participant
                 )

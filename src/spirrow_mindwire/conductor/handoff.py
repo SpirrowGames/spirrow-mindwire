@@ -839,18 +839,63 @@ def _accepting(accept_new_forms: bool | None) -> bool:
     return ACCEPT_NEW_FORMS if accept_new_forms is None else accept_new_forms
 
 
+class TerminalView(StrEnum):
+    """What a roster-free reader (the sweep, 1b, 1c) may conclude from a head's terminal form.
+
+    The three values partition every body, and the partition is what keeps a refused form from
+    being silent (PR #531 gate msg-8190 / msg-8201): the roster-free view can only be *stricter*
+    than the roster's, never laxer, because :func:`_terminal_form` applies the roster check last
+    and the field check (:func:`_resolve_terminal`) comes after that. So:
+
+    - ``LEGACY`` — neither form. The roster reader does not see one either; nothing here changes.
+    - ``REFUSED`` — every reader with a roster refuses it too (``Handoff.malformed`` is set). The
+      sweep must LAUNCH it (never read its ``NEXT:`` token, which may be a stop token such as
+      ``none``), so the conductor posts the MALFORMED notice.
+    - ``SETTLES`` — accepted without a roster. The sweep parks it; the roster may still refuse it
+      (a wake outside ``STOP_WAKE_ROLES``, a contradicting field), and the park-wake tick — the
+      roster reader that runs on parked heads — posts the notice for exactly those.
+
+    ∴ a refused form is said by the conductor iff ``REFUSED`` and by the tick iff ``SETTLES``:
+    once, by one of the two.
+    """
+
+    LEGACY = "legacy"
+    REFUSED = "refused"
+    SETTLES = "settles"
+
+
+def terminal_form_view(body: str, *, accept_new_forms: bool | None = None) -> TerminalView:
+    """The roster-free :class:`TerminalView` of ``body`` (see there for why it partitions)."""
+    form = _terminal_form(body, {}, check_roster=False)
+    if form is None:
+        return TerminalView.LEGACY
+    if isinstance(form, MalformedHandoff) or not _accepting(accept_new_forms):
+        return TerminalView.REFUSED
+    return TerminalView.SETTLES
+
+
 def settles_by_terminal_form(body: str, *, accept_new_forms: bool | None = None) -> bool:
     """Does ``body`` stop the loop through an ACCEPTED terminal form? Roster-free (sweep's view).
 
     The readers that classify a head by its ``NEXT:`` token alone — head_skip Stage 1, 1c's tail
     rule, 1b's settled precheck — ask this first and read a ``True`` as ``none``: an accepted
     ``STOP: done`` or ``BLOCKED-ON`` head stops the loop exactly as ``NEXT: none`` (+ ``STOP:``)
-    did. While the forms are off this is always ``False``, so those readers see the head as it is
-    (no token, or the wake's token) and the conductor is launched to post the MALFORMED notice.
+    did. While the forms are off this is always ``False``. A head that is ``False`` here may still
+    be a refused form (:func:`refused_by_terminal_form`); a reader that would act on its ``NEXT:``
+    token must ask that too, because the token of a refused form can be a stop token.
     """
-    if not _accepting(accept_new_forms):
-        return False
-    return isinstance(_terminal_form(body, {}, check_roster=False), StopLine)
+    return terminal_form_view(body, accept_new_forms=accept_new_forms) is TerminalView.SETTLES
+
+
+def refused_by_terminal_form(body: str, *, accept_new_forms: bool | None = None) -> bool:
+    """Is ``body`` a terminal form that every reader refuses, roster or not? Roster-free.
+
+    ``True`` for a broken form (``BLOCKED-ON: pr a/b#1`` above ``NEXT: none``, a ``STOP:`` that is
+    not ``STOP: done``, ...) and, while the forms are off, for a well-formed one. Its ``NEXT:``
+    token says nothing: head_skip reads such a head as UNRESOLVED (LAUNCH) so the conductor posts
+    the notice, and 1c does not treat it as an idle tail (PR #531 gate msg-8201).
+    """
+    return terminal_form_view(body, accept_new_forms=accept_new_forms) is TerminalView.REFUSED
 
 
 _MALFORMED_CAUSES: dict[MalformedHandoff, str] = {
@@ -1814,12 +1859,15 @@ __all__ = [
     "OperatorFault",
     "StopLine",
     "StopStatus",
+    "TerminalView",
     "build_handoff_protocol_block",
     "conditional_proceed_notice",
     "declares_no_tier_c",
     "declares_tier_c",
     "malformed_notice",
     "parse_next_token",
+    "refused_by_terminal_form",
     "resolve_handoff",
     "settles_by_terminal_form",
+    "terminal_form_view",
 ]

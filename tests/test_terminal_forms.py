@@ -208,7 +208,8 @@ def test_head_skip_launches_new_forms_while_off() -> None:
     # LAUNCH is what gets the MALFORMED notice posted (the notice moves the head).
     assert not stage1_skips(DONE)
     assert not stage1_skips(BLOCKED)
-    assert parse_head_token(BLOCKED) == "bohr"
+    # UNRESOLVED, not the wake's token: a refused form's NEXT says nothing (PR #531 msg-8201).
+    assert parse_head_token(BLOCKED) == ""
 
 
 def test_head_skip_reads_accepted_forms_as_none(accepting: None) -> None:
@@ -352,3 +353,138 @@ def test_the_conductor_and_the_tick_post_the_same_notice() -> None:
 
     assert not hasattr(core, "_malformed_notice")
     assert vars(core)["malformed_notice"] is malformed_notice
+
+
+# --------------------------------------------------------------------------- the whole matrix
+#
+# PR #531 gate msg-8190 / msg-8201: each round found one cell of (accepted / malformed) x (final
+# NEXT token) where a refused form was parked silently. This enumerates every cell and checks the
+# class, not an instance: for each head, with the forms off and on, and with and without a
+# contradicting ``next_participant`` field —
+#
+# - refused (``resolve_handoff`` with the roster sets ``malformed``): the MALFORMED notice is
+#   posted EXACTLY ONCE between the two readers that can say it — the conductor (when the sweep
+#   LAUNCHes) and the park-wake tick (when the sweep SKIPs) — and 1c does not fire on the
+#   conductor's share;
+# - accepted: the sweep SKIPs (also on the cached token), the tick posts nothing, and nothing is
+#   launched — a valid wait never relaunches.
+
+_TOKENS: dict[str, str | None] = {
+    "participant": "Bohr",
+    "human": HUMAN_TOKEN,
+    "none": NONE_TOKEN,
+    "operator": "operator",
+    "pr-review": "pr-review a/b#1",
+    "absent": None,
+}
+
+
+def _matrix_bodies() -> list[tuple[str, str]]:
+    """``(cell id, body)`` for every terminal-form shape under every final ``NEXT:`` token."""
+    cells: list[tuple[str, str]] = []
+    for name, token in _TOKENS.items():
+        # A ``NEXT:`` line earlier in the body (quoted, or a stale one) above a final STOP line.
+        lead = f"x\nNEXT: {token}\n\n" if token is not None else "x\n\n"
+        cells.append((f"stop-done/{name}", f"{lead}STOP: done"))
+        cells.append((f"stop-not-done/{name}", f"{lead}STOP: nope"))
+        cells.append((f"stop-spaced/{name}", f"{lead}STOP : done"))
+        if token is None:
+            continue
+        cells.append((f"blocked-on-bad-form/{name}", f"x\nBLOCKED-ON: soon\nNEXT: {token}"))
+        cells.append((f"blocked-on-self/{name}", f"x\nBLOCKED-ON: self job-1\nNEXT: {token}"))
+        cells.append((f"blocked-on-lowercase/{name}", f"x\nblocked-on: pr a/b#1\nNEXT: {token}"))
+        cells.append((f"blocked-on-pr/{name}", f"x\nBLOCKED-ON: pr a/b#1\nNEXT: {token}"))
+        cells.append((f"blocked-on-thread/{name}", f"x\nBLOCKED-ON: thread T-other\nNEXT: {token}"))
+    # Participant-only shapes: a roster-refused wake, and STOP above a participant.
+    cells.append(
+        ("blocked-on-implementer/participant", "x\nBLOCKED-ON: pr a/b#1\nNEXT: Heisenberg")
+    )
+    cells.append(("blocked-on-unknown/participant", "x\nBLOCKED-ON: pr a/b#1\nNEXT: Nobody"))
+    cells.append(("stop-above-next/participant", "x\nSTOP: done\nNEXT: Bohr"))
+    return cells
+
+
+_MATRIX = [
+    pytest.param(body, field, on, id=f"{cell}/field={field}/accept={on}")
+    for cell, body in _matrix_bodies()
+    for field in (None, "Einstein")
+    for on in (False, True)
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("body", "field", "on"), _MATRIX)
+async def test_no_cell_of_the_matrix_is_silent(
+    monkeypatch: pytest.MonkeyPatch, body: str, field: str | None, on: bool
+) -> None:
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", on)
+    # Every cell is a terminal form; a legacy body would test nothing here.
+    assert handoff_mod.terminal_form_view(body) is not handoff_mod.TerminalView.LEGACY
+    refused = resolve_handoff(body, _ROSTER, next_participant=field).malformed
+
+    # Sweep (roster-free, field-blind), on the fetched body and on the cached token.
+    sweep_skips = stage1_skips(body)
+    assert stage1_skips(f"NEXT: {parse_head_token(body)}") is sweep_skips
+
+    # Park-wake tick (roster + field).
+    tick = _TickMcp()
+    tick.thread("p", "T-other", content="x\n\nNEXT: Bohr")
+    tick.thread("p", "T-x", content=body, msg_id="msg-7")
+    if field is not None:
+        tick.threads[("p", "T-x")]["messages"][0]["next_participant"] = field
+    report = (await run_tick(mcp=tick, gh=_Gh({}), project="p", roster=_ROSTER)).as_dict()
+    tick_notices = [p["content"] for p in tick.posts if p["thread_id"] == "T-x"]
+
+    # Conductor — launched only when the sweep does not skip.
+    conductor_notices: list[str] = []
+    if not sweep_skips:
+        mcp = _FakeChatroomMcp()
+        mcp.seed(author="Bohr", content=body, next_participant=field)
+        disp = _ScriptedDispatcher(mcp, {})
+        outcome = await _conductor_with(mcp, disp, None).run()
+        assert disp.spawns == []
+        if refused is not None:
+            assert outcome.stop_reason is StopReason.MALFORMED_HANDOFF
+        conductor_notices = [p["content"] for p in mcp.posts]
+
+    if refused is not None:
+        notices = tick_notices + conductor_notices
+        assert notices == [malformed_notice(refused)], "a refused form must be said exactly once"
+        if not sweep_skips:
+            # The conductor's share: 1c must not fire the gate onto the head the conductor is
+            # answering. (The tick's share is a head 1c, field- and roster-blind like the sweep,
+            # reads as settled — the same reading as before this PR for ``NEXT: none``.)
+            assert tail_decision(body, repo="a/b", number=1) is AutoGateNoop.QUEUED_BEHIND
+        # The notice moves the head to one the sweep parks and that is not itself a form.
+        assert stage1_skips(notices[0])
+        assert handoff_mod.terminal_form_view(notices[0]) is handoff_mod.TerminalView.LEGACY
+    else:
+        assert on, "nothing is accepted while the forms are off"
+        assert sweep_skips and parse_head_token(body) == NONE_TOKEN
+        assert tick_notices == [] and report["notices"] == []
+        assert conductor_notices == []
+
+
+def test_the_matrix_covers_every_token_and_both_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The matrix is only as good as its cells: every NEXT token appears, and with the forms on it
+    # holds both accepted heads and heads refused only by the roster / the field (the tick's
+    # share) as well as heads refused without one (the conductor's share).
+    monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
+    names = {cell.split("/")[1] for cell, _ in _matrix_bodies()}
+    assert names == set(_TOKENS)
+    shares = set()
+    for _, body in _matrix_bodies():
+        for field in (None, "Einstein"):
+            refused = resolve_handoff(body, _ROSTER, next_participant=field).malformed
+            skips = stage1_skips(body)
+            shares.add(("accepted" if refused is None else "refused", skips))
+    assert shares == {("accepted", True), ("refused", True), ("refused", False)}
+
+
+@pytest.mark.parametrize("token", ["none", "human", "operator"])
+def test_a_refused_form_ending_on_a_stop_token_launches(token: str) -> None:
+    # The msg-8201 instance, pinned by name: the token of a refused form is never read.
+    body = f"x\nBLOCKED-ON: pr a/b#1\nNEXT: {token}"
+    assert handoff_mod.refused_by_terminal_form(body)
+    assert parse_head_token(body) == ""
+    assert not stage1_skips(body)
