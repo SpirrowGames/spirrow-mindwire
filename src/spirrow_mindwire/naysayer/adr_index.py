@@ -57,9 +57,12 @@ The body locator format is one of:
 * ``chatroom:<project>/<thread>#msg-<n>`` — canonical: the decide-close message.
 * ``unknown`` — weak: "this index does not record where the body is". The default a
   new entry gets, carried forward as debt until someone records the real locator.
-* ``drive`` / ``drive:<fileId-or-title>`` — **legacy.** Drive stopped being canonical on
-  2026-09-11 (see below), so nothing new should be pointed there. Still accepted, because
-  rejecting it would red the suite over entries written before that decision.
+* ``drive`` — **legacy.** Drive stopped being canonical on 2026-09-11 (see below), so
+  nothing new should be pointed there. Still accepted, because rejecting it would red the
+  suite over entries written before that decision. The pointer form ``drive:<fileId>`` is
+  **no longer accepted** (T-adr-index-locator-grammar-fail-open-edges, human decision):
+  it had zero entries, its ``.+`` admitted whitespace, and with Drive no longer canonical
+  nothing new will be written in it.
 * ``repo:<repo-relative path>.md`` — the body file lives in **this** repository (under
   ``docs/adr/``). Guarded by the regex *plus* an out-of-regex path predicate (no
   absolute paths, no ``..`` segments) *plus* a same-tree existence check, because a
@@ -93,15 +96,25 @@ _MANIFEST_REL = Path("spec") / "adr_index.yaml"
 # A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``. The
 # naysayer index reads the manifest (below), not §M; §M is parsed only to build/validate
 # the manifest. What is optional about the third column (``thread``) is its *content*
-# (``[^|]*?`` admits an empty cell), NOT the column: the closing pipe is mandatory. A row
+# (``[^|\n]*?`` admits an empty cell), NOT the column: the closing pipe is mandatory. A row
 # that drops the column outright (2 cells / 3 pipes) therefore does not match at all, and
 # its ADR vanishes from the parse result in silence — and, since ``adr_index_gen`` folds
 # §M into the generated manifest, out of the manifest too. §M is the only source for the
 # §M-only identity ADRs, so for those the entry simply ceases to exist. The guard against
 # that is ``test_section_m_rows_all_parse``; the two §M drift-checks cannot be, because
 # both are subset checks over rows that already parsed.
+#
+# Every cell class and every pad is LINE-BOUNDED (``[^|\n]``, ``[ \t]*``), so a match can
+# never cross into the next row. ``re.MULTILINE`` changes only ``^``; it does not stop
+# ``[^|]`` or ``\s`` from matching a newline. With those, a broken row (closing pipe
+# missing, or third column missing) borrowed the NEXT row's leading ``|`` and matched, so
+# the broken row's id parsed and its well-formed neighbour vanished instead
+# (T-adr-index-locator-grammar-fail-open-edges (c); both shapes are pinned in
+# ``test_broken_section_m_row_does_not_swallow_the_next_row``). Now it is the broken row's
+# own id that drops out, which is what ``test_section_m_rows_all_parse`` reports.
 _ADR_INDEX_ROW_RE = re.compile(
-    r"^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|]*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|",
+    r"^\|[ \t]*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|\n]*\|[ \t]*([^|\n]+?)[ \t]*\|"
+    r"[ \t]*([^|\n]*?)[ \t]*\|",
     re.MULTILINE,
 )
 
@@ -110,8 +123,10 @@ _ADR_INDEX_ROW_RE = re.compile(
 # Accepts these shapes and only these:
 #   - chatroom:<project>/<thread>#msg-<n>
 #   - unknown                      (weak default: location not recorded)
-#   - drive / drive:<non-empty>    (legacy — Drive is no longer canonical. Preserved on
-#                                  regenerate; never what a new entry defaults to)
+#   - drive                        (legacy — Drive is no longer canonical. Preserved on
+#                                  regenerate; never what a new entry defaults to. The
+#                                  ``drive:<pointer>`` form was dropped: zero entries,
+#                                  and its ``.+`` admitted whitespace)
 #   - repo:<repo-relative path>.md
 # ``[\w.-]+`` matches project/thread ids (letters/digits/_/./-); the anchor ``#msg-<n>``
 # is required for the chatroom form (Einstein's O-1 in msg-2582 — an anchor-missing
@@ -124,7 +139,7 @@ _ADR_INDEX_ROW_RE = re.compile(
 # :func:`body_locator_is_valid` over matching this regex directly — the regex alone is
 # NOT the full validity rule.
 BODY_LOCATOR_RE = re.compile(
-    r"^(?:chatroom:[\w.-]+/[\w.-]+#msg-\d+|unknown|drive|drive:.+|repo:[A-Za-z0-9._/-]+\.md)$"
+    r"^(?:chatroom:[\w.-]+/[\w.-]+#msg-\d+|unknown|drive|repo:[A-Za-z0-9._/-]+\.md)$"
 )
 
 _REPO_LOCATOR_PREFIX = "repo:"
@@ -335,7 +350,7 @@ def build_adr_index_block(repo_root: Path | None = None) -> str:
         "locator: `chatroom:<project>/<thread>#msg-<n>` names the message that carries "
         "the decide-close; `repo:<path>` names a file inside this repository (read it "
         "directly); `unknown` means this index does not record where the body is — a "
-        "weak locator and a known debt; `drive` / `drive:<id>` are legacy entries from "
+        "weak locator and a known debt; a bare `drive` is a legacy entry from "
         "before Drive stopped being canonical. A locator says where the bytes can be "
         "opened, not "
         "which copy is normative:\n"
