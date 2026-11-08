@@ -886,6 +886,17 @@ missing from a listing that was read in full on a tick with no failing source. A
 listing drops nothing. A legacy `STOP: blocked-on … wake:<x>` line above `NEXT: none` needs the
 roster to check its wake, which the tick does not have, so it reads as C.
 
+**`--report` (D-16d-1).** `uv run python scripts/stall_ledger_tick.py --data-dir <dir> --report`
+prints one JSON line built from the store alone. It makes no chatroom or GitHub call, takes no
+lock, uses no fetch budget and writes nothing, so it is safe to run while the task is live. It
+shows `heads_by_group` (cached heads per group A–D; B, `STOP: done`, is only counted here),
+`pending_heads` (the heads the last tick that wrote the store could not read; the tick keeps
+them in the store's `thread_heads_pending`), `next_human` (the D heads that are `NEXT: human`,
+count and list — they still open at 72h like the rest of D) and `open_records_by_group` (every
+open record under its thread's group; an unread thread is under C with `head_read: false`, a
+PR or quarantine record under `not_thread`). The report does not tell a `T-pr-review-*` thread
+whose PR is merged or closed apart from others: neither the store nor the tick has PR state.
+
 Known limit: the chatroom offers no way to edit a message (no edit tool on the MCP surface, and no
 edit field on a message, checked 2026-11-09). If one is added and an edit does not move
 `last_activity_at`, the tick will not see the edit. To correct a head, post a new message.
