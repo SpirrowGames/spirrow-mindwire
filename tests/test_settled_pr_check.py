@@ -38,7 +38,7 @@ from spirrow_mindwire.conductor.gate_records import (
     render_relay_heading,
     verdict_heads,
 )
-from spirrow_mindwire.conductor.handoff import parse_next_token
+from spirrow_mindwire.conductor.handoff import parse_next_token, settles_by_terminal_form
 from spirrow_mindwire.conductor.head_skip import stage1_skips
 from spirrow_mindwire.conductor.parked_lane import ParkedLane, classify_parked
 from spirrow_mindwire.gate_admission import AdmissionResult, GateAdmission
@@ -155,7 +155,7 @@ def test_merged_with_closes_thread_naming_this_thread_settles() -> None:
         proposer="Bohr",
     )
     assert post is not None
-    assert post.next_line == "NEXT: none"
+    assert post.next_line == "STOP: done"
     assert _MERGE_SHA in post.body
 
 
@@ -318,7 +318,7 @@ async def test_settled_pr_posts_the_fact_once_and_never_reaches_admission(
 
 @pytest.mark.anyio
 async def test_the_tick_after_a_settled_post_does_not_come_back_to_the_gate() -> None:
-    # Closes-thread names this thread → NEXT: none. The second run reads that head and stops
+    # Closes-thread names this thread → STOP: done. The second run reads that head and stops
     # SETTLED: no second post, no state read, no gate.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content=f"pushed\n\nNEXT: pr-review {_REF}")
@@ -627,6 +627,7 @@ async def test_conductor_does_not_close_on_a_bare_id_it_cannot_resolve(
     content = mcp.posts[-1]["content"]
     assert f"（{why}）" in content  # noqa: RUF001
     assert parse_next_token(content) != "none"
+    assert not settles_by_terminal_form(content)
     assert gate.fired == []
 
 
@@ -640,7 +641,7 @@ async def test_conductor_closes_on_a_qualified_id_even_when_unresolved() -> None
     cond = _settled_conductor(mcp, state=_StateSource(merged), gate=gate)
     cond._repo_projects = lambda: RepoProjectMap(unresolved=frozenset({"app"}))
     await cond.run()
-    assert parse_next_token(mcp.posts[-1]["content"]) == "none"
+    assert settles_by_terminal_form(mcp.posts[-1]["content"])
 
 
 def test_conductor_without_a_table_or_with_a_broken_one_resolves_nothing() -> None:

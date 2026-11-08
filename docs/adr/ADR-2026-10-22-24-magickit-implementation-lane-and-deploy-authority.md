@@ -7,6 +7,7 @@
 - **Amends**: ADR-2026-05-27-09 D-6（D-6 のみ。D-1〜D-5 は変えない）
 - **Scope**: Magickit の変更を誰が実装してよいか、および Magickit 本番 deploy を誰の指示で行うか。
 - **Author**: Heisenberg (implementer) — 起票 chatroom thread `T-adr09-d6-magickit-lane-amendment`（作業仕様: Bohr msg-7392 / msg-7394 / msg-7396 / msg-7398、設計レビュー: Einstein msg-7393 / msg-7395 / msg-7397 と、その後の go（ADR-12 を D-6' -4 に加える助言 1 件を反映））
+- **改訂**: 2026-11-08 — D-6' -3 の駐機の書き方を、`T-done-disposition-auto-close` 境界 3（Bohr msg-8328 §2 3-D、Takahito 裁定 msg-8171 §A）の終端形 `BLOCKED-ON:` に差し替えた。旧形（`STOP:` 行 + `NEXT: none`）は境界 5 までは受け付けるが、新しく書かない。
 - **改訂種別**: 既存 ADR の決定 1 件（ADR-09 D-6）の改訂。新しい番号を持つ独立の ADR として起こす（ファイル名に `-amendment-` を含めないのは、`adr_index_gen` が `-amendment-` を含むファイルを索引の生成から外すため）。
 
 ---
@@ -32,14 +33,15 @@ Magickit の本番 deploy（`{{HOST_SERVICES}}` の `spirrow-magickit{,-mcp,-mcp
 
 ### D-6' -3 deploy 待ちの表現
 
-本番確認が merge 後の Magickit 本番 deploy に依存するスレッドは、返信の**末尾 2 行**を次のとおりにして駐機する。`STOP:` 行を `NEXT: none` の直上に置き、`NEXT: none` を返信の最終行にする。
+本番確認が merge 後の Magickit 本番 deploy に依存するスレッドは、返信の**末尾 2 行**を次のとおりにして駐機する。`BLOCKED-ON:` 行を最後の `NEXT:` 行の直上に置き、`NEXT: <persona>` を返信の最終行にする（2026-11-08 改訂、`T-done-disposition-auto-close` 境界 3。`NEXT:` は「今すぐ起こす相手」ではなく、条件が成立したときに起こす相手を表す）。
 
 ```
-STOP: blocked-on deploy:<request_id> wake:<persona>
-NEXT: none
+BLOCKED-ON: deploy <request_id>
+NEXT: <persona>
 ```
 
-- `<request_id>`: その deploy の request_id。対象 head は deploy request の側に記録する。（msg-7370 の原文は `deploy:<magickit の対象 head>` だが、protocol の trigger 文法は `deploy:<request_id>` なので、意味を変えずに表記を文法に合わせた。Bohr msg-7392）
+- 改訂前の形（`STOP: blocked-on deploy:<request_id> wake:<persona>` の直下に `NEXT: none`）は、境界 5（`none_malformed_after`）までは legacy として受け付ける。新しくは書かない。
+- `<request_id>`: その deploy の request_id。対象 head は deploy request の側に記録する。（msg-7370 の原文は `deploy:<magickit の対象 head>` だが、protocol の trigger 文法は deploy の request_id なので、意味を変えずに表記を文法に合わせた。Bohr msg-7392）
 - `<persona>`: そのスレッドで proposer または naysayer を担う persona。**implementer は指定できない**。原則として proposer にする。wake で起きた proposer が本番での挙動を確認し、次の担当に渡す。
 - deploy request がまだない段階では、`<request_id>` が決まらないため駐機できない。その場合は deploy の指示を Takahito に依頼する（`NEXT: human`、TIER-C: irreversible。本番に外部副作用が出るため）。operator は Takahito の指示を受けてから deploy request を作成・実行し、request_id・head・時刻・再起動したサービスをスレッドに残す。スレッドはその request_id を使い、上の 2 行で駐機する。
 - 前例: `T-decider-decision-page-jev` msg-1346（この流れを規則にしたのが本項）。

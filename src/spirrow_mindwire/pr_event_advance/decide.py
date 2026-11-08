@@ -21,7 +21,7 @@ but this reader also accepts the forms those headings have had before — a verd
 without ``@ sha`` (pre-#244), an admission heading without the parenthetical or with ``-`` as the
 separator — because the oldest stalled threads are the ones 1b exists to rescue. The ref it
 extracts must still pass ``parse_pr_ref`` or the tail is row 1 (fail closed). A misread can only
-write a true GitHub fact and hand to the proposer; ``none`` still needs ``Closes-thread:``
+write a true GitHub fact and hand to the proposer; ``STOP: done`` still needs ``Closes-thread:``
 naming this thread. This tolerance is local to 1b: ``verdict_heads`` / ``ci_route_heads`` (the
 admission inputs) are unchanged. An admission tail never carries a ci-hold, so on an open PR it
 is row 5; only rows 3/4 newly apply to it.
@@ -34,7 +34,7 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 1   not a relay, or heading unreadable  —                                   Noop(NOT_RELAY_TAIL)
 2   token = ``none``                    —                                   Noop(SETTLED)
 2b  relay with ``MERGE-SELF:``          merged, or closed (not merged)      Noop (note 2b)
-3   relay                               merged                              Post: none / proposer
+3   relay                               merged                              Post: done / proposer
 4   relay                               closed, not merged                  Post: proposer (always)
 5   relay, no ci-hold                   open                                Noop(OPEN_NO_HOLD)
 6   relay, ci-hold                      open, head moved                    Noop(HEAD_MOVED)
@@ -71,8 +71,9 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 * Once a :class:`Post` lands, the tail is authored by :data:`PR_EVENT_RELAY_AUTHOR`, which row 1
   rejects: the second tick is a no-op without any counter (R5).
 
-This module never closes a thread. ``NEXT: none`` is a conductor handoff token, not the
-magickit ``chatroom_close_thread`` status change ``closeable_roles`` governs (msg-5906, R10).
+This module never closes a thread. The ``STOP: done`` it writes on a ``Closes-thread:`` merge (the
+``NEXT: none`` of before boundary 3) is a conductor terminal form, not the magickit
+``chatroom_close_thread`` status change ``closeable_roles`` governs (msg-5906, R10).
 """
 
 from __future__ import annotations
@@ -94,6 +95,7 @@ from ..conductor.handoff import (
     OPERATOR_TASK_KEYWORD,
     OPERATOR_TOKEN,
     PR_REVIEW_TOKEN,
+    STOP_DONE,
     TIER_C_CHECK_KEYWORD,
     TIER_C_CHECK_NONE,
     parse_next_token,
@@ -233,7 +235,8 @@ class Noop:
 
 @dataclass(frozen=True)
 class Post:
-    """One message to write. ``next_line`` is the whole hand-off block (1 or 3 lines)."""
+    """One message to write. ``next_line`` is the whole control block (1 or 3 lines): a
+    ``NEXT:`` hand-off, the 3-line operator form, or the terminal ``STOP: done``."""
 
     body: str
     next_line: str
@@ -433,7 +436,14 @@ def lifecycle_post(
             sha = pr.merge_commit_sha or "merge commit 不明"
             body = f"{_heading(pr_ref)}\n\nPR {pr_ref} が merge された（{sha}）。"  # noqa: RUF001 (§F.1.1 wording)
             if closes_thread(pr.body, thread_project, thread_id, pr_project.project):
-                return Post(body=body, next_line=f"NEXT: {NONE_TOKEN}")
+                # T-done-disposition-auto-close boundary 3 (Bohr msg-8328 §2 3-B): the settle is
+                # written as the terminal form ``STOP: done``, with no NEXT line after it. It is
+                # for classification and notification, not for closing: this post is authored by
+                # a relay that holds no role (null), so Conclair's (e) and magickit's
+                # ``role_not_eligible`` keep it out of every close (msg-8182). Every reader of the
+                # head (head_skip, the conductor, 1c, and 1b's precheck if it ever read this tail)
+                # reads it as settled through ``settles_by_terminal_form``.
+                return Post(body=body, next_line=f"STOP: {STOP_DONE}")
             withheld = _withheld_close_line(pr.body, thread_id, pr_ref, pr_project)
             if withheld is not None:
                 body = f"{body}\n{withheld}"

@@ -26,8 +26,9 @@ every tick. ``posted_heads`` in the JSON gives the msg id of every post (``""`` 
 read, or when the post may have landed without an answer), so the sweep can move its heads without
 probing again.
 
-This module never calls (and does not import) ``chatroom_close_thread`` (R10): ``NEXT: none``
-is a handoff token, and a status close is the human's / a closeable role's act.
+This module never calls (and does not import) ``chatroom_close_thread`` (R10): the ``STOP: done``
+it writes is a terminal form of the conductor protocol, and a status close is the human's / a
+closeable role's act.
 """
 
 from __future__ import annotations

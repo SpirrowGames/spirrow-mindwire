@@ -980,7 +980,7 @@ $scA = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 2; blocked_on = 1; 
 $scB = [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0; blocked_on = 0; unclassified = 1; human_close = 0 }; unclassified = @('T-c') }
 $scLines = Get-StopClassDigestLines -ByProject @{ 'p1' = $scA; 'p2' = $scB }
 Check "counts are summed over projects" `
-    '停止理由（NEXT: none）: 決着 2 / 着手条件待ち 1 / 未分類 3 / 人の close 1' $scLines[0]
+    '停止理由（決着・待ち）: 決着 2 / 着手条件待ち 1 / 未分類 3 / 人の close 1' $scLines[0]
 Check "unclassified threads are named project/thread" '  未分類: p1/T-a, p1/T-b, p2/T-c' $scLines[1]
 Check "the block ends with a blank separator" '' $scLines[2]
 $scFailed = Get-StopClassDigestLines -ByProject @{ 'p1' = $scB } -Failed @('p9')
@@ -990,7 +990,7 @@ $scLongLines = Get-StopClassDigestLines -ByProject @{ 'p' = $scLong }
 CheckTrue "the unclassified list is capped at 300 chars" ($scLongLines[1].Length -le 300) $scLongLines[1].Length
 $scDigest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
     -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @() -StopClassLines $scLines
-CheckTrue "New-DailyDigest renders the stop-reason line" ($scDigest -match '停止理由（NEXT: none）: 決着 2') $scDigest
+CheckTrue "New-DailyDigest renders the stop-reason line" ($scDigest -match '停止理由（決着・待ち）: 決着 2') $scDigest
 $scPlain = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
     -Now ([datetime]::Parse('2026-10-03T00:00:00Z')) -LiveKeys @()
 CheckTrue "without -StopClassLines the digest has no stop-reason line" (-not ($scPlain -match '停止理由')) $scPlain

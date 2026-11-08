@@ -392,19 +392,22 @@ _STOP_BLOCKED_ON_RE = re.compile(
 #     BLOCKED-ON: <arm> <ref>           <- directly above the final NEXT
 #     NEXT: <wake>                         (the wake is the participant who acts once <arm> holds)
 #
-# Boundary 2 ships the READING side only, switched off. ``ACCEPT_NEW_FORMS`` is a module constant,
-# not a per-process config value, on purpose: the sweep (head_skip), the conductor, the gateway,
-# the park-wake tick and 1b/1c each read a head in their own process, and the design's condition
-# for turning the forms on is that every one of those readers accepts them in the SAME deploy
-# (msg-8175 §4). A config key could be true in one process and false in another; a constant
-# changes in exactly one reviewed commit (boundary 3), which is also where the relays start
-# writing ``STOP: done``.
+# Boundary 2 shipped the READING side switched off; boundary 3 (Bohr msg-8328 §2 3-A) turned it on
+# here, in the same commit in which the relays start writing ``STOP: done`` and the protocol prompt
+# starts teaching the forms. ``ACCEPT_NEW_FORMS`` is a module constant, not a per-process config
+# value, on purpose: the sweep (head_skip), the conductor, the gateway, the park-wake tick and
+# 1b/1c each read a head in their own process, and the design's condition for turning the forms on
+# is that every one of those readers accepts them in the SAME deploy (msg-8175 §4). A config key
+# could be true in one process and false in another; a constant changes in exactly one reviewed
+# commit, and rolling it back is reverting that commit.
 #
-# While it is ``False`` a well-formed new form is MALFORMED (``NEW_FORM_NOT_ACCEPTED``): the
-# conductor stops with a notice that ends ``NEXT: human``, so nothing settles silently and no
-# naysayer is force-summoned for it (msg-8171 B-1 — the path a bare ``STOP: done`` takes on the
-# pre-change main). ``NEXT: none`` keeps its meaning either way; its retirement is boundary 5.
-ACCEPT_NEW_FORMS: bool = False
+# With it ``False`` a well-formed new form is MALFORMED (``NEW_FORM_NOT_ACCEPTED``): the conductor
+# stops with a notice that ends ``NEXT: human``, so nothing settles silently and no naysayer is
+# force-summoned for it (msg-8171 B-1). The tests keep pinning that OFF column through the explicit
+# ``accept_new_forms`` argument. ``NEXT: none`` (with or without the legacy ``STOP:`` line above
+# it) is still accepted and keeps its meaning; it becomes MALFORMED only at boundary 5
+# (``none_malformed_after``).
+ACCEPT_NEW_FORMS: bool = True
 
 BLOCKED_ON_KEYWORD = "BLOCKED-ON"
 STOP_DONE = "done"
@@ -952,7 +955,9 @@ def malformed_notice(reason: MalformedHandoff) -> str:
         f"Conductor stand-down — 決着・待ちの書き方を受け付けませんでした\n\n"
         f"理由 (`{reason.value}`): {_MALFORMED_CAUSES[reason]}\n\n"
         f"∴ 誰も spawn せず停止しました。次にやること: 次に動く人がいるなら `NEXT: <persona>`、"
-        f"決着・待ちなら現行の `STOP:` 行 + `NEXT: {NONE_TOKEN}` の形で投稿し直してください。\n\n"
+        f"決着なら最後の制御行を `STOP: {STOP_DONE}` にして (その後に `NEXT:` 行を書かない)、"
+        f"待ちなら `{BLOCKED_ON_KEYWORD}: <arm> <ref>` の直下に `NEXT: <wake>` を置き、"
+        f"人の判断が要るなら `NEXT: {HUMAN_TOKEN}` で投稿し直してください。\n\n"
         f"head が動くまでループは再開しません。\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
@@ -1464,26 +1469,28 @@ OPERATOR_FORM_EXAMPLE = (
 )
 _OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
 
-# Slice 3 (T-next-line-carries-who-not-why, Bohr msg-5175 §3 / msg-4716 §2): the two STOP forms
-# the protocol teaches. Like OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each
-# through the parser and requires an accepted status, so the prompt cannot teach a form the
-# parser reads as MALFORMED.
-STOP_FORM_EXAMPLES: tuple[str, ...] = (
-    "STOP: done",
-    "STOP: blocked-on <trigger> wake:<persona>",
-)
-_STOP_FORMS_INDENTED = "\n".join(f"    {line}" for line in STOP_FORM_EXAMPLES)
+# T-done-disposition-auto-close boundary 3 (Bohr msg-8328 §2 3-D): the two terminal forms the
+# protocol teaches, replacing Slice 3's ``STOP:`` line above ``NEXT: none``. Like
+# OPERATOR_FORM_EXAMPLE, a test feeds concrete instances of each through the parser and requires
+# DONE / BLOCKED_ON, so the prompt cannot teach a form the parser reads as MALFORMED. Built from the
+# keyword constants the parser reads. ``BLOCKED-ON: self`` is deliberately not taught: it is
+# refused (``blocked_on_self_unsupported``) until something observes the implementer's own job.
+STOP_DONE_EXAMPLE = f"STOP: {STOP_DONE}"
+BLOCKED_ON_EXAMPLE = f"{BLOCKED_ON_KEYWORD}: <arm> <ref>\nNEXT: <wake>"
+STOP_FORM_EXAMPLES: tuple[str, ...] = (STOP_DONE_EXAMPLE, BLOCKED_ON_EXAMPLE)
+_STOP_DONE_INDENTED = f"    {STOP_DONE_EXAMPLE}"
+_BLOCKED_ON_INDENTED = "\n".join(f"    {line}" for line in BLOCKED_ON_EXAMPLE.splitlines())
 #: What each trigger arm waits for, in the words the prompt uses. Keyed in
 #: :data:`STOP_TRIGGER_ARMS` order and checked against it at import, so an arm added to the parser
 #: without a sentence here fails the import instead of being accepted but never taught.
 _STOP_TRIGGER_MEANINGS: dict[str, str] = {
-    "thread": "`thread:<thread-id>` or `thread:<project>/<thread-id>` (that thread is resolved)",
-    "pr": "`pr:<owner/repo#n>` (that pull request is merged or closed)",
+    "thread": "`thread <thread-id>` or `thread <project>/<thread-id>` (that thread is resolved)",
+    "pr": "`pr <owner/repo#n>` (that pull request is merged or closed)",
     "deploy": (
-        "`deploy:<request_id>` (that deploy request has succeeded, failed or been interrupted)"
+        "`deploy <request_id>` (that deploy request has succeeded, failed or been interrupted)"
     ),
     "queue-empty": (
-        "`queue-empty:<project>` or `queue-empty:<project>:<role>` (no open thread of that "
+        "`queue-empty <project>` or `queue-empty <project>:<role>` (no open thread of that "
         "project hands to a participant, or to one holding that role)"
     ),
 }
@@ -1501,9 +1508,13 @@ Conductor handoff protocol (REQUIRED)
 
 A conductor drives this thread one turn at a time: after your reply is posted it \
 reads the LAST line of your message to decide who acts next. So end EVERY reply \
-with exactly one handoff line, and make it the FINAL line of your reply:
+with exactly one control line, and make it the FINAL line of your reply: either a \
+handoff line
 
     NEXT: <name>
+
+or, when the work this thread exists for is finished, the settle line `STOP: {STOP_DONE}` \
+(see below).
 
 `<name>` is either another participant's persona name (spelled exactly as it \
 appears as a message author in this thread — the persona name, not a role name: \
@@ -1518,24 +1529,9 @@ refactor extent, work order, splitting PRs or threads, approving an internal \
 mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
-  - `NEXT: {NONE_TOKEN}` — nobody acts next on this thread. Say why on the line directly \
-above it, in exactly one of these two forms:
-
-{_STOP_FORMS_INDENTED}
-
-    `STOP: done` means the work this thread exists for is finished. It is recorded as done \
-and waits for its owner to close it.
-    `STOP: blocked-on <trigger> wake:<persona>` means work remains, but it can start only \
-once something happens that the sweep can see. When `<trigger>` holds, the sweep posts a \
-wake message into this thread ending in `NEXT: <persona>`, and the conductor routes it \
-exactly as it would route that handoff written now (the same gates apply). `<persona>` is \
-a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never the \
-implementer: to resume implementation, wake the proposer, who checks the scope and hands \
-it on. `<trigger>` is one of: {_STOP_TRIGGER_PROSE}. There is no \
-`{HUMAN_TOKEN}` trigger or wake: a stop that needs a person is `NEXT: {HUMAN_TOKEN}`.
-    Write the line exactly so: `STOP` in capitals, single spaces, nothing else on the \
-line. A `NEXT: {NONE_TOKEN}` without a valid `STOP:` line directly above it is recorded \
-as unclassified — a stop nobody explained.
+  - `NEXT: {NONE_TOKEN}` — still accepted, but do NOT write it any more (with or without a \
+`STOP:` line above it). It will be refused as malformed once the legacy forms are retired. \
+Write one of the two forms below instead.
   - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
 of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
 comes first: if the work is, or could be, any of those types, hand it to \
@@ -1548,8 +1544,36 @@ A `NEXT: {OPERATOR_TOKEN}` without the `{OPERATOR_TASK_KEYWORD}:` line, without 
 `{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` directly above it, or in a reply that \
 also declares a Tier-C type, is refused and the conductor stops.
 
-The handoff line is part of your verbatim reply, not meta-commentary: write it \
-out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
+When nobody acts next on this thread, say why with one of these two forms:
+
+  - Finished — the work this thread exists for is done. Make this the final control line \
+of your reply and write NO `NEXT:` line after it:
+
+{_STOP_DONE_INDENTED}
+
+    It is recorded as done and waits for its owner to close it.
+  - Waiting — work remains, but it can start only once something happens that the sweep \
+can see. Put the `{BLOCKED_ON_KEYWORD}:` line directly above the final `NEXT:` line:
+
+{_BLOCKED_ON_INDENTED}
+
+    `<arm> <ref>` is one of: {_STOP_TRIGGER_PROSE}. Nobody is started now. When it holds, \
+the sweep posts a wake message into this thread ending in `NEXT: <wake>`, and the conductor \
+routes it exactly as it would route that handoff written now (the same gates apply). \
+`<wake>` is a participant of this thread who holds the {_STOP_WAKE_ROLES_PROSE} role — never \
+the implementer: to resume implementation, wake the proposer, who checks the scope and hands \
+it on. There is no `{HUMAN_TOKEN}` arm or wake, and no `self` arm: a stop that needs a person \
+is `NEXT: {HUMAN_TOKEN}`.
+
+Write both forms exactly so: the keyword in capitals, single spaces, nothing else on the \
+line, not indented and not inside a code block. A misspelled `STOP:` or \
+`{BLOCKED_ON_KEYWORD}:` line is refused and the conductor stops with a notice, and so is \
+`STOP: {STOP_DONE}` directly above a `NEXT:` that names a participant (finished and "this \
+person acts next" contradict each other).
+
+The control line is part of your verbatim reply, not meta-commentary: write it \
+out literally (for example `NEXT: {HUMAN_TOKEN}` or `STOP: {STOP_DONE}`) and put \
+nothing after it."""
 
 # U2 (T-tier-c-admission-gate msg-4768): the label list taught to proposer and implementer is the
 # admission gate's closed set, rendered from :data:`TIER_C_LABELS` (itself derived from
@@ -1849,6 +1873,7 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 __all__ = [
     "ACCEPT_NEW_FORMS",
+    "BLOCKED_ON_EXAMPLE",
     "BLOCKED_ON_KEYWORD",
     "HUMAN_TOKEN",
     "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
@@ -1857,6 +1882,9 @@ __all__ = [
     "OPERATOR_TASK_KEYWORD",
     "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
+    "STOP_DONE",
+    "STOP_DONE_EXAMPLE",
+    "STOP_FORM_EXAMPLES",
     "STOP_TRIGGER_ARMS",
     "STOP_WAKE_ROLES",
     "TIER_C_CHECK_KEYWORD",
