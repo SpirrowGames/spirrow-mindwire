@@ -340,8 +340,12 @@ def test_protocol_block_teaches_only_forms_the_parser_accepts(role: Role) -> Non
     names (DONE / BLOCKED_ON) and never to MALFORMED."""
     block = build_handoff_protocol_block(role)
     for form in handoff_mod.STOP_FORM_EXAMPLES:
+        # Slice I (msg-8455 §1 I-1): the examples are embedded NOT indented, because an indented
+        # terminal form is refused (``indented_terminal_form``). The whole example starts a line
+        # of the block, and no indented copy of it is taught anywhere.
+        assert f"\n{form}\n" in block, form
         for line in form.splitlines():
-            assert f"    {line}\n" in block, line
+            assert f"    {line}" not in block, line
     for arm in STOP_TRIGGER_ARMS:
         assert f"`{arm} <" in block
     # The legacy line is no longer taught, and neither is the refused ``self`` arm.
