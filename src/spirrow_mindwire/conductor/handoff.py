@@ -385,6 +385,124 @@ _STOP_BLOCKED_ON_RE = re.compile(
 )
 
 
+# ---- Terminal forms (T-done-disposition-auto-close, design v2.4 msg-8185; boundary 2) -------- #
+# The Takahito ruling of msg-8171 §A replaces ``NEXT: none`` with forms that say what they mean:
+#
+#     STOP: done                        <- the final control line; no NEXT line follows it
+#     BLOCKED-ON: <arm> <ref>           <- directly above the final NEXT
+#     NEXT: <wake>                         (the wake is the participant who acts once <arm> holds)
+#
+# Boundary 2 ships the READING side only, switched off. ``ACCEPT_NEW_FORMS`` is a module constant,
+# not a per-process config value, on purpose: the sweep (head_skip), the conductor, the gateway,
+# the park-wake tick and 1b/1c each read a head in their own process, and the design's condition
+# for turning the forms on is that every one of those readers accepts them in the SAME deploy
+# (msg-8175 §4). A config key could be true in one process and false in another; a constant
+# changes in exactly one reviewed commit (boundary 3), which is also where the relays start
+# writing ``STOP: done``.
+#
+# While it is ``False`` a well-formed new form is MALFORMED (``NEW_FORM_NOT_ACCEPTED``): the
+# conductor stops with a notice that ends ``NEXT: human``, so nothing settles silently and no
+# naysayer is force-summoned for it (msg-8171 B-1 — the path a bare ``STOP: done`` takes on the
+# pre-change main). ``NEXT: none`` keeps its meaning either way; its retirement is boundary 5.
+ACCEPT_NEW_FORMS: bool = False
+
+BLOCKED_ON_KEYWORD = "BLOCKED-ON"
+STOP_DONE = "done"
+
+# ``BLOCKED-ON`` is detected loosely and parsed strictly, for the same reason as ``STOP:`` above:
+# a mis-spelled line must land in MALFORMED, where it is noticed, never fall through to a plain
+# ``NEXT: <wake>`` that would be dispatched at once — running a wait whose condition could not be
+# read is the unsafe direction (msg-8172 §1).
+_BLOCKED_ON_KEYWORD_RE = re.compile(
+    r"\A[\s*_`>]*(?P<keyword>BLOCKED-ON)(?P<gap>[\s*_`>]*):\s*(?P<rest>.*?)\s*\Z", re.IGNORECASE
+)
+# ``self`` is the arm msg-8172 §1 planned for D-2' (the implementer's own background job). No job
+# record exists for park-wake to observe yet, so a ``self`` park could never wake: it is refused
+# with its own reason rather than accepted into a wait nothing ends.
+BLOCKED_ON_SELF_ARM = "self"
+_BLOCKED_ON_FORM_RE = re.compile(
+    r"\A(?P<arm>"
+    + "|".join(re.escape(arm) for arm in (*STOP_TRIGGER_ARMS, BLOCKED_ON_SELF_ARM))
+    + r") (?P<ref>\S+)\Z"
+)
+
+# A line indented four or more columns is an indented code block, not a control line. Applied to
+# the two new forms only: the ``NEXT:`` line grammar above (and its corpus) is unchanged.
+_INDENTED_CODE_RE = re.compile(r"\A(?: {4}|\t| {0,3}\t)")
+_HTML_COMMENT_LINE_RE = re.compile(r"\A\s*<!--.*-->\s*\Z")
+
+# Fenced code (CommonMark §4.5, the subset that matters here). An opener is up to three spaces of
+# indent and three or more backticks or tildes; a backtick opener's info string may not contain a
+# backtick. A closer is up to three spaces, the SAME character at least as many times as the
+# opener, and nothing but whitespace after it. An unclosed fence runs to the end of the body.
+# Lines inside a fence (both fence lines included) are never control lines (msg-8178 §2 /
+# msg-8179 §B): a fenced example of ``STOP: done`` or ``NEXT: Bohr`` is an example.
+_FENCE_OPEN_RE = re.compile(r"\A {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)\Z")
+_FENCE_CLOSE_RE = re.compile(r"\A {0,3}(?P<fence>`{3,}|~{3,})[ \t]*\Z")
+
+
+def _fenced_line_starts(body: str) -> frozenset[int]:
+    """The start offsets of every line of ``body`` that lies inside a fenced code block."""
+    fenced: set[int] = set()
+    open_char: str | None = None
+    open_len = 0
+    pos = 0
+    for line in body.split("\n"):
+        text = line.rstrip("\r")
+        if open_char is None:
+            opener = _FENCE_OPEN_RE.match(text)
+            if opener is not None:
+                fence = opener.group("fence")
+                if not (fence[0] == "`" and "`" in opener.group("info")):
+                    open_char, open_len = fence[0], len(fence)
+                    fenced.add(pos)
+        else:
+            fenced.add(pos)
+            closer = _FENCE_CLOSE_RE.match(text)
+            if closer is not None:
+                fence = closer.group("fence")
+                if fence[0] == open_char and len(fence) >= open_len:
+                    open_char = None
+        pos += len(line) + 1
+    return frozenset(fenced)
+
+
+def _control_next_matches(body: str) -> list[re.Match[str]]:
+    """Every ``NEXT:`` line match of ``body`` that is not inside a fenced code block."""
+    matches = list(_NEXT_LINE_RE.finditer(body))
+    if not matches or ("```" not in body and "~~~" not in body):
+        return matches
+    fenced = _fenced_line_starts(body)
+    return [m for m in matches if m.start() not in fenced]
+
+
+class MalformedHandoff(StrEnum):
+    """Why a head written in (or near) the terminal forms was refused. Values are notice reasons.
+
+    Every one of them stops the conductor with a notice that ends ``NEXT: human``
+    (``StopReason.MALFORMED_HANDOFF``); none is dispatched and none settles.
+    """
+
+    # A well-formed new form while :data:`ACCEPT_NEW_FORMS` is off (msg-8175 Obj-1-2, cut form).
+    NEW_FORM_NOT_ACCEPTED = "new_form_not_accepted"
+    # The final control line is a ``STOP:`` line that is not exactly ``STOP: done``.
+    STOP_NOT_DONE = "stop_not_done"
+    # A ``STOP:`` line directly above a final ``NEXT:`` naming a participant: "settled" and "this
+    # person acts next" contradict each other (msg-8172 §1).
+    STOP_ABOVE_NEXT = "stop_above_next"
+    # ``BLOCKED-ON`` was announced but the line is not ``BLOCKED-ON: <arm> <ref>``.
+    BLOCKED_ON_MALFORMED = "blocked_on_malformed"
+    # ``BLOCKED-ON: self …`` — nothing observes the implementer's own job yet (see above).
+    BLOCKED_ON_SELF_UNSUPPORTED = "blocked_on_self_unsupported"
+    # The ``NEXT:`` under ``BLOCKED-ON`` is not a participant who may be woken: ``human`` /
+    # ``none`` / ``operator`` / ``pr-review``, an unknown name, or a role outside
+    # :data:`STOP_WAKE_ROLES` (the S3b-2 rule, unchanged).
+    BLOCKED_ON_BAD_WAKE = "blocked_on_bad_wake"
+    # The structured ``next_participant`` field contradicts the terminal form (msg-8175 §2): a
+    # field on a ``STOP: done`` head, or a field naming someone other than the ``BLOCKED-ON`` wake.
+    FIELD_CONFLICT = "field_conflict"
+
+
 class StopStatus(StrEnum):
     """What the line above a final ``NEXT: none`` says about why the thread stops.
 
@@ -425,6 +543,10 @@ class StopLine:
     trigger_operand: str | None = None
     wake: str | None = None
     raw: str | None = None
+    # ``True`` when the disposition came from a terminal form (``STOP: done`` as the final control
+    # line, or ``BLOCKED-ON:`` above ``NEXT: <wake>``) rather than from the line above
+    # ``NEXT: none``. Observability only: every consumer reads ``status`` and the trigger fields.
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -513,6 +635,10 @@ class Handoff:
     human_ask: HumanAsk | None = None
     operator_task: str | None = None
     operator_fault: OperatorFault | None = None
+    # Set, with kind ``ABSENT``, when the head is a refused terminal form
+    # (:class:`MalformedHandoff`); the conductor stops on ``StopReason.MALFORMED_HANDOFF`` and
+    # posts a notice.
+    malformed: MalformedHandoff | None = None
 
     def __post_init__(self) -> None:
         if not self.author_requested_human:
@@ -536,10 +662,10 @@ def _last_next_raw(body: str) -> str | None:
     what the author wrote (msg-1074 §4-1 wanted one owner for the token; making both routes read an
     unmodified string is a stronger form of that than making both read the same *edited* string).
     """
-    matches = _NEXT_LINE_RE.findall(body)
+    matches = _control_next_matches(body)
     if not matches:
         return None
-    return str(matches[-1]).strip() or None
+    return str(matches[-1].group("token")).strip() or None
 
 
 def _line_above_last_next(body: str) -> str | None:
@@ -548,7 +674,7 @@ def _line_above_last_next(body: str) -> str | None:
     Shared by the two annotation readers (``TIER-C:`` and ``STOP:``) so both look at exactly the
     same line: n-1 where n is the final ``NEXT:``, no blank-line skipping, no wider window.
     """
-    matches = list(_NEXT_LINE_RE.finditer(body))
+    matches = _control_next_matches(body)
     if not matches:
         return None
     last_next_start = matches[-1].start()
@@ -602,6 +728,129 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
         wake=resolved[0],
         raw=raw,
     )
+
+
+def _last_meaningful_line(body: str) -> tuple[int, str] | None:
+    """``(start offset, text)`` of the last line that is neither blank nor an HTML comment.
+
+    The conductor appends ``<!-- source: … -->`` / ``<!-- attest: … -->`` footers after a reply's
+    control line, so those (and blank lines) are skipped (msg-8174 訂正 2). Nothing else is.
+    """
+    end = len(body)
+    while end > 0:
+        start = body.rfind("\n", 0, end) + 1
+        text = body[start:end].rstrip("\r")
+        if text.strip() and not _HTML_COMMENT_LINE_RE.match(text):
+            return start, text
+        end = start - 1
+    return None
+
+
+def _is_control_candidate(text: str) -> bool:
+    """May ``text`` be a terminal-form control line at all? Indented code may not."""
+    return _INDENTED_CODE_RE.match(text) is None
+
+
+def _terminal_form(
+    body: str, roster: Mapping[str, Role], *, check_roster: bool
+) -> StopLine | MalformedHandoff | None:
+    """Read the terminal forms of ``body``; ``None`` when it uses neither (the existing grammar).
+
+    - The final control line is a ``STOP:`` line → ``STOP: done`` is DONE, anything else is
+      :attr:`MalformedHandoff.STOP_NOT_DONE`. The line must be the last meaningful line
+      (:func:`_last_meaningful_line`), outside any fence and not indented code.
+    - Otherwise the line directly above the final ``NEXT:`` is looked at (the same n-1 rule as
+      ``TIER-C:`` / legacy ``STOP:``): a ``BLOCKED-ON:`` line makes the ``NEXT:`` its wake; a
+      ``STOP:`` line above a ``NEXT:`` naming a participant is a contradiction. A ``STOP:`` line
+      above a reserved word (``none`` — the existing form, read by
+      :func:`_stop_line_above_last_next` — or ``human``) keeps its pre-change reading.
+
+    ``check_roster=False`` is the sweep's reading: head_skip has no roster, so the wake is only
+    checked to be a participant-shaped name that is not a reserved word. Every reader that has a
+    roster passes ``True`` and applies the full wake rule.
+    """
+    last = _last_meaningful_line(body)
+    if last is not None:
+        start, text = last
+        stop = _STOP_KEYWORD_RE.match(text) if _is_control_candidate(text) else None
+        if stop is not None and not (
+            ("```" in body or "~~~" in body) and start in _fenced_line_starts(body)
+        ):
+            raw = text.strip()
+            if (
+                stop.group("keyword") == "STOP"
+                and not stop.group("gap")
+                and stop.group("rest") == STOP_DONE
+            ):
+                return StopLine(StopStatus.DONE, raw=raw, terminal=True)
+            return MalformedHandoff.STOP_NOT_DONE
+    raw_next = _last_next_raw(body)
+    if raw_next is None:
+        return None
+    above = _line_above_last_next(body)
+    if above is None or not _is_control_candidate(above):
+        return None
+    name = _name_from_raw(raw_next)
+    blocked = _BLOCKED_ON_KEYWORD_RE.match(above)
+    if blocked is None:
+        # "Settled, and <participant> acts next" is the contradiction (msg-8172 §1). A ``STOP:``
+        # line above a reserved word keeps its pre-change reading: above ``none`` it is the
+        # existing form, and above ``human`` the Decider entry must stay as it was (msg-4718 §1-3,
+        # pinned in test_conductor_stop_line.py).
+        if (
+            _STOP_KEYWORD_RE.match(above) is not None
+            and name is not None
+            and _PR_REVIEW_RE.match(raw_next) is None
+            and name.casefold() not in (NONE_TOKEN, HUMAN_TOKEN, OPERATOR_TOKEN)
+        ):
+            return MalformedHandoff.STOP_ABOVE_NEXT
+        return None
+    if blocked.group("keyword") != BLOCKED_ON_KEYWORD or blocked.group("gap"):
+        return MalformedHandoff.BLOCKED_ON_MALFORMED
+    form = _BLOCKED_ON_FORM_RE.match(blocked.group("rest"))
+    if form is None:
+        return MalformedHandoff.BLOCKED_ON_MALFORMED
+    if form.group("arm") == BLOCKED_ON_SELF_ARM:
+        return MalformedHandoff.BLOCKED_ON_SELF_UNSUPPORTED
+    if (
+        name is None
+        or _PR_REVIEW_RE.match(raw_next) is not None
+        or name.casefold() in (HUMAN_TOKEN, NONE_TOKEN, OPERATOR_TOKEN)
+    ):
+        return MalformedHandoff.BLOCKED_ON_BAD_WAKE
+    wake = name
+    if check_roster:
+        resolved = _wake_lookup(roster, name)
+        if resolved is None or resolved[1] not in STOP_WAKE_ROLES:
+            return MalformedHandoff.BLOCKED_ON_BAD_WAKE
+        wake = resolved[0]
+    return StopLine(
+        StopStatus.BLOCKED_ON,
+        trigger_arm=form.group("arm"),
+        trigger_operand=form.group("ref"),
+        wake=wake,
+        raw=above.strip(),
+        terminal=True,
+    )
+
+
+def _accepting(accept_new_forms: bool | None) -> bool:
+    """The effective switch: an explicit argument (tests), else :data:`ACCEPT_NEW_FORMS`."""
+    return ACCEPT_NEW_FORMS if accept_new_forms is None else accept_new_forms
+
+
+def settles_by_terminal_form(body: str, *, accept_new_forms: bool | None = None) -> bool:
+    """Does ``body`` stop the loop through an ACCEPTED terminal form? Roster-free (sweep's view).
+
+    The readers that classify a head by its ``NEXT:`` token alone — head_skip Stage 1, 1c's tail
+    rule, 1b's settled precheck — ask this first and read a ``True`` as ``none``: an accepted
+    ``STOP: done`` or ``BLOCKED-ON`` head stops the loop exactly as ``NEXT: none`` (+ ``STOP:``)
+    did. While the forms are off this is always ``False``, so those readers see the head as it is
+    (no token, or the wake's token) and the conductor is launched to post the MALFORMED notice.
+    """
+    if not _accepting(accept_new_forms):
+        return False
+    return isinstance(_terminal_form(body, {}, check_roster=False), StopLine)
 
 
 def _tier_c_label_above_last_next(body: str) -> str | None:
@@ -688,7 +937,7 @@ def _operator_task_line(body: str) -> str | None:
     ``NEXT: operator``. A task line quoted anywhere else in the body does not count, for the same
     reason the ``TIER-C:`` / ``STOP:`` readers look at one fixed line.
     """
-    matches = list(_NEXT_LINE_RE.finditer(body))
+    matches = _control_next_matches(body)
     if not matches:
         return None
     # The last element is the empty tail after the newline that ends the line above ``NEXT:``.
@@ -743,8 +992,17 @@ def resolve_handoff(
     roster: Mapping[str, Role],
     *,
     next_participant: str | None = None,
+    accept_new_forms: bool | None = None,
 ) -> Handoff:
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
+
+    **Terminal forms first** (T-done-disposition-auto-close, design v2.4): when the head is
+    written in ``STOP: done`` / ``BLOCKED-ON:`` form (:func:`_terminal_form`), it is resolved by
+    :func:`_resolve_terminal` and nothing below applies. Accepted (``accept_new_forms``, default
+    :data:`ACCEPT_NEW_FORMS`), it is a ``NONE`` handoff carrying the typed :class:`StopLine`, so
+    every consumer of a settled head (the conductor's SETTLED stop, the gateway's
+    ``disposition``, the park-wake tick) reads it exactly as it reads ``STOP:`` + ``NEXT: none``.
+    Otherwise it is ``ABSENT`` with :attr:`Handoff.malformed` set.
 
     Resolution order: the ``pr-review <ref>`` PR-gate sentinel (PR-2b-2) first, then the reserved
     ``human`` / ``none`` / ``operator`` sentinels, then the roster (case-insensitive on the
@@ -784,6 +1042,15 @@ def resolve_handoff(
     verdict but not the cause: a programmatic consumer reads :attr:`Handoff.mismatch_reason` to
     tell them apart without duplicating this resolver.
     """
+    terminal = _terminal_form(body, roster, check_roster=True)
+    if terminal is not None:
+        return _resolve_terminal(
+            terminal,
+            body,
+            roster,
+            next_participant=next_participant,
+            accept_new_forms=_accepting(accept_new_forms),
+        )
     body_handoff = _resolve_body(body, roster)
     if body_handoff.human_ask is HumanAsk.OPERATOR_WORK:
         # PR #402 gate (82ec032): a malformed body ``NEXT: operator`` stands down whatever the
@@ -809,6 +1076,43 @@ def resolve_handoff(
         # NEXT:, which reads as ABSENT — correct: nobody wrote a STOP line.
         resolved = replace(resolved, stop_line=_stop_line_above_last_next(body, roster))
     return resolved
+
+
+def _resolve_terminal(
+    terminal: StopLine | MalformedHandoff,
+    body: str,
+    roster: Mapping[str, Role],
+    *,
+    next_participant: str | None,
+    accept_new_forms: bool,
+) -> Handoff:
+    """The handoff of a head written in a terminal form (design v2.4 §1 / §2, msg-8175 table).
+
+    Order: a broken form is MALFORMED whatever else holds; a well-formed one is MALFORMED while
+    the forms are off; then the structured field is checked against it (a field on ``STOP: done``,
+    or one naming someone other than the ``BLOCKED-ON`` wake, is ``FIELD_CONFLICT``). Only then is
+    it the ``NONE`` handoff the settled-head consumers read.
+    """
+    token = parse_next_token(body)
+    if isinstance(terminal, MalformedHandoff):
+        return Handoff(HandoffKind.ABSENT, token=token, malformed=terminal)
+    if not accept_new_forms:
+        return Handoff(
+            HandoffKind.ABSENT, token=token, malformed=MalformedHandoff.NEW_FORM_NOT_ACCEPTED
+        )
+    field_value = next_participant.strip() if next_participant is not None else ""
+    if field_value:
+        field = _resolve_field(field_value, roster)
+        agrees = (
+            terminal.status is StopStatus.BLOCKED_ON
+            and field.kind is HandoffKind.ROLE
+            and field.identity == terminal.wake
+        )
+        if not agrees:
+            return Handoff(
+                HandoffKind.ABSENT, token=token, malformed=MalformedHandoff.FIELD_CONFLICT
+            )
+    return Handoff(HandoffKind.NONE, token=token, stop_line=terminal)
 
 
 def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
@@ -1439,6 +1743,8 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 
 __all__ = [
+    "ACCEPT_NEW_FORMS",
+    "BLOCKED_ON_KEYWORD",
     "HUMAN_TOKEN",
     "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
     "NONE_TOKEN",
@@ -1454,6 +1760,7 @@ __all__ = [
     "Handoff",
     "HandoffKind",
     "HumanAsk",
+    "MalformedHandoff",
     "MismatchReason",
     "OperatorFault",
     "StopLine",
@@ -1464,4 +1771,5 @@ __all__ = [
     "declares_tier_c",
     "parse_next_token",
     "resolve_handoff",
+    "settles_by_terminal_form",
 ]

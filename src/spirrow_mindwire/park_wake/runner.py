@@ -42,7 +42,12 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, assert_never
 
 from ..conductor.disposition import StopClass, classify_stop, stop_line_of
-from ..conductor.handoff import HandoffKind, StopStatus, resolve_handoff
+from ..conductor.handoff import (
+    HandoffKind,
+    StopStatus,
+    resolve_handoff,
+    settles_by_terminal_form,
+)
 from ..github.client import PrRef, PrResolution, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ..pr_event_advance.runner import list_open_threads
@@ -355,6 +360,19 @@ async def run_tick(
     for head in heads:
         stop = stop_line_of(head.content, roster, next_participant=head.next_participant)
         if stop is None:
+            if settles_by_terminal_form(head.content):
+                # The sweep reads this head without a roster and parks it as settled, but with the
+                # roster it is refused (a BLOCKED-ON wake outside STOP_WAKE_ROLES, or a field that
+                # contradicts it), so the conductor never runs to post its MALFORMED notice. It is
+                # counted where a stall is counted, by thread, instead of disappearing.
+                handoff = resolve_handoff(
+                    head.content, roster, next_participant=head.next_participant
+                )
+                reason = handoff.malformed.value if handoff.malformed is not None else "unknown"
+                report.classify(StopClass.UNCLASSIFIED, head.thread_id)
+                report.errors.append(
+                    {"thread_id": head.thread_id, "reason": f"terminal-form-refused: {reason}"}
+                )
             continue
         # The author matters only when there is no valid line (classify_stop), so only then is
         # the registry asked.

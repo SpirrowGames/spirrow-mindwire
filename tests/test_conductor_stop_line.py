@@ -200,11 +200,14 @@ def test_field_route_keeps_the_body_stop_line() -> None:
     assert _stop("x\nSTOP: done\nNEXT: none", field="none") == StopLine(
         StopStatus.DONE, raw="STOP: done"
     )
-    # field none, no body NEXT: → no STOP line was written → ABSENT
-    assert _stop("x\nSTOP: done", field="none") == StopLine(StopStatus.ABSENT)
+    # field none, body ending in a bare `STOP: done` (no NEXT:): that is the terminal form of
+    # T-done-disposition-auto-close, refused (MALFORMED) rather than measured — so no stop line.
+    assert _stop("x\nSTOP: done", field="none") is None
     # field none vs body Bohr → mismatch → HUMAN, not measured
+    # (T-done-disposition-auto-close: a STOP line above a participant's NEXT is itself refused
+    # now, before the field is reconciled — still not measured, and still stopped with a notice.)
     h = resolve_handoff("x\nSTOP: done\nNEXT: Bohr", _ROSTER, next_participant="none")
-    assert h.kind is HandoffKind.HUMAN and h.stop_line is None
+    assert h.kind is HandoffKind.ABSENT and h.malformed is not None and h.stop_line is None
 
 
 # --------------------------------------------------------------------------- item 2: measurement

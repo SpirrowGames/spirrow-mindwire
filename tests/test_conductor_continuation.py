@@ -577,9 +577,15 @@ async def test_6c_fenced_continue_is_self_handoff() -> None:
 
 
 @pytest.mark.anyio
-async def test_6d_unclosed_fence_continue_is_self_handoff() -> None:
+async def test_6d_unclosed_fence_continue_is_not_a_handoff() -> None:
     """PR #519 gate round 3 Obj-2: the fence is never closed, so the trailing CONTINUE / NEXT are
-    example text; no relay, ordinary SELF_HANDOFF."""
+    example text; no relay.
+
+    T-done-disposition-auto-close (design v2.1 §C / v2.2 §B): the handoff parser now applies the
+    same rule to ``NEXT:``. An unclosed fence runs to the end of the body, so the fenced ``NEXT:
+    Heisenberg`` is no longer read as a (self-)handoff: the head has no handoff, an un-routed
+    implementer turn gets the guard (ii) naysayer consult, and the scripted naysayer posting
+    nothing ends the run on NO_PROGRESS. Before this change it was an ordinary SELF_HANDOFF."""
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content=_ENTRY)
     mcp.seed(
@@ -590,5 +596,5 @@ async def test_6d_unclosed_fence_continue_is_self_handoff() -> None:
 
     outcome = await _conductor(mcp, disp).run()
 
-    assert outcome.stop_reason is StopReason.SELF_HANDOFF
+    assert outcome.stop_reason is StopReason.NO_PROGRESS
     assert _relays(mcp) == []

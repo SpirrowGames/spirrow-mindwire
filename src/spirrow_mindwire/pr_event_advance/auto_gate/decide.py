@@ -50,6 +50,7 @@ from ...conductor.handoff import (
     HandoffKind,
     parse_next_token,
     resolve_handoff,
+    settles_by_terminal_form,
 )
 from ...github.client import GatePr
 from ..decide import (
@@ -238,7 +239,9 @@ def already_fired(messages: Iterable[Mapping[str, object]], *, repo: str, number
 
 def tail_decision(tail_body: str, *, repo: str, number: int) -> AutoGateNoop | Post:
     """Rows 9-10. One thread carries one token, so a later PR waits its turn (msg-7485 O1)."""
-    token = parse_next_token(tail_body)
+    # An accepted terminal form (``STOP: done`` / ``BLOCKED-ON:``) settles like ``NEXT: none``
+    # (T-done-disposition-auto-close design v2.4): the thread is not waiting on anyone's turn.
+    token = NONE_TOKEN if settles_by_terminal_form(tail_body) else parse_next_token(tail_body)
     if token is None or token.casefold() not in (NONE_TOKEN, OPERATOR_TOKEN):
         return AutoGateNoop.QUEUED_BEHIND
     slug = f"{repo}#{number}"
