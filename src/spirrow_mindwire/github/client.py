@@ -2016,6 +2016,80 @@ class GitHubClient:
             )
         return resp.text
 
+    async def fetch_file_bytes_at(
+        self, owner: str, repo: str, *, path: str, ref: str
+    ) -> bytes | None:
+        """Raw bytes of ``path`` at ``ref`` via ``contents`` (``None`` on 404, else fail-loud).
+
+        Reads ``.naysayer-ignore`` (T-diff-cap-has-no-escape-for-indivisible-data-artifacts).
+        Bytes, not text, so the caller decodes once and nothing is re-encoded on the way. URL
+        construction is the one :meth:`fetch_file_at` documents.
+        """
+        segments = "/".join(quote(seg, safe="") for seg in path.split("/"))
+        raw_path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/contents/{segments}"
+        ).encode("ascii")
+        url = self._client.base_url.copy_with(raw_path=raw_path).copy_merge_params({"ref": ref})
+        try:
+            resp = await self._client.get(url, headers={"Accept": "application/vnd.github.raw"})
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {url.path} (contents): {exc}") from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {url.path} (contents) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        return resp.content
+
+    async def fetch_compare_blob_shas(
+        self, owner: str, repo: str, base_ref: str, head_sha: str
+    ) -> dict[str, str]:
+        """``{filename: files[].sha}`` of the three-dot compare (JSON form), fail-loud.
+
+        The 40-hex git blob sha of each changed file at the head side, which the
+        ``.naysayer-ignore`` summary line carries as ``blob=``. GitHub lists at most 300
+        files here; a file beyond that is simply absent, and its line says ``blob=unavailable``.
+        """
+        base_seg, head_seg = quote(base_ref, safe=""), quote(head_sha, safe="")
+        path = f"/repos/{owner}/{repo}/compare/{base_seg}...{head_seg}"
+        try:
+            resp = await self._client.get(path)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            files = resp.json().get("files") or []
+        except (ValueError, AttributeError) as exc:
+            raise GitHubHTTPError(f"GET {path}: unreadable body: {exc}") from exc
+        out: dict[str, str] = {}
+        for entry in files if isinstance(files, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name, sha = entry.get("filename"), entry.get("sha")
+            if isinstance(name, str) and isinstance(sha, str) and sha:
+                out[name] = sha
+        return out
+
+    async def fetch_blob_bytes(self, owner: str, repo: str, sha: str) -> bytes:
+        """Raw bytes of git blob ``sha`` (``git/blobs``, raw media type), fail-loud."""
+        path = f"/repos/{owner}/{repo}/git/blobs/{quote(sha, safe='')}"
+        try:
+            resp = await self._client.get(path, headers={"Accept": "application/vnd.github.raw"})
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        return resp.content
+
 
 def _gate_pr_row(owner: str, repo: str, row: object) -> GatePr | None:
     """One listing row -> :class:`GatePr`, or ``None`` if it lacks a field 1c decides on.
