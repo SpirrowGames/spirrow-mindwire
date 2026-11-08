@@ -187,7 +187,9 @@ def classify(
             if not (since <= m.timestamp < until):
                 continue
             roster = builder.routing_roster(messages[: i + 1], current_roster)
-            handoff = resolve_handoff(m.content, roster, next_participant=m.next_participant)
+            handoff = resolve_handoff(
+                m.content, roster, next_participant=m.next_participant, posted_at=m.timestamp
+            )
             if handoff.kind is not HandoffKind.HUMAN or not handoff.author_requested_human:
                 continue
             ref = f"{project}/{thread_id}#{m.msg_id}"

@@ -10,7 +10,8 @@ moved since the previous tick, and the only input both ticks take from a thread 
 message.
 
 What is cached. For each thread: the tail message the two ticks decide from (``msg_id``,
-``author``, ``content``, ``next_participant``), keyed by the thread's head id (``head_msg_id``).
+``author``, ``content``, ``next_participant``, ``timestamp``), keyed by the thread's head id
+(``head_msg_id``).
 The decision itself is NOT cached: 1b and park-wake still decide every thread on every tick,
 because their other inputs (PR state, CI, trigger facts) change without the thread moving.
 
@@ -38,7 +39,9 @@ from pathlib import Path
 from typing import Any
 
 #: Bumped when the file's shape changes; a file with another value is ignored (full read).
-SCHEMA_VERSION = 1
+#: 2: the tail's ``timestamp`` (boundary 5 reads it; a v1 entry has none, and a missing time is
+#: "after the cutoff", so v1 files are dropped rather than read).
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -49,15 +52,18 @@ class CachedTail:
     author: str
     content: str
     next_participant: str | None
+    timestamp: str | None = None
 
     @classmethod
     def from_message(cls, msg: Mapping[str, Any]) -> CachedTail:
         np = msg.get("next_participant")
+        ts = msg.get("timestamp")
         return cls(
             msg_id=str(msg.get("msg_id") or ""),
             author=str(msg.get("author", "")),
             content=str(msg.get("content", "")),
             next_participant=np if isinstance(np, str) else None,
+            timestamp=ts if isinstance(ts, str) and ts else None,
         )
 
     def as_message(self) -> dict[str, Any]:
@@ -68,6 +74,8 @@ class CachedTail:
         }
         if self.next_participant is not None:
             out["next_participant"] = self.next_participant
+        if self.timestamp is not None:
+            out["timestamp"] = self.timestamp
         return out
 
 

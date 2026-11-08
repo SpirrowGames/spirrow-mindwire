@@ -185,6 +185,7 @@ from .handoff import (
     declares_no_tier_c,
     malformed_notice,
     parse_next_token,
+    posted_at_of,
     resolve_handoff,
 )
 from .head_skip import stage1_skips
@@ -914,6 +915,8 @@ class Conductor:
                 # read the conductor stopped on NO_HANDOFF. Absent field ⇒ backward-compatible
                 # body-only routing (rows 1-2 of §3-1's truth table).
                 next_participant=_next_participant(latest),
+                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED.
+                posted_at=posted_at_of(latest),
             )
             # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
             # HUMAN (safety valve) and carries the divergence so we can log it as observability
@@ -1972,7 +1975,7 @@ class Conductor:
         if (
             handoff.kind is HandoffKind.HUMAN
             and handoff.human_ask is HumanAsk.OPERATOR_WORK
-            and stage1_skips(_content(messages[-1]))
+            and stage1_skips(_content(messages[-1]), posted_at=posted_at_of(messages[-1]))
         ):
             # T-next-operator-is-silent D1 (Bohr msg-5930 / msg-5934, Einstein msg-5931 / 5933):
             # a well-formed ``NEXT: operator`` stops here, WITHOUT going through
@@ -2531,7 +2534,7 @@ class Conductor:
         if (
             stop_reason not in (StopReason.HUMAN, StopReason.SETTLED)
             or field is None
-            or stage1_skips(body)
+            or stage1_skips(body, posted_at=posted_at_of(latest))
         ):
             return latest_msg_id
         body_target = parse_next_token(body)
@@ -3015,7 +3018,10 @@ class Conductor:
             # latest-message routing above — both sides read the same field via the same resolver
             # (Bohr msg-179 §3-2).
             past = resolve_handoff(
-                _content(msg), self._roster, next_participant=_next_participant(msg)
+                _content(msg),
+                self._roster,
+                next_participant=_next_participant(msg),
+                posted_at=posted_at_of(msg),
             )
             # 2e-1b: a ``NEXT: human`` the admission gate bounced never reached the human, so it
             # does not end the segment — else the author's RETRY / relabelled reply would force a

@@ -173,6 +173,7 @@ def _legacy(head: ThreadHead, roster: Mapping[str, Role], include_legacy: bool) 
         body if isinstance(body, str) else "",
         roster,
         next_participant=nxt if isinstance(nxt, str) and nxt else None,
+        posted_at=parse_timestamp(head.head.get("timestamp")),
     )
     if not include_legacy or stop is None:
         return Verdict(SettledClass.NOT_SETTLED, "legacy" if stop is not None else "")
@@ -206,7 +207,11 @@ def classify(
         return Verdict(SettledClass.NOT_SETTLED, "not_done")
 
     body = head.head.get("content")
-    stop = stop_line_of(body if isinstance(body, str) else "", roster)
+    stop = stop_line_of(
+        body if isinstance(body, str) else "",
+        roster,
+        posted_at=parse_timestamp(head.head.get("timestamp")),
+    )
     if stop is None or stop.status is not StopStatus.DONE:
         return Verdict(SettledClass.NOT_ELIGIBLE, "body-disagrees")
     if head.head.get("next_participant") is not None:

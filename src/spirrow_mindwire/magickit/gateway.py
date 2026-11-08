@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from ..conductor.disposition import body_disposition
@@ -124,7 +125,11 @@ class MagickitChatroomGateway:
         # evidence — but a harness-only author would silently record null.
         if role is not None:
             arguments["role"] = role.value
-        disposition = body_disposition(body, self._roster) if self._roster is not None else None
+        disposition = (
+            body_disposition(body, self._roster, posted_at=datetime.now(UTC))
+            if self._roster is not None
+            else None
+        )
         if disposition is None:
             result = await self._mcp.call_tool("chatroom_post_message", arguments)
             return _extract_msg_id(result)
