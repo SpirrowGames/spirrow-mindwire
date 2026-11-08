@@ -27,6 +27,7 @@ from spirrow_mindwire.clone_slot_cli import (
     run,
 )
 from spirrow_mindwire.clone_slot_prep import SessionsUnknown, SlotPrep
+from spirrow_mindwire.clone_slot_trust import project_key
 
 REPO = "demo"
 THREAD = "T-slot-cli-demo"
@@ -186,6 +187,10 @@ def test_cli_slot_prep_end_to_end(
     import spirrow_mindwire.clone_slot_cli as mod
 
     monkeypatch.setattr(mod, "claude_sessions_under", lambda: lambda _p: 0)
+    cfg_dir = world["slots"].parent / "claude-cfg"  # never the real ~/.claude.json
+    cfg_dir.mkdir()
+    (cfg_dir / ".claude.json").write_text('{"projects": {}}', encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     argv = [
         "slot-prep",
         "--slots-root",
@@ -205,7 +210,10 @@ def test_cli_slot_prep_end_to_end(
     with pytest.raises(SystemExit) as exc:
         cli.main(argv)
     assert exc.value.code == EXIT_LAUNCH
-    assert _payload(capsys.readouterr().out)["action"] == "launch"
+    p = _payload(capsys.readouterr().out)
+    assert p["action"] == "launch"
+    trusted = json.loads((cfg_dir / ".claude.json").read_text(encoding="utf-8"))["projects"]
+    assert trusted[project_key(Path(p["slot_dir"]))]["hasTrustDialogAccepted"] is True
 
 
 def test_wrapper_crash_park_code_matches_clone_slot_constant() -> None:

@@ -933,3 +933,26 @@ def test_first_tick_without_a_session_does_each_step_once(world: dict[str, Path]
     names = [p.name for p in _artefacts(world)]
     assert sum(n.endswith(".bundle") for n in names) == 1
     assert sum(n.endswith(".untracked.txt") for n in names) == 1
+
+
+# -- msg-8234 判断 3: prepare_slot runs inside provisioning --------------------------------------
+
+
+def test_prepare_slot_is_called_once_per_provision_with_the_slot(world: dict[str, Path]) -> None:
+    seen: list[Path] = []
+    slot = _ready(world, prepare_slot=seen.append)
+    assert seen == [slot]
+    _ready(world, prepare_slot=seen.append)  # a healthy slot is not re-provisioned
+    assert seen == [slot]
+    (slot / "stray.txt").write_text("u\n", encoding="utf-8")
+    assert _prep(world, prepare_slot=seen.append).run().action is PrepAction.LAUNCH  # rebuilt
+    assert seen == [slot, slot]
+
+
+def test_prepare_slot_failure_fails_the_provision(world: dict[str, Path]) -> None:
+    def boom(_p: Path) -> None:
+        raise RuntimeError("trust config unreadable")
+
+    res = _prep(world, prepare_slot=boom).run()
+    assert res.action is PrepAction.SKIP and "provision" in res.detail.lower(), res
+    assert _owner(world).get("complete") is not True
