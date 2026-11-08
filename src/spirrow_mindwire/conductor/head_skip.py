@@ -110,6 +110,7 @@ from .handoff import (
     OPERATOR_TOKEN,
     HumanAsk,
     TerminalView,
+    none_refused_after_cutoff,
     parse_next_token,
     resolve_handoff,
     terminal_form_view,
@@ -180,21 +181,37 @@ STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN, OPERATOR_TOKEN
 BODY_DEPENDENT_STOP_TOKENS: frozenset[str] = frozenset({OPERATOR_TOKEN})
 
 
+#: The ``posted_at`` a head-cache replay is read with. The cached token was computed by
+#: :func:`parse_head_token` with the head's real posting time, so the boundary-5 cutoff has
+#: already been applied to it: a refused legacy ``NEXT: none`` is cached as ``""``, and a cached
+#: ``none`` is a head the cutoff let through (a pre-cutoff legacy settle, or an accepted terminal
+#: form, which the cache also replays as ``none``). Replaying the synthetic ``NEXT: <token>`` body
+#: with the earliest instant keeps the cutoff from being applied a second time to a body that has
+#: no posting time of its own. Within one deploy the cutoff is a constant, and it is set at least
+#: 24 h ahead of its commit (msg-8455 §3), so no cached token predates the rule it was read under.
+CACHED_TOKEN_POSTED_AT: datetime = datetime.min.replace(tzinfo=UTC)
+
+
 def _is_parked_operator(head_body: str) -> bool:
-    """Is this ``NEXT: operator`` head the accepted 3-line form? Asks the grammar owner."""
+    """Is this ``NEXT: operator`` head the accepted 3-line form? Asks the grammar owner.
+
+    No ``posted_at``: the boundary-5 cutoff only turns a ``NONE`` into a refusal, and
+    ``human_ask`` is set only on a ``HUMAN`` handoff, so the answer cannot depend on it.
+    """
     return resolve_handoff(head_body, {}).human_ask is HumanAsk.OPERATOR_WORK
 
 
-def stage1_skips(head_body: str) -> bool:
+def stage1_skips(head_body: str, *, posted_at: datetime | None = None) -> bool:
     """Does Stage 1 of :func:`decide` SKIP this head body? The single owner of that boundary.
 
     T-role-body-field-divergence-relaunch D1 (Bohr msg-5855/5859, approved by Einstein msg-5858):
     the conductor needs the same answer to decide whether a stop it made from the structured
     ``next_participant`` field is invisible to the sweep (the sweep reads only the body). Both
     callers ask this one function, so the boundary cannot drift between them. It reads nothing but
-    the body — no record, no clock, no status — exactly like Stage 1 itself.
+    the body — no record, no clock, no status — exactly like Stage 1 itself. ``posted_at`` is the
+    head's posting time, for the boundary-5 cutoff (:func:`parse_head_token`).
     """
-    token = parse_head_token(head_body)
+    token = parse_head_token(head_body, posted_at=posted_at)
     return token in STOP_TOKENS and (token != OPERATOR_TOKEN or _is_parked_operator(head_body))
 
 
@@ -397,7 +414,7 @@ def _normalize_token(name: str) -> str:
     return _SEP_RE.sub("-", name.strip()).casefold()
 
 
-def parse_head_token(body: str) -> str:
+def parse_head_token(body: str, *, posted_at: datetime | None = None) -> str:
     """Return the normalised NEXT token for a head message body, or ``""`` when UNRESOLVED.
 
     UNRESOLVED covers three cases treated identically by :func:`decide`: (a) no ``NEXT:`` line at
@@ -418,11 +435,19 @@ def parse_head_token(body: str) -> str:
     LAUNCHes, the conductor posts the MALFORMED notice that moves it, and the stop is terminal
     (``malformed_handoff``), so the same head is not launched twice; the cache replays ``""``,
     which Stage 1b keeps parked.
+
+    A legacy ``NEXT: none`` that the boundary-5 cutoff refuses (``posted_at`` at or after
+    ``handoff.NONE_MALFORMED_AFTER``, or unknown while a cutoff is set) is UNRESOLVED for the same
+    reason: the conductor resolves it as MALFORMED (``legacy_none_after_cutoff``) and posts the
+    notice, through the same LAUNCH path as a refused terminal form. With no cutoff (the shipped
+    5-A value) ``posted_at`` changes nothing.
     """
     view = terminal_form_view(body)
     if view is TerminalView.SETTLES:
         return NONE_TOKEN
     if view is TerminalView.REFUSED:
+        return ""
+    if none_refused_after_cutoff(body, posted_at=posted_at):
         return ""
     raw = parse_next_token(body)
     if raw is None:
@@ -459,8 +484,12 @@ def decide(
     control_state: str,
     record: Record | None,
     thread_status: str = "",
+    posted_at: datetime | None = None,
 ) -> Verdict:
     """The two-stage predicate, preceded by the Stage 0 thread-status gate.
+
+    ``posted_at`` is the head's posting time (boundary 5, :func:`parse_head_token`); on a
+    head-cache replay the caller passes :data:`CACHED_TOKEN_POSTED_AT`.
 
     ``now`` is the wall-clock UTC of this evaluation, injected so the caller can time-travel in
     tests. ``head_msg_id`` / ``head_body`` come from the sweep's probe. ``control_state`` is the
@@ -475,7 +504,7 @@ def decide(
     session dies, the record has already been written with attempts+1, so the backoff floor
     applies to the retry).
     """
-    token = parse_head_token(head_body)
+    token = parse_head_token(head_body, posted_at=posted_at)
     raw = parse_next_token(head_body)
 
     # --- Stage 0: thread-status judgment. Reads NOTHING but the status string. ---------------
@@ -505,7 +534,7 @@ def decide(
     # so the closed-set invariant is visible: this is the ONLY place the head-skip cache can
     # return SKIP, and expanding it requires editing STOP_TOKENS. Any downstream code that
     # short-circuits SKIP on other conditions is a bug (see test #13).
-    if stage1_skips(head_body):
+    if stage1_skips(head_body, posted_at=posted_at):
         return Verdict(
             decision=Decision.SKIP,
             reason="stop-token",
@@ -1036,6 +1065,7 @@ REPORT_MODE_VALUE: str = "report"
 __all__ = [
     "BASE",
     "BODY_DEPENDENT_STOP_TOKENS",
+    "CACHED_TOKEN_POSTED_AT",
     "CAP",
     "HEAD_CACHE_TTL",
     "REPORT_MODE_ENV",
