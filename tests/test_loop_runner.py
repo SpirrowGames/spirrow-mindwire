@@ -9,8 +9,8 @@ touching any core (watcher / dispatcher / adapter):
   design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
   unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
   the wrinkle the runner solves: the base ``ClaudeCodeSdkAdapter`` declares
-  EXECUTE_CODE and would otherwise shadow the gated implementer under
-  first-qualified.
+  EXECUTE_CODE and, registered first, would otherwise take the IMPLEMENTER slot
+  under first-qualified.
 - **config**: ``[loop].watches`` parse into ``WatchSpec``s with the right role.
 - **assembly**: a fully built loop dispatches a proposer reply over a fake
   chatroom (the registry→dispatcher→watcher→gateway composition is sound).
@@ -452,7 +452,8 @@ def test_build_registry_rejects_non_independent_naysayer(tmp_path: Path) -> None
 
 def test_build_registry_rejects_proposer_that_shadows_implementer(tmp_path: Path) -> None:
     # If the "proposer" advertises EXECUTE_CODE it also qualifies for IMPLEMENTER
-    # and, registered first, would shadow the gated implementer — caught fail-loud.
+    # and, registered first, would take the IMPLEMENTER slot ahead of
+    # ImplementerSdkAdapter — caught fail-loud.
     exec_proposer = _StubAdapter("exec-proposer", _exec_caps())
     implementer = ImplementerSdkAdapter(
         cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lexora.local"
