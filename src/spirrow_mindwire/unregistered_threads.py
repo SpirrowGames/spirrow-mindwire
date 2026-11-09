@@ -70,6 +70,22 @@ narrowed by msg-7445) so the wrapper can say so in the tick log and the
 digest. There is no ``updated_at`` fallback (msg-7441 F-1: one field, not
 two).
 
+**Exclusion by tag** (T-sweep-exclude-by-tag, Bohr msg-8731 as amended
+by msg-8749). A thread that declares itself out of the sweep with one of
+:data:`EXCLUDE_TAGS` is never auto-registered; the wrapper counts it as
+excluded, beside the thread-id ``exclude`` list (which stays, for threads
+nobody can tag). Tags are read from the listing's own ``tags`` field
+(:func:`classify_listing_tags`). An item whose listing ``tags`` is not a
+list of strings is looked up with ``chatroom_get_thread`` by the CLI — the
+fallback, always built (msg-8749: a partial rollout must not fail closed) —
+bounded by :data:`TAG_LOOKUP_CAP` per tick; what was not read is
+``unread`` and the wrapper refuses it. ``null`` is interpreted per
+endpoint, by two separate constants measured separately
+(:data:`LISTING_TAGS_NULL_MEANS_EMPTY`, :data:`GET_THREAD_TAGS_NULL_MEANS_EMPTY`).
+The per-project counters ``tags_field_present_count`` (P),
+``tags_null_count`` and ``listed_count`` (M) are counted before the
+registered filter, like ``field_absent_count``.
+
 Fail direction: this module makes **no** MCP calls of its own — the CLI
 around it does. What it does with an MCP failure is separated from what
 it does with a well-shaped answer, on purpose (msg-2531 §2 invariants):
@@ -103,7 +119,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -129,6 +145,41 @@ PR_REVIEW_PREFIX: str = "T-pr-review-"
 #: The listing field the idle time is read from (msg-7441 F-1). One name,
 #: used for the input key, the JSON output key and the PowerShell key.
 ACTIVITY_FIELD: str = "last_activity_at"
+
+#: The tags that take a thread out of the sweep (msg-8731 D-1). Compared
+#: after trim + lowercase. The report carries the tuple (``exclude_tags``)
+#: so the wrapper never holds a second copy.
+EXCLUDE_TAGS: tuple[str, ...] = ("do-not-sweep", "not-swept", "scratch", "probe")
+
+#: The listing / get_thread field the tags are read from.
+TAGS_FIELD: str = "tags"
+
+#: At most this many ``chatroom_get_thread`` tag lookups per tick (msg-8731
+#: D-1 fallback). The rest are ``unread`` and the wrapper refuses them.
+TAG_LOOKUP_CAP: int = 20
+
+#: What a ``tags: null`` in a ``chatroom_list_threads`` item means.
+#: ``None`` = unmeasured: such an item goes to the fallback, and the wrapper
+#: WARNs (``listing tags null``) so the value gets measured.
+#: Measured 2026-11-09 (T-sweep-exclude-by-tag D-0, PR body): the listing
+#: carries ``tags`` on every item (448/448 across 8 projects) and an untagged
+#: thread reads ``[]``; ``null`` was not observed, so its meaning is NOT
+#: known and this stays ``None``. Only a PR that measures the LISTING may set
+#: it; never copy the get_thread observation here (Einstein msg-8726).
+LISTING_TAGS_NULL_MEANS_EMPTY: bool | None = None
+
+#: What a ``thread.tags: null`` in a ``chatroom_get_thread`` response means.
+#: Measured 2026-11-09 (T-sweep-exclude-by-tag D-0, PR body): an untagged
+#: thread reads ``[]`` (``mode="summary"``); ``null`` was not observed, so it
+#: is not taken to be empty: ``False`` -> ``unreadable``. Only a PR that
+#: measures get_thread may change it; never derive it from the listing.
+GET_THREAD_TAGS_NULL_MEANS_EMPTY: bool = False
+
+#: The four states of a thread's tags (msg-8731 D-1). ``ok`` = read, as a
+#: list of strings; ``field_missing`` = the get_thread answer has no ``tags``
+#: key; ``unread`` = not looked up (over the cap, or not a lookup target);
+#: ``unreadable`` = looked up, and the answer or the call was unusable.
+TagState = Literal["ok", "field_missing", "unread", "unreadable"]
 
 #: The three states of a listing item's ``last_activity_at`` (msg-6770 §1).
 #: They are never mixed: "had a time", "had none" and "had something that
@@ -176,6 +227,49 @@ def classify_activity_at(raw: object) -> ThreadTime:
     return ThreadTime("ok", parsed.astimezone(UTC))
 
 
+def _str_list(raw: object) -> tuple[str, ...] | None:
+    if isinstance(raw, list) and all(isinstance(t, str) for t in raw):
+        return tuple(raw)
+    return None
+
+
+def classify_listing_tags(item: dict[str, Any]) -> tuple[str, ...] | None:
+    """The listing item's tags, or ``None`` when they must be looked up (the fallback).
+
+    A list of strings (``[]`` included) is used as is. A ``null`` is empty
+    only when :data:`LISTING_TAGS_NULL_MEANS_EMPTY` is ``True``. Anything
+    else — no key, ``null`` while unmeasured / ``False``, a string, a list
+    holding a non-string — goes to the fallback.
+    """
+    raw = item.get(TAGS_FIELD)
+    if TAGS_FIELD in item and raw is None and LISTING_TAGS_NULL_MEANS_EMPTY is True:
+        return ()
+    return _str_list(raw)
+
+
+def classify_get_thread_tags(result: object) -> tuple[TagState, tuple[str, ...] | None]:
+    """``(state, tags)`` from one ``chatroom_get_thread`` answer (``thread.tags``)."""
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if not isinstance(thread, dict):
+        return "unreadable", None
+    if TAGS_FIELD not in thread:
+        return "field_missing", None
+    raw = thread[TAGS_FIELD]
+    if raw is None:
+        return ("ok", ()) if GET_THREAD_TAGS_NULL_MEANS_EMPTY else ("unreadable", None)
+    tags = _str_list(raw)
+    return ("ok", tags) if tags is not None else ("unreadable", None)
+
+
+def match_exclude_tag(tags: Iterable[str]) -> str | None:
+    """The first :data:`EXCLUDE_TAGS` entry present in ``tags`` (trim + lowercase), or ``None``."""
+    normal = {t.strip().lower() for t in tags}
+    for tag in EXCLUDE_TAGS:
+        if tag in normal:
+            return tag
+    return None
+
+
 @dataclass(frozen=True)
 class ListedThread:
     """One dict-shaped listing item plus its classified ``last_activity_at``."""
@@ -197,6 +291,9 @@ class UnregisteredThread:
     time_state: TimeState
     last_activity_at: str | None = None
     idle_days: float | None = None
+    #: The matched :data:`EXCLUDE_TAGS` entry (only when ``tag_state == "ok"``).
+    exclude_tag: str | None = None
+    tag_state: TagState = "unread"
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -204,6 +301,8 @@ class UnregisteredThread:
             "time_state": self.time_state,
             ACTIVITY_FIELD: self.last_activity_at,
             "idle_days": self.idle_days,
+            "exclude_tag": self.exclude_tag,
+            "tag_state": self.tag_state,
         }
 
 
@@ -237,6 +336,15 @@ class RegisteredIndex:
     #: projects to enumerate; preserving order keeps output stable
     #: across runs when the config has not been reordered.
     projects: tuple[str, ...]
+
+    #: The ``exclude`` keys (``"<project>/<thread_id>"``), the ``clones``
+    #: projects and ``intake.max_idle_days`` — read only to pick the tag
+    #: lookup targets the same way the wrapper's rule order reaches the tag
+    #: step (msg-8731 D-1 fallback / D-2), so no lookup is spent on a thread
+    #: the wrapper will never judge by tag.
+    exclude: frozenset[str] = frozenset()
+    clones: frozenset[str] = frozenset()
+    max_idle_days: float = 14.0
 
     def contains(self, project: str, thread_id: str) -> bool:
         return (project, thread_id) in self.pairs
@@ -282,6 +390,12 @@ class ProjectReport:
     threads: tuple[UnregisteredThread, ...] = ()
     field_absent_count: int | None = 0
     listed_count: int | None = 0
+    #: Of the ``listed_count`` items (M, before the registered filter): how
+    #: many carried ``tags`` as a list of strings (P), and how many carried
+    #: the key with a ``null`` value (msg-8731 D-1). ``None`` when the listing
+    #: failed.
+    tags_field_present_count: int | None = 0
+    tags_null_count: int | None = 0
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -293,6 +407,8 @@ class ProjectReport:
             "malformed_count": self.malformed_count,
             "field_absent_count": self.field_absent_count,
             "listed_count": self.listed_count,
+            "tags_field_present_count": self.tags_field_present_count,
+            "tags_null_count": self.tags_null_count,
         }
 
 
@@ -316,6 +432,11 @@ class EnumerateReport:
     """
 
     projects: tuple[ProjectReport, ...] = field(default_factory=tuple)
+    #: How many threads needed a tag lookup this tick, and how many were
+    #: looked up (at most :data:`TAG_LOOKUP_CAP`). ``needed > done`` is the
+    #: wrapper's ``WARN tag lookup cap``.
+    tag_lookup_needed: int = 0
+    tag_lookup_done: int = 0
 
     @property
     def unregistered_count_total(self) -> int:
@@ -344,6 +465,11 @@ class EnumerateReport:
             # header and 時刻不明 reason from this one constant instead of
             # hardcoding it a second time (PR #497 gate advisory).
             "activity_field": ACTIVITY_FIELD,
+            "exclude_tags": list(EXCLUDE_TAGS),
+            "tag_lookup_cap": TAG_LOOKUP_CAP,
+            "tag_lookup_needed": self.tag_lookup_needed,
+            "tag_lookup_done": self.tag_lookup_done,
+            "listing_tags_null_measured": LISTING_TAGS_NULL_MEANS_EMPTY is not None,
             "unregistered_count_total": self.unregistered_count_total,
             "unmeasured_projects": list(self.unmeasured_projects),
             "any_unmeasured": self.any_unmeasured,
@@ -383,6 +509,7 @@ def parse_registered(payload: Any) -> RegisteredIndex:
         raise UnregisteredThreadsError("sweep.json 'candidates' must be a JSON array")
 
     pairs: set[tuple[str, str]] = set()
+    clone_projects: set[str] = set()
     projects: list[str] = []
     seen_projects: set[str] = set()
 
@@ -422,13 +549,34 @@ def parse_registered(payload: Any) -> RegisteredIndex:
                     f"sweep.json 'clones' has a blank key or value: {key!r} => {value!r}"
                 )
             _add_project(str(key).strip())
+            clone_projects.add(str(key).strip())
 
     declared = payload.get("projects")
     if isinstance(declared, list) and all(isinstance(p, str) and p.strip() for p in declared):
         for p in declared:
             _add_project(p.strip())
 
-    return RegisteredIndex(pairs=frozenset(pairs), projects=tuple(projects))
+    # exclude / intake.max_idle_days only narrow which threads get a tag lookup.
+    # Their shape errors are the wrapper's to raise (ConvertFrom-SweepIntakeConfig
+    # throws and stops the tick), so a malformed value here is simply not used.
+    exclude: set[str] = set()
+    raw_exclude = payload.get("exclude")
+    if isinstance(raw_exclude, list):
+        exclude = {e.strip() for e in raw_exclude if isinstance(e, str) and e.strip()}
+    max_idle_days = 14.0
+    intake = payload.get("intake")
+    if isinstance(intake, dict):
+        v = intake.get("max_idle_days")
+        if isinstance(v, int | float) and not isinstance(v, bool) and v > 0:
+            max_idle_days = float(v)
+
+    return RegisteredIndex(
+        pairs=frozenset(pairs),
+        projects=tuple(projects),
+        exclude=frozenset(exclude),
+        clones=frozenset(clone_projects),
+        max_idle_days=max_idle_days,
+    )
 
 
 def load_registered(path: Path) -> RegisteredIndex:
@@ -513,15 +661,25 @@ def enumerate_project(
     unregistered: list[str] = []
     details: list[UnregisteredThread] = []
     listed_count = 0
+    tags_present = 0
+    tags_null = 0
     for listed in threads:
         listed_count += 1
         thread = listed.thread
+        # P / null are counted here, before the registered filter (msg-8729).
+        if _str_list(thread.get(TAGS_FIELD)) is not None:
+            tags_present += 1
+        elif TAGS_FIELD in thread and thread[TAGS_FIELD] is None:
+            tags_null += 1
         if not is_unregistered_live(project, thread, registered):
             continue
         thread_id = str(thread.get("thread_id") or "").strip()
         if not thread_id:
             continue
         unregistered.append(thread_id)
+        tags = classify_listing_tags(thread)
+        tag_state: TagState = "ok" if tags is not None else "unread"
+        exclude_tag = match_exclude_tag(tags) if tags is not None else None
         at = listed.time.at
         if listed.time.state == "ok" and at is not None:
             idle = max(0.0, (reference - at).total_seconds() / 86400.0)
@@ -531,10 +689,19 @@ def enumerate_project(
                     time_state="ok",
                     last_activity_at=at.isoformat(),
                     idle_days=round(idle, 3),
+                    exclude_tag=exclude_tag,
+                    tag_state=tag_state,
                 )
             )
         else:
-            details.append(UnregisteredThread(thread_id=thread_id, time_state=listed.time.state))
+            details.append(
+                UnregisteredThread(
+                    thread_id=thread_id,
+                    time_state=listed.time.state,
+                    exclude_tag=exclude_tag,
+                    tag_state=tag_state,
+                )
+            )
     return ProjectReport(
         project=project,
         unregistered_count=len(unregistered),
@@ -544,6 +711,70 @@ def enumerate_project(
         threads=tuple(details),
         field_absent_count=field_absent_count,
         listed_count=listed_count,
+        tags_field_present_count=tags_present,
+        tags_null_count=tags_null,
+    )
+
+
+def tag_lookup_targets(
+    reports: Iterable[ProjectReport], registered: RegisteredIndex
+) -> list[tuple[str, str]]:
+    """Every ``(project, thread_id)`` the fallback should look up, in lookup order.
+
+    A target is a reported thread whose listing tags were unusable
+    (``tag_state == "unread"``) and that the wrapper's rule order would carry
+    as far as the tag step (msg-8731 D-1 / D-2): not a PR-review thread, its
+    key not in ``exclude``, its project in ``clones``, ``time_state == "ok"``
+    and ``idle_days <= max_idle_days``. Ordered by ``idle_days`` ascending
+    (freshest first), ties in report order. The cap is the caller's.
+    """
+    found: list[tuple[float, int, str, str]] = []
+    n = 0
+    for report in reports:
+        if report.unregistered_count is None or report.project not in registered.clones:
+            continue
+        for t in report.threads:
+            n += 1
+            if t.tag_state != "unread" or t.thread_id.startswith(PR_REVIEW_PREFIX):
+                continue
+            if f"{report.project}/{t.thread_id}" in registered.exclude:
+                continue
+            if t.time_state != "ok" or t.idle_days is None:
+                continue
+            if t.idle_days > registered.max_idle_days:
+                continue
+            found.append((t.idle_days, n, report.project, t.thread_id))
+    found.sort(key=lambda row: (row[0], row[1]))
+    return [(p, tid) for _, _, p, tid in found]
+
+
+def apply_tag_lookups(
+    report: EnumerateReport,
+    results: dict[tuple[str, str], tuple[TagState, tuple[str, ...] | None]],
+    *,
+    needed: int,
+) -> EnumerateReport:
+    """``report`` with each looked-up thread's tag state replaced by its lookup result.
+
+    ``results`` maps ``(project, thread_id)`` to :func:`classify_get_thread_tags`'s
+    answer (or ``("unreadable", None)`` for a failed call). A target that is
+    not in ``results`` stays ``unread``. ``needed`` is the number of targets
+    before the cap.
+    """
+    projects: list[ProjectReport] = []
+    for p in report.projects:
+        threads: list[UnregisteredThread] = []
+        for t in p.threads:
+            hit = results.get((p.project, t.thread_id))
+            if hit is None:
+                threads.append(t)
+                continue
+            state, tags = hit
+            matched = match_exclude_tag(tags) if state == "ok" and tags is not None else None
+            threads.append(replace(t, tag_state=state, exclude_tag=matched))
+        projects.append(replace(p, threads=tuple(threads)))
+    return replace(
+        report, projects=tuple(projects), tag_lookup_needed=needed, tag_lookup_done=len(results)
     )
 
 
@@ -569,25 +800,38 @@ def project_error_report(project: str, error: str) -> ProjectReport:
         malformed_count=None,
         field_absent_count=None,
         listed_count=None,
+        tags_field_present_count=None,
+        tags_null_count=None,
     )
 
 
 __all__ = [
     "ACTIVITY_FIELD",
+    "EXCLUDE_TAGS",
+    "GET_THREAD_TAGS_NULL_MEANS_EMPTY",
+    "LISTING_TAGS_NULL_MEANS_EMPTY",
     "LIVE_STATUSES",
     "PR_REVIEW_PREFIX",
+    "TAGS_FIELD",
+    "TAG_LOOKUP_CAP",
     "EnumerateReport",
     "ListedThread",
     "ProjectReport",
     "RegisteredIndex",
+    "TagState",
     "ThreadTime",
     "TimeState",
     "UnregisteredThread",
     "UnregisteredThreadsError",
+    "apply_tag_lookups",
     "classify_activity_at",
+    "classify_get_thread_tags",
+    "classify_listing_tags",
     "enumerate_project",
     "is_unregistered_live",
     "load_registered",
+    "match_exclude_tag",
     "parse_registered",
     "project_error_report",
+    "tag_lookup_targets",
 ]

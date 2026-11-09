@@ -33,6 +33,15 @@ script and hands its report to ``deploy/lib/UnregisteredIntake.ps1``:
   ``parked`` state and no ``state/quarantine.json`` entry (§F.1,
   msg-4900 §2 — D-2.1).
 
+Tag lookup fallback (T-sweep-exclude-by-tag, Bohr msg-8731 D-1 as amended
+by msg-8749): a reported thread whose listing item carries no usable
+``tags`` (no key, ``null`` while unmeasured, a non-list) and that the
+wrapper's rule order would carry to the tag step is looked up with
+``chatroom_get_thread`` (``mode="summary"``), freshest ``idle_days`` first,
+at most :data:`~spirrow_mindwire.unregistered_threads.TAG_LOOKUP_CAP` per
+tick. The rest stay ``unread`` and the wrapper refuses them. On a listing
+that carries ``tags`` (measured 2026-11-09: every item) no lookup is made.
+
 Read-only: every chatroom tool this script may call is wrapped in
 :class:`ReadOnlyMcp` (a two-entry read allowlist). A future edit that
 reaches for a write tool fails loudly here, not silently in a downstream
@@ -172,21 +181,26 @@ from spirrow_mindwire.magickit.read_only import ReadOnlyViolationError
 from spirrow_mindwire.unregistered_threads import (
     ACTIVITY_FIELD,
     LIVE_STATUSES,
+    TAG_LOOKUP_CAP,
     EnumerateReport,
     ListedThread,
     ProjectReport,
     RegisteredIndex,
+    TagState,
     UnregisteredThreadsError,
+    apply_tag_lookups,
     classify_activity_at,
+    classify_get_thread_tags,
     enumerate_project,
     load_registered,
     project_error_report,
+    tag_lookup_targets,
 )
 
 #: Every chatroom tool this script may call. Membership is enforced by
 #: :class:`ReadOnlyMcp`; adding a name here is a design decision, not a
 #: convenience knob.
-READ_ONLY_TOOLS = frozenset({"chatroom_list_threads"})
+READ_ONLY_TOOLS = frozenset({"chatroom_list_threads", "chatroom_get_thread"})
 
 #: One listing page — the same size Phase 0 uses. Large enough that a
 #: typical project fits in one round trip, small enough that a runaway
@@ -325,12 +339,39 @@ async def _enumerate_project_with_recovery(
     )
 
 
-async def _run(registered: RegisteredIndex, url: str | None) -> EnumerateReport:
-    mcp = ReadOnlyMcp(StreamableHttpChatroomMcp(url))
+async def _lookup_tags(
+    mcp: ToolCaller, report: EnumerateReport, registered: RegisteredIndex
+) -> EnumerateReport:
+    """The fallback: read the tags of up to :data:`TAG_LOOKUP_CAP` targets with get_thread.
+
+    The targets and their order are :func:`tag_lookup_targets`'s. A failed
+    call makes that one thread ``unreadable``; it neither stops the others
+    nor the report (the read-only guard is not caught: it is a bug).
+    """
+    targets = tag_lookup_targets(report.projects, registered)
+    results: dict[tuple[str, str], tuple[TagState, tuple[str, ...] | None]] = {}
+    for project, thread_id in targets[:TAG_LOOKUP_CAP]:
+        try:
+            answer = await mcp.call_tool(
+                "chatroom_get_thread",
+                {"project": project, "thread_id": thread_id, "mode": "summary"},
+            )
+        except MagickitMcpError:
+            results[(project, thread_id)] = ("unreadable", None)
+            continue
+        results[(project, thread_id)] = classify_get_thread_tags(answer)
+    return apply_tag_lookups(report, results, needed=len(targets))
+
+
+async def _enumerate_all(mcp: ToolCaller, registered: RegisteredIndex) -> EnumerateReport:
     reports: list[ProjectReport] = []
     for project in registered.projects:
         reports.append(await _enumerate_project_with_recovery(mcp, project, registered))
-    return EnumerateReport(projects=tuple(reports))
+    return await _lookup_tags(mcp, EnumerateReport(projects=tuple(reports)), registered)
+
+
+async def _run(registered: RegisteredIndex, url: str | None) -> EnumerateReport:
+    return await _enumerate_all(ReadOnlyMcp(StreamableHttpChatroomMcp(url)), registered)
 
 
 def default_sweep_config_path() -> Path:
