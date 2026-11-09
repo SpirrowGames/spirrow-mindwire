@@ -9,18 +9,20 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from spirrow_mindwire import cli
-from spirrow_mindwire.clone_guard import CloneGuard, DirtyCloneError
+from spirrow_mindwire.clone_guard import CloneGuard, DirtyCloneError, GitResult
 from spirrow_mindwire.clone_recover import (
     NOT_ELIGIBLE_EXIT,
     RECOVER_PREFIX,
     RECOVERED_EXIT,
     CloneRecoverer,
     RecoverOutcome,
+    _subprocess_git,
 )
 
 
@@ -208,6 +210,7 @@ def test_cli_prints_one_row_and_maps_exit_codes(
         "detail": "",
         "preserved_ref": None,
         "preserved_sha": None,
+        "branch_deleted": True,
     }
 
 
@@ -238,6 +241,7 @@ def test_preserve_keeps_unpushed_commits_on_a_local_wip_ref(origin: Path, clone:
     assert res.outcome is RecoverOutcome.RECOVERED, res
     ref = f"wip/feature/x-{STAMP}"
     assert (res.branch, res.preserved_ref, res.preserved_sha) == ("feature/x", ref, sha)
+    assert res.branch_deleted is True
     assert _head(clone) == "main"
     assert _branches(clone) == ["main", ref]  # the original branch is gone, the commits are not
     assert _git(clone, "rev-parse", ref).strip() == sha
@@ -272,6 +276,7 @@ def test_preserve_detached_head_reachable_from_remote_switches_without_a_ref(
     res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
     assert res.outcome is RecoverOutcome.RECOVERED, res
     assert (res.branch, res.preserved_ref) == (None, None)
+    assert res.branch_deleted is False
     assert _head(clone) == "main"
     assert _branches(clone) == ["main"]
 
@@ -349,6 +354,7 @@ def test_cli_preserve_writes_one_record_for_the_thread(
     assert (rec["kind"], rec["thread_id"], rec["outcome"]) == ("retreat", "T-a", "preserved")
     assert (rec["preserved_ref"], rec["preserved_sha"]) == (row["preserved_ref"], sha)
     assert rec["pushed"] is False
+    assert rec["branch_deleted"] is True
 
 
 def test_cli_preserve_needs_thread_and_state_dir(clone: Path) -> None:
@@ -363,3 +369,20 @@ def test_cli_plain_mode_writes_no_record(tmp_path: Path, clone: Path) -> None:
         cli.main(["clone-recover", "--repo-dir", str(clone)])
     assert nope.value.code == NOT_ELIGIBLE_EXIT
     assert not (tmp_path / "state").exists()
+
+
+def test_preserve_branch_delete_that_fails_is_recorded_as_not_deleted(clone: Path) -> None:
+    # PR-gate #558 round 2 advisory: the notice reads ``branch_deleted``, not ``detail``.
+    _feature_commit(clone, push=False)
+
+    def git(repo_dir: Path, args: Sequence[str]) -> GitResult:
+        if list(args[:2]) == ["branch", "-D"]:
+            return GitResult(1, "", "error: cannot lock ref")
+        return _subprocess_git(repo_dir, args)
+
+    res = CloneRecoverer(clone, git=git, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    assert res.branch_deleted is False
+    assert "branch delete failed" in res.detail
+    assert _head(clone) == "main"
+    assert "feature/x" in _branches(clone)

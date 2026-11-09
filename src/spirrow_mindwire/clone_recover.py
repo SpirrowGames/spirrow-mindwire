@@ -77,7 +77,6 @@ from .clone_guard import (
     GitResult,
     GitRunner,
 )
-from .clone_retreat_log import BRANCH_DELETE_FAILED_NOTE
 
 RECOVER_PREFIX = "MINDWIRE_CLONE_RECOVER "
 RECOVERED_EXIT = 0
@@ -106,6 +105,9 @@ class RecoverResult:
     detail: str = ""
     preserved_ref: str | None = None
     preserved_sha: str | None = None
+    # True only when ``git branch -D <branch>`` ran and succeeded; the preserve notice reads it to
+    # decide whether it may say the original branch name is free again.
+    branch_deleted: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -124,6 +126,7 @@ class RecoverResult:
                 "detail": self.detail,
                 "preserved_ref": self.preserved_ref,
                 "preserved_sha": self.preserved_sha,
+                "branch_deleted": self.branch_deleted,
             },
             ensure_ascii=False,
         )
@@ -277,10 +280,12 @@ class CloneRecoverer:
         ff = self._run(["merge", "--ff-only", f"origin/{default}"])
         if not _ok(ff):
             notes.append(f"ff-only failed: {_why(ff)}")
+        branch_deleted = False
         if branch is not None:
             deleted = self._run(["branch", "-D", branch])
-            if not _ok(deleted):
-                notes.append(f"{BRANCH_DELETE_FAILED_NOTE}: {_why(deleted)}")
+            branch_deleted = _ok(deleted)
+            if not branch_deleted:
+                notes.append(f"branch delete failed: {_why(deleted)}")
         return RecoverResult(
             RecoverOutcome.RECOVERED,
             branch=branch,
@@ -288,6 +293,7 @@ class CloneRecoverer:
             detail="; ".join(notes),
             preserved_ref=ref,
             preserved_sha=sha,
+            branch_deleted=branch_deleted,
         )
 
     def _preserve_head(self, branch: str | None, default: str) -> tuple[str, str] | RecoverResult:
@@ -369,6 +375,7 @@ def run(
                 preserved_ref=result.preserved_ref,
                 preserved_sha=result.preserved_sha,
                 recovered=result.outcome is RecoverOutcome.RECOVERED,
+                branch_deleted=result.branch_deleted,
                 detail=result.detail,
             )
         except Exception as exc:

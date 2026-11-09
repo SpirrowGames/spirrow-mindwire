@@ -27,7 +27,6 @@ from spirrow_mindwire.clone_retreat import (
     git_env,
 )
 from spirrow_mindwire.clone_retreat_log import (
-    BRANCH_DELETE_FAILED_NOTE,
     CLONE_RETREAT_LOG_FILENAME,
     DELIVERED_KIND,
     NOTICE_TAG,
@@ -605,7 +604,9 @@ def test_records_with_the_same_timestamp_get_distinct_ids(tmp_path: Path) -> Non
 # --- T-role-exit-leaves-clone-off-default-branch PR-A: clone-recover --preserve records ----------
 
 
-def _preserved(thread: str = THREAD, *, recovered: bool = True) -> dict[str, Any]:
+def _preserved(
+    thread: str = THREAD, *, recovered: bool = True, branch_deleted: bool | None = None
+) -> dict[str, Any]:
     return build_preserved_record(
         thread_id=thread,
         repo_dir=Path("C:/clones/repo"),
@@ -613,6 +614,7 @@ def _preserved(thread: str = THREAD, *, recovered: bool = True) -> dict[str, Any
         preserved_ref="wip/feature/x-20261110T000000Z",
         preserved_sha="0123456789abcdef0123456789abcdef01234567",
         recovered=recovered,
+        branch_deleted=recovered if branch_deleted is None else branch_deleted,
         detail="1 unpushed commit(s) kept on local ref wip/feature/x-20261110T000000Z",
         at=AT,
     )
@@ -650,12 +652,18 @@ def test_preserved_notice_when_the_switch_failed_does_not_claim_the_branch_was_d
 
 
 def test_preserved_notice_when_the_delete_failed_does_not_claim_the_branch_was_deleted() -> None:
-    rec = _preserved()
-    rec["detail"] += f"; {BRANCH_DELETE_FAILED_NOTE}: error: cannot lock ref"
+    rec = _preserved(branch_deleted=False)
     assert rec["outcome"] == "preserved"
     text = render_notice(rec)
     assert "name is free again" not in text
     assert "`feature/x` (NOT deleted" in text
+
+
+def test_preserved_notice_without_the_branch_deleted_key_does_not_claim_the_delete() -> None:
+    rec = _preserved()
+    del rec["branch_deleted"]
+    text = render_notice(rec)
+    assert "name is free again" not in text
 
 
 @pytest.mark.anyio
