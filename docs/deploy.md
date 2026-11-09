@@ -894,7 +894,8 @@ shows `heads_by_group` (cached heads per group A–D; B, `STOP: done`, is only c
 them in the store's `thread_heads_pending`), `next_human` (the D heads that are `NEXT: human`,
 count and list — they still open at 72h like the rest of D) and `open_records_by_group` (every
 open record under its thread's group; an unread thread is under C with `head_read: false`, a
-PR or quarantine record under `not_thread`). The report does not tell a `T-pr-review-*` thread
+PR record under `not_thread`, and every `quarantined_records` entry under `not_thread` with
+`quarantined: true` and its `reason`). `--repo` / `--project` are not needed for `--report`. The report does not tell a `T-pr-review-*` thread
 whose PR is merged or closed apart from others: neither the store nor the tick has PR state.
 
 Known limit: the chatroom offers no way to edit a message (no edit tool on the MCP surface, and no

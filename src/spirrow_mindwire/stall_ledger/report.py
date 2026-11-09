@@ -4,9 +4,10 @@ Spec: T-stalled-pr-has-no-detector msg-8477 ⑤ (``--report`` reads the cache; i
 body of its own), msg-8549 §1-§4 as amended by msg-8552 (Obj-7-1 / Obj-7-2).
 
 **What it reads.** The store file, once, read-only: ``thread_heads`` (the cache the tick
-keeps), ``thread_heads_pending`` (the heads the last evaluated tick could not read) and
-``records``. It never calls the chatroom or GitHub, never takes the ledger lock and never writes
-or moves anything -- a corrupt or missing store is reported as such, not repaired.
+keeps), ``thread_heads_pending`` (the heads the last evaluated tick could not read), ``records``
+and ``quarantined_records``. It never calls the chatroom or GitHub, never takes the ledger
+lock and never writes or moves anything -- a corrupt or missing store is reported as such,
+not repaired.
 
 **What it prints.**
 
@@ -18,7 +19,10 @@ or moves anything -- a corrupt or missing store is reported as such, not repaire
   72h like the rest of D (msg-8552 Obj-7-1); the report only shows them.
 * ``open_records_by_group`` -- every open ledger record, under its thread's cached group. A
   thread record whose head is not cached goes under C with ``head_read: false`` (unread is C);
-  a record that is not a thread (a PR, a quarantine entry) goes under ``not_thread``.
+  a record that is not a thread (a PR) goes under ``not_thread``. Every entry of
+  ``quarantined_records`` also goes under ``not_thread``, whatever its key, marked
+  ``quarantined: true`` with its ``reason``: it is not a record the tick evaluates, so no
+  head group applies to it.
 
 The "``T-pr-review-*`` whose PR is merged or closed" form of B is not here: neither the store
 nor the tick holds PR state, so it would always read "unknown" (msg-8552 Obj-7-2, moved to
@@ -111,6 +115,17 @@ def build_report(envelope: Mapping[str, Any] | None, *, store_state: str) -> dic
             continue
         open_by_group[cached.head.group.value].append(
             {**entry, "head_read": True, "detail": cached.head.detail}
+        )
+    for key, raw in sorted(_mapping(envelope, "quarantined_records").items()):
+        quarantined = raw if isinstance(raw, Mapping) else {}
+        open_by_group[NOT_THREAD].append(
+            {
+                "key": key,
+                "quarantined": True,
+                "reason": quarantined.get("reason"),
+                "first_detected_at": quarantined.get("first_detected_at"),
+                "last_detected_at": quarantined.get("last_detected_at"),
+            }
         )
 
     return {

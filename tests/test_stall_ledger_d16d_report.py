@@ -174,3 +174,42 @@ def test_unparsable_cache_entry_is_listed_not_counted_and_other_units_go_to_not_
     assert report["heads_unparsed"] == ["thread:p/T-x"]
     assert [e["key"] for e in report["open_records_by_group"][NOT_THREAD]] == ["pr:o/r#1"]
     assert [e["key"] for e in report["open_records_by_group"]["A"]] == ["thread:p/T-a"]
+
+
+def test_quarantined_records_are_listed_under_not_thread() -> None:
+    """PR #547 gate Obj-1-1: quarantine entries live in ``quarantined_records``."""
+    envelope = {
+        "records": {"pr:o/r#1": {"stall_epoch_start": "s", "klass": "k"}},
+        "quarantined_records": {
+            "thread:p/T-q": {
+                "reason": "missing_fields",
+                "first_detected_at": "t1",
+                "last_detected_at": "t2",
+                "count": 2,
+            },
+            "pr:o/r#9": "not an object",
+        },
+    }
+    report = build_report(envelope, store_state="schema_version='1.0'")
+    not_thread = report["open_records_by_group"][NOT_THREAD]
+    assert [e["key"] for e in not_thread] == ["pr:o/r#1", "pr:o/r#9", "thread:p/T-q"]
+    by_key = {e["key"]: e for e in not_thread}
+    assert "quarantined" not in by_key["pr:o/r#1"]
+    assert by_key["thread:p/T-q"] == {
+        "key": "thread:p/T-q",
+        "quarantined": True,
+        "reason": "missing_fields",
+        "first_detected_at": "t1",
+        "last_detected_at": "t2",
+    }
+    assert by_key["pr:o/r#9"]["quarantined"] is True
+    assert by_key["pr:o/r#9"]["reason"] is None
+    # a quarantined thread key is never bucketed into a head group
+    grouped = report["open_records_by_group"]
+    assert all(e["key"] != "thread:p/T-q" for g in "ABCD" for e in grouped[g])
+
+
+def test_documented_report_command_needs_no_repo_or_project(tmp_path: Path) -> None:
+    """Advisory #547 Obj-1-2: the ``docs/deploy.md`` command line parses and runs as written."""
+    cli = _load_cli()
+    assert cli.main(["--data-dir", str(tmp_path), "--report"]) == 0
