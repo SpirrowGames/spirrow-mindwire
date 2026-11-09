@@ -278,6 +278,7 @@ async def resolve_heads(
     """
     clean_tick = all(not r.report.is_failure(ADAPTER_FORMAT_VERSION) for r in results)
     out: list[SourceResult] = []
+    pending: list[str] = []
     for result in results:
         rows = result.head_rows
         reader = result.head_reader
@@ -297,6 +298,8 @@ async def resolve_heads(
                 observations.append(obs)
                 continue
             head = await _head_for(store, key, obs, row, reader, now, budget, counters)
+            if head is None:
+                pending.append(key)
             observations.append(apply_head(obs, head))
         if result.complete and clean_tick:
             listed = set(rows) | set(result.unobservable)
@@ -309,6 +312,8 @@ async def resolve_heads(
                 if result.scope(Unit(UnitKind.THREAD, identifier)) and store.evict_head(key):
                     counters.heads_evicted += 1
         out.append(dataclasses.replace(result, observations=tuple(observations)))
+    # ``--report`` reads the store only, so this tick's unread heads are kept there for it.
+    store.set_pending_heads(pending)
     return out
 
 
