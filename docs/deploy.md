@@ -233,17 +233,28 @@ behaviour or coverage** — the full review still runs:
   and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
   review — so Item 2's saving is measured before you enforce it.
 
-## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6)
+## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6 / §10)
 
-The naysayer answers through one of two Lexora tiers, chosen per request by
-`naysayer/n3_routing.py::route_tier` (the only place that decides):
+**Since ADR-14 §10 (2026-11-10, Takahito) every naysayer request goes to the codex tier.**
+`naysayer/n3_routing.py::route_tier` (the only place that decides) always returns `naysayer`, and
+Lexora's wrapper behind it is `codex_only`: when codex can't answer, the request is refused (HTTP 502)
+instead of being answered by Gemini. Lexora no longer has a Gemini backend or a `naysayer-gemini` tier,
+and requests without `X-Mindwire-N3-Route` go to codex too.
 
 | tier | answered by | the attestation accepts |
 |---|---|---|
-| `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
-| `naysayer-gemini` | Gemini only (paid key, project logging off; no ZDR on this API — ADR-14 §9) | `gemini` |
+| `naysayer` | codex (ChatGPT Pro, **no ZDR**). No fallback | `codex` |
+| `naysayer-gemini` | *retired by §10* (was: Gemini only, paid key, project logging off — ADR-14 §9) | `gemini` (never routed to) |
 
-A request goes to `naysayer-gemini` when **any** of these holds:
+While codex is closed, the naysayer stops: the PR-gate's pass 1 fails loudly on a Lexora error (a timeout
+degrades to a COMMENT for the human), and Lexora's Discord notice says `codex unavailable`. A Lexora
+deploy reopens codex itself (Lexora `deploy/RUNBOOK.md` §11).
+
+The rest of this section is the §7.3 **classification**, now `n3_routing.classify_n3`. It still runs, but
+only as the reason in the routing log line (`codex tier (N-3 classified, routed to codex per ADR-14 §10:
+...)`); read "goes to `naysayer-gemini`" as "is classified N-3".
+
+A request is classified N-3 (formerly: went to `naysayer-gemini`) when **any** of these holds:
 
 - it carries the marker `n3-sensitive`: a PR **label** at the PR-gate, a thread **tag** at design time.
   Labels or tags that couldn't be read count as marked. The conductor passes the tags it got from
@@ -283,7 +294,8 @@ A request goes to `naysayer-gemini` when **any** of these holds:
 Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
 glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
 be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
-notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+notifier, if one is set. Since §10 that only means the classification couldn't be made; the review
+still runs on codex.
 The scheduled sweep counts that token in each conductor run's output and the daily digest carries
 one line per repo ("routed to Gemini (fail-safe)"); the counts reset after a full digest delivery.
 
@@ -301,9 +313,10 @@ T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a v
 no glob lists and with no marker set. That request can't be classified in advance, and it reaches the
 codex tier.
 
-**Merge order (§7.6):** this routing and the per-tier attestation take effect together with Lexora's
-codex path. Lexora must serve both `naysayer` (the fallback wrapper) and `naysayer-gemini` before this
-is deployed. Otherwise every naysayer attestation fails closed.
+**Merge order (§7.6 / §10):** this routing and the per-tier attestation take effect together with Lexora's
+codex path. Since §10 MindWire sends nothing to `naysayer-gemini`, so MindWire goes first and Lexora can
+then drop that tier; a Lexora still in `fallback` mode answering with `gemini-fallback` fails the
+attestation closed.
 
 ## Run
 

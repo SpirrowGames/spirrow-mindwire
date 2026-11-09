@@ -24,16 +24,15 @@ from typing import Any
 
 import yaml
 
-# ADR-14 §7.6: the independent naysayer runs behind one of TWO Lexora tiers, and which one a
-# request goes to is decided per request by
+# ADR-14 §7.6: the tier a request goes to is decided per request by
 # :func:`spirrow_mindwire.naysayer.n3_routing.route_tier` — never here, never at a call site.
 #
-# - ``naysayer`` — Lexora's fallback wrapper: ``codex`` primary, ``gemini-fallback`` backup.
-#   The name is the pre-existing one on purpose, so an existing caller lands on the codex tier.
-# - ``naysayer-gemini`` — Gemini only. Serves the N-3 subset (ADR-14 §7.3 / §9: paid key, project
-#   logging off and plain generateContent — the Developer API offers no ZDR, but its no-training
-#   term is contractual, unlike the ChatGPT Pro codex path's data-controls toggle) and requests
-#   over the codex tier's prompt limit (§7.5).
+# - ``naysayer`` — Lexora's wrapper over codex. Since ADR-14 §10 (2026-11-10, Takahito) it is
+#   ``codex_only``: no Gemini behind it, and every naysayer request comes here.
+# - ``naysayer-gemini`` — the former Gemini-only tier for the N-3 subset (§7.3 / §9) and for
+#   requests over the codex prompt limit (§7.5). ``route_tier`` no longer returns it and Lexora
+#   no longer serves it (§10); the name stays only so :func:`n3_routing.classify_n3` can say
+#   which requests the old rule would have sent there.
 NAYSAYER_MODEL_TIER = "naysayer"
 NAYSAYER_GEMINI_TIER = "naysayer-gemini"
 NAYSAYER_UPSTREAM_MODEL = "gemini-3.1-pro-preview"
@@ -55,7 +54,9 @@ GEMINI_BACKEND = "gemini"
 # be decided in two places. A row whose ``backend`` is outside its tier's set fails closed.
 TIER_ALLOWED_BACKENDS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        NAYSAYER_MODEL_TIER: frozenset({CODEX_BACKEND, GEMINI_FALLBACK_BACKEND}),
+        # ADR-14 §10: codex only. ``gemini-fallback`` is no longer an accepted answerer, so a
+        # Lexora that still fell back would fail the attestation closed instead of passing.
+        NAYSAYER_MODEL_TIER: frozenset({CODEX_BACKEND}),
         NAYSAYER_GEMINI_TIER: frozenset({GEMINI_BACKEND}),
     }
 )
