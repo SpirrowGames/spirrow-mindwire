@@ -115,7 +115,7 @@ mindwire の中で閉じられるものは閉じ、機械をまたいで共有�
 |---|---|---|---|---|
 | 1 | git 同期フック | D7・D8 | なし（単一機でも価値がある） | spirrow-mindwire |
 | 2a | turn user 分離（launcher・起動時確認・adapter の配線） | D9（前提整備） | なし。launcher と `mindwire turn-isolation-check` は #485（`9206ed6`）で入っている。adapter の配線はまだ | spirrow-mindwire |
-| 2b | Vaultwarden bootstrap | D9 | 2a の配線が完了していること（adapter が launcher 経由で turn を起動している）。かつ、その host で `mindwire turn-isolation-check` が exit 0 になること（§2.1、§7.1）。**期限 2026-11-26**（implementer PAT の失効日）を理由にこの順序を崩さない（2026-11-10 改訂、Fermi msg-8780） | spirrow-mindwire |
+| 2b | Vaultwarden bootstrap | D9 | 2a の配線が完了していること（adapter が launcher 経由で turn を起動している）。2a の配線には、check のタイムアウトを exit 10 の停止に揃える修正（msg-7363 の A）を含む。かつ、その host で `mindwire turn-isolation-check` が exit 0 になること（§2.1、§7.1）。**期限 2026-11-26**（implementer PAT の失効日）を理由にこの順序を崩さない（2026-11-10 改訂、Fermi msg-8780） | spirrow-mindwire |
 | 3 | Magickit: 実行機の動的な報告の受付・ターン依頼と占有権・予約 | D6・D13 | なし | spirrow-magickit（別スレッドに分割。spirrow-conclair 側に起票済みの分があれば、D6 の改訂を理由に取り下げる） |
 | 4 | フェーズ 1: リモート Implementer の実装と振り分け ＋ Magickit 側（deploy_history への報告受付、タグ作成経路、予約ツール） | D1〜D5・D10〜D13・D17 | 単位 3、および移設の完了（D15） | spirrow-mindwire ＋ spirrow-magickit |
 | 5 | フェーズ 2: 並列化と全体の同時実行数上限 | D16 | 単位 4。`T-sweep-starves-deep-candidates` の公平性と合流 | spirrow-mindwire |
@@ -203,7 +203,8 @@ mindwire の中で閉じられるものは閉じ、機械をまたいで共有�
 - **(b) 2b の設定が無い host では何もしない（INV-0）。** 今と同じく Vaultwarden を使わず、tick も止めない。2b を入れた時点で、2b を使わない host（CI 機など）の tick が止まってはならない。
 - **(c) 「通った」と言えるのは、同じ tick の check が exit 0 で終わった場合だけである。**
   - check の結果は sweep wrapper の中で、check から 2b へ直接渡す。前回の tick の結果をファイルなどに保存して使い回すことはしない。
-  - タイムアウト、traceback、exit 1 など、exit 0 以外はすべて「通っていない」として扱う。`check.run` が `subprocess.TimeoutExpired` を捕まえない問題（msg-7363）が直る前も、この扱いで fail-closed になる。
+  - タイムアウト、traceback、exit 1 など、exit 0 以外はすべて「通っていない」として扱い、(a) の停止（exit 10 と停止行 1 行）に揃える。check が例外を投げた場合も同じで、2b を呼ぶ側がその例外を捕まえて (a) の停止に変換する。例外をそのまま上へ伝えて tick を traceback で落とすことは、(a) を満たさない。
+  - `check.run` が `subprocess.TimeoutExpired` を捕まえず、タイムアウトが exit 10 ではなく traceback と exit 1 になる問題（msg-7363 の A）は、2a の配線で直す（§4 の 2b の前提に含まれる）。したがって 2b が入る時点ではこの問題は直っている。2b の側でも上の変換を持つので、check の実装に頼らずに (a) が成り立つ。
 - **(d) 必須テスト（2b の PR で固定する）。**
   - isolation OFF のとき、鍵の読み出しと `bw` の起動がどちらも 0 回であること
   - check が失敗したとき、どちらも 0 回であること
