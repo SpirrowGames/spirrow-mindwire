@@ -9,7 +9,9 @@
 # dropped to null — could never bootstrap out of `observed = ∅`.)
 #
 # `legitimate: []` (an empty list) is the honest value for a **machine** identity — msg-1484 §2
-# (Einstein endorsed msg-1485). It is NOT a stand-in for "unknown" — an identity that has not
+# (Einstein endorsed msg-1485), with exactly ONE exception: `settled-closer` → ["integrator"],
+# listed in identity/classification.py::MACHINE_ROLE_EXCEPTIONS (T-done-disposition-auto-close
+# msg-8589; docs/identity-classification.md § settled-closer). It is NOT a stand-in for "unknown" — an identity that has not
 # been classified must not appear in this file at all, and the findings script MUST list it as
 # an unclassified author for a human to classify before the write half runs.
 #
@@ -24,7 +26,10 @@
 #                    is applied at query time by identity/normalize.py)
 #       kind:        "participant" | "machine"
 #       legitimate:  list[str] — the roles this identity may honestly claim.
-#                    kind=machine MUST have legitimate=[] (invariant per docs).
+#                    kind=machine MUST have legitimate=[] (invariant per docs). The only
+#                    exception is the one entry in
+#                    identity/classification.py::MACHINE_ROLE_EXCEPTIONS (settled-closer:
+#                    exactly ["integrator"]); the loader refuses any other machine role set.
 #                    kind=participant MUST have len(legitimate) >= 1 (invariant).
 #       independence_class:  participant only, optional at load time but REQUIRED to register
 #                    (the registration constructor refuses a participant without one rather
@@ -131,6 +136,24 @@ identities:
       invariant). A distinct author from `pr-event-relay` / `conductor-relay` so no reader that
       narrows to those authors reads a wake as one of their records. The conductor routes the
       wake like any handoff, guard (i) included, so a park cannot launder a gated handoff.
+
+  - name: settled-closer
+    kind: machine
+    legitimate: ["integrator"]
+    primary_source: "src/spirrow_mindwire/settled_close/runner.py::attempt_close"
+    reason: >-
+      T-done-disposition-auto-close (Takahito Tier-C msg-8589; design Bohr msg-8601 §1 /
+      msg-8612 / msg-8615, Einstein msg-8606 / msg-8613 / msg-8618). The one machine allowed a
+      role (identity/classification.py::MACHINE_ROLE_EXCEPTIONS). (1) settled_close closes a
+      thread with a fixed text that never passes through an LLM (msg-8172 §3), so it is a
+      machine. (2) magickit requires a registered closing author to hold one of its
+      CLOSEABLE_ROLES (implementer / integrator / proposer), so the identity needs exactly one
+      role. (3) The recorded `integrator` is not a claim of having written a judgement; it is the
+      capability marker "may close". The sanction for each close is
+      `close_sanction.kind=settled_disposition` plus the proposer's `STOP: done` head
+      (`settled_head_msg_id`). (4) Decided by Takahito in msg-8589. It owns no thread, is wrapped
+      in a close-only MCP client, is never on the conductor roster, and its
+      `independence_class` stays `machine` (derived, not written here).
 
   - name: operator
     kind: participant

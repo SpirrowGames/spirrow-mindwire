@@ -250,6 +250,21 @@ def test_absent_config_is_disabled() -> None:
     assert SettledCloseConfig().enabled is False
 
 
+def test_default_author_is_the_settled_closer() -> None:
+    # C-8 (T-done-disposition-auto-close msg-8601 §1-2 S-5): the default is the one machine
+    # MACHINE_ROLE_EXCEPTIONS lets hold ``integrator``, read from its single definition — not
+    # ``orchestrator``, whose ``allowed_roles=[]`` made every close refused (msg-8556 §1).
+    from spirrow_mindwire.identity.classification import SETTLED_CLOSER
+    from spirrow_mindwire.settled_close import config as settled_config
+
+    assert settled_config.DEFAULT_AUTHOR is SETTLED_CLOSER
+    assert parse_settled_close_config({"settled_close": {"enabled": True}}).author == (
+        "settled-closer"
+    )
+    assert parse_settled_close_config({}).author == "settled-closer"
+    assert parse_settled_close_config({"settled_close": {"author": "x"}}).author == "x"
+
+
 @pytest.mark.parametrize(
     "raw",
     [

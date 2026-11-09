@@ -2,15 +2,19 @@
 
 ::
 
-    {"enabled": false, "author": "orchestrator", "role": "integrator",
+    {"enabled": false, "author": "settled-closer", "role": "integrator",
      "grace_seconds": 86400, "max_attempts": 10, "breaker": 3}
 
 ``enabled`` is the one switch for the sweep tick (msg-8455 §2 6-3). It ships ``false`` and
 turning it on is a Tier-C decision together with registering the closer in Prismind and adding
 it to magickit's ``settled_close.closers``; this repository never turns it on. The other keys:
 
-* ``author`` / ``role`` — who the close is sent as. The defaults are phase 2's
-  (``orchestrator`` + ``integrator``); the Tier-C request names the real closer.
+* ``author`` / ``role`` — who the close is sent as. The defaults are the dedicated closer
+  (``settled-closer`` + ``integrator``; the name lives once, in
+  ``identity/classification.py::SETTLED_CLOSER``, which is also the one machine
+  ``MACHINE_ROLE_EXCEPTIONS`` lets hold ``integrator`` — T-done-disposition-auto-close
+  msg-8589 / msg-8601 §1-2 S-5). The former default ``orchestrator`` has
+  ``allowed_roles=[]`` and was therefore refused on every close (msg-8556 §1).
 * ``grace_seconds`` — the client's copy of magickit's ``settled_close.grace_seconds`` (default
   24h). It only shapes the prediction: magickit judges the grace itself.
 * ``max_attempts`` — at most this many close calls per pass. ``breaker`` — this many
@@ -22,7 +26,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_AUTHOR = "orchestrator"
+from ..identity.classification import SETTLED_CLOSER
+
+DEFAULT_AUTHOR = SETTLED_CLOSER
 DEFAULT_ROLE = "integrator"
 DEFAULT_GRACE_SECONDS = 24 * 60 * 60
 DEFAULT_MAX_ATTEMPTS = 10

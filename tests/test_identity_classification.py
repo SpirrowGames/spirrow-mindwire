@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 
 from spirrow_mindwire.identity import (
+    MACHINE_ROLE_EXCEPTIONS,
+    SETTLED_CLOSER,
     ClassificationError,
     IdentityCollisionError,
     default_classification_path,
@@ -134,6 +136,73 @@ identities:
     reason: "y"
 """.strip(),
         )
+        with pytest.raises(ClassificationError, match="kind=machine requires legitimate=\\[\\]"):
+            load_legitimate_roles(path)
+
+    # --- the one machine role exception (T-done-disposition-auto-close msg-8589) ------------
+
+    @staticmethod
+    def _machine_yaml(tmp_path: Path, name: str, legitimate: str) -> Path:
+        return _write_yaml(
+            tmp_path,
+            f"""
+version: 1
+identities:
+  - name: {name}
+    kind: machine
+    legitimate: {legitimate}
+    primary_source: "x"
+    reason: "y"
+""".strip(),
+        )
+
+    @pytest.mark.parametrize("legitimate", ['["integrator"]', "[]"])
+    def test_settled_closer_loads_with_integrator_or_empty(
+        self, tmp_path: Path, legitimate: str
+    ) -> None:
+        # C-1: the excepted set loads, and so does the rollback shape ``[]``.
+        loaded = load_legitimate_roles(self._machine_yaml(tmp_path, SETTLED_CLOSER, legitimate))
+        entry = loaded.by_key(SETTLED_CLOSER)
+        assert entry is not None
+        assert entry.kind == "machine"
+        assert entry.legitimate == (
+            frozenset({"integrator"}) if legitimate != "[]" else frozenset()
+        )
+
+    @pytest.mark.parametrize(
+        "legitimate", ['["proposer"]', '["integrator", "proposer"]', '["naysayer"]']
+    )
+    def test_settled_closer_with_any_other_role_set_is_rejected(
+        self, tmp_path: Path, legitimate: str
+    ) -> None:
+        # C-3: the role set must equal the excepted set exactly — not a superset, not another.
+        path = self._machine_yaml(tmp_path, SETTLED_CLOSER, legitimate)
+        with pytest.raises(ClassificationError, match="MACHINE_ROLE_EXCEPTIONS"):
+            load_legitimate_roles(path)
+
+    @pytest.mark.parametrize("name", ["Settled-Closer", "settled_closer"])
+    def test_respelled_settled_closer_does_not_inherit_the_exception(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        # C-4: the key is the RAW name, matched exactly (not the ADR-11 normalised key).
+        path = self._machine_yaml(tmp_path, name, '["integrator"]')
+        with pytest.raises(ClassificationError, match="kind=machine requires legitimate=\\[\\]"):
+            load_legitimate_roles(path)
+
+    @pytest.mark.parametrize(
+        "name",
+        sorted(
+            e.name
+            for e in load_legitimate_roles(default_classification_path()).entries
+            if e.kind == "machine" and e.name not in MACHINE_ROLE_EXCEPTIONS
+        ),
+    )
+    def test_every_other_shipped_machine_with_integrator_is_rejected(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        # T-4 (replaces msg-8601 C-2): parametrised from the shipped YAML, so a machine added
+        # later is covered automatically without editing this list.
+        path = self._machine_yaml(tmp_path, name, '["integrator"]')
         with pytest.raises(ClassificationError, match="kind=machine requires legitimate=\\[\\]"):
             load_legitimate_roles(path)
 
@@ -361,6 +430,15 @@ class TestShippedFile:
             assert entry is not None
             assert entry.kind == "machine"
             assert entry.legitimate == frozenset()
+        # C-7: the one machine role exception is shipped with exactly its excepted set, and the
+        # exception table itself has exactly one row (T-done-disposition-auto-close msg-8589).
+        assert dict(MACHINE_ROLE_EXCEPTIONS) == {SETTLED_CLOSER: frozenset({"integrator"})}
+        closer = loaded.by_key(SETTLED_CLOSER)
+        assert closer is not None
+        assert closer.name == SETTLED_CLOSER
+        assert closer.kind == "machine"
+        assert closer.legitimate == frozenset({"integrator"})
+        assert closer.independence_class is None
 
     def test_conductor_relay_uses_the_module_constant_as_its_key(self) -> None:
         # D-1a pin (msg-2540 §1-4): the yaml entry's key must match the runtime constant so a
@@ -380,6 +458,12 @@ class TestShippedFile:
     def test_kind_decides_the_bidirectional_side_without_any_traffic(self) -> None:
         """`kind` alone fixes which side of the msg-1489 §4 biconditional applies.
 
+        The msg-1489 §4 biconditional holds for every entry EXCEPT the one listed in
+        ``MACHINE_ROLE_EXCEPTIONS`` (``settled-closer`` → ``{integrator}``), decided by
+        Takahito in T-done-disposition-auto-close msg-8589. That entry is checked
+        separately below: it must be a machine whose allowed roles are exactly the
+        excepted set — so the biconditional is broken in one named place, not loosened.
+
         The YAML's two invariants (machine ⇒ ``legitimate = []``; participant ⇒
         ``len(legitimate) >= 1``) plus ``allowed_roles := legitimate`` mean the
         answer to "does this identity get ``independence_class``?" is decided by
@@ -389,7 +473,15 @@ class TestShippedFile:
         (msg-1585 §8).
         """
         loaded = load_legitimate_roles(default_classification_path())
+        excepted = [e for e in loaded.entries if e.name in MACHINE_ROLE_EXCEPTIONS]
+        assert [e.name for e in excepted] == list(MACHINE_ROLE_EXCEPTIONS)
+        for entry in excepted:
+            derived = derive_allowed_and_residual([], entry.legitimate)
+            assert entry.kind == "machine"
+            assert derived.allowed_roles == MACHINE_ROLE_EXCEPTIONS[entry.name]
         for entry in loaded.entries:
+            if entry.name in MACHINE_ROLE_EXCEPTIONS:
+                continue
             derived = derive_allowed_and_residual([], entry.legitimate)
             allowed = sorted(derived.allowed_roles)
             assert (entry.kind == "participant") == (derived.allowed_roles != frozenset()), (
