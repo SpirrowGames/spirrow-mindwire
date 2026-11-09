@@ -253,8 +253,8 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 # the loop reads rather than a mirror.
 _BASE_IMPLEMENTER_SYSTEM_PROMPT = """\
 You are the implementer in a Spirrow MindWire ChatRoom thread. You write and \
-run code to carry out the agreed proposal. You operate under a strict, \
-fail-loud allow-list (Stage 3 autonomy gating):
+run code to carry out the agreed proposal. You operate under Stage 3 autonomy \
+gating, and you are expected to keep to it strictly:
 
 ALLOWED (Tier A): edit files inside the repository, run tests/builds/code, \
 commit and push on feature/* and develop branches, merge feature/* into \
@@ -262,7 +262,8 @@ develop, open pull requests, `git fetch`, and merging the PR's base branch \
 into your own feature branch (`git merge origin/<base>`). read and search \
 freely.
 
-FORBIDDEN (Tier C — never attempt; they will be denied and halt you): merging \
+FORBIDDEN (Tier C — never attempt, whether or not anything stops you; merging \
+or pushing to main is also refused server-side): merging \
 to or pushing to main, force-push, history rewrite (rebase / reset --hard / \
 filter-branch), deleting files, writing to Drive, any external publish/post/send.
 
@@ -484,7 +485,7 @@ def _adr_index_block() -> str:
 
 
 class ImplementerSdkAdapter:
-    """RoleAdapter for the implementer: SDK + EXECUTE_CODE + allow-list (T19).
+    """RoleAdapter for the implementer: SDK + EXECUTE_CODE (T19).
 
     ``capabilities`` carries ``EXECUTE_CODE`` (qualifies for the implementer
     slot) and omits ``NAYSAYER_QUALIFIED`` (same model family as main).

@@ -40,18 +40,19 @@ embodiment terminal_coding_agent):
   in for), while the PR→naysayer-review→merge-GO leg is already mechanised via
   ``PrReviewOrchestrator``.
 - **Invariants (msg-385 §5)**: (a) exactly one auto-reply role per thread;
-  (b) no core modification; (c) the implementer adapter loads the allow-list and
-  the daemon never auto-fires merge-to-main (Tier C stays unreachable from the
-  loop — ADR-2026-05-23-07).
+  (b) no core modification; (c) the implementer runs without an in-agent
+  allow-list (what bounds it is described in the adapters/implementer.py
+  module docstring) and the daemon never auto-fires merge-to-main (Tier C stays
+  unreachable from the loop — ADR-2026-05-23-07).
 
 Adapter→role routing (a Stage 3 wrinkle): the registry's Phase 1 policy is
 "first qualified". ``ClaudeCodeSdkAdapter`` declares ``EXECUTE_CODE`` (the T16
 dual-use case where one adapter fills both proposer and implementer), so it
-would also win the IMPLEMENTER slot and shadow the allow-list-gated
+would also win the IMPLEMENTER slot and shadow the
 ``ImplementerSdkAdapter``. We therefore run the proposer as a
 :class:`Stage3ProposerAdapter` that drops ``EXECUTE_CODE`` — which is also the
 correct Stage 3 model (the proposer only proposes, and may read to check what it
-proposes against; the implementer executes and writes, gated).
+proposes against; only the implementer executes and writes).
 :func:`build_registry` then asserts the resolution fail-loud.
 
 Secrets / inference endpoints are resolved from the environment by the adapters
@@ -179,12 +180,14 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
     both proposer and implementer). With both it and
     :class:`~spirrow_mindwire.adapters.implementer.ImplementerSdkAdapter`
     registered, the IMPLEMENTER slot would resolve to whichever was registered
-    first — risking the allow-list-gated implementer being shadowed by an
-    un-gated adapter. Dropping ``EXECUTE_CODE`` here makes this adapter qualify
-    for PROPOSER only, so the IMPLEMENTER slot resolves unambiguously to the
-    gated adapter. It is also the correct Stage 3 model: the proposer proposes;
-    only the implementer executes code or changes the tree, behind the
-    allow-list.
+    first — so the proposer could take the IMPLEMENTER slot away from
+    ImplementerSdkAdapter, the only adapter that carries the implementer's
+    obligations manifest, ledger tools and spawn-time checks. Dropping
+    EXECUTE_CODE here makes this adapter qualify for PROPOSER only, so the
+    IMPLEMENTER slot resolves unambiguously to ImplementerSdkAdapter. It is also
+    the correct Stage 3 model: the proposer proposes; only the implementer
+    executes code or changes the tree. (What bounds the implementer is outside
+    the agent — see the adapters/implementer.py module docstring.)
 
     Independence is unaffected: like the base adapter this omits
     ``NAYSAYER_QUALIFIED`` (same model family as ``main``), so it can never fill
@@ -311,7 +314,7 @@ def _assert_role_resolution(
     implementer_candidates = registry.qualified_for(Role.IMPLEMENTER)
     if not implementer_candidates or implementer_candidates[0] is not implementer:
         raise RuntimeError(
-            "IMPLEMENTER slot did not resolve to the allow-list-gated "
+            "IMPLEMENTER slot did not resolve to the "
             f"ImplementerSdkAdapter (got {[a.adapter_id for a in implementer_candidates]!r}); "
             "the proposer must not advertise EXECUTE_CODE (use Stage3ProposerAdapter)"
         )
@@ -351,7 +354,7 @@ def _assert_role_resolution(
 # axes are still what stops a widening of this list from silently widening the
 # role: (a) :class:`Stage3ProposerAdapter` drops ``EXECUTE_CODE`` from
 # ``capabilities`` so PROPOSER is the only registry slot it qualifies for and
-# the IMPLEMENTER slot resolves unambiguously to the allow-list-gated adapter;
+# the IMPLEMENTER slot resolves unambiguously to ImplementerSdkAdapter;
 # (b) the ``can_use_tool`` guard injected at :func:`build_proposer` (currently
 # :class:`_PathScopeGuard`, whose ``scopeable_tools`` frozenset admits only
 # ``Read`` / ``Glob`` / ``Grep``) refuses anything it cannot bound; (c) the
@@ -417,7 +420,7 @@ def build_implementer(
     ledger_mcp: McpToolCaller | None = None,
     ledger_journal_dir: Path | None = None,
 ) -> ImplementerSdkAdapter:
-    """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
+    """The implementer adapter; inference base URL from env/defaults.
 
     ``inference_base_url`` is left to the adapter's
     ``MINDWIRE_IMPLEMENTER_BASE_URL`` resolution; the adapter **refuses to

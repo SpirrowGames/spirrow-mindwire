@@ -1,9 +1,8 @@
-"""Tests for T19 ``ImplementerSdkAdapter`` + the SDK-tool classifier.
+"""Tests for T19 ``ImplementerSdkAdapter``.
 
-The classifier (SDK tool call → allow-list :class:`Operation`) is the
-safety-critical mapping and is tested exhaustively. The adapter lifecycle is
-exercised with a fake SDK client that drives the ``can_use_tool`` guard, so the
-fail-loud allow-list-violation path is covered without the real CLI.
+The adapter lifecycle is exercised with a fake SDK client, so it is covered
+without the real CLI. There is no per-call tool guard to drive (see the
+adapters/implementer.py module docstring).
 """
 
 from __future__ import annotations
