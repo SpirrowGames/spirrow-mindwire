@@ -212,7 +212,8 @@ $n3UnresolvedStatePath = Join-Path $dataDir "state\n3-unresolved.json"
 
 # T-decider-conductor-hook DECIDED 2e-2: the Conductor's Jev annotations (written under
 # [decider.tierc] mode = "annotate" | "bounce"; spirrow_mindwire.config.resolve_tierc_annotations_path).
-# Read by scripts/parked_humans.py; a missing file means "nothing annotated".
+# Read by scripts/parked_humans.py (digest) and scripts/jev_material.py (the material PUT's `jev`,
+# 2e-2b-2); a missing file means "nothing annotated".
 $tiercAnnotationsPath = Join-Path $dataDir "state\tierc_annotations.jsonl"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
 # derive the ⚠ line ("full digest is X periods overdue") from period-typed fields —
@@ -761,6 +762,9 @@ function Test-HoldForCandidate {
 $HeadSkipProbeTimeoutSeconds = 120
 $HeadProbeTimeoutSeconds = 120
 $ParkedHumansProbeTimeoutSeconds = 120
+# scripts/jev_material.py (2e-2b-2): a local file read, no network. Same bound as its siblings; on a
+# timeout the PUT goes out without `jev` (display only, fail-open).
+$JevMaterialProbeTimeoutSeconds = 120
 # scripts/unregistered_threads.py: one paged chatroom_list_threads walk per project (msg-5889 D-2).
 $UnregisteredThreadsProbeTimeoutSeconds = 120
 $ControlProbeTimeoutSeconds = 120
@@ -4123,6 +4127,44 @@ function Invoke-MaterialPut {
     }
 }
 
+# The `jev` object of the material PUT for the head the composer read (T-decider-conductor-hook
+# 2e-2b-2, Bohr msg-8616 against magickit#109). A SEAM, like Invoke-MaterialPut: the tests override
+# it so Push-DecisionMaterial's unit tests never shell out.
+#
+# Asks scripts/jev_material.py, which owns the mapping (spirrow_mindwire.decider.annotation.
+# jev_material) and the join on (project, thread_id, head). Looked up at push time, not carried on
+# the parked-humans rows: the PUT is sent from the sweep loop right after the Conductor run, and
+# that probe runs later, for the digest. The Conductor has already written the annotation by then.
+#
+# Returns @{ jev = <PSCustomObject>|$null; error = $string|$null }. Never throws. The object is
+# returned as the script printed it: the wrapper does not validate or strip it (msg-6648 — a
+# stripped-and-resent body would mask the defect; magickit's 400 and the push log line show it).
+function Get-JevMaterial {
+    param([string]$Project, [string]$ThreadId, [string]$HeadMsgId)
+    $jevScript = Join-Path $repoRoot "scripts\jev_material.py"
+    $annPath = Get-Variable -Name tiercAnnotationsPath -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $annPath) { $annPath = 'tierc_annotations.absent.jsonl' }
+    try {
+        $r = Invoke-BoundedUvProbe -Label "jev-material-$Project" -TimeoutSeconds $JevMaterialProbeTimeoutSeconds `
+            -Arguments @($jevScript, '--annotations', "$annPath", '--project', $Project,
+                '--thread-id', $ThreadId, '--head-msg-id', $HeadMsgId)
+    }
+    catch { return @{ jev = $null; error = "invocation failed: $($_.Exception.Message)" } }
+    if (-not $r.ok) {
+        $why = if ($r.timedOut) { 'timed out' } elseif ($r.error) { "$($r.error)" } else { "exit $($r.code)" }
+        $tail = "$($r.stderr)".Trim()
+        if ($tail.Length -gt 120) { $tail = $tail.Substring(0, 120) + '…' }
+        if ($tail) { $why = "$why — $tail" }
+        return @{ jev = $null; error = $why }
+    }
+    try { $obj = "$($r.stdout)" | ConvertFrom-Json -ErrorAction Stop }
+    catch { return @{ jev = $null; error = 'output unparseable' } }
+    if ($null -eq $obj -or -not ($obj.PSObject.Properties.Name -contains 'jev')) {
+        return @{ jev = $null; error = 'output has no jev key' }
+    }
+    return @{ jev = $obj.jev; error = $null }
+}
+
 # Read one named field off an envelope-shaped object, returning $null on absence. Handles BOTH the
 # JSON-loaded shape (PSCustomObject; all wrapper-facing production envelopes come from
 # `ConvertFrom-Json` in Invoke-ComposerCli) AND the freshly-written / test-authored shape
@@ -4358,6 +4400,22 @@ function Push-DecisionMaterial {
     if (-not [string]::IsNullOrEmpty($recommendation)) { $body['recommendation'] = "$recommendation" }
     if (-not [string]::IsNullOrEmpty($recommendationReason)) { $body['recommendation_reason'] = "$recommendationReason" }
     if ($unknowns.Count -gt 0) { $body['unknowns'] = @($unknowns | ForEach-Object { "$_" }) }
+    # 2e-2b-2 (Bohr msg-8616 §4/§5): Jev's annotation for exactly this head, display only on the
+    # decision page. Sent only when there is one. Without it the key is left out, and magickit's
+    # INSERT OR REPLACE then clears a `jev` stored for an earlier head, which is right: the page
+    # must not show a p from another head. A failed lookup is the same absence (fail-open) and its
+    # reason goes on the push log line. One push, no retry without `jev` (msg-6649).
+    $jevLookup = $null
+    try { $jevLookup = Get-JevMaterial -Project $Project -ThreadId $ThreadId -HeadMsgId $head }
+    catch { $jevLookup = @{ jev = $null; error = "unhandled from Get-JevMaterial: $($_.Exception.Message)" } }
+    $jevNote = 'jev=absent'
+    if ($null -ne $jevLookup -and $null -ne $jevLookup.jev) {
+        $body['jev'] = $jevLookup.jev
+        $jevNote = 'jev=present'
+    }
+    elseif ($null -ne $jevLookup -and $jevLookup.error) {
+        $jevNote = "jev=absent (lookup failed: $($jevLookup.error))"
+    }
 
     $bodyJson = $body | ConvertTo-Json -Depth 6 -Compress
     $url = New-MaterialUrl -Project $Project -ThreadId $ThreadId
@@ -4385,17 +4443,17 @@ function Push-DecisionMaterial {
             }
             catch { }
         }
-        Write-Log "material push: $Key head=$head replaced=$replaced ($($result.elapsed_ms) ms) url=$url link=$link"
+        Write-Log "material push: $Key head=$head replaced=$replaced $jevNote ($($result.elapsed_ms) ms) url=$url link=$link"
     }
     elseif ($result.status) {
         $bodySnippet = if ($result.body) {
             $flat = ($result.body -replace "\s+", ' ').Trim()
             if ($flat.Length -gt 120) { $flat.Substring(0, 120) + '…' } else { $flat }
         } else { '<no body>' }
-        Write-Log "material push FAILED (non-fatal): $Key head=$head — HTTP $($result.status) $bodySnippet — 通知は継続"
+        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote — HTTP $($result.status) $bodySnippet — 通知は継続"
     }
     else {
-        Write-Log "material push FAILED (non-fatal): $Key head=$head — $($result.error) — 通知は継続"
+        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote — $($result.error) — 通知は継続"
     }
     if ($result.ok) { return @{ outcome = 'pushed'; reason = $null; put = $result } }
     $why = if ($result.status) { "put_http_$($result.status)" } else { 'put_error' }

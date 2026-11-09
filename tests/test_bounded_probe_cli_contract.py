@@ -84,7 +84,16 @@ def test_every_call_site_was_found() -> None:
     # T-gate-fires-on-pr-open adds Invoke-AutoGateTick: fifteen.
     # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 adds Invoke-CloneRecover: sixteen.
     # PR-1a of the same thread adds Invoke-CloneRetreat: seventeen.
-    assert len(_SITES) == 17, _SITES
+    # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
+    assert len(_SITES) == 18, _SITES
+
+
+def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"jev-material-$Project"') == (
+        "jev_material.py",
+        ["--annotations", "--project", "--thread-id", "--head-msg-id"],
+    )
 
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
