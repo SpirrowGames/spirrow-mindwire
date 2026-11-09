@@ -423,7 +423,9 @@ exit 3
     # +1 for Invoke-CloneRetreat (same thread, PR-1a): no -UvOptions; passes -Environment.
     # +1 for the settled_close tick (T-done-disposition-auto-close boundary 6): the -Invoke
     # scriptblock handed to Invoke-SettledCloseTick, like the operator pass; no -UvOptions.
-    Check 'twenty helper call sites in the sweep script' 20 $helperCalls.Count
+    # +1 for Get-JevMaterial (T-decider-conductor-hook 2e-2b-2): scripts/jev_material.py for the
+    # material PUT's `jev`; no -UvOptions, like Invoke-ParkedHumansProbe.
+    Check 'twenty-one helper call sites in the sweep script' 21 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
