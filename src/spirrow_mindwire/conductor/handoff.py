@@ -1983,6 +1983,34 @@ def conditional_proceed_notice(issuing: bool) -> str | None:
     return NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE if issuing else None
 
 
+def build_roster_notice(roster: Mapping[str, Role]) -> str | None:
+    """The per-turn notice naming every participant a ``NEXT:`` line may address, or ``None``.
+
+    T-naysayer-invents-next-participant D-1 (Bohr msg-8588 → msg-8591 → msg-8594, then
+    Einstein's go with no objections). No prompt carried the roster's names, so a turn told to write
+    ``NEXT: <implementer persona>`` had to guess the persona from the thread's authors, and invented
+    one (``Curie``, ``Gauss``, ...) that the conductor could not resolve. This puts the names on
+    every turn's prompt, for every role, from the same roster :func:`resolve_handoff` reads.
+
+    The text lives here, beside :func:`build_handoff_protocol_block`, so the vocabulary the prompt
+    teaches and the vocabulary the parser accepts come from one file (msg-8594 Obj-2-2). The
+    reserved words are named one by one (``HUMAN_TOKEN`` / ``OPERATOR_TOKEN``), never derived from
+    the set the parser accepts: that set still holds the retired ``NONE_TOKEN``, and a future
+    deprecated word added to it must not reach the prompt by default (msg-8594 Obj-2-1).
+
+    Entries are listed in roster order; a role the roster does not hold simply does not appear.
+    An empty roster gives ``None``, so the prompt is byte-for-byte as before (msg-8591 (e)).
+    """
+    if not roster:
+        return None
+    participants = ", ".join(f"{identity} = {role.value}" for identity, role in roster.items())
+    return (
+        f"Participants of this thread: {participants}.\n"
+        f"A NEXT: line names exactly one of these names, or a reserved word "
+        f"({HUMAN_TOKEN} / {OPERATOR_TOKEN}). No other name resolves."
+    )
+
+
 def _resolve_participant(roster: Mapping[str, Role], token: str) -> Handoff:
     """Resolve a non-sentinel token: identity name first, then a role name (D1).
 
@@ -2080,6 +2108,7 @@ __all__ = [
     "StopStatus",
     "TerminalView",
     "build_handoff_protocol_block",
+    "build_roster_notice",
     "conditional_proceed_notice",
     "declares_no_tier_c",
     "declares_tier_c",

@@ -182,6 +182,7 @@ from .handoff import (
     HumanAsk,
     MismatchReason,
     OperatorFault,
+    build_roster_notice,
     declares_no_tier_c,
     malformed_notice,
     parse_next_token,
@@ -3754,6 +3755,9 @@ class Conductor:
             review_round=review_round,
             review_round_notice=review_round_notice,
             conditional_proceed_notice=conditional_proceed_notice,
+            # T-naysayer-invents-next-participant D-1: every role, every dispatch; the text is
+            # built in handoff.py from the same roster resolve_handoff reads.
+            roster_notice=build_roster_notice(self._roster),
         )
 
     def _review_round(
