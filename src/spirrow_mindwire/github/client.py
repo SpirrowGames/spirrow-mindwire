@@ -24,6 +24,7 @@ unreachable GitHub onto a fail-closed halt (ADR-07 §2.6).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -301,6 +302,42 @@ class ReviewInfo:
     # (``fetch_review_body``) needs the id. Defaulted so every existing construction is
     # unchanged.
     review_id: str | None = None
+    # The review's raw body, as the reviews list already returns it (no extra call). Read by
+    # B-(a) coverage to recover the diff fingerprint the gate stamped on a prior APPROVE
+    # (T-gate-verdict-not-a-function-of-its-input msg-8424 D-2'). Defaulted like ``review_id``.
+    body: str | None = None
+
+
+# T-gate-verdict-not-a-function-of-its-input (msg-8424 D-2'): every content review the gate
+# posts carries this hidden line, so a later gate run can tell whether a prior APPROVE was
+# given to the very same diff bytes. ``<hex>`` is ``sha256(diff.encode("utf-8"))`` of the
+# compare diff BEFORE truncation. The line is written by the gate, below the critique, so
+# :func:`parse_diff_sha256_marker` takes the LAST whole-line match: a quoted marker inside the
+# critique (the PR's own code quoted by the model) sits above it and never wins (msg-8425
+# advisory 2).
+DIFF_SHA256_MARKER_PREFIX = "<!-- mindwire:diff-sha256 "
+_DIFF_SHA256_MARKER_RE = re.compile(r"^<!-- mindwire:diff-sha256 ([0-9a-f]{64}) -->$", re.MULTILINE)
+
+
+def diff_sha256(diff: str) -> str:
+    """The fingerprint of the diff the gate read: sha256 over its UTF-8 bytes, hex."""
+    return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
+
+def render_diff_sha256_marker(digest: str) -> str:
+    return f"{DIFF_SHA256_MARKER_PREFIX}{digest} -->"
+
+
+def parse_diff_sha256_marker(body: str | None) -> str | None:
+    """The gate-stamped diff fingerprint in a review body, or ``None`` when there is none.
+
+    The LAST whole-line match wins (the gate writes its line after the critique). A body
+    written before the marker existed returns ``None`` — "cannot tell", never a guess.
+    """
+    if not body:
+        return None
+    matches = _DIFF_SHA256_MARKER_RE.findall(body)
+    return matches[-1] if matches else None
 
 
 @dataclass(frozen=True)
@@ -322,6 +359,11 @@ class CrossPrApproveCoverage:
     sha: str
     other_pr: PrRef
     approved_at: str | None
+    # The diff fingerprint the gate stamped on that APPROVE's body (msg-8424 D-2'), or
+    # ``None`` when the body carries no marker (a review older than the marker). Only an
+    # exact match against this run's fingerprint licenses the "identical input" reversal
+    # note; ``None`` keeps the note silent.
+    prior_diff_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1459,6 +1501,7 @@ class GitHubClient:
                         commit_id=str(cid) if cid else None,
                         submitted_at=str(submitted) if submitted else None,
                         review_id=str(rid) if rid is not None else None,
+                        body=row.get("body") if isinstance(row.get("body"), str) else None,
                     )
                 )
             if len(rows) < 100:
@@ -1712,7 +1755,10 @@ class GitHubClient:
                         ):
                             coverage.append(
                                 CrossPrApproveCoverage(
-                                    sha=sha, other_pr=other_pr, approved_at=r.submitted_at
+                                    sha=sha,
+                                    other_pr=other_pr,
+                                    approved_at=r.submitted_at,
+                                    prior_diff_sha256=parse_diff_sha256_marker(r.body),
                                 )
                             )
                             seen.add(key)
