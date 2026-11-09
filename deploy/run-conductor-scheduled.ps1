@@ -6144,6 +6144,14 @@ try {
         Confirm-LogWorthKeeping
         foreach ($w in $schemaWarnings) { Write-Log $w }
     }
+    # Tag reading (T-sweep-exclude-by-tag msg-8731 D-3): the lookup cap and an unmeasured listing null
+    # are WARNs kept on a quiet tick; the listing's tags rollout (partial / complete) is INFO only.
+    $tagWarnings = @(Get-UnregisteredIntakeTagWarnings -Intake $unregisteredIntake)
+    if ($tagWarnings.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        foreach ($w in $tagWarnings) { Write-Log $w }
+    }
+    foreach ($w in @(Get-UnregisteredIntakeTagInfo -Intake $unregisteredIntake)) { Write-Log $w }
     if (@($unregisteredIntake.added).Count -gt 0 -or @($unregisteredIntake.refused).Count -gt 0 -or
         @($unregisteredIntake.shadow).Count -gt 0 -or @($unregisteredIntake.idle).Count -gt 0 -or
         @($unregisteredIntake.time_unknown).Count -gt 0 -or $unregisteredIntake.excluded_count -gt 0) {
@@ -6159,7 +6167,8 @@ try {
                    "[$((@($unregisteredIntake.idle) | ForEach-Object { $_.key }) -join ', ')], " +
                    "time-unknown $(@($unregisteredIntake.time_unknown).Count) " +
                    "[$((@($unregisteredIntake.time_unknown) | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ', ')], " +
-                   "excluded $($unregisteredIntake.excluded_count)")
+                   "excluded $($unregisteredIntake.excluded_count) " +
+                   "(list $($unregisteredIntake.excluded_list_count), tag $($unregisteredIntake.excluded_tag_count))")
     }
 
     # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the

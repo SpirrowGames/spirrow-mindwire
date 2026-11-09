@@ -1,0 +1,271 @@
+{
+  "_provenance": {
+    "source": "hand-built from the real item shape of magickit_chatroom_list_threads_page.json, with the tags key removed or nulled so every reported thread is a tag-lookup candidate",
+    "captured_at": "2026-11-09T00:00:00+00:00",
+    "captured_by": "Heisenberg (implementer), T-sweep-exclude-by-tag",
+    "purpose": "msg-8731 parity test: the keys the Python fallback sends to chatroom_get_thread equal the keys the PowerShell rule order carries to the tag step. 'report' is the enumerator's output before any lookup and is pinned equal to it by tests/test_unregistered_threads_tags.py"
+  },
+  "now": "2026-11-09T00:00:00+00:00",
+  "sweep": {
+    "candidates": [
+      {
+        "project": "mw",
+        "thread_id": "T-listed",
+        "repo_dir": "/clones/mw"
+      }
+    ],
+    "clones": {
+      "mw": "/clones/mw"
+    },
+    "intake": {
+      "mode": "on",
+      "max_idle_days": 14
+    },
+    "exclude": [
+      "mw/T-excluded"
+    ],
+    "projects": [
+      "mw",
+      "nc"
+    ]
+  },
+  "listings": {
+    "mw": [
+      {
+        "project": "mw",
+        "thread_id": "T-listed",
+        "title": "T-listed",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-pr-review-mw-1",
+        "title": "T-pr-review-mw-1",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-excluded",
+        "title": "T-excluded",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-idle",
+        "title": "T-idle",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-10-01T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-notime",
+        "title": "T-notime",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": null
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-fresh2",
+        "title": "T-fresh2",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "tags": null,
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-07T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-fresh1",
+        "title": "T-fresh1",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      },
+      {
+        "project": "mw",
+        "thread_id": "T-resolved",
+        "title": "T-resolved",
+        "owner": "Fermi",
+        "status": "resolved",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      }
+    ],
+    "nc": [
+      {
+        "project": "nc",
+        "thread_id": "T-noclone",
+        "title": "T-noclone",
+        "owner": "Fermi",
+        "status": "active",
+        "created_at": "2026-10-09T03:09:55.327965Z",
+        "created_by_msg": "msg-6740",
+        "resolved_by_msg": null,
+        "affects_threads": [],
+        "last_msg_id": "msg-7452",
+        "msg_count": 38,
+        "last_activity_at": "2026-11-08T00:00:00+00:00"
+      }
+    ]
+  },
+  "expected_tag_step": [
+    "mw/T-fresh1",
+    "mw/T-fresh2"
+  ],
+  "report": {
+    "projects": [
+      {
+        "project": "mw",
+        "unregistered_count": 5,
+        "unregistered": [
+          "T-excluded",
+          "T-idle",
+          "T-notime",
+          "T-fresh2",
+          "T-fresh1"
+        ],
+        "threads": [
+          {
+            "thread_id": "T-excluded",
+            "time_state": "ok",
+            "last_activity_at": "2026-11-08T00:00:00+00:00",
+            "idle_days": 1.0,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          },
+          {
+            "thread_id": "T-idle",
+            "time_state": "ok",
+            "last_activity_at": "2026-10-01T00:00:00+00:00",
+            "idle_days": 39.0,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          },
+          {
+            "thread_id": "T-notime",
+            "time_state": "missing",
+            "last_activity_at": null,
+            "idle_days": null,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          },
+          {
+            "thread_id": "T-fresh2",
+            "time_state": "ok",
+            "last_activity_at": "2026-11-07T00:00:00+00:00",
+            "idle_days": 2.0,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          },
+          {
+            "thread_id": "T-fresh1",
+            "time_state": "ok",
+            "last_activity_at": "2026-11-08T00:00:00+00:00",
+            "idle_days": 1.0,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          }
+        ],
+        "error": null,
+        "malformed_count": 0,
+        "field_absent_count": 0,
+        "listed_count": 8,
+        "tags_field_present_count": 0,
+        "tags_null_count": 1
+      },
+      {
+        "project": "nc",
+        "unregistered_count": 1,
+        "unregistered": [
+          "T-noclone"
+        ],
+        "threads": [
+          {
+            "thread_id": "T-noclone",
+            "time_state": "ok",
+            "last_activity_at": "2026-11-08T00:00:00+00:00",
+            "idle_days": 1.0,
+            "exclude_tag": null,
+            "tag_state": "unread"
+          }
+        ],
+        "error": null,
+        "malformed_count": 0,
+        "field_absent_count": 0,
+        "listed_count": 1,
+        "tags_field_present_count": 0,
+        "tags_null_count": 0
+      }
+    ],
+    "activity_field": "last_activity_at",
+    "exclude_tags": [
+      "do-not-sweep",
+      "not-swept",
+      "scratch",
+      "probe"
+    ],
+    "tag_lookup_cap": 20,
+    "tag_lookup_needed": 0,
+    "tag_lookup_done": 0,
+    "listing_tags_null_measured": false,
+    "unregistered_count_total": 6,
+    "unmeasured_projects": [],
+    "any_unmeasured": false,
+    "malformed_count_total": 0,
+    "any_malformed": false
+  }
+}
