@@ -30,7 +30,10 @@ traceback, so "could not tell" is never confused with "dirty".
 PR-0) switches a ``wrong_head`` clone back to its default branch when every commit on its branch is
 already on the remote; see :mod:`spirrow_mindwire.clone_recover`. Exit 0 recovered, 3 not
 eligible (nothing changed), 1 failed. The wrapper calls it before ``clone-check``, which still
-makes the release decision.
+makes the release decision. ``--preserve --thread-id <id> --state-dir <dir>``
+(T-role-exit-leaves-clone-off-default-branch PR-A) also switches back a clean clone whose commits
+are not all on the remote, after keeping them on a local ``wip/`` ref, and records that ref for the
+thread's next implementer turn.
 
 ``mindwire clone-retreat --repo-dir <dir> --thread-id <id> --head-msg <msg> --stop-reason <r>
 --state-dir <dir>`` (same thread, PR-1a) runs after a launch: WIP to a ``wip/`` branch, or export a
@@ -101,6 +104,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="switch a wrong_head clone back to its default branch if that loses no commit",
     )
     recover.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
+    recover.add_argument(
+        "--preserve",
+        action="store_true",
+        help="also recover unpushed commits / detached HEAD by keeping them on a local wip/ ref",
+    )
+    recover.add_argument("--thread-id", default=None, help="(--preserve) the thread to record for")
+    recover.add_argument(
+        "--state-dir", type=Path, default=None, help="(--preserve) where clone-retreats.jsonl is"
+    )
     retreat = sub.add_parser(
         "clone-retreat",
         help="after a launch: move a dirty clone's WIP to a wip/ branch, or export and discard it",
@@ -197,7 +209,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "clone-recover":
         from .clone_recover import run as run_clone_recover
 
-        raise SystemExit(run_clone_recover(args.repo_dir))
+        if args.preserve and (not args.thread_id or args.state_dir is None):
+            print("clone-recover: --preserve needs --thread-id and --state-dir", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(
+            run_clone_recover(
+                args.repo_dir,
+                preserve=args.preserve,
+                thread_id=args.thread_id,
+                state_dir=args.state_dir,
+            )
+        )
     if args.command == "clone-retreat":
         from .clone_retreat import run as run_clone_retreat
 

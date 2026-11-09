@@ -134,6 +134,60 @@ def record_result(
     return row
 
 
+PRESERVED_OUTCOME = "preserved"
+
+
+def build_preserved_record(
+    *,
+    thread_id: str,
+    repo_dir: Path,
+    branch: str | None,
+    preserved_ref: str,
+    preserved_sha: str,
+    recovered: bool,
+    detail: str = "",
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """The ``retreat`` row for ``mindwire clone-recover --preserve`` (T-role-exit-leaves-clone-off-
+    default-branch PR-A, msg-8698 §3): a clean clone off the default branch whose unpushed commits
+    were kept on the local ref ``preserved_ref``.
+
+    ``outcome`` is ``preserved`` when the clone is back on the default branch, and ``failed`` when
+    the ref was made but the switch back failed. In that case :func:`_opening_state` sends the
+    implementer to inspect the clone first. The row has the PR-1b keys, so the wrapper's readers
+    (parking alert line, discard alerts that select ``discarded`` / ``discard_incomplete`` only)
+    read it unchanged."""
+    stamp = _now_iso(at)
+    return {
+        "kind": RETREAT_KIND,
+        "record_id": f"{thread_id}@{stamp}#{uuid.uuid4().hex[:12]}",
+        "at": stamp,
+        "thread_id": thread_id,
+        "repo_dir": str(repo_dir),
+        "head_msg": "-",
+        "stop_reason": "-",
+        "outcome": PRESERVED_OUTCOME if recovered else "failed",
+        "pushed": False,
+        "branch": branch,
+        "files": None,
+        "insertions": None,
+        "deletions": None,
+        "patch": None,
+        "untracked": None,
+        "marker": None,
+        "detail": detail,
+        "preserved_ref": preserved_ref,
+        "preserved_sha": preserved_sha,
+    }
+
+
+def record_preserved(path: Path, **kw: Any) -> dict[str, Any]:
+    """Append :func:`build_preserved_record` to ``path`` and return the row."""
+    row = build_preserved_record(**kw)
+    _append(path, row)
+    return row
+
+
 def _rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -225,8 +279,50 @@ def _opening_state(record: dict[str, Any]) -> str:
     )
 
 
+def _render_preserved(record: dict[str, Any]) -> str:
+    """The notice for a ``clone-recover --preserve`` row: the commits are on a local ``wip/`` ref
+    of this clone (not pushed), named with its sha."""
+    ref = record.get("preserved_ref")
+    sha = record.get("preserved_sha")
+    if record.get("outcome") == PRESERVED_OUTCOME:
+        opening = (
+            "A previous launch on this thread ended with the shared clone off the default branch, "
+            "holding commits that were not on the remote. The wrapper kept them on a local ref "
+            "and switched the clone back to the default branch."
+        )
+    else:
+        opening = (
+            "A previous launch on this thread ended with the shared clone off the default branch, "
+            "holding commits that were not on the remote. The wrapper kept them on a local ref, "
+            "but switching back to the default branch did not complete, so the clone may still "
+            "be on that branch. Inspect the current clone state (`git status`, "
+            "`git branch --show-current`, `git log -1`) first."
+        )
+    lines = [
+        f"{NOTICE_TAG} {opening}",
+        f"- when: {record.get('at')}",
+        f"- repo: {record.get('repo_dir')}",
+        f"- outcome: {record.get('outcome')} ({record.get('detail') or 'no detail'})",
+    ]
+    if record.get("branch"):
+        lines.append(
+            f"- original branch: `{record['branch']}` (deleted locally; name is free again)"
+        )
+    lines.append(
+        f"- commits: in this clone's local ref `{ref}` at `{sha}` "
+        "(NOT pushed: it exists only in this clone)"
+    )
+    lines.append(
+        f"Check that ref before redoing the work: `git switch -c <your branch> {ref}` or "
+        "cherry-pick from it."
+    )
+    return "\n".join(lines)
+
+
 def render_notice(record: dict[str, Any]) -> str:
     """The prompt block for one ``retreat`` row. Information for the turn, not a rule."""
+    if record.get("preserved_ref"):
+        return _render_preserved(record)
     lines = [
         f"{NOTICE_TAG} A previous launch on this thread left the shared clone dirty. "
         f"{_opening_state(record)}",
@@ -284,12 +380,15 @@ __all__ = [
     "DELIVERED_KIND",
     "NOTICE_TAG",
     "NO_OP_OUTCOMES",
+    "PRESERVED_OUTCOME",
     "RETREAT_KIND",
     "PendingNotice",
+    "build_preserved_record",
     "build_record",
     "load_pending_notice",
     "mark_delivered",
     "pending_record",
+    "record_preserved",
     "record_result",
     "render_notice",
 ]

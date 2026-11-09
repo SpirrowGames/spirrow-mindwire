@@ -3242,10 +3242,20 @@ function Invoke-CloneCheck {
 # origin/<default> (or origin/develop). Then it switches to <default>, fast-forwards, and deletes the
 # local branch. Returns @{ code; row (the MINDWIRE_CLONE_RECOVER json text or ''); stderr }.
 # A probe that could not run or timed out reports code -1.
+# -Preserve (T-role-exit-leaves-clone-off-default-branch PR-A, Bohr msg-8698; launch end only):
+# also switches back a clean clone whose commits are not all on the remote (or a detached HEAD),
+# after keeping them on a LOCAL wip/<branch|detached-sha8>-<ts> ref. Nothing is pushed. The kept ref
+# is recorded in -StateDir\clone-retreats.jsonl for -ThreadId's next implementer turn.
 function Invoke-CloneRecover {
-    param([string]$RepoDir)
-    $r = Invoke-BoundedUvProbe -Label 'clone-recover' -TimeoutSeconds $CloneCheckTimeoutSeconds `
-        -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir)
+    param([string]$RepoDir, [switch]$Preserve, [string]$ThreadId = '', [string]$StateDir = '')
+    # Two literal call sites, so tests/test_bounded_probe_cli_contract.py checks each argv.
+    if ($Preserve) {
+        $r = Invoke-BoundedUvProbe -Label 'clone-recover-preserve' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir, '--preserve', '--thread-id', $ThreadId, '--state-dir', $StateDir)
+    } else {
+        $r = Invoke-BoundedUvProbe -Label 'clone-recover' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir)
+    }
     if (-not $r.ok) { return @{ code = -1; row = ''; stderr = "$($r.error)" } }
     $row = ''
     foreach ($line in @("$($r.stdout)" -split "`r?`n")) {
@@ -3284,9 +3294,17 @@ function Invoke-CloneRetreat {
 # make it. The one-line kinds are dirty-clone-retreated / dirty-clone-discarded thread=<id>
 # patch=<path> / dirty-clone-discard-incomplete thread=<id> marker=<name> patch=<path>; the full
 # row (with every git step's stderr) follows it so 4b stops can be investigated. Returns the outcome.
+# T-role-exit-leaves-clone-off-default-branch PR-A (G3, Bohr msg-8698): when the retreat says
+# not_eligible, $Recover (Invoke-CloneRecover -Preserve in production, a stub in tests) runs once,
+# right away. It changes the clone only for a clean wrong_head (its own guard decides that), so for
+# every other not_eligible it is a no-op. Whether the clone stays parked is still decided by
+# clone-check, as before. Returns 'recovered' (switched back, no commit to keep), 'preserved'
+# (switched back after keeping commits on a local wip/ ref, record written), 'recover_failed', or
+# 'not_eligible' when recover did nothing either.
 function Invoke-LaunchEndRetreat {
     param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
-          [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat)
+          [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
+          [scriptblock]$Recover = $null)
     if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
@@ -3300,7 +3318,11 @@ function Invoke-LaunchEndRetreat {
     $outcome = "$($p.outcome)"
     switch ($outcome) {
         'clean' { return 'clean' }
-        'not_eligible' { Write-Log "dirty-clone-retreat-skipped ${RepoDir}: thread=$ThreadId $($p.detail)"; return $outcome }
+        'not_eligible' {
+            Write-Log "dirty-clone-retreat-skipped ${RepoDir}: thread=$ThreadId $($p.detail)"
+            if ($null -eq $Recover) { return $outcome }
+            return (Invoke-LaunchEndRecover -RepoDir $RepoDir -ThreadId $ThreadId -StateDir $StateDir -Recover $Recover)
+        }
         'retreated' {
             $pushNote = if ($p.pushed) { 'pushed' } else { 'NOT pushed (local branch only)' }
             Write-Log "dirty-clone-retreated ${RepoDir}: thread=$ThreadId ($CandidateKey) stop=$StopReason branch=$($p.branch) files=$($p.files) +$($p.insertions)/-$($p.deletions) $pushNote — back on the default branch"
@@ -3311,6 +3333,29 @@ function Invoke-LaunchEndRetreat {
     }
     Write-Log "clone-retreat row ${RepoDir}: $rrow"
     return $outcome
+}
+
+# PR-A (G3): the launch-end clone-recover --preserve, run once after a not_eligible retreat. Only
+# logs and reports; clone-check still decides the parking. See Invoke-LaunchEndRetreat for returns.
+function Invoke-LaunchEndRecover {
+    param([string]$RepoDir, [string]$ThreadId, [string]$StateDir, [scriptblock]$Recover)
+    $rr = & $Recover $RepoDir $ThreadId $StateDir
+    $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
+    $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
+    $p = $null
+    if ($rrow) { try { $p = $rrow | ConvertFrom-Json -ErrorAction Stop } catch { $p = $null } }
+    if ($rcode -eq 3) { return 'not_eligible' }  # not a clean wrong_head (or fetch failed): nothing changed
+    if ($rcode -eq 0 -and $null -ne $p) {
+        if ($p.preserved_ref) {
+            Write-Log "dirty-clone-preserved ${RepoDir}: thread=$ThreadId branch=$($p.branch) unpushed commits kept on LOCAL ref $($p.preserved_ref) ($($p.preserved_sha)), not pushed — back on the default branch — $rrow"
+            return 'preserved'
+        }
+        Write-Log "dirty-clone-recovered ${RepoDir}: thread=$ThreadId wrong_head $($p.branch) switched to the default branch at launch end, no commit lost — $rrow"
+        return 'recovered'
+    }
+    $err = if ($null -ne $rr) { "$($rr.stderr)" } else { '' }
+    Write-Log "dirty-clone-recover-failed ${RepoDir}: thread=$ThreadId clone-recover --preserve exit=$rcode — $rrow $err"
+    return 'recover_failed'
 }
 
 # D-3c: re-judge every parked repo once. $Probe is a scriptblock taking the repo_dir and returning
@@ -6949,7 +6994,8 @@ try {
         $retreatOutcome = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
             -HeadMsg "$probeHead" -StopReason "$($verdict.reason)" -ExitCode $code `
             -StateDir (Join-Path $dataDir 'state') `
-            -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s }
+            -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s } `
+            -Recover { param($d, $t, $s) Invoke-CloneRecover -RepoDir $d -Preserve -ThreadId $t -StateDir $s }
         # PR-3: a retreat that may have appended a record invalidates the per-tick table, so the
         # exit-8 alert below never shows a record older than the file. Only no-op outcomes keep it.
         if ("$retreatOutcome" -notin @('skipped', 'clean', 'not_eligible')) { $recordsByRepoTick = $null }

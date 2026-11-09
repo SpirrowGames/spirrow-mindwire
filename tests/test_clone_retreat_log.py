@@ -31,9 +31,11 @@ from spirrow_mindwire.clone_retreat_log import (
     DELIVERED_KIND,
     NOTICE_TAG,
     RETREAT_KIND,
+    build_preserved_record,
     build_record,
     load_pending_notice,
     pending_record,
+    record_preserved,
     record_result,
     render_notice,
 )
@@ -597,3 +599,77 @@ def test_records_with_the_same_timestamp_get_distinct_ids(tmp_path: Path) -> Non
     assert rows[0] is not None and rows[1] is not None
     assert rows[0]["at"] == rows[1]["at"]
     assert rows[0]["record_id"] != rows[1]["record_id"]
+
+
+# --- T-role-exit-leaves-clone-off-default-branch PR-A: clone-recover --preserve records ----------
+
+
+def _preserved(thread: str = THREAD, *, recovered: bool = True) -> dict[str, Any]:
+    return build_preserved_record(
+        thread_id=thread,
+        repo_dir=Path("C:/clones/repo"),
+        branch="feature/x",
+        preserved_ref="wip/feature/x-20261110T000000Z",
+        preserved_sha="0123456789abcdef0123456789abcdef01234567",
+        recovered=recovered,
+        detail="1 unpushed commit(s) kept on local ref wip/feature/x-20261110T000000Z",
+        at=AT,
+    )
+
+
+def test_preserved_notice_names_the_local_ref_and_sha() -> None:
+    text = render_notice(_preserved())
+    assert text.startswith(NOTICE_TAG)
+    assert "`wip/feature/x-20261110T000000Z`" in text
+    assert "0123456789abcdef0123456789abcdef01234567" in text
+    assert "NOT pushed" in text
+    assert "switched the clone back to the default branch" in text
+    assert "left the shared clone dirty" not in text
+
+
+def test_preserved_notice_when_the_switch_failed_says_to_inspect_first() -> None:
+    rec = _preserved(recovered=False)
+    assert rec["outcome"] == "failed"
+    text = render_notice(rec)
+    assert "did not complete" in text
+    assert "git status" in text
+    assert "wip/feature/x-20261110T000000Z" in text
+
+
+@pytest.mark.anyio
+async def test_preserved_record_reaches_this_threads_implementer_once(tmp_path: Path) -> None:
+    log = tmp_path / CLONE_RETREAT_LOG_FILENAME
+    record_preserved(
+        log,
+        thread_id=THREAD,
+        repo_dir=tmp_path,
+        branch="feature/x",
+        preserved_ref="wip/feature/x-20261110T000000Z",
+        preserved_sha="abc123",
+        recovered=True,
+    )
+    _, dispatcher, _ = await _run(log)
+    [(role, event)] = dispatcher.dispatched
+    assert event.clone_retreat_notice is not None
+    prompt = _build_prompt(event, role)
+    assert "wip/feature/x-20261110T000000Z" in prompt
+    assert "abc123" in prompt
+    assert pending_record(log, THREAD) is None
+
+
+@pytest.mark.anyio
+async def test_preserved_record_of_another_thread_is_not_shown(tmp_path: Path) -> None:
+    log = tmp_path / CLONE_RETREAT_LOG_FILENAME
+    record_preserved(
+        log,
+        thread_id="T-other",
+        repo_dir=tmp_path,
+        branch="feature/x",
+        preserved_ref="wip/feature/x-20261110T000000Z",
+        preserved_sha="abc123",
+        recovered=True,
+    )
+    _, dispatcher, _ = await _run(log)
+    [(_, event)] = dispatcher.dispatched
+    assert event.clone_retreat_notice is None
+    assert pending_record(log, "T-other") is not None

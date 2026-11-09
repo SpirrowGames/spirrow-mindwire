@@ -85,7 +85,8 @@ def test_every_call_site_was_found() -> None:
     # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 adds Invoke-CloneRecover: sixteen.
     # PR-1a of the same thread adds Invoke-CloneRetreat: seventeen.
     # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
-    assert len(_SITES) == 18, _SITES
+    # T-role-exit-leaves-clone-off-default-branch PR-A adds Invoke-CloneRecover -Preserve: nineteen.
+    assert len(_SITES) == 19, _SITES
 
 
 def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:
@@ -107,6 +108,10 @@ def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:
     assert sites.get("'clone-recover'") == (
         "-m spirrow_mindwire.cli clone-recover",
         ["--repo-dir"],
+    )
+    assert sites.get("'clone-recover-preserve'") == (
+        "-m spirrow_mindwire.cli clone-recover",
+        ["--repo-dir", "--preserve", "--thread-id", "--state-dir"],
     )
     assert sites.get("'clone-retreat'") == (
         "-m spirrow_mindwire.cli clone-retreat",
