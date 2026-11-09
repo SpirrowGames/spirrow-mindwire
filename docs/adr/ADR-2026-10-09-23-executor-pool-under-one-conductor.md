@@ -10,7 +10,7 @@
   - `T-agmsg-transport-lessons-readiness-session-claim-board`（T45〜T49: 占有の設計）— 参照のみ。合流させない（2026-10-13 改訂。あちらはエージェントのセッションの占有で、置き場所の前提が違う。Bohr msg-6890 §4）
   - `T-sweep-starves-deep-candidates` — 単位 5（フェーズ 2）で公平性と合流させる
   - `T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down` — park 理由の明示（停止理由を黙って消さない）
-- **改訂種別**: 新規 ADR（2026-10-13: D6 改訂。§2.2 を追加し、§2.1・§4・§7(a)(c)(d)(e) の置き場所を追従、§7(f) を追加）
+- **改訂種別**: 新規 ADR（2026-10-13: D6 改訂。§2.2 を追加し、§2.1・§4・§7(a)(c)(d)(e) の置き場所を追従、§7(f) を追加。2026-11-10: §4 の単位 2 を 2a / 2b に分割し、§2.1 に D9 の解釈を、§7.1「単位 2b への要件」を追加。takahito 承認 — Fermi msg-8780）
 
 ---
 
@@ -76,6 +76,9 @@ D1〜D17 は承認済みの文言をそのまま残す（D6・D12 は takahito �
   - **park は Conductor だけが決める。** Conductor はスレッドごとに nullable なタイムスタンプ `no_match_since` を 1 つだけ、Conductor のローカル状態に持つ（§2.2）。tick ごとに、プールの中に依頼のタグと一致する実行機が 1 台もなければ、`no_match_since` が空ならその時刻を入れ、1 台でもあれば空に戻す（区間の累積や一時停止はしない。リセットだけである）。一致する実行機が 1 台でもあれば、それが空きスロットなし・予約中（D13）・実行中のどれであっても、その待ちは通常の資源待ちであり、バージョン不一致としては数えない（資源待ちの扱いは D3・D4・D13 と単位 5 の公平性に従う）。`now - no_match_since` がこの上限を超えた場合に限り、Conductor がそのスレッドを park し、停止理由に「実行機バージョン不一致: 手元 X / 依頼 Y」を明示する。X はその時点のプール内の実行機の現バージョン（複数あれば列挙）で、定義上 Y を含まない。これは D4 の「実行機オフライン」と同じ構造（振れる実行機がない → 一定の手当ての後に park）であり、D5 の「依頼を受け取る前の失敗は別の機械へ回してよい」とも矛盾しない。上限時間は未決の数値とする（§5）。起点をスレッドや依頼の作成時刻にしてはならない。長く資源待ちをしていたスレッドが、配備の窓で一致する実行機が一瞬 0 台になっただけで即座に park されてしまい、この節が防ごうとしている誤った park が起きるからである。
 - **D12 は D6 に合わせて本文を改訂済み（§2）。** 改訂前の「Conclair は現バージョンだけを持ち」は D6 の改訂と矛盾していたため、読み替えではなく本文を書き換えた。
 - **D17「投稿のメタデータに実行機名を載せる」は、投稿本文末尾の `<!-- source: … -->` フッターに載せる。** Conclair 側の変更は要らない（Bohr msg-6890 §2）。
+- **D9 の bootstrap 鍵を Credential Manager に置いてよいのは、turn が `[turn.isolation] user` で動いている host に限る（2026-11-10 追記、takahito 承認 — Fermi msg-8780、改訂案 Bohr msg-8781）。** D9 の本文は書き換えない。
+  - 根拠: ADR-2026-05-23-07 §8（決定内容 3）は、Vaultwarden に届くことを残留リスクとして受け入れた。その前提は「解錠の材料を host に置かない」ことである。owner として `bypassPermissions` と Bash で動く implementer がいる host に bootstrap 鍵を置くと、この前提が成り立たなくなる。
+  - そのため単位 2 を 2a（turn user 分離）と 2b（Vaultwarden bootstrap）に分け、2b の前提を 2a の配線完了とする（§4）。2b が満たす fail-closed の要件は §7.1 に固定する。
 
 ### 2.2 状態の置き場所（D6 の内訳、2026-10-13）
 
@@ -111,7 +114,8 @@ mindwire の中で閉じられるものは閉じ、機械をまたいで共有�
 | 単位 | 内容 | 決定 | 前提 | 実装先 |
 |---|---|---|---|---|
 | 1 | git 同期フック | D7・D8 | なし（単一機でも価値がある） | spirrow-mindwire |
-| 2 | Vaultwarden bootstrap | D9 | なし。**期限 2026-11-26**（implementer PAT の失効日） | spirrow-mindwire |
+| 2a | turn user 分離（launcher・起動時確認・adapter の配線） | D9（前提整備） | なし。launcher と `mindwire turn-isolation-check` は #485（`9206ed6`）で入っている。adapter の配線はまだ | spirrow-mindwire |
+| 2b | Vaultwarden bootstrap | D9 | 2a の配線が完了していること（adapter が launcher 経由で turn を起動している）。2a の配線には、check のタイムアウトを exit 10 の停止に揃える修正（msg-7363 の A）を含む。かつ、その host で `mindwire turn-isolation-check` が exit 0 になること（§2.1、§7.1）。**期限 2026-11-26**（implementer PAT の失効日）を理由にこの順序を崩さない（2026-11-10 改訂、Fermi msg-8780） | spirrow-mindwire |
 | 3 | Magickit: 実行機の動的な報告の受付・ターン依頼と占有権・予約 | D6・D13 | なし | spirrow-magickit（別スレッドに分割。spirrow-conclair 側に起票済みの分があれば、D6 の改訂を理由に取り下げる） |
 | 4 | フェーズ 1: リモート Implementer の実装と振り分け ＋ Magickit 側（deploy_history への報告受付、タグ作成経路、予約ツール） | D1〜D5・D10〜D13・D17 | 単位 3、および移設の完了（D15） | spirrow-mindwire ＋ spirrow-magickit |
 | 5 | フェーズ 2: 並列化と全体の同時実行数上限 | D16 | 単位 4。`T-sweep-starves-deep-candidates` の公平性と合流 | spirrow-mindwire |
@@ -187,6 +191,27 @@ mindwire の中で閉じられるものは閉じ、機械をまたいで共有�
     - 報告が失効した実行機を、台帳の capabilities で選び、台帳の wol で起こすこと
     - 台帳にない名前からの報告は使われず、ログに残ること
     - 台帳の project に対応する clone の報告がない場合、その「実行機 × project」が候補から外れ、そのことが報告されること
+
+## 7.1 単位 2b への要件（2026-11-10 追記、takahito 承認 — Fermi msg-8780、改訂案 Bohr msg-8781、設計レビュー Einstein）
+
+単位 2b（Vaultwarden bootstrap）の spec はまだ無い。2b の spec を書くときは、この節を要件として引用する（§2.1 の D9 の解釈を実装に落としたもの）。
+
+- **(a) turn isolation が効いていない host では fail-closed にする。** 2b の設定がある host で、次のどちらかに当たる場合が対象である。
+  - `[turn.isolation] user` が設定されていない。
+  - 同じ tick の `mindwire turn-isolation-check` が exit 0 で終わっていない。
+  - このとき 2b は Credential Manager から bootstrap 鍵を読まず、`bw` も呼ばない。tick は `SECRETS_STOP_EXIT_CODE`（10）で止める。停止理由は `turn isolation inactive: refusing Vaultwarden bootstrap` の 1 行だけにし、値は出さない。
+- **(b) 2b の設定が無い host では何もしない（INV-0）。** 今と同じく Vaultwarden を使わず、tick も止めない。2b を入れた時点で、2b を使わない host（CI 機など）の tick が止まってはならない。
+- **(c) 「通った」と言えるのは、同じ tick の check が exit 0 で終わった場合だけである。**
+  - check の結果は sweep wrapper の中で、check から 2b へ直接渡す。前回の tick の結果をファイルなどに保存して使い回すことはしない。
+  - タイムアウト、traceback、exit 1 など、exit 0 以外はすべて「通っていない」として扱い、(a) の停止（exit 10 と停止行 1 行）に揃える。check が例外を投げた場合も同じで、2b を呼ぶ側がその例外を捕まえて (a) の停止に変換する。例外をそのまま上へ伝えて tick を traceback で落とすことは、(a) を満たさない。
+  - `check.run` が `subprocess.TimeoutExpired` を捕まえず、タイムアウトが exit 10 ではなく traceback と exit 1 になる問題（msg-7363 の A）は、2a の配線で直す（§4 の 2b の前提に含まれる）。したがって 2b が入る時点ではこの問題は直っている。2b の側でも上の変換を持つので、check の実装に頼らずに (a) が成り立つ。
+- **(d) 必須テスト（2b の PR で固定する）。**
+  - isolation OFF のとき、鍵の読み出しと `bw` の起動がどちらも 0 回であること
+  - check が失敗したとき、どちらも 0 回であること
+  - check がタイムアウトしたとき、どちらも 0 回であること
+  - 2b の設定が無いとき、現行と同じ動作であること（INV-0）
+  - 停止行に値が含まれないこと
+- **(e) 期限 2026-11-26（implementer PAT の失効日）を理由に、2a の配線より先に 2b を入れない。** 間に合わない場合のつなぎは、人による PAT の手動更新とする（Bohr msg-8781）。
 
 ---
 
