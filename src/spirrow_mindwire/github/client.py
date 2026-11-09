@@ -29,7 +29,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from types import TracebackType
@@ -308,35 +308,40 @@ class ReviewInfo:
     body: str | None = None
 
 
-# T-gate-verdict-not-a-function-of-its-input (msg-8424 D-2'): every content review the gate
-# posts carries this hidden line, so a later gate run can tell whether a prior APPROVE was
-# given to the very same diff bytes. ``<hex>`` is ``sha256(diff.encode("utf-8"))`` of the
-# compare diff BEFORE truncation. The line is written by the gate, below the critique, so
-# :func:`parse_diff_sha256_marker` takes the LAST whole-line match: a quoted marker inside the
-# critique (the PR's own code quoted by the model) sits above it and never wins (msg-8425
-# advisory 2).
-DIFF_SHA256_MARKER_PREFIX = "<!-- mindwire:diff-sha256 "
-_DIFF_SHA256_MARKER_RE = re.compile(r"^<!-- mindwire:diff-sha256 ([0-9a-f]{64}) -->$", re.MULTILINE)
+# T-gate-verdict-not-a-function-of-its-input (msg-8810 D-2'' / msg-8812 Obj-3-2): every content
+# review the gate posts carries this hidden line, so a later gate run can tell whether a prior
+# APPROVE read the very same diff text. ``<hex>`` is ``sha256(view.text.encode("utf-8"))`` —
+# the diff string handed to ``_build_messages``, i.e. after ``.naysayer-ignore`` filtering and
+# truncation. Only the diff text is fingerprinted; the rest of the prompt (PR slug, B-(a)
+# marker) is not. The name and ``v1`` identify that hash domain: any other name or version (the
+# earlier raw-diff ``mindwire:diff-sha256`` included) is not comparable and parses as ``None``.
+# The gate writes the line below the critique, so :func:`parse_reviewed_diff_sha256_marker`
+# takes the LAST whole-line match: a marker the model quoted inside the critique sits above it
+# and never wins (msg-8425 advisory 2).
+REVIEWED_DIFF_SHA256_MARKER_PREFIX = "<!-- mindwire:reviewed-diff-sha256 v1 "
+_REVIEWED_DIFF_SHA256_MARKER_RE = re.compile(
+    r"^<!-- mindwire:reviewed-diff-sha256 v1 ([0-9a-f]{64}) -->$", re.MULTILINE
+)
 
 
-def diff_sha256(diff: str) -> str:
-    """The fingerprint of the diff the gate read: sha256 over its UTF-8 bytes, hex."""
-    return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+def reviewed_diff_sha256(reviewed_diff: str) -> str:
+    """Fingerprint of the diff text the model read: sha256 over its UTF-8 bytes, hex."""
+    return hashlib.sha256(reviewed_diff.encode("utf-8")).hexdigest()
 
 
-def render_diff_sha256_marker(digest: str) -> str:
-    return f"{DIFF_SHA256_MARKER_PREFIX}{digest} -->"
+def render_reviewed_diff_sha256_marker(digest: str) -> str:
+    return f"{REVIEWED_DIFF_SHA256_MARKER_PREFIX}{digest} -->"
 
 
-def parse_diff_sha256_marker(body: str | None) -> str | None:
-    """The gate-stamped diff fingerprint in a review body, or ``None`` when there is none.
+def parse_reviewed_diff_sha256_marker(body: str | None) -> str | None:
+    """The ``v1`` reviewed-diff fingerprint in a review body, or ``None`` when there is none.
 
-    The LAST whole-line match wins (the gate writes its line after the critique). A body
-    written before the marker existed returns ``None`` — "cannot tell", never a guess.
+    The LAST whole-line ``v1`` match wins (the gate writes its line after the critique). A body
+    without a ``v1`` marker returns ``None`` — "cannot compare", never a guess.
     """
     if not body:
         return None
-    matches = _DIFF_SHA256_MARKER_RE.findall(body)
+    matches = _REVIEWED_DIFF_SHA256_MARKER_RE.findall(body)
     return matches[-1] if matches else None
 
 
@@ -359,11 +364,46 @@ class CrossPrApproveCoverage:
     sha: str
     other_pr: PrRef
     approved_at: str | None
-    # The diff fingerprint the gate stamped on that APPROVE's body (msg-8424 D-2'), or
-    # ``None`` when the body carries no marker (a review older than the marker). Only an
-    # exact match against this run's fingerprint licenses the "identical input" reversal
-    # note; ``None`` keeps the note silent.
+    # The ``v1`` reviewed-diff fingerprint the gate stamped on that APPROVE's body
+    # (msg-8812 Obj-3-2), or ``None`` when the body carries none (an older review, or another
+    # marker version). Only an exact match against this run's fingerprint licenses the
+    # "identical reviewed diff" note; ``None`` keeps the note silent.
     prior_diff_sha256: str | None = None
+
+
+def _read_failure_label(exc: BaseException) -> str:
+    """Public-safe label of a failed read: class name, plus the HTTP status when known.
+
+    Never ``str(exc)`` — a ``GitHubHTTPError`` message carries paths and response detail and
+    the label reaches a public PR notice (msg-8424 Obj-1-2, msg-8810 D-1').
+    """
+    status = getattr(exc, "status_code", None)
+    name = type(exc).__name__
+    return f"{name} status={status}" if isinstance(status, int) else name
+
+
+@dataclass(frozen=True)
+class CoverageLookup:
+    """What one B-(a) coverage lookup found, and which reads failed (msg-8810 D-1').
+
+    ``coverage`` is the head-bound APPROVE rows that were found. ``read_failures`` holds one
+    :func:`_read_failure_label` per read that failed (commits list, commit→pulls, reviews, or
+    the outer belt) — labels only, never exception messages. The lookup stays fail-open: a
+    failed read is recorded and skipped, never raised.
+
+    ``state``: ``ok-empty`` (nothing found, nothing failed), ``ok`` (rows found; may be
+    partial when reads also failed) or ``failed`` (nothing found and at least one read failed —
+    "no coverage" cannot be told apart from "could not look").
+    """
+
+    coverage: list[CrossPrApproveCoverage] = field(default_factory=list)
+    read_failures: tuple[str, ...] = ()
+
+    @property
+    def state(self) -> str:
+        if self.coverage:
+            return "ok"
+        return "failed" if self.read_failures else "ok-empty"
 
 
 @dataclass(frozen=True)
@@ -634,7 +674,7 @@ class GitHubReviewClient(Protocol):
 
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
-    ) -> list[CrossPrApproveCoverage]: ...
+    ) -> CoverageLookup: ...
 
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None: ...
 
@@ -1572,6 +1612,7 @@ class GitHubClient:
                         commit_id=str(cid) if cid else None,
                         submitted_at=str(submitted) if submitted else None,
                         review_id=str(rid) if rid is not None else None,
+                        body=row.get("body") if isinstance(row.get("body"), str) else None,
                     )
                 )
             if len(rows) < 100:
@@ -1581,7 +1622,7 @@ class GitHubClient:
 
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
-    ) -> list[CrossPrApproveCoverage]:
+    ) -> CoverageLookup:
         """Which commits in ``pr``'s diff are covered by another PR's head-bound APPROVE.
 
         B-(a) marker resolution (msg-475 §2: "この計測は resolution ロジックの feasibility spike
@@ -1595,11 +1636,19 @@ class GitHubClient:
         内容自身の head に紐づいている"). Anything else (an APPROVE against a DIFFERENT head,
         or an APPROVE by a different reviewer) is not a head-bound APPROVE and does not count.
 
+        D-1' (T-gate-verdict-not-a-function-of-its-input msg-8810): the reads used here are
+        the STRICT twins (:meth:`_list_pr_commits_strict`, :meth:`_commit_pulls_strict`,
+        :meth:`fetch_pr_reviews_strict`), each failure caught on the spot, recorded in
+        :attr:`CoverageLookup.read_failures` (label only) and skipped. The fail-soft twins are
+        untouched for their other callers (DESIGN v3 §3: fail-soft and strict never share one
+        function). The paragraphs below describe the fail-open contract, which is unchanged:
+
         Fail-soft: any network / non-2xx / parse failure on any of the underlying reads is
-        logged and treated as "no coverage found". The whole method returns ``[]`` when the
-        driver should fire without the marker (msg-473 §5 fail-open: "解決に失敗したら marker
-        無しで撃つ (defer しない)"). It does NOT raise — that would let a transient GitHub
-        outage stop the gate from firing at all, which the fail-open rule forbids.
+        logged and treated as "no coverage found". The whole method returns an empty
+        ``coverage`` when the driver should fire without the marker (msg-473 §5 fail-open:
+        "解決に失敗したら marker 無しで撃つ (defer しない)"). It does NOT raise — that would
+        let a transient GitHub outage stop the gate from firing at all, which the fail-open
+        rule forbids.
 
         The no-raise guarantee is **structural**, not just a property inherited from the
         callees. Every underlying read this method makes (``_list_pr_commits``,
@@ -1654,10 +1703,18 @@ class GitHubClient:
         cache would judge fresh heads against stale review data, undoing exactly the
         head-tied APPROVE invariant this method exposes.
         """
+        failures: list[str] = []
+        coverage: list[CrossPrApproveCoverage] = []
         try:
-            commits = await self._list_pr_commits(pr)
+            try:
+                commits = await self._list_pr_commits_strict(pr)
+            except Exception as commits_exc:
+                logger.warning(
+                    "B-(a) commits read failed for %s: %s (fail-open)", pr.slug, commits_exc
+                )
+                return CoverageLookup(read_failures=(_read_failure_label(commits_exc),))
             if not commits:
-                return []
+                return CoverageLookup()
             seen: set[tuple[str, PrRef]] = set()
             # Per-invocation cache of the FETCHED review list, keyed on ``other_pr``
             # alone. Different from ``seen`` above (which dedupes the OUTPUT rows on
@@ -1696,9 +1753,18 @@ class GitHubClient:
             #        carries an APPROVE by construction, so this fallback almost
             #        never triggers in the primary use case.
             reviews_cache: dict[PrRef, list[ReviewInfo]] = {}
-            coverage: list[CrossPrApproveCoverage] = []
             for sha in commits:
-                candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
+                try:
+                    candidates = await self._commit_pulls_strict(pr.owner, pr.repo, sha)
+                except Exception as pulls_exc:
+                    logger.warning(
+                        "B-(a) commit→pulls read failed for %s @ %s: %s (fail-open, skipped)",
+                        pr.slug,
+                        sha,
+                        pulls_exc,
+                    )
+                    failures.append(_read_failure_label(pulls_exc))
+                    continue
                 for other_pr in candidates:
                     # Same-PR self-reference never counts as cross-PR coverage.
                     # ``other_pr`` may still have a different (owner, repo) — GitHub
@@ -1719,16 +1785,13 @@ class GitHubClient:
                         reviews = reviews_cache[other_pr]
                     else:
                         try:
-                            reviews = await self.fetch_pr_reviews(other_pr)
+                            reviews = await self.fetch_pr_reviews_strict(other_pr)
                         except Exception as inner_exc:
-                            # Exception path — future-regression belt (T2 §5 ③).
-                            # ``fetch_pr_reviews`` is documented fail-soft today so
-                            # this arm is unreachable under the current dependency;
-                            # kept per Bohr §5 T2 mandate and Einstein msg-695
-                            # blocking objection so the correctness contract does
-                            # not depend on a callee's undocumented no-raise
-                            # promise. Do NOT cache: a later commit against the
-                            # same ``other_pr`` retries.
+                            # Exception path (T2 §5 ③). Since D-1' (msg-8810) the read
+                            # is strict, so every HTTP failure lands here: recorded as a
+                            # read failure, and — as before — NOT cached, so a later
+                            # commit against the same ``other_pr`` retries.
+                            failures.append(_read_failure_label(inner_exc))
                             logger.warning(
                                 "fetch_pr_reviews(%s) raised inside "
                                 "find_cross_pr_head_bound_approves(%s); not caching "
@@ -1739,12 +1802,9 @@ class GitHubClient:
                                 inner_exc,
                             )
                             continue
-                        # Empty-return path — TODAY's fail-soft manifestation.
-                        # A 502 / 4xx / malformed JSON at the HTTP layer surfaces
-                        # here as ``[]`` (see ``fetch_pr_reviews`` docstring). Not
-                        # caching ``[]`` preserves the implicit-retry semantics of
-                        # the pre-cache N+1 code (pr-gate naysayer's blocking
-                        # objection on this PR's first VERDICT).
+                        # Empty-return path. With the strict read ``[]`` now means "really
+                        # no reviews"; the not-caching-``[]`` rule is kept unchanged
+                        # anyway (msg-8810 D-1': do not widen the scope).
                         if reviews:
                             reviews_cache[other_pr] = reviews
                     for r in reviews:
@@ -1758,12 +1818,12 @@ class GitHubClient:
                                     sha=sha,
                                     other_pr=other_pr,
                                     approved_at=r.submitted_at,
-                                    prior_diff_sha256=parse_diff_sha256_marker(r.body),
+                                    prior_diff_sha256=parse_reviewed_diff_sha256_marker(r.body),
                                 )
                             )
                             seen.add(key)
                             break
-            return coverage
+            return CoverageLookup(coverage=coverage, read_failures=tuple(failures))
         except Exception as exc:
             # Structural fail-open belt: the callees are already fail-soft, but keeping
             # this outer catch means the docstring's "does NOT raise" promise holds
@@ -1776,7 +1836,88 @@ class GitHubClient:
                 pr.slug,
                 exc,
             )
-            return []
+            # The belt drops partial rows, as it always did; the failure itself is recorded.
+            return CoverageLookup(read_failures=(*failures, _read_failure_label(exc)))
+
+    async def _list_pr_commits_strict(self, pr: PrRef) -> list[str]:
+        """Fail-LOUD twin of :meth:`_list_pr_commits` (msg-8810 D-1').
+
+        Raises :class:`GitHubHTTPError` on transport / non-2xx / malformed JSON, so the B-(a)
+        lookup can record that it could not look. A separate method, not a mode flag (DESIGN
+        v3 §3); the fail-soft twin keeps its behaviour.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/commits"
+        out: list[str] = []
+        page = 1
+        while True:
+            rows = await self._get_rows_strict(path, page, what="commits strict")
+            if not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sha = row.get("sha")
+                if isinstance(sha, str) and sha:
+                    out.append(sha)
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
+    async def _commit_pulls_strict(self, owner: str, repo: str, sha: str) -> list[PrRef]:
+        """Fail-LOUD twin of :meth:`_commit_pulls` (msg-8810 D-1'); same row rules."""
+        path = f"/repos/{owner}/{repo}/commits/{sha}/pulls"
+        out: list[PrRef] = []
+        page = 1
+        while True:
+            rows = await self._get_rows_strict(path, page, what="commit pulls strict")
+            if not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                number = row.get("number")
+                base = row.get("base") or {}
+                base_repo = base.get("repo") if isinstance(base, dict) else None
+                if not isinstance(base_repo, dict):
+                    continue
+                repo_name = base_repo.get("name")
+                owner_data = base_repo.get("owner") or {}
+                owner_login = owner_data.get("login") if isinstance(owner_data, dict) else None
+                if not isinstance(number, int) or number <= 0:
+                    continue
+                if not isinstance(repo_name, str) or not repo_name:
+                    continue
+                if not isinstance(owner_login, str) or not owner_login:
+                    continue
+                out.append(PrRef(owner=owner_login, repo=repo_name, number=number))
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
+    async def _get_rows_strict(self, path: str, page: int, *, what: str) -> list[Any]:
+        """One page of a JSON list endpoint, raising :class:`GitHubHTTPError` on any failure.
+
+        Shared only by the two strict twins above; a non-list body reads as an empty page,
+        as in the fail-soft twins.
+        """
+        try:
+            resp = await self._client.get(path, params={"per_page": 100, "page": page})
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path} ({what}): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} ({what}) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
+            )
+        try:
+            rows = resp.json()
+        except ValueError as exc:
+            raise GitHubHTTPError(f"GET {path} ({what}): malformed JSON: {exc}") from exc
+        return rows if isinstance(rows, list) else []
 
     async def _list_pr_commits(self, pr: PrRef) -> list[str]:
         """``GET /repos/{owner}/{repo}/pulls/{n}/commits`` → shas in PR order (paginated).

@@ -21,6 +21,7 @@ import pytest
 from spirrow_mindwire.github.client import (
     CiState,
     CiStatus,
+    CoverageLookup,
     CrossPrApproveCoverage,
     GitHubClient,
     GitHubHTTPError,
@@ -161,6 +162,8 @@ class _FakeGitHub:
         self._reviews = list(reviews) if reviews is not None else []
         self._coverage = list(coverage) if coverage is not None else []
         self._coverage_exc = coverage_exc
+        # D-1' (msg-8810): failed-read labels the client would report alongside the coverage.
+        self.read_failures: tuple[str, ...] = ()
         # T-gate-blocks-on-miscounted-line-numbers. Map (path, ref) -> content-or-None (None
         # models a 404 at that ref). Absent entries default to None (fail-closed on the
         # demotion direction — an unknown (path, ref) reads as "path not there").
@@ -208,11 +211,11 @@ class _FakeGitHub:
 
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
-    ) -> list[CrossPrApproveCoverage]:
+    ) -> CoverageLookup:
         self.coverage_requested.append((pr, reviewer_login))
         if self._coverage_exc is not None:
             raise self._coverage_exc
-        return list(self._coverage)
+        return CoverageLookup(coverage=list(self._coverage), read_failures=self.read_failures)
 
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None

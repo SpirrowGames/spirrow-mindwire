@@ -55,6 +55,7 @@ from ..github.client import (
     PR_FILES_LIST_CAP,
     CiState,
     CiStatus,
+    CoverageLookup,
     CrossPrApproveCoverage,
     EnvironmentTerminalError,
     GitHubClient,
@@ -70,9 +71,9 @@ from ..github.client import (
     Scope,
     TargetTerminalError,
     classify_http_error,
-    diff_sha256,
     naysayer_github_token,
-    render_diff_sha256_marker,
+    render_reviewed_diff_sha256_marker,
+    reviewed_diff_sha256,
     scope_from_probe,
 )
 from ..github.reviews import (
@@ -1448,43 +1449,21 @@ def derive_verdict(report: ObjectionReport) -> ReviewEvent:
     return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
 
 
-@dataclass(frozen=True)
-class CoverageLookup:
-    """What the B-(a) coverage lookup returned on this run (msg-8422 D-1).
-
-    Three states, read by the G-coverage note: ``ok-empty`` (looked, nothing — no note, the
-    body stays byte-identical to before), ``ok`` (n commits covered, the marker was in the
-    prompt) and ``failed`` (the lookup raised; the review fired WITHOUT the marker). Fail-open
-    is unchanged — this only makes the outcome visible. ``failed`` holds the exception CLASS
-    NAME only, never ``str(exc)``: the notice is posted publicly and a ``GitHubHTTPError``
-    message carries paths and response detail (msg-8423 Obj-2 / msg-8424 Obj-1-2). The message
-    goes to ``logger.warning`` alone.
-
-    Limit, stated so the reader does not over-read ``ok-empty``: the client method is itself
-    fail-soft on its underlying reads (``_list_pr_commits`` / ``_commit_pulls`` /
-    ``fetch_pr_reviews`` return ``[]`` on an HTTP failure), so a failure INSIDE it surfaces
-    here as ``ok-empty``. ``failed`` is what reaches the driver as an exception.
-    """
-
-    coverage: tuple[CrossPrApproveCoverage, ...] = ()
-    failed: str | None = None
-
-    @property
-    def state(self) -> str:
-        if self.failed is not None:
-            return "failed"
-        return "ok" if self.coverage else "ok-empty"
+def _status_suffix(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None)
+    return f" status={status}" if isinstance(status, int) else ""
 
 
 def find_identical_input_approve(
     lookup: CoverageLookup | None, digest: str | None
 ) -> CrossPrApproveCoverage | None:
-    """The first prior head-bound APPROVE given to exactly these diff bytes, else ``None``.
+    """The first prior head-bound APPROVE whose reviewed diff text hashed the same, else ``None``.
 
-    "Exactly these bytes" is a fingerprint match (msg-8424 D-2'), never a tree match: a shared
-    head tree over a different base is a different diff, so a tree match would claim a
-    reversal on inputs that differed (msg-8423 Obj-1). A prior review without the marker has
-    ``prior_diff_sha256 is None`` and never matches — silence means "cannot tell".
+    A fingerprint match over the diff text the model read (msg-8810 D-2''), never a tree match:
+    a shared head tree over a different base is a different diff (msg-8423 Obj-1). Only the
+    diff text is proven equal — the rest of the prompt may differ (msg-8812 Obj-3-1). A prior
+    review without a ``v1`` marker has ``prior_diff_sha256 is None`` and never matches —
+    silence means "cannot compare".
     """
     if lookup is None or digest is None:
         return None
@@ -1547,11 +1526,11 @@ class VerdictDecision:
     # overrode the gate verdict (FAIL -> REQUEST_CHANGES, HOLD -> COMMENT), so the F-conditions
     # note can say why. ``None`` on every other path, including a passing check.
     design_conditions: DesignConditionsCheck | None = None
-    # T-gate-verdict-not-a-function-of-its-input (msg-8422 D-1 / msg-8424 D-2'). The B-(a)
-    # lookup outcome and the fingerprint of the diff this run read. Both are observation only:
-    # nothing reads them into ``gate_verdict`` (msg-473 — the driver does not decide verdicts);
-    # ``render_gate_notice`` turns them into the G-coverage / H-reversal notes. ``None`` on the
-    # paths that read no diff.
+    # T-gate-verdict-not-a-function-of-its-input (msg-8810 D-1' / D-2''). The B-(a)
+    # lookup outcome and the fingerprint of the diff text this run's model read. Both are
+    # observation only: nothing reads them into ``gate_verdict`` (msg-473 — the driver does
+    # not decide verdicts); ``render_gate_notice`` turns them into the G-coverage / H-reversal
+    # notes. ``None`` on the paths that read no diff.
     coverage_lookup: CoverageLookup | None = None
     diff_sha256: str | None = None
 
@@ -1885,12 +1864,12 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_e = decision.model_verdict is ModelVerdict.AMBIGUOUS
     conditions = decision.design_conditions
     fire_f = conditions is not None and conditions.overrides
-    # G-coverage (msg-8422 D-1): ``ok-empty`` / no lookup stays silent so the body is
+    # G-coverage (msg-8810 D-1'): ``ok-empty`` / no lookup stays silent so the body is
     # byte-identical to the pre-change shape; ``ok`` and ``failed`` each print one line.
     lookup = decision.coverage_lookup
     fire_g = lookup is not None and lookup.state != "ok-empty"
-    # H-reversal (msg-8424 D-2'): a prior head-bound APPROVE on the same diff fingerprint,
-    # and this run's GATE verdict is not APPROVE.
+    # H-reversal (msg-8810 D-2'' / msg-8812): a prior head-bound APPROVE on the same reviewed-
+    # diff fingerprint, and this run's GATE verdict is not APPROVE.
     reversed_approve = (
         find_identical_input_approve(lookup, decision.diff_sha256)
         if decision.gate_verdict is not ReviewEvent.APPROVE
@@ -1923,28 +1902,36 @@ def render_gate_notice(decision: VerdictDecision) -> str:
         # instead of something an operator finds by hand with ``cmp`` (msg-4155 §1).
         lines.append(">")
         lines.append(f"> {_MARKER_H_REVERSAL}")
+        # Wording from msg-8812 Obj-3-1: the hash proves the diff text only, and which verdict
+        # stands is a policy question kept in its own sentence, apart from the hash claim.
         lines.append(
-            f"> **Verdict reversal on identical input.** this diff's sha256 "
-            f"{decision.diff_sha256[:12]} == the diff APPROVED in "
-            f"{reversed_approve.other_pr.slug} at {reversed_approve.sha[:12]}. Two verdicts "
-            f"of equal authority disagree on the same bytes; neither supersedes the other by "
-            f"recency. This note makes the disagreement visible; it does not prevent it and "
-            f"did not change the verdict."
+            f"> **Identical reviewed diff, differing verdicts.** The diff text this review read "
+            f"hashes to {decision.diff_sha256[:12]}, the same as the diff text read by the "
+            f"review that APPROVED {reversed_approve.other_pr.slug} at "
+            f"{reversed_approve.sha[:12]}. Only the diff text is shown to match; other prompt "
+            f"context (PR slug, prior-verdict marker) may differ."
+        )
+        lines.append(
+            "> This notice records the disagreement; it does not decide which verdict stands."
         )
     if fire_g and lookup is not None:
         lines.append(">")
         lines.append(f"> {_MARKER_G_COVERAGE}")
-        if lookup.failed is not None:
+        failed_reads = len(lookup.read_failures)
+        if lookup.state == "failed":
             lines.append(
-                f"> prior-verdict coverage lookup FAILED ({lookup.failed}) — reviewed WITHOUT "
-                f"the marker"
+                f"> prior-verdict coverage lookup FAILED ({lookup.read_failures[0]}, "
+                f"{failed_reads} read(s)) — reviewed WITHOUT the marker"
             )
         else:
             commits = len({c.sha for c in lookup.coverage})
             slugs = ", ".join(dict.fromkeys(c.other_pr.slug for c in lookup.coverage))
+            partial_note = (
+                f"; {failed_reads} read(s) failed — coverage may be partial" if failed_reads else ""
+            )
             lines.append(
                 f"> prior-verdict coverage: {commits} commit(s) already head-bound APPROVED on "
-                f"{slugs} — marker was in the prompt"
+                f"{slugs} — marker was in the prompt{partial_note}"
             )
     if fire_a:
         remaining = view.limit - view.original_chars
@@ -2913,10 +2900,10 @@ class NaysayerPrReviewDriver:
         # exception on the lookup path is logged and swallowed, and the review proceeds with
         # ``coverage = []``. The marker never gates the fire; it enriches the request when
         # available and gets out of the way when not.
-        coverage: list[CrossPrApproveCoverage] = []
-        coverage_failed: str | None = None
+        # D-1' (msg-8810): the client records its own failed reads in ``read_failures``; this
+        # catch is the driver-side belt for anything that still escapes it.
         try:
-            coverage = await self._github.find_cross_pr_head_bound_approves(
+            coverage_lookup = await self._github.find_cross_pr_head_bound_approves(
                 pr, reviewer_login=self._review_login
             )
         except Exception as exc:  # fail-open by design (msg-473 §5)
@@ -2925,12 +2912,14 @@ class NaysayerPrReviewDriver:
                 pr.slug,
                 exc,
             )
-            coverage = []
-            # Class name only — the message stays in the log above (msg-8424 Obj-1-2).
-            coverage_failed = type(exc).__name__
-        coverage_lookup = CoverageLookup(coverage=tuple(coverage), failed=coverage_failed)
-        # Fingerprint of the diff as fetched, before truncation (msg-8424 D-2').
-        this_diff_sha256 = diff_sha256(diff)
+            # Class name (+ status) only — the message stays in the log above (Obj-1-2).
+            coverage_lookup = CoverageLookup(
+                read_failures=(f"{type(exc).__name__}{_status_suffix(exc)}",)
+            )
+        coverage: list[CrossPrApproveCoverage] = list(coverage_lookup.coverage)
+        # Fingerprint of the diff text the model reads (``view.text``: after ignore filtering
+        # and truncation) — msg-8810 D-2''.
+        this_diff_sha256 = reviewed_diff_sha256(view.text)
 
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
@@ -3078,7 +3067,7 @@ class NaysayerPrReviewDriver:
         # The diff fingerprint goes BELOW the critique (so the last-match parse can never pick a
         # marker the model quoted) and above the verdict footer / ADR marker, which keep their
         # fixed tail positions. The driver never truncates the body, so nothing cuts it off.
-        body = f"{body.rstrip()}\n\n{render_diff_sha256_marker(this_diff_sha256)}"
+        body = f"{body.rstrip()}\n\n{render_reviewed_diff_sha256_marker(this_diff_sha256)}"
         # Stamp the ADR-pointer section + marker onto the body BEFORE posting / submitting, so
         # the chat-room copy, the GitHub review, and the outcome all carry the same rendered
         # body (the marker is the final line — the driver relies on that fixed position).
