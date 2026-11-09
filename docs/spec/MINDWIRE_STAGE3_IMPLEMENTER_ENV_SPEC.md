@@ -27,7 +27,7 @@ implementer は EXECUTE_CODE を全開放するため、blast radius を loop �
 ## 4. Credentials
 - GitHub token = mindwire repo scoped fine-grained PAT（Contents R/W + PR R/W）。
 - Vaultwarden アクセスを環境に置かない。長期クレデンシャルを implementer 環境に保持しない。
-- 同一機械で owner と turn が同居する構成（ADR-2026-10-09-23 D9）では、上の 2 点は **Windows ユーザーの分離**で担保する。turn は `[turn.isolation] user` で動き、owner の Credential Manager（`mindwire/vaultwarden` / `mindwire/turn-user` / `mindwire/implementer-pat`）を読めない。turn の環境に入るのは S5 で `turn` と宣言された名前だけ（2a では `GH_TOKEN`）。§5 の確認方法はこれに合わせてある。
+- 同一機械で owner と turn が同居する構成（ADR-2026-10-09-23 D9）では、上の 2 点は **Windows ユーザーの分離**で担保する。turn は `[turn.isolation] user` で動き、owner の Credential Manager（`mindwire/vaultwarden` / `mindwire/turn-user` / `mindwire/implementer-pat`）を読めない。turn の環境に入るのは S5 で `turn` と宣言された名前だけ（2a では `GH_TOKEN`）。§5 の確認方法はこれに合わせてある。この分離を Vaultwarden bootstrap（単位 2b）の前提として強制するのは、ADR-2026-10-09-23 §7.1「単位 2b への要件」である。その根拠は、ADR-2026-05-23-07 §8 が Vaultwarden への到達を残留リスクとして受け入れた前提、つまり「解錠の材料を host に置かない」ことにある（ADR-2026-10-09-23 §2.1）。
 - **Anthropic API キーは implementer PC に持たせない**。推論は Lexora 経由（Lexora が cloud Claude へルーティング、キーは {{HOST_SERVICES}} のみ保持）。
 
 ## 5. Deny smoke test (EXECUTE_CODE 解放の前提)
