@@ -135,6 +135,9 @@ def record_result(
 
 
 PRESERVED_OUTCOME = "preserved"
+# The note clone_recover puts in ``detail`` when ``git branch -D <branch>`` failed. The notice reads
+# it to decide whether it may say the original branch name is free again.
+BRANCH_DELETE_FAILED_NOTE = "branch delete failed"
 
 
 def build_preserved_record(
@@ -305,9 +308,18 @@ def _render_preserved(record: dict[str, Any]) -> str:
         f"- outcome: {record.get('outcome')} ({record.get('detail') or 'no detail'})",
     ]
     if record.get("branch"):
-        lines.append(
-            f"- original branch: `{record['branch']}` (deleted locally; name is free again)"
+        # Only a completed preserve reached ``git branch -D``; a ``failed`` row stopped at the
+        # switch, and a delete that failed leaves its note in ``detail``. Claim the name is free
+        # only when the delete is known to have run and succeeded.
+        deleted = record.get("outcome") == PRESERVED_OUTCOME and (
+            BRANCH_DELETE_FAILED_NOTE not in (record.get("detail") or "")
         )
+        state = (
+            "deleted locally; name is free again"
+            if deleted
+            else "NOT deleted: it may still exist locally; check `git branch` before reusing it"
+        )
+        lines.append(f"- original branch: `{record['branch']}` ({state})")
     lines.append(
         f"- commits: in this clone's local ref `{ref}` at `{sha}` "
         "(NOT pushed: it exists only in this clone)"

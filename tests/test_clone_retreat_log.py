@@ -27,6 +27,7 @@ from spirrow_mindwire.clone_retreat import (
     git_env,
 )
 from spirrow_mindwire.clone_retreat_log import (
+    BRANCH_DELETE_FAILED_NOTE,
     CLONE_RETREAT_LOG_FILENAME,
     DELIVERED_KIND,
     NOTICE_TAG,
@@ -634,6 +635,27 @@ def test_preserved_notice_when_the_switch_failed_says_to_inspect_first() -> None
     assert "did not complete" in text
     assert "git status" in text
     assert "wip/feature/x-20261110T000000Z" in text
+
+
+def test_preserved_notice_says_the_branch_name_is_free_only_after_the_delete() -> None:
+    text = render_notice(_preserved())
+    assert "`feature/x` (deleted locally; name is free again)" in text
+
+
+def test_preserved_notice_when_the_switch_failed_does_not_claim_the_branch_was_deleted() -> None:
+    # PR-gate #558 round 1: a failed switch never reaches ``branch -D``.
+    text = render_notice(_preserved(recovered=False))
+    assert "name is free again" not in text
+    assert "`feature/x` (NOT deleted" in text
+
+
+def test_preserved_notice_when_the_delete_failed_does_not_claim_the_branch_was_deleted() -> None:
+    rec = _preserved()
+    rec["detail"] += f"; {BRANCH_DELETE_FAILED_NOTE}: error: cannot lock ref"
+    assert rec["outcome"] == "preserved"
+    text = render_notice(rec)
+    assert "name is free again" not in text
+    assert "`feature/x` (NOT deleted" in text
 
 
 @pytest.mark.anyio

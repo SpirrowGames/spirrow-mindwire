@@ -77,6 +77,7 @@ from .clone_guard import (
     GitResult,
     GitRunner,
 )
+from .clone_retreat_log import BRANCH_DELETE_FAILED_NOTE
 
 RECOVER_PREFIX = "MINDWIRE_CLONE_RECOVER "
 RECOVERED_EXIT = 0
@@ -279,7 +280,7 @@ class CloneRecoverer:
         if branch is not None:
             deleted = self._run(["branch", "-D", branch])
             if not _ok(deleted):
-                notes.append(f"branch delete failed: {_why(deleted)}")
+                notes.append(f"{BRANCH_DELETE_FAILED_NOTE}: {_why(deleted)}")
         return RecoverResult(
             RecoverOutcome.RECOVERED,
             branch=branch,
