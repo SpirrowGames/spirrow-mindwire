@@ -5696,14 +5696,16 @@ function Get-SweepDeclaredProjects {
 # its fired parks woken). Control first and the same HOLD skip as the candidate loop, so a held
 # project gets no writes; no 1b and no head probe — with no candidate there is nothing to launch.
 # The control answer is NOT put in $controlByProject: that map feeds the resource-axis HOLD gate
-# and the digest's per-candidate view, and new rows would change them.
+# and the digest's per-candidate view, and new rows would change them. It goes into -ControlSink
+# instead (when given), which only the hold-ack pending set reads: a held project with no candidate
+# is otherwise never acknowledged (F1, PR #571 gate round 1).
 #
 # Returns @{ byProject = @{ <project> = <tick JSON> }; failed = <string[]> } for
 # Get-StopClassDigestLines. A tick that failed (thread listing unreadable, crash, no JSON) and a
 # malformed `projects` key ('sweep.json:projects') are in `failed`, which the digest names: never a
 # silent zero.
 function Invoke-DeclaredProjectsParkWake {
-    param([hashtable]$Declared, [string[]]$CandidateProjects = @())
+    param([hashtable]$Declared, [string[]]$CandidateProjects = @(), [hashtable]$ControlSink = $null)
 
     $byProject = @{}
     $failed = @()
@@ -5713,6 +5715,7 @@ function Invoke-DeclaredProjectsParkWake {
     }
     foreach ($proj in @($Declared.projects | Where-Object { $CandidateProjects -notcontains $_ })) {
         $control = Invoke-ControlProbe -Project $proj
+        if ($null -ne $ControlSink) { $ControlSink[$proj] = $control }
         if (Test-HoldObserved -Control $control) { continue }
         $parkWake = Invoke-ParkWakeTick -Project $proj
         if ($null -ne $parkWake) { $byProject[$proj] = $parkWake } else { $failed += $proj }
@@ -5959,16 +5962,18 @@ function Invoke-AutoGateTick {
 # case 1c exists for: its design thread idles at NEXT: none and nobody is left to write the line.
 # Only `clones` widens the scan, because a project's repo is read from its clone. Control first and
 # the same HOLD skip as the candidate loop, so a held project gets no 1c write. As in
-# Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject.
+# Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject and goes into
+# -ControlSink (when given) for the hold-ack pending set only (F1, PR #571 gate round 1).
 # -Clones is $sweepIntakeConfig.clones: the OrderedDictionary ConvertFrom-SweepIntakeConfig builds
 # from sweep.json, not ConvertFrom-Json's PSCustomObject, so `.Keys` names the projects (PR #512
 # review msg-7820 #1; Test-SweepDigest.ps1 pins it on the sweep.json path).
 function Get-AutoGateProjects {
-    param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones)
+    param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones, [hashtable]$ControlSink = $null)
 
     $out = @($PassedHold)
     foreach ($proj in @($Clones.Keys | ForEach-Object { [string]$_ } | Where-Object { $CandidateProjects -notcontains $_ })) {
         $control = Invoke-ControlProbe -Project $proj
+        if ($null -ne $ControlSink) { $ControlSink[$proj] = $control }
         if (Test-HoldObserved -Control $control) { continue }
         $out += $proj
     }
@@ -6371,10 +6376,15 @@ try {
         $headsByProject[$proj] = $h
     }
 
+    # Control answers of the projects no candidate names (`clones` and sweep.json `projects`), probed by
+    # Get-AutoGateProjects and Invoke-DeclaredProjectsParkWake. Kept apart from $controlByProject (see
+    # those functions); only the hold-ack pending set below reads it, so a held project with zero
+    # candidates is acknowledged too (F1, PR #571 gate round 1). Later probe of the same project wins.
+    $offCandidateControl = @{}
     $phaseStartUtc = Get-SweepNowUtc
     $passedHoldProjects = Get-AutoGateProjects -PassedHold $autoGateProjects `
         -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
-        -Clones $sweepIntakeConfig.clones
+        -Clones $sweepIntakeConfig.clones -ControlSink $offCandidateControl
     $autoGate = Invoke-AutoGateTick -Projects $passedHoldProjects
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'autogate' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6391,7 +6401,8 @@ try {
     $phaseStartUtc = Get-SweepNowUtc
     $declaredScan = Invoke-DeclaredProjectsParkWake `
         -Declared (Get-SweepDeclaredProjects -Path $sweepConfigPath) `
-        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)
+        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
+        -ControlSink $offCandidateControl
     foreach ($k in $declaredScan.byProject.Keys) { $stopClassByProject[$k] = $declaredScan.byProject[$k] }
     $stopClassFailed += @($declaredScan.failed)
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'declaredparkwake' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6713,10 +6724,21 @@ try {
     # unlaunched-tick-ack): EVERY such project starts as `no-launch`, not only a parked one (PR-B) —
     # a held project with nothing to launch otherwise never gets its acknowledgement (the deadlock
     # msg-3268 named). The parked skip below narrows the reason to `dirty-clone-parked`. The verdict
-    # is Test-HoldAckStale, the same one the warning line and Test-HoldObserved use.
+    # is Test-HoldAckStale, the same one the warning line and Test-HoldObserved use. The projects come
+    # from the candidate-derived $controlByProject AND from $offCandidateControl (`clones` / declared
+    # projects no candidate names): a held project with zero candidates has nothing to launch by
+    # definition, and is exactly the case F1 exists for (PR #571 gate round 1).
     $holdAckViaPark = @{}
     foreach ($ackProj in @($controlByProject.Keys | Sort-Object)) {
         if ($null -ne (Test-HoldAckStale -Control $controlByProject[$ackProj])) { $holdAckViaPark[$ackProj] = 'no-launch' }
+    }
+    foreach ($ackProj in @($offCandidateControl.Keys | Where-Object { -not $controlByProject.ContainsKey($_) } | Sort-Object)) {
+        $ackVerdictOff = Test-HoldAckStale -Control $offCandidateControl[$ackProj]
+        if ($null -ne $ackVerdictOff) {
+            Confirm-LogWorthKeeping
+            Write-Log "HOLD NOT ACKNOWLEDGED [$ackProj]: no candidate — $($ackVerdictOff.Reason); the sweep acknowledges it after the candidate loop"
+            $holdAckViaPark[$ackProj] = 'no-launch'
+        }
     }
     $launchedProjects = @{}
     # PR-B (PR-gate #560 obj 1): a missing ledger is created holding the `*` (absent) sentinel here,

@@ -836,6 +836,12 @@ for a parked clone, `sweep:no-launch` otherwise), once per tick per project, but
 - `state/conductor-inflight.json` exists, parses, and has neither a row for that project nor a
   `*` row.
 
+This covers a project with **no candidate at all** too: a project listed only under `clones` or
+sweep.json `projects` has its control read by the 1c / declared-projects scans, and a hold there
+that is not freshly acknowledged is logged as `HOLD NOT ACKNOWLEDGED [<project>]: no candidate …`
+and acknowledged with `sweep:no-launch`. A held project the sweep config does not mention anywhere
+is never read, so it is not acknowledged.
+
 The ledger is how the sweep knows no orphaned conductor may still be running the project:
 
 - **Before each launch** the sweep adds a row `{ "<GUID>": { project, key, started_at } }`. If that

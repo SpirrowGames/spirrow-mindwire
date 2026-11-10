@@ -9,6 +9,8 @@
 #     hold Test-HoldAckStale flags (stale ack included), with `--why no-launch`; the parked skip
 #     narrows it to `dirty-clone-parked`; the why reaches the reporter. The span that builds the set
 #     is lifted from the wrapper and run for real.
+#   * a held project with ZERO candidates (`clones` / sweep.json `projects` only) is discovered,
+#     made pending as `no-launch` and acknowledged (PR #571 gate round 1)
 #   * the ledger: a launch's row is added before and only its own row removed after; a failed write
 #     leaves the old file untouched; a corrupt file is copied (never renamed) and replaced by a `*`
 #     sentinel; a missing file is created holding a `*` sentinel; every failure path keeps the next
@@ -318,10 +320,63 @@ $controlByProject = @{
     'Run'     = New-Control 'run' 'run'
     'Unread'  = $null
 }
+$offCandidateControl = @{}   # no zero-candidate project in this case
 . ([scriptblock]::Create($pendSpan))
 $keys = (@($holdAckViaPark.Keys | Sort-Object) -join ',')
 Check '(1)/(2a) stale, older, never, run-observed -> pending; fresh, no-timestamp ack, run, unreadable -> not' ($keys -eq 'Never,Old,RunObs,Stale') "got [$keys]"
 Check 'every pending project starts as no-launch' (@($holdAckViaPark.Values | Where-Object { $_ -ne 'no-launch' }).Count -eq 0)
+
+# PR #571 gate round 1: a held project with ZERO candidates. It is discovered only through `clones`
+# (Get-AutoGateProjects) or sweep.json `projects` (Invoke-DeclaredProjectsParkWake); their control
+# answers go into $offCandidateControl, which the pending set reads. Discovery, selection and the
+# acknowledgement are all run for real (probes stubbed), not a hand-built cache.
+Write-Host "Zero-candidate held project: discovered, pending (no-launch), acknowledged"
+Check 'the pending set also reads $offCandidateControl, skipping candidate projects' ($pendSpan.Contains('$offCandidateControl.Keys | Where-Object { -not $controlByProject.ContainsKey($_) }') -and $pendSpan.Contains('Test-HoldAckStale -Control $offCandidateControl[$ackProj]'))
+Check 'both discovery calls hand the sink over' ($src.Contains('-Clones $sweepIntakeConfig.clones -ControlSink $offCandidateControl') -and $src -match '-ControlSink \$offCandidateControl\r?\n\s*foreach \(\$k in \$declaredScan\.byProject\.Keys\)')
+$iSink = $src.IndexOf('    $offCandidateControl = @{}')
+Check 'the sink is created before discovery and before the pending set' ($iSink -gt 0 -and $iSink -lt $src.IndexOf('$passedHoldProjects = Get-AutoGateProjects') -and $iSink -lt $iPendStart)
+foreach ($fname in @('Test-HoldObserved', 'Get-AutoGateProjects', 'Invoke-DeclaredProjectsParkWake')) {
+    $fdef = $wrapperAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fname }, $true) | Select-Object -First 1
+    if (-not $fdef) { throw "function not found in sweep script: $fname" }
+    Invoke-Expression $fdef.Extent.Text
+}
+function Confirm-LogWorthKeeping { }
+$script:zcControl = @{
+    'Cand'        = New-Control 'hold' $null '2026-09-08T12:00:00Z'                                   # a candidate project: already in $controlByProject
+    'CloneHeld'   = New-Control 'hold' 'run' '2026-09-08T12:00:00Z' '2026-09-08T11:00:00Z'           # zero candidates, `clones` only
+    'DeclStale'   = New-Control 'hold' 'hold' '2026-09-08T12:00:00.106309Z' '2026-09-08T12:00:00Z'   # zero candidates, declared only, stale ack
+    'DeclFresh'   = New-Control 'hold' 'hold' '2026-09-08T12:00:00Z' '2026-09-08T12:00:01Z'           # zero candidates, fresh ack
+    'CloneRun'    = New-Control 'run' 'run'
+}
+function Invoke-ControlProbe { param([string]$Project) return $script:zcControl[$Project] }
+function Invoke-ParkWakeTick { param([string]$Project) return [PSCustomObject]@{ counts = [PSCustomObject]@{ done = 0 } } }
+$offCandidateControl = @{}
+$null = Get-AutoGateProjects -PassedHold @() -CandidateProjects @('Cand') -ControlSink $offCandidateControl `
+    -Clones ([ordered]@{ 'Cand' = 'c0'; 'CloneHeld' = 'c1'; 'CloneRun' = 'c2' })
+$null = Invoke-DeclaredProjectsParkWake -Declared @{ projects = @('Cand', 'DeclStale', 'DeclFresh'); error = $null } `
+    -CandidateProjects @('Cand') -ControlSink $offCandidateControl
+Check 'discovery records every zero-candidate project, held ones included, and no candidate project' `
+    ((@($offCandidateControl.Keys | Sort-Object) -join ',') -eq 'CloneHeld,CloneRun,DeclFresh,DeclStale') "got [$(@($offCandidateControl.Keys | Sort-Object) -join ',')]"
+$controlByProject = @{ 'Cand' = $script:zcControl['Cand'] }
+$script:logs = @()
+. ([scriptblock]::Create($pendSpan))
+$zcKeys = (@($holdAckViaPark.Keys | Sort-Object) -join ',')
+Check 'zero-candidate stale/unacked holds are pending with the candidate one; fresh and run are not' ($zcKeys -eq 'Cand,CloneHeld,DeclStale') "got [$zcKeys]"
+Check 'zero-candidate pending projects carry why=no-launch' ($holdAckViaPark['CloneHeld'] -eq 'no-launch' -and $holdAckViaPark['DeclStale'] -eq 'no-launch')
+Check 'a zero-candidate unacknowledged hold is logged as HOLD NOT ACKNOWLEDGED' (@($script:logs | Where-Object { $_ -like 'HOLD NOT ACKNOWLEDGED `[CloneHeld`]*' }).Count -eq 1 -and @($script:logs | Where-Object { $_ -like 'HOLD NOT ACKNOWLEDGED `[DeclStale`]*' }).Count -eq 1)
+$zcTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("holdack-zc-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $zcTmp | Out-Null
+try {
+    $zcLedger = Join-Path $zcTmp 'conductor-inflight.json'
+    [System.IO.File]::WriteAllText($zcLedger, '{}')
+    $script:reported = @(); $script:reportedWhy = @{}
+    $null = Invoke-HoldAckViaPark -Pending $holdAckViaPark -LaunchedProjects @{} -InflightPath $zcLedger -Report $okReport
+    Check 'with a clear ledger and no launch, the zero-candidate holds are acknowledged (why=no-launch)' `
+        ((@($script:reported | Sort-Object) -join ',') -eq 'Cand,CloneHeld,DeclStale' -and $script:reportedWhy['CloneHeld'] -eq 'no-launch' -and $script:reportedWhy['DeclStale'] -eq 'no-launch') "got [$(@($script:reported | Sort-Object) -join ',')]"
+}
+finally {
+    Remove-Item -LiteralPath $zcTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # F4c: the warning line is kept even on a tick that does nothing else.
 Write-Host "HOLD NOT ACKNOWLEDGED is kept (F4c)"
