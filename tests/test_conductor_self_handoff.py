@@ -142,11 +142,11 @@ async def test_a_handoff_to_a_different_participant_is_untouched() -> None:
 
 @pytest.mark.anyio
 async def test_next_fermi_stops_exactly_where_next_human_stops() -> None:
-    """(b) ``NEXT: Fermi`` is the same stop condition as ``NEXT: human`` (ADR D-3).
+    """(b) ``NEXT: Fermi`` stops at the human like ``NEXT: human`` (ADR D-3), under its own reason.
 
-    Asserted as a comparison rather than against a literal so the two cannot drift: whatever
-    reason an explicit human handoff produces from this fixture is the reason the Fermi handoff
-    has to produce.
+    Both stop without spawning anyone and both are heard. Since T-next-names-unspawnable-identity
+    (msg-8709 D2) the Fermi stop is ``unspawnable_target_to_human`` rather than ``human``, so the
+    notification can say the request was not delivered instead of "判断待ち".
     """
     human_mcp = _FakeChatroomMcp()
     human_mcp.seed(author="Einstein", content="review done\n\nNEXT: human")
@@ -158,7 +158,7 @@ async def test_next_fermi_stops_exactly_where_next_human_stops() -> None:
     fermi_outcome = await _conductor(fermi_mcp, fermi_disp).run()
 
     assert human_outcome.stop_reason is StopReason.HUMAN
-    assert fermi_outcome.stop_reason is human_outcome.stop_reason
+    assert fermi_outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert fermi_disp.spawns == [], "the ADR forbids an adapter for web_ai_chat"
 
 
@@ -171,7 +171,7 @@ async def test_fermi_is_blocked_without_any_configuration() -> None:
 
     outcome = await _conductor(mcp, disp, identity_embodiment=None).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 
@@ -200,7 +200,7 @@ async def test_the_rule_is_general_not_a_fermi_special_case() -> None:
 
     outcome = await _conductor(mcp, disp, identity_embodiment={"Sagan": "web_ai_chat"}).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 
@@ -213,7 +213,7 @@ async def test_an_unknown_embodiment_blocks_rather_than_falling_through() -> Non
 
     outcome = await _conductor(mcp, disp, identity_embodiment={"Sagan": "carrier-pigeon"}).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 

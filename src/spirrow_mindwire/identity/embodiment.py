@@ -74,6 +74,13 @@ def normalize_embodiment_table(
     deployment can correct a shipped default (for instance, if Fermi ever gained a terminal
     embodiment) without a release. Keys are normalised on the way in, which is what makes
     ``fermi`` / ``Fermi`` / ``FERMI`` one row rather than three.
+
+    An operator key whose partition key contains ``=`` raises :class:`ValueError`
+    (T-next-names-unspawnable-identity msg-8707 v0.4 item 2). The key is printed as
+    ``blocked_target=<key>`` on the conductor's stop line, and normalisation removes whitespace
+    but keeps ``=``; such a name is not an identity under ADR-2026-05-29-11, so the
+    misconfiguration fails at startup instead of being patched over at stop time. The shipped
+    defaults are not checked here because they cannot contain one (a test pins that).
     """
     table: dict[str, str] = {}
     if include_defaults:
@@ -81,6 +88,12 @@ def normalize_embodiment_table(
             table[normalize_identity_key(name)] = embodiment
     for name, embodiment in (raw or {}).items():
         key = normalize_identity_key(name)
+        if "=" in key:
+            raise ValueError(
+                f"[conductor.identity_embodiment] key {name!r} normalises to {key!r}, which "
+                "contains '=': an identity name cannot hold '=' (it would break the stop line's "
+                "blocked_target= field)"
+            )
         if key:
             table[key] = embodiment
     return table

@@ -169,6 +169,22 @@ Check "quarantine reason names the code" 'adapter_error:adapter.shutdown_failed'
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=adapter_error rounds=0 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=None error_code=RuntimeError')
 Check "last_msg=None still absence on adapter_error" $null $v.last_msg
 Check "class-name error_code parsed" 'RuntimeError' $v.error_code
+
+Write-Host ""
+Write-Host "Get-ConductorVerdict — blocked_target= after last_msg= (T-next-names-unspawnable-identity D2)"
+# msg-8703 Obj-1-2: the field is appended after last_msg=; every other field must read exactly as
+# it does on the same line without it.
+$base = 'conductor stopped: reason=unspawnable_target_to_human rounds=0 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=msg-8801'
+$plain = Get-ConductorVerdict -Output @($base)
+$withTarget = Get-ConductorVerdict -Output @("$base blocked_target=fermi")
+Check "blocked_target parsed" 'fermi' $withTarget.blocked_target
+Check "reason unchanged by blocked_target" $plain.reason $withTarget.reason
+Check "rounds unchanged by blocked_target" $plain.rounds $withTarget.rounds
+Check "last_msg unchanged by blocked_target" $plain.last_msg $withTarget.last_msg
+Check "last_msg is the id, not swallowing the next field" 'msg-8801' $withTarget.last_msg
+Check "no blocked_target on a line without it" $null $plain.blocked_target
+$v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=2 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=msg-1')
+Check "ordinary human stop has no blocked_target" $null $v.blocked_target
 $v = Get-ConductorVerdict -Output @('no stop line at all')
 Check "no line: quarantine reason stays null" $null (Get-QuarantineStopReason -Verdict $v)
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=2 forced_naysayer=0 last_msg=msg-1')
