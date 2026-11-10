@@ -99,7 +99,13 @@ from ..decider.hook import (
 from ..decider.result import DecisionResult
 from ..decider.verdict import TierCV2Verdict, TierCVerdictKind
 from ..exceptions import AdapterSpawnTimeoutError
-from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
+from ..gate_admission import (
+    CAP_MERGE_UNKNOWN,
+    RED_CONCLUSIONS,
+    AdmissionResult,
+    GateAdmission,
+    gate_admission,
+)
 from ..git_sync import GitSyncDeferredError, GitSyncParkError
 from ..git_sync.notice import git_sync_park_event, render_git_sync_park_notice
 from ..github.client import CheckRollup, PrRef, PrState, parse_pr_ref
@@ -153,14 +159,18 @@ from .continuation_ledger import AttemptOutcome, record_admitted, record_attempt
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
+    CI_ROUTE_CI_RED,
+    CI_ROUTE_CONFLICT,
     MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
     is_merge_wait_relay,
+    mergeable_unknown_since,
     normalize_sha,
     render_admission_heading,
     render_ci_route_marker,
+    render_mergeable_unknown_marker,
     verdict_heads,
 )
 from .gate_resume import (
@@ -272,6 +282,13 @@ DEFAULT_REVIEW_LOGIN: str = NaysayerGatingConfig.model_fields["review_login"].de
 #: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
+#: In-tick re-reads of the rollup while GitHub answers ``mergeable == UNKNOWN``
+#: (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.3 §1). Asking for ``mergeable`` is what makes
+#: GitHub start computing it, and it normally settles within seconds, so most UNKNOWNs end
+#: inside the tick and never reach R1e. At most two extra GraphQL reads, and only on UNKNOWN.
+MERGEABLE_REREADS = 2
+MERGEABLE_REREAD_DELAY_S = 2.0
 
 GUARD_I_REDIRECT_TITLE = "Conductor stop — guard (i) redirect"
 """The first-line prefix of every guard-(i) redirect relay — how a reader (the read-only census,
@@ -1020,11 +1037,22 @@ class Conductor:
                 # read) falls through to the pre-wiring path below unchanged.
                 admitted = await self._admit(parsed_ref, latest, messages)
                 if admitted is not None:
-                    decision, rollup = admitted
+                    decision, rollup, unknown_since = admitted
                     if decision.admission is GateAdmission.DEFER:
-                        # R1a / R2. Post nothing, summon nobody: the next tick re-derives this
-                        # from a fresh rollup. This is where §5.2A.7's "pending gate invocations
-                        # 3 → 0" and "relay COMMENT noise 3 → 0" are actually paid.
+                        # R1a / R2 / R1e. Post nothing, summon nobody: the next tick re-derives
+                        # this from a fresh rollup. This is where §5.2A.7's "pending gate
+                        # invocations 3 → 0" and "relay COMMENT noise 3 → 0" are actually paid.
+                        # The one exception is the FIRST R1e on a (head, base): it records when
+                        # the UNKNOWN started, which is the R1e / R1f clock (v0.5').
+                        if decision.rule == "R1e" and unknown_since is None:
+                            wait_msg = await self._post_mergeable_unknown(parsed_ref.slug, rollup)
+                            return self._stop(
+                                round_index,
+                                StopReason.CI_WAIT,
+                                _msg_id(wait_msg) or latest_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
                         return self._stop(
                             round_index, StopReason.CI_WAIT, latest_msg_id, forced, forced_saveable
                         )
@@ -1049,7 +1077,9 @@ class Conductor:
                             forced_saveable,
                         )
                     if decision.admission is GateAdmission.ROUTE_HUMAN:
-                        # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push).
+                        # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push) /
+                        # R1d (sent back once already, still conflicting on the same head) /
+                        # R1f (GitHub left mergeable UNKNOWN past CAP_MERGE_UNKNOWN).
                         # The escalation is POSTED, not merely returned: a human summoned without
                         # the reason in the thread is a stop nobody can act on, and ``reason``
                         # already names the stuck checks and which clock decided.
@@ -1065,8 +1095,10 @@ class Conductor:
                         )
                     if decision.admission is GateAdmission.ROUTE_IMPLEMENTER:
                         # R4: first red on this head (E-CI-RED — the CI-fix edge, NOT carve-out
-                        # ②; no verdict exists to relay). The ci-route marker on this post is
-                        # what lets the NEXT tick's R5 tell a second red apart from this one.
+                        # ②; no verdict exists to relay). R1c: first conflict on this head — the
+                        # same edge and the same single path; only the post's instruction and
+                        # its marker's ``cause`` differ. The ci-route marker on this post is what
+                        # lets the NEXT tick's R5 / R1d tell a second time apart from this one.
                         route_msg = await self._post_ci_route(parsed_ref.slug, decision, rollup)
                         route_msg_id = _msg_id(route_msg)
                         implementer_identity = self._implementer_identity
@@ -1109,7 +1141,8 @@ class Conductor:
                             return gave_up
                         processed_msg_id = route_msg_id
                         continue
-                    # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
+                    # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through. R1b / R7
+                    # reach here only when mergeable is known (R1e / R1f replace them otherwise).
                 relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
@@ -3536,7 +3569,7 @@ class Conductor:
 
     async def _admit(
         self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]
-    ) -> tuple[AdmissionResult, CheckRollup] | None:
+    ) -> tuple[AdmissionResult, CheckRollup, datetime | None] | None:
         """Run pre-gate CI-wait admission for ``pr``, or ``None`` to keep the pre-wiring path.
 
         ``None`` is returned for exactly two situations, and they are deliberately given the
@@ -3582,6 +3615,20 @@ class Conductor:
         a deviation rather than absorbed, because it is the single decision that determines
         whether the mechanism runs at all. Nothing about it weakens a guard: every rule it makes
         reachable ends in the conductor doing *less* (defer, don't re-fire, or stop and ask).
+
+        The mergeable-unknown self-wake (:meth:`_post_mergeable_unknown`) is the one relay post
+        that DOES end ``NEXT: pr-review``. Its author is not the human, so it reads as
+        ``nomination_is_self=True`` and the table applies again on the next tick — which is the
+        point: it is the conductor's own deferral, not an override.
+
+        ``mergeable`` (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.3 / v0.5')
+        ---------------------------------------------------------------------
+
+        When the read says UNKNOWN, the rollup is re-read up to :data:`MERGEABLE_REREADS` times,
+        :data:`MERGEABLE_REREAD_DELAY_S` apart, before admission is asked; a re-read that fails
+        keeps the last good read. The third element of the result is the UNKNOWN start recorded
+        on this thread for the final read's (head, base) — ``None`` when there is none, which on
+        an R1e tells the caller to write one.
         """
         if self._rollup_source is None:
             return None
@@ -3593,16 +3640,28 @@ class Conductor:
                 pr.slug,
             )
             return None
+        for _ in range(MERGEABLE_REREADS):
+            if rollup.head_conflicting is not None:
+                break
+            await asyncio.sleep(MERGEABLE_REREAD_DELAY_S)
+            reread = await self._rollup_source.fetch_check_rollup(pr)
+            if reread is None:
+                break
+            rollup = reread
         relay_bodies = [_content(msg) for msg in messages if _author(msg) == RELAY_AUTHOR]
+        now = datetime.now(UTC)
+        unknown_since = mergeable_unknown_since(relay_bodies, rollup.head_sha, rollup.base_sha, now)
         decision = gate_admission(
             rollup=rollup.rows,
             head_sha=normalize_sha(rollup.head_sha),
             head_committed_date=rollup.head_committed_date,
             head_pushed_at=rollup.head_pushed_at,
-            now=datetime.now(UTC),
+            now=now,
             nomination_is_self=not self._is_human(_author(latest)),
             verdict_heads=verdict_heads(relay_bodies),
-            ci_red_routed_heads=ci_route_heads(relay_bodies),
+            implementer_routed_heads=ci_route_heads(relay_bodies),
+            head_conflicting=rollup.head_conflicting,
+            mergeable_unknown_since=unknown_since,
         )
         logger.info(
             "gate admission for %s: rule=%s admission=%s reason=%s",
@@ -3611,17 +3670,20 @@ class Conductor:
             decision.admission.value,
             decision.reason,
         )
-        return decision, rollup
+        return decision, rollup, unknown_since
 
     async def _post_admission_escalation(
         self, pr_ref: str, decision: AdmissionResult
     ) -> dict[str, Any]:
-        """Post the R3 / R5 escalation so the summoned human can see WHY they were summoned.
+        """Post the R3 / R5 / R1d / R1f escalation so the summoned human can see WHY.
 
-        ``decision.reason`` already names the stuck checks and which clock decided (R3) or that
-        the same head went red twice with no intervening push (R5), so this adds no judgement of
-        its own — it carries a machine string to a human surface. Rare by construction: R3 needs
-        a 6 h / 12 h cap to elapse and R5 needs a second red on an unchanged head.
+        ``decision.reason`` already names the stuck checks and which clock decided (R3), that
+        the same head went red twice with no intervening push (R5), that the implementer was
+        already sent back on a head that still conflicts (R1d), or how long GitHub has left
+        ``mergeable`` UNKNOWN (R1f), so this adds no judgement of its own — it carries a machine
+        string to a human surface. Rare by construction: R3 needs a 6 h / 12 h cap to elapse,
+        R5 / R1d a second send-back on an unchanged head, R1f a 15 min UNKNOWN that two in-tick
+        re-reads did not settle.
         """
         body = (
             f"{render_admission_heading(pr_ref)}\n\n"
@@ -3735,16 +3797,35 @@ class Conductor:
     async def _post_ci_route(
         self, pr_ref: str, decision: AdmissionResult, rollup: CheckRollup
     ) -> dict[str, Any]:
-        """Post the R4 CI-fix dispatch, carrying the one new record design §5.2A.5 sanctions.
+        """Post the R4 CI-fix / R1c conflict dispatch, carrying the ci-route record (§5.2A.5).
 
         The marker is written **only here** — never on a deferral, never on a verdict relay —
         which is what keeps the thread cost of this whole mechanism at "one line, on the rare
-        red". It is also the only reason R5 can exist: a deferral leaves no message, so the
-        thread cannot otherwise distinguish a first red from a second one on the same head.
+        red / conflict". It is also the only reason R5 / R1d can exist: a deferral leaves no
+        message, so the thread cannot otherwise distinguish a first send-back from a second one
+        on the same head. R1c shares this one path (T-ci-wait-misreads-conflicting-pr-as-no-ci
+        v0.2, Obj-1-2); ``decision.rule`` picks the instruction and the marker's ``cause``.
         """
+        if decision.rule == "R1c":
+            marker = render_ci_route_marker(head=rollup.head_sha, cause=CI_ROUTE_CONFLICT)
+            base = rollup.base_sha[:12] or "<unread>"
+            body = (
+                f"{render_admission_heading(pr_ref)}\n\n"
+                f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+                f"{rollup.head_sha[:12]} conflicts with its base (base {base}).\n\n"
+                f"{decision.reason}\n\n"
+                f"The gate was NOT fired — a conflicting head cannot be merged, so its CI is "
+                f"not the question. Merge the PR's base branch into your branch (merge, never "
+                f"rebase), resolve the conflicts, run the gate, push, and hand back with "
+                f"`NEXT: pr-review {pr_ref}`.\n\n"
+                f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
+                f"{marker}"
+            )
+            return await self._post_as_relay(body)
         failing = [row.name for row in rollup.rows if (row.conclusion or "") in RED_CONCLUSIONS]
         marker = render_ci_route_marker(
             head=rollup.head_sha,
+            cause=CI_ROUTE_CI_RED,
             conclusion="failure",
             checks=failing,
         )
@@ -3758,6 +3839,42 @@ class Conductor:
             f"the next tick re-reads the rollup on the new head.\n\n"
             f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
             f"{marker}"
+        )
+        return await self._post_as_relay(body)
+
+    async def _post_mergeable_unknown(self, pr_ref: str, rollup: CheckRollup) -> dict[str, Any]:
+        """Record the first R1e on (head, base) and wake this thread's gate admission again.
+
+        T-ci-wait-misreads-conflicting-pr-as-no-ci v0.5'. Written once per (head, base) — only
+        when :func:`~.gate_records.mergeable_unknown_since` found no record — so an ordinary
+        UNKNOWN, which settles inside the tick's re-reads, posts nothing, and a lasting one posts
+        exactly this. The marker's ``since`` is the R1e / R1f clock; ``NEXT: pr-review`` makes
+        the next tick run admission again (a relay-authored hand-off is ``nomination_is_self``).
+
+        The first line is deliberately neither :func:`~.gate_records.render_admission_heading`
+        nor :func:`~.gate_records.render_relay_heading`, and the post carries no ci-route
+        marker: it is not a verdict (``verdict_heads``), not a send-back
+        (``implementer_routed_heads``), and not an admission post for 1b to report on.
+
+        Chatroom producer surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the intended reader is
+        the conductor itself on its next tick (and a person auditing why the gate waited). When
+        the thread is resolved, :meth:`_post_as_relay` catches :class:`ThreadResolvedError` and
+        logs it — disposition **(3)**, fail loudly in the run log: a resolved thread has no gate
+        left to wait for.
+        """
+        now = datetime.now(UTC)
+        marker = render_mergeable_unknown_marker(
+            head=rollup.head_sha, base=rollup.base_sha, since=now
+        )
+        minutes = int(CAP_MERGE_UNKNOWN.total_seconds() // 60)
+        base = rollup.base_sha[:12] or "<unread>"
+        body = (
+            f"ADMISSION: R1e — mergeable UNKNOWN on {rollup.head_sha[:12]} (base {base}); "
+            f"waiting up to {minutes} min\n\n"
+            f"GitHub has not yet said whether this head merges into its base, so the gate was "
+            f"NOT fired. This is a machine observation, not a review.\n\n"
+            f"{marker}\n\n"
+            f"NEXT: pr-review {pr_ref}"
         )
         return await self._post_as_relay(body)
 

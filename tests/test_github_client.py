@@ -2278,3 +2278,47 @@ async def test_fetch_default_branch() -> None:
 
     async with _client(handler) as client:
         assert await client.fetch_default_branch("o", "r") == "trunk"
+
+
+@pytest.mark.parametrize(
+    ("mergeable", "expected"),
+    [
+        ("CONFLICTING", True),
+        ("MERGEABLE", False),
+        ("UNKNOWN", None),
+        (None, None),
+        ("SOMETHING_NEW", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_fetch_check_rollup_maps_mergeable_and_base(
+    mergeable: str | None, expected: bool | None
+) -> None:
+    # T-ci-wait-misreads-conflicting-pr-as-no-ci v0.5' item 1: ``mergeable`` and ``baseRefOid``
+    # ride the existing query (no extra request). Anything but CONFLICTING / MERGEABLE is "not
+    # known yet", never "mergeable".
+    payload = _rollup_payload()
+    pull = payload["data"]["repository"]["pullRequest"]
+    pull["mergeable"] = mergeable
+    pull["baseRefOid"] = "BASE0123"
+    async with _rollup_client(payload) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert rollup.head_conflicting is expected
+    assert rollup.base_sha == "BASE0123"
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_asks_for_mergeable_and_base_in_the_one_query() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["query"])
+        return httpx.Response(200, json=_rollup_payload())
+
+    async with _client(handler) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert len(seen) == 1
+    assert "mergeable" in seen[0] and "baseRefOid" in seen[0]
+    # Absent fields read as unknown / unread, not as mergeable.
+    assert rollup is not None and rollup.head_conflicting is None and rollup.base_sha == ""

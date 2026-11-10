@@ -68,7 +68,14 @@ class _RecordingGitHub:
 
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup:
         self.calls.append("fetch_check_rollup")
-        return CheckRollup(head_sha="s1", head_committed_date=T0, head_pushed_at=T0, rows=())
+        return CheckRollup(
+            head_sha="s1",
+            head_committed_date=T0,
+            head_pushed_at=T0,
+            rows=(),
+            head_conflicting=False,
+            base_sha="",
+        )
 
     async def fetch_review_body(self, pr: PrRef, review_id: str) -> str | None:
         self.calls.append("fetch_review_body")

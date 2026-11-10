@@ -67,6 +67,7 @@ from spirrow_mindwire.value_objects import Role
 
 _PR = "acme/widgets#7"
 _SHA = "703b836737f29fe0f4139d86d2d02077c662ce5f"
+_BASE = "1111111111111111111111111111111111111111"
 _OTHER_SHA = "1111111111111111111111111111111111111111"
 _GATE_LOGIN = "spirrowgames-ops"
 
@@ -90,17 +91,19 @@ def _ci_route(sha: str = _SHA, *, nxt: str = "Heisenberg") -> str:
         f"CI is red on {sha[:12]}: CI\n\n"
         "first red\n\n"
         f"NEXT: {nxt}\n\n"
-        f"{render_ci_route_marker(head=sha, conclusion='failure', checks=['CI'])}"
+        f"{render_ci_route_marker(head=sha, cause='ci-red', conclusion='failure', checks=['CI'])}"
     )
 
 
-def _rollup(*rows: CheckRow, head: str = _SHA) -> CheckRollup:
+def _rollup(*rows: CheckRow, head: str = _SHA, conflicting: bool | None = False) -> CheckRollup:
     now = datetime.now(UTC)
     return CheckRollup(
         head_sha=head,
         head_committed_date=now - timedelta(minutes=30),
         head_pushed_at=now - timedelta(minutes=30),
         rows=rows,
+        head_conflicting=conflicting,
+        base_sha=_BASE,
     )
 
 
@@ -712,3 +715,62 @@ async def test_a_silent_implementer_after_verified_is_still_bounded_by_the_watch
     assert outcome.stop_reason is StopReason.STALLED
     assert disp.dispatches == []
     assert "outcome=verified" in mcp.posts[-1]["content"]
+
+
+# ---------- R1c conflict route (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.2) -------------- #
+
+
+def _conflict_body(sha: str = _SHA) -> str:
+    return (
+        f"{render_admission_heading('acme/widgets#7')}\n\n"
+        "ADMISSION: route_implementer (rule=R1c)\n\n"
+        "NEXT: Heisenberg\n\n"
+        f"{render_ci_route_marker(head=sha, cause='conflict')}"
+    )
+
+
+def test_conflict_route_post_is_its_own_resume_kind() -> None:
+    candidate = resume_candidate(author=RELAY_AUTHOR, body=_conflict_body(), names_implementer=True)
+    assert candidate is not None
+    assert candidate.kind is ResumeKind.CONFLICT_ROUTE
+    assert candidate.head_sha == _SHA
+
+
+@pytest.mark.anyio
+async def test_conflict_route_verified_by_mergeable_not_by_ci_colour() -> None:
+    # A conflicting head's CI may well be green: the resume checks the fact R1c acted on.
+    candidate = resume_candidate(author=RELAY_AUTHOR, body=_conflict_body(), names_implementer=True)
+    assert candidate is not None
+    verified = await verify_resume(
+        candidate,
+        rollup_source=_Rollups(_rollup(*_GREEN, conflicting=True)),
+        review_source=None,
+        review_login="gate",
+    )
+    assert verified.outcome is ResumeOutcome.VERIFIED
+    contradicted = await verify_resume(
+        candidate,
+        rollup_source=_Rollups(_rollup(*_RED, conflicting=False)),
+        review_source=None,
+        review_login="gate",
+    )
+    assert contradicted.outcome is ResumeOutcome.CONTRADICTED
+    assert contradicted.detail == "head_not_conflicting"
+
+
+@pytest.mark.anyio
+async def test_conflict_route_resume_with_mergeable_unknown_is_unavailable() -> None:
+    # UNKNOWN (GitHub still recomputing) is not evidence the conflict cleared: it must take the
+    # quiet-retry path, never the contradiction path (PR #563 gate objection 1).
+    candidate = resume_candidate(author=RELAY_AUTHOR, body=_conflict_body(), names_implementer=True)
+    assert candidate is not None
+    for colour in (_GREEN, _RED):
+        unknown = await verify_resume(
+            candidate,
+            rollup_source=_Rollups(_rollup(*colour, conflicting=None)),
+            review_source=None,
+            review_login="gate",
+        )
+        assert unknown.outcome is ResumeOutcome.UNAVAILABLE
+        assert unknown.detail == "mergeable unknown"
+        assert unknown.pr_head == _SHA

@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.conductor import core as conductor_core
 from spirrow_mindwire.conductor.control import ControlSnapshot, ControlState
 from spirrow_mindwire.conductor.core import (
     CONDUCTOR_RELAY_AUTHOR,
@@ -25,9 +26,12 @@ from spirrow_mindwire.conductor.core import (
 from spirrow_mindwire.conductor.gate_records import (
     MERGE_WAIT_LINE,
     RelayRoute,
+    ci_route_entries,
     ci_route_heads,
     decide_relay_route,
+    mergeable_unknown_since,
     render_ci_route_marker,
+    render_mergeable_unknown_marker,
     render_relay_heading,
 )
 from spirrow_mindwire.conductor.handoff import parse_next_token
@@ -2388,6 +2392,7 @@ async def test_past_field_human_boundary_terminates_the_naysayer_segment() -> No
 
 
 _HEAD = "703b836737f29fe0f4139d86d2d02077c662ce5f"
+_BASE = "1111111111111111111111111111111111111111"
 
 
 def _check(
@@ -2408,6 +2413,8 @@ def _rollup(
     head: str = _HEAD,
     committed_ago: timedelta = timedelta(minutes=30),
     pushed_ago: timedelta = timedelta(minutes=30),
+    conflicting: bool | None = False,
+    base: str = _BASE,
 ) -> CheckRollup:
     now = datetime.now(UTC)
     return CheckRollup(
@@ -2415,6 +2422,8 @@ def _rollup(
         head_committed_date=now - committed_ago,
         head_pushed_at=now - pushed_ago,
         rows=rows,
+        head_conflicting=conflicting,
+        base_sha=base,
     )
 
 
@@ -2680,7 +2689,9 @@ async def test_admission_reads_heads_only_off_relay_authored_messages() -> None:
         author="Einstein",
         content=(
             "quoting the marker for discussion: "
-            + render_ci_route_marker(head=_HEAD, conclusion="failure", checks=["CI"])
+            + render_ci_route_marker(
+                head=_HEAD, cause="ci-red", conclusion="failure", checks=["CI"]
+            )
             + "\n\nNEXT: Heisenberg"
         ),
     )
@@ -2762,3 +2773,208 @@ async def test_r12_refire_after_a_ci_hold_defers_when_ci_is_pending_again() -> N
     assert gate.fired == []
     assert mcp.posts == []  # R2 DEFER writes nothing; the tail still says pr-review
     assert outcome.stop_reason is StopReason.CI_WAIT
+
+
+# --------------------------------------------------------------------------- #
+# T-ci-wait-misreads-conflicting-pr-as-no-ci (D2 v0.5'): the conductor side of
+# R1c / R1d / R1e / R1f — the in-tick mergeable re-read, the conflict send-back
+# on the one ci-route path, and the mergeable-unknown record.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def _no_reread_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(conductor_core, "MERGEABLE_REREAD_DELAY_S", 0.0)
+
+
+def _pr_review_seed(mcp: _FakeChatroomMcp) -> None:
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+
+
+@pytest.mark.anyio
+async def test_r1c_sends_a_conflicting_green_head_back_to_merge_the_base() -> None:
+    # Obj-1-1: green CI on a conflicting head must not reach R7. The send-back rides the R4
+    # path (one dispatch path), with the conflict instruction and a ``cause=conflict`` marker.
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=True))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
+    posted = mcp.posts[0]
+    assert posted["author"] == "pr-gate-relay"
+    assert "rule=R1c" in posted["content"]
+    assert "Merge the PR's base branch" in posted["content"]
+    assert "CI is red" not in posted["content"]
+    assert ci_route_entries([posted["content"]]) == frozenset({(_HEAD, "conflict")})
+
+
+@pytest.mark.anyio
+async def test_r1c_then_still_conflicting_on_the_same_head_is_r1d() -> None:
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["could not resolve\n\nNEXT: pr-review acme/widgets#7"]}
+    )
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=True))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]  # ONCE
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert "rule=R1d" in mcp.posts[-1]["content"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second", "rule"),
+    [
+        pytest.param(
+            _rollup(*_RED, conflicting=False), _rollup(*_RED, conflicting=True), "R1d", id="R4-R1d"
+        ),
+        pytest.param(
+            _rollup(*_GREEN, conflicting=True), _rollup(*_RED, conflicting=False), "R5", id="R1c-R5"
+        ),
+    ],
+)
+async def test_cross_cause_second_send_back_on_one_head_goes_to_human(
+    first: CheckRollup, second: CheckRollup, rule: str
+) -> None:
+    # v0.2: one ``implementer_routed_heads`` set for both causes. The implementer already had a
+    # turn on this head and did not push; a second send-back for the other cause is a human's.
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["no push\n\nNEXT: pr-review acme/widgets#7"]}
+    )
+    source = _ScriptedRollupSource(first, second)
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert f"rule={rule}" in mcp.posts[-1]["content"]
+
+
+@pytest.mark.anyio
+async def test_unknown_is_re_read_in_tick_and_a_conflict_found_there_is_r1c(
+    _no_reread_delay: None,
+) -> None:
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(
+        _rollup(*_GREEN, conflicting=None), _rollup(*_GREEN, conflicting=True)
+    )
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert len(source.asked) == 2
+    assert gate.fired == []
+    assert "rule=R1c" in mcp.posts[0]["content"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("conflicting", [False, True])
+async def test_a_known_mergeable_is_read_once(conflicting: bool) -> None:
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=conflicting))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert len(source.asked) == 1
+
+
+@pytest.mark.anyio
+async def test_first_lasting_unknown_posts_one_self_wake_record(_no_reread_delay: None) -> None:
+    # Two in-tick re-reads still UNKNOWN, no record yet: R1e, the gate is NOT fired, and exactly
+    # one post records the start under the relay author and ends ``NEXT: pr-review`` so the
+    # next tick runs admission again.
+    mcp = _FakeChatroomMcp()
+    _pr_review_seed(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=None))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert len(source.asked) == 1 + conductor_core.MERGEABLE_REREADS
+    assert gate.fired == []
+    assert disp.dispatches == []
+    assert outcome.stop_reason is StopReason.CI_WAIT
+    assert len(mcp.posts) == 1
+    body = mcp.posts[0]["content"]
+    assert mcp.posts[0]["author"] == "pr-gate-relay"
+    assert body.startswith(f"ADMISSION: R1e — mergeable UNKNOWN on {_HEAD[:12]}")
+    assert body.rstrip().splitlines()[-1] == "NEXT: pr-review acme/widgets#7"
+    since = mergeable_unknown_since([body], _HEAD, _BASE, datetime.now(UTC))
+    assert since is not None
+    # Not a verdict, not a send-back.
+    assert ci_route_heads([body]) == frozenset()
+
+
+def _seed_unknown_record(mcp: _FakeChatroomMcp, *, ago: timedelta, base: str = _BASE) -> None:
+    marker = render_mergeable_unknown_marker(head=_HEAD, base=base, since=datetime.now(UTC) - ago)
+    mcp.seed(
+        author="pr-gate-relay",
+        content=f"ADMISSION: R1e — earlier\n\n{marker}\n\nNEXT: pr-review acme/widgets#7",
+    )
+
+
+@pytest.mark.anyio
+async def test_a_later_r1e_within_the_cap_posts_nothing(_no_reread_delay: None) -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_record(mcp, ago=timedelta(minutes=3))
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=None))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert mcp.posts == []
+    assert outcome.stop_reason is StopReason.CI_WAIT
+
+
+@pytest.mark.anyio
+async def test_a_moved_base_starts_a_new_record(_no_reread_delay: None) -> None:
+    # The old record is for another base: it must not send this head straight to R1f.
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_record(mcp, ago=timedelta(hours=2), base="2" * 40)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=None))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert outcome.stop_reason is StopReason.CI_WAIT
+    assert len(mcp.posts) == 1
+    assert (
+        mergeable_unknown_since([mcp.posts[0]["content"]], _HEAD, _BASE, datetime.now(UTC))
+        is not None
+    )
+
+
+@pytest.mark.anyio
+async def test_r1f_past_the_cap_escalates_to_a_human(_no_reread_delay: None) -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_record(mcp, ago=timedelta(minutes=20))
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=None))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert "rule=R1f" in mcp.posts[-1]["content"]
+
+
+@pytest.mark.anyio
+async def test_a_human_quoting_the_record_does_not_set_the_clock(_no_reread_delay: None) -> None:
+    # The reader is narrowed to relay posts: a person's post carrying an old marker must not
+    # push the head to R1f. The first R1e still writes its own record.
+    mcp = _FakeChatroomMcp()
+    marker = render_mergeable_unknown_marker(
+        head=_HEAD, base=_BASE, since=datetime.now(UTC) - timedelta(hours=3)
+    )
+    mcp.seed(author="Heisenberg", content=f"{marker}\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN, conflicting=None))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert outcome.stop_reason is StopReason.CI_WAIT
+    assert len(mcp.posts) == 1 and "ADMISSION: R1e" in mcp.posts[0]["content"]

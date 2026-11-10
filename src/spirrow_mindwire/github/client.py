@@ -324,9 +324,15 @@ class CrossPrApproveCoverage:
     approved_at: str | None
 
 
+#: GraphQL ``MergeableState`` -> :func:`gate_admission`'s ``head_conflicting``. ``UNKNOWN`` and
+#: any value GitHub adds later are absent, so they read as ``None`` ("not known yet"), which is
+#: the value admission treats with the most caution (R1e / R1f), never as "mergeable".
+_MERGEABLE_TO_CONFLICTING: dict[str, bool] = {"CONFLICTING": True, "MERGEABLE": False}
+
+
 @dataclass(frozen=True)
 class CheckRollup:
-    """The four facts :func:`~spirrow_mindwire.gate_admission.gate_admission` needs about a head.
+    """The facts :func:`~spirrow_mindwire.gate_admission.gate_admission` needs about a head.
 
     Constructed **only when the read succeeded**, which is the whole point of the type.
     :func:`gate_admission`'s ``rollup`` parameter documents that "the caller must not conflate
@@ -340,12 +346,23 @@ class CheckRollup:
     per :func:`gate_admission`'s documented preference order. See
     :meth:`GitHubClient.fetch_check_rollup` for which element of that order this build actually
     gets, and the measurement behind it.
+
+    ``head_conflicting`` is GitHub's ``PullRequest.mergeable`` mapped onto
+    :func:`gate_admission`'s parameter of the same name: ``CONFLICTING`` -> ``True``,
+    ``MERGEABLE`` -> ``False``, ``UNKNOWN`` (or anything unrecognised) -> ``None``.
+    ``base_sha`` is ``PullRequest.baseRefOid`` — the base the mergeability was computed
+    against, which keys the mergeable-unknown record (T-ci-wait-misreads-conflicting-pr-as-no-ci
+    v0.5); ``""`` when GitHub did not answer it. Neither has a default, for the same reason the
+    admission parameters have none: a constructor that forgot them must not silently read as
+    "mergeable".
     """
 
     head_sha: str
     head_committed_date: datetime
     head_pushed_at: datetime
     rows: tuple[CheckRow, ...]
+    head_conflicting: bool | None
+    base_sha: str
 
 
 #: GraphQL ``CheckStatusState`` / ``StatusState`` are SCREAMING_CASE while
@@ -1081,7 +1098,7 @@ class GitHubClient:
         query = (
             "query($owner:String!,$name:String!,$number:Int!){"
             "repository(owner:$owner,name:$name){"
-            "pullRequest(number:$number){headRefOid updatedAt "
+            "pullRequest(number:$number){headRefOid updatedAt mergeable baseRefOid "
             "commits(last:1){nodes{commit{committedDate pushedDate "
             "statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename "
             "... on CheckRun{name status conclusion startedAt} "
@@ -1163,11 +1180,17 @@ class GitHubClient:
             for row in (_check_row(node) for node in (raw_nodes or []) if isinstance(node, dict))
             if row is not None
         )
+        mergeable = pull.get("mergeable")
+        base = pull.get("baseRefOid")
         return CheckRollup(
             head_sha=head_sha,
             head_committed_date=committed,
             head_pushed_at=pushed,
             rows=rows,
+            head_conflicting=_MERGEABLE_TO_CONFLICTING.get(mergeable)
+            if isinstance(mergeable, str)
+            else None,
+            base_sha=base if isinstance(base, str) else "",
         )
 
     async def list_open_prs(self, owner: str, repo: str) -> OpenPrListing:
