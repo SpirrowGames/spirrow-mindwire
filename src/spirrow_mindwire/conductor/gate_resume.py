@@ -29,7 +29,8 @@ outcome            when                                        what the conducto
 ``VERIFIED``       the post's SHA is the PR head, and (RC) the  dispatch the implementer
                    gate login's latest review on that SHA is
                    CHANGES_REQUESTED / (R4) the rollup on that
-                   SHA is red
+                   SHA is red / (R1c) GitHub still says the
+                   head is CONFLICTING
 ``UNAVAILABLE``    a read failed (network, rate limit, 5xx,    stop ``resume_retry``: post
                    timeout, unparseable answer)                nothing, retry next tick
 ``STALE``          the post's SHA is not the PR head (a newer   stop ``resume_retry``
@@ -47,6 +48,11 @@ an RC resume reads it from REST ``GET /pulls/{n}`` (:class:`PrHeadSource`) and n
 rollup, because a fine-grained PAT is refused the rollup's GraphQL contexts on a private repo; an
 R4 resume reads it from the rollup, whose rows it needs anyway. See :func:`verify_resume`.
 
+An R1c post (a ci-route marker whose ``cause`` is ``conflict``,
+T-ci-wait-misreads-conflicting-pr-as-no-ci v0.2) is the same record with a different fact behind
+it, so it is verified against that fact — ``mergeable == CONFLICTING`` on the same head — and
+never against the rollup's colour: a conflicting head's CI may well be green.
+
 The resume never calls :func:`~spirrow_mindwire.gate_admission.gate_admission`. It only reads the
 rollup (R4) or the head and reviews (RC), so resuming after R4 is not counted as a second red on
 the head (R5); R5 is still judged on the next ``NEXT: pr-review`` after the implementer's turn.
@@ -63,9 +69,10 @@ from ..gate_admission import rollup_is_red
 from ..github.client import ReviewEvent, parse_pr_ref
 from ..github.reviews import parse_verdict_footer
 from .gate_records import (
+    CI_ROUTE_CONFLICT,
     RELAY_AUTHOR,
     admission_heading_pr_ref,
-    ci_route_heads,
+    ci_route_entries,
     normalize_sha,
     relay_heading_pr_ref,
 )
@@ -84,6 +91,7 @@ class ResumeKind(StrEnum):
 
     REQUEST_CHANGES = "request_changes"  # (i) a verdict relay whose footer says REQUEST_CHANGES
     CI_ROUTE = "ci_route"  # (ii) the R4 ci-route post (carries the ci-route marker)
+    CONFLICT_ROUTE = "conflict_route"  # (iii) the R1c post (ci-route marker, cause=conflict)
 
 
 class ResumeOutcome(StrEnum):
@@ -153,9 +161,11 @@ def resume_candidate(*, author: str, body: str, names_implementer: bool) -> Resu
     All of: authored by :data:`~.gate_records.RELAY_AUTHOR`; its handoff names the implementer
     (``names_implementer``, resolved by the caller through the roster); and either (i) a relay
     heading plus exactly one verdict footer with ``event=REQUEST_CHANGES``, or (ii) an admission
-    heading plus exactly one ci-route marker. The author test is noise rejection only — what
-    opens guard (i) is :func:`verify_resume`, never this function. A STALLED or other notice
-    under the same author ends ``NEXT: human`` and is rejected by ``names_implementer``.
+    heading plus exactly one ci-route marker — :attr:`ResumeKind.CONFLICT_ROUTE` when its
+    ``cause`` is ``conflict``, :attr:`ResumeKind.CI_ROUTE` otherwise. The author test is noise
+    rejection only — what opens guard (i) is :func:`verify_resume`, never this function. A
+    STALLED or other notice under the same author ends ``NEXT: human`` and is rejected by
+    ``names_implementer``.
     """
     if author != RELAY_AUTHOR or not names_implementer:
         return None
@@ -171,11 +181,13 @@ def resume_candidate(*, author: str, body: str, names_implementer: bool) -> Resu
         return ResumeCandidate(kind=ResumeKind.REQUEST_CHANGES, pr=pr, head_sha=sha)
     raw_ref = admission_heading_pr_ref(body)
     if raw_ref is not None:
-        heads = ci_route_heads([body])
+        entries = ci_route_entries([body])
         pr = parse_pr_ref(raw_ref)
-        if pr is None or len(heads) != 1:
+        if pr is None or len(entries) != 1:
             return None
-        return ResumeCandidate(kind=ResumeKind.CI_ROUTE, pr=pr, head_sha=next(iter(heads)))
+        head, cause = next(iter(entries))
+        kind = ResumeKind.CONFLICT_ROUTE if cause == CI_ROUTE_CONFLICT else ResumeKind.CI_ROUTE
+        return ResumeCandidate(kind=kind, pr=pr, head_sha=head)
     return None
 
 
@@ -215,7 +227,7 @@ async def verify_resume(
     A missing source is CONTRADICTED, not UNAVAILABLE: it is configuration, and retrying cannot
     fix it (msg-6318).
     """
-    if candidate.kind is ResumeKind.CI_ROUTE:
+    if candidate.kind in (ResumeKind.CI_ROUTE, ResumeKind.CONFLICT_ROUTE):
         return await _verify_ci_route(candidate, rollup_source)
     return await _verify_request_changes(
         candidate,
@@ -239,6 +251,14 @@ async def _verify_ci_route(
     pr_head = normalize_sha(rollup.head_sha)
     if pr_head != candidate.head_sha:
         return ResumeCheck(outcome=ResumeOutcome.STALE, detail="head moved", pr_head=pr_head)
+    if candidate.kind is ResumeKind.CONFLICT_ROUTE:
+        if rollup.head_conflicting is True:
+            return ResumeCheck(
+                outcome=ResumeOutcome.VERIFIED, detail="head conflicting", pr_head=pr_head
+            )
+        return ResumeCheck(
+            outcome=ResumeOutcome.CONTRADICTED, detail="head_not_conflicting", pr_head=pr_head
+        )
     if rollup_is_red(rollup.rows):
         return ResumeCheck(outcome=ResumeOutcome.VERIFIED, detail="rollup red", pr_head=pr_head)
     return ResumeCheck(outcome=ResumeOutcome.CONTRADICTED, detail="rollup_not_red", pr_head=pr_head)

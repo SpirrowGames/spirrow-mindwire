@@ -50,6 +50,7 @@ this PR (T-operator-board msg-2568 §A — landing the primitive first).
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from itertools import product
 
@@ -58,6 +59,7 @@ import pytest
 from spirrow_mindwire.gate_admission import (
     CAP_CHECK,
     CAP_EMPTY_RACE,
+    CAP_MERGE_UNKNOWN,
     CAP_NOCLOCK,
     COMPLETED,
     RED_CONCLUSIONS,
@@ -146,11 +148,18 @@ def _admit(
     now: datetime = NOW,
     nomination_is_self: bool = True,
     verdict_heads: frozenset[str] = frozenset(),
-    ci_red_routed_heads: frozenset[str] = frozenset(),
+    implementer_routed_heads: frozenset[str] = frozenset(),
     head_committed: datetime = HEAD_COMMITTED,
     head_pushed: datetime = HEAD_PUSHED,
+    head_conflicting: bool | None = False,
+    mergeable_unknown_since: datetime | None = None,
 ) -> AdmissionResult:
-    """Call :func:`gate_admission` with named defaults so tests read at the site."""
+    """Call :func:`gate_admission` with named defaults so tests read at the site.
+
+    ``head_conflicting`` defaults to ``False`` (MERGEABLE) here, in the TEST helper only, so the
+    pre-existing rollup tests keep exercising the table they were written for; the function
+    itself has no default for it.
+    """
     return gate_admission(
         rollup=rollup,
         head_sha=head,
@@ -159,7 +168,9 @@ def _admit(
         now=now,
         nomination_is_self=nomination_is_self,
         verdict_heads=verdict_heads,
-        ci_red_routed_heads=ci_red_routed_heads,
+        implementer_routed_heads=implementer_routed_heads,
+        head_conflicting=head_conflicting,
+        mergeable_unknown_since=mergeable_unknown_since,
     )
 
 
@@ -207,7 +218,7 @@ def test_r0_override_invokes_on_non_self_nomination_with_r5_looped_red_head() ->
     result = _admit(
         rollup=[_completed_check(conclusion="failure")],
         nomination_is_self=False,
-        ci_red_routed_heads=frozenset({HEAD}),
+        implementer_routed_heads=frozenset({HEAD}),
     )
     assert result.admission is GateAdmission.INVOKE
     assert result.rule == "R0-OVERRIDE"
@@ -263,7 +274,7 @@ def test_r0_override_precedes_r7_default_green() -> None:
         pytest.param(lambda: [_completed_check(conclusion="failure")], {}, id="red-first"),
         pytest.param(
             lambda: [_completed_check(conclusion="failure")],
-            {"ci_red_routed_heads": frozenset({HEAD})},
+            {"implementer_routed_heads": frozenset({HEAD})},
             id="red-routed-loop-safety",
         ),
         pytest.param(
@@ -508,7 +519,7 @@ def test_r5_escalates_to_human_on_repeated_red_same_head() -> None:
     # loop the marker was added to stop.
     result = _admit(
         rollup=[_completed_check(conclusion="failure")],
-        ci_red_routed_heads=frozenset({HEAD}),
+        implementer_routed_heads=frozenset({HEAD}),
     )
     assert result.admission is GateAdmission.ROUTE_HUMAN
     assert result.rule == "R5"
@@ -520,7 +531,7 @@ def test_r4_fires_when_red_head_marker_is_on_a_different_head() -> None:
     # would jump straight to R5 on its first red.
     result = _admit(
         rollup=[_completed_check(conclusion="failure")],
-        ci_red_routed_heads=frozenset({OTHER_HEAD}),
+        implementer_routed_heads=frozenset({OTHER_HEAD}),
     )
     assert result.admission is GateAdmission.ROUTE_IMPLEMENTER
     assert result.rule == "R4"
@@ -737,3 +748,219 @@ def test_inv_ci_2_gate_admission_module_does_not_import_verdict_types() -> None:
             f"verdict-content type, and INV-CI-2 keeps verdict content "
             f"structurally out of this module"
         )
+
+
+# --------------------------------------------------------------------------- #
+# T-ci-wait-misreads-conflicting-pr-as-no-ci (D2 v0.5'): R1c / R1d on a
+# CONFLICTING head, R1e / R1f replacing an INVOKE while mergeable is UNKNOWN.
+# --------------------------------------------------------------------------- #
+
+#: A push older than the R1a grace, so an empty rollup reaches R1b.
+_OLD_PUSH = NOW - CAP_EMPTY_RACE - timedelta(minutes=1)
+
+_ROLLUP_SHAPES: dict[str, tuple[Callable[[], list[CheckRow]], datetime]] = {
+    "empty-fresh": (lambda: [], NOW - timedelta(seconds=30)),
+    "empty-old": (lambda: [], _OLD_PUSH),
+    "pending": (lambda: [_running_check(started_at=NOW - timedelta(hours=1))], HEAD_PUSHED),
+    "stuck": (
+        lambda: [_running_check(started_at=NOW - (CAP_CHECK + timedelta(hours=1)))],
+        HEAD_PUSHED,
+    ),
+    "red": (lambda: [_completed_check(conclusion="failure")], HEAD_PUSHED),
+    "green": (lambda: [_completed_check(conclusion="success")], HEAD_PUSHED),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_ROLLUP_SHAPES))
+@pytest.mark.parametrize("reviewed", [False, True], ids=["no-verdict", "verdict"])
+def test_r1c_conflicting_head_routes_implementer_whatever_the_rollup(
+    shape: str, reviewed: bool
+) -> None:
+    # Obj-1-1: a conflicting head is judged before R1a / R2-R7, so a green rollup does not reach
+    # R7 (APPROVE) and a prior verdict does not reach R6 (MERGE_WAIT on a merge that cannot
+    # happen). The empty-old case is the #370 misread itself (R1b "no CI configured").
+    factory, pushed = _ROLLUP_SHAPES[shape]
+    result = _admit(
+        rollup=factory(),
+        head_pushed=pushed,
+        head_conflicting=True,
+        verdict_heads=frozenset({HEAD}) if reviewed else frozenset(),
+    )
+    assert result.admission is GateAdmission.ROUTE_IMPLEMENTER
+    assert result.rule == "R1c"
+
+
+@pytest.mark.parametrize("shape", sorted(_ROLLUP_SHAPES))
+def test_r1d_conflicting_head_already_routed_goes_to_human(shape: str) -> None:
+    factory, pushed = _ROLLUP_SHAPES[shape]
+    result = _admit(
+        rollup=factory(),
+        head_pushed=pushed,
+        head_conflicting=True,
+        implementer_routed_heads=frozenset({HEAD}),
+    )
+    assert result.admission is GateAdmission.ROUTE_HUMAN
+    assert result.rule == "R1d"
+
+
+def test_r1d_keys_on_this_head_only() -> None:
+    result = _admit(
+        rollup=[], head_conflicting=True, implementer_routed_heads=frozenset({OTHER_HEAD})
+    )
+    assert result.rule == "R1c"
+
+
+def test_cross_cause_red_route_then_conflict_is_r1d() -> None:
+    # v0.2: one set for both causes. R4 sent the implementer back on this head; it did not push,
+    # and the head now conflicts → human, not a second implementer dispatch.
+    result = _admit(
+        rollup=[_completed_check(conclusion="failure")],
+        head_conflicting=True,
+        implementer_routed_heads=frozenset({HEAD}),
+    )
+    assert result.rule == "R1d"
+
+
+def test_cross_cause_conflict_route_then_red_is_r5() -> None:
+    # The other direction: R1c sent it back, the conflict cleared without a push, CI is red.
+    result = _admit(
+        rollup=[_completed_check(conclusion="failure")],
+        head_conflicting=False,
+        implementer_routed_heads=frozenset({HEAD}),
+    )
+    assert result.rule == "R5"
+
+
+@pytest.mark.parametrize("conflicting", [True, None])
+def test_r0_override_precedes_r1c_and_r1e(conflicting: bool | None) -> None:
+    result = _admit(
+        rollup=[_completed_check(conclusion="success")],
+        nomination_is_self=False,
+        head_conflicting=conflicting,
+    )
+    assert result.rule == "R0-OVERRIDE"
+
+
+@pytest.mark.parametrize(
+    ("rollup", "pushed", "would_be"),
+    [
+        pytest.param([_completed_check(conclusion="success")], HEAD_PUSHED, "R7", id="green"),
+        pytest.param([], _OLD_PUSH, "R1b", id="empty-past-grace"),
+    ],
+)
+def test_r1e_replaces_invoke_while_mergeable_unknown(
+    rollup: list[CheckRow], pushed: datetime, would_be: str
+) -> None:
+    # With no record yet (since=None) and within the cap: DEFER. The reason names the row it
+    # replaced so a log reader can tell which INVOKE was held back.
+    for since in (None, NOW - timedelta(minutes=1), NOW - CAP_MERGE_UNKNOWN):
+        result = _admit(
+            rollup=rollup, head_pushed=pushed, head_conflicting=None, mergeable_unknown_since=since
+        )
+        assert result.admission is GateAdmission.DEFER
+        assert result.rule == "R1e"
+        assert f"would have been {would_be}" in result.reason
+
+
+@pytest.mark.parametrize(
+    "rollup",
+    [
+        pytest.param([_completed_check(conclusion="success")], id="green"),
+        pytest.param([], id="empty-past-grace"),
+    ],
+)
+def test_r1f_past_the_cap_goes_to_human(rollup: list[CheckRow]) -> None:
+    since = NOW - CAP_MERGE_UNKNOWN - timedelta(seconds=1)
+    result = _admit(
+        rollup=rollup,
+        head_pushed=_OLD_PUSH,
+        head_conflicting=None,
+        mergeable_unknown_since=since,
+    )
+    assert result.admission is GateAdmission.ROUTE_HUMAN
+    assert result.rule == "R1f"
+
+
+def test_r1e_r1f_clock_is_since_only_not_push_or_commit() -> None:
+    # Obj-3-1: a PR event that refreshed the push proxy (updatedAt) must not hold the cap off.
+    # Obj-4-1: an old commit must not skip the grace. Only mergeable_unknown_since decides.
+    green = [_completed_check(conclusion="success")]
+    past = _admit(
+        rollup=green,
+        head_conflicting=None,
+        head_pushed=NOW - timedelta(seconds=5),
+        head_committed=NOW - timedelta(days=30),
+        mergeable_unknown_since=NOW - CAP_MERGE_UNKNOWN - timedelta(minutes=1),
+    )
+    assert past.rule == "R1f"
+    within = _admit(
+        rollup=green,
+        head_conflicting=None,
+        head_pushed=NOW - timedelta(days=30),
+        head_committed=NOW - timedelta(days=30),
+        mergeable_unknown_since=NOW - timedelta(minutes=1),
+    )
+    assert within.rule == "R1e"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "rule"),
+    [
+        pytest.param({"rollup": [], "head_pushed": NOW - timedelta(seconds=30)}, "R1a", id="r1a"),
+        pytest.param(
+            {"rollup": [_running_check(started_at=NOW - timedelta(hours=1))]}, "R2", id="r2"
+        ),
+        pytest.param(
+            {"rollup": [_running_check(started_at=NOW - (CAP_CHECK + timedelta(hours=1)))]},
+            "R3",
+            id="r3",
+        ),
+        pytest.param({"rollup": [_completed_check(conclusion="failure")]}, "R4", id="r4"),
+        pytest.param(
+            {
+                "rollup": [_completed_check(conclusion="failure")],
+                "implementer_routed_heads": frozenset({HEAD}),
+            },
+            "R5",
+            id="r5",
+        ),
+        pytest.param(
+            {
+                "rollup": [_completed_check(conclusion="success")],
+                "verdict_heads": frozenset({HEAD}),
+            },
+            "R6",
+            id="r6",
+        ),
+    ],
+)
+def test_unknown_leaves_every_non_invoke_row_unchanged(
+    kwargs: dict[str, object], rule: str
+) -> None:
+    # v0.3: only INVOKE can APPROVE, so only INVOKE is replaced. Even past the cap, a pending /
+    # red / already-reviewed head keeps its own row.
+    stale = NOW - CAP_MERGE_UNKNOWN - timedelta(hours=1)
+    result = _admit(head_conflicting=None, mergeable_unknown_since=stale, **kwargs)  # type: ignore[arg-type]
+    assert result.rule == rule
+
+
+@pytest.mark.parametrize(
+    ("rollup", "rule"),
+    [
+        pytest.param([_completed_check(conclusion="success")], "R7", id="green"),
+        pytest.param([], "R1b", id="empty-past-grace"),
+    ],
+)
+def test_mergeable_false_keeps_invoke(rollup: list[CheckRow], rule: str) -> None:
+    result = _admit(rollup=rollup, head_pushed=_OLD_PUSH, head_conflicting=False)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == rule
+
+
+def test_new_admission_parameters_have_no_default() -> None:
+    # v0.5' item 5: a caller that forgets one of these must fail at the call, not silently
+    # read as "mergeable" / "never routed" / "no record".
+    sig = inspect.signature(gate_admission)
+    for name in ("head_conflicting", "implementer_routed_heads", "mergeable_unknown_since"):
+        assert sig.parameters[name].default is inspect.Parameter.empty, name
+    assert "ci_red_routed_heads" not in sig.parameters

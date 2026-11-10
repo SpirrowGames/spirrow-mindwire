@@ -226,7 +226,14 @@ class _FakeGitHub:
         )
 
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup:
-        return CheckRollup(head_sha="s", head_committed_date=T0, head_pushed_at=T0, rows=())
+        return CheckRollup(
+            head_sha="s",
+            head_committed_date=T0,
+            head_pushed_at=T0,
+            rows=(),
+            head_conflicting=False,
+            base_sha="",
+        )
 
     async def fetch_review_body(self, pr: PrRef, review_id: str) -> str | None:
         from spirrow_mindwire.github.client import GitHubHTTPError
