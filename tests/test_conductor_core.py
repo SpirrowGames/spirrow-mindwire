@@ -105,10 +105,13 @@ def _attested(body: str, *, backend: str = "gemini", expected: str = "gemini") -
 class _FakeChatroomMcp:
     """In-memory chatroom: serves ``chatroom_get_thread`` and grows on ``chatroom_post_message``."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, owner: str | None = None) -> None:
         self._messages: list[dict[str, Any]] = []
         self._counter = 0
         self.posts: list[dict[str, Any]] = []
+        # ``thread.owner`` of the read (``None`` = no ``thread`` object, the pre-existing shape).
+        # The ``NEXT: Fermi`` scope (T-retire-operator-identity-and-scope-next-fermi D2) reads it.
+        self.owner = owner
 
     def seed(self, *, author: str, content: str, next_participant: str | None = None) -> None:
         self._counter += 1
@@ -128,7 +131,10 @@ class _FakeChatroomMcp:
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "chatroom_get_thread":
-            return {"messages": list(self._messages)}
+            result: dict[str, Any] = {"messages": list(self._messages)}
+            if self.owner is not None:
+                result["thread"] = {"owner": self.owner, "tags": []}
+            return result
         if name == "chatroom_post_message":
             self._counter += 1
             msg = {

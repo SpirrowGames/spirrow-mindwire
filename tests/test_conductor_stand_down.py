@@ -310,7 +310,9 @@ async def test_unresolved_identity_reports_in_target_thread_not_elsewhere(
     caplog: pytest.LogCaptureFixture, next_line: str, reason: StandDownReason
 ) -> None:
     caplog.set_level(logging.INFO)
-    mcp = _FakeChatroomMcp()
+    # Fermi's own thread: elsewhere ``NEXT: Fermi`` is refused before spawnability is asked
+    # (ADR-2026-09-14-21 §7 Amendment).
+    mcp = _FakeChatroomMcp(owner="Fermi")
     # Authored by the naysayer so the ABSENT turn is not first sent to a forced consult (that
     # routing is unchanged by T44); the stop is the identity failure itself.
     mcp.seed(author="Einstein", content=f"critique\n\n{next_line}")

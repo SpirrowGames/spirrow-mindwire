@@ -110,7 +110,9 @@ from .handoff import (
     OPERATOR_TOKEN,
     HumanAsk,
     TerminalView,
+    human_task_refused,
     none_refused_after_cutoff,
+    operator_refused_after_cutoff,
     parse_next_token,
     resolve_handoff,
     terminal_form_view,
@@ -192,13 +194,16 @@ BODY_DEPENDENT_STOP_TOKENS: frozenset[str] = frozenset({OPERATOR_TOKEN})
 CACHED_TOKEN_POSTED_AT: datetime = datetime.min.replace(tzinfo=UTC)
 
 
-def _is_parked_operator(head_body: str) -> bool:
+def _is_parked_operator(head_body: str, *, posted_at: datetime | None) -> bool:
     """Is this ``NEXT: operator`` head the accepted 3-line form? Asks the grammar owner.
 
-    No ``posted_at``: the boundary-5 cutoff only turns a ``NONE`` into a refusal, and
-    ``human_ask`` is set only on a ``HUMAN`` handoff, so the answer cannot depend on it.
+    ``posted_at`` is passed because the operator cutoff (``handoff.OPERATOR_MALFORMED_AFTER``)
+    reads it: without it a head posted BEFORE the cutoff would be read at an unknown time, i.e. as
+    retired, and launched. :func:`parse_head_token` has already read a retired head as ``""``, so
+    this is only asked for one the cutoff let through.
     """
-    return resolve_handoff(head_body, {}).human_ask is HumanAsk.OPERATOR_WORK
+    resolved = resolve_handoff(head_body, {}, posted_at=posted_at)
+    return resolved.human_ask is HumanAsk.OPERATOR_WORK
 
 
 def stage1_skips(head_body: str, *, posted_at: datetime | None = None) -> bool:
@@ -212,7 +217,9 @@ def stage1_skips(head_body: str, *, posted_at: datetime | None = None) -> bool:
     head's posting time, for the boundary-5 cutoff (:func:`parse_head_token`).
     """
     token = parse_head_token(head_body, posted_at=posted_at)
-    return token in STOP_TOKENS and (token != OPERATOR_TOKEN or _is_parked_operator(head_body))
+    return token in STOP_TOKENS and (
+        token != OPERATOR_TOKEN or _is_parked_operator(head_body, posted_at=posted_at)
+    )
 
 
 # Conductor stop reasons that TERMINATE a thread until its head moves (design §6.2).
@@ -441,6 +448,13 @@ def parse_head_token(body: str, *, posted_at: datetime | None = None) -> str:
     reason: the conductor resolves it as MALFORMED (``legacy_none_after_cutoff``) and posts the
     notice, through the same LAUNCH path as a refused terminal form. With no cutoff (the shipped
     5-A value) ``posted_at`` changes nothing.
+
+    A ``NEXT: operator`` the operator cutoff retires (``handoff.OPERATOR_MALFORMED_AFTER``,
+    T-retire-operator-identity-and-scope-next-fermi msg-8935 §1) is UNRESOLVED by the same
+    reasoning: ``operator`` is a stop token, and parking a retired head on it would keep the
+    ``operator_retired`` notice from ever being posted. So is a ``HUMAN-TASK:`` form the grammar
+    refuses: its token is ``human``, which Stage 1 would otherwise SKIP unconditionally. Both
+    LAUNCH, the conductor posts the notice that moves the head, and the cache replays ``""``.
     """
     view = terminal_form_view(body)
     if view is TerminalView.SETTLES:
@@ -448,6 +462,10 @@ def parse_head_token(body: str, *, posted_at: datetime | None = None) -> str:
     if view is TerminalView.REFUSED:
         return ""
     if none_refused_after_cutoff(body, posted_at=posted_at):
+        return ""
+    if operator_refused_after_cutoff(body, posted_at=posted_at):
+        return ""
+    if human_task_refused(body):
         return ""
     raw = parse_next_token(body)
     if raw is None:

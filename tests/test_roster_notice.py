@@ -85,15 +85,16 @@ def test_every_name_the_notice_offers_resolves() -> None:
         assert handoff.kind is HandoffKind.ROLE and handoff.role is role
 
 
-def test_the_notice_offers_human_and_operator_but_never_none() -> None:
-    """(c, msg-8594 Obj-2-1) Reserved words are named one by one; the retired ``none`` is not."""
+def test_the_notice_offers_human_but_never_none_or_operator() -> None:
+    """(c, msg-8594 Obj-2-1) Reserved words are named one by one; the retired ``none`` is not, and
+    neither is the retired ``operator`` (T-retire-operator-identity-and-scope-next-fermi)."""
     notice = build_roster_notice(_ROSTER)
     assert notice is not None
     words = set(re.findall(r"[a-z]+", notice))
     assert HUMAN_TOKEN in words
-    assert OPERATOR_TOKEN in words
+    assert OPERATOR_TOKEN not in words
     assert NONE_TOKEN not in words
-    assert f"({HUMAN_TOKEN} / {OPERATOR_TOKEN})" in notice
+    assert f"the reserved word {HUMAN_TOKEN}." in notice
 
 
 def test_a_roster_without_an_implementer_lists_what_it_holds() -> None:

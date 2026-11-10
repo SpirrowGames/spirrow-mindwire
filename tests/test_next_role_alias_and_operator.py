@@ -27,8 +27,9 @@ from test_conductor_core import _ROSTER, _FakeChatroomMcp, _ScriptedDispatcher, 
 
 from spirrow_mindwire.conductor.core import Conductor, StopReason
 from spirrow_mindwire.conductor.handoff import (
+    HUMAN_TASK_FORM_EXAMPLE,
+    HUMAN_TASK_KEYWORD,
     OPERATOR_FORM_EXAMPLE,
-    OPERATOR_TASK_KEYWORD,
     OPERATOR_TOKEN,
     TIER_C_CHECK_KEYWORD,
     TIER_C_CHECK_NONE,
@@ -156,7 +157,8 @@ async def test_spawn_blocked_applies_to_the_resolved_identity() -> None:
         "Fermi": Role.IMPLEMENTER,
         "Einstein": Role.NAYSAYER,
     }
-    mcp = _FakeChatroomMcp()
+    # Fermi's own thread, where a handoff to Fermi is valid (ADR-21 §7 Amendment).
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="x\n\nNEXT: implementer")
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, roster).run()
@@ -204,20 +206,24 @@ async def test_ambiguous_role_name_stands_down_with_its_own_reason() -> None:
 
 @pytest.mark.parametrize("role", list(Role))
 def test_protocol_teaches_the_operator_form_from_the_constants(role: Role) -> None:
+    # T-retire-operator-identity-and-scope-next-fermi: the form taught is the HUMAN-TASK form;
+    # ``NEXT: operator`` is named only as retired.
     block = build_handoff_protocol_block(role)
-    assert f"NEXT: {OPERATOR_TOKEN}" in block
-    assert f"{OPERATOR_TASK_KEYWORD}:" in block
+    assert f"`NEXT: {OPERATOR_TOKEN}` is retired" in block
+    assert f"{HUMAN_TASK_KEYWORD}:" in block
     assert f"{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}" in block
-    for line in OPERATOR_FORM_EXAMPLE.splitlines():
+    for line in HUMAN_TASK_FORM_EXAMPLE.splitlines():
         assert line in block
-    assert "one of three reserved words" in block
+    assert "OPERATOR-TASK:" not in block
+    assert "one of two reserved words" in block
     assert "not a role name" in block
 
 
 def test_protocol_does_not_list_kinds_of_work_as_operator_examples() -> None:
     # D4'' item 1 (msg-5422): Tier-C is decided by its four types, not by the kind of work.
     block = build_handoff_protocol_block(Role.IMPLEMENTER)
-    operator_part = block.split(f"`NEXT: {OPERATOR_TOKEN}` —", 1)[1]
+    operator_part = block.split(f"`NEXT: {OPERATOR_TOKEN}` is retired", 1)[1]
+    operator_part = operator_part.split("When nobody acts next", 1)[0]
     assert "secret" not in operator_part.lower()
     assert "host" not in operator_part.lower()
 
@@ -311,12 +317,12 @@ def test_field_human_with_body_operator_is_a_divergence() -> None:
         (
             "x\n\nTIER-C-CHECK: none\nNEXT: operator",
             StandDownReason.IDENTITY_OPERATOR_NO_TASK,
-            OPERATOR_FORM_EXAMPLE.splitlines()[0],
+            HUMAN_TASK_FORM_EXAMPLE.splitlines()[0],
         ),
         (
             "x\n\nOPERATOR-TASK: do it\nNEXT: operator",
             StandDownReason.IDENTITY_OPERATOR_NO_TASK,
-            OPERATOR_FORM_EXAMPLE.splitlines()[1],
+            HUMAN_TASK_FORM_EXAMPLE.splitlines()[1],
         ),
         (
             f"TIER-C: cost\n\n{OPERATOR_FORM_EXAMPLE}",

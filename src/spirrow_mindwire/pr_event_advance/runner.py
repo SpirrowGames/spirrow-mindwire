@@ -7,7 +7,8 @@ post, the tail is :data:`~.decide.PR_EVENT_RELAY_AUTHOR`'s message, which :func:
 Fail-closed rule (R4): when a fact could not be read — the thread, the PR state, the CI state —
 nothing is written and the reason is reported. Writing on a guess is the one thing this must not
 do; the next tick reads again. The one write that proceeds on a missing input is the roster: the
-PR event is a fact already read, so it is written and the hand-off goes to ``NEXT: operator``.
+PR event is a fact already read, so it is written and the hand-off is a ``HUMAN-TASK:``
+request (the successor of ``NEXT: operator``).
 
 Chatroom producer surface (OBL-CHATROOM-PRODUCER-READER-SURFACE)
 ----------------------------------------------------------------

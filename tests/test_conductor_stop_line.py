@@ -382,7 +382,7 @@ def test_protocol_block_indents_only_its_code_examples() -> None:
     must be one of the examples meant to render as code, never prose."""
     core = handoff_mod._HANDOFF_PROTOCOL_CORE
     meant_as_code = {"    NEXT: <name>"} | {
-        f"    {line}" for line in handoff_mod.OPERATOR_FORM_EXAMPLE.splitlines()
+        f"    {line}" for line in handoff_mod.HUMAN_TASK_FORM_EXAMPLE.splitlines()
     }
     indented = [
         line for line in core.splitlines() if line.startswith(("    ", "\t")) and line.strip()
