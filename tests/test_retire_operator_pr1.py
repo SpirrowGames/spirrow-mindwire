@@ -488,7 +488,9 @@ async def test_the_conductor_keeps_the_spawn_blocked_stop_on_a_fermi_thread() ->
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp).run()
     assert disp.spawns == []
-    assert outcome.stop_reason is StopReason.HUMAN
+    # The spawn-blocked stop has its own reason since T-next-names-unspawnable-identity PR-1
+    # (#564; it was ``HUMAN``). Merged next to this PR, so this test met it only on main.
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert all("fermi_outside_own_thread" not in p["content"] for p in mcp.posts)
 
 

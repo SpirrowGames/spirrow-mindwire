@@ -45,6 +45,13 @@ _ROSTER: Mapping[str, Role] = {
 }
 
 
+def _fermi_thread() -> _FakeChatroomMcp:
+    """A thread Fermi owns: since PR #562 (ADR-2026-09-14-21 §7) ``NEXT: Fermi`` anywhere else is
+    refused as ``fermi_outside_own_thread`` before the spawnability check, so the stop this file
+    pins only happens on a Fermi-owned thread."""
+    return _FakeChatroomMcp(owner="Fermi")
+
+
 def _conductor(mcp: _FakeChatroomMcp) -> Conductor:
     return Conductor(
         mcp=mcp,
@@ -69,7 +76,7 @@ def _relay_posts(mcp: _FakeChatroomMcp) -> list[dict[str, Any]]:
 async def test_stop_line_carries_the_normalised_blocked_target(
     token: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    mcp = _FakeChatroomMcp()
+    mcp = _fermi_thread()
     mcp.seed(author="Bohr", content=f"ask the chat\n\nNEXT: {token}")
     caplog.set_level(logging.INFO, logger="spirrow_mindwire.conductor.core")
 
@@ -118,7 +125,7 @@ async def test_other_stops_carry_no_blocked_target(caplog: pytest.LogCaptureFixt
 
 @pytest.mark.anyio
 async def test_the_thread_notice_says_the_request_was_not_delivered() -> None:
-    mcp = _FakeChatroomMcp()
+    mcp = _fermi_thread()
     mcp.seed(author="Bohr", content="ask the chat\n\nNEXT: Fermi")
 
     await _conductor(mcp).run()
