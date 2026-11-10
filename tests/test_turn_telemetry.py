@@ -311,3 +311,65 @@ def test_the_implementer_adapter_registers_the_precompact_hook(tmp_path: Path) -
     assert options.hooks is not None
     assert set(options.hooks) == {"PreCompact"}
     assert adapter._make_options().hooks is None
+
+
+class _NoJobModule:
+    """The POSIX path of the Job API: no Job Object, so the test is host-independent."""
+
+    def create_job(self, _session_id: str) -> Any:
+        raise NotImplementedError("no Job Object in this test")
+
+
+@pytest.mark.anyio
+async def test_the_implementer_spawn_path_wires_the_precompact_hook_to_the_delivered_trigger(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # rev12 P-B (Bohr msg-8938; Einstein go on rev12): the test above calls _make_options()
+    # directly, so nothing pinned that ImplementerSdkAdapter.spawn() itself hands telemetry
+    # through. Mock only: this says the spawn path registers the callback and the callback
+    # logs against the delivered trigger — not that the SDK/CLI fires it, nor anything of prod.
+    client = _Client()
+    seen: list[Any] = []
+
+    def factory(options: Any) -> _Client:
+        seen.append(options)
+        return client
+
+    async def on_reply(_d: ReplyDraft) -> None:
+        return None
+
+    async def on_event_log(_e: Event) -> None:
+        return None
+
+    ctx = SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.IMPLEMENTER,
+        own_instance_id="implementer-1",
+    )
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path,
+        obligations=load_manifest(),
+        inference_base_url="https://api.anthropic.com",
+        client_factory=factory,
+        job_module=_NoJobModule(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, ctx)
+    [options] = seen
+    assert options.hooks is not None
+    [matcher] = options.hooks["PreCompact"]
+    [callback] = matcher.hooks
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.adapters._turn_telemetry"):
+        await adapter.deliver_event(handle, _event(_msgs(3), "msg-3"))
+        out = await callback(_PRECOMPACT_INPUT, None, {"signal": None})
+    assert out == {}
+    precompact = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("turn-telemetry precompact ")
+    ]
+    [line] = precompact
+    fields = _line_fields(line, "turn-telemetry precompact ")
+    assert set(fields) == PRECOMPACT_LOG_KEYS
+    assert fields["upstream_msg_id"] == "msg-3"
+    assert _SECRET not in line
