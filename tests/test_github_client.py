@@ -1233,7 +1233,7 @@ async def test_find_cross_pr_head_bound_approves_identifies_stacked_parent() -> 
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == [
+    assert result.coverage == [
         CrossPrApproveCoverage(sha="sha1", other_pr=coverage_pr, approved_at="2026-09-07T04:51:05Z")
     ]
 
@@ -1264,7 +1264,7 @@ async def test_find_cross_pr_head_bound_approves_ignores_non_head_bound_approve(
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == []
+    assert result.coverage == []
 
 
 @pytest.mark.anyio
@@ -1292,7 +1292,7 @@ async def test_find_cross_pr_head_bound_approves_ignores_wrong_reviewer() -> Non
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == []
+    assert result.coverage == []
 
 
 @pytest.mark.anyio
@@ -1326,7 +1326,7 @@ async def test_find_cross_pr_head_bound_approves_excludes_same_pr() -> None:
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == []
+    assert result.coverage == []
 
 
 @pytest.mark.anyio
@@ -1342,7 +1342,7 @@ async def test_find_cross_pr_head_bound_approves_fail_soft_on_commits_error() ->
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == []
+    assert result.coverage == []
 
 
 @pytest.mark.anyio
@@ -1371,8 +1371,8 @@ async def test_find_cross_pr_head_bound_approves_deduplicates_repeated_sha() -> 
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert len(result) == 1
-    assert result[0].sha == "sha1"
+    assert len(result.coverage) == 1
+    assert result.coverage[0].sha == "sha1"
 
 
 @pytest.mark.anyio
@@ -1410,8 +1410,8 @@ async def test_find_cross_pr_head_bound_approves_dedup_across_forks() -> None:
         )
     # Both fork associations survive dedup — a number-only key would have collapsed them
     # into one row and this assertion would fail.
-    assert len(result) == 2
-    slugs = {c.other_pr.slug for c in result}
+    assert len(result.coverage) == 2
+    slugs = {c.other_pr.slug for c in result.coverage}
     assert slugs == {
         "SpirrowGames/spirrow-conclair#19",
         "AnotherOrg/spirrow-conclair-fork#19",
@@ -1446,12 +1446,12 @@ async def test_find_cross_pr_head_bound_approves_never_raises_on_dependency_fail
         raise GitHubHTTPError("simulated regression: private cross-fork", status_code=403)
 
     async with _client(handler) as client:
-        monkeypatch.setattr(client, "fetch_pr_reviews", _raising_reviews)
+        monkeypatch.setattr(client, "_list_pr_reviews_strict", _raising_reviews)
         # Must not raise. Must return [] (the fail-open marker-less state).
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
-    assert result == []
+    assert result.coverage == []
 
 
 @pytest.mark.anyio
@@ -1494,7 +1494,7 @@ async def test_find_cross_pr_head_bound_approves_caches_reviews_per_invocation()
             _PR, reviewer_login="spirrowgames-ops"
         )
     # Marker output is unchanged (§5 ①): sha1 covered, sha2/sha3 not.
-    assert result == [
+    assert result.coverage == [
         CrossPrApproveCoverage(
             sha="sha1",
             other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
@@ -1556,7 +1556,7 @@ async def test_find_cross_pr_head_bound_approves_does_not_cache_exception(
     )
 
     async with _client(handler) as client:
-        monkeypatch.setattr(client, "fetch_pr_reviews", _flaky_reviews)
+        monkeypatch.setattr(client, "_list_pr_reviews_strict", _flaky_reviews)
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )
@@ -1564,7 +1564,7 @@ async def test_find_cross_pr_head_bound_approves_does_not_cache_exception(
     # The second call was actually made (retry, not a cache hit on failure).
     assert call_count["n"] == 2, "cache trapped the exception and skipped the retry"
     # And with the retry succeeding, sha2's marker landed — no silent drop.
-    assert result == [
+    assert result.coverage == [
         CrossPrApproveCoverage(
             sha="sha2",
             other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
@@ -1630,7 +1630,7 @@ async def test_find_cross_pr_head_bound_approves_does_not_cache_fail_soft_empty(
         "cache stored the fail-soft [] from the transient 502 and skipped the retry on sha2"
     )
     # And with the retry succeeding, sha2's marker landed — no silent drop.
-    assert result == [
+    assert result.coverage == [
         CrossPrApproveCoverage(
             sha="sha2",
             other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),

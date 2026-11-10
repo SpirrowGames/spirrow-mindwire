@@ -1347,12 +1347,12 @@ class _FakeGitHubCi:
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
         return []
 
-    async def find_cross_pr_head_bound_approves(
-        self, pr: PrRef, *, reviewer_login: str
-    ) -> list[Any]:
+    async def find_cross_pr_head_bound_approves(self, pr: PrRef, *, reviewer_login: str) -> Any:
         # Orchestrator L2 tests never exercise B-(a); return empty (the fail-open baseline).
         # Kept for GitHubReviewClient Protocol compliance.
-        return []
+        from spirrow_mindwire.github.client import CoverageLookup
+
+        return CoverageLookup()
 
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
