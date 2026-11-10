@@ -384,8 +384,8 @@ def test_bohr_persona_tools_today_do_not_include_write_or_execute_tools() -> Non
     role's invariant (see the block comment atop this section) — the proposer
     *role* stays read-only regardless of what future Bohr embodiments carry,
     because the role's read-only-ness is enforced by ``capabilities`` (the
-    IMPLEMENTER slot resolves to the gated adapter) and by the
-    ``can_use_tool`` guard (:class:`_PathScopeGuard` admits only
+    IMPLEMENTER slot resolves to ImplementerSdkAdapter, not the proposer) and
+    by the ``can_use_tool`` guard (:class:`_PathScopeGuard` admits only
     ``Read`` / ``Glob`` / ``Grep`` today). If a future change widens Bohr's
     persona 面 to include a write or execute tool it must also widen the guard
     (or a per-persona equivalent) — the role invariant is protected there.
@@ -409,7 +409,8 @@ def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None
 
     ``capabilities`` is a class attribute and independent of the tool list, so
     widening the tools cannot make first-qualified hand the IMPLEMENTER slot to
-    the un-gated adapter. That was the whole point of the split.
+    this proposer adapter instead of ImplementerSdkAdapter. That was the whole
+    point of the split.
     """
     assert Capability.EXECUTE_CODE not in Stage3ProposerAdapter.capabilities
 
@@ -418,8 +419,8 @@ def test_stage3_proposer_capabilities_are_unchanged() -> None:
     caps = Stage3ProposerAdapter.capabilities
     assert Capability.READ_THREAD in caps
     assert Capability.POST_REPLY in caps
-    # Dropping EXECUTE_CODE is what lets the IMPLEMENTER slot resolve to the
-    # gated adapter rather than the proposer (registry first-qualified).
+    # Dropping EXECUTE_CODE is what lets the IMPLEMENTER slot resolve to
+    # ImplementerSdkAdapter rather than the proposer (registry first-qualified).
     assert Capability.EXECUTE_CODE not in caps
     # Same-model family as main → never qualifies as naysayer (ADR-05 §5).
     assert Capability.NAYSAYER_QUALIFIED not in caps
