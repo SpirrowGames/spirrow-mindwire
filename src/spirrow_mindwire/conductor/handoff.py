@@ -1734,15 +1734,14 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
     write-time validation (§3-3's escape hatch is "drop the field and re-send", which the
     row-5 escalation asks the human to do).
 
-    Missing the ``pr-review`` sentinel on this side would break the field-driven PR-gate
-    (ADR-19 N-1): a field of ``pr-review acme/widgets#7`` would fall out of every branch
-    below, resolve to ABSENT, be seen as a field/body mismatch by :func:`_reconcile`, and
-    escalate to the human — silently disabling the synchronous Tier B review whenever the
-    envelope field is the authoritative handoff. So the sentinel is matched here just as it
-    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair. (As noted
-    above, Magickit's writer does not let such a field through today, so this branch keeps
-    the read side consistent with the body path rather than serving a live write route; it is
-    kept because it is harmless and pinned by tests.)
+    For a field that arrives outside Magickit's validation, matching the ``pr-review``
+    sentinel here keeps the read side consistent with the body resolver (the PR-gate handoff,
+    ADR-19 N-1): without it, a field of ``pr-review acme/widgets#7`` would fall out of
+    every branch below, resolve to ABSENT, be seen as a field/body mismatch by
+    :func:`_reconcile`, and escalate to the human. So the sentinel is matched here just as it
+    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair. This is
+    not a live write route through Magickit today (see above); the branch is kept because it
+    is harmless and pinned by tests.
     """
     sentinel = _PR_REVIEW_RE.match(field_value)
     if sentinel is not None and (operand := sentinel.group("rest").strip()):
