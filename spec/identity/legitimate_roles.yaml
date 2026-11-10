@@ -36,6 +36,9 @@
 #                    than guess — msg-1179 §5). A machine MUST NOT carry this field: its value
 #                    is derived from kind by identity/registration.py::build_upsert_identity_args
 #                    so the machine value string lives in one place (msg-1706 §2).
+#       retired:     optional, a date "YYYY-MM-DD". A retired identity keeps its row (past posts
+#                    and owned threads still classify) but MUST have legitimate=[] whatever its
+#                    kind; the participant ">= 1 role" invariant does not apply to it.
 #       primary_source:  one-line pointer, "path::symbol" or "path::§heading"
 #       reason:      short prose justification, cross-referenced to the doc
 #
@@ -157,10 +160,16 @@ identities:
 
   - name: operator
     kind: participant
-    legitimate: ["integrator"]
+    legitimate: []
     independence_class: main-chain
+    retired: "2026-11-10"
     primary_source: "docs/identity-classification.md::§ Names written outside this repo"
     reason: >-
+      RETIRED 2026-11-10 (Takahito, spirrow-mindwire T-retire-operator-identity-and-scope-next-fermi
+      msg-8871 / msg-8898): the session this name stood for is now Fermi, which takes over its
+      work. The store record was set to allowed_roles=[] that day (msg-8898), so this row carries
+      legitimate=[] and the register script cannot re-grant a role. The row stays so that past
+      posts and the threads it still owns classify. What follows is the history.
       The operator lane: a Claude Code session acting as Takahito's hands. It files threads,
       deploys, runs probes and posts raw observations. Every post is LLM-written, so it is a
       participant, not a machine. No code in this repo writes under this name. The `NEXT: operator`

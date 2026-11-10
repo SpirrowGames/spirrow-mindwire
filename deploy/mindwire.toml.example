@@ -51,7 +51,7 @@ human_identity = "human"
 # chatroom. Default empty (only a human post unlatches G1). A recorder that holds proposer /
 # implementer / naysayer in a thread's roster is ignored in that thread (WARNING at startup, the
 # daemon still starts). See docs/deploy.md "G1 latch and recording an out-of-chat decision".
-# tier_c_recorders = ["operator", "Fermi"]
+# tier_c_recorders = ["Fermi"]   (`operator` was retired on 2026-11-10; Fermi took over its work)
 # Runaway backstop: max serial turns before the conductor stops (default 40).
 max_rounds = 40
 # Wall-clock budgets for one run, in seconds. Soft: the conductor logs `conductor.run_timeout`,
