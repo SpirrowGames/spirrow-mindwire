@@ -1462,13 +1462,14 @@ def find_identical_input_approve(
     A fingerprint match over the diff text the model read (msg-8810 D-2''), never a tree match:
     a shared head tree over a different base is a different diff (msg-8423 Obj-1). Only the
     diff text is proven equal — the rest of the prompt may differ (msg-8812 Obj-3-1). A prior
-    review without a ``v1`` marker has ``prior_diff_sha256 is None`` and never matches —
-    silence means "cannot compare".
+    review without a ``v1`` marker contributes no fingerprint and never matches — silence
+    means "cannot compare". Every fingerprint of every qualifying APPROVE on a row is checked,
+    not just the first approval's (PR-gate #556 round 1 obj 2).
     """
     if lookup is None or digest is None:
         return None
     for c in lookup.coverage:
-        if c.prior_diff_sha256 is not None and c.prior_diff_sha256 == digest:
+        if digest in c.prior_diff_sha256s:
             return c
     return None
 

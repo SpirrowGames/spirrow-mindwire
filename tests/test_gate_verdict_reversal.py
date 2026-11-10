@@ -56,7 +56,10 @@ _CANARY = "https://api.example/repos/x?token=ghp_LEAKCANARY"
 
 def _cov(prior: str | None, sha: str = _APPROVED_SHA) -> CrossPrApproveCoverage:
     return CrossPrApproveCoverage(
-        sha=sha, other_pr=_OTHER, approved_at="2026-10-01T10:38:00Z", prior_diff_sha256=prior
+        sha=sha,
+        other_pr=_OTHER,
+        approved_at="2026-10-01T10:38:00Z",
+        prior_diff_sha256s=(prior,) if prior is not None else (),
     )
 
 
@@ -218,10 +221,21 @@ async def test_failed_from_driver_belt_prints_class_and_status_never_the_message
 # ---------- D-1': the client records failed strict reads -------------------------------------- #
 
 _ME = PrRef("SpirrowGames", "spirrow-playproof", 96)
+_UNMARKED = "ok\n\nVERDICT: APPROVE"
+
+
+def _marked(hexd: str) -> str:
+    return f"ok\n\nVERDICT: APPROVE\n\n{render_reviewed_diff_sha256_marker(hexd)}"
 
 
 def _client_handler(
-    *, commits: int | None = None, pulls: int | None = None, reviews: int | None = None
+    *,
+    commits: int | None = None,
+    pulls: int | None = None,
+    reviews: int | None = None,
+    commits_body: object = None,
+    pulls_body: object = None,
+    approve_bodies: tuple[str, ...] | None = None,
 ) -> httpx.MockTransport:
     """Two commits, both in PR #95; #95 carries a head-bound APPROVE on sha2 only.
 
@@ -238,11 +252,15 @@ def _client_handler(
         if path.endswith("/pulls/96/commits"):
             if commits is not None:
                 return fail(commits)
+            if commits_body is not None:
+                return httpx.Response(200, json=commits_body)
             return httpx.Response(200, json=[{"sha": "sha1"}, {"sha": "sha2"}])
         if "/commits/" in path and path.endswith("/pulls"):
             seen["pulls"] += 1
             if pulls is not None and seen["pulls"] == 1:
                 return fail(pulls)
+            if pulls_body is not None and seen["pulls"] == 1:
+                return httpx.Response(200, json=pulls_body)
             row = {
                 "number": 95,
                 "base": {"repo": {"name": "spirrow-playproof", "owner": {"login": "SpirrowGames"}}},
@@ -252,6 +270,7 @@ def _client_handler(
             seen["reviews"] += 1
             if reviews is not None and seen["reviews"] == 1:
                 return fail(reviews)
+            bodies = approve_bodies if approve_bodies is not None else (_marked("d" * 64),)
             return httpx.Response(
                 200,
                 json=[
@@ -259,10 +278,10 @@ def _client_handler(
                         "user": {"login": "spirrowgames-ops"},
                         "state": "APPROVED",
                         "commit_id": "sha2",
-                        "submitted_at": "2026-10-01T10:38:00Z",
-                        "body": "ok\n\nVERDICT: APPROVE\n\n"
-                        + render_reviewed_diff_sha256_marker("d" * 64),
+                        "submitted_at": f"2026-10-01T10:3{i}:00Z",
+                        "body": b,
                     }
+                    for i, b in enumerate(bodies)
                 ],
             )
         return httpx.Response(404)
@@ -303,7 +322,13 @@ async def test_client_reviews_read_502_is_recorded_and_retried() -> None:
 @pytest.mark.anyio
 @pytest.mark.parametrize("which", ["commits", "pulls", "reviews"])
 async def test_client_read_failures_never_carry_the_message(which: str) -> None:
-    result = await _lookup(_client_handler(**{which: 502}))
+    result = await _lookup(
+        _client_handler(
+            commits=502 if which == "commits" else None,
+            pulls=502 if which == "pulls" else None,
+            reviews=502 if which == "reviews" else None,
+        )
+    )
     assert result.read_failures
     assert all("LEAKCANARY" not in f and "/" not in f for f in result.read_failures)
 
@@ -313,7 +338,63 @@ async def test_client_fills_prior_diff_sha256_from_the_review_body() -> None:
     result = await _lookup(_client_handler())
     assert result.state == "ok"
     assert result.read_failures == ()
-    assert [c.prior_diff_sha256 for c in result.coverage] == ["d" * 64]
+    assert [c.prior_diff_sha256s for c in result.coverage] == [("d" * 64,)]
+
+
+# PR-gate #556 round 1 obj 1: a 2xx body that is not a JSON list is a failed read, not ok-empty.
+@pytest.mark.anyio
+@pytest.mark.parametrize("bad", [{}, {"message": _CANARY}, "x", 0])
+async def test_client_commits_non_list_200_is_a_failed_read(bad: object) -> None:
+    result = await _lookup(_client_handler(commits_body=bad))
+    assert result.state == "failed"
+    assert result.coverage == []
+    assert result.read_failures == ("GitHubHTTPError",)
+    assert all("LEAKCANARY" not in f for f in result.read_failures)
+
+
+@pytest.mark.anyio
+async def test_client_commits_null_200_is_a_failed_read() -> None:
+    """``null`` on its own: the handler's ``None`` default means "use the normal rows"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/pulls/96/commits"):
+            return httpx.Response(
+                200, content=b"null", headers={"content-type": "application/json"}
+            )
+        return httpx.Response(404)
+
+    result = await _lookup(httpx.MockTransport(handler))
+    assert result.state == "failed"
+    assert result.read_failures == ("GitHubHTTPError",)
+
+
+@pytest.mark.anyio
+async def test_client_commit_pulls_non_list_200_is_recorded_and_skipped() -> None:
+    result = await _lookup(_client_handler(pulls_body={}))
+    assert result.state == "ok"
+    assert [c.sha for c in result.coverage] == ["sha2"]
+    assert result.read_failures == ("GitHubHTTPError",)
+
+
+# PR-gate #556 round 1 obj 2: every qualifying APPROVE's fingerprint is kept.
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("bodies", "expected"),
+    [
+        ((_UNMARKED, _marked("d" * 64)), ("d" * 64,)),
+        ((_marked("f" * 64), _marked("d" * 64)), ("f" * 64, "d" * 64)),
+    ],
+    ids=["unmarked-then-marked", "differing-then-marked"],
+)
+async def test_client_keeps_fingerprints_of_all_approvals_one_row_per_pair(
+    bodies: tuple[str, ...], expected: tuple[str, ...]
+) -> None:
+    result = await _lookup(_client_handler(approve_bodies=bodies))
+    assert len(result.coverage) == 1  # coverage reporting stays one row per (sha, PR)
+    row = result.coverage[0]
+    assert row.sha == "sha2"
+    assert row.approved_at == "2026-10-01T10:30:00Z"  # the first approval, as before
+    assert row.prior_diff_sha256s == expected
 
 
 # ---------- D-2'': reversal line -------------------------------------------------------------- #
@@ -359,6 +440,19 @@ async def test_reversal_silent_when_fingerprint_differs() -> None:
     """Different diff text (e.g. same head tree over another base) is a different input."""
     body, _ = await _run(verdict="REQUEST_CHANGES", coverage=[_cov("f" * 64)])
     assert _MARKER_H_REVERSAL not in body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "first", [_UNMARKED, _marked("f" * 64)], ids=["unmarked-then-match", "differing-then-match"]
+)
+async def test_reversal_fires_when_a_later_approval_matches(first: str) -> None:
+    """End to end: client lookup, then the driver notice; the match is on the SECOND approval."""
+    lookup = await _lookup(_client_handler(approve_bodies=(first, _marked(_THIS))))
+    assert len(lookup.coverage) == 1
+    body, verdict = await _run(verdict="REQUEST_CHANGES", coverage=lookup.coverage)
+    assert verdict is ReviewEvent.REQUEST_CHANGES
+    assert _MARKER_H_REVERSAL in _notice(body)
 
 
 @pytest.mark.anyio

@@ -364,11 +364,14 @@ class CrossPrApproveCoverage:
     sha: str
     other_pr: PrRef
     approved_at: str | None
-    # The ``v1`` reviewed-diff fingerprint the gate stamped on that APPROVE's body
-    # (msg-8812 Obj-3-2), or ``None`` when the body carries none (an older review, or another
-    # marker version). Only an exact match against this run's fingerprint licenses the
-    # "identical reviewed diff" note; ``None`` keeps the note silent.
-    prior_diff_sha256: str | None = None
+    # The ``v1`` reviewed-diff fingerprints the gate stamped on EVERY qualifying APPROVE of
+    # this (sha, other_pr) pair (msg-8812 Obj-3-2; PR-gate #556 round 1 obj 2), in review
+    # order. A body without a ``v1`` marker (an older review, or another marker version)
+    # contributes nothing. The coverage row stays one per pair, but no fingerprint is
+    # dropped: an older unmarked or differing APPROVE must not hide a later matching one.
+    # Only an exact match against this run's fingerprint licenses the "identical reviewed
+    # diff" note; an empty tuple keeps the note silent.
+    prior_diff_sha256s: tuple[str, ...] = ()
 
 
 def _read_failure_label(exc: BaseException) -> str:
@@ -394,6 +397,11 @@ class CoverageLookup:
     ``state``: ``ok-empty`` (nothing found, nothing failed), ``ok`` (rows found; may be
     partial when reads also failed) or ``failed`` (nothing found and at least one read failed —
     "no coverage" cannot be told apart from "could not look").
+
+    A 2xx commits or commit→pulls page whose body is not a JSON list counts as a failed read
+    (:meth:`GitHubClient._get_rows_strict`). The reviews read goes through the shared
+    :meth:`GitHubClient.fetch_pr_reviews_strict`, whose existing contract still reads such a
+    body as "no reviews"; that method has other strict callers and is left unchanged here.
     """
 
     coverage: list[CrossPrApproveCoverage] = field(default_factory=list)
@@ -1807,22 +1815,32 @@ class GitHubClient:
                         # anyway (msg-8810 D-1': do not widen the scope).
                         if reviews:
                             reviews_cache[other_pr] = reviews
-                    for r in reviews:
-                        if (
-                            r.login == reviewer_login
-                            and r.state == "APPROVED"
-                            and r.commit_id == sha
-                        ):
-                            coverage.append(
-                                CrossPrApproveCoverage(
-                                    sha=sha,
-                                    other_pr=other_pr,
-                                    approved_at=r.submitted_at,
-                                    prior_diff_sha256=parse_reviewed_diff_sha256_marker(r.body),
-                                )
+                    # Every qualifying APPROVE is examined (PR-gate #556 round 1 obj 2): the
+                    # row is still one per (sha, other_pr) and keeps the FIRST approval's
+                    # ``approved_at`` as before, but the fingerprints of all of them are kept
+                    # so a later matching APPROVE is not hidden behind an earlier one.
+                    approvals = [
+                        r
+                        for r in reviews
+                        if r.login == reviewer_login
+                        and r.state == "APPROVED"
+                        and r.commit_id == sha
+                    ]
+                    if approvals:
+                        fingerprints = tuple(
+                            fp
+                            for fp in (parse_reviewed_diff_sha256_marker(r.body) for r in approvals)
+                            if fp is not None
+                        )
+                        coverage.append(
+                            CrossPrApproveCoverage(
+                                sha=sha,
+                                other_pr=other_pr,
+                                approved_at=approvals[0].submitted_at,
+                                prior_diff_sha256s=fingerprints,
                             )
-                            seen.add(key)
-                            break
+                        )
+                        seen.add(key)
             return CoverageLookup(coverage=coverage, read_failures=tuple(failures))
         except Exception as exc:
             # Structural fail-open belt: the callees are already fail-soft, but keeping
@@ -1899,8 +1917,11 @@ class GitHubClient:
     async def _get_rows_strict(self, path: str, page: int, *, what: str) -> list[Any]:
         """One page of a JSON list endpoint, raising :class:`GitHubHTTPError` on any failure.
 
-        Shared only by the two strict twins above; a non-list body reads as an empty page,
-        as in the fail-soft twins.
+        Shared only by the two strict twins above. Unlike the fail-soft twins, a 2xx body that
+        is not a JSON list (``{}``, ``null``, a scalar) RAISES: the lookup could not establish
+        what the endpoint holds, so it must be recorded as a failed read, never read as an
+        empty page that would make "could not look" look like ``ok-empty`` (PR-gate #556
+        round 1 obj 1).
         """
         try:
             resp = await self._client.get(path, params={"per_page": 100, "page": page})
@@ -1917,7 +1938,11 @@ class GitHubClient:
             rows = resp.json()
         except ValueError as exc:
             raise GitHubHTTPError(f"GET {path} ({what}): malformed JSON: {exc}") from exc
-        return rows if isinstance(rows, list) else []
+        if not isinstance(rows, list):
+            raise GitHubHTTPError(
+                f"GET {path} ({what}): expected a JSON list, got {type(rows).__name__}"
+            )
+        return rows
 
     async def _list_pr_commits(self, pr: PrRef) -> list[str]:
         """``GET /repos/{owner}/{repo}/pulls/{n}/commits`` → shas in PR order (paginated).
