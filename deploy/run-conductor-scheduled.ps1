@@ -6665,6 +6665,11 @@ try {
     # was attempted for this tick. Both are per tick; Invoke-HoldAckViaPark reads them after the loop.
     $holdAckViaPark = @{}
     $launchedProjects = @{}
+    # PR-B (PR-gate #560 obj 1): a missing ledger is created holding the `*` (absent) sentinel here,
+    # before any candidate, so a tick where every candidate is parked still creates it.
+    $inflightInit = Initialize-InflightLedger -Path $inflightStatePath -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+    foreach ($ev in $inflightInit.events) { Write-Log "inflight: $ev" }
+    if (-not $inflightInit.ok) { Write-Log "WARN inflight: could not create $inflightStatePath ($($inflightInit.error)) — hold-ack via park stays withheld; launches unaffected" }
     # D-3b/c (T-clone-guard-pin-ignored-only-in-mindwire v2.1): repos parked by an earlier exit 8.
     # Each gets exactly one `mindwire clone-check` here, before any candidate is looked at: exit 0
     # releases it (its candidates launch this tick, launches_same_head starting at 1 because the

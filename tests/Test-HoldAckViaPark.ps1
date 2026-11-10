@@ -199,6 +199,41 @@ try {
     $null = Add-InflightMark -Path $p -LaunchId 'Lx' -Project 'P-x' -Key 'P-x/T' -NowIso $now
     $r = Invoke-Ack -Pending @('P') -Path $p
     Check "P-x's row does not exclude P (exact match)" (($script:reported -join ',') -eq 'P')
+
+    # PR-gate #560 round 1, objection 1: the ledger must exist even when no tick ever launches.
+    Write-Host "Tick-start initialization (every candidate parked)"
+    $p = New-LedgerPath
+    $init = Initialize-InflightLedger -Path $p -NowIso $now
+    $read = Read-InflightLedger -Path $p
+    Check 'missing ledger -> created holding only the * (absent) sentinel' ($init.ok -and $init.created -and $read.status -eq 'ok' -and $read.rows.Count -eq 1 -and $read.rows['*'].reason -eq 'absent')
+    Check 'creation is logged as an event' ($init.events -contains 'inflight-file-created (absent; sentinel set)')
+    # The all-parked tick: initialization, then no launch at all, then the acknowledgement pass.
+    $r = Invoke-Ack -Pending @('P') -Path $p
+    Check 'all-parked first tick: no report, reason is the * sentinel (not inflight-file-absent)' ($script:reported.Count -eq 0 -and $r[0].reason -eq 'inflight-sentinel (absent)')
+    $obj = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+    $obj.PSObject.Properties.Remove('*')
+    Write-Ledger $p ($obj | ConvertTo-Json)
+    $init2 = Initialize-InflightLedger -Path $p -NowIso $now
+    $r = Invoke-Ack -Pending @('P') -Path $p
+    Check 'after the operator clears *: the next tick does not re-add it and reports' ($init2.ok -and -not $init2.created -and ($script:reported -join ',') -eq 'P')
+    $p = New-LedgerPath
+    $seed = '{"La": {"project": "A", "key": "A/T"}}'
+    Write-Ledger $p $seed
+    $null = Initialize-InflightLedger -Path $p -NowIso $now
+    Check 'existing ledger -> left byte-for-byte as it was' ([System.IO.File]::ReadAllText($p) -eq $seed)
+    $p = New-LedgerPath
+    Write-Ledger $p '{not json'
+    $null = Initialize-InflightLedger -Path $p -NowIso $now
+    Check 'corrupt ledger -> left as it was (the gate still refuses it)' ([System.IO.File]::ReadAllText($p) -eq '{not json' -and (Test-InflightClearForProject -Path $p -Project 'P').clear -eq $false)
+    $p = New-LedgerPath
+    $init = Initialize-InflightLedger -Path $p -NowIso $now -Io (New-FaultyIo -Fail 'Move')
+    Check 'failed create -> ok=$false, no file, gate still says absent' (-not $init.ok -and -not (Test-Path -LiteralPath $p) -and (Test-InflightClearForProject -Path $p -Project 'P').reason -eq 'inflight-file-absent')
+    $p = New-LedgerPath
+    $race = New-InflightLedgerIo
+    $race.Move = { param($t, $dest) [System.IO.File]::WriteAllText($dest, '{"Lz": {"project": "Z"}}'); throw 'exists' }
+    $init = Initialize-InflightLedger -Path $p -NowIso $now -Io $race
+    $rows = (Read-InflightLedger -Path $p).rows
+    Check 'a launch row that appears under the create is kept' ($init.ok -and $rows.ContainsKey('Lz'))
 }
 finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -212,6 +247,9 @@ $iParked = $src.IndexOf("`$dispositions[`$cand.key] = 'dirty-clone-parked'")
 $iWanted = $src.IndexOf('if (Test-HoldAckViaParkWanted -Control $control) { $holdAckViaPark[$cand.project] = $true }')
 Check 'hold check precedes the parked check; the parked skip records the project' ($iHeld -gt 0 -and $iParked -gt $iHeld -and $iWanted -gt $iParked)
 $iMark = $src.IndexOf('$mark = Add-InflightMark')
+$iInit = $src.IndexOf('$inflightInit = Initialize-InflightLedger -Path $inflightStatePath')
+$iFirstCand = $src.IndexOf('foreach ($cand in $candidates) {')
+Check 'the ledger is initialized every tick, before any candidate (incl. the parked check)' ($iInit -gt 0 -and $iFirstCand -gt $iInit -and $iParked -gt $iFirstCand -and $iMark -gt $iFirstCand)
 $iCommit = $src.IndexOf('$commitResult = Invoke-HeadSkipCommitLaunch')
 $iInner = $src.IndexOf('$output = (& $inner')
 Check 'mark is written before commit-launch and before the spawn' ($iMark -gt 0 -and $iMark -lt $iCommit -and $iCommit -lt $iInner)
@@ -267,6 +305,16 @@ try {
     }
 }
 finally { Remove-Item -LiteralPath $tmp2 -Recurse -Force -ErrorAction SilentlyContinue }
+
+# PR-gate #560 round 1, objection 2: the operator edits the ledger only with the sweep stopped.
+Write-Host "Clearing procedure (docs/deploy.md)"
+$doc = Get-Content -LiteralPath (Join-Path $repoRoot 'docs/deploy.md') -Raw
+$iClear = $doc.IndexOf('**Clearing (operator).**')
+$iEnd = $doc.IndexOf('## Stall ledger tick')
+$proc = $doc.Substring($iClear, $iEnd - $iClear)
+$iDisable = $proc.IndexOf('Disable-ScheduledTask'); $iWait = $proc.IndexOf("-match 'run-conductor-scheduled' }) { Start-Sleep")
+$iProc = $proc.IndexOf('**Check the processes.**'); $iSet = $proc.IndexOf('Set-Content -LiteralPath $p'); $iEnable = $proc.IndexOf('Enable-ScheduledTask')
+Check 'stop -> wait for the running sweep -> process check -> edit -> resume, in that order' ($iDisable -gt 0 -and $iWait -gt $iDisable -and $iProc -gt $iWait -and $iSet -gt $iProc -and $iEnable -gt $iSet)
 
 if ($script:failures -gt 0) { Write-Host "$script:failures check(s) FAILED"; exit 1 }
 Write-Host "all checks passed"

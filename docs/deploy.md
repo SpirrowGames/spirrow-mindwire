@@ -848,23 +848,45 @@ is a `*` sentinel (`corrupt` / `absent`). Launches are not affected by either; o
 hold acknowledgement is withheld, and that project's acknowledgement lands as before, at the first
 launch after the clone is unparked. The log says which: `hold-ack via park <proj>: skipped (<reason>)`.
 
-**Clearing (operator).** On the loop host, check that no `mindwire-loop` / `claude` process of the
-conductor is left for that project (for the `*` sentinel: for any project). Then remove **only**
-the row(s) concerned — the project's GUID rows, or the `*` row — and leave the file in place:
+**Clearing (operator).** The sweep writes this file on every launch, so the operator must never
+edit it while a sweep can run: a read-modify-write that straddles a sweep's new launch row would
+overwrite that row, and if that conductor then exits 7 nothing would hold its project back from a
+wrong acknowledgement. Clear rows only inside this stop → check → edit → resume window:
 
-```powershell
-$p = Join-Path $env:MINDWIRE_PATHS__DATA_DIR 'state\conductor-inflight.json'   # or ~/spirrow-mindwire-data
-$o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
-$o.PSObject.Properties.Remove('*')            # or the GUID key of the row to clear
-$o | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $p -Encoding utf8
-```
+1. **Stop the sweep.** Disable the Task Scheduler task that runs
+   `deploy/run-conductor-scheduled.ps1` (disabling stops new ticks, not the one already running),
+   then wait until no wrapper process is left:
+
+   ```powershell
+   $t = Get-ScheduledTask | Where-Object { "$($_.Actions.Arguments)" -match 'run-conductor-scheduled' }
+   $t | Disable-ScheduledTask | Out-Null
+   while (Get-CimInstance Win32_Process | Where-Object { "$($_.CommandLine)" -match 'run-conductor-scheduled' }) { Start-Sleep 10 }
+   ```
+
+   Do not go on while that loop is still waiting.
+2. **Check the processes.** On the loop host, check that no `mindwire-loop` / `claude` process of
+   the conductor is left for that project (for the `*` sentinel: for any project). If one is, stop
+   here: re-enable the task (step 4) and leave the row in place.
+3. **Edit.** Remove **only** the row(s) concerned — the project's GUID rows, or the `*` row — and
+   leave the file in place:
+
+   ```powershell
+   $p = Join-Path $env:MINDWIRE_PATHS__DATA_DIR 'state\conductor-inflight.json'   # or ~/spirrow-mindwire-data
+   $o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+   $o.PSObject.Properties.Remove('*')            # or the GUID key of the row to clear
+   $o | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $p -Encoding utf8
+   ```
+4. **Resume.** Re-enable the task: `$t | Enable-ScheduledTask | Out-Null`.
 
 Do not delete the file while a project might have an orphaned conductor: a missing file is
 re-created with the `*` sentinel, so deleting it clears nothing and only discards the rows.
 
-**One-time step after deploying this change.** The first tick creates the file with the `*`
-(`absent`) sentinel, because an orphan from before the deploy cannot be ruled out. Once the process
-check above finds nothing, remove the `*` row as shown.
+**One-time step after deploying this change.** Every tick starts by creating a missing file with the
+`*` (`absent`) sentinel, before it looks at any candidate — so the first tick after the deploy
+creates it even when every candidate is parked (log line `inflight: inflight-file-created (absent;
+sentinel set)`). An orphan from before the deploy cannot be ruled out, so the sentinel withholds the
+sweep's acknowledgement until an operator clears it with the stop → check → edit → resume procedure
+above.
 
 ## Stall ledger tick (D-16c)
 

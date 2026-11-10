@@ -144,6 +144,21 @@ function Update-InflightLedger {
     return @{ ok = $false; error = 'conductor-inflight.json changed twice under the update'; events = $events }
 }
 
+# At the start of every tick, before any candidate is looked at: create a MISSING ledger holding the
+# `*` (absent) sentinel. Without this a tick where every candidate is parked never reaches
+# Add-InflightMark, so the file is never created, the acknowledgement gate stays at
+# `inflight-file-absent` forever and the operator has no `*` row to clear (PR-gate #560 round 1,
+# objection 1). An existing file — ok or corrupt — is left exactly as it is: the create is a
+# non-overwriting Move, and a file that appears under it is re-read and kept (Update-InflightLedger).
+# Never throws; a failed create is reported and the gate keeps saying `inflight-file-absent`.
+function Initialize-InflightLedger {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$NowIso, [hashtable]$Io = $null)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return @{ ok = $true; error = $null; events = @(); created = $false } }
+    $result = Update-InflightLedger -Path $Path -NowIso $NowIso -Io $Io -Mutate { param($rows) }
+    $result.created = ($result.ok -and ($result.events -contains 'inflight-file-created (absent; sentinel set)'))
+    return $result
+}
+
 # Before a launch: add this launch's row. ok=$false means: do not launch. Without -LaunchId a fresh
 # GUID is used; the result's launch_id is the key the caller later passes to Remove-InflightMark.
 function Add-InflightMark {
