@@ -173,8 +173,9 @@ from .gate_resume import (
     verify_resume,
 )
 from .handoff import (
+    HUMAN_TASK_FORM_EXAMPLE,
+    HUMAN_TASK_KEYWORD,
     HUMAN_TOKEN,
-    OPERATOR_FORM_EXAMPLE,
     OPERATOR_TOKEN,
     STOP_DONE,
     Handoff,
@@ -188,6 +189,7 @@ from .handoff import (
     parse_next_token,
     posted_at_of,
     resolve_handoff,
+    scope_fermi_handoff,
 )
 from .head_skip import stage1_skips
 from .human_identity import is_human_identity
@@ -299,8 +301,9 @@ def _operator_fault_notice(fault: OperatorFault) -> str:
     """
     if fault is OperatorFault.TIER_C_CONFLICT:
         cause = (
-            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は operator には"
-            "渡せません (protocol 違反: Tier-C を operator に渡そうとした)。"
+            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は手作業の依頼"
+            f"(`{HUMAN_TASK_KEYWORD}:` 形式 / 旧 `NEXT: {OPERATOR_TOKEN}`) としては渡せません "
+            "(protocol 違反: Tier-C を手作業として渡そうとした)。"
         )
         fix = (
             "次にやること: Tier-C の作業として、次の形で human に渡し直してください。\n\n"
@@ -308,17 +311,21 @@ def _operator_fault_notice(fault: OperatorFault) -> str:
         )
     else:
         if fault is OperatorFault.NO_TASK:
-            cause = "`OPERATOR-TASK:` 行がありません (`NEXT:` の 2 行上に必要です)。"
+            cause = (
+                f"作業を書いた `{HUMAN_TASK_KEYWORD}:` 行 (旧形式では `OPERATOR-TASK:` 行) が "
+                "`NEXT:` の 2 行上にありません。"
+            )
         else:
-            cause = f"`NEXT: {OPERATOR_TOKEN}` の直上の行が `TIER-C-CHECK: none` ではありません。"
-        indented = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+            cause = "`NEXT:` の直上の行が `TIER-C-CHECK: none` ではありません。"
+        indented = "\n".join(f"    {line}" for line in HUMAN_TASK_FORM_EXAMPLE.splitlines())
         fix = (
             "次にやること: 作業が Tier-C のどの型にも当たらないなら、次の 3 行で書き直して"
             f"ください。当たる、または当たりうるなら `TIER-C: <type>` / `NEXT: {HUMAN_TOKEN}` "
             f"で渡してください。\n\n{indented}"
         )
     return (
-        f"Conductor stand-down — `NEXT: {OPERATOR_TOKEN}` を受け付けませんでした\n\n"
+        f"Conductor stand-down — 手作業の依頼 (`{HUMAN_TASK_KEYWORD}:` 形式 / 旧 "
+        f"`NEXT: {OPERATOR_TOKEN}`) を受け付けませんでした\n\n"
         f"理由 (`{fault.value}`): {cause}\n\n"
         f"∴ 誰も spawn せず停止しました。{fix}\n\n"
         f"head が動くまでループは再開しません。\n\n"
@@ -664,6 +671,9 @@ class Conductor:
         # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
         # the response carries none) — handed to every event for the naysayer's N-3 routing.
         self._thread_tags: tuple[str, ...] | None = None
+        # ``thread.owner`` of the same read (None until one succeeds or when it carries none):
+        # the D2 scope of ``NEXT: Fermi`` (:func:`.handoff.scope_fermi_handoff`).
+        self._thread_owner: str | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -916,9 +926,15 @@ class Conductor:
                 # read the conductor stopped on NO_HANDOFF. Absent field ⇒ backward-compatible
                 # body-only routing (rows 1-2 of §3-1's truth table).
                 next_participant=_next_participant(latest),
-                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED.
+                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED (and,
+                # once its cutoff is set, a ``NEXT: operator``).
                 posted_at=posted_at_of(latest),
             )
+            # D2 (msg-8871 / msg-8874): ``NEXT: Fermi`` only on a thread Fermi owns. Applied to
+            # the handoff every branch below reads, so the refusal reaches ``_route`` as a
+            # malformed head -- stopped, with its notice, ahead of the spawnability check that
+            # would otherwise park it as an ordinary spawn-blocked stop.
+            handoff = scope_fermi_handoff(handoff, thread_owner=self._thread_owner)
             # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
             # HUMAN (safety valve) and carries the divergence so we can log it as observability
             # BEFORE the routing decision below acts on the escalated kind. Recording is loud and
@@ -3062,6 +3078,7 @@ class Conductor:
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         self._thread_tags = _thread_tags(result)
+        self._thread_owner = _thread_owner(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -4191,6 +4208,13 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_owner(result: Any) -> str | None:
+    """``thread.owner`` of a ``chatroom_get_thread`` response, or None if absent/malformed."""
+    thread = result.get("thread") if isinstance(result, dict) else None
+    owner = thread.get("owner") if isinstance(thread, dict) else None
+    return owner if isinstance(owner, str) and owner.strip() else None
 
 
 def _thread_tags(result: Any) -> tuple[str, ...] | None:

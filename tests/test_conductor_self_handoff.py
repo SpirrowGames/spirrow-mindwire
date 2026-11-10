@@ -152,7 +152,8 @@ async def test_next_fermi_stops_exactly_where_next_human_stops() -> None:
     human_mcp.seed(author="Einstein", content="review done\n\nNEXT: human")
     human_outcome = await _conductor(human_mcp, _ScriptedDispatcher(human_mcp, {})).run()
 
-    fermi_mcp = _FakeChatroomMcp()
+    # On a thread Fermi owns: elsewhere ``NEXT: Fermi`` is refused (ADR-21 §7 Amendment).
+    fermi_mcp = _FakeChatroomMcp(owner="Fermi")
     fermi_mcp.seed(author="Einstein", content="review done\n\nNEXT: Fermi")
     fermi_disp = _ScriptedDispatcher(fermi_mcp, {})
     fermi_outcome = await _conductor(fermi_mcp, fermi_disp).run()
@@ -165,7 +166,7 @@ async def test_next_fermi_stops_exactly_where_next_human_stops() -> None:
 @pytest.mark.anyio
 async def test_fermi_is_blocked_without_any_configuration() -> None:
     """The ADR's entry ships as a default; a host that wrote no config still refuses."""
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="ask the chat\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {})
 
@@ -177,7 +178,7 @@ async def test_fermi_is_blocked_without_any_configuration() -> None:
 
 @pytest.mark.anyio
 async def test_spawn_unavailable_writes_the_general_rule_into_the_thread() -> None:
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="ask the chat\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {})
 
@@ -223,9 +224,10 @@ async def test_an_operator_entry_can_unblock_a_shipped_default() -> None:
 
     Fermi is put in the roster here too, because unblocking it only means anything if there is
     a role to dispatch — which is exactly what a deployment that gave Fermi a terminal
-    embodiment would have had to do.
+    embodiment would have had to do. The thread is Fermi's own, the one place ``NEXT: Fermi``
+    is valid (ADR-21 §7 Amendment).
     """
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="hand over\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {Role.PROPOSER: ["from fermi\n\nNEXT: none"]})
     conductor = Conductor(

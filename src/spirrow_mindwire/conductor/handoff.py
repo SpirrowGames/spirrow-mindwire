@@ -155,6 +155,16 @@ OPERATOR_TOKEN = "operator"
 # stand-down notice are all built from it (and from ``TIER_C_CHECK_KEYWORD`` / ``_NONE`` below),
 # so what the prompt teaches and what the parser accepts cannot drift apart.
 OPERATOR_TASK_KEYWORD = "OPERATOR-TASK"
+# T-retire-operator-identity-and-scope-next-fermi (Bohr msg-8874 D1-1, kept through v8 msg-8954):
+# the successor of the operator form. ``HUMAN-TASK: <work>`` / ``TIER-C-CHECK: none`` /
+# ``NEXT: human`` asks a person for work by hand exactly as ``NEXT: operator`` did: the same
+# :func:`_check_operator` checks, the same :attr:`HumanAsk.OPERATOR_WORK`, the same parked lane and
+# stop reason (their value strings are notification keys and do not change). Only the spelling of
+# the request moves off the retired ``operator`` word and onto ``human``.
+HUMAN_TASK_KEYWORD = "HUMAN-TASK"
+# D2 (msg-8871, Takahito 2026-11-10): ``NEXT: Fermi`` is valid only on a thread Fermi owns. The
+# identity is named here once; the comparison is on ADR-2026-05-29-11 keys.
+FERMI_IDENTITY = "Fermi"
 
 # The standing-autonomy ``DELEGATE`` marker that used to live here is gone. It authorised carve-out
 # ③ per *thread*, from the most recent human message, and non-stickily — so it had to be re-written
@@ -430,6 +440,18 @@ ACCEPT_NEW_FORMS: bool = True
 # ``NEXT: <participant>`` / ``human`` / ``operator`` / ``pr-review`` are never affected.
 NONE_MALFORMED_AFTER: datetime | None = None
 
+# The ``NEXT: operator`` cutoff (T-retire-operator-identity-and-scope-next-fermi, Bohr msg-8935 §1 /
+# msg-8941 §1 / msg-8943 §2). The same shape as :data:`NONE_MALFORMED_AFTER` and the same rule
+# (:func:`_after_cutoff`): from this instant a ``NEXT: operator`` -- in the body, or only in the
+# ``next_participant`` field -- is MALFORMED (:attr:`MalformedHandoff.OPERATOR_RETIRED`) instead
+# of operator work; one posted before it is read as it always was, so history keeps its reading.
+#
+# PR-1 ships it ``None``: no reader changes whenever PR-1 is deployed. PR-3 is the one-line commit
+# that sets it, under the switch conditions recorded on the design thread. Only the retired
+# ``operator`` word is touched: a ``HUMAN-TASK:`` form or a plain ``NEXT: human`` is never refused
+# by it, whatever its posting time.
+OPERATOR_MALFORMED_AFTER: datetime | None = None
+
 BLOCKED_ON_KEYWORD = "BLOCKED-ON"
 STOP_DONE = "done"
 
@@ -556,6 +578,15 @@ class MalformedHandoff(StrEnum):
     # msg-8455 §3). Not a terminal form: :func:`resolve_handoff` sets it on the legacy path, and
     # :func:`none_refused_after_cutoff` is its roster-free reading.
     LEGACY_NONE_AFTER_CUTOFF = "legacy_none_after_cutoff"
+    # A ``NEXT: operator`` (body or field) posted at or after :data:`OPERATOR_MALFORMED_AFTER`, or
+    # at an unknown time while that cutoff is set. Decided first in :func:`_check_operator`, so it
+    # wins over every :class:`OperatorFault`; :func:`operator_refused_after_cutoff` is its
+    # roster-free reading.
+    OPERATOR_RETIRED = "operator_retired"
+    # ``NEXT: Fermi`` (body or field) on a thread whose owner is not Fermi, or whose owner could
+    # not be read (msg-8871 D2). Set by :func:`scope_fermi_handoff`, which the conductor applies to
+    # the head it routes.
+    FERMI_OUTSIDE_OWN_THREAD = "fermi_outside_own_thread"
 
 
 class StopStatus(StrEnum):
@@ -939,6 +970,24 @@ def _after_cutoff(posted_at: datetime | None, none_malformed_after: datetime | N
     posted at or after the cutoff.
     """
     cutoff = NONE_MALFORMED_AFTER if none_malformed_after is None else none_malformed_after
+    return _at_or_after(posted_at, cutoff)
+
+
+def _operator_after_cutoff(
+    posted_at: datetime | None, operator_malformed_after: datetime | None
+) -> bool:
+    """Is a ``NEXT: operator`` posted at ``posted_at`` retired? The same rule at its own constant.
+
+    The cutoff is the explicit argument (tests), else :data:`OPERATOR_MALFORMED_AFTER`.
+    """
+    cutoff = (
+        OPERATOR_MALFORMED_AFTER if operator_malformed_after is None else operator_malformed_after
+    )
+    return _at_or_after(posted_at, cutoff)
+
+
+def _at_or_after(posted_at: datetime | None, cutoff: datetime | None) -> bool:
+    """The cutoff rule both constants share: none -> never; unknown / naive time -> always."""
     if cutoff is None:
         return False
     if posted_at is None or posted_at.utcoffset() is None:
@@ -985,6 +1034,69 @@ def none_refused_after_cutoff(
         return False
     token = parse_next_token(body)
     return token is not None and token.casefold() == NONE_TOKEN
+
+
+def operator_refused_after_cutoff(
+    body: str,
+    *,
+    posted_at: datetime | None,
+    operator_malformed_after: datetime | None = None,
+) -> bool:
+    """Is ``body`` a ``NEXT: operator`` the cutoff retires? Roster-free and field-blind.
+
+    The reading the sweep (head_skip) makes without a roster: ``True`` exactly when
+    :func:`resolve_handoff` with an empty roster and no field sets
+    :attr:`MalformedHandoff.OPERATOR_RETIRED` -- it asks that function, so the two cannot drift.
+    Always ``False`` while no cutoff is set. A field-only ``operator`` has no ``NEXT:`` in its
+    body, so the sweep already reads it as UNRESOLVED and launches it.
+    """
+    if not _operator_after_cutoff(posted_at, operator_malformed_after):
+        return False
+    resolved = resolve_handoff(
+        body, {}, posted_at=posted_at, operator_malformed_after=operator_malformed_after
+    )
+    return resolved.malformed is MalformedHandoff.OPERATOR_RETIRED
+
+
+def human_task_refused(body: str) -> bool:
+    """Is ``body`` a ``HUMAN-TASK:`` form that :func:`_check_operator` refuses? Roster-free.
+
+    Its ``NEXT:`` token is ``human``, a stop token, so a reader that classified it by the token
+    alone would park it silently, and the stand-down notice that says what is wrong would never be
+    posted. head_skip reads it as UNRESOLVED instead (LAUNCH), the way it treats a refused
+    ``NEXT: operator``.
+    """
+    if not _human_task_announced(body):
+        return False
+    return resolve_handoff(body, {}).operator_fault is not None
+
+
+def scope_fermi_handoff(handoff: Handoff, *, thread_owner: str | None) -> Handoff:
+    """D2 (msg-8871): a handoff to Fermi is valid only on a thread Fermi owns.
+
+    The target is read the way the spawnability check reads it (``identity``, else ``token``), so a
+    body ``NEXT: Fermi`` and a field-only ``next_participant=Fermi`` are both caught; Fermi is not
+    a roster participant, so either resolves with ``Fermi`` only in ``token``. The owner is
+    compared on ADR-2026-05-29-11 keys. An owner that could not be read (``None`` / empty) is
+    treated as not Fermi: both outcomes stop at a person, so failing closed costs one notice.
+
+    A refused handoff is ``ABSENT`` with :attr:`MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD`, which
+    the conductor stops on with the malformed notice -- never silently rewritten to ``NEXT: human``,
+    which would hide the author's mistake and misfile the request (msg-8874 D2).
+    """
+    if handoff.kind in (HandoffKind.NONE, HandoffKind.PR_REVIEW) or handoff.malformed is not None:
+        return handoff
+    fermi = normalize_identity_key(FERMI_IDENTITY)
+    target = handoff.identity or handoff.token or ""
+    if not target or normalize_identity_key(target) != fermi:
+        return handoff
+    if thread_owner and normalize_identity_key(thread_owner) == fermi:
+        return handoff
+    return Handoff(
+        HandoffKind.ABSENT,
+        token=handoff.token,
+        malformed=MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD,
+    )
 
 
 class TerminalView(StrEnum):
@@ -1092,7 +1204,23 @@ _MALFORMED_CAUSES: dict[MalformedHandoff, str] = {
         f"`NEXT: {NONE_TOKEN}` は廃止され、もう受け付けていません"
         "(上に旧 `STOP:` 行があっても同じです)。"
     ),
+    MalformedHandoff.OPERATOR_RETIRED: (
+        f"`NEXT: {OPERATOR_TOKEN}` は廃止され、もう受け付けていません"
+        "(構造化フィールド `next_participant` だけで operator を指した場合も同じです)。"
+    ),
+    MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD: (
+        f"`NEXT: {FERMI_IDENTITY}` は {FERMI_IDENTITY} が起票した (owner の) スレッドでだけ"
+        "受け付けます。このスレッドの owner は "
+        f"{FERMI_IDENTITY} ではありません (または owner を読めませんでした)。"
+    ),
 }
+
+# The reasons whose fix is a person's request rather than a settle or a wait: the notice teaches the
+# request forms (the human decision, and the HUMAN-TASK form for work by hand) instead of the
+# terminal forms. Every other reason keeps the terminal-form fix text below, unchanged.
+_MALFORMED_REQUEST_REASONS: frozenset[MalformedHandoff] = frozenset(
+    {MalformedHandoff.OPERATOR_RETIRED, MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD}
+)
 
 
 def malformed_notice(reason: MalformedHandoff) -> str:
@@ -1105,7 +1233,22 @@ def malformed_notice(reason: MalformedHandoff) -> str:
     Says which rule refused the head and how to write it in the forms the conductor reads today.
     The body ends ``NEXT: human`` so head_skip parks the thread on it; its own lines are not a
     terminal form (no ``STOP:`` / ``BLOCKED-ON:`` line at the end or above that ``NEXT:``).
+
+    For a refused request (:data:`_MALFORMED_REQUEST_REASONS`) the fix teaches ``NEXT: human`` for a
+    decision and the :data:`HUMAN_TASK_FORM_EXAMPLE` (indented, so it is an example and not a
+    control line of the notice) for work by hand.
     """
+    if reason in _MALFORMED_REQUEST_REASONS:
+        indented = "\n".join(f"    {line}" for line in HUMAN_TASK_FORM_EXAMPLE.splitlines())
+        return (
+            f"Conductor stand-down — `NEXT:` の宛先を受け付けませんでした\n\n"
+            f"理由 (`{reason.value}`): {_MALFORMED_CAUSES[reason]}\n\n"
+            f"∴ 誰も spawn せず停止しました。次にやること: 人の判断が要るなら "
+            f"`NEXT: {HUMAN_TOKEN}` で、人の手作業 (Tier-C のどの型にも当たらないもの) なら"
+            f"次の 3 行で投稿し直してください。\n\n{indented}\n\n"
+            f"head が動くまでループは再開しません。\n\n"
+            f"NEXT: {HUMAN_TOKEN}"
+        )
     return (
         f"Conductor stand-down — 決着・待ちの書き方を受け付けませんでした\n\n"
         f"理由 (`{reason.value}`): {_MALFORMED_CAUSES[reason]}\n\n"
@@ -1193,34 +1336,95 @@ def declares_no_tier_c(body: str) -> bool:
 _OPERATOR_TASK_RE = re.compile(
     r"\A\s*" + re.escape(OPERATOR_TASK_KEYWORD) + r":\s*(?P<task>\S.*?)\s*\Z", re.IGNORECASE
 )
+_HUMAN_TASK_RE = re.compile(
+    r"\A\s*" + re.escape(HUMAN_TASK_KEYWORD) + r":\s*(?P<task>\S.*?)\s*\Z", re.IGNORECASE
+)
+# Detected loosely, checked strictly (the ``STOP:`` / ``BLOCKED-ON:`` rule): a ``HUMAN-TASK``
+# line in either of the two slots above a final ``NEXT: human`` announces the form, and a form that
+# was announced but not written correctly is refused with a notice, never read as a plain decision.
+_HUMAN_TASK_ANNOUNCE_RE = re.compile(
+    r"\A[\s*_`>]*" + re.escape(HUMAN_TASK_KEYWORD) + r"[\s*_`>]*:", re.IGNORECASE
+)
 
 
-def _operator_task_line(body: str) -> str | None:
-    """The work on ``OPERATOR-TASK: <work>`` two lines above the final ``NEXT:``, or ``None``.
-
-    The position is the template's (D4''' item 4): the task, then ``TIER-C-CHECK: none``, then
-    ``NEXT: operator``. A task line quoted anywhere else in the body does not count, for the same
-    reason the ``TIER-C:`` / ``STOP:`` readers look at one fixed line.
-    """
+def _lines_above_last_next(body: str) -> list[str] | None:
+    """The body's lines above the final control ``NEXT:`` (the last one is the line directly
+    above it), or ``None`` when there is no ``NEXT:``. The trailing empty element left by the
+    newline that ends the line above ``NEXT:`` is dropped."""
     matches = _control_next_matches(body)
     if not matches:
         return None
-    # The last element is the empty tail after the newline that ends the line above ``NEXT:``.
-    lines = body[: matches[-1].start()].split("\n")
-    if len(lines) < 3:
+    return body[: matches[-1].start()].split("\n")[:-1]
+
+
+def _human_task_announced(body: str) -> bool:
+    """Is a ``HUMAN-TASK`` line in one of the two slots directly above the final ``NEXT:``?
+
+    Only meaningful above a ``NEXT: human``; :func:`_resolve_body` asks it on that branch alone.
+    The slot two lines up is the template's; the slot directly above is the commonest mistake
+    (the ``TIER-C-CHECK: none`` line left out), and it must be refused loudly rather than read as a
+    decision.
+    """
+    lines = _lines_above_last_next(body)
+    if not lines:
+        return False
+    return any(_HUMAN_TASK_ANNOUNCE_RE.match(line) for line in lines[-2:])
+
+
+def _operator_task_line(body: str) -> str | None:
+    """The work on the task line two lines above the final ``NEXT:``, or ``None``.
+
+    The position is the template's (D4''' item 4): the task, then ``TIER-C-CHECK: none``, then the
+    ``NEXT:``. The keyword follows the body's final ``NEXT:`` token: ``HUMAN-TASK:`` above
+    ``NEXT: human`` (the current form), ``OPERATOR-TASK:`` above ``NEXT: operator`` (the retired
+    one). A task line quoted anywhere else in the body does not count, for the same reason the
+    ``TIER-C:`` / ``STOP:`` readers look at one fixed line.
+    """
+    lines = _lines_above_last_next(body)
+    if lines is None or len(lines) < 2:
         return None
-    match = _OPERATOR_TASK_RE.match(lines[-3])
+    token = parse_next_token(body)
+    pattern = (
+        _HUMAN_TASK_RE
+        if token is not None and token.casefold() == HUMAN_TOKEN
+        else _OPERATOR_TASK_RE
+    )
+    match = pattern.match(lines[-2])
     return match.group("task") if match is not None else None
 
 
-def _check_operator(body: str, handoff: Handoff) -> Handoff:
-    """D6'''': accept a ``NEXT: operator`` only in its 3-line form; otherwise stand down.
+def _check_operator(
+    body: str,
+    handoff: Handoff,
+    *,
+    posted_at: datetime | None = None,
+    operator_malformed_after: datetime | None = None,
+) -> Handoff:
+    """D6'''': accept a request for work by hand only in its 3-line form; otherwise stand down.
 
-    The order is fixed (msg-5428): a Tier-C declaration anywhere in the message is checked first,
-    so a contradictory message is reported as the contradiction, never as a missing line. There is
-    no ``decided <msg-ref>`` form (msg-5425 / msg-5426): an agent cannot claim that a human already
-    approved Tier-C work. Tier-C work goes to ``NEXT: human``.
+    **Retirement first** (msg-8941 §2 / msg-8943 §2): when :data:`OPERATOR_MALFORMED_AFTER` (or
+    the explicit ``operator_malformed_after``) is set, a handoff whose token is the retired
+    ``operator`` word, posted at or after the cutoff or at an unknown time, is MALFORMED
+    (:attr:`MalformedHandoff.OPERATOR_RETIRED`) before any of the form checks below. Both callers
+    in :func:`resolve_handoff` reach here -- the body form before reconciliation, the field-only
+    form after it -- so neither can stand down on ``NO_TASK`` around the retirement. The token
+    condition is what keeps the ``HUMAN-TASK:`` form (token ``human``) and a plain ``NEXT: human``
+    out of it: both carry or may carry :attr:`HumanAsk.OPERATOR_WORK` too.
+
+    Then the order is fixed (msg-5428): a Tier-C declaration anywhere in the message is checked
+    first, so a contradictory message is reported as the contradiction, never as a missing line.
+    There is no ``decided <msg-ref>`` form (msg-5425 / msg-5426): an agent cannot claim that a human
+    already approved Tier-C work. Tier-C work goes to ``NEXT: human``.
     """
+    if (
+        handoff.human_ask is HumanAsk.OPERATOR_WORK
+        and handoff.token is not None
+        and handoff.token.casefold() == OPERATOR_TOKEN
+        and _operator_after_cutoff(posted_at, operator_malformed_after)
+    ):
+        return Handoff(
+            HandoffKind.ABSENT, token=handoff.token, malformed=MalformedHandoff.OPERATOR_RETIRED
+        )
     task = _operator_task_line(body)
     fault: OperatorFault | None = None
     if declares_tier_c(body):
@@ -1260,8 +1464,19 @@ def resolve_handoff(
     accept_new_forms: bool | None = None,
     posted_at: datetime | None = None,
     none_malformed_after: datetime | None = None,
+    operator_malformed_after: datetime | None = None,
 ) -> Handoff:
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
+
+    **The operator cutoff** (``posted_at`` / ``operator_malformed_after``, default
+    :data:`OPERATOR_MALFORMED_AFTER`): a ``NEXT: operator`` -- body or field -- is ``ABSENT`` with
+    :attr:`MalformedHandoff.OPERATOR_RETIRED` when that cutoff is set and the message was posted at
+    or after it, or at an unknown time. Decided in :func:`_check_operator`, ahead of its form
+    checks. With no cutoff (PR-1 ships ``None``) nothing changes.
+
+    **The ``HUMAN-TASK:`` form**: a final ``NEXT: human`` with a ``HUMAN-TASK`` line in one of the
+    two slots above it resolves to ``HUMAN`` with :attr:`HumanAsk.OPERATOR_WORK` and is checked by
+    :func:`_check_operator` exactly as the retired operator form was.
 
     **Boundary 5** (``posted_at`` / ``none_malformed_after``, default :data:`NONE_MALFORMED_AFTER`):
     a handoff that would resolve to a legacy ``NONE`` -- a body or field ``none``, outside the
@@ -1334,8 +1549,13 @@ def resolve_handoff(
         # field turned this into a quiet TARGET_DIVERGENCE park instead, the head would never
         # move and every tick would relaunch the same head. A well-formed body still reconciles
         # against the field as before (head_skip SKIPs it, so a quiet park is safe there).
-        checked = _check_operator(body, body_handoff)
-        if checked.operator_fault is not None:
+        checked = _check_operator(
+            body,
+            body_handoff,
+            posted_at=posted_at,
+            operator_malformed_after=operator_malformed_after,
+        )
+        if checked.operator_fault is not None or checked.malformed is not None:
             return checked
     field_value = next_participant.strip() if next_participant is not None else ""
     if not field_value:
@@ -1343,7 +1563,12 @@ def resolve_handoff(
     else:
         resolved = _reconcile(_resolve_field(field_value, roster), body_handoff)
     if resolved.human_ask is HumanAsk.OPERATOR_WORK:
-        resolved = _check_operator(body, resolved)
+        resolved = _check_operator(
+            body,
+            resolved,
+            posted_at=posted_at,
+            operator_malformed_after=operator_malformed_after,
+        )
     if resolved.kind is HandoffKind.NONE:
         # STOP: disposition (Slice 1, measurement only). Attached AFTER reconciliation so a
         # field-driven NONE whose body also says `NEXT: none` keeps the body's STOP line instead
@@ -1419,6 +1644,14 @@ def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=raw)
     folded = token.casefold()
+    if folded == HUMAN_TOKEN and _human_task_announced(body):
+        # The HUMAN-TASK form (msg-8874 D1-1): work by hand, asked of the human. It is the
+        # successor of ``NEXT: operator`` and resolves the way that did -- ``OPERATOR_WORK``,
+        # checked once after reconciliation by :func:`_check_operator` -- so it parks in the
+        # operator-work lane and is not a Tier-C entry: ``author_requested_human`` stays False
+        # (the Decider / Tier-C admission read that fact for decisions only) and no
+        # ``tier_c_label`` is read (the line above is ``TIER-C-CHECK: none`` by construction).
+        return Handoff(HandoffKind.HUMAN, token=token, human_ask=HumanAsk.OPERATOR_WORK)
     if folded == HUMAN_TOKEN:
         # C (msg-890 §3): look 1 line above the final NEXT: for a TIER-C: <label> and attach it
         # as a non-blocking measurement tag. Absence is also observable — Handoff.tier_c_label
@@ -1528,6 +1761,11 @@ def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
         )
     if body_handoff.kind is HandoffKind.ABSENT:
         return field_handoff
+    if _is_plain_human(field_handoff) and _is_human_task(body_handoff):
+        # A ``human`` field over a body in the HUMAN-TASK form names the same person and asks for
+        # the same thing: the field cannot spell the form (it is one word), so the body's reading
+        # -- the request for work by hand -- is the one kept.
+        return body_handoff
     if _same_target(field_handoff, body_handoff):
         return field_handoff
     return Handoff(
@@ -1535,6 +1773,21 @@ def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
         token=field_handoff.token,
         mismatch_reason=MismatchReason.TARGET_DIVERGENCE,
         mismatch_body_token=body_handoff.token,
+    )
+
+
+def _is_plain_human(handoff: Handoff) -> bool:
+    """A ``human`` handoff that asks for a decision (no :attr:`Handoff.human_ask`)."""
+    return handoff.kind is HandoffKind.HUMAN and handoff.human_ask is None
+
+
+def _is_human_task(handoff: Handoff) -> bool:
+    """A body handoff in the HUMAN-TASK form: ``OPERATOR_WORK`` under the ``human`` token."""
+    return (
+        handoff.kind is HandoffKind.HUMAN
+        and handoff.human_ask is HumanAsk.OPERATOR_WORK
+        and handoff.token is not None
+        and handoff.token.casefold() == HUMAN_TOKEN
     )
 
 
@@ -1640,7 +1893,18 @@ OPERATOR_FORM_EXAMPLE = (
     f"{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}\n"
     f"NEXT: {OPERATOR_TOKEN}"
 )
-_OPERATOR_FORM_INDENTED = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+# The successor form (msg-8874 D1-1). The protocol text and the stand-down notices teach this one;
+# OPERATOR_FORM_EXAMPLE above stays as the description of the retired form that is still read
+# (history, and new posts until the cutoff). A test feeds this example through
+# :func:`resolve_handoff` and requires ``HumanAsk.OPERATOR_WORK``, as for the old one.
+HUMAN_TASK_FORM_EXAMPLE = (
+    f"{HUMAN_TASK_KEYWORD}: <the concrete work, one line>\n"
+    f"{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}\n"
+    f"NEXT: {HUMAN_TOKEN}"
+)
+_HUMAN_TASK_FORM_INDENTED = "\n".join(
+    f"    {line}" for line in HUMAN_TASK_FORM_EXAMPLE.splitlines()
+)
 
 # T-done-disposition-auto-close boundary 3 (Bohr msg-8328 §2 3-D): the two terminal forms the
 # protocol teaches, replacing Slice 3's ``STOP:`` line above ``NEXT: none``. Like
@@ -1697,9 +1961,10 @@ or, when the work this thread exists for is finished, the settle line `STOP: {ST
 `<name>` is either another participant's persona name (spelled exactly as it \
 appears as a message author in this thread — the persona name, not a role name: \
 write the name of the persona who holds the implementer role here, not \
-`implementer`) or one of three reserved words:
+`implementer`) or one of two reserved words:
 
-  - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision. Tier-C \
+  - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision, or (in the \
+three-line form below) for work only a person can do by hand. Tier-C \
 is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything else is NOT \
 Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
 to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
@@ -1710,17 +1975,18 @@ gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proc
   - `NEXT: {NONE_TOKEN}` — still accepted, but do NOT write it any more (with or without a \
 `STOP:` line above it). It will be refused as malformed once the legacy forms are retired. \
 Write one of the two forms below instead.
-  - `NEXT: {OPERATOR_TOKEN}` — a person has to do work by hand, and that work is none \
-of the Tier-C types defined above. It is not a way to ask for a decision. Tier-C \
-comes first: if the work is, or could be, any of those types, hand it to \
-`{HUMAN_TOKEN}` as a Tier-C decision instead, never `NEXT: {OPERATOR_TOKEN}`. \
-Use exactly these three lines at the end of your reply:
 
-{_OPERATOR_FORM_INDENTED}
+`NEXT: {OPERATOR_TOKEN}` is retired: do NOT write it (it will be refused as malformed). When a \
+person has to do work by hand, and that work is none of the Tier-C types defined above, end \
+your reply with exactly these three lines instead. It is not a way to ask for a decision. \
+Tier-C comes first: if the work is, or could be, any of those types, hand it to \
+`{HUMAN_TOKEN}` as a Tier-C decision instead, without the `{HUMAN_TASK_KEYWORD}:` line.
 
-A `NEXT: {OPERATOR_TOKEN}` without the `{OPERATOR_TASK_KEYWORD}:` line, without \
-`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` directly above it, or in a reply that \
-also declares a Tier-C type, is refused and the conductor stops.
+{_HUMAN_TASK_FORM_INDENTED}
+
+A `{HUMAN_TASK_KEYWORD}:` line with no work after it, without \
+`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` between it and the `NEXT: {HUMAN_TOKEN}`, or in \
+a reply that also declares a Tier-C type, is refused and the conductor stops.
 
 When nobody acts next on this thread, say why with one of these two forms:
 
@@ -1857,10 +2123,10 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     ),
     # T-naysayer-omits-tierc-label (Bohr msg-6658 spec, Einstein msg-6657 / go): D1 — `human` only
     # for a Tier-C type, labelled, with the shared label guidance; D2'-b — the TIER-C-CHECK is the
-    # Tier-C types and nothing else (manual work goes to `NEXT: operator`, an unsettled conflict is
-    # no longer a human condition); D2'-a / D2'-c — a non-Tier-C objection still unsettled after two
-    # hand-backs is recorded as `Unresolved objection:` and the design goes to the implementer, so
-    # an advisory role cannot stall the thread by handing back forever (Einstein msg-6655).
+    # Tier-C types and nothing else (manual work goes to the HUMAN-TASK form, an unsettled conflict
+    # is no longer a human condition); D2'-a / D2'-c — a non-Tier-C objection still unsettled after
+    # two hand-backs is recorded as `Unresolved objection:` and the design goes to the implementer,
+    # so an advisory role cannot stall the thread by handing back forever (Einstein msg-6655).
     # D6-a (Bohr msg-6684 after PR-gate msg-6663's weakest point, endorsed by Einstein msg-6685):
     # that bound applies only to a NON-Tier-C objection. D6-b' (Bohr msg-6694, replacing D6-b after
     # PR-gate's blocking finding on #469; endorsed by Einstein): a Tier-C objection may be handed
@@ -1893,7 +2159,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"decision: {_NAYSAYER_CHECK_PROSE}. If any of those applies, hand to the human instead, "
         "with that type as the label. Without the check line the conductor does not build "
         "autonomously — it routes your go to the human. Work that only a person can do by hand is "
-        f"not Tier-C: use the `NEXT: {OPERATOR_TOKEN}` form above for it. Hand to `{HUMAN_TOKEN}` "
+        f"not Tier-C: use the `{HUMAN_TASK_KEYWORD}:` form above for it. Hand to `{HUMAN_TOKEN}` "
         f"only when the matter is one of the {_TIER_C_COUNT_WORD} Tier-C types, and name the type "
         "on the line directly above your handoff, e.g.:\n\n"
         f"    TIER-C: {require_admitted('irreversible', where='handoff example')}\n"
@@ -1994,7 +2260,8 @@ def build_roster_notice(roster: Mapping[str, Role]) -> str | None:
 
     The text lives here, beside :func:`build_handoff_protocol_block`, so the vocabulary the prompt
     teaches and the vocabulary the parser accepts come from one file (msg-8594 Obj-2-2). The
-    reserved words are named one by one (``HUMAN_TOKEN`` / ``OPERATOR_TOKEN``), never derived from
+    reserved words are named one by one (``HUMAN_TOKEN``; the retired ``OPERATOR_TOKEN`` is no
+    longer taught, T-retire-operator-identity-and-scope-next-fermi), never derived from
     the set the parser accepts: that set still holds the retired ``NONE_TOKEN``, and a future
     deprecated word added to it must not reach the prompt by default (msg-8594 Obj-2-1).
 
@@ -2006,8 +2273,8 @@ def build_roster_notice(roster: Mapping[str, Role]) -> str | None:
     participants = ", ".join(f"{identity} = {role.value}" for identity, role in roster.items())
     return (
         f"Participants of this thread: {participants}.\n"
-        f"A NEXT: line names exactly one of these names, or a reserved word "
-        f"({HUMAN_TOKEN} / {OPERATOR_TOKEN}). No other name resolves."
+        f"A NEXT: line names exactly one of these names, or the reserved word "
+        f"{HUMAN_TOKEN}. No other name resolves."
     )
 
 
@@ -2082,11 +2349,15 @@ __all__ = [
     "ACCEPT_NEW_FORMS",
     "BLOCKED_ON_EXAMPLE",
     "BLOCKED_ON_KEYWORD",
+    "FERMI_IDENTITY",
+    "HUMAN_TASK_FORM_EXAMPLE",
+    "HUMAN_TASK_KEYWORD",
     "HUMAN_TOKEN",
     "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
     "NONE_MALFORMED_AFTER",
     "NONE_TOKEN",
     "OPERATOR_FORM_EXAMPLE",
+    "OPERATOR_MALFORMED_AFTER",
     "OPERATOR_TASK_KEYWORD",
     "OPERATOR_TOKEN",
     "PR_REVIEW_TOKEN",
@@ -2112,12 +2383,15 @@ __all__ = [
     "conditional_proceed_notice",
     "declares_no_tier_c",
     "declares_tier_c",
+    "human_task_refused",
     "malformed_notice",
     "none_refused_after_cutoff",
+    "operator_refused_after_cutoff",
     "parse_next_token",
     "posted_at_of",
     "refused_by_terminal_form",
     "resolve_handoff",
+    "scope_fermi_handoff",
     "settles_by_terminal_form",
     "terminal_form_roster_free",
     "terminal_form_view",
