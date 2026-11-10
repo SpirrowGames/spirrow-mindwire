@@ -200,7 +200,7 @@ ADR 番号 `21` は、`spec/adr_index.yaml` の既存最大連番が `20`（ADR-
 ### 7.1 何が変わるか
 
 - D-3「`NEXT: Fermi` は `NEXT: human` と同じ停止」は、**スレッドの owner（`thread.owner`）が Fermi のときだけ**成り立つ。owner の比較は ADR-2026-05-29-11 の partition キーで行う（`fermi` / `Fermi` は同じ）。
-- owner が Fermi でないスレッド、または owner を読めなかったスレッドで `NEXT:` が Fermi を指したとき（本文の `NEXT: Fermi`、または構造化フィールド `next_participant=Fermi`）は、Conductor は spawn 不能の停止ではなく **malformed handoff**（reason `fermi_outside_own_thread`）として止まり、notice を投稿する。notice は「人の判断なら `NEXT: human`、人の手作業なら `HUMAN-TASK:` の 3 行形式」で書き直すよう案内し、`NEXT: human` で終わる。
+- owner が Fermi でないスレッド、または owner を読めなかったスレッドで `NEXT:` が Fermi を指したとき（本文の `NEXT: Fermi`、または構造化フィールド `next_participant=Fermi`）は、Conductor は spawn 不能の停止ではなく **malformed handoff**（reason `fermi_outside_own_thread`）として止まり、notice を投稿する。本文と構造化フィールドが食い違う場合も、**どちらか一方でも** Fermi を指していれば同じ扱いとする（本文と field を突き合わせた後の宛先ではなく、両側の元の宛先で判定する。突き合わせ後は Fermi が `human` などに置き換わって見えなくなるため）。notice は「人の判断なら `NEXT: human`、人の手作業なら `HUMAN-TASK:` の 3 行形式」で書き直すよう案内し、`NEXT: human` で終わる。
 - `NEXT: human` への**黙った読み替えはしない**。読み替えると書き手の誤りが消え、Fermi の受け皿と人の受け皿のどちらに積むべき依頼だったかも見えなくなる（msg-8874 D2）。
 - 強制点は Conductor の 1 箇所だけ（`conductor/handoff.py` の `scope_fermi_handoff`、`conductor/core.py` で routing に使う handoff へ適用）。magickit の `next_participant` 検証には入れない（本文の `NEXT:` 行が正本、強制点を 1 箇所に保つ）。
 

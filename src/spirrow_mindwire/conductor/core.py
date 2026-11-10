@@ -934,7 +934,15 @@ class Conductor:
             # the handoff every branch below reads, so the refusal reaches ``_route`` as a
             # malformed head -- stopped, with its notice, ahead of the spawnability check that
             # would otherwise park it as an ordinary spawn-blocked stop.
-            handoff = scope_fermi_handoff(handoff, thread_owner=self._thread_owner)
+            # Both raw sides go in with the reconciled handoff: a Fermi named on either side is
+            # refused even when reconciliation made the target something else (PR #562 gate,
+            # finding 1).
+            handoff = scope_fermi_handoff(
+                handoff,
+                thread_owner=self._thread_owner,
+                body=_content(latest),
+                next_participant=_next_participant(latest),
+            )
             # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
             # HUMAN (safety valve) and carries the divergence so we can log it as observability
             # BEFORE the routing decision below acts on the escalated kind. Recording is loud and

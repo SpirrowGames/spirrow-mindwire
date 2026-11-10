@@ -382,34 +382,89 @@ async def test_two_ticks_launch_once_and_post_one_notice(
 # -------------------------------------------------------------------------------- D2: Fermi
 
 
+def _scoped(body: str, field: str | None, owner: str | None) -> tuple[Handoff, Handoff]:
+    """The handoff the conductor resolves, and what the D2 scope makes of it (core.py's call)."""
+    handoff = resolve_handoff(body, _ROSTER, next_participant=field)
+    return handoff, scope_fermi_handoff(
+        handoff, thread_owner=owner, body=body, next_participant=field
+    )
+
+
+# Fermi named on one side or both. The last five disagree with the other side (PR #562 gate,
+# finding 1). In the first three of those, reconciliation alone hides Fermi: Fermi is not on the
+# roster, so a body Fermi resolves ABSENT and any resolvable field -- ``human``, a persona, a
+# ``pr-review`` -- wins quietly over it. The last two -- a Fermi
+# field over another body target -- kept Fermi as the reconciled token already; they are here so
+# that stays true by the scope's own reading of the field, not by _reconcile's choice of token.
+_FERMI_REQUESTS = [
+    ("x\n\nNEXT: Fermi", None),
+    ("x\n\nNEXT: fermi (確認)", None),
+    (FIELD_ONLY_BODY, "Fermi"),
+    ("x\n\nNEXT: Fermi", "Fermi"),
+    ("x\n\nNEXT: Fermi", "human"),
+    ("x\n\nNEXT: Fermi", "Bohr"),
+    ("x\n\nNEXT: Fermi", "pr-review a/b#1"),
+    ("x\n\nNEXT: Bohr", "Fermi"),
+    (PLAIN_HUMAN, "Fermi"),
+]
+_HIDDEN_BY_RECONCILIATION = _FERMI_REQUESTS[4:7]
+
+
 @pytest.mark.parametrize("owner", ["Fermi", "fermi", "FERMI"])
-def test_fermi_on_a_fermi_thread_is_unchanged(owner: str) -> None:
-    for handoff in (
-        resolve_handoff("x\n\nNEXT: Fermi", _ROSTER),
-        resolve_handoff(FIELD_ONLY_BODY, _ROSTER, next_participant="Fermi"),
-    ):
-        assert scope_fermi_handoff(handoff, thread_owner=owner) == handoff
+@pytest.mark.parametrize(("body", "field"), _FERMI_REQUESTS)
+def test_fermi_on_a_fermi_thread_is_unchanged(owner: str, body: str, field: str | None) -> None:
+    handoff, scoped = _scoped(body, field, owner)
+    assert scoped == handoff
 
 
 @pytest.mark.parametrize("owner", ["Bohr", "operator", "human", "", None])
-def test_fermi_elsewhere_is_malformed(owner: str | None) -> None:
-    for handoff in (
-        resolve_handoff("x\n\nNEXT: Fermi", _ROSTER),
-        resolve_handoff("x\n\nNEXT: fermi (確認)", _ROSTER),
-        resolve_handoff(FIELD_ONLY_BODY, _ROSTER, next_participant="Fermi"),
-    ):
-        got = scope_fermi_handoff(handoff, thread_owner=owner)
-        assert got.kind is HandoffKind.ABSENT
-        assert got.malformed is MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD
+@pytest.mark.parametrize(("body", "field"), _FERMI_REQUESTS)
+def test_fermi_elsewhere_is_malformed(owner: str | None, body: str, field: str | None) -> None:
+    _, scoped = _scoped(body, field, owner)
+    assert scoped.kind is HandoffKind.ABSENT
+    assert scoped.malformed is MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD
+
+
+def test_the_disagreement_cases_really_lose_fermi_in_reconciliation() -> None:
+    """Pins why the raw sides are read: the reconciled handoff alone no longer names Fermi."""
+    for body, field in _HIDDEN_BY_RECONCILIATION:
+        handoff = resolve_handoff(body, _ROSTER, next_participant=field)
+        target = handoff.identity or handoff.token or ""
+        assert handoff.kind is HandoffKind.PR_REVIEW or target.casefold() != "fermi", (body, field)
+    # The worst of them: Fermi is not on the roster, so the body resolves ABSENT and a ``human``
+    # field wins quietly -- reading as the author's own request of the human, exactly the silent
+    # reinterpretation §7.1 forbids. The scope refuses it instead.
+    handoff = resolve_handoff("x\n\nNEXT: Fermi", _ROSTER, next_participant="human")
+    assert handoff.kind is HandoffKind.HUMAN and handoff.author_requested_human
 
 
 @pytest.mark.parametrize(
     "body", ["x\n\nNEXT: Bohr", PLAIN_HUMAN, HUMAN_TASK, "x\n\nNEXT: pr-review a/b#1", "x"]
 )
-def test_other_targets_are_not_scoped(body: str) -> None:
-    handoff = resolve_handoff(body, _ROSTER)
-    assert scope_fermi_handoff(handoff, thread_owner="Bohr") == handoff
-    assert scope_fermi_handoff(handoff, thread_owner=None) == handoff
+@pytest.mark.parametrize("field", [None, "Bohr", "human"])
+def test_other_targets_are_not_scoped(body: str, field: str | None) -> None:
+    for owner in ("Bohr", None):
+        handoff, scoped = _scoped(body, field, owner)
+        assert scoped == handoff
+
+
+def test_an_earlier_fermi_line_is_not_the_handoff() -> None:
+    """Only the last ``NEXT:`` line is the request, here as in the resolver."""
+    handoff, scoped = _scoped("x\nNEXT: Fermi\nlater\n\nNEXT: Bohr", None, "Bohr")
+    assert scoped == handoff and handoff.kind is HandoffKind.ROLE
+
+
+def test_an_existing_refusal_is_kept() -> None:
+    """A head already refused keeps its own notice; a Fermi field does not replace it."""
+    handoff, scoped = _scoped("x\n\nNEXT: operator", "Fermi", "Bohr")
+    assert handoff.kind is HandoffKind.ABSENT and handoff.operator_fault is OperatorFault.NO_TASK
+    assert scoped == handoff
+
+
+def test_a_bad_field_does_not_hide_a_fermi_body() -> None:
+    """An unresolvable field escalates to HUMAN; the body's Fermi is still refused."""
+    _, scoped = _scoped("x\n\nNEXT: Fermi", "no-such-persona", "Bohr")
+    assert scoped.malformed is MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD
 
 
 class _OwnedChatroomMcp(_FakeChatroomMcp):
@@ -439,7 +494,18 @@ async def test_the_conductor_keeps_the_spawn_blocked_stop_on_a_fermi_thread() ->
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("owner", ["Bohr", None])
-@pytest.mark.parametrize(("body", "field"), [("x\n\nNEXT: Fermi", None), ("x", "Fermi")])
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        ("x\n\nNEXT: Fermi", None),
+        ("x", "Fermi"),
+        # Disagreement (PR #562 gate, finding 1): reconciliation would make each of these a HUMAN
+        # or a Bohr handoff, so only reading the raw sides catches the Fermi in them.
+        ("x\n\nNEXT: Fermi", "human"),
+        ("x\n\nNEXT: Fermi", "Bohr"),
+        ("x\n\nNEXT: Bohr", "Fermi"),
+    ],
+)
 async def test_the_conductor_refuses_fermi_outside_its_thread(
     owner: str | None, body: str, field: str | None
 ) -> None:

@@ -1071,24 +1071,54 @@ def human_task_refused(body: str) -> bool:
     return resolve_handoff(body, {}).operator_fault is not None
 
 
-def scope_fermi_handoff(handoff: Handoff, *, thread_owner: str | None) -> Handoff:
+def scope_fermi_handoff(
+    handoff: Handoff,
+    *,
+    thread_owner: str | None,
+    body: str,
+    next_participant: str | None,
+) -> Handoff:
     """D2 (msg-8871): a handoff to Fermi is valid only on a thread Fermi owns.
 
-    The target is read the way the spawnability check reads it (``identity``, else ``token``), so a
-    body ``NEXT: Fermi`` and a field-only ``next_participant=Fermi`` are both caught; Fermi is not
-    a roster participant, so either resolves with ``Fermi`` only in ``token``. The owner is
-    compared on ADR-2026-05-29-11 keys. An owner that could not be read (``None`` / empty) is
-    treated as not Fermi: both outcomes stop at a person, so failing closed costs one notice.
+    A Fermi request is looked for in three places, so that reconciling the body against the
+    structured field cannot hide one (PR #562 gate, finding 1):
+
+    - the resolved target (``identity``, else ``token`` -- the way the spawnability check reads
+      it), which catches a body ``NEXT: Fermi`` and a field-only ``next_participant=Fermi``
+      (Fermi is not a roster participant, so either resolves with ``Fermi`` only in ``token``);
+    - the body's own last ``NEXT:`` name, *before* reconciliation -- Fermi is not on the roster,
+      so a body ``NEXT: Fermi`` resolves ``ABSENT`` and any resolvable field (``human``, a
+      persona, a ``pr-review``) wins over it quietly. Under a ``human`` field that is worse than
+      a lost target: it reads as the author's own request of the human, the silent
+      reinterpretation msg-8874 D2 forbids;
+    - the field's own name, before reconciliation. A Fermi field over another body target already
+      kept ``Fermi`` as the reconciled ``token`` (a ``FIELD_UNRESOLVABLE`` escalation); reading the
+      field directly makes that a property of this function, not of :func:`_reconcile`'s choice.
+
+    ``body`` and ``next_participant`` are therefore required: the two raw sides are what the
+    message said, and :func:`resolve_handoff`'s answer is only what it made of them. Both are read
+    with the resolver's own name reader (:func:`parse_next_token` / :func:`_name_from_raw`), so a
+    ``NEXT: fermi (確認)`` gloss reads the same here as there.
+
+    The owner is compared on ADR-2026-05-29-11 keys. An owner that could not be read (``None`` /
+    empty) is treated as not Fermi: both outcomes stop at a person, so failing closed costs one
+    notice. A handoff that is already refused (malformed, or an operator-form stand-down) keeps
+    its own refusal and notice.
 
     A refused handoff is ``ABSENT`` with :attr:`MalformedHandoff.FERMI_OUTSIDE_OWN_THREAD`, which
     the conductor stops on with the malformed notice -- never silently rewritten to ``NEXT: human``,
     which would hide the author's mistake and misfile the request (msg-8874 D2).
     """
-    if handoff.kind in (HandoffKind.NONE, HandoffKind.PR_REVIEW) or handoff.malformed is not None:
+    if handoff.malformed is not None or handoff.operator_fault is not None:
         return handoff
     fermi = normalize_identity_key(FERMI_IDENTITY)
-    target = handoff.identity or handoff.token or ""
-    if not target or normalize_identity_key(target) != fermi:
+    candidates: list[str | None] = [parse_next_token(body)]
+    field_value = next_participant.strip() if next_participant is not None else ""
+    if field_value:
+        candidates.append(_name_from_raw(field_value))
+    if handoff.kind not in (HandoffKind.NONE, HandoffKind.PR_REVIEW):
+        candidates.append(handoff.identity or handoff.token)
+    if not any(c and normalize_identity_key(c) == fermi for c in candidates):
         return handoff
     if thread_owner and normalize_identity_key(thread_owner) == fermi:
         return handoff
@@ -1976,7 +2006,8 @@ gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proc
 `STOP:` line above it). It will be refused as malformed once the legacy forms are retired. \
 Write one of the two forms below instead.
 
-`NEXT: {OPERATOR_TOKEN}` is retired: do NOT write it (it will be refused as malformed). When a \
+`NEXT: {OPERATOR_TOKEN}` is retired: do NOT write it (it is still read, but will be refused as \
+malformed once its retirement cutoff is set). When a \
 person has to do work by hand, and that work is none of the Tier-C types defined above, end \
 your reply with exactly these three lines instead. It is not a way to ask for a decision. \
 Tier-C comes first: if the work is, or could be, any of those types, hand it to \
