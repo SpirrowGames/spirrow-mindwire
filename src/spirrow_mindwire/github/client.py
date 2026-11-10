@@ -696,6 +696,36 @@ class GitHubReviewClient(Protocol):
     async def aclose(self) -> None: ...
 
 
+def _review_infos_from_rows(rows: list[Any]) -> list[ReviewInfo]:
+    """Decode one page of ``GET /pulls/{n}/reviews`` rows into :class:`ReviewInfo`.
+
+    Pure row decoder shared by every reviews reader (fail-soft, strict, coverage-strict),
+    so the field mapping lives in one place while each reader keeps its own HTTP failure
+    contract (DESIGN v3 §3). Non-dict rows are skipped.
+    """
+    out: list[ReviewInfo] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        user = row.get("user")
+        login = str(user.get("login") or "") if isinstance(user, dict) else ""
+        cid = row.get("commit_id")
+        submitted = row.get("submitted_at")
+        rid = row.get("id")
+        body = row.get("body")
+        out.append(
+            ReviewInfo(
+                login=login,
+                state=str(row.get("state") or ""),
+                commit_id=str(cid) if cid else None,
+                submitted_at=str(submitted) if submitted else None,
+                review_id=str(rid) if rid is not None else None,
+                body=body if isinstance(body, str) else None,
+            )
+        )
+    return out
+
+
 class GitHubClient:
     """Thin async client over the GitHub REST API (diff fetch + review submit).
 
@@ -1535,24 +1565,7 @@ class GitHubClient:
                 return []
             if not isinstance(rows, list) or not rows:
                 break
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                user = row.get("user")
-                login = str(user.get("login") or "") if isinstance(user, dict) else ""
-                cid = row.get("commit_id")
-                submitted = row.get("submitted_at")
-                rid = row.get("id")
-                out.append(
-                    ReviewInfo(
-                        login=login,
-                        state=str(row.get("state") or ""),
-                        commit_id=str(cid) if cid else None,
-                        submitted_at=str(submitted) if submitted else None,
-                        review_id=str(rid) if rid is not None else None,
-                        body=row.get("body") if isinstance(row.get("body"), str) else None,
-                    )
-                )
+            out.extend(_review_infos_from_rows(rows))
             if len(rows) < 100:
                 break
             page += 1
@@ -1606,24 +1619,7 @@ class GitHubClient:
                 ) from exc
             if not isinstance(rows, list) or not rows:
                 break
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                user = row.get("user")
-                login = str(user.get("login") or "") if isinstance(user, dict) else ""
-                cid = row.get("commit_id")
-                submitted = row.get("submitted_at")
-                rid = row.get("id")
-                out.append(
-                    ReviewInfo(
-                        login=login,
-                        state=str(row.get("state") or ""),
-                        commit_id=str(cid) if cid else None,
-                        submitted_at=str(submitted) if submitted else None,
-                        review_id=str(rid) if rid is not None else None,
-                        body=row.get("body") if isinstance(row.get("body"), str) else None,
-                    )
-                )
+            out.extend(_review_infos_from_rows(rows))
             if len(rows) < 100:
                 break
             page += 1
@@ -1932,25 +1928,7 @@ class GitHubClient:
             rows = await self._get_rows_strict(path, page, what="reviews coverage strict")
             if not rows:
                 break
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                user = row.get("user")
-                login = str(user.get("login") or "") if isinstance(user, dict) else ""
-                cid = row.get("commit_id")
-                submitted = row.get("submitted_at")
-                rid = row.get("id")
-                body = row.get("body")
-                out.append(
-                    ReviewInfo(
-                        login=login,
-                        state=str(row.get("state") or ""),
-                        commit_id=str(cid) if cid else None,
-                        submitted_at=str(submitted) if submitted else None,
-                        review_id=str(rid) if rid is not None else None,
-                        body=body if isinstance(body, str) else None,
-                    )
-                )
+            out.extend(_review_infos_from_rows(rows))
             if len(rows) < 100:
                 break
             page += 1
