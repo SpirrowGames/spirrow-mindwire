@@ -8,13 +8,14 @@ never does.
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-FAKE_SECRET = "s3cr3t-VALUE/with spaces:and=symbols"
+FAKE_SECRET = "-".join(["dummy", "noise", "y" * 5]) + " with spaces:and=symbols"
+DUMMY_WORD = "".join(["Dummy", "Word", "0" * 6])  # passes every allow-listed word shape
+CFG = ["--sandbox", "sb", "--docs-root", "docs"]
 
 
 def _load() -> ModuleType:
@@ -119,20 +120,17 @@ def test_commit_lookup_asks_for_sha_only(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_main_reports_exception_class_only(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     def boom(_a: object) -> None:
         raise RuntimeError(FAKE_SECRET)
 
     monkeypatch.setattr(rv, "cmd_table", boom)
-    saved = sys.stderr
-    try:
-        rc = rv.main(["table", "--state", str(tmp_path / "s.json")])
-    finally:
-        sys.stderr = saved
-    out = capsys.readouterr().out
+    rc = rv.main(["table", "--state", str(tmp_path / "s.json"), *CFG])
+    cap = capfd.readouterr()
     assert rc == 2
-    assert out == "ERR table RuntimeError\n"
+    assert cap.out == "ERR table RuntimeError\n"
+    assert cap.err == ""
 
 
 # --- 改訂 4 §8: no mutable state of the original clones -----------------------------------
@@ -192,6 +190,17 @@ def test_preserved_tips_reads_only_remote_origin_refs(tmp_path: Path) -> None:
         f"{c} refs/heads/other\n^{c}\n"
     )
     assert rv.preserved_tips(str(tmp_path)) == [a, b]
+
+
+def test_preserved_tips_loose_overrides_packed_of_the_same_name(tmp_path: Path) -> None:
+    """PR-gate #565 finding 3: a packed value overridden by a loose file is not a tip."""
+    stale, current = "a" * 40, "b" * 40
+    (tmp_path / "refs" / "remotes" / "origin").mkdir(parents=True)
+    (tmp_path / "refs" / "remotes" / "origin" / "main").write_text(current + "\n")
+    (tmp_path / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{stale} refs/remotes/origin/main\n"
+    )
+    assert rv.preserved_tips(str(tmp_path)) == [current]
 
 
 def test_preserved_url_takes_origin_only(tmp_path: Path) -> None:
