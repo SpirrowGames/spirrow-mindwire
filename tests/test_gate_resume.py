@@ -748,12 +748,29 @@ async def test_conflict_route_verified_by_mergeable_not_by_ci_colour() -> None:
         review_login="gate",
     )
     assert verified.outcome is ResumeOutcome.VERIFIED
-    for state in (False, None):
-        contradicted = await verify_resume(
+    contradicted = await verify_resume(
+        candidate,
+        rollup_source=_Rollups(_rollup(*_RED, conflicting=False)),
+        review_source=None,
+        review_login="gate",
+    )
+    assert contradicted.outcome is ResumeOutcome.CONTRADICTED
+    assert contradicted.detail == "head_not_conflicting"
+
+
+@pytest.mark.anyio
+async def test_conflict_route_resume_with_mergeable_unknown_is_unavailable() -> None:
+    # UNKNOWN (GitHub still recomputing) is not evidence the conflict cleared: it must take the
+    # quiet-retry path, never the contradiction path (PR #563 gate objection 1).
+    candidate = resume_candidate(author=RELAY_AUTHOR, body=_conflict_body(), names_implementer=True)
+    assert candidate is not None
+    for colour in (_GREEN, _RED):
+        unknown = await verify_resume(
             candidate,
-            rollup_source=_Rollups(_rollup(*_RED, conflicting=state)),
+            rollup_source=_Rollups(_rollup(*colour, conflicting=None)),
             review_source=None,
             review_login="gate",
         )
-        assert contradicted.outcome is ResumeOutcome.CONTRADICTED
-        assert contradicted.detail == "head_not_conflicting"
+        assert unknown.outcome is ResumeOutcome.UNAVAILABLE
+        assert unknown.detail == "mergeable unknown"
+        assert unknown.pr_head == _SHA

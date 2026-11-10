@@ -32,7 +32,8 @@ outcome            when                                        what the conducto
                    SHA is red / (R1c) GitHub still says the
                    head is CONFLICTING
 ``UNAVAILABLE``    a read failed (network, rate limit, 5xx,    stop ``resume_retry``: post
-                   timeout, unparseable answer)                nothing, retry next tick
+                   timeout, unparseable answer), or (R1c)      nothing, retry next tick
+                   GitHub's mergeable is still UNKNOWN
 ``STALE``          the post's SHA is not the PR head (a newer   stop ``resume_retry``
                    push the thread has not caught up with)
 ``CONTRADICTED``   same SHA, but the facts disagree, or a       fall through to ``_route``
@@ -255,6 +256,12 @@ async def _verify_ci_route(
         if rollup.head_conflicting is True:
             return ResumeCheck(
                 outcome=ResumeOutcome.VERIFIED, detail="head conflicting", pr_head=pr_head
+            )
+        if rollup.head_conflicting is None:
+            # GitHub's mergeable is UNKNOWN (still recomputing): that is an observation that
+            # cannot yet verify the dispatch, not evidence the conflict cleared — retry quietly.
+            return ResumeCheck(
+                outcome=ResumeOutcome.UNAVAILABLE, detail="mergeable unknown", pr_head=pr_head
             )
         return ResumeCheck(
             outcome=ResumeOutcome.CONTRADICTED, detail="head_not_conflicting", pr_head=pr_head
