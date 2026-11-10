@@ -188,6 +188,11 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 # Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
 # D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
 $dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
+# PR-B (T-role-exit-leaves-clone-off-default-branch): one row per launch whose exit is not yet
+# confirmed. Written before each launch, its own row dropped after a confirmed exit; the sweep's
+# hold acknowledgement for a parked clone requires the project to have no row and no `*` sentinel.
+# See deploy/lib/InflightLedger.ps1.
+$inflightStatePath = Join-Path $dataDir "state\conductor-inflight.json"
 # PR-1b's retreat records (written by `mindwire clone-retreat`, CLONE_RETREAT_LOG_FILENAME). The
 # sweep only reads it, for the PR-2 dirty-clone alert's "latest retreat record" line.
 $cloneRetreatRecordsPath = Join-Path $dataDir "state\clone-retreats.jsonl"
@@ -271,6 +276,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
 # Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
 . (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
+# In-flight launch ledger + hold acknowledgement while a clone is parked (T-role-exit-leaves-clone-
+# off-default-branch PR-B): Read-/Update-InflightLedger, Add-/Remove-InflightMark,
+# Test-HoldAckViaParkWanted, Invoke-HoldAckViaPark. Calls Write-Log at call time.
+. (Join-Path $PSScriptRoot 'lib/InflightLedger.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -3242,10 +3251,20 @@ function Invoke-CloneCheck {
 # origin/<default> (or origin/develop). Then it switches to <default>, fast-forwards, and deletes the
 # local branch. Returns @{ code; row (the MINDWIRE_CLONE_RECOVER json text or ''); stderr }.
 # A probe that could not run or timed out reports code -1.
+# -Preserve (T-role-exit-leaves-clone-off-default-branch PR-A, Bohr msg-8698; launch end only):
+# also switches back a clean clone whose commits are not all on the remote (or a detached HEAD),
+# after keeping them on a LOCAL wip/<branch|detached-sha8>-<ts> ref. Nothing is pushed. The kept ref
+# is recorded in -StateDir\clone-retreats.jsonl for -ThreadId's next implementer turn.
 function Invoke-CloneRecover {
-    param([string]$RepoDir)
-    $r = Invoke-BoundedUvProbe -Label 'clone-recover' -TimeoutSeconds $CloneCheckTimeoutSeconds `
-        -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir)
+    param([string]$RepoDir, [switch]$Preserve, [string]$ThreadId = '', [string]$StateDir = '')
+    # Two literal call sites, so tests/test_bounded_probe_cli_contract.py checks each argv.
+    if ($Preserve) {
+        $r = Invoke-BoundedUvProbe -Label 'clone-recover-preserve' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir, '--preserve', '--thread-id', $ThreadId, '--state-dir', $StateDir)
+    } else {
+        $r = Invoke-BoundedUvProbe -Label 'clone-recover' -TimeoutSeconds $CloneCheckTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'clone-recover', '--repo-dir', $RepoDir)
+    }
     if (-not $r.ok) { return @{ code = -1; row = ''; stderr = "$($r.error)" } }
     $row = ''
     foreach ($line in @("$($r.stdout)" -split "`r?`n")) {
@@ -3284,9 +3303,17 @@ function Invoke-CloneRetreat {
 # make it. The one-line kinds are dirty-clone-retreated / dirty-clone-discarded thread=<id>
 # patch=<path> / dirty-clone-discard-incomplete thread=<id> marker=<name> patch=<path>; the full
 # row (with every git step's stderr) follows it so 4b stops can be investigated. Returns the outcome.
+# T-role-exit-leaves-clone-off-default-branch PR-A (G3, Bohr msg-8698): when the retreat says
+# not_eligible, $Recover (Invoke-CloneRecover -Preserve in production, a stub in tests) runs once,
+# right away. It changes the clone only for a clean wrong_head (its own guard decides that), so for
+# every other not_eligible it is a no-op. Whether the clone stays parked is still decided by
+# clone-check, as before. Returns 'recovered' (switched back, no commit to keep), 'preserved'
+# (switched back after keeping commits on a local wip/ ref, record written), 'recover_failed', or
+# 'not_eligible' when recover did nothing either.
 function Invoke-LaunchEndRetreat {
     param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
-          [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat)
+          [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
+          [scriptblock]$Recover = $null)
     if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
@@ -3300,7 +3327,11 @@ function Invoke-LaunchEndRetreat {
     $outcome = "$($p.outcome)"
     switch ($outcome) {
         'clean' { return 'clean' }
-        'not_eligible' { Write-Log "dirty-clone-retreat-skipped ${RepoDir}: thread=$ThreadId $($p.detail)"; return $outcome }
+        'not_eligible' {
+            Write-Log "dirty-clone-retreat-skipped ${RepoDir}: thread=$ThreadId $($p.detail)"
+            if ($null -eq $Recover) { return $outcome }
+            return (Invoke-LaunchEndRecover -RepoDir $RepoDir -ThreadId $ThreadId -StateDir $StateDir -Recover $Recover)
+        }
         'retreated' {
             $pushNote = if ($p.pushed) { 'pushed' } else { 'NOT pushed (local branch only)' }
             Write-Log "dirty-clone-retreated ${RepoDir}: thread=$ThreadId ($CandidateKey) stop=$StopReason branch=$($p.branch) files=$($p.files) +$($p.insertions)/-$($p.deletions) $pushNote — back on the default branch"
@@ -3311,6 +3342,29 @@ function Invoke-LaunchEndRetreat {
     }
     Write-Log "clone-retreat row ${RepoDir}: $rrow"
     return $outcome
+}
+
+# PR-A (G3): the launch-end clone-recover --preserve, run once after a not_eligible retreat. Only
+# logs and reports; clone-check still decides the parking. See Invoke-LaunchEndRetreat for returns.
+function Invoke-LaunchEndRecover {
+    param([string]$RepoDir, [string]$ThreadId, [string]$StateDir, [scriptblock]$Recover)
+    $rr = & $Recover $RepoDir $ThreadId $StateDir
+    $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
+    $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
+    $p = $null
+    if ($rrow) { try { $p = $rrow | ConvertFrom-Json -ErrorAction Stop } catch { $p = $null } }
+    if ($rcode -eq 3) { return 'not_eligible' }  # not a clean wrong_head (or fetch failed): nothing changed
+    if ($rcode -eq 0 -and $null -ne $p) {
+        if ($p.preserved_ref) {
+            Write-Log "dirty-clone-preserved ${RepoDir}: thread=$ThreadId branch=$($p.branch) unpushed commits kept on LOCAL ref $($p.preserved_ref) ($($p.preserved_sha)), not pushed — back on the default branch — $rrow"
+            return 'preserved'
+        }
+        Write-Log "dirty-clone-recovered ${RepoDir}: thread=$ThreadId wrong_head $($p.branch) switched to the default branch at launch end, no commit lost — $rrow"
+        return 'recovered'
+    }
+    $err = if ($null -ne $rr) { "$($rr.stderr)" } else { '' }
+    Write-Log "dirty-clone-recover-failed ${RepoDir}: thread=$ThreadId clone-recover --preserve exit=$rcode — $rrow $err"
+    return 'recover_failed'
 }
 
 # D-3c: re-judge every parked repo once. $Probe is a scriptblock taking the repo_dir and returning
@@ -6607,6 +6661,15 @@ try {
     # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
     # $DirtyCloneExitCode). Per tick only; the persistent record is $dirtyClonesParked below.
     $dirtyRepoDirs = @{}
+    # PR-B: projects whose unacknowledged HOLD met a parked clone this tick, and the projects a launch
+    # was attempted for this tick. Both are per tick; Invoke-HoldAckViaPark reads them after the loop.
+    $holdAckViaPark = @{}
+    $launchedProjects = @{}
+    # PR-B (PR-gate #560 obj 1): a missing ledger is created holding the `*` (absent) sentinel here,
+    # before any candidate, so a tick where every candidate is parked still creates it.
+    $inflightInit = Initialize-InflightLedger -Path $inflightStatePath -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+    foreach ($ev in $inflightInit.events) { Write-Log "inflight: $ev" }
+    if (-not $inflightInit.ok) { Write-Log "WARN inflight: could not create $inflightStatePath ($($inflightInit.error)) — hold-ack via park stays withheld; launches unaffected" }
     # D-3b/c (T-clone-guard-pin-ignored-only-in-mindwire v2.1): repos parked by an earlier exit 8.
     # Each gets exactly one `mindwire clone-check` here, before any candidate is looked at: exit 0
     # releases it (its candidates launch this tick, launches_same_head starting at 1 because the
@@ -6715,6 +6778,8 @@ try {
         if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $dirtyClonesParked) {
             $dispositions[$cand.key] = 'dirty-clone-parked'
             Write-Log "dirty-clone-parked $($cand.key): repo_dir=$($cand.repo_dir) is parked (clone not clean), not launching"
+            # PR-B: no launch will land this hold's acknowledgement; the sweep reports it after the loop.
+            if (Test-HoldAckViaParkWanted -Control $control) { $holdAckViaPark[$cand.project] = $true }
             continue
         }
 
@@ -6832,69 +6897,109 @@ try {
         if ($null -eq $commitPayload) {
             throw "head_skip decide returned a LAUNCH verdict without a commit_launch_payload for $($cand.key)"
         }
-        $commitResult = Invoke-HeadSkipCommitLaunch -Payload $commitPayload -StateFilePath $headSkipStatePath
-        if (-not $commitResult.ok) {
-            # Systemic failure of the same class as decide fail-close: if commit-launch is broken
-            # then decide is broken too, so we must abort the tick rather than spawn a conductor
-            # that will not be recorded.
-            Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
-            throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
-                   "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
+        # PR-B: persist the in-flight mark before anything about this launch is recorded or spawned.
+        # Placed ahead of commit-launch (not only ahead of the spawn) so a refused mark leaves no
+        # LAUNCH record behind. If it cannot be written nothing launches, and since the data
+        # directory is what failed, nothing after it would either: stop the tick's launches.
+        $launchedProjects[$cand.project] = $true
+        $mark = Add-InflightMark -Path $inflightStatePath -Project $cand.project `
+            -Key $cand.key -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+        $inflightLaunchId = $mark.launch_id
+        foreach ($ev in $mark.events) { Write-Log "inflight $($cand.key): $ev" }
+        if (-not $mark.ok) {
+            Write-Log "inflight-mark-unwritable $($cand.key): $($mark.error) — not launching it or anything after it"
+            $breakReason = 'inflight-mark-unwritable'
+            break
         }
-        if ($commitResult.warning) {
-            Write-Log "WARN T42 stall watchdog disabled for $($cand.key) this launch — $($commitResult.warning)"
-        }
-
-        # All three must move together: the daemon reads the thread from [conductor] but the project
-        # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
-        # against the wrong repo.
-        Set-TomlValue -Path $configPath -Section 'loop'      -Key 'project'        -Value $cand.project
-        Set-TomlValue -Path $configPath -Section 'loop'      -Key 'repo_dir'       -Value $cand.repo_dir
-        Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
-
-        $launched++
-        # Past commit-launch, so this IS a launch: G counts it, and the wait clock clears.
-        Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'launched'
-        Clear-LaunchWait -EvaluatedState $evaluatedState -Key $cand.key
-        # T42 stall watchdog: hand the conductor the same-head launch count the commit above just
-        # recorded, pinned to the head it was counted on. The conductor stands down (posts STALLED,
-        # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
-        $stallArgs = @('--launches-same-head', "$($commitResult.launches_same_head)")
-        if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
-        # T-retry-once-before-quarantine D-4: a launch of a retry-pending thread IS its one retry.
-        # --retry-of lets the conductor warn roles in RETRY_NOTICE_ROLES (the implementer) that the
-        # failed launch may already have pushed / opened a PR / commented on this same head. It is
-        # passed only when the head IS that same head (Test-RetryNoticeHeadMatches): on a moved head
-        # the notice would claim a failed attempt at a message nobody has attempted yet.
-        if ($retryState.pending.ContainsKey($cand.key)) {
-            $retryLaunched++
-            $pendingForLaunch = $retryState.pending[$cand.key]
-            $retryOf = Get-RetryOfArgument -Record $pendingForLaunch
-            if (Test-RetryNoticeHeadMatches -Record $pendingForLaunch -ProbeHead "$probeHead") {
-                $stallArgs += @('--retry-of', $retryOf)
-                Write-Log "retry-launch $($cand.key): --retry-of $retryOf (same head $probeHead, launches_same_head=$($commitResult.launches_same_head))"
+        # PR-B addendum (Bohr msg-8857, go Einstein): from here to the conductor spawn nothing has
+        # been started, and every way this span ends without launching is a terminating error (a
+        # failed commit-launch throws; so can the config writes and summon helpers). The catch drops
+        # only this launch's own row and rethrows, so a launch that never ran leaves no row. The
+        # spawn stays OUTSIDE the try: once it is called the child may have started, and the row
+        # then follows the exit-code rule below (kept on exit 7 or a throw).
+        try {
+            $commitResult = Invoke-HeadSkipCommitLaunch -Payload $commitPayload -StateFilePath $headSkipStatePath
+            if (-not $commitResult.ok) {
+                # Systemic failure of the same class as decide fail-close: if commit-launch is broken
+                # then decide is broken too, so we must abort the tick rather than spawn a conductor
+                # that will not be recorded.
+                Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
+                throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
+                       "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
             }
-            else {
-                $failedHead = $pendingForLaunch.failure_fingerprint.head
-                Write-Log "retry-launch $($cand.key): head moved ($failedHead -> $probeHead) — no --retry-of notice; still the one retry of $retryOf"
+            if ($commitResult.warning) {
+                Write-Log "WARN T42 stall watchdog disabled for $($cand.key) this launch — $($commitResult.warning)"
+            }
+
+            # All three must move together: the daemon reads the thread from [conductor] but the project
+            # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
+            # against the wrong repo.
+            Set-TomlValue -Path $configPath -Section 'loop'      -Key 'project'        -Value $cand.project
+            Set-TomlValue -Path $configPath -Section 'loop'      -Key 'repo_dir'       -Value $cand.repo_dir
+            Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
+
+            $launched++
+            # Past commit-launch, so this IS a launch: G counts it, and the wait clock clears.
+            Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'launched'
+            Clear-LaunchWait -EvaluatedState $evaluatedState -Key $cand.key
+            # T42 stall watchdog: hand the conductor the same-head launch count the commit above just
+            # recorded, pinned to the head it was counted on. The conductor stands down (posts STALLED,
+            # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
+            $stallArgs = @('--launches-same-head', "$($commitResult.launches_same_head)")
+            if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
+            # T-retry-once-before-quarantine D-4: a launch of a retry-pending thread IS its one retry.
+            # --retry-of lets the conductor warn roles in RETRY_NOTICE_ROLES (the implementer) that the
+            # failed launch may already have pushed / opened a PR / commented on this same head. It is
+            # passed only when the head IS that same head (Test-RetryNoticeHeadMatches): on a moved head
+            # the notice would claim a failed attempt at a message nobody has attempted yet.
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched++
+                $pendingForLaunch = $retryState.pending[$cand.key]
+                $retryOf = Get-RetryOfArgument -Record $pendingForLaunch
+                if (Test-RetryNoticeHeadMatches -Record $pendingForLaunch -ProbeHead "$probeHead") {
+                    $stallArgs += @('--retry-of', $retryOf)
+                    Write-Log "retry-launch $($cand.key): --retry-of $retryOf (same head $probeHead, launches_same_head=$($commitResult.launches_same_head))"
+                }
+                else {
+                    $failedHead = $pendingForLaunch.failure_fingerprint.head
+                    Write-Log "retry-launch $($cand.key): head moved ($failedHead -> $probeHead) — no --retry-of notice; still the one retry of $retryOf"
+                }
+            }
+            # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1′): a gate-lane launch
+            # stops before the implementer's turn; that turn is launched later from the role lane. Kept
+            # apart from $stallArgs (the T42 / retry arguments) and re-assigned on every candidate, so
+            # nothing can accumulate across iterations (PR #458 gate advisory).
+            $laneArgs = @(Get-ConductorLaneArgs -Lane $lane)
+            # Summon (v1.6 §4 / v1.4): the owning project whose Summon is also in scope, and — whenever
+            # this thread has a summon_yield record — the resume notice, with origin/main read now.
+            # Re-assigned on every candidate like $laneArgs.
+            $summonArgs = @(Get-SummonOwnerArgs -Disposition $summonDisp)
+            $resumeEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
+            if ($null -ne $resumeEntry) {
+                $summonArgs += @(Get-ResumeNoticeArgs -Entry $resumeEntry -MainSha (Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh))
+                Write-Log "resume-notice $($cand.key): $($summonArgs -join ' ')"
             }
         }
-        # Gate-only slice (T-sweep-starves-deep-candidates PR-B, msg-6313 §1′): a gate-lane launch
-        # stops before the implementer's turn; that turn is launched later from the role lane. Kept
-        # apart from $stallArgs (the T42 / retry arguments) and re-assigned on every candidate, so
-        # nothing can accumulate across iterations (PR #458 gate advisory).
-        $laneArgs = @(Get-ConductorLaneArgs -Lane $lane)
-        # Summon (v1.6 §4 / v1.4): the owning project whose Summon is also in scope, and — whenever
-        # this thread has a summon_yield record — the resume notice, with origin/main read now.
-        # Re-assigned on every candidate like $laneArgs.
-        $summonArgs = @(Get-SummonOwnerArgs -Disposition $summonDisp)
-        $resumeEntry = Get-SummonYieldEntry -EvaluatedState $evaluatedState -Key $cand.key
-        if ($null -ne $resumeEntry) {
-            $summonArgs += @(Get-ResumeNoticeArgs -Entry $resumeEntry -MainSha (Get-SummonMainSha -RepoDir $cand.repo_dir -Refresh))
-            Write-Log "resume-notice $($cand.key): $($summonArgs -join ' ')"
+        catch {
+            $undo = Remove-InflightMark -Path $inflightStatePath -LaunchId $inflightLaunchId `
+                -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+            foreach ($ev in $undo.events) { Write-Log "inflight $($cand.key): $ev" }
+            if ($undo.ok) { Write-Log "inflight $($cand.key): not launched — row $inflightLaunchId removed" }
+            else { Write-Log "WARN inflight $($cand.key): not launched, row $inflightLaunchId not removed ($($undo.error)) — kept" }
+            throw
         }
         $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        # PR-B: the run's exit is confirmed on every code but 7, so drop this launch's own row. On
+        # exit 7 the row stays (an orphan may be alive); a failed removal leaves it too. Either way
+        # the project is kept out of the sweep's hold acknowledgement until an operator clears it.
+        if ($code -ne $ConductorKillUnconfirmedExitCode) {
+            $unmark = Remove-InflightMark -Path $inflightStatePath -LaunchId $inflightLaunchId `
+                -NowIso ((Get-Date).ToUniversalTime().ToString('o'))
+            foreach ($ev in $unmark.events) { Write-Log "inflight $($cand.key): $ev" }
+            if (-not $unmark.ok) { Write-Log "WARN inflight $($cand.key): row $inflightLaunchId not removed ($($unmark.error)) — kept; project excluded from hold-ack via park" }
+        }
+        else { Write-Log "inflight $($cand.key): exit=$code — row $inflightLaunchId kept (exit not confirmed)" }
         # A launch that did not defer got past git-sync: end this candidate's deferral episode so
         # its next outage alerts again (see Get-GitSyncDeferredNotice).
         if ($code -ne $GitSyncDeferredExitCode -and
@@ -6949,7 +7054,8 @@ try {
         $retreatOutcome = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
             -HeadMsg "$probeHead" -StopReason "$($verdict.reason)" -ExitCode $code `
             -StateDir (Join-Path $dataDir 'state') `
-            -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s }
+            -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s } `
+            -Recover { param($d, $t, $s) Invoke-CloneRecover -RepoDir $d -Preserve -ThreadId $t -StateDir $s }
         # PR-3: a retreat that may have appended a record invalidates the per-tick table, so the
         # exit-8 alert below never shows a record older than the file. Only no-op outcomes keep it.
         if ("$retreatOutcome" -notin @('skipped', 'clean', 'not_eligible')) { $recordsByRepoTick = $null }
@@ -7298,6 +7404,20 @@ try {
         }
         $dispositions[$cand.key] = 'no-work'
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
+    }
+
+    # PR-B: acknowledge the HOLD of a project whose clone is parked, since no launch will. Only for a
+    # project that launched nothing this tick and whose in-flight ledger is clear (no row, no `*`) —
+    # see deploy/lib/InflightLedger.ps1. Observability only: a failed report is a WARN, never a stop.
+    if ($holdAckViaPark.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        $holdAckProbe = Join-Path $repoRoot "scripts\loop_control.py"
+        $null = Invoke-HoldAckViaPark -Pending $holdAckViaPark -LaunchedProjects $launchedProjects `
+            -InflightPath $inflightStatePath -Report {
+                param($proj)
+                Invoke-BoundedUvProbe -Label "hold-ack-$proj" -TimeoutSeconds $ControlProbeTimeoutSeconds `
+                    -Arguments @($holdAckProbe, '--report-observed-hold', '--project', $proj)
+            }
     }
 
     # Everything the sweep never touched is 'not-reached'. Deliberately NOT rolled into

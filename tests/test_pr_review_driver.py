@@ -82,6 +82,7 @@ from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
     strip_wrapping_fences,
 )
 from spirrow_mindwire.naysayer.principles import (
+    CODEX_OUTPUT_RESERVE_TOKENS,
     build_preamble,
     objection_classes,
     principles_path,
@@ -844,9 +845,12 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
     # not order.
     pass_1 = max(lexora.calls, key=lambda call: call[2])
     model, _messages, max_tokens = pass_1
-    # The fake cannot read labels → route_tier's fail-safe → the Gemini-only tier (ADR-14 §7.3).
-    assert model == "naysayer-gemini"
+    # The fake cannot read labels → classified N-3 by the §7.3 fail-safe, which since ADR-14 §10
+    # no longer moves it off the codex tier: every review goes to ``naysayer``.
+    assert model == "naysayer"
     assert max_tokens >= 8000  # reasoning-model floor (4096 truncated the critique)
+    # The codex tier's prompt limit leaves CODEX_OUTPUT_RESERVE_TOKENS for the answer.
+    assert max_tokens <= CODEX_OUTPUT_RESERVE_TOKENS
 
 
 @pytest.mark.anyio
@@ -1235,8 +1239,9 @@ async def test_lexora_timeout_degrades_to_comment_not_raise() -> None:
     assert event is ReviewEvent.COMMENT  # GitHub review submitted as COMMENT (not RC)
     assert outcome.verdict is ReviewEvent.COMMENT
     assert outcome.timed_out is True
-    # model telemetry preserved on the timeout-degrade path (routed tier; fake → fail-safe Gemini)
-    assert outcome.model == "naysayer-gemini"
+    # model telemetry preserved on the timeout-degrade path (routed tier: the codex tier, which
+    # since ADR-14 §10 also takes the fake's fail-safe N-3 classification)
+    assert outcome.model == "naysayer"
     assert outcome.head_sha == "sha-to"  # CI head SHA still recorded
     assert outcome.ci_state is CiState.SUCCESS
 
@@ -5606,23 +5611,65 @@ async def _pass1_model(github: _FakeGitHub) -> str:
     return models.pop()
 
 
+_N3_TO_CODEX = re.compile(
+    r"n3 routing: (?P<slug>\S+) -> tier=naysayer "
+    r"\(codex tier \(N-3 classified, routed to codex per ADR-14 §10: (?P<cause>.*)\)\)"
+)
+
+
+async def _n3_classified_to_codex(
+    github: _FakeGitHub,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    n3_notifier: Callable[[str], Awaitable[None]] | None = None,
+) -> str:
+    """Review ``github``'s PR as an N-3 one is reviewed since ADR-14 §10; return the N-3 cause.
+
+    Both passes go to the codex tier (``naysayer``) and carry the §7.3 ``X-Mindwire-N3-Route:
+    v1`` declaration. The ``n3 routing: ... -> tier=`` line still records that the request was
+    classified N-3 (what the old rule sent to ``naysayer-gemini``); its cause is returned so
+    the caller pins WHY.
+    """
+    lexora = _FakeLexora()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, n3_notifier=n3_notifier)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {"naysayer"}
+    assert lexora.n3_routed == [True, True]
+    messages = [record.getMessage() for record in caplog.records]
+    routed = [m for m in messages if m.startswith("n3 routing: ") and " -> " in m]
+    assert len(routed) == 1, routed
+    match = _N3_TO_CODEX.fullmatch(routed[0])
+    assert match is not None, routed[0]
+    assert match["slug"] == _pr().slug
+    return match["cause"]
+
+
 @pytest.mark.anyio
 async def test_routing_unmarked_pr_with_explicit_empty_list_goes_to_codex_tier() -> None:
     assert await _pass1_model(_routed_github()) == "naysayer"
 
 
 @pytest.mark.anyio
-async def test_routing_marker_label_goes_to_gemini_tier() -> None:
+async def test_routing_marker_label_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     github = _routed_github(labels=frozenset({"n3-sensitive"}))
-    assert await _pass1_model(github) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(github, caplog) == "n3-sensitive marker"
 
 
 @pytest.mark.anyio
-async def test_routing_reads_globs_at_base_and_head() -> None:
+async def test_routing_reads_globs_at_base_and_head(caplog: pytest.LogCaptureFixture) -> None:
     base = _routed_github(base_cfg='n3_sensitive_paths = ["src/*"]\n')
-    assert await _pass1_model(base) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(base, caplog) == (
+        "src/app.py matches n3_sensitive_paths glob 'src/*'"
+    )
     head = _routed_github(head_cfg='n3_sensitive_paths = ["src/app.py"]\n')
-    assert await _pass1_model(head) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(head, caplog) == (
+        "src/app.py matches n3_sensitive_paths glob 'src/app.py'"
+    )
     assert (_N3, "main") in {(path, ref) for _pr_, path, ref in head.file_reads}
 
 
@@ -5647,13 +5694,18 @@ async def test_routing_missing_base_config_uses_org_defaults_without_notifying(
     assert {call[0] for call in lexora.calls} == {"naysayer"}
     assert "n3-routing-unresolved" not in caplog.text
     assert "org default globs only" in caplog.text
+    assert "N-3 classified" not in caplog.text
     assert told == []
+    # The org defaults still classify: a workflow file is N-3, reviewed on codex (ADR-14 §10).
     workflow = _routed_github(base_cfg=None, paths=(".github/workflows/ci.yml",))
-    assert await _pass1_model(workflow) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(workflow, caplog) == (
+        ".github/workflows/ci.yml matches n3_sensitive_paths glob '.github/workflows/*'"
+    )
+    assert told == []
 
 
 @pytest.mark.anyio
-async def test_routing_malformed_base_config_goes_to_gemini_and_notifies(
+async def test_routing_malformed_base_config_is_classified_n3_goes_to_codex_and_notifies(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     told: list[str] = []
@@ -5661,35 +5713,37 @@ async def test_routing_malformed_base_config_goes_to_gemini_and_notifies(
     async def notifier(line: str) -> None:
         told.append(line)
 
-    lexora = _FakeLexora()
-    _posted, post = _capture()
-    driver = NaysayerPrReviewDriver(
-        lexora=lexora,
-        github=_routed_github(base_cfg="this is = = not toml"),
-        n3_notifier=notifier,
-    )
-    with caplog.at_level("WARNING"):
-        await driver.review(_pr(), post_critique=post)
-    assert {call[0] for call in lexora.calls} == {"naysayer-gemini"}
-    assert "n3-routing-unresolved" in caplog.text
+    github = _routed_github(base_cfg="this is = = not toml")
+    cause = await _n3_classified_to_codex(github, caplog, n3_notifier=notifier)
+    assert cause.startswith("n3 config unresolved: ")
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.startswith("n3-routing-unresolved: PR-gate ")
+    # ADR-14 §10: still reported, but it no longer turns the review into a Gemini one.
+    assert warning.endswith("N-3 cannot be classified (routing is codex regardless, ADR-14 §10)")
     assert len(told) == 1 and "PR-gate" in told[0]
 
 
 @pytest.mark.anyio
-async def test_routing_pr_touching_the_config_goes_to_gemini() -> None:
-    assert await _pass1_model(_routed_github(paths=(_N3,))) == "naysayer-gemini"
+async def test_routing_pr_touching_the_config_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cause = await _n3_classified_to_codex(_routed_github(paths=(_N3,)), caplog)
+    assert cause == f"touches {_N3}"
 
 
 @pytest.mark.anyio
-async def test_19_incomplete_changed_file_list_goes_to_gemini() -> None:
+async def test_19_incomplete_changed_file_list_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """msg-6573 (b): GitHub's files endpoint stops at 3000; a short list is not trusted."""
+    incomplete = "changed-file list may be incomplete"
     short = _routed_github(paths=("src/app.py",), entries=1, changed_files=4000)
-    assert await _pass1_model(short) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(short, caplog) == incomplete
     capped = _routed_github(paths=("src/app.py",), entries=3000, changed_files=3000)
-    assert await _pass1_model(capped) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(capped, caplog) == incomplete
     unreadable = _routed_github()
     unreadable.pr_files = None  # the files endpoint raises
-    assert await _pass1_model(unreadable) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(unreadable, caplog) == incomplete
 
 
 @pytest.mark.anyio
@@ -5702,13 +5756,19 @@ async def test_27_deleted_non_sensitive_file_goes_to_codex() -> None:
 
 
 @pytest.mark.anyio
-async def test_28_deleted_sensitive_file_goes_to_gemini() -> None:
+async def test_28_deleted_sensitive_file_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     github = _routed_github(base_cfg='n3_sensitive_paths = ["deploy/*"]\n', paths=("deploy/x.ps1",))
-    assert await _pass1_model(github) == "naysayer-gemini"
+    assert await _n3_classified_to_codex(github, caplog) == (
+        "deploy/x.ps1 matches n3_sensitive_paths glob 'deploy/*'"
+    )
 
 
 @pytest.mark.anyio
-async def test_29_rename_or_copy_out_of_a_sensitive_glob_goes_to_gemini() -> None:
+async def test_29_rename_or_copy_out_of_a_sensitive_glob_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """msg-6579 + Einstein's advisory: ``previous_filename`` counts, renamed OR copied.
 
     The client puts both names into ``PrFileList.paths`` (one file entry); this pins that
@@ -5719,13 +5779,25 @@ async def test_29_rename_or_copy_out_of_a_sensitive_glob_goes_to_gemini() -> Non
         paths=("src/now_public.py", "secrets/key.pem"),
         entries=1,
     )
-    assert await _pass1_model(github) == "naysayer-gemini"
+    # The old name is what is classified (``secrets/*`` here, or the org default ``*.pem``).
+    cause = await _n3_classified_to_codex(github, caplog)
+    assert cause.startswith("secrets/key.pem matches n3_sensitive_paths glob ")
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("bad", ["../outside.py", "/etc/passwd", "C:/x.py"])
-async def test_30_abnormal_api_path_goes_to_gemini(bad: str) -> None:
-    assert await _pass1_model(_routed_github(paths=(bad,))) == "naysayer-gemini"
+@pytest.mark.parametrize(
+    ("bad", "problem"),
+    [
+        ("../outside.py", "'../outside.py' has a '..' segment"),
+        ("/etc/passwd", "'/etc/passwd' is absolute"),
+        ("C:/x.py", "'C:/x.py' is absolute"),
+    ],
+)
+async def test_30_abnormal_api_path_is_classified_n3_and_goes_to_codex(
+    caplog: pytest.LogCaptureFixture, bad: str, problem: str
+) -> None:
+    cause = await _n3_classified_to_codex(_routed_github(paths=(bad,)), caplog)
+    assert cause == f"path outside the repository boundary: {problem}"
 
 
 @pytest.mark.anyio
@@ -5740,31 +5812,31 @@ async def test_pinned_model_bypasses_routing() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("labels", "tier"),
-    [(frozenset(), "naysayer"), (frozenset({"n3-sensitive"}), "naysayer-gemini")],
-)
-async def test_routed_review_declares_n3_route_on_both_passes(
-    labels: frozenset[str], tier: str
-) -> None:
-    # ADR-14 §7.3 / msg-6982: the declaration follows ``route_tier`` having run for this PR,
-    # whichever tier it chose; Lexora only acts on it for a codex-backed tier.
+@pytest.mark.parametrize("labels", [frozenset(), frozenset({"n3-sensitive"})])
+async def test_routed_review_declares_n3_route_on_both_passes(labels: frozenset[str]) -> None:
+    # ADR-14 §7.3 / msg-6982: the declaration follows ``route_tier`` having run for this PR.
+    # Since ADR-14 §10 it always picks the codex tier, where Lexora acts on the declaration, so
+    # a marked (N-3 classified) PR carries it there as well.
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(lexora=lexora, github=_routed_github(labels=labels))
     await driver.review(_pr(), post_critique=post)
-    assert {call[0] for call in lexora.calls} == {tier}
+    assert {call[0] for call in lexora.calls} == {"naysayer"}
     assert lexora.n3_routed == [True, True]
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("diff_chars", "tier", "marked"),
-    [(1_000, "naysayer", False), (140_000, "naysayer-gemini", True)],
+    ("diff_chars", "over_limit"),
+    [(1_000, False), (140_000, True)],
 )
-async def test_a_review_in_the_codex_limit_band_is_marked_for_the_ledger(
-    diff_chars: int, tier: str, marked: bool
+async def test_no_review_is_marked_for_the_codex_limit_band_whatever_its_size(
+    caplog: pytest.LogCaptureFixture, diff_chars: int, over_limit: bool
 ) -> None:
+    """ADR-14 §10: a review over the codex prompt limit (140k chars sat in the band between the
+    current and the pre-raise limit, and used to go to ``naysayer-gemini`` with the band mark)
+    now goes to the codex tier like any other, so nothing is billed to Gemini because of the
+    raise and no trace carries the band mark. The size is still classified, in the reason."""
     from spirrow_mindwire.naysayer.n3_routing import is_codex_limit_band_trace_id
 
     lexora = _FakeLexora()
@@ -5772,14 +5844,17 @@ async def test_a_review_in_the_codex_limit_band_is_marked_for_the_ledger(
     github = _routed_github()
     github._diff = "x" * diff_chars
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
-    await driver.review(_pr(), post_critique=post)
-    assert {call[0] for call in lexora.calls} == {tier}
-    # Every review now carries one trace on both passes (the backend read-back needs it);
-    # only a band review carries the band mark.
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        await driver.review(_pr(), post_critique=post)
+    assert {call[0] for call in lexora.calls} == {"naysayer"}
+    # Every review carries one trace on both passes (the backend read-back needs it); none
+    # carries the band mark.
     first = lexora.trace_ids[0]
     assert isinstance(first, str)
     assert lexora.trace_ids == [first, first]
-    assert is_codex_limit_band_trace_id(first) is marked
+    assert is_codex_limit_band_trace_id(first) is False
+    assert ("N-3 classified" in caplog.text) is over_limit
+    assert ("chars > codex tier limit" in caplog.text) is over_limit
 
 
 def _attest_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -5801,27 +5876,28 @@ def _rows_for(backends: list[str]) -> Callable[[str], Awaitable[list[dict[str, A
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("backends", "logged"),
-    [(["codex", "codex"], "codex"), (["gemini-fallback", "gemini-fallback"], "gemini-fallback")],
-)
 async def test_pr_gate_logs_the_backend_read_back_from_the_ledger(
-    caplog: pytest.LogCaptureFixture, backends: list[str], logged: str
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Takahito msg-7813 (2) / Bohr msg-7830: the PR gate logs the backend that actually
     # served the review, read back by the review's own trace id — not the pre-send tier.
+    # ADR-14 §10: the codex tier expects codex alone; ``gemini-fallback`` rows are a mismatch
+    # (test_pr_gate_mismatching_backend_logs_unknown_naming_the_reported_backend).
     lexora = _FakeLexora()
     posted, post = _capture()
     driver = NaysayerPrReviewDriver(
-        lexora=lexora, github=_routed_github(), turn_rows=_rows_for(backends), sleep=_no_sleep
+        lexora=lexora,
+        github=_routed_github(),
+        turn_rows=_rows_for(["codex", "codex"]),
+        sleep=_no_sleep,
     )
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
         outcome = await driver.review(_pr(), post_critique=post)
     (line,) = _attest_lines(caplog)
     assert f"pr={_pr().slug} " in line
     assert " tier=naysayer " in line
-    assert f" backend={logged} " in line
-    assert " expected=codex|gemini-fallback " in line
+    assert " backend=codex " in line
+    assert " expected=codex " in line
     assert line.endswith("probe=cost-row#100+101")
     # Log only: nothing about the backend reaches the posted review.
     assert all("backend=" not in body for body in posted)
@@ -5832,6 +5908,9 @@ async def test_pr_gate_logs_the_backend_read_back_from_the_ledger(
 async def test_pr_gate_mixed_backends_across_the_two_passes_are_visible(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # ADR-14 §10: one pass falling back to Gemini is no longer an accepted codex-tier answer.
+    # The codex row beside it does not license it: the line is ``backend=unknown`` and its
+    # reason names both backends the rows reported. Log only: the verdict stands.
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(
@@ -5841,9 +5920,12 @@ async def test_pr_gate_mixed_backends_across_the_two_passes_are_visible(
         sleep=_no_sleep,
     )
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
-        await driver.review(_pr(), post_critique=post)
+        outcome = await driver.review(_pr(), post_critique=post)
     (line,) = _attest_lines(caplog)
-    assert " backend=codex|gemini-fallback " in line
+    assert " backend=unknown expected=codex " in line
+    assert "['codex', 'gemini-fallback']" in line
+    assert "allowed ['codex']" in line
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
 
 
 @pytest.mark.anyio
@@ -5896,25 +5978,27 @@ async def test_pr_gate_with_no_ledger_reader_says_so(caplog: pytest.LogCaptureFi
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
         await driver.review(_pr(), post_critique=post)
     (line,) = _attest_lines(caplog)
-    assert line.endswith("backend=unknown expected=codex|gemini-fallback reason=no ledger reader")
+    assert line.endswith("backend=unknown expected=codex reason=no ledger reader")
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["gemini", "gemini-fallback"])
 async def test_pr_gate_mismatching_backend_logs_unknown_naming_the_reported_backend(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, backend: str
 ) -> None:
+    # ``gemini-fallback`` joined plain ``gemini`` here with ADR-14 §10 (codex tier = codex only).
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(
         lexora=_FakeLexora(),
         github=_routed_github(),
-        turn_rows=_rows_for(["gemini", "gemini"]),
+        turn_rows=_rows_for([backend, backend]),
         sleep=_no_sleep,
     )
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
         outcome = await driver.review(_pr(), post_critique=post)
     (line,) = _attest_lines(caplog)
     assert " backend=unknown " in line
-    assert "['gemini']" in line
+    assert f"['{backend}']" in line
     assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
 
 

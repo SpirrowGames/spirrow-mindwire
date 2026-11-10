@@ -62,6 +62,10 @@ from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
     render_marker,
     select_adr_pointers,
 )
+from spirrow_mindwire.naysayer.principles import (
+    CODEX_OUTPUT_RESERVE_TOKENS,
+    NAYSAYER_MODEL_TIER,
+)
 
 # ---------- helpers (fakes + minimal harness for the driver) ---------------- #
 
@@ -339,21 +343,34 @@ async def test_t5_marker_present_on_normal_approve_body() -> None:
 
 
 @pytest.mark.anyio
-async def test_pass2_budget_is_independent_of_review_budget() -> None:
+@pytest.mark.parametrize(
+    ("review_max_tokens", "pass1_budget"),
+    [(50_000, 50_000), (200_000, CODEX_OUTPUT_RESERVE_TOKENS)],
+)
+async def test_pass2_budget_is_independent_of_review_budget(
+    review_max_tokens: int, pass1_budget: int
+) -> None:
     """#487: a deployment's review budget override reaches pass 1 only.
 
     Pass 2 keeps its own fixed budget, so MAX_POINTER_PAYLOAD_BYTES (derived from the
     shape of legitimate pass-2 output) stays valid whatever review_max_tokens is set to.
+
+    Since ADR-14 §10 every review is on the codex tier, so pass 1 takes the override up to
+    the codex output reserve and is clamped there; an override under the reserve shows the
+    override itself reaching pass 1, one over it shows the clamp. Pass 2 is neither.
     """
     from spirrow_mindwire.naysayer import pr_review
 
     lexora = _FakeLexora(pass1_content="all good\n\nVERDICT: APPROVE", pass2_content="[]")
-    driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub(), max_tokens=200_000)
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=_FakeGitHub(), max_tokens=review_max_tokens
+    )
     _, post = _capture()
     await driver.review(_pr(), post_critique=post)
 
+    assert [call[0] for call in lexora.calls] == [NAYSAYER_MODEL_TIER, NAYSAYER_MODEL_TIER]
     budgets = [call[2] for call in lexora.calls]
-    assert budgets == [200_000, pr_review._ADR_POINTER_MAX_TOKENS]
+    assert budgets == [pass1_budget, pr_review._ADR_POINTER_MAX_TOKENS]
 
 
 @pytest.mark.anyio

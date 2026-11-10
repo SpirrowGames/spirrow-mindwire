@@ -75,6 +75,7 @@ Claude Code の自動化は「種類としてはクリーン」だが、OAuth/�
     - **(i) 他人の個人データを LLM 経路に載せる用途**（例: Thirdy の顧客ミーティング処理、ゲーム内 UGC のモデレーション）。
     - **(ii) セキュリティ構成・未公開脆弱性が naysay 対象の中心になる経路**（例: 認証設計・インフラ構成・Vaultwarden/Tailscale/firewall 構成の議論、PR レビューで脆弱性箇所を記述する naysay）。これは「他人の個人データ」ではないが実害度が異なり、かつ **T15 認証4軸議論のように naysayer 経路を実際に通っている**（再帰構造）。Takahito 本人の認証材料・個人開発環境の機密も (ii) で拾う（「他人の」限定が本人機密を除外しないため）。
       - **§9（2026-11-07）で改訂**: Gemini Developer API では ZDR を取れないため、(ii) の Gemini 経路は ZDR の代わりに「paid 鍵・project のログ保存オフ・素の `generateContent` だけ」を要件とします。(i) は変えていません。
+      - **§10（2026-11-10）で改訂**: naysayer は (ii) を含めて全件 codex に送ります。機密情報そのものは伏せ字（§7.3 の redact）でどちらにも送らず、「機密を扱うファイル」という理由だけでは codex を避けません。
   - **検知点（N-2 取り込み）**: トリガーは静的条件だけでなく **評価タイミング** とセットで持つ。**新規 service/機能が Lexora 経由で LLM を呼ぶ設計をするとき、その設計 ADR の段階で「この経路に (i)(ii) のいずれかが載るか」を必須チェック項目にする**。「条件は書いたが検知が無主で暗黙運用に落ちる」を防ぐ。
 - **素の `generateContent` のみ**。grounding（検索/マップ、30日保持・無効化不可）/ File API / 明示的コンテキストキャッシュ / Live API / Interactions API は呼ばない（adapter 層で gate）。この gate は ZDR の要否と独立した surface 強制であり、ZDR 格下げの影響を受けない（PR spirrow-lexora#1）。
 
@@ -506,3 +507,35 @@ D-4 の surface 強制不変条件「素の `generateContent` のみ（tools/gro
 
 - §7.3 の振り分け（N-3 は Gemini 固定）、attestation（§7.6）、§8 の既定 glob、paid 鍵の不変条件、§6。
 - ZDR は「推奨」のままです。Gemini の経路で取れるようになったら（または Vertex AI に移したら）、有効にします。
+
+## 10. Amendment (2026-11-10): naysayer は全件 codex — Gemini のフォールバックと N-3 の Gemini 固定をやめる（Takahito の判断）
+
+- **決めた人**: Takahito。Claude Code の operator セッションで直接指示したもので、ループと chatroom は通していません（「ループ待たずにここで対応する」）。
+- **変えるところ**: §7.3 の振り分け（N-3 は Gemini 固定）、§7.5 のプロンプト上限による Gemini 送り、§7.6 の codex ティアの attestation（`gemini-fallback` を受け入れていた点）、§9.2 の 3。
+
+### 10.1 何が起きていたか（実測）
+
+- 2026-11-08 09:57Z、Lexora の deploy（lexora#108）の再起動が、その 3 秒前に始まった codex の run を殺しました。run は `aborted:signal` で latch され（violation 1017）、codex は人が解除するまで閉じたままでした。
+- その間、naysayer の要求は Lexora の fallback で全部 Gemini が答えました。11-08 09:57Z〜11-09 20:50Z で 332 件、$25.35、codex は 0 件です。Discord の通知は出ていましたが、文面からは「deploy の再起動が原因で、解除が要る」とは読めませんでした。
+- 同じ期間、N-3 の振り分け（§7.3 / §8）で Gemini 専用ティアに送られた要求が 107 件ありました（11-06〜11-08 の codex が開いていた期間でも、naysayer 全体の約 24%）。
+- 一方、待ち時間の予算を 150 + 150 + 600 に変えた後（11-06 21:20Z〜11-08 09:57Z）、要求の重なりによるフォールバックは 0 件でした（codex 242 件）。
+
+### 10.2 決定
+
+1. **naysayer の要求は全件 codex に送ります。** `n3_routing.route_tier` は常に codex のティア（`naysayer`）を返します。§7.3 の分類は `classify_n3` として残し、判定の理由（`N-3 classified, routed to codex per ADR-14 §10: ...`）にだけ使います。§7.5 のプロンプト上限を超えた要求も codex に送ります（上限は 1 文字 = 1 トークンの最悪見積もりで、2026-10-10〜11-09 の naysayer の入力は最大 65k トークン。codex の窓は 272k トークン）。
+2. **Lexora は Gemini にフォールバックしません。** naysayer のラッパーは `codex_only` で、codex が答えられないときはその要求を 502 で断ります（Discord の通知は "codex unavailable" として出ます）。Lexora の設定から `gemini` backend と `naysayer-gemini` ティアを外しました。X-Mindwire-N3-Route の無い要求も codex に送ります。
+3. **attestation（§7.6）**: codex のティアが受け入れるのは `codex` だけです。`gemini-fallback` の行は fail-closed になります。
+4. **Takahito の理由**: 「機密情報そのものはどちらにも送らない（伏せ字が担う）。機密を扱うファイルというだけなら、仮に学習されても困らない。Gemini は OK で codex はダメ、という区別はピンとこない。」§9.2 の 3 が挙げた差（Gemini の非学習は paid の契約、codex はトグル）は、この判断で重みを持たなくなりました。
+5. **deploy の再起動で codex が閉じたままにならないようにします。** magickit の deploy runner は、Lexora の再起動の前に実行中の codex を待ち、再起動の後に「再起動が原因の latch だけ」を解除して `verify_codex` を取り直します（Lexora `deploy/RUNBOOK.md` §11）。それ以外の latch は、これまでどおり人が調べます。
+
+### 10.3 受け入れるリスク（Takahito の判断）
+
+- **codex が閉じている間は、naysayer が止まります。** PR-gate は、pass 1 が Lexora のエラーで終わると例外のまま止まり（fail-loud、`pr_review.py`）、timeout なら COMMENT で人に渡します。どちらも Gemini の回答で代わりにはしません。
+- N-3 に当たる内容（deploy・CI・認証のコード・ホストのセキュリティ構成など）も、ChatGPT Pro のサブスクの経路に載ります。この経路の「学習に使わない」は data controls のトグルで、30 日ごとの人の確認（Lexora `deploy/RUNBOOK.md` §8）で担保しています。
+- D-4 のトリガー (i)（他人の個人データ）は変えません。(i) に当たる経路は、naysayer であっても作る前に別に判断します。
+
+### 10.4 変えないこと
+
+- 伏せ字（§7.3 の redact）。codex を含む経路では必須のままです（Lexora の S-1）。
+- ツールを無効にすること（§7.4 / D-D）と、検証ゲート（`verify_codex`）。
+- `.mindwire-n3.toml` と既定 glob（§8）は残します。振り分けには使いませんが、分類の記録に使います。

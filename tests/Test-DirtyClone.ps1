@@ -539,7 +539,7 @@ $crv = $functions | Where-Object { $_.Name -eq 'Invoke-CloneRecover' } | Select-
 Check 'Invoke-CloneRecover runs the clone-recover subcommand' $true ($crv.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-recover', '--repo-dir'")
 
 # --- PR-1a: launch-end clone-retreat ----------------------------------------------------------------
-foreach ($name in 'Invoke-LaunchEndRetreat', 'Invoke-CloneRetreat') {
+foreach ($name in 'Invoke-LaunchEndRetreat', 'Invoke-LaunchEndRecover', 'Invoke-CloneRetreat') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -593,6 +593,49 @@ $irt = $functions | Where-Object { $_.Name -eq 'Invoke-CloneRetreat' } | Select-
 Check 'PR-1a: Invoke-CloneRetreat runs the clone-retreat subcommand' $true ($irt.Extent.Text -match "'spirrow_mindwire\.cli', 'clone-retreat', '--repo-dir'")
 Check 'PR-1a: Invoke-CloneRetreat sets GIT_EDITOR=true for the child' $true ($irt.Extent.Text -match "GIT_EDITOR = 'true'")
 Check 'PR-1a: the wrapper never posts from the retreat' $false ($irt.Extent.Text -match 'chatroom|Send-Notification')
+
+# --- T-role-exit-leaves-clone-off-default-branch PR-A (G3): launch-end clone-recover --preserve -----
+function New-RecoverStub { param([string]$Row, [int]$Code = 0)
+    $script:recoverPCalls = @(); $script:recRow = $Row; $script:recCode = $Code
+    return { param($d, $t, $s) $script:recoverPCalls += "$d|$t|$s"; @{ code = $script:recCode; row = $script:recRow; stderr = 'e' } } }
+$rowNe = '{"outcome":"not_eligible","thread_id":"T-x","detail":"guard reason is wrong_head: on feature/x","steps":[]}'
+$recPreserved = '{"outcome":"recovered","branch":"feature/x","default":"main","detail":"1 unpushed commit(s) kept on local ref wip/feature/x-20261110T000000Z","preserved_ref":"wip/feature/x-20261110T000000Z","preserved_sha":"abc123"}'
+$recPlain = '{"outcome":"recovered","branch":"feature/x","default":"main","detail":"","preserved_ref":null,"preserved_sha":null}'
+$recNe = '{"outcome":"not_eligible","branch":null,"default":null,"detail":"guard reason is index_lock, not wrong_head","preserved_ref":null,"preserved_sha":null}'
+$recFail = '{"outcome":"failed","branch":"feature/x","default":"main","detail":"preserve: creating wip/x failed","preserved_ref":null,"preserved_sha":null}'
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe) -Recover (New-RecoverStub -Row $recPreserved)
+Check 'PR-A: not_eligible retreat runs recover --preserve once' 1 $script:recoverPCalls.Count
+Check 'PR-A: recover gets repo, thread, state dir' 'C:\c|T-x|S' ($script:recoverPCalls -join ';')
+Check 'PR-A: kept commits -> preserved' 'preserved' $o
+Check 'PR-A: preserved line names the local ref and says not pushed' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-preserved C:\c: thread=T-x*LOCAL ref wip/feature/x-20261110T000000Z (abc123), not pushed*' }).Count -eq 1)
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe) -Recover (New-RecoverStub -Row $recPlain)
+Check 'PR-A: all commits on remote -> recovered' 'recovered' $o
+Check 'PR-A: recovered line logged' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-recovered C:\c: thread=T-x*' }).Count -eq 1)
+
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe) -Recover (New-RecoverStub -Row $recNe -Code 3)
+Check 'PR-A: recover not eligible (not a wrong_head) -> not_eligible, a no-op for PR-3' 'not_eligible' $o
+
+$script:logLines = @()
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe) -Recover (New-RecoverStub -Row $recFail -Code 1)
+Check 'PR-A: recover failed -> recover_failed' 'recover_failed' $o
+Check 'PR-A: recover failure logged' $true (@($script:logLines | Where-Object { $_ -like 'dirty-clone-recover-failed C:\c: thread=T-x*exit=1*' }).Count -eq 1)
+
+foreach ($r in @($rowRet, $rowClean)) {
+    $null = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $r) -Recover (New-RecoverStub -Row $recPlain)
+    Check "PR-A: recover is not run after outcome $(($r | ConvertFrom-Json).outcome)" 0 $script:recoverPCalls.Count
+}
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode $DirtyCloneExitCode -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe) -Recover (New-RecoverStub -Row $recPlain)
+Check 'PR-A: exit 8 (no session ran) never recovers' 0 $script:recoverPCalls.Count
+$o = Invoke-LaunchEndRetreat -RepoDir 'C:\c' -ThreadId 'T-x' -CandidateKey 'p::T-x' -HeadMsg 'm' -StopReason 'r' -ExitCode 0 -StateDir 'S' -Retreat (New-RetreatStub -Row $rowNe)
+Check 'PR-A: without -Recover the old not_eligible return stays' 'not_eligible' $o
+
+Check 'PR-A: the sweep passes Invoke-CloneRecover -Preserve to the launch-end retreat' $true ($scriptText -match 'Recover \{ param\(\$d, \$t, \$s\) Invoke-CloneRecover -RepoDir \$d -Preserve -ThreadId \$t -StateDir \$s \}')
+Check 'PR-A: Invoke-CloneRecover passes --preserve --thread-id --state-dir' $true ($crv.Extent.Text -match "'--preserve', '--thread-id', \`$ThreadId, '--state-dir', \`$StateDir")
+Check 'PR-A: the parking re-judge still calls plain recover (no -Preserve)' $true ($scriptText -match 'Recover \{ param\(\$d\) Invoke-CloneRecover -RepoDir \$d \}')
 
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all dirty-clone checks passed"
