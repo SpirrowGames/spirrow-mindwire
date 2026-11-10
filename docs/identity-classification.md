@@ -291,7 +291,17 @@ human (Takahito) chose it on 2026-10-22, when he approved the registry change th
 as Tier-C in spirrow-magickit `T-conclair-persist-disposition-and-d8-readback` msg-1344. The
 registration and its read-back are in msg-1355 of that thread.
 
-### `operator` — **participant**, `legitimate = {integrator}`
+### `operator` — **participant**, retired 2026-11-10, `legitimate = {}` (was `{integrator}`)
+
+**Retired.** Takahito retired this name on 2026-11-10 (spirrow-mindwire
+`T-retire-operator-identity-and-scope-next-fermi` msg-8871): the session it stood for is now `Fermi`,
+which takes over its work (deploy requests, firing gates, develop merges, filing threads, sweep
+edits). The store record was set to `allowed_roles=[]` that day (msg-8898), and the YAML row now
+carries `retired: "2026-11-10"` with `legitimate: []`, so `scripts/register_identities.py` writes
+`[]` and a store record that still holds a role is reported as drift. The row is kept, not removed,
+so past posts and the threads it still owns classify. `NEXT: operator` is being retired in the
+conductor separately (the `HUMAN-TASK:` form, `OPERATOR_MALFORMED_AFTER`). The rest of this section
+is the history.
 
 The operator lane is a Claude Code session acting as Takahito's hands: it files threads, deploys,
 runs probes and posts raw observations. Every post is LLM-written, so it is a participant. It owned
@@ -324,7 +334,7 @@ author.
 | --------------- | ------- | ---------------------------------------------------------------------------- |
 | `claude.ai`     | 17      | Superseded by `Fermi` (ADR-2026-09-14-21); the latest was opened 2026-08-28 |
 | `main`          | 3       | Bootstrap threads from 2026-05-21 and 05-22; all resolved                   |
-| `operator-lane` | 1       | A spelling variant of `operator` (one thread, opened 2026-09-09)           |
+| `operator-lane` | 1       | A spelling variant of `operator` (one thread, opened 2026-09-09); retired with `operator` on 2026-11-10 |
 
 ## What this classification does NOT decide
 

@@ -422,11 +422,12 @@ class ConductorConfig(_StrictModel):
     discharge the named Tier-C declaration from guard (i)'s G1 latch
     (T-guard-i-latches-on-discharged-tierc-line msg-7202 §2 (a) / msg-7204).
 
-    This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["operator",
-    "Fermi"]``). Empty (the default) = only a human post unlatches G1, the previous behaviour. A
-    recorder holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that
-    thread (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING
-    for the overlap. Same author-string trust as ``human_identity``."""
+    This is the record of a human decision given OUTSIDE the chatroom (e.g. ``["Fermi"]``;
+    ``operator`` was retired on 2026-11-10, T-retire-operator-identity-and-scope-next-fermi).
+    Empty (the default) = only a human post unlatches G1, the previous behaviour. A recorder
+    holding proposer / implementer / naysayer in a thread's ``roster`` is ignored in that thread
+    (an agent must not unlatch its own proceed); the daemon still starts and logs a WARNING for
+    the overlap. Same author-string trust as ``human_identity``."""
     max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 

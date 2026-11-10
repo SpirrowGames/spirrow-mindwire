@@ -33,8 +33,8 @@ variable; the deploy wrappers deliberately do NOT duplicate the check.
 :meth:`NaysayerSdkAdapter.spawn` (see the guard on ``self._inference_base_url``
 that raises :class:`NaysayerSdkSpawnError`), which runs when a naysayer session
 is actually summoned. That is intentional — it lets a daemon that never needs
-a naysayer (e.g. an operator-lane conductor working purely on the operator
-thread) start without a value.
+a naysayer (e.g. a conductor working only on threads that never summon one)
+start without a value.
 
 *Process-exit timing (per ``--mode``)*: the exit story diverges by mode
 because different call sites treat spawn failures differently. Producers

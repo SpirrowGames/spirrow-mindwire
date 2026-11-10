@@ -482,6 +482,14 @@ class TestShippedFile:
         for entry in loaded.entries:
             if entry.name in MACHINE_ROLE_EXCEPTIONS:
                 continue
+            if entry.retired is not None:
+                # A retired identity claims no role whatever its kind (the loader's rule,
+                # T-retire-operator-identity-and-scope-next-fermi msg-8898); the biconditional
+                # is broken here in one named, loader-enforced way, not loosened.
+                assert derive_allowed_and_residual([], entry.legitimate).allowed_roles == (
+                    frozenset()
+                )
+                continue
             derived = derive_allowed_and_residual([], entry.legitimate)
             allowed = sorted(derived.allowed_roles)
             assert (entry.kind == "participant") == (derived.allowed_roles != frozenset()), (

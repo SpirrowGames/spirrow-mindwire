@@ -55,3 +55,7 @@ NEXT: <persona>
 
 - `spirrow-magickit/T-T45-pr2-magickit-session-declare-request` は「Magickit team への依頼」ではなく、通常の実装スレッドになる（PR1 の merge 後に着手）。merge 後の報告は proposer が行う（msg-7370「Bohr に依頼すること」）。
 - deploy の権限（D-6' -2）は実装レーンと切り離した。Magickit の PR を merge しても、本番に反映されるのは Takahito の指示による deploy の後である。
+
+## Amendment 2026-11-10（operator の廃止）
+
+`operator` は 2026-11-10 に Takahito が廃止した（spirrow-mindwire `T-retire-operator-identity-and-scope-next-fermi` msg-8871 / msg-8898。Prismind の identity は `allowed_roles=[]`）。D-6' -2 と D-6' -3 で `operator` が担っていた作業、つまり Takahito の指示を受けて deploy request を作成・実行し、request_id・head・時刻・再起動したサービスをスレッドに残す作業は、Fermi が引き継ぐ。deploy の権限そのもの（Takahito の明示的な指示があるときにだけ行う。ループは自律で deploy しない）は変えない。本文中の `operator` は、2026-11-10 以後は Fermi と読み替える。

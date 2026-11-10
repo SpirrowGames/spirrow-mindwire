@@ -23,7 +23,9 @@ Two entry points, both pure (no I/O):
                 ``MACHINE_ROLE_EXCEPTIONS`` (settled-closer → {integrator}),
                 whose ``allowed_roles`` must equal that exact set instead
   participant   ``allowed_roles != []`` **and** ``independence_class !=
-                MACHINE_INDEPENDENCE_CLASS``
+                MACHINE_INDEPENDENCE_CLASS``. Exception: a ``retired``
+                entry, whose ``allowed_roles`` must be ``[]`` (the loader
+                requires ``legitimate=[]`` for it)
   ============  ==========================================================
 
   The participant side is deliberately NOT written as ``∈ {main-chain,
@@ -139,7 +141,10 @@ def check_identity_against_classification(
                 )
             )
     else:  # participant — the loader admits no third kind
-        if roles is not None and not roles:
+        # A retired participant holds no role by construction (the loader requires
+        # legitimate=[] for it); the differ check below still reports a store record
+        # that kept one (T-retire-operator-identity-and-scope-next-fermi msg-8898).
+        if roles is not None and not roles and entry.retired is None:
             violations.append(
                 GuardViolation(
                     "participant_has_no_roles",
