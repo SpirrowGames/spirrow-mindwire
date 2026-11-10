@@ -429,3 +429,105 @@ def test_guard_marks_count_only_in_commit_tool_output(
     assert f"C2CAND {SHA}" in out
     assert "C2EV" not in out
     assert "C3aCAND " + SHA + " 00000000-0000-0000-0000-000000000000 commit_stopped 0" in out
+
+
+# --- PR-gate round 2 -------------------------------------------------------------------------
+
+
+def test_store_check_failed_replace_ref_read_is_an_error_not_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 2 #3: a full store whose refs/replace enumeration fails is incomplete."""
+    monkeypatch.setattr(rv, "_FAILS", 0)
+    monkeypatch.setattr(rv, "git_obj", lambda *a: (0, "false\n"))
+    monkeypatch.setattr(rv, "run", lambda argv: (124, ""))
+    assert rv.store_check("table", "proj", "s") is False
+    out = capsys.readouterr().out
+    assert "STORE proj full replace -1" in out
+    assert "ERR table proj replace-rc124" in out
+    assert rv._FAILS == 1
+
+
+def test_store_check_full_store_with_readable_replace_refs_succeeds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(rv, "_FAILS", 0)
+    monkeypatch.setattr(rv, "git_obj", lambda *a: (0, "false\n"))
+    monkeypatch.setattr(rv, "run", lambda argv: (0, ""))
+    assert rv.store_check("table", "proj", "s") is True
+    assert "ERR" not in capsys.readouterr().out
+    assert rv._FAILS == 0
+
+
+def _tool_pair_recs(tid: str, command: str, result: str, ts: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "assistant",
+            "cwd": CLONE,
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command}}
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": ts,
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": tid, "content": result}]
+            },
+        },
+    ]
+
+
+def _run_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recs: list[dict[str, Any]]
+) -> None:
+    monkeypatch.setattr(rv, "git_obj", lambda *a: (0, SHA))
+    monkeypatch.setattr(rv, "store_check", lambda *a: True)
+    monkeypatch.setattr(rv, "store_of", lambda p: CLONE)
+    monkeypatch.setattr(
+        rv, "transcripts", lambda p: [("proj-dir", "0" * 8 + "-0000-0000-0000-" + "0" * 12, recs)]
+    )
+    monkeypatch.setattr(rv, "docs_rev", lambda p: REV)
+    state = tmp_path / "s.json"
+    row = {"n": 1, "project": "proj", "sha": SHA, "committer": "2026-10-03T00:00:00+00:00"}
+    state.write_text(json.dumps([row]), encoding="utf-8")
+    monkeypatch.setattr(rv, "_FAILS", 0)
+    rv.cmd_creation(SimpleNamespace(state=str(state), preserve=str(tmp_path)))
+
+
+SID = "00000000-0000-0000-0000-000000000000"
+
+
+def test_c2cand_time_is_converted_to_utc(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Round 2 #1: +09:00 local 09:01 is 00:01Z, not 09:01Z."""
+    recs = _session("git commit -m x", GOOD_OUT, ts="2026-10-03T09:01:00+09:00")
+    _run_creation(monkeypatch, tmp_path, recs)
+    out = capsys.readouterr().out
+    assert f"C2CAND {SHA} proj-dir {SID} 2026-10-03T00:01:00Z" in out
+    assert "09:01:00Z" not in out
+
+
+def test_guard_mark_in_git_read_output_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Round 2 #2: `git show HEAD:commit-notes.md` mentions 'commit' but is not a commit call;
+    a real failed `git commit` with the same mark is the positive control."""
+    mark = "Commit stopped by conventions"
+    recs = [
+        *_tool_pair_recs("r1", "git show HEAD:commit-notes.md", mark, "2026-10-03T00:00:10Z"),
+        *_tool_pair_recs("r2", "git log --grep=commit -1", mark, "2026-10-03T00:00:20Z"),
+        *_session("git commit -m x", GOOD_OUT),
+    ]
+    _run_creation(monkeypatch, tmp_path, recs)
+    assert f"C3aCAND {SHA} {SID} commit_stopped 0" in capsys.readouterr().out
+
+    recs = [
+        *_tool_pair_recs("r3", "git commit -m x", mark, "2026-10-03T00:00:30Z"),
+        *_session("git commit -m x", GOOD_OUT),
+    ]
+    _run_creation(monkeypatch, tmp_path, recs)
+    assert f"C3aCAND {SHA} {SID} commit_stopped 1" in capsys.readouterr().out

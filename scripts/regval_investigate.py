@@ -287,9 +287,15 @@ def store_check(step: str, label: str, store: str) -> bool:
         T("replace"),
         ("int", replace_n),
     )
+    ok = True
     if shallow:
         fail(step, ("project", label), "shallow")
-    return not shallow
+        ok = False
+    if rc2:
+        # A failed read is not an observation (PR-gate round 2 #3): ERR + step incomplete.
+        fail(step, ("project", label), f"replace-{rc_tag(rc2)}")
+        ok = False
+    return ok
 
 
 def rc_tag(rc: int) -> str:
@@ -786,7 +792,6 @@ _COMMIT_OUT_ANY = re.compile(r"\[[^\]\s]+(?: \([^)]*\))? ([0-9a-f]{7,40})\]")
 _SIMPLE_GIT = re.compile(
     r"^git(?: -C ([^\s;&|<>`$()\n#'\"]+))? (?:commit|cherry-pick)(?: [^;&|<>`$()\n#]*)?$"
 )
-_GIT_COMMITISH = re.compile(r"^git\b[^\n]*\b(?:commit|cherry-pick)\b")
 C2_WINDOW = timedelta(minutes=10)
 
 
@@ -969,7 +974,7 @@ def cmd_creation(a: argparse.Namespace) -> None:
         for pdir, sid, recs in transcripts(project):
             pairs = tool_pairs(recs)
             mentions = 0
-            cand_at: str | None = None
+            cand_at: datetime | None = None
             for p in pairs:
                 verdict = c2_candidate(p, sha, committer[sha], dirs, store)
                 if verdict == "fail":
@@ -977,7 +982,7 @@ def cmd_creation(a: argparse.Namespace) -> None:
                 elif verdict == "mention":
                     mentions += 1
                 elif verdict == "cand" and cand_at is None:
-                    cand_at = p["timestamp"]
+                    cand_at = _ts(p["timestamp"])  # not None: condition 5 parsed it
             if mentions:
                 emit(T("C2MENTION"), ("sha", sha), ("uuid", sid), ("int", mentions))
             if cand_at is None:
@@ -987,18 +992,24 @@ def cmd_creation(a: argparse.Namespace) -> None:
                 ("sha", sha),
                 ("path", pdir),
                 ("uuid", sid),
-                ("time", cand_at[:19] + "Z"),
+                ("time", iso(cand_at)),  # converted to UTC; the offset is honoured
             )
             # C-3a: guard messages in the OUTPUT of git commit / cherry-pick calls of this
             # session up to the candidate — never in prose or quoted instructions.
+            # The git subcommand itself must be commit / cherry-pick (the same whole-command
+            # form as S-6 condition 1), so `git show HEAD:commit-notes.md` never counts.
+            # Instants are compared as parsed datetimes, never as strings.
             for tag, needle in _GUARD_MARKS:
-                n = sum(
-                    1
-                    for p in pairs
-                    if p["timestamp"] <= cand_at
-                    and _GIT_COMMITISH.match(p["command"].strip())
-                    and needle in p["text"]
-                )
+                n = 0
+                for p in pairs:
+                    t = _ts(p["timestamp"])
+                    if (
+                        t is not None
+                        and t <= cand_at
+                        and _SIMPLE_GIT.match(p["command"].strip())
+                        and needle in p["text"]
+                    ):
+                        n += 1
                 emit(T("C3aCAND"), ("sha", sha), ("uuid", sid), T(tag), ("int", n))
     # C-3b: the preserved snapshot's state (現状 only; never used for 当時).
     for project in sorted({p for p, _ in shas}):
