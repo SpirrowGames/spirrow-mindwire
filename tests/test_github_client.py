@@ -1446,7 +1446,7 @@ async def test_find_cross_pr_head_bound_approves_never_raises_on_dependency_fail
         raise GitHubHTTPError("simulated regression: private cross-fork", status_code=403)
 
     async with _client(handler) as client:
-        monkeypatch.setattr(client, "fetch_pr_reviews_strict", _raising_reviews)
+        monkeypatch.setattr(client, "_list_pr_reviews_strict", _raising_reviews)
         # Must not raise. Must return [] (the fail-open marker-less state).
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
@@ -1556,7 +1556,7 @@ async def test_find_cross_pr_head_bound_approves_does_not_cache_exception(
     )
 
     async with _client(handler) as client:
-        monkeypatch.setattr(client, "fetch_pr_reviews_strict", _flaky_reviews)
+        monkeypatch.setattr(client, "_list_pr_reviews_strict", _flaky_reviews)
         result = await client.find_cross_pr_head_bound_approves(
             _PR, reviewer_login="spirrowgames-ops"
         )

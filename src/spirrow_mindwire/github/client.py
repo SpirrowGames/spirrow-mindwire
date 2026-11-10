@@ -398,10 +398,11 @@ class CoverageLookup:
     partial when reads also failed) or ``failed`` (nothing found and at least one read failed —
     "no coverage" cannot be told apart from "could not look").
 
-    A 2xx commits or commit→pulls page whose body is not a JSON list counts as a failed read
-    (:meth:`GitHubClient._get_rows_strict`). The reviews read goes through the shared
-    :meth:`GitHubClient.fetch_pr_reviews_strict`, whose existing contract still reads such a
-    body as "no reviews"; that method has other strict callers and is left unchanged here.
+    A 2xx commits, commit→pulls or reviews page whose body is not a JSON list counts as a
+    failed read (:meth:`GitHubClient._get_rows_strict`). The reviews read uses the
+    coverage-only :meth:`GitHubClient._list_pr_reviews_strict` (PR-gate #556 round 2); the
+    shared :meth:`GitHubClient.fetch_pr_reviews_strict`, which has other strict callers, is
+    left unchanged.
     """
 
     coverage: list[CrossPrApproveCoverage] = field(default_factory=list)
@@ -1646,7 +1647,7 @@ class GitHubClient:
 
         D-1' (T-gate-verdict-not-a-function-of-its-input msg-8810): the reads used here are
         the STRICT twins (:meth:`_list_pr_commits_strict`, :meth:`_commit_pulls_strict`,
-        :meth:`fetch_pr_reviews_strict`), each failure caught on the spot, recorded in
+        :meth:`_list_pr_reviews_strict`), each failure caught on the spot, recorded in
         :attr:`CoverageLookup.read_failures` (label only) and skipped. The fail-soft twins are
         untouched for their other callers (DESIGN v3 §3: fail-soft and strict never share one
         function). The paragraphs below describe the fail-open contract, which is unchanged:
@@ -1793,7 +1794,7 @@ class GitHubClient:
                         reviews = reviews_cache[other_pr]
                     else:
                         try:
-                            reviews = await self.fetch_pr_reviews_strict(other_pr)
+                            reviews = await self._list_pr_reviews_strict(other_pr)
                         except Exception as inner_exc:
                             # Exception path (T2 §5 ③). Since D-1' (msg-8810) the read
                             # is strict, so every HTTP failure lands here: recorded as a
@@ -1914,10 +1915,51 @@ class GitHubClient:
             page += 1
         return out
 
+    async def _list_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        """Coverage-only strict reviews read (PR-gate #556 round 2 obj 1).
+
+        Same row rules as :meth:`fetch_pr_reviews_strict`, but every page goes through
+        :meth:`_get_rows_strict`, so a 2xx body that is not a JSON list (``{}``, ``null``, a
+        scalar) RAISES and the B-(a) lookup records it as a failed read instead of reading it
+        as "no reviews". A separate method so the shared :meth:`fetch_pr_reviews_strict` and
+        its other strict callers (replay, auto-gate, stall ledger, loop runner) keep their
+        contract unchanged (DESIGN v3 §3: one contract per function).
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
+        out: list[ReviewInfo] = []
+        page = 1
+        while True:
+            rows = await self._get_rows_strict(path, page, what="reviews coverage strict")
+            if not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user = row.get("user")
+                login = str(user.get("login") or "") if isinstance(user, dict) else ""
+                cid = row.get("commit_id")
+                submitted = row.get("submitted_at")
+                rid = row.get("id")
+                body = row.get("body")
+                out.append(
+                    ReviewInfo(
+                        login=login,
+                        state=str(row.get("state") or ""),
+                        commit_id=str(cid) if cid else None,
+                        submitted_at=str(submitted) if submitted else None,
+                        review_id=str(rid) if rid is not None else None,
+                        body=body if isinstance(body, str) else None,
+                    )
+                )
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def _get_rows_strict(self, path: str, page: int, *, what: str) -> list[Any]:
         """One page of a JSON list endpoint, raising :class:`GitHubHTTPError` on any failure.
 
-        Shared only by the two strict twins above. Unlike the fail-soft twins, a 2xx body that
+        Shared only by the strict coverage reads above. Unlike the fail-soft twins, a 2xx body that
         is not a JSON list (``{}``, ``null``, a scalar) RAISES: the lookup could not establish
         what the endpoint holds, so it must be recorded as a failed read, never read as an
         empty page that would make "could not look" look like ``ok-empty`` (PR-gate #556

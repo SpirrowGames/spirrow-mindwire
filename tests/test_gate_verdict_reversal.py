@@ -236,11 +236,13 @@ def _client_handler(
     commits_body: object = None,
     pulls_body: object = None,
     approve_bodies: tuple[str, ...] | None = None,
+    reviews_raw: bytes | None = None,
 ) -> httpx.MockTransport:
     """Two commits, both in PR #95; #95 carries a head-bound APPROVE on sha2 only.
 
     An int argument makes that endpoint answer with that status (and a canary in its body);
     for ``pulls`` / ``reviews`` only the FIRST call fails, so a partial result is observable.
+    ``reviews_raw`` makes EVERY reviews call answer 200 with that raw JSON body.
     """
     seen = {"pulls": 0, "reviews": 0}
 
@@ -268,6 +270,10 @@ def _client_handler(
             return httpx.Response(200, json=[row])
         if path.endswith("/pulls/95/reviews"):
             seen["reviews"] += 1
+            if reviews_raw is not None:
+                return httpx.Response(
+                    200, content=reviews_raw, headers={"content-type": "application/json"}
+                )
             if reviews is not None and seen["reviews"] == 1:
                 return fail(reviews)
             bodies = approve_bodies if approve_bodies is not None else (_marked("d" * 64),)
@@ -374,6 +380,45 @@ async def test_client_commit_pulls_non_list_200_is_recorded_and_skipped() -> Non
     assert result.state == "ok"
     assert [c.sha for c in result.coverage] == ["sha2"]
     assert result.read_failures == ("GitHubHTTPError",)
+
+
+# PR-gate #556 round 2 obj 1: a 2xx reviews body that is not a JSON list is a failed read too.
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "raw", [b"{}", b"null", b'"x"', b"0", b'{"message": "' + _CANARY.encode() + b'"}']
+)
+async def test_client_reviews_non_list_200_is_a_failed_read_and_fail_open(raw: bytes) -> None:
+    # commits and commit→pulls succeed; only the reviews endpoint answers a non-list 200.
+    # Must not raise (fail-open), and must NOT come back as ok-empty.
+    result = await _lookup(_client_handler(reviews_raw=raw))
+    assert result.state == "failed"
+    assert result.coverage == []
+    # Not cached on failure, so each of the two commits retried the read and recorded it.
+    assert result.read_failures == ("GitHubHTTPError", "GitHubHTTPError")
+    assert all("LEAKCANARY" not in f for f in result.read_failures)
+
+
+@pytest.mark.anyio
+async def test_reviews_non_list_200_reaches_the_notice_as_failed_and_stays_fail_open() -> None:
+    async with GitHubClient(
+        token="t", transport=_client_handler(reviews_raw=b"{}"), base_url="https://api.test"
+    ) as c:
+        lookup = await c.find_cross_pr_head_bound_approves(_ME, reviewer_login="spirrowgames-ops")
+    body, verdict = await _run(verdict="APPROVE", read_failures=lookup.read_failures)
+    assert (
+        "> prior-verdict coverage lookup FAILED (GitHubHTTPError, 2 read(s)) — "
+        "reviewed WITHOUT the marker"
+    ) in _notice(body)
+    assert verdict is ReviewEvent.APPROVE
+
+
+@pytest.mark.anyio
+async def test_shared_fetch_pr_reviews_strict_contract_is_unchanged() -> None:
+    """The coverage-only read is separate; the shared strict read still reads {} as no rows."""
+    async with GitHubClient(
+        token="t", transport=_client_handler(reviews_raw=b"{}"), base_url="https://api.test"
+    ) as c:
+        assert await c.fetch_pr_reviews_strict(_OTHER) == []
 
 
 # PR-gate #556 round 1 obj 2: every qualifying APPROVE's fingerprint is kept.
