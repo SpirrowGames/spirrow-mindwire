@@ -172,6 +172,41 @@ class TestTheSentinelMayCarryItsOwnDecoration:
             assert resolve_handoff(f"x\n\n{line}", _ROSTER).kind is HandoffKind.ABSENT, line
 
 
+class TestTheParticipantNameHasAnEnd:
+    """A name that runs on into more alphanumerics is not that name (T-handoff-participant-name-
+    has-no-terminator). ``re.match`` stopped at the end of the ASCII class and returned the prefix,
+    so ``NEXT: Bohr太郎`` dispatched the real role ``Bohr``. The fix refuses the line; it does NOT
+    widen the vocabulary to Unicode names (``NEXT: 太郎`` stays unrouted)."""
+
+    @pytest.mark.parametrize(
+        "line", ["NEXT: Bohr太郎", "NEXT: Bohr-太郎", "NEXT: Bohr_太郎", "NEXT: human太郎"]
+    )
+    def test_a_name_glued_to_more_letters_is_no_name(self, line: str) -> None:
+        assert parse_next_token(f"x\n\n{line}") is None
+        assert resolve_handoff(f"x\n\n{line}", _ROSTER).kind is HandoffKind.ABSENT
+
+    def test_a_unicode_name_is_still_not_a_name(self) -> None:
+        assert parse_next_token("x\n\nNEXT: 太郎") is None
+
+    @pytest.mark.parametrize(
+        ("line", "name"),
+        [
+            ("NEXT: Bohr（x）", "Bohr"),  # noqa: RUF001 (fullwidth parenthesis intentional)
+            ("NEXT: Bohr。", "Bohr"),
+            ("**NEXT: human**。", "human"),
+            ("NEXT: Bohr — go", "Bohr"),
+            ("_NEXT: human_", "human"),
+            ("NEXT: Bohr-(x)", "Bohr"),
+            ("NEXT: **Bohr**太郎", "Bohr"),
+            ("NEXT: some_bot", "some_bot"),
+            ("NEXT: Bohrx", "Bohrx"),
+            ("NEXT: Bohr-x", "Bohr-x"),
+        ],
+    )
+    def test_punctuation_and_decoration_still_end_a_name(self, line: str, name: str) -> None:
+        assert parse_next_token(f"x\n\n{line}") == name
+
+
 class TestThePrRefGrammarHasOneOwner:
     """`parse_pr_ref` decides what a PR ref is; this module asks it (msg-1158 blocking / 1159 §2).
 

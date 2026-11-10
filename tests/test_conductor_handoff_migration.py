@@ -142,6 +142,37 @@ def decorated_lines() -> Iterator[str]:
             yield f"{lead}{body}{at[len(fragments)]}"
 
 
+# A second axis the product above does not have: a character class glued DIRECTLY onto the name.
+# Every gloss in ``_GLOSSES`` starts with a non-word character or a space, so no generated line
+# ever put an alphanumeric right after the name — which is exactly where the participant-name
+# pattern had no end (``NEXT: Bohr太郎`` -> ``Bohr``; T-handoff-participant-name-has-no-terminator).
+# ``x`` / ``-x`` are the ASCII control group: refused before the fix too, pinned so they stay so.
+_GLUED = ("太郎", "x", "-太郎", "_太郎", "-x")
+
+
+def glued_lines() -> Iterator[tuple[str, str]]:
+    """``(original target, line)`` for every (lead x glued target x gloss x wrapper).
+
+    The suffix is joined onto the target BEFORE the line is cut into fragments —
+    ``wrapper(target + suffix)`` — so no wrapper slot ever falls between the name and its suffix:
+    ``NEXT: **Bohr太郎**`` is generated, ``NEXT: **Bohr**太郎`` is not (the latter's name IS
+    followed by decoration and correctly routes to ``Bohr``). ``pr-review`` targets are left out:
+    that sentinel ends at ``_NOT_WORD_CONTINUATION`` and carries an unparsed operand to the
+    conductor's own human fail-safe, a separate contract this axis does not pin.
+    """
+    targets = [target for target in _TARGETS if not target[0].startswith("pr-review")]
+    for lead, target, suffix, gloss in itertools.product(_LEADS, targets, _GLUED, _GLOSSES):
+        glued = (*target[:-1], target[-1] + suffix)
+        fragments = _fragments(glued, gloss)
+        for marker, span in _wrappers(fragments):
+            at: dict[int, str] = dict.fromkeys(_slots(fragments), "")
+            if span is not None:
+                at[span[0]] += marker
+                at[span[1]] += marker
+            body = "".join(at[index] + fragment for index, fragment in enumerate(fragments))
+            yield target[-1], f"{lead}{body}{at[len(fragments)]}"
+
+
 def _corpus_lines() -> list[str]:
     """The real-traffic corpus, read straight from the fixture.
 
@@ -306,6 +337,24 @@ class TestTheLegacyReferenceIsTheParserItClaimsToBe:
         # *previous* generation (`1836387`) would fail here too.
         assert legacy_resolve_handoff("_NEXT: Bohr_", _ROSTER).identity == "Bohr"
         assert legacy_resolve_handoff("**NEXT:** Heisenberg", _ROSTER).identity == "Heisenberg"
+
+
+class TestAGluedNameIsNotTheName:
+    def test_the_glued_set_is_a_real_product(self) -> None:
+        assert sum(1 for _ in glued_lines()) > 10_000
+
+    def test_no_glued_line_resolves_to_the_name_it_starts_with(self) -> None:
+        wrong = []
+        for original, line in glued_lines():
+            folded = original.casefold()
+            token = parse_next_token(line)
+            handoff = resolve_handoff(line, _ROSTER)
+            routed_to = handoff.identity if handoff.kind == "role" else str(handoff.kind)
+            if (token is not None and token.casefold() == folded) or (
+                routed_to is not None and routed_to.casefold() == folded
+            ):
+                wrong.append((line, token, routed_to))
+        assert not wrong, f"{len(wrong)} glued line(s) still resolve, e.g. {wrong[:8]}"
 
 
 class TestNothingRoutableBecameUnroutable:
