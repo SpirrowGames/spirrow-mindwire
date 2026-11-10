@@ -163,7 +163,7 @@ async def test_spawn_blocked_applies_to_the_resolved_identity() -> None:
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, roster).run()
     assert disp.spawns == []
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     (post,) = mcp.posts
     assert "Fermi" in post["content"]
 

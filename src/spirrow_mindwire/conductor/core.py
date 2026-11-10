@@ -476,6 +476,14 @@ class StopReason(StrEnum):
     # roster-free sweep parks as settled but the roster refuses never reaches the conductor; the
     # park-wake tick posts the same notice for it (park_wake/runner.py, PR #531 gate msg-8190).
     MALFORMED_HANDOFF = "malformed_handoff"
+    # T-next-names-unspawnable-identity (Bohr msg-8709 PR-1, D2): the head's ``NEXT:`` names an
+    # identity whose embodiment no adapter here can run (ADR-2026-09-14-21 D-2 / D-3 — Fermi is
+    # the first such identity). Nobody is spawned and a notice ending ``NEXT: human`` says so. Kept
+    # apart from ``HUMAN`` because it is not a decision: the request was never delivered, and the
+    # notification must say that and name the target instead of "判断待ち". The stop line carries
+    # ``blocked_target=<ADR-11 partition key>`` after ``last_msg=`` so the sweep can put the name
+    # in that notification.
+    UNSPAWNABLE_TARGET = "unspawnable_target_to_human"
 
 
 class SummonOwnerSource(Protocol):
@@ -1367,6 +1375,7 @@ class Conductor:
                     forced,
                     forced_saveable,
                     stop_class=self._none_stop_class(handoff, latest, stop_reason),
+                    blocked_target=self._blocked_target(handoff, stop_reason),
                 )
             # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
             # count describes the head this launch started on; a later round is on a head this
@@ -1859,14 +1868,16 @@ class Conductor:
         # arriving at the human with "NEXT: could not be read" — a true statement that names the
         # wrong cause.
         #
-        # The stop is ``StopReason.HUMAN``: the ADR says ``NEXT: Fermi`` is the same stop
-        # condition as ``NEXT: human``, and an operator's notification set is keyed on the reason
-        # string. What it deliberately does NOT do is route through :meth:`_human_terminal`, i.e.
-        # it does not force an Obj2 naysayer consult first. That consult exists to put an
-        # independent review in front of an *un-reviewed agent proposal* before a human approves
-        # it; a nomination nobody can start is a routing dead end, not a proposal. Forcing a
-        # Gemini call on it would spend the review budget on a turn that has nothing to review,
-        # and it would also delay the thread post below by a round.
+        # The stop is ``StopReason.UNSPAWNABLE_TARGET`` (msg-8709 D2; it was ``HUMAN`` before): the
+        # ADR says ``NEXT: Fermi`` is the same stop condition as ``NEXT: human`` — a person has to
+        # act — but it is not a decision, and a ``human`` notification read "あなたの判断待ち" with
+        # no sign that the request never reached its target. The reason is in the sweep's
+        # notification map, so it is still heard. What it deliberately does NOT do is route
+        # through :meth:`_human_terminal`, i.e. it does not force an Obj2 naysayer consult first.
+        # That consult exists to put an independent review in front of an *un-reviewed agent
+        # proposal* before a human approves it; a nomination nobody can start is a routing dead
+        # end, not a proposal. Forcing a Gemini call on it would spend the review budget on a turn
+        # that has nothing to review, and it would also delay the thread post below by a round.
         if (blocked := self._spawn_blocked(handoff)) is not None:
             identity, embodiment = blocked
             logger.warning(
@@ -1882,7 +1893,7 @@ class Conductor:
                 is_forced=False,
                 is_saveable=False,
                 spawn_blocked=True,
-                stop_reason=StopReason.HUMAN,
+                stop_reason=StopReason.UNSPAWNABLE_TARGET,
             )
 
         # Self-handoff (design §6.1): the head hands to its own author. Detected here, before
@@ -2411,6 +2422,23 @@ class Conductor:
         embodiment = blocked_embodiment(name, self._embodiments)
         return None if embodiment is None else (name, embodiment)
 
+    def _blocked_target(self, handoff: Handoff, reason: StopReason) -> str | None:
+        """The ``blocked_target=`` value for the stop line, or ``None`` when it carries none.
+
+        Only on :attr:`StopReason.UNSPAWNABLE_TARGET`, and only the ADR-2026-05-29-11 partition
+        key of the blocked identity (``Fermi`` / ``fermi`` → ``fermi``; msg-8707 v0.4 item 1),
+        never the token as the author typed it. A key holds no whitespace by construction, and
+        :func:`normalize_embodiment_table` refuses a key holding ``=`` at load, so the value
+        cannot break the line's ``key=value`` shape. A typo such as ``NEXT: Fermii`` is not in
+        the embodiment table, so it never reaches this stop (it is ``IDENTITY_UNRESOLVED``).
+        """
+        if reason is not StopReason.UNSPAWNABLE_TARGET:
+            return None
+        blocked = self._spawn_blocked(handoff)
+        if blocked is None:
+            return None
+        return normalize_identity_key(blocked[0]) or None
+
     def _is_self_handoff(self, handoff: Handoff, author: str) -> bool:
         """Does ``handoff`` hand back to ``author``?
 
@@ -2468,6 +2496,7 @@ class Conductor:
                 f"(ADR-2026-09-14-21 D-2 / D-3)。\n\n"
                 f"∴ spawn せず、`NEXT: human` と同じ停止として扱いました。"
                 f"これは特例ではなく、adapter を持たない稼働形態すべてに適用される一般則です。\n\n"
+                f"依頼は `{identity}` に配送されていません。\n\n"
                 f"次にやること: `{identity}` に依頼する内容であれば、その本人が投稿してから"
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
@@ -4175,20 +4204,25 @@ class Conductor:
         *,
         stop_class: StopClass | None = None,
         yield_to: str | None = None,
+        blocked_target: str | None = None,
     ) -> ConductorOutcome:
         # ``stop_class=`` is appended only on a ``NEXT: none`` settle (see ``_none_stop_class``),
         # after ``last_msg=``: the wrapper reads each ``key=`` with its own match
         # (Get-ConductorVerdict), so a field it does not know is ignored. Summon (v1.5 / v1.6):
         # ``yield_to=`` only on SUMMON_YIELD, and ``resume_notice=delivered`` whenever this run sent
         # the turn carrying the resume notice — both can appear on one line (I-SY5).
+        # ``blocked_target=`` only on UNSPAWNABLE_TARGET, directly after ``last_msg=`` (msg-8709
+        # D2): an ADR-11 partition key, which has no whitespace and no ``=`` (see
+        # :meth:`_blocked_target`), so it reads as one token like every other field.
         logger.info(
             "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
-            "forced_naysayer_saveable=%d last_msg=%s%s%s%s",
+            "forced_naysayer_saveable=%d last_msg=%s%s%s%s%s",
             reason.value,
             rounds,
             forced,
             forced_saveable,
             last_msg_id,
+            f" blocked_target={blocked_target}" if blocked_target else "",
             f" stop_class={stop_class.value}" if stop_class is not None else "",
             f" yield_to={yield_to}" if yield_to else "",
             " resume_notice=delivered" if self._resume_notice_delivered else "",

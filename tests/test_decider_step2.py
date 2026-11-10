@@ -1373,13 +1373,14 @@ async def test_conductor_spawn_blocked_human_leaves_one_spawn_blocked_line(
             replies={},
             identity_embodiment=_HUMAN_UNSPAWNABLE,
         )
-    assert outcome.stop_reason is StopReason.HUMAN
+    # T-next-names-unspawnable-identity D2: the spawn-blocked stop has its own reason now.
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.dispatches == []
     assert outcome.forced_naysayer_turns == 0
     assert outcome.forced_naysayer_turns_saveable == 0
     assert len(stub.states) == 1
     (line,) = _decider_lines(caplog)
-    assert line["routed"] == "spawn_blocked" and line["stop"] == "human"
+    assert line["routed"] == "spawn_blocked" and line["stop"] == "unspawnable_target_to_human"
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
     assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
@@ -1411,7 +1412,7 @@ def _route_of(
                 is_forced=False,
                 is_saveable=False,
                 spawn_blocked=True,
-                stop_reason=StopReason.HUMAN,
+                stop_reason=StopReason.UNSPAWNABLE_TARGET,
             ),
         ),
         # forced consult on an explicit NEXT: human (not saveable)

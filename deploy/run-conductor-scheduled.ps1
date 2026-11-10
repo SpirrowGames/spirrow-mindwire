@@ -2863,7 +2863,9 @@ function Get-StarvedKeys {
 # --- parse the conductor's own verdict ----------------------------------------------------------
 # The daemon's last word on stdout looks like:
 #   conductor stopped: reason=none rounds=0 forced_naysayer=0 ... last_msg=msg-1919
-# Returns @{ reason; rounds; last_msg; error_code }; nulls mean "could not tell".
+# Returns @{ reason; rounds; last_msg; error_code; blocked_target }; nulls mean "could not tell".
+# `blocked_target=` is only on `reason=unspawnable_target_to_human` (T-next-names-unspawnable-identity
+# msg-8709 D2): the ADR-11 key of the identity the run could not spawn, after `last_msg=`.
 # `error_code=` is only on the adapter-error line loop_runner.main prints when an adapter's
 # deliver_event raised (`reason=adapter_error`, T-successful-turn-quarantined-on-sdk-lifecycle-
 # failure Bohr msg-4440 D-2'); every other stop line has none and leaves it $null.
@@ -2871,7 +2873,7 @@ function Get-ConductorVerdict {
     param([string[]]$Output)
 
     $line = $Output | Where-Object { $_ -match 'conductor stopped:' } | Select-Object -Last 1
-    $verdict = @{ reason = $null; rounds = $null; last_msg = $null; error_code = $null }
+    $verdict = @{ reason = $null; rounds = $null; last_msg = $null; error_code = $null; blocked_target = $null }
     if (-not $line) { return $verdict }
     if ($line -match 'reason=(\S+)') { $verdict.reason = $Matches[1] }
     if ($line -match 'error_code=(\S+)') { $verdict.error_code = $Matches[1] }
@@ -2881,6 +2883,7 @@ function Get-ConductorVerdict {
     # equal to a real id (so it failed open, harmlessly) but it made "no head recorded yet"
     # indistinguishable from a real head in both the state file and the log.
     if ($line -match 'last_msg=(\S+)' -and $Matches[1] -ne 'None') { $verdict.last_msg = $Matches[1] }
+    if ($line -match '(^|\s)blocked_target=(\S+)') { $verdict.blocked_target = $Matches[2] }
     return $verdict
 }
 
@@ -4759,7 +4762,10 @@ function Format-DecisionMessage {
         [string]$LastMsgId,
         [string]$RawFallback,
         $Envelope = $null,
-        [int]$Budget = $DecisionMessageDiscordBudget
+        [int]$Budget = $DecisionMessageDiscordBudget,
+        # The stop line's blocked_target= (T-next-names-unspawnable-identity D2); feeds the
+        # header phrase's {0} only.
+        [string]$BlockedTarget = ''
     )
 
     # Background: 2 lines the ladder never touches (D-29). A truncated form without them collapses
@@ -4772,7 +4778,7 @@ function Format-DecisionMessage {
     # phrase for the actual stop reason from the SOT map in deploy/lib/StopReason.ps1 instead of
     # the fixed "判断待ち" literal. Every other field on this line is preserved byte-for-byte.
     $header = New-NotificationHeader -ThreadId $ThreadId -Project $Project `
-        -StopReason $StopReason -Rounds $Rounds -LastMsgId $LastMsgId
+        -StopReason $StopReason -Rounds $Rounds -LastMsgId $LastMsgId -BlockedTarget $BlockedTarget
     $background = "$header`n$link"
 
     if (-not $Envelope) { return $null }   # caller falls back to $RawFallback
@@ -5035,7 +5041,9 @@ function Send-HumanParkAlert {
         [string]$RawFallback,
         # D-3: state\material-missing.json. $null (tests that predate D-3) records nothing; the ⚠
         # line is added either way, because it depends only on this tick's outcome.
-        [hashtable]$MaterialMissingState = $null
+        [hashtable]$MaterialMissingState = $null,
+        # The stop line's blocked_target= (T-next-names-unspawnable-identity D2), for the header.
+        [string]$BlockedTarget = ''
     )
 
     # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
@@ -5081,7 +5089,8 @@ function Send-HumanParkAlert {
     if ($warning) { $formatBudget -= ($warning.Length + 1) }
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `
-        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget
+        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget `
+        -BlockedTarget $BlockedTarget
     $message = if ($enriched) { $enriched } else { $RawFallback }
     if ($warning) { $message = "$warning`n$message" }
 
@@ -7378,8 +7387,12 @@ try {
             # the sequence a named function is what makes the two invariants testable in isolation
             # (the AST-lift harness in Test-DecisionComposerWiring.ps1 cannot reach code inlined
             # inside the sweep body).
+            # The phrase goes through Get-StopReasonPhrase, not $needsHuman[...] directly, so the
+            # one template phrase gets its {0} filled (T-next-names-unspawnable-identity D2). For
+            # every other reason the two are the same string.
             $rawFallback = ("MindWire: **$thread** ($($cand.project)) — " +
-                            $needsHuman[$verdict.reason] +
+                            (Get-StopReasonPhrase -StopReason $verdict.reason `
+                                -BlockedTarget "$($verdict.blocked_target)") +
                             " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
                             "chatroom を確認してください。")
             Send-HumanParkAlert -PendingDecisionsState $pendingDecisionsState `
@@ -7388,7 +7401,7 @@ try {
                 -Project $cand.project -ThreadId $thread `
                 -Signature $sig -LastMsgId $verdict.last_msg `
                 -StopReason $verdict.reason -Rounds $verdict.rounds `
-                -RawFallback $rawFallback
+                -RawFallback $rawFallback -BlockedTarget "$($verdict.blocked_target)"
         }
 
         if ($verdict.rounds -gt 0) {

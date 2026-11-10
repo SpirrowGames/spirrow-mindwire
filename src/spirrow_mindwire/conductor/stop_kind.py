@@ -83,6 +83,9 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     # Not in §6.3 (T-done-disposition-auto-close). A refused STOP: done / BLOCKED-ON: form; like
     # SELF_HANDOFF its notice ends ``NEXT: human``, so it is read as a human stop.
     StopReason.MALFORMED_HANDOFF: None,
+    # Not in §6.3 (T-next-names-unspawnable-identity). ``NEXT:`` named an identity no adapter can
+    # run; like SELF_HANDOFF its notice ends ``NEXT: human``, so it is read as a human stop.
+    StopReason.UNSPAWNABLE_TARGET: None,
     # Its notice carries the stop marker, so R-RELAY-STOP gives the same value.
     StopReason.STALLED: StopKind.STALLED,
     # Never returned by ``Conductor.run``: the run exits 1, and R-QUAR's log tail decides.
