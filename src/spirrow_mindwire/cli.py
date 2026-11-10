@@ -10,6 +10,11 @@ The status / debug commands are still deferred to a later phase.
 measures a PR's diff exactly as the naysayer gate does and prints ``decision=fix-now`` (exit 0)
 or ``decision=split`` (exit 3); see :mod:`spirrow_mindwire.naysayer.pr_diff_size`.
 
+``mindwire settled-close --dry-run [--include-legacy] [--projects a,b] [--format table]``
+(T-done-disposition-auto-close boundary 6) lists, read-only, which open threads magickit's
+settled-disposition carve-out would close; ``--tick`` is the sweep's call and does nothing unless
+``sweep.json``'s ``settled_close.enabled`` is true. See :mod:`spirrow_mindwire.settled_close`.
+
 ``mindwire clone-check --repo-dir <dir>`` (T-clone-guard-pin-ignored-only-in-mindwire, design
 v2.1 D-3c, Bohr msg-6162 / msg-6164) re-judges a shared clone the sweep wrapper has parked after a
 dirty-clone exit 8. It runs exactly what the dispatcher runs before a dispatch —
@@ -25,7 +30,10 @@ traceback, so "could not tell" is never confused with "dirty".
 PR-0) switches a ``wrong_head`` clone back to its default branch when every commit on its branch is
 already on the remote; see :mod:`spirrow_mindwire.clone_recover`. Exit 0 recovered, 3 not
 eligible (nothing changed), 1 failed. The wrapper calls it before ``clone-check``, which still
-makes the release decision.
+makes the release decision. ``--preserve --thread-id <id> --state-dir <dir>``
+(T-role-exit-leaves-clone-off-default-branch PR-A) also switches back a clean clone whose commits
+are not all on the remote, after keeping them on a local ``wip/`` ref, and records that ref for the
+thread's next implementer turn.
 
 ``mindwire clone-retreat --repo-dir <dir> --thread-id <id> --head-msg <msg> --stop-reason <r>
 --state-dir <dir>`` (same thread, PR-1a) runs after a launch: WIP to a ``wip/`` branch, or export a
@@ -101,6 +109,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="switch a wrong_head clone back to its default branch if that loses no commit",
     )
     recover.add_argument("--repo-dir", required=True, type=Path, help="the shared clone")
+    recover.add_argument(
+        "--preserve",
+        action="store_true",
+        help="also recover unpushed commits / detached HEAD by keeping them on a local wip/ ref",
+    )
+    recover.add_argument("--thread-id", default=None, help="(--preserve) the thread to record for")
+    recover.add_argument(
+        "--state-dir", type=Path, default=None, help="(--preserve) where clone-retreats.jsonl is"
+    )
     retreat = sub.add_parser(
         "clone-retreat",
         help="after a launch: move a dirty clone's WIP to a wip/ branch, or export and discard it",
@@ -146,6 +163,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="mindwire.toml to resolve the ledger path from (default: the standard location)",
     )
+    settled = sub.add_parser(
+        "settled-close",
+        help="settled_close: --dry-run lists what would close (read only); --tick is the sweep's",
+    )
+    from .settled_close.__main__ import add_arguments as add_settled_close_arguments
+
+    add_settled_close_arguments(settled)
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -206,10 +230,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(run_band_count(args.limit))
     if args.command == "clone-check":
         raise SystemExit(clone_check(args.repo_dir))
+    if args.command == "settled-close":
+        from .settled_close.__main__ import run as run_settled_close
+
+        raise SystemExit(run_settled_close(args))
     if args.command == "clone-recover":
         from .clone_recover import run as run_clone_recover
 
-        raise SystemExit(run_clone_recover(args.repo_dir))
+        if args.preserve and (not args.thread_id or args.state_dir is None):
+            print("clone-recover: --preserve needs --thread-id and --state-dir", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(
+            run_clone_recover(
+                args.repo_dir,
+                preserve=args.preserve,
+                thread_id=args.thread_id,
+                state_dir=args.state_dir,
+            )
+        )
     if args.command == "clone-retreat":
         from .clone_retreat import run as run_clone_retreat
 

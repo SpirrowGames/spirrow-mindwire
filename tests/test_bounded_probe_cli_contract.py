@@ -84,7 +84,26 @@ def test_every_call_site_was_found() -> None:
     # T-gate-fires-on-pr-open adds Invoke-AutoGateTick: fifteen.
     # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 adds Invoke-CloneRecover: sixteen.
     # PR-1a of the same thread adds Invoke-CloneRetreat: seventeen.
-    assert len(_SITES) == 17, _SITES
+    # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
+    # T-role-exit-leaves-clone-off-default-branch PR-A adds Invoke-CloneRecover -Preserve: nineteen.
+    # PR-B of the same thread adds the hold acknowledgement via park -> loop_control.py: twenty.
+    assert len(_SITES) == 20, _SITES
+
+
+def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"hold-ack-$proj"') == (
+        "loop_control.py",
+        ["--report-observed-hold", "--project"],
+    )
+
+
+def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"jev-material-$Project"') == (
+        "jev_material.py",
+        ["--annotations", "--project", "--thread-id", "--head-msg-id"],
+    )
 
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
@@ -98,6 +117,10 @@ def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:
     assert sites.get("'clone-recover'") == (
         "-m spirrow_mindwire.cli clone-recover",
         ["--repo-dir"],
+    )
+    assert sites.get("'clone-recover-preserve'") == (
+        "-m spirrow_mindwire.cli clone-recover",
+        ["--repo-dir", "--preserve", "--thread-id", "--state-dir"],
     )
     assert sites.get("'clone-retreat'") == (
         "-m spirrow_mindwire.cli clone-retreat",

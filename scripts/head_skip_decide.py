@@ -101,7 +101,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from spirrow_mindwire.conductor.handoff import posted_at_of
 from spirrow_mindwire.conductor.head_skip import (
+    CACHED_TOKEN_POSTED_AT,
     REPORT_MODE_VALUE,
     Decision,
     Record,
@@ -157,8 +159,11 @@ def _thread_status_of(result: dict[str, Any]) -> str:
 
 async def _fetch_head_body(
     mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
-) -> tuple[str, str, str] | None:
-    """Return ``(head_msg_id, head_body, thread_status)`` for a thread, or ``None`` on error.
+) -> tuple[str, str, str, datetime | None] | None:
+    """Return ``(head_msg_id, head_body, thread_status, posted_at)``, or ``None`` on error.
+
+    ``posted_at`` is the head's ``timestamp`` (``None`` when unreadable), for the boundary-5
+    ``NEXT: none`` cutoff (``handoff.NONE_MALFORMED_AFTER``).
 
     Errors are swallowed (fail-open at the caller): a probe gap costs one launched candidate,
     never a silent park. ``None`` means "could not fetch"; the caller synthesises an UNRESOLVED
@@ -186,7 +191,7 @@ async def _fetch_head_body(
         return None
     msg_id = str(last.get("msg_id") or "")
     body = str(last.get("content") or "")
-    return (msg_id, body, _thread_status_of(result)) if msg_id else None
+    return (msg_id, body, _thread_status_of(result), posted_at_of(last)) if msg_id else None
 
 
 def _load_state(path: Path) -> dict[str, Record]:
@@ -310,6 +315,10 @@ async def _decide_all(
         # ``""`` = unknown → Stage 0 fails open. Set from the fetch, or from the cached
         # observation on a cache hit (otherwise a cache hit would hide a resolved thread).
         thread_status = ""
+        # Boundary 5: the head's posting time. A replay of the cached token reads with
+        # ``CACHED_TOKEN_POSTED_AT`` (the cutoff was applied when the token was cached); an
+        # unfetchable body has no token, so its ``None`` changes nothing.
+        posted_at: datetime | None = None
         if can_reuse_cached_parse(rec, head_msg_id, now):
             # Synthesise a body from the cached NORMALISED token. Round-tripping the same
             # normalised token through ``parse_head_token`` reproduces the identical token, so
@@ -321,6 +330,7 @@ async def _decide_all(
             head_fetched = False
             actual_msg_id = head_msg_id
             thread_status = rec.last_observed_status
+            posted_at = CACHED_TOKEN_POSTED_AT
         else:
             fetched = await _fetch_head_body(mcp, project, thread_id)
             if fetched is None:
@@ -344,7 +354,7 @@ async def _decide_all(
                     else ""
                 )
             else:
-                actual_msg_id, head_body, thread_status = fetched
+                actual_msg_id, head_body, thread_status, posted_at = fetched
                 head_fetched = True
 
         v: Verdict = decide(
@@ -354,6 +364,7 @@ async def _decide_all(
             control_state=control_state,
             record=rec,
             thread_status=thread_status,
+            posted_at=posted_at,
         )
 
         # Observation-only refresh. NEVER touches the launch baseline (that is the
@@ -371,7 +382,7 @@ async def _decide_all(
             new_state[thread_id] = commit_observation(
                 now=now,
                 head_msg_id=actual_msg_id,
-                token=parse_head_token(head_body),
+                token=parse_head_token(head_body, posted_at=posted_at),
                 record=rec,
                 thread_status=thread_status,
             )

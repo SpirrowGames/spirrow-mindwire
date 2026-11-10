@@ -34,4 +34,6 @@ pwsh -NoProfile -File tests/Test-GitSyncDeferred.ps1
 pwsh -NoProfile -File tests/Test-UnregisteredIntake.ps1
 pwsh -NoProfile -File tests/Test-OperatorLane.ps1
 pwsh -NoProfile -File tests/Test-PreLoopBudget.ps1
+pwsh -NoProfile -File tests/Test-SettledClose.ps1
+pwsh -NoProfile -File tests/Test-HoldAckViaPark.ps1
 uv run pytest

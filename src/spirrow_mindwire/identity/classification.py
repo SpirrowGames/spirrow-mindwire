@@ -31,6 +31,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -39,11 +40,14 @@ from .normalize import IdentityCollisionError, find_collisions, normalize_identi
 
 __all__ = [
     "MACHINE_INDEPENDENCE_CLASS",
+    "MACHINE_ROLE_EXCEPTIONS",
+    "SETTLED_CLOSER",
     "ClassificationEntry",
     "ClassificationError",
     "LegitimateRolesFile",
     "derive_allowed_and_residual",
     "load_legitimate_roles",
+    "machine_roles_are_excepted",
 ]
 
 
@@ -117,6 +121,45 @@ _VALID_KINDS = frozenset({"participant", "machine"})
 #: verification that the deployed service accepts it is the live ``upsert_identity``
 #: result (msg-1706 §2 / DoD 2), not a tuple or import pinned here.
 MACHINE_INDEPENDENCE_CLASS = "machine"
+
+#: The identity the settled-disposition closer (``settled_close``) closes threads
+#: as. This is the ONE place the name string lives in this repo: the
+#: ``settled_close`` default author and :data:`MACHINE_ROLE_EXCEPTIONS` both read
+#: it (T-done-disposition-auto-close msg-8601 §1-2 S-1 / S-5).
+SETTLED_CLOSER = "settled-closer"
+
+#: The ONLY machines that may carry a non-empty ``legitimate`` role set, mapped to
+#: the exact role set each may carry. Every other ``kind: machine`` identity still
+#: requires ``legitimate: []`` (msg-1484 §2).
+#:
+#: ``settled-closer`` closes threads with a fixed text that never passes through an
+#: LLM (msg-8172 §3), so it is a machine. magickit nonetheless requires a
+#: registered closing author to hold one of its ``CLOSEABLE_ROLES``, so the
+#: identity needs exactly one role. The recorded ``integrator`` is a capability
+#: marker ("may close"), not a claim of having authored a judgement; the sanction
+#: for each close is ``close_sanction.kind=settled_disposition`` plus the
+#: proposer's ``STOP: done`` head. Decided by Takahito, T-done-disposition-auto-close
+#: msg-8589.
+#:
+#: Keys are matched against the RAW ``name`` exactly — deliberately NOT the ADR-11
+#: normalised key — so no alternative spelling (``Settled_Closer`` …) can inherit
+#: the exception. The role set must also match exactly. Widening the table is a
+#: source change and therefore passes the PR gate; a YAML edit alone cannot.
+#: Writing ``legitimate: []`` for the same name stays valid (the rollback shape).
+MACHINE_ROLE_EXCEPTIONS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {SETTLED_CLOSER: frozenset({"integrator"})}
+)
+
+
+def machine_roles_are_excepted(name: str, roles: Iterable[str]) -> bool:
+    """True iff the machine ``name`` may carry exactly ``roles`` (non-empty).
+
+    The single predicate both the loader (:func:`_parse_entry`) and the
+    registration check (:func:`~.registration.check_identity_against_classification`)
+    use, so the exception cannot be spelled two ways.
+    """
+    allowed = MACHINE_ROLE_EXCEPTIONS.get(name)
+    return allowed is not None and frozenset(roles) == allowed
 
 
 def load_legitimate_roles(path: Path) -> LegitimateRolesFile:
@@ -222,10 +265,12 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         raise ClassificationError(
             f"{path}: identities[{index}].legitimate must be a list of strings"
         )
-    if kind == "machine" and legitimate:
+    if kind == "machine" and legitimate and not machine_roles_are_excepted(name, legitimate):
         raise ClassificationError(
-            f"{path}: identities[{index}] kind=machine requires legitimate=[] "
-            f"(machinery has no honest role claim; msg-1484 §2)"
+            f"{path}: identities[{index}] kind=machine requires legitimate=[] unless listed "
+            f"in MACHINE_ROLE_EXCEPTIONS (settled-closer: integrator only) "
+            f"(machinery has no honest role claim; msg-1484 §2, "
+            f"T-done-disposition-auto-close msg-8589)"
         )
     if kind == "participant" and not legitimate:
         raise ClassificationError(

@@ -25,6 +25,10 @@
 #      $retryState, $evaluatedState, Invoke-HeadSkipDecide and $liveKeys in the run section. And
 #      functionally: a quarantined auto-registered key is in the joined candidates, which is where the
 #      decide batch and the dispatch loop look it up in $quarantineState and skip it.
+#   T  Exclusion by tag (T-sweep-exclude-by-tag msg-8731 / msg-8749): the rule order (exclude list ->
+#      clone -> time -> idle -> tag -> mode), tag_state other than ok refused as "tags <state>", the
+#      P/M INFO (移行可 only at P == M), the null / lookup-cap WARNs and header notes, and the parity
+#      fixture shared with tests/test_unregistered_threads_tags.py.
 #   Digest  The 未登録（登録不可）section: "?" rows first, true totals in the header, the floor of the
 #      sections after it intact under the shipped budget, and no change when no intake is passed.
 
@@ -55,14 +59,19 @@ function CheckTrue {
 
 function Cand { param($p, $t, $d) [pscustomobject]@{ project = $p; thread_id = $t; repo_dir = $d; key = "$p/$t" } }
 # One enumerator project row. $ids: thread ids; $times: optional hashtable id -> idle_days (number),
-# 'missing' or 'unparseable'. An id with no entry is fresh (1 day).
+# 'missing' or 'unparseable'. An id with no entry is fresh (1 day). $tags: optional hashtable id ->
+# 'tag:<exclude tag>' (read, and matched) or a tag_state ('unread' / 'unreadable' / 'field_missing').
+# An id with no entry has tag_state 'ok' and no exclude tag (read, untagged).
 function Proj {
-    param($p, $ids, $count = 'auto', $err = $null, $times = @{}, [switch]$NoThreads)
+    param($p, $ids, $count = 'auto', $err = $null, $times = @{}, $tags = @{}, [switch]$NoThreads)
     $c = if ($count -eq 'auto') { @($ids).Count } else { $count }
     $rows = @(foreach ($id in @($ids)) {
         $t = if ($times.ContainsKey($id)) { $times[$id] } else { 1.0 }
-        if ($t -is [string]) { [pscustomobject]@{ thread_id = $id; time_state = $t; last_activity_at = $null; idle_days = $null } }
-        else { [pscustomobject]@{ thread_id = $id; time_state = 'ok'; last_activity_at = '2026-10-01T00:00:00+00:00'; idle_days = [double]$t } }
+        $tg = if ($tags.ContainsKey($id)) { $tags[$id] } else { 'ok' }
+        $ex = if ($tg -is [string] -and $tg.StartsWith('tag:')) { $tg.Substring(4) } else { $null }
+        $ts = if ($null -ne $ex) { 'ok' } else { [string]$tg }
+        if ($t -is [string]) { [pscustomobject]@{ thread_id = $id; time_state = $t; last_activity_at = $null; idle_days = $null; exclude_tag = $ex; tag_state = $ts } }
+        else { [pscustomobject]@{ thread_id = $id; time_state = 'ok'; last_activity_at = '2026-10-01T00:00:00+00:00'; idle_days = [double]$t; exclude_tag = $ex; tag_state = $ts } }
     })
     $o = [pscustomobject]@{ project = $p; unregistered_count = $c; unregistered = @($ids); error = $err; malformed_count = 0 }
     if (-not $NoThreads) { $o | Add-Member -NotePropertyName threads -NotePropertyValue $rows }
@@ -269,7 +278,7 @@ $jf = Join-UnregisteredCandidates -Candidates $cands -Intake $i
 Check "Join with a failed probe returns exactly the listed candidates" 3 $jf.Count
 
 $i = Resolve (Rep (Proj 'mw' @()))
-Check "measured 0 -> header '0 件' without '?'" '未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件）' (Get-UnregisteredIntakeHeader -Intake $i)
+Check "measured 0 -> header '0 件' without '?'" '未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件（列挙 0 / tag 0））' (Get-UnregisteredIntakeHeader -Intake $i)
 
 Write-Host "D-2.2 — added rows are ordinary candidates (same shape, no marker)"
 $rep = Rep (Proj 'mw' @('T-new1', 'T-new2'))
@@ -403,14 +412,14 @@ $withNull = New-DailyDigest @base -UnregisteredIntake $null
 Check "no intake passed -> digest unchanged" $without $withNull
 CheckTrue "no intake passed -> no 未登録 section" (-not ($without -match '未登録（登録不可）'))
 
-$dIntake = @{ added = @((Cand 'mw' 'T-a' $dirA)); probe_error = $null; max_idle_days = 14; excluded_count = 2
+$dIntake = @{ added = @((Cand 'mw' 'T-a' $dirA)); probe_error = $null; max_idle_days = 14; excluded_count = 2; excluded_list_count = 2
     unmeasured = @([pscustomobject]@{ project = 'vw'; reason = 'Timeout' })
     refused = @([pscustomobject]@{ project = 'mk'; thread_id = 'T-r'; key = 'mk/T-r'; reason = 'clones 未登録' })
     shadow = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-s'; key = 'mw/T-s'; idle_days = 3.25 })
     idle = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-i'; key = 'mw/T-i'; idle_days = 40 })
     time_unknown = @([pscustomobject]@{ project = 'mw'; thread_id = 'T-u'; key = 'mw/T-u'; reason = 'last_activity_at missing' }) }
 $d = New-DailyDigest @base -UnregisteredIntake $dIntake
-CheckTrue "section header counts every bucket, with '?'" ($d.Contains('未登録（登録不可）: 1 件 + ?（この tick の自動登録 1 件 / 登録予定（shadow） 1 件 / 放置 1 件 / 時刻不明 1 件 / 除外 2 件）')) $d
+CheckTrue "section header counts every bucket, with '?'" ($d.Contains('未登録（登録不可）: 1 件 + ?（この tick の自動登録 1 件 / 登録予定（shadow） 1 件 / 放置 1 件 / 時刻不明 1 件 / 除外 2 件（列挙 2 / tag 0））')) $d
 CheckTrue "refused row names key and reason" ($d -match '  mk/T-r — clones 未登録') $d
 CheckTrue "unmeasured row shows '?'" ($d -match '  vw — \? 測れなかった: Timeout') $d
 CheckTrue "時刻不明 row shows '?' and the state" ($d -match '  mw/T-u — \? 時刻不明（登録しない）: last_activity_at missing') $d
@@ -418,7 +427,7 @@ CheckTrue "shadow row shows 登録予定 and idle days" ($d -match '  mw/T-s —
 CheckTrue "放置 row shows idle days and the limit" ($d -match '  mw/T-i — 放置（登録しない）: 最終更新から 40 日 > 上限 14 日') $d
 CheckTrue "excluded threads get no row (count only)" (-not ($d -match '除外（')) $d
 $legacy = New-DailyDigest @base -UnregisteredIntake @{ added = @(); refused = @(); unmeasured = @(); probe_error = $null }
-CheckTrue "an intake without the new keys renders zeros, not phantom rows" ($legacy.Contains('未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件）')) $legacy
+CheckTrue "an intake without the new keys renders zeros, not phantom rows" ($legacy.Contains('未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件（列挙 0 / tag 0））')) $legacy
 $lines = $d -split "`n"
 $uIdx = [array]::IndexOf($lines, ($lines | Where-Object { $_ -like '  vw — ?*' } | Select-Object -First 1))
 $rIdx = [array]::IndexOf($lines, ($lines | Where-Object { $_ -like '  mk/T-r*' } | Select-Object -First 1))
@@ -430,7 +439,7 @@ CheckTrue "section sits between 停止中 and 飢餓" ($hdrStale -lt $hdrUnreg -
 
 $emptyIntake = @{ added = @(); refused = @(); unmeasured = @(); probe_error = $null }
 $d0 = New-DailyDigest @base -UnregisteredIntake $emptyIntake
-CheckTrue "measured and nothing refused -> header at 0 件 plus (該当なし)" ($d0 -match "未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件）`n  \(該当なし\)") $d0
+CheckTrue "measured and nothing refused -> header at 0 件 plus (該当なし)" ($d0 -match "未登録（登録不可）: 0 件（この tick の自動登録 0 件 / 登録予定（shadow） 0 件 / 放置 0 件 / 時刻不明 0 件 / 除外 0 件（列挙 0 / tag 0））`n  \(該当なし\)") $d0
 
 # Budget: 80 refused rows + 10 starved rows under the shipped budget.
 $many = @{ added = @(); unmeasured = @(); probe_error = $null; refused = @() }
@@ -450,6 +459,84 @@ CheckTrue "飢餓 keeps its floor after 未登録" ($dm -match '  p/T-starved-')
 Write-Host "Get-ParkedRowTag — merge_wait lane survives the helper extraction"
 Check "merge_wait tag" '   — [merge 待ち・PR 一覧に掲載]' (Get-ParkedRowTag -Row ([pscustomobject]@{ lane = 'merge_wait' }) -Default 'x')
 Check "decision row keeps its default" 'x' (Get-ParkedRowTag -Row ([pscustomobject]@{ lane = 'decision' }) -Default 'x')
+
+Write-Host "T — exclusion by tag (T-sweep-exclude-by-tag msg-8731 / msg-8749)"
+$tagRep = Rep @((Proj 'mw' @('T-plain', 'T-probe', 'T-unread', 'T-unreadable', 'T-missing', 'T-old', 'T-old-unread', 'T-exlist') `
+    -times @{ 'T-old' = 30.0; 'T-old-unread' = 30.0 } `
+    -tags @{ 'T-probe' = 'tag:probe'; 'T-unread' = 'unread'; 'T-unreadable' = 'unreadable'; 'T-missing' = 'field_missing'; 'T-old-unread' = 'unread'; 'T-exlist' = 'unread' }))
+$tagCfg = Cfg -Clones ([ordered]@{ mw = $dirA; mk = $dirB }) -Exclude @('mw/T-exlist')
+$ti = Resolve -Report $tagRep -Config $tagCfg
+Check "untagged, tag read -> added" 'mw/T-plain' (@($ti.added | ForEach-Object { $_.key }) -join ',')
+Check "exclude tag -> excluded, counted by tag" 1 $ti.excluded_tag_count
+Check "exclude list -> excluded, counted by list (before the tag step)" 1 $ti.excluded_list_count
+Check "excluded_count is the sum" 2 $ti.excluded_count
+Check "tag state not ok -> refused 'tags <state>'" 'mw/T-unread (tags unread),mw/T-unreadable (tags unreadable),mw/T-missing (tags field_missing)' `
+    (@($ti.refused | ForEach-Object { "$($_.key) ($($_.reason))" }) -join ',')
+Check "idle is judged before the tag (an unread idle thread is 放置, not refused)" 'mw/T-old,mw/T-old-unread' (@($ti.idle | ForEach-Object { $_.key }) -join ',')
+$noTagState = Rep @([pscustomobject]@{ project = 'mw'; unregistered_count = 1; unregistered = @('T-x'); error = $null; malformed_count = 0
+    threads = @([pscustomobject]@{ thread_id = 'T-x'; time_state = 'ok'; last_activity_at = 'x'; idle_days = 1.0 }) })
+Check "a row without tag_state is refused as unread (fail closed)" 'tags unread' (@((Resolve -Report $noTagState).refused)[0].reason)
+$shadowTag = Resolve -Report (Rep @((Proj 'mw' @('T-p', 'T-s') -tags @{ 'T-p' = 'tag:scratch' }))) -Config (Cfg -Clones ([ordered]@{ mw = $dirA }) -Mode 'shadow')
+Check "the tag is judged before mode (shadow)" '1/mw/T-s' "$($shadowTag.excluded_tag_count)/$(@($shadowTag.shadow | ForEach-Object { $_.key }) -join ',')"
+$noClone = Resolve -Report (Rep @((Proj 'zz' @('T-p') -tags @{ 'T-p' = 'tag:probe' }))) -Config $tagCfg
+Check "the clone is judged before the tag" '0/clones 未登録' "$($noClone.excluded_tag_count)/$(@($noClone.refused)[0].reason)"
+
+# P / M / null / lookup-cap facts. A project row with the counters, as the enumerator writes them.
+function WithTags { param($Row, $Present, $NullCount = 0, $Listed)
+    $Row | Add-Member -NotePropertyName tags_field_present_count -NotePropertyValue $Present
+    $Row | Add-Member -NotePropertyName tags_null_count -NotePropertyValue $NullCount
+    $Row | Add-Member -NotePropertyName listed_count -NotePropertyValue $Listed -Force
+    $Row }
+function TagRep { param([object[]]$Projects, $NullMeasured = $false, $Needed = 0, $Done = 0)
+    $r = Rep $Projects
+    $r | Add-Member -NotePropertyName listing_tags_null_measured -NotePropertyValue $NullMeasured
+    $r | Add-Member -NotePropertyName tag_lookup_needed -NotePropertyValue $Needed
+    $r | Add-Member -NotePropertyName tag_lookup_done -NotePropertyValue $Done
+    $r | Add-Member -NotePropertyName tag_lookup_cap -NotePropertyValue 20
+    $r }
+$full = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 5 -Listed 5)))
+Check "P == M -> complete INFO, migration possible" 'INFO listing tags complete: mw 5/5 — exclude migration (D-4 tags-present route) possible' (@(Get-UnregisteredIntakeTagInfo -Intake $full) -join '|')
+CheckTrue "P == M -> header says 全件・移行可" ((Get-UnregisteredIntakeHeader -Intake $full).Contains('［listing tags 全件: mw 5/5・移行可］')) (Get-UnregisteredIntakeHeader -Intake $full)
+Check "P == M, nothing over the cap -> no WARN" 0 @(Get-UnregisteredIntakeTagWarnings -Intake $full).Count
+$part = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 3 -Listed 5)))
+Check "0 < P < M -> partial INFO only" 'INFO listing tags partial: mw 3/5 — fallback still in use' (@(Get-UnregisteredIntakeTagInfo -Intake $part) -join '|')
+$partHead = Get-UnregisteredIntakeHeader -Intake $part
+CheckTrue "0 < P < M -> header says 一部, never 移行可 / complete" ($partHead.Contains('［listing tags 一部: mw 3/5］') -and -not $partHead.Contains('移行可')) $partHead
+CheckTrue "0 < P < M with no unregistered thread at all -> still no 移行可" (-not ((@(Get-UnregisteredIntakeTagInfo -Intake $part) -join '|') -match 'complete|possible')) ''
+$none = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 0 -Listed 5)))
+Check "P == 0 -> no INFO" 0 @(Get-UnregisteredIntakeTagInfo -Intake $none).Count
+CheckTrue "P == 0 -> no tags note in the header" (-not (Get-UnregisteredIntakeHeader -Intake $none).Contains('listing tags')) ''
+$nul = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 3 -NullCount 2 -Listed 5)))
+Check "null while unmeasured -> WARN" "WARN listing tags null: mw 2/5 — LISTING_TAGS_NULL_MEANS_EMPTY unmeasured; measure (D-0') and set it" (@(Get-UnregisteredIntakeTagWarnings -Intake $nul) -join '|')
+CheckTrue "null while unmeasured -> 登録不可 note" ((Get-UnregisteredIntakeHeader -Intake $nul).Contains('［listing tags null 未測定: mw 2/5］')) (Get-UnregisteredIntakeHeader -Intake $nul)
+$nulM = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 3 -NullCount 2 -Listed 5)) -NullMeasured $true)
+Check "null once measured -> no WARN" 0 @(Get-UnregisteredIntakeTagWarnings -Intake $nulM).Count
+$capped = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 0 -Listed 25)) -Needed 25 -Done 20)
+Check "over the cap -> WARN" "WARN tag lookup cap: 25 threads need a tag lookup, 20 looked up (cap 20) — the rest are refused as 'tags unread' this tick" (@(Get-UnregisteredIntakeTagWarnings -Intake $capped) -join '|')
+CheckTrue "over the cap -> 登録不可 note" ((Get-UnregisteredIntakeHeader -Intake $capped).Contains('［tag 照会上限 25/20］')) (Get-UnregisteredIntakeHeader -Intake $capped)
+$atCap = Resolve -Report (TagRep @((WithTags (Proj 'mw' @()) -Present 0 -Listed 20)) -Needed 20 -Done 20)
+Check "exactly at the cap -> no WARN" 0 @(Get-UnregisteredIntakeTagWarnings -Intake $atCap).Count
+CheckTrue "header splits 除外 by list / tag" ((Get-UnregisteredIntakeHeader -Intake $ti).Contains('除外 2 件（列挙 1 / tag 1）')) (Get-UnregisteredIntakeHeader -Intake $ti)
+
+Write-Host "T — parity with the Python fallback (tests/data/sweep_exclude_by_tag_parity.json)"
+$parity = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'data/sweep_exclude_by_tag_parity.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$pCands = @(foreach ($c in @($parity.sweep.candidates)) { Cand $c.project $c.thread_id $dirA })
+$pClones = [ordered]@{}
+foreach ($k in @($parity.sweep.clones.PSObject.Properties.Name)) { $pClones[$k] = $dirA }
+$pCfg = Cfg -Clones $pClones -Exclude @($parity.sweep.exclude) -MaxIdle $parity.sweep.intake.max_idle_days
+$pi = Resolve -Report $parity.report -Config $pCfg -Candidates $pCands
+# Every reported thread's listing lacks tags, so each one the rule order carries to the tag step ends
+# 'tags unread' — the keys the Python side sends to chatroom_get_thread (expected_tag_step).
+$tagStep = @($pi.refused | Where-Object { $_.reason -like 'tags *' } | ForEach-Object { $_.key } | Sort-Object)
+Check "keys reaching the tag step == the Python get_thread keys" ((@($parity.expected_tag_step) | Sort-Object) -join ',') ($tagStep -join ',')
+
+Write-Host "T — the wrapper's tick-log lines"
+$intakeLog = ($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+    $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n"
+CheckTrue "the 'unregistered intake: auto-registered' prefix is unchanged" ($intakeLog.Contains('unregistered intake: auto-registered ')) ''
+CheckTrue "excluded is split into (list L, tag T)" ($intakeLog.Contains('(list $($unregisteredIntake.excluded_list_count), tag $($unregisteredIntake.excluded_tag_count))')) ''
+CheckTrue "the tag WARNs are wired" ($intakeLog -match 'Get-UnregisteredIntakeTagWarnings' -or (Get-Content -LiteralPath $sweepScript -Raw).Contains('Get-UnregisteredIntakeTagWarnings -Intake $unregisteredIntake')) ''
+CheckTrue "the tag INFO lines are wired" ((Get-Content -LiteralPath $sweepScript -Raw).Contains('Get-UnregisteredIntakeTagInfo -Intake $unregisteredIntake')) ''
 
 if ($script:failures -gt 0) {
     Write-Host ""

@@ -3,7 +3,7 @@
 Spec: T-stalled-pr-has-no-detector msg-4685 §1 (``--data-dir``), msg-4697 §2 /
 msg-4699 §2 (``--list-quarantined`` / ``--clear-quarantined``).
 
-Three modes::
+Four modes::
 
     # one heartbeat (scheduled by deploy/run-stall-ledger-tick.ps1, D-16c)
     uv run python scripts/stall_ledger_tick.py --data-dir ~/spirrow-mindwire-data \\
@@ -11,6 +11,10 @@ Three modes::
 
     # show quarantined ledger records, pending clear requests and the last lock holder
     uv run python scripts/stall_ledger_tick.py --data-dir ... --list-quarantined
+
+    # D-16d-1: head groups, pending heads, NEXT: human threads and open records, read from
+    # the store only (no chatroom / GitHub call, no lock, no write)
+    uv run python scripts/stall_ledger_tick.py --data-dir ... --report
 
     # ask the next tick to clear one quarantined ledger record
     uv run python scripts/stall_ledger_tick.py --data-dir ... \\
@@ -21,7 +25,7 @@ hard-codes it.
 
 **Single writer.** Only a tick holding the OS lock on ``stall-ledger.lock`` writes the
 store. ``--clear-quarantined`` never touches the store: it drops a request file that the
-next tick applies (msg-4699 §2). ``--list-quarantined`` only reads.
+next tick applies (msg-4699 §2). ``--list-quarantined`` and ``--report`` only read.
 
 **What this never touches.** It writes nothing to the digest, Discord, the chatroom or
 GitHub (msg-4685 §8). It reads ``quarantine.json`` and never writes it, and it never
@@ -55,6 +59,7 @@ from spirrow_mindwire.stall_ledger.adapters import (
 )
 from spirrow_mindwire.stall_ledger.driver import DEFAULT_T_TICK_MAX, TickPaths, run_tick
 from spirrow_mindwire.stall_ledger.lock import read_payload
+from spirrow_mindwire.stall_ledger.report import report_from_path
 from spirrow_mindwire.stall_ledger.store import (
     load_store_readonly,
     read_clear_requests,
@@ -96,6 +101,12 @@ def list_quarantined(paths: TickPaths) -> int:
             "lock_last_holder": read_payload(paths.lock),
         }
     )
+    return 0
+
+
+def report(paths: TickPaths) -> int:
+    """Read-only: the head cache and open records (``stall_ledger.report``). Fetches nothing."""
+    _print(report_from_path(paths.store))
     return 0
 
 
@@ -189,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list-quarantined", action="store_true")
     mode.add_argument("--clear-quarantined", metavar="UNIT_KEY")
+    mode.add_argument("--report", action="store_true")
     parser.add_argument("--requested-by", default=None)
     args = parser.parse_args(argv)
     # An override that leaves no room for one body fetch would stop owed fetches from
@@ -204,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     paths = TickPaths(state_dir=args.data_dir / "state")
     if args.list_quarantined:
         return list_quarantined(paths)
+    if args.report:
+        return report(paths)
     if args.clear_quarantined:
         requested_by = args.requested_by or getpass.getuser()
         return clear_quarantined(paths, args.clear_quarantined, requested_by)

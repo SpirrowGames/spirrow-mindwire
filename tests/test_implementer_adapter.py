@@ -1,14 +1,12 @@
-"""Tests for T19 ``ImplementerSdkAdapter`` + the SDK-tool classifier.
+"""Tests for T19 ``ImplementerSdkAdapter``.
 
-The classifier (SDK tool call → allow-list :class:`Operation`) is the
-safety-critical mapping and is tested exhaustively. The adapter lifecycle is
-exercised with a fake SDK client that drives the ``can_use_tool`` guard, so the
-fail-loud allow-list-violation path is covered without the real CLI.
+The adapter lifecycle is exercised with a fake SDK client, so it is covered
+without the real CLI. There is no per-call tool guard to drive (see the
+adapters/implementer.py module docstring).
 """
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,103 +50,6 @@ _OBLIGATIONS = load_manifest()
 
 
 # --------------------------------------------------------------------------- #
-# classifier
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-# T27: indirection is unified via recursion (direct == wrapped), not a regex
-# mirror. These cover the shell-extraction edge cases (nesting, multiple -c,
-# $() nesting, tokenizer-defeating quoting, depth bound).
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-# guard
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-# guard branch enrichment (fail-closed on missing branch/target)
-# --------------------------------------------------------------------------- #
-
-
-def _init_head(repo_root: Path, branch: str | None) -> None:
-    """Make ``repo_root`` a real git repo checked out on ``branch``.
-
-    ``_current_branch`` now shells out to ``git rev-parse --abbrev-ref HEAD``
-    (worktree / packed-ref safe, T23), so the test needs a real repo rather than a
-    hand-written ``.git/HEAD``. ``branch=None`` leaves a non-repo → ``rev-parse``
-    fails → None (fail-closed).
-    """
-    if branch is None:
-        return
-    subprocess.run(
-        ["git", "init", "-q", "-b", branch], cwd=repo_root, check=True, capture_output=True
-    )
-    # An empty commit makes the branch born, so `git rev-parse --abbrev-ref HEAD`
-    # returns it on every git version. Identity via -c (don't depend on global cfg).
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.email=t@e.test",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-
-
-def _init_detached_head(repo_root: Path) -> None:
-    """Make ``repo_root`` a real git repo checked out at a detached HEAD.
-
-    Initialises on ``main``, records the commit sha, then checks that sha out
-    directly so ``git rev-parse --abbrev-ref HEAD`` returns the literal
-    ``HEAD`` (which ``_current_branch`` treats as None → fail-closed).
-    """
-    _init_head(repo_root, "main")
-    sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "checkout", "-q", "--detach", sha],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-
-
-# --------------------------------------------------------------------------- #
-# guard: force_push / history_rewrite branch enrichment
-#
-# `force_push` and `history_rewrite` moved from unconditional Tier C to
-# branch-scoped Tier A on 2026-08-15 (T-branch-scoped-implementer-permissions).
-# The move rests on TWO things happening together — the allow rule with
-# `branch_glob`, AND the enrichment of the current branch from `git rev-parse`.
-# Miss the enrichment and `branch_glob` never fires, because the classifier
-# emits `branch=None` for both operations (rebase mutates HEAD, a bare
-# `git push --force` inherits the checkout).
-#
-# These tests are the ONLY guard against silently missing a new op from the
-# `_enrich` enumeration (a static enum omission produces zero warnings and is
-# invisible to type checks). If a future widening reuses `branch_glob` without
-# also touching `_enrich`, these tests must break — that is what they are for.
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
 # adapter lifecycle (fake SDK client)
 # --------------------------------------------------------------------------- #
 
@@ -171,7 +72,8 @@ def _result(*, is_error: bool = False) -> ResultMessage:
 
 
 class _FakeSdkClient:
-    """Structural stand-in that can drive the options' can_use_tool guard."""
+    """Structural stand-in for the SDK client (no per-call tool guard; see the
+    adapters/implementer.py module docstring)."""
 
     def __init__(
         self,
@@ -393,8 +295,3 @@ async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
     await adapter.halt(handle)
     with pytest.raises(ImplementerSdkDeliveryError):
         await adapter.deliver_event(handle, _event())
-
-
-# --------------------------------------------------------------------------- #
-# manual SDK smoke (B3): verify the REAL SDK routes tool calls through the guard
-# --------------------------------------------------------------------------- #

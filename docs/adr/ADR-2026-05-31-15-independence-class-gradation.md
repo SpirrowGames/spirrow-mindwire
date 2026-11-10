@@ -142,6 +142,7 @@ naysayer の Gemini 化は、SpirrowGames の private な設計情報（ADR / di
 - 再必須化トリガー (ii) に当たる部分集合は、ZDR が必須のままです。
 - codex は ZDR を満たしていません。そのため、この部分集合は Gemini 固定です。
   - **ADR-14 §9（2026-11-07）で改訂**: Gemini Developer API では ZDR を取れないため、この部分集合の Gemini 経路は「paid 鍵・project のログ保存オフ・素の `generateContent` だけ」を要件にしました。Gemini 固定は続けます。理由は、Gemini の非訓練が paid の契約にもとづき、codex のトグルと違って予告なしには変わらないことです。
+  - **ADR-14 §10（2026-11-10、Takahito）で撤回**: この部分集合も codex に送ります。Gemini 固定と Gemini へのフォールバックをやめ、naysayer は codex だけが答えます（codex が閉じている間は止まります）。機密情報そのものは伏せ字でどちらにも送らず、「機密を扱うファイル」という理由だけでは codex を避けません。下の 2 行（codex を返さない・`gemini` だけを期待する）も §10 で無効です。
 - ティアを決める関数が、この部分集合では codex を返さないようにします。
 - attestation でも、この部分集合には `gemini` だけを期待します（ADR-14 §7.6）。
 

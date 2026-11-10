@@ -27,7 +27,7 @@
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
 #     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
-#     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
+#     drive                                 — legacy: accepted, and preserved on regenerate
 #                                             like any hand-set value; never defaulted to
 # CI regenerates this and fails on drift (test_committed_manifest_matches_regeneration);
 # well-formed, that every `body:` matches the locator format above, that every `repo:`

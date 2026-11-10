@@ -233,17 +233,28 @@ behaviour or coverage** — the full review still runs:
   and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
   review — so Item 2's saving is measured before you enforce it.
 
-## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6)
+## Naysayer tier routing (N-3, ADR-14 §7.3 / §7.6 / §10)
 
-The naysayer answers through one of two Lexora tiers, chosen per request by
-`naysayer/n3_routing.py::route_tier` (the only place that decides):
+**Since ADR-14 §10 (2026-11-10, Takahito) every naysayer request goes to the codex tier.**
+`naysayer/n3_routing.py::route_tier` (the only place that decides) always returns `naysayer`, and
+Lexora's wrapper behind it is `codex_only`: when codex can't answer, the request is refused (HTTP 502)
+instead of being answered by Gemini. Lexora no longer has a Gemini backend or a `naysayer-gemini` tier,
+and requests without `X-Mindwire-N3-Route` go to codex too.
 
 | tier | answered by | the attestation accepts |
 |---|---|---|
-| `naysayer` | codex (ChatGPT Pro, **no ZDR**), with `gemini-fallback` as backup | `codex`, `gemini-fallback` |
-| `naysayer-gemini` | Gemini only (paid key, project logging off; no ZDR on this API — ADR-14 §9) | `gemini` |
+| `naysayer` | codex (ChatGPT Pro, **no ZDR**). No fallback | `codex` |
+| `naysayer-gemini` | *retired by §10* (was: Gemini only, paid key, project logging off — ADR-14 §9) | `gemini` (never routed to) |
 
-A request goes to `naysayer-gemini` when **any** of these holds:
+While codex is closed, the naysayer stops: the PR-gate's pass 1 fails loudly on a Lexora error (a timeout
+degrades to a COMMENT for the human), and Lexora's Discord notice says `codex unavailable`. A Lexora
+deploy reopens codex itself (Lexora `deploy/RUNBOOK.md` §11).
+
+The rest of this section is the §7.3 **classification**, now `n3_routing.classify_n3`. It still runs, but
+only as the reason in the routing log line (`codex tier (N-3 classified, routed to codex per ADR-14 §10:
+...)`); read "goes to `naysayer-gemini`" as "is classified N-3".
+
+A request is classified N-3 (formerly: went to `naysayer-gemini`) when **any** of these holds:
 
 - it carries the marker `n3-sensitive`: a PR **label** at the PR-gate, a thread **tag** at design time.
   Labels or tags that couldn't be read count as marked. The conductor passes the tags it got from
@@ -283,7 +294,8 @@ A request goes to `naysayer-gemini` when **any** of these holds:
 Paths and globs are normalised (`\` → `/`, case-folded) before both the config-file match and the
 glob match, and globs are matched with `fnmatch`, so `*` also crosses `/`. When the trusted side can't
 be resolved, the router logs a WARNING containing `n3-routing-unresolved` and calls the injected
-notifier, if one is set. If that line keeps appearing, every review is quietly running on Gemini.
+notifier, if one is set. Since §10 that only means the classification couldn't be made; the review
+still runs on codex.
 The scheduled sweep counts that token in each conductor run's output and the daily digest carries
 one line per repo ("routed to Gemini (fail-safe)"); the counts reset after a full digest delivery.
 
@@ -301,9 +313,10 @@ T-D8-codex-backend-adr14-15-amendment:** suppose the review itself discovers a v
 no glob lists and with no marker set. That request can't be classified in advance, and it reaches the
 codex tier.
 
-**Merge order (§7.6):** this routing and the per-tier attestation take effect together with Lexora's
-codex path. Lexora must serve both `naysayer` (the fallback wrapper) and `naysayer-gemini` before this
-is deployed. Otherwise every naysayer attestation fails closed.
+**Merge order (§7.6 / §10):** this routing and the per-tier attestation take effect together with Lexora's
+codex path. Since §10 MindWire sends nothing to `naysayer-gemini`, so MindWire goes first and Lexora can
+then drop that tier; a Lexora still in `fallback` mode answering with `gemini-fallback` fails the
+attestation closed.
 
 ## Run
 
@@ -787,6 +800,7 @@ tick launches it. The same edit rule applies to every terminal stop reason.
 | `<data_dir>/state/retry-pending.json` | `{ pending, events }` — threads whose first failure is waiting for its one automatic retry, plus the retry events the next digest counts; see *Retry once before quarantine*. Single writer: the sweep |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
+| `<data_dir>/state/conductor-inflight.json` | in-flight launch ledger: one row per launch whose exit is not yet confirmed, plus an optional `*` sentinel. Gates the sweep's hold acknowledgement for a parked clone; see *In-flight ledger and the hold acknowledgement* below. Single writer: the sweep; atomic replace. **Do not delete the file** — remove rows instead |
 | `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **Only shape `{...}` (JSON object) is treated as a valid migration marker** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds any non-object root (root array, root scalar, JSON parse error, blank/whitespace, `[]`), the P4-3 v4.1 policy fails closed: `verdict='unreadable'`, T-5 flush skipped, corrupt file preserved in place as forensic evidence. `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete or truncate without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
@@ -805,6 +819,74 @@ shortcut. Truncating it (blank / whitespace / `[]`) does NOT bypass this: the wr
 shapes as `verdict='unreadable'` fail-closed, not as valid-with-no-holder, so the next tick defers
 rather than granting — but repairing then requires following the same Recovery path. Follow §
 Migration boundary Recovery in either case.
+
+### In-flight ledger and the hold acknowledgement
+
+A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. A project whose clone is
+parked (`dirty-clone-parked`) launches nothing, so its HOLD used to stay `HOLD NOT ACKNOWLEDGED`
+for as long as the clone stayed parked. The sweep now writes that acknowledgement itself
+(`scripts/loop_control.py --report-observed-hold`, actor `sweep:dirty-clone-parked`), once per
+tick per project, but only when **both** hold:
+
+- no candidate of that project launched this tick, and
+- `state/conductor-inflight.json` exists, parses, and has neither a row for that project nor a
+  `*` row.
+
+The ledger is how the sweep knows no orphaned conductor may still be running the project:
+
+- **Before each launch** the sweep adds a row `{ "<GUID>": { project, key, started_at } }`. If that
+  write fails, nothing launches and the tick stops launching (`inflight-mark-unwritable` in the log).
+- **After the launch**, on any exit code but 7, the sweep removes that launch's own row. On exit 7
+  (kill-unconfirmed: an orphan may be alive) the row stays; if the removal fails, the row stays too.
+- **A file that does not parse** is copied to `conductor-inflight.json.corrupt-<ts>` (the original
+  stays in place until replaced) and replaced by a file holding the `*` sentinel, `reason: corrupt`.
+- **A missing file** is created holding the `*` sentinel, `reason: absent` (log line
+  `inflight-file-created (absent; sentinel set)`).
+
+A row left by exit 7, a sweep crash, or a failed delete is never cleared automatically, and neither
+is a `*` sentinel (`corrupt` / `absent`). Launches are not affected by either; only the sweep's own
+hold acknowledgement is withheld, and that project's acknowledgement lands as before, at the first
+launch after the clone is unparked. The log says which: `hold-ack via park <proj>: skipped (<reason>)`.
+
+**Clearing (operator).** The sweep writes this file on every launch, so the operator must never
+edit it while a sweep can run: a read-modify-write that straddles a sweep's new launch row would
+overwrite that row, and if that conductor then exits 7 nothing would hold its project back from a
+wrong acknowledgement. Clear rows only inside this stop → check → edit → resume window:
+
+1. **Stop the sweep.** Disable the Task Scheduler task that runs
+   `deploy/run-conductor-scheduled.ps1` (disabling stops new ticks, not the one already running),
+   then wait until no wrapper process is left:
+
+   ```powershell
+   $t = Get-ScheduledTask | Where-Object { "$($_.Actions.Arguments)" -match 'run-conductor-scheduled' }
+   $t | Disable-ScheduledTask | Out-Null
+   while (Get-CimInstance Win32_Process | Where-Object { "$($_.CommandLine)" -match 'run-conductor-scheduled' }) { Start-Sleep 10 }
+   ```
+
+   Do not go on while that loop is still waiting.
+2. **Check the processes.** On the loop host, check that no `mindwire-loop` / `claude` process of
+   the conductor is left for that project (for the `*` sentinel: for any project). If one is, stop
+   here: re-enable the task (step 4) and leave the row in place.
+3. **Edit.** Remove **only** the row(s) concerned — the project's GUID rows, or the `*` row — and
+   leave the file in place:
+
+   ```powershell
+   $p = Join-Path $env:MINDWIRE_PATHS__DATA_DIR 'state\conductor-inflight.json'   # or ~/spirrow-mindwire-data
+   $o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+   $o.PSObject.Properties.Remove('*')            # or the GUID key of the row to clear
+   $o | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $p -Encoding utf8
+   ```
+4. **Resume.** Re-enable the task: `$t | Enable-ScheduledTask | Out-Null`.
+
+Do not delete the file while a project might have an orphaned conductor: a missing file is
+re-created with the `*` sentinel, so deleting it clears nothing and only discards the rows.
+
+**One-time step after deploying this change.** Every tick starts by creating a missing file with the
+`*` (`absent`) sentinel, before it looks at any candidate — so the first tick after the deploy
+creates it even when every candidate is parked (log line `inflight: inflight-file-created (absent;
+sentinel set)`). An orphan from before the deploy cannot be ruled out, so the sentinel withholds the
+sweep's acknowledgement until an operator clears it with the stop → check → edit → resume procedure
+above.
 
 ## Stall ledger tick (D-16c)
 
@@ -862,6 +944,45 @@ otherwise read unauthenticated and run into GitHub's 60/hour per-IP limit.
 newest line of the day's `stall-ledger-*.jsonl` is a `heartbeat`. In that line,
 `budget_exhausted: true` together with a `pending_markers` count that keeps growing means body
 fetches are falling behind (see `deferred_fetches`).
+
+**Thread heads (D-16d-1).** The tick reads a chatroom thread's head message only when the
+thread's `(last_msg_id, last_activity_at)` in the listing differs from the cached read. The
+cache is the store's top-level `thread_heads` object. Each read is one `chatroom_get_thread`
+call, taken from the same fetch budget as marker fetches, so a tick reads at most the threads
+that had a new post since the last read. The head is sorted into a group, and the group sets
+the thread's `N`:
+
+| Group | Head | `N` |
+|---|---|---|
+| A | `NEXT: <persona>` / `NEXT: pr-review`, and the `next_participant` field (if set) agrees | 6h |
+| B | `STOP: done` | never opens; an open record closes |
+| C | anything else: `NEXT: none` without `STOP:`, no `NEXT:`, a refused form, field ≠ body | 6h |
+| D | `BLOCKED-ON:` (any trigger, never evaluated), `NEXT: human`, a well-formed `NEXT: operator` | 72h for now; D-16d-2 sets `T_WAIT_AUTO` / `T_WAIT_MANUAL` |
+
+A head the tick could not read yet is treated as C with the old 72h. It is counted in the
+heartbeat's `pending_heads` and read on a later tick; `head_fetches` is the number of reads this
+tick. Only a failed read is retried: a thread read in full whose head message is absent or has no
+text body is cached as C (`head_missing` / `head_malformed`) under the same key, so it is not
+fetched again until a new post changes the key. A cache entry is dropped when the listing shows the thread `resolved`, or when the thread is
+missing from a listing that was read in full on a tick with no failing source. A failed or partial
+listing drops nothing. A legacy `STOP: blocked-on … wake:<x>` line above `NEXT: none` needs the
+roster to check its wake, which the tick does not have, so it reads as C.
+
+**`--report` (D-16d-1).** `uv run python scripts/stall_ledger_tick.py --data-dir <dir> --report`
+prints one JSON line built from the store alone. It makes no chatroom or GitHub call, takes no
+lock, uses no fetch budget and writes nothing, so it is safe to run while the task is live. It
+shows `heads_by_group` (cached heads per group A–D; B, `STOP: done`, is only counted here),
+`pending_heads` (the heads the last tick that wrote the store could not read; the tick keeps
+them in the store's `thread_heads_pending`), `next_human` (the D heads that are `NEXT: human`,
+count and list — they still open at 72h like the rest of D) and `open_records_by_group` (every
+open record under its thread's group; an unread thread is under C with `head_read: false`, a
+PR record under `not_thread`, and every `quarantined_records` entry under `not_thread` with
+`quarantined: true` and its `reason`). `--repo` / `--project` are not needed for `--report`. The report does not tell a `T-pr-review-*` thread
+whose PR is merged or closed apart from others: neither the store nor the tick has PR state.
+
+Known limit: the chatroom offers no way to edit a message (no edit tool on the MCP surface, and no
+edit field on a message, checked 2026-11-09). If one is added and an edit does not move
+`last_activity_at`, the tick will not see the edit. To correct a head, post a new message.
 
 To stop it, disable the `mindwire-stall-ledger` task. The store survives a stop; quarantined
 ledger records are listed and cleared with `scripts/stall_ledger_tick.py --list-quarantined` /

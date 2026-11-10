@@ -45,6 +45,11 @@ _NOT_SDK_BACKED: dict[str, str] = {
     "__init__.py": "package marker; defines no adapter",
     "_sdk_result.py": "parses an SDK result object; spawns nothing",
     "_session_isolation.py": "this module IS the policy",
+    "_turn_telemetry.py": (
+        "builds the PreCompact hook value and log lines for options an adapter builds; "
+        "constructs no ClaudeAgentOptions and spawns nothing — isolation is applied by the "
+        "adapter that registers the hook"
+    ),
     "claude_bg.py": (
         "launches `claude --bg` as a CLI subprocess and constructs no "
         "ClaudeAgentOptions; the session's settings come from the repo's "

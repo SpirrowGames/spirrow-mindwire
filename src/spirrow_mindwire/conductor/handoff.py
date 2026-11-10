@@ -58,7 +58,9 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from ..github.client import parse_pr_ref
 from ..identity.normalize import normalize_identity_key
@@ -409,6 +411,25 @@ _STOP_BLOCKED_ON_RE = re.compile(
 # (``none_malformed_after``).
 ACCEPT_NEW_FORMS: bool = True
 
+# Boundary 5 (T-done-disposition-auto-close, Bohr msg-8455 §3 / msg-8556 §3): the instant from
+# which a legacy ``NEXT: none`` -- with or without the legacy ``STOP:`` line above it -- is refused
+# as MALFORMED (``LEGACY_NONE_AFTER_CUTOFF``) instead of settling. A module constant for the same
+# reason as :data:`ACCEPT_NEW_FORMS`: every reader of a head must switch in the same deploy, and a
+# constant changes in exactly one reviewed commit.
+#
+# 5-A ships the rule with the cutoff ``None``, which applies it nowhere: every reader answers as it
+# did before. 5-B is the one-line commit that puts a timezone-aware instant here, after the
+# proposer has measured that no machine writer still produces ``NEXT: none``.
+#
+# Rule (:func:`_after_cutoff`): a message posted at or after the cutoff is refused. A message
+# whose posting time is unknown (``None``) or carries no timezone is treated as posted AFTER the
+# cutoff, so it is refused with a notice rather than settling silently (D3). That is why every
+# reader that routes on, or classifies, a ``NEXT: none`` passes the message's ``posted_at``. A
+# message posted before the cutoff is read as LEGACY_NONE under the rules it was written under,
+# so history keeps its classification. The new forms (``STOP: done`` / ``BLOCKED-ON:``) and
+# ``NEXT: <participant>`` / ``human`` / ``operator`` / ``pr-review`` are never affected.
+NONE_MALFORMED_AFTER: datetime | None = None
+
 BLOCKED_ON_KEYWORD = "BLOCKED-ON"
 STOP_DONE = "done"
 
@@ -530,6 +551,11 @@ class MalformedHandoff(StrEnum):
     # indentation is removed (Slice I, msg-8455 §1 I-2). Indented code is not a control line, so
     # without this the form was read as absent: a wait was dropped and its wake routed at once.
     INDENTED_TERMINAL_FORM = "indented_terminal_form"
+    # A legacy ``NEXT: none`` (with or without the ``STOP:`` line above it) posted at or after
+    # :data:`NONE_MALFORMED_AFTER`, or at an unknown time while a cutoff is set (boundary 5,
+    # msg-8455 §3). Not a terminal form: :func:`resolve_handoff` sets it on the legacy path, and
+    # :func:`none_refused_after_cutoff` is its roster-free reading.
+    LEGACY_NONE_AFTER_CUTOFF = "legacy_none_after_cutoff"
 
 
 class StopStatus(StrEnum):
@@ -905,6 +931,62 @@ def _accepting(accept_new_forms: bool | None) -> bool:
     return ACCEPT_NEW_FORMS if accept_new_forms is None else accept_new_forms
 
 
+def _after_cutoff(posted_at: datetime | None, none_malformed_after: datetime | None) -> bool:
+    """Is a legacy ``NEXT: none`` posted at ``posted_at`` refused? (the rule at the constant).
+
+    The cutoff is the explicit argument (tests), else :data:`NONE_MALFORMED_AFTER`. No cutoff:
+    never. An unknown or timezone-less ``posted_at``: always (the loud side, D3). Otherwise:
+    posted at or after the cutoff.
+    """
+    cutoff = NONE_MALFORMED_AFTER if none_malformed_after is None else none_malformed_after
+    if cutoff is None:
+        return False
+    if posted_at is None or posted_at.utcoffset() is None:
+        return True
+    return posted_at >= cutoff
+
+
+def posted_at_of(message: Mapping[str, Any]) -> datetime | None:
+    """The ``timestamp`` of a chatroom message as a timezone-aware datetime, else ``None``.
+
+    The value a reader passes to :func:`resolve_handoff` as ``posted_at``. A missing, unparseable
+    or timezone-less timestamp is ``None``, which the cutoff rule reads as "after the cutoff".
+    """
+    raw = message.get("timestamp")
+    if isinstance(raw, datetime):
+        return raw if raw.utcoffset() is not None else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return value if value.utcoffset() is not None else None
+
+
+def none_refused_after_cutoff(
+    body: str,
+    *,
+    posted_at: datetime | None,
+    none_malformed_after: datetime | None = None,
+) -> bool:
+    """Is ``body`` a legacy ``NEXT: none`` the cutoff refuses? Roster-free and field-blind.
+
+    The reading the sweep (head_skip) and 1c make without a roster: ``True`` exactly when
+    :func:`resolve_handoff` with an empty roster and no field sets
+    :attr:`MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF`. Always ``False`` while no cutoff is set.
+    """
+    if not _after_cutoff(posted_at, none_malformed_after):
+        return False
+    if terminal_form_view(body) is not TerminalView.LEGACY:
+        return False
+    token = parse_next_token(body)
+    return token is not None and token.casefold() == NONE_TOKEN
+
+
 class TerminalView(StrEnum):
     """What a roster-free reader (the sweep, 1b, 1c) may conclude from a head's terminal form.
 
@@ -938,6 +1020,19 @@ def terminal_form_view(body: str, *, accept_new_forms: bool | None = None) -> Te
     if isinstance(form, MalformedHandoff) or not _accepting(accept_new_forms):
         return TerminalView.REFUSED
     return TerminalView.SETTLES
+
+
+def terminal_form_roster_free(body: str) -> StopLine | MalformedHandoff | None:
+    """The terminal-form parse of ``body`` as a roster-free reader sees it; ``None`` if neither.
+
+    The same parse :func:`terminal_form_view` makes (``check_roster=False``), returned whole so a
+    roster-free reader that needs the disposition itself -- ``done`` vs ``blocked_on`` and the
+    trigger arm -- reads it from this module's one parser instead of a second one. The stall
+    ledger's head classifier (``stall_ledger.heads``, T-stalled-pr-has-no-detector D-16d-1) is
+    that reader. It does not apply :data:`ACCEPT_NEW_FORMS`; a caller that must honour the switch
+    asks :func:`terminal_form_view` first.
+    """
+    return _terminal_form(body, {}, check_roster=False)
 
 
 def settles_by_terminal_form(body: str, *, accept_new_forms: bool | None = None) -> bool:
@@ -992,6 +1087,10 @@ _MALFORMED_CAUSES: dict[MalformedHandoff, str] = {
     MalformedHandoff.INDENTED_TERMINAL_FORM: (
         "`STOP: done` / `BLOCKED-ON:` 行が字下げされています。字下げした行はコードとして読まれ、"
         "制御行になりません。字下げせず、行頭から書いて投稿し直してください。"
+    ),
+    MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF: (
+        f"`NEXT: {NONE_TOKEN}` は廃止され、もう受け付けていません"
+        "(上に旧 `STOP:` 行があっても同じです)。"
     ),
 }
 
@@ -1159,8 +1258,18 @@ def resolve_handoff(
     *,
     next_participant: str | None = None,
     accept_new_forms: bool | None = None,
+    posted_at: datetime | None = None,
+    none_malformed_after: datetime | None = None,
 ) -> Handoff:
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
+
+    **Boundary 5** (``posted_at`` / ``none_malformed_after``, default :data:`NONE_MALFORMED_AFTER`):
+    a handoff that would resolve to a legacy ``NONE`` -- a body or field ``none``, outside the
+    terminal forms -- is ``ABSENT`` with :attr:`MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF` when a
+    cutoff is set and the message was posted at or after it, or at an unknown time
+    (:func:`_after_cutoff`). With no cutoff (5-A ships ``None``) nothing changes. Only ``NONE``
+    is touched, so a reader that tests for ``ROLE`` / ``HUMAN`` / ``PR_REVIEW`` / an operator
+    request gets the same answer with or without ``posted_at``.
 
     **Terminal forms first** (T-done-disposition-auto-close, design v2.4): when the head is
     written in ``STOP: done`` / ``BLOCKED-ON:`` form (:func:`_terminal_form`), it is resolved by
@@ -1240,6 +1349,14 @@ def resolve_handoff(
         # field-driven NONE whose body also says `NEXT: none` keeps the body's STOP line instead
         # of being miscounted as ABSENT. A field NONE with no body NEXT: has no line above any
         # NEXT:, which reads as ABSENT — correct: nobody wrote a STOP line.
+        if _after_cutoff(posted_at, none_malformed_after):
+            # Boundary 5: the legacy settle is retired. Refused like a broken terminal form, so
+            # the conductor stops with the MALFORMED notice instead of settling (D3).
+            return Handoff(
+                HandoffKind.ABSENT,
+                token=resolved.token,
+                malformed=MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF,
+            )
         resolved = replace(resolved, stop_line=_stop_line_above_last_next(body, roster))
     return resolved
 
@@ -1613,6 +1730,7 @@ of your reply and write NO `NEXT:` line after it:
 {STOP_DONE_EXAMPLE}
 
 It is recorded as done and waits for its owner to close it.
+
 Waiting — work remains, but it can start only once something happens that the sweep \
 can see. Put the `{BLOCKED_ON_KEYWORD}:` line directly above the final `NEXT:` line:
 
@@ -1865,6 +1983,34 @@ def conditional_proceed_notice(issuing: bool) -> str | None:
     return NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE if issuing else None
 
 
+def build_roster_notice(roster: Mapping[str, Role]) -> str | None:
+    """The per-turn notice naming every participant a ``NEXT:`` line may address, or ``None``.
+
+    T-naysayer-invents-next-participant D-1 (Bohr msg-8588 → msg-8591 → msg-8594, then
+    Einstein's go with no objections). No prompt carried the roster's names, so a turn told to write
+    ``NEXT: <implementer persona>`` had to guess the persona from the thread's authors, and invented
+    one (``Curie``, ``Gauss``, ...) that the conductor could not resolve. This puts the names on
+    every turn's prompt, for every role, from the same roster :func:`resolve_handoff` reads.
+
+    The text lives here, beside :func:`build_handoff_protocol_block`, so the vocabulary the prompt
+    teaches and the vocabulary the parser accepts come from one file (msg-8594 Obj-2-2). The
+    reserved words are named one by one (``HUMAN_TOKEN`` / ``OPERATOR_TOKEN``), never derived from
+    the set the parser accepts: that set still holds the retired ``NONE_TOKEN``, and a future
+    deprecated word added to it must not reach the prompt by default (msg-8594 Obj-2-1).
+
+    Entries are listed in roster order; a role the roster does not hold simply does not appear.
+    An empty roster gives ``None``, so the prompt is byte-for-byte as before (msg-8591 (e)).
+    """
+    if not roster:
+        return None
+    participants = ", ".join(f"{identity} = {role.value}" for identity, role in roster.items())
+    return (
+        f"Participants of this thread: {participants}.\n"
+        f"A NEXT: line names exactly one of these names, or a reserved word "
+        f"({HUMAN_TOKEN} / {OPERATOR_TOKEN}). No other name resolves."
+    )
+
+
 def _resolve_participant(roster: Mapping[str, Role], token: str) -> Handoff:
     """Resolve a non-sentinel token: identity name first, then a role name (D1).
 
@@ -1938,6 +2084,7 @@ __all__ = [
     "BLOCKED_ON_KEYWORD",
     "HUMAN_TOKEN",
     "NAYSAYER_CONDITIONAL_PROCEED_GUIDANCE",
+    "NONE_MALFORMED_AFTER",
     "NONE_TOKEN",
     "OPERATOR_FORM_EXAMPLE",
     "OPERATOR_TASK_KEYWORD",
@@ -1961,13 +2108,17 @@ __all__ = [
     "StopStatus",
     "TerminalView",
     "build_handoff_protocol_block",
+    "build_roster_notice",
     "conditional_proceed_notice",
     "declares_no_tier_c",
     "declares_tier_c",
     "malformed_notice",
+    "none_refused_after_cutoff",
     "parse_next_token",
+    "posted_at_of",
     "refused_by_terminal_form",
     "resolve_handoff",
     "settles_by_terminal_form",
+    "terminal_form_roster_free",
     "terminal_form_view",
 ]

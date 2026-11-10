@@ -52,9 +52,12 @@ frame rots out of one of them.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .value_objects import ChatroomEvent, Role, ThreadContext, ThreadContextMessage
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_THREAD_CONTEXT_MAX_MESSAGES = 12
 """Recent-window message cap. See the module docstring for the measurement."""
@@ -85,6 +88,23 @@ def _as_message(raw: Any) -> ThreadContextMessage | None:
         author=str(raw.get("author", "")),
         body=str(raw.get("content", "")),
     )
+
+
+class TriggerAppendedThread(list[dict[str, Any]]):
+    """A fetched thread with its trigger appended after the fetch (R-1b).
+
+    Built only by :func:`with_appended_trigger`. It is a plain list to every reader;
+    the type exists so :func:`build_thread_context` can report ``trigger_appended``
+    in its Point-1 line from the one place both call sites pass through, without
+    threading a flag through every dispatch helper between them.
+    """
+
+
+def with_appended_trigger(
+    messages: list[dict[str, Any]], trigger: dict[str, Any]
+) -> TriggerAppendedThread:
+    """``[*messages, trigger]`` as a new list — ``messages`` stays as fetched (R-1b)."""
+    return TriggerAppendedThread([*messages, trigger])
 
 
 class ThreadContextTriggerMissing(ValueError):  # noqa: N818 — name fixed by msg-4871 §3 R-1
@@ -123,6 +143,12 @@ def build_thread_context(
     ``total_count`` (R-1a) is the length of the thread **at trigger time**,
     trigger included (``index + 1``). Counting later messages would leak the
     future through the elision notice even with their bodies cut.
+
+    **Point-1 telemetry** (T-implementer-context-drop-unexplained D-1', Bohr
+    msg-8398). Every successful build logs one identity-only line — trigger id,
+    selected ids, counts, and whether the caller appended the trigger — here and
+    nowhere else, so the watcher and conductor paths cannot drift apart. No body
+    text is logged.
     """
     parsed = [m for m in (_as_message(r) for r in messages) if m is not None]
     index = next((i for i, m in enumerate(parsed) if m.msg_id == trigger_msg_id), None)
@@ -134,7 +160,9 @@ def build_thread_context(
     total = index + 1
     others = parsed[:index]
     if not others:
-        return ThreadContext(opener=None, recent=(), omitted_count=0, total_count=total)
+        ctx = ThreadContext(opener=None, recent=(), omitted_count=0, total_count=total)
+        _log_built(ctx, trigger_msg_id, messages)
+        return ctx
 
     opener = others[0]
     rest = others[1:]
@@ -154,11 +182,25 @@ def build_thread_context(
         used += cost
     taken.reverse()
 
-    return ThreadContext(
+    ctx = ThreadContext(
         opener=opener,
         recent=tuple(taken),
         omitted_count=len(rest) - len(taken),
         total_count=total,
+    )
+    _log_built(ctx, trigger_msg_id, messages)
+    return ctx
+
+
+def _log_built(ctx: ThreadContext, trigger_msg_id: str, messages: list[dict[str, Any]]) -> None:
+    logger.info(
+        "thread-context built trigger_msg_id=%s recent_ids=%s omitted_count=%d total_count=%d "
+        "trigger_appended=%s",
+        trigger_msg_id,
+        ",".join(m.msg_id for m in ctx.recent),
+        ctx.omitted_count,
+        ctx.total_count,
+        str(isinstance(messages, TriggerAppendedThread)).lower(),
     )
 
 
@@ -209,6 +251,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     )
     head = f"You are acting as the {own_role.value} role in thread {event.thread_ref.thread_id}."
     blocks = [head]
+    # T-naysayer-invents-next-participant D-1: the names a NEXT: line may address, right after
+    # the role line. Absent -> no block, so the prompt is unchanged.
+    if event.roster_notice:
+        blocks.append(event.roster_notice)
     if event.review_round_notice:
         blocks.append(event.review_round_notice)
     if event.conditional_proceed_notice:
@@ -243,7 +289,9 @@ __all__ = [
     "DEFAULT_THREAD_CONTEXT_BUDGET_CHARS",
     "DEFAULT_THREAD_CONTEXT_MAX_MESSAGES",
     "ThreadContextTriggerMissing",
+    "TriggerAppendedThread",
     "build_thread_context",
     "build_turn_prompt",
     "render_thread_context",
+    "with_appended_trigger",
 ]

@@ -117,7 +117,7 @@ from ..routing import (
     guard_proposer_to_implementer,
 )
 from ..source_marker import attestation_agrees, parse_attestation_marker
-from ..thread_context import build_thread_context
+from ..thread_context import build_thread_context, with_appended_trigger
 from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
 from ..tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
@@ -182,9 +182,11 @@ from .handoff import (
     HumanAsk,
     MismatchReason,
     OperatorFault,
+    build_roster_notice,
     declares_no_tier_c,
     malformed_notice,
     parse_next_token,
+    posted_at_of,
     resolve_handoff,
 )
 from .head_skip import stage1_skips
@@ -914,6 +916,8 @@ class Conductor:
                 # read the conductor stopped on NO_HANDOFF. Absent field ⇒ backward-compatible
                 # body-only routing (rows 1-2 of §3-1's truth table).
                 next_participant=_next_participant(latest),
+                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED.
+                posted_at=posted_at_of(latest),
             )
             # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
             # HUMAN (safety valve) and carries the divergence so we can log it as observability
@@ -1064,7 +1068,7 @@ class Conductor:
                             sessions,
                             implementer_identity,
                             route_msg,
-                            [*messages, route_msg],
+                            with_appended_trigger(messages, route_msg),
                             round_index=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -1113,7 +1117,7 @@ class Conductor:
                     sessions,
                     implementer_identity,
                     relay_msg,
-                    [*messages, relay_msg],
+                    with_appended_trigger(messages, relay_msg),
                     round_index=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
@@ -1251,7 +1255,7 @@ class Conductor:
                     parked = await self._dispatch_recording(
                         handle,
                         bounce_msg,
-                        [*messages, bounce_msg],
+                        with_appended_trigger(messages, bounce_msg),
                         role=author_role,
                         rounds=round_index,
                         forced=forced,
@@ -1972,7 +1976,7 @@ class Conductor:
         if (
             handoff.kind is HandoffKind.HUMAN
             and handoff.human_ask is HumanAsk.OPERATOR_WORK
-            and stage1_skips(_content(messages[-1]))
+            and stage1_skips(_content(messages[-1]), posted_at=posted_at_of(messages[-1]))
         ):
             # T-next-operator-is-silent D1 (Bohr msg-5930 / msg-5934, Einstein msg-5931 / 5933):
             # a well-formed ``NEXT: operator`` stops here, WITHOUT going through
@@ -2359,7 +2363,7 @@ class Conductor:
             sessions,
             plan.implementer,
             posted,
-            [*messages, posted],
+            with_appended_trigger(messages, posted),
             round_index=round_index,
             forced=forced,
             forced_saveable=forced_saveable,
@@ -2531,7 +2535,7 @@ class Conductor:
         if (
             stop_reason not in (StopReason.HUMAN, StopReason.SETTLED)
             or field is None
-            or stage1_skips(body)
+            or stage1_skips(body, posted_at=posted_at_of(latest))
         ):
             return latest_msg_id
         body_target = parse_next_token(body)
@@ -3015,7 +3019,10 @@ class Conductor:
             # latest-message routing above — both sides read the same field via the same resolver
             # (Bohr msg-179 §3-2).
             past = resolve_handoff(
-                _content(msg), self._roster, next_participant=_next_participant(msg)
+                _content(msg),
+                self._roster,
+                next_participant=_next_participant(msg),
+                posted_at=posted_at_of(msg),
             )
             # 2e-1b: a ``NEXT: human`` the admission gate bounced never reached the human, so it
             # does not end the segment — else the author's RETRY / relabelled reply would force a
@@ -3748,6 +3755,9 @@ class Conductor:
             review_round=review_round,
             review_round_notice=review_round_notice,
             conditional_proceed_notice=conditional_proceed_notice,
+            # T-naysayer-invents-next-participant D-1: every role, every dispatch; the text is
+            # built in handoff.py from the same roster resolve_handoff reads.
+            roster_notice=build_roster_notice(self._roster),
         )
 
     def _review_round(

@@ -27,6 +27,14 @@ file is bounded: an append that leaves it over :data:`COMPACT_AT_BYTES` rewrites
 places it. Last row per key wins. A missing file is "nothing annotated"; an unreadable line is
 skipped and counted.
 
+**Decision page (2e-2b-2, Bohr msg-8616 after the operator's msg-8577).** magickit#109 accepts
+an optional ``jev`` object on the material PUT: ``should_ask_human`` (a number in [0, 1], not a
+bool), ``rule`` (str) and ``model_version`` (str), all three required when ``jev`` is sent; any
+violation is a 400 that stores nothing. :func:`jev_material` is the one place an annotation is
+mapped to that object, and ``scripts/jev_material.py`` hands it to the sweep wrapper for the head
+the composer read. The wrapper sends it as is: it neither validates nor strips it (msg-6648: a
+stripped-and-resent body would mask the defect), so the validation lives in :func:`_parse`.
+
 **Reader of the payload.** Takahito, through the daily digest. This module never posts to a
 chatroom thread, so no chatroom fallback surface is involved.
 """
@@ -79,6 +87,9 @@ class TierCAnnotation:
     questions_version: str
     decision_id: str | None
     logged_at: str
+    provider: str | None = None
+    """``DecisionResult.provider`` — which backend answered (2e-2b-2). ``None`` on lines written
+    before the field existed; :func:`jev_material` then says ``unknown``."""
 
     def key(self) -> tuple[str, str, str]:
         return (self.project, self.thread_id, self.msg_id)
@@ -111,6 +122,7 @@ def annotation_from_result(
         questions_version=av.questions_version,
         decision_id=dr.decision_id,
         logged_at=now.isoformat(),
+        provider=dr.provider,
     )
 
 
@@ -166,12 +178,15 @@ def _parse(raw: Any) -> TierCAnnotation | None:
             return None
         rule = raw.get("matched_rule")
         decision_id = raw.get("decision_id")
+        provider = raw.get("provider")
         fields = (raw["project"], raw["thread_id"], raw["msg_id"], raw["questions_version"])
         if not all(isinstance(v, str) and v for v in fields):
             return None
         if rule is not None and not isinstance(rule, str):
             return None
         if decision_id is not None and not isinstance(decision_id, str):
+            return None
+        if provider is not None and not isinstance(provider, str):
             return None
         return TierCAnnotation(
             project=raw["project"],
@@ -182,6 +197,7 @@ def _parse(raw: Any) -> TierCAnnotation | None:
             questions_version=raw["questions_version"],
             decision_id=decision_id,
             logged_at=str(raw.get("logged_at") or ""),
+            provider=provider or None,
         )
     except KeyError:
         return None
@@ -219,15 +235,43 @@ def annotation_line(annotation: TierCAnnotation) -> str:
     return f"Jev: should_ask_human={p}（未検証、AUC 未確立）— {rule}"  # noqa: RUF001 (msg-5141 wording)
 
 
+UNKNOWN_PROVIDER = "unknown"
+"""The provider half of ``model_version`` when the annotation names none (a pre-2e-2b-2 line)."""
+
+
+def jev_material(annotation: TierCAnnotation | None) -> dict[str, Any] | None:
+    """The ``jev`` object of the material PUT (magickit#109), or ``None`` with no annotation.
+
+    The mapping is decided here and nowhere else (Bohr msg-8616 §2):
+
+    * ``should_ask_human`` — ``ask_score``, already a finite float in [0, 1] (:func:`_parse` and
+      :func:`annotation_from_result` both guarantee it);
+    * ``rule`` — ``matched_rule``, or :data:`NO_RULE_TEXT` when there is none, the same text
+      :func:`annotation_line` shows, so the page and the digest agree; magickit requires a str;
+    * ``model_version`` — ``"<provider>/<questions_version>"``, with :data:`UNKNOWN_PROVIDER`
+      for a line that names no provider: never empty, and it says which backend answered which
+      question set."""
+    if annotation is None:
+        return None
+    provider = annotation.provider or UNKNOWN_PROVIDER
+    return {
+        "should_ask_human": annotation.ask_score,
+        "rule": annotation.matched_rule or NO_RULE_TEXT,
+        "model_version": f"{provider}/{annotation.questions_version}",
+    }
+
+
 __all__ = [
     "ANNOTATING_TIERC_MODES",
     "COMPACT_AT_BYTES",
     "KEEP_LINES",
     "NO_RULE_TEXT",
+    "UNKNOWN_PROVIDER",
     "TierCAnnotation",
     "annotation_from_result",
     "annotation_line",
     "append_annotation",
     "compact_annotations",
+    "jev_material",
     "read_annotations",
 ]

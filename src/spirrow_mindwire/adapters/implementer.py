@@ -65,7 +65,7 @@ import asyncio
 import contextlib
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -122,6 +122,12 @@ from ._sdk_job_hook import (
     JobState,
 )
 from ._session_isolation import session_isolation_kwargs
+from ._turn_telemetry import (
+    TurnTelemetryState,
+    log_context_usage,
+    log_prompt,
+    precompact_hooks,
+)
 
 # Reuse the SDK session glue (same package, identical reply-drain protocol).
 from .claude_code_sdk import (
@@ -247,8 +253,8 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 # the loop reads rather than a mirror.
 _BASE_IMPLEMENTER_SYSTEM_PROMPT = """\
 You are the implementer in a Spirrow MindWire ChatRoom thread. You write and \
-run code to carry out the agreed proposal. You operate under a strict, \
-fail-loud allow-list (Stage 3 autonomy gating):
+run code to carry out the agreed proposal. You operate under Stage 3 autonomy \
+gating, and you are expected to keep to it strictly:
 
 ALLOWED (Tier A): edit files inside the repository, run tests/builds/code, \
 commit and push on feature/* and develop branches, merge feature/* into \
@@ -256,7 +262,8 @@ develop, open pull requests, `git fetch`, and merging the PR's base branch \
 into your own feature branch (`git merge origin/<base>`). read and search \
 freely.
 
-FORBIDDEN (Tier C — never attempt; they will be denied and halt you): merging \
+FORBIDDEN (Tier C — never attempt, whether or not anything stops you; merging \
+or pushing to main is also refused server-side): merging \
 to or pushing to main, force-push, history rewrite (rebase / reset --hard / \
 filter-branch), deleting files, writing to Drive, any external publish/post/send.
 
@@ -397,6 +404,9 @@ class _Session:
     # The message this session is answering, for the ledger tools' provenance header. ``None``
     # when the adapter was built without a ledger (``ledger_mcp=None``).
     ledger_head: LedgerHead | None = None
+    # D-1' turn telemetry (T-implementer-context-drop-unexplained): the in-flight trigger id the
+    # PreCompact hook reads, and the session's cumulative prompt bytes.
+    telemetry: TurnTelemetryState = field(default_factory=TurnTelemetryState)
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -475,7 +485,7 @@ def _adr_index_block() -> str:
 
 
 class ImplementerSdkAdapter:
-    """RoleAdapter for the implementer: SDK + EXECUTE_CODE + allow-list (T19).
+    """RoleAdapter for the implementer: SDK + EXECUTE_CODE (T19).
 
     ``capabilities`` carries ``EXECUTE_CODE`` (qualifies for the implementer
     slot) and omits ``NAYSAYER_QUALIFIED`` (same model family as main).
@@ -612,7 +622,9 @@ class ImplementerSdkAdapter:
         )
         return head, build_ledger_mcp_server(notes)
 
-    def _make_options(self, *, ledger_server: Any = None) -> ClaudeAgentOptions:
+    def _make_options(
+        self, *, ledger_server: Any = None, telemetry: TurnTelemetryState | None = None
+    ) -> ClaudeAgentOptions:
         mcp_servers = dict(self._mcp_servers)
         allowed_tools = list(self._allowed_tools)
         if ledger_server is not None:
@@ -657,6 +669,9 @@ class ImplementerSdkAdapter:
             # (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         }
+        if telemetry is not None:
+            # D-1' Point-4: observe auto-compaction of this reused session (primary path only).
+            kwargs["hooks"] = precompact_hooks(telemetry)
         return ClaudeAgentOptions(**kwargs)
 
     async def spawn(
@@ -694,7 +709,10 @@ class ImplementerSdkAdapter:
                 "via Lexora, never api.anthropic.com directly (ADR-07 §2.4 / env spec §4)"
             )
         ledger = self._ledger_for(thread_ref, ctx)
-        options = self._make_options(ledger_server=None if ledger is None else ledger[1])
+        telemetry = TurnTelemetryState()
+        options = self._make_options(
+            ledger_server=None if ledger is None else ledger[1], telemetry=telemetry
+        )
         try:
             check_command_line(options)
         except Exception as exc:
@@ -712,6 +730,7 @@ class ImplementerSdkAdapter:
             last_active_at=now,
             options=options,
             ledger_head=None if ledger is None else ledger[0],
+            telemetry=telemetry,
         )
         session_registered = False
         client: _SdkClient | None = None
@@ -865,12 +884,15 @@ class ImplementerSdkAdapter:
         # ``adapter.turn_timeout``.
         observed_uuid: list[str] = []
         try:
-            await session.client.query(_build_prompt(event, session.own_role))
+            prompt = _build_prompt(event, session.own_role)
+            log_prompt(event, prompt, session.telemetry)
+            await session.client.query(prompt)
             body = await _drain_reply(
                 session.client,
                 turn_timeout_seconds=self._turn_timeout_seconds,
                 on_init=observed_uuid.append,
             )
+            await log_context_usage(session.client, session.telemetry)
             await session.ctx.on_reply(
                 ReplyDraft(
                     body=body,
