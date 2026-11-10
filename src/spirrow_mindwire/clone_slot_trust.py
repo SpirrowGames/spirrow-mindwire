@@ -10,8 +10,12 @@ Measured on the loop host (T-ephemeral-impl-clone-slot-per-thread):
   closed, 60 s tree-kill bound, Bohr msg-8502), first measured 2026-11-08 in the retreated WIP;
 * an entry ``projects["<absolute path, forward slashes>"].hasTrustDialogAccepted = true`` in
   ``<config dir>/.claude.json`` is enough: the same launch, with only that entry added to an
-  otherwise empty config, prints ``backgrounded`` and exits 0. (Measured once, 2026-11-08, in
-  the retreated WIP session; not re-measured since — step 1b confirms it.)
+  otherwise empty config, prints ``backgrounded`` and exits 0. First measured 2026-11-08 in the
+  retreated WIP session; confirmed against the loop host's real ``~/.claude.json`` at
+  2026-11-10T03:04:06Z (Claude Code 2.1.321, step 1b, msg-8915): the path registered by
+  :func:`ensure_trusted` launched with exit 0 in 3.9 s and the session was ``busy/working``.
+  The stdout/stderr of that launch were not kept (the one-off probe script failed while
+  printing them), so only the exit code, timing and session state are on record.
 
 So every slot is registered once, when it is provisioned. The config file is Claude Code's own
 (``$CLAUDE_CONFIG_DIR/.claude.json``, else ``~/.claude.json``). It is never created here: a missing
