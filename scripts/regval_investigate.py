@@ -15,13 +15,22 @@ OUTPUT CONTRACT (§0-b) — the reason this file exists as a reviewed script:
     fixed code.  ``gh api`` commit lookups use ``--jq .sha`` so the patch is never produced.
   * Python's own stderr is pointed at devnull and every exception is caught at the top and
     reported as ``ERR <step> <ExceptionClassName>`` only (the message may carry a value).
-  * Original clones are only read: no fetch / pull / gc / checkout / ref or config writes.
-    ``git`` is run with ``GIT_OPTIONAL_LOCKS=0`` and ``gc.auto=0`` / ``maintenance.auto=false``.
+MUTABLE STATE (改訂 4 §8) — after §1-1 the script reads no mutable state of the original clones:
+  * refs, reflogs, config and hooks come ONLY from the §1-1 preserved copy (--preserve).
+  * The original clones (and spirrow-docs) are used ONLY as object stores, and only through
+    ``git_obj``, which refuses any revision argument that is not a full 40-hex sha.  Objects
+    are content-addressed, so a read by full sha cannot see a later change; a pruned object
+    fails (→ an error code), it cannot return different content.
+  * The guard's checker and registry are loaded from blobs at the preserved spirrow-docs HEAD
+    sha, not from the spirrow-docs working tree.
+  * ``git`` runs with ``GIT_OPTIONAL_LOCKS=0`` and ``gc.auto=0`` / ``maintenance.auto=false``.
     Network access happens only in ``mirror`` (into a separate scratch mirror) and ``expose``.
+  * Session transcripts (~/.claude/projects) are read as append-only logs (C-2 / C-3a).
 
 Subcommands (run in this order):
-  table     §1-3  re-derive P (pushed commits in the window whose added Markdown lines the guard's
-                  own scanner flags) as value-free rows, and save them to --state.
+  table     §1-3  re-derive candidate P (改訂 4 §7-a: a CANDIDATE list, not the fixed P) from the
+                  preserved refs/remotes/origin tips: pushed commits in the window whose added
+                  Markdown lines the guard's own scanner flags; value-free rows → --state.
   mirror    §1-2  ``git clone --mirror`` each project into --mirror-dir (state acquisition only).
   expose    §2    A-1 / A-1b / A-2 / A-3 / A-4 per row.
   registry  §3    B-1 (hash equality against the registry version(s) in force by history at the
@@ -42,6 +51,7 @@ import os
 import re
 import subprocess
 import sys
+import types
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -128,7 +138,46 @@ def run3(argv: list[str]) -> tuple[int, str, str]:
 
 
 def git(repo: str, *args: str) -> tuple[int, str]:
+    """Plain git; used only on the scratch mirror (never on an original clone)."""
     return run(["git", *_GIT_SAFE, "-C", repo, *args])
+
+
+_OBJ_SUBCOMMANDS = ("log", "show", "rev-parse")
+_OBJ_REV = re.compile(r"^[0-9a-f]{40}(?::[A-Za-z0-9_.\-/]+)?$")
+
+
+def git_obj(store: str, sub: str, *args: str) -> tuple[int, str]:
+    """git on an original clone used purely as an object store (改訂 4 §8).
+
+    Every revision must be a full 40-hex sha (optionally ``sha:path``).  A ref name, ``HEAD``,
+    ``--all`` / ``--remotes`` or a reflog selector would read mutable state, so it is refused
+    with ValueError before git runs.  Arguments after ``--`` are pathspecs.
+    """
+    if sub not in _OBJ_SUBCOMMANDS:
+        raise ValueError("subcommand")
+    seen_dashdash = False
+    for arg in args:
+        if seen_dashdash:
+            continue
+        if arg == "--":
+            seen_dashdash = True
+        elif arg.startswith("-"):
+            if arg.startswith(
+                (
+                    "--all",
+                    "--remotes",
+                    "--branches",
+                    "--tags",
+                    "--glob",
+                    "--reflog",
+                    "-g",
+                    "--walk-reflogs",
+                )
+            ):
+                raise ValueError("ref-selecting option")
+        elif not _OBJ_REV.match(arg):
+            raise ValueError("revision is not a full sha")
+    return run(["git", *_GIT_SAFE, "-C", store, sub, *args])
 
 
 def gh_api(path: str, jq: str, paginate: bool = False) -> tuple[int, str]:
@@ -144,11 +193,37 @@ def rc_tag(rc: int) -> str:
 # The guard's own scanner and registry loader (imported, so "flagged" means what the hook means).
 
 
-def load_guard() -> Any:
-    sys.path.insert(0, os.path.join(DOCS_ROOT, "scripts"))
-    import check_infra_placeholders as g  # type: ignore[import-not-found]
+def docs_rev(preserve: str) -> str:
+    """spirrow-docs HEAD at preservation time: the last reflog entry of the preserved copy."""
+    entries = reflog_entries(os.path.join(preserve, "spirrow-docs", "logs", "HEAD"))
+    if not entries:
+        raise ValueError("no preserved spirrow-docs HEAD")
+    return entries[-1][1]
 
-    return g
+
+def load_guard(rev: str) -> Any:
+    """The guard's checker module, executed from its blob at ``rev`` (not the working tree)."""
+    rc, src = git_obj(DOCS_ROOT, "show", f"{rev}:{CHECKER_REL}")
+    if rc:
+        raise ValueError("checker blob unreadable")
+    name = "check_infra_placeholders_pinned"
+    mod = types.ModuleType(name)
+    sys.modules[name] = mod  # dataclasses resolve their module through sys.modules
+    exec(
+        compile(src, "<checker-blob>", "exec"), mod.__dict__
+    )  # the guard's own code, at a pinned sha
+    return mod
+
+
+def registry_at(g: Any, rev: str) -> Any:
+    """Registry parsed from its blob at ``rev``, in memory; None if unreadable or unparsable."""
+    rc, text = git_obj(DOCS_ROOT, "show", f"{rev}:{REGISTRY_REL}")
+    if rc:
+        return None
+    try:
+        return g.load_registry(_MemText(text))
+    except BaseException:  # SystemExit text may name the blob; keep inert
+        return None
 
 
 class _MemText:
@@ -170,15 +245,57 @@ def item_of(kind: str) -> tuple[str, str]:
     return ("value", m.group(1)) if m else ("pattern", kind)
 
 
-def remote_repo(clone: str) -> str:
-    _, url = git(clone, "config", "--get", "remote.origin.url")
+def preserved_url(base: str) -> str:
+    """remote.origin.url from the preserved config copy."""
+    cfg = Path(base, "config").read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'^\[remote "origin"\][^\[]*?^\s*url\s*=\s*(\S+)\s*$', cfg, re.M | re.S)
+    return m.group(1) if m else ""
+
+
+def repo_of_url(url: str) -> str:
     m = re.search(r"github\.com[/:]([^/\s]+/[^/\s]+?)(?:\.git)?\s*$", url)
     return m.group(1) if m else ""
 
 
-def findings_of_commit(g: Any, clone: str, sha: str, registry: Any) -> list[tuple[str, int, Any]]:
+def preserved_tips(base: str) -> list[str]:
+    """Full shas of refs/remotes/origin/* in the preserved copy (loose files + packed-refs)."""
+    tips: set[str] = set()
+    root = Path(base, "refs", "remotes", "origin")
+    for f in root.rglob("*") if root.is_dir() else []:
+        if f.is_file():
+            v = f.read_text(encoding="utf-8", errors="replace").strip()
+            if re.fullmatch(r"[0-9a-f]{40}", v):
+                tips.add(v)
+    packed = Path(base, "packed-refs")
+    if packed.is_file():
+        for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split(" ", 1)
+            if (
+                len(parts) == 2
+                and parts[1].startswith("refs/remotes/origin/")
+                and re.fullmatch(r"[0-9a-f]{40}", parts[0])
+            ):
+                tips.add(parts[0])
+    return sorted(tips)
+
+
+def preserved_projects(preserve: str) -> list[str]:
+    return sorted(
+        d
+        for d in os.listdir(preserve)
+        if d != "spirrow-docs" and os.path.isdir(os.path.join(preserve, d))
+    )
+
+
+def store_of(project: str) -> str:
+    return f"{SANDBOX}/{project}-impl"
+
+
+def findings_of_commit(g: Any, project: str, sha: str, registry: Any) -> list[tuple[str, int, Any]]:
     """(path, line, Finding) for every flagged added Markdown line of ``sha``.  In memory only."""
-    _, diff = git(clone, "show", "--format=", "-U0", "--diff-filter=ACMR", sha, "--", "*.md")
+    _, diff = git_obj(
+        store_of(project), "show", "--format=", "-U0", "--diff-filter=ACMR", sha, "--", "*.md"
+    )
     out: list[tuple[str, int, Any]] = []
     for chunk in re.split(r"^diff --git ", diff, flags=re.M)[1:]:
         m = re.search(r"^\+\+\+ b/(.+)$", chunk, re.M)
@@ -196,13 +313,21 @@ def findings_of_commit(g: Any, clone: str, sha: str, registry: Any) -> list[tupl
 
 
 def cmd_table(a: argparse.Namespace) -> None:
-    g = load_guard()
-    registry = g.load_registry(Path(DOCS_ROOT) / REGISTRY_REL)
+    rev = docs_rev(a.preserve)
+    g = load_guard(rev)
+    registry = registry_at(g, rev)
+    if registry is None:
+        raise ValueError("registry blob unparsable")
+    emit(T("DOCSREV"), ("sha", rev))
     rows: list[dict[str, Any]] = []
-    for clone in sorted(glob.glob(f"{SANDBOX}/*-impl")):
-        project = os.path.basename(clone)[: -len("-impl")]
-        repo = remote_repo(clone)
-        rc, log = git(clone, "log", "--remotes=origin", "--no-merges", "--format=%H %aI %cI")
+    for project in preserved_projects(a.preserve):
+        base = os.path.join(a.preserve, project)
+        repo = repo_of_url(preserved_url(base))
+        tips = preserved_tips(base)
+        emit(T("TIPS"), ("project", project), ("int", len(tips)))
+        if not tips:
+            continue
+        rc, log = git_obj(store_of(project), "log", "--no-merges", "--format=%H %aI %cI", *tips)
         if rc:
             emit(T("ERR"), T("table-log"), ("project", project), T(rc_tag(rc)))
             continue
@@ -211,7 +336,7 @@ def cmd_table(a: argparse.Namespace) -> None:
             if len(parts) != 3 or datetime.fromisoformat(parts[1]) < WIN_START:
                 continue
             sha, ai, ci = parts
-            for path, line_no, f in findings_of_commit(g, clone, sha, registry):
+            for path, line_no, f in findings_of_commit(g, project, sha, registry):
                 cls, item = item_of(f.kind)
                 rows.append(
                     {
@@ -243,7 +368,7 @@ def cmd_table(a: argparse.Namespace) -> None:
             ("time", r["committer"]),
         )
     emit(
-        T("TOTAL"),
+        T("CANDIDATE_TOTAL"),
         T("commits"),
         ("int", len({r["sha"] for r in rows})),
         T("rows"),
@@ -263,8 +388,7 @@ def load_rows(a: argparse.Namespace) -> list[dict[str, Any]]:
 
 def cmd_mirror(a: argparse.Namespace) -> None:
     for project in sorted({r["project"] for r in load_rows(a)}):
-        clone = f"{SANDBOX}/{project}-impl"
-        _, url = git(clone, "config", "--get", "remote.origin.url")
+        url = preserved_url(os.path.join(a.preserve, project))
         dest = os.path.join(a.mirror_dir, f"{project}.git")
         if os.path.exists(dest):
             emit(T("MIRROR"), ("project", project), T("exists"))
@@ -355,8 +479,8 @@ def cmd_expose(a: argparse.Namespace) -> None:
 # §3 registry
 
 
-def registry_history() -> list[tuple[datetime, str]]:
-    _, out = git(DOCS_ROOT, "log", "--format=%H %cI", "--", REGISTRY_REL)
+def registry_history(drev: str) -> list[tuple[datetime, str]]:
+    _, out = git_obj(DOCS_ROOT, "log", "--format=%H %cI", drev, "--", REGISTRY_REL)
     hist = []
     for line in out.splitlines():
         sha, ci = line.split()
@@ -398,9 +522,13 @@ def head_at(entries: list[tuple[datetime, str, str]], t: datetime) -> str | None
 
 
 def cmd_registry(a: argparse.Namespace) -> None:
-    g = load_guard()
-    current = g.load_registry(Path(DOCS_ROOT) / REGISTRY_REL)
-    hist = registry_history()
+    drev = docs_rev(a.preserve)
+    g = load_guard(drev)
+    current = registry_at(g, drev)
+    if current is None:
+        raise ValueError("registry blob unparsable")
+    emit(T("DOCSREV"), ("sha", drev))
+    hist = registry_history(drev)
     emit(
         T("B0"),
         T("registry-versions"),
@@ -418,9 +546,8 @@ def cmd_registry(a: argparse.Namespace) -> None:
     )
     cache: dict[str, Any] = {}
     for r in load_rows(a):
-        clone = f"{SANDBOX}/{r['project']}-impl"
         match = None
-        for path, line_no, f in findings_of_commit(g, clone, r["sha"], current):
+        for path, line_no, f in findings_of_commit(g, r["project"], r["sha"], current):
             if path == r["path"] and line_no == r["line"] and item_of(f.kind)[1] == r["item"]:
                 match = digest(f.match)
                 break
@@ -434,11 +561,7 @@ def cmd_registry(a: argparse.Namespace) -> None:
                 emit(T("B1"), ("int", r["n"]), T(label), T("no-version-before"))
                 continue
             if rev not in cache:
-                rc, text = git(DOCS_ROOT, "show", f"{rev}:{REGISTRY_REL}")
-                try:
-                    cache[rev] = g.load_registry(_MemText(text)) if rc == 0 else None
-                except BaseException:  # SystemExit text may name the blob; keep inert
-                    cache[rev] = None
+                cache[rev] = registry_at(g, rev)
             reg = cache[rev]
             if reg is None:
                 verdict = "unparsable"
@@ -457,8 +580,8 @@ def cmd_registry(a: argparse.Namespace) -> None:
             if head is None:
                 emit(T("B2EV"), ("int", r["n"]), T(label), T("no-docs-reflog-before"))
                 continue
-            _, b_head = git(DOCS_ROOT, "rev-parse", f"{head}:{REGISTRY_REL}")
-            _, b_rev = git(DOCS_ROOT, "rev-parse", f"{rev}:{REGISTRY_REL}")
+            _, b_head = git_obj(DOCS_ROOT, "rev-parse", f"{head}:{REGISTRY_REL}")
+            _, b_rev = git_obj(DOCS_ROOT, "rev-parse", f"{rev}:{REGISTRY_REL}")
             same = bool(b_head.strip()) and b_head.strip() == b_rev.strip()
             emit(
                 T("B2EV"),
@@ -553,7 +676,7 @@ def cmd_creation(a: argparse.Namespace) -> None:
                     )
         emit(T("C1N"), ("sha", sha), ("int", hits))
         # C-1 identity candidate: author email vs the preserved clone config (bool only).
-        _, email = git(f"{SANDBOX}/{project}-impl", "show", "-s", "--format=%ae", sha)
+        _, email = git_obj(store_of(project), "show", "-s", "--format=%ae", sha)
         cfg = (
             Path(base, "config").read_text(encoding="utf-8", errors="replace")
             if Path(base, "config").exists()
@@ -623,10 +746,11 @@ def cmd_creation(a: argparse.Namespace) -> None:
             ("time", acq),
         )
     # Guard version by history (candidate only): last change of hook / checker before each commit.
+    drev = docs_rev(a.preserve)
     for r in rows:
         for rel in (HOOK_REL, CHECKER_REL):
-            _, out = git(
-                DOCS_ROOT, "log", "-1", "--format=%H", f"--before={r['committer']}", "--", rel
+            _, out = git_obj(
+                DOCS_ROOT, "log", "-1", "--format=%H", f"--before={r['committer']}", drev, "--", rel
             )
             emit(T("C3GV"), ("int", r["n"]), ("path", rel), ("sha", out.strip()))
 

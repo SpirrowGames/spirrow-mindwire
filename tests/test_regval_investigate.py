@@ -133,3 +133,72 @@ def test_main_reports_exception_class_only(
     out = capsys.readouterr().out
     assert rc == 2
     assert out == "ERR table RuntimeError\n"
+
+
+# --- 改訂 4 §8: no mutable state of the original clones -----------------------------------
+
+SHA = "d" * 40
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("log", "HEAD"),
+        ("log", "origin/main"),
+        ("log", "--remotes=origin"),
+        ("log", "--all"),
+        ("log", "-g", SHA),
+        ("log", "--walk-reflogs", SHA),
+        ("show", "HEAD:docs/x.md"),
+        ("show", SHA[:12]),
+        ("config", "--get", "remote.origin.url"),
+        ("fetch", "origin"),
+    ],
+)
+def test_git_obj_refuses_anything_but_full_sha(
+    monkeypatch: pytest.MonkeyPatch, args: tuple[str, ...]
+) -> None:
+    monkeypatch.setattr(rv, "run3", lambda argv: pytest.fail("git must not run"))
+    with pytest.raises(ValueError):
+        rv.git_obj("store", *args)
+
+
+def test_git_obj_accepts_full_sha_and_pathspec(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake(argv: list[str]) -> tuple[int, str, str]:
+        seen.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(rv, "run3", fake)
+    rv.git_obj("store", "show", "--format=", "-U0", SHA, "--", "*.md")
+    rv.git_obj("store", "rev-parse", f"{SHA}:docs/platform/infra-registry.md")
+    rv.git_obj("store", "log", "--format=%H", "--before=2026-10-02T00:00:00Z", SHA, "--", "x")
+    assert len(seen) == 3
+    assert all("-C" in argv and "store" in argv for argv in seen)
+
+
+def test_preserved_tips_reads_only_remote_origin_refs(tmp_path: Path) -> None:
+    a, b, c = "a" * 40, "b" * 40, "c" * 40
+    (tmp_path / "refs" / "remotes" / "origin" / "feature").mkdir(parents=True)
+    (tmp_path / "refs" / "remotes" / "origin" / "feature" / "x").write_text(a + "\n")
+    (tmp_path / "refs" / "remotes" / "origin" / "HEAD").write_text(
+        "ref: refs/remotes/origin/main\n"
+    )
+    (tmp_path / "refs" / "heads").mkdir(parents=True)
+    (tmp_path / "refs" / "heads" / "local").write_text(c + "\n")
+    (tmp_path / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{b} refs/remotes/origin/main\n"
+        f"{c} refs/heads/other\n^{c}\n"
+    )
+    assert rv.preserved_tips(str(tmp_path)) == [a, b]
+
+
+def test_preserved_url_takes_origin_only(tmp_path: Path) -> None:
+    (tmp_path / "config").write_text(
+        '[core]\n\thooksPath = X\n[remote "upstream"]\n\turl = https://github.com/o/up.git\n'
+        '[remote "origin"]\n\turl = https://github.com/SpirrowGames/spirrow-tutorail.git\n'
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+    )
+    url = rv.preserved_url(str(tmp_path))
+    assert rv.repo_of_url(url) == "SpirrowGames/spirrow-tutorail"
