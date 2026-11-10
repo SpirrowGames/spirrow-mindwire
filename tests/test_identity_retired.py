@@ -80,7 +80,10 @@ class TestLoader:
         with pytest.raises(ClassificationError, match="is retired"):
             load_legitimate_roles(_yaml(tmp_path, body))
 
-    @pytest.mark.parametrize("bad", ['"yesterday"', '""', "3", '"2026-13-01"', "[]"])
+    @pytest.mark.parametrize(
+        "bad",
+        ['"yesterday"', '""', "3", '"2026-13-01"', "[]", '"20261110"', '"2026-W46-2"'],
+    )
     def test_malformed_retired_is_rejected(self, tmp_path: Path, bad: str) -> None:
         with pytest.raises(ClassificationError, match="retired must be a date"):
             load_legitimate_roles(_yaml(tmp_path, _RETIRED_PARTICIPANT.format(retired=bad)))

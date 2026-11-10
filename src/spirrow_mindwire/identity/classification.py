@@ -29,6 +29,7 @@ calls it to build findings. One derivation, two callers — msg-1493 §2's "**�
 from __future__ import annotations
 
 import datetime
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -330,17 +331,23 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
     )
 
 
+_RETIRED_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def _parse_retired(value: Any, index: int, path: Path) -> str | None:
     """Return the ``retired`` date as ``YYYY-MM-DD``, or ``None`` if absent.
 
     YAML reads an unquoted ``2026-11-10`` as a :class:`datetime.date`; a quoted
-    one stays a string. Both are accepted. Anything else is a schema violation.
+    one stays a string. Both are accepted. A string must be spelled exactly
+    ``YYYY-MM-DD``: the compact (``20261110``) and ISO week-date
+    (``2026-W46-2``) forms that :meth:`datetime.date.fromisoformat` also
+    takes are refused. Anything else is a schema violation.
     """
     if value is None:
         return None
     if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
         return value.isoformat()
-    if isinstance(value, str):
+    if isinstance(value, str) and _RETIRED_DATE_RE.fullmatch(value.strip()):
         try:
             return datetime.date.fromisoformat(value.strip()).isoformat()
         except ValueError:
