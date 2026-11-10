@@ -27,6 +27,15 @@ values were written at. They are surfaced here so the sweep wrapper can log them
 Bohr msg-2789 §3 / F4b — warn on the sweep log when a HOLD's acknowledgement has not landed
 (``observed_at`` older than ``desired_at``, or ``null``). This is a strictly-observability
 addition: this script does not gate on either value.
+
+``--report-observed-hold`` (T-role-exit-leaves-clone-off-default-branch PR-B) is the one write
+this script makes: the sweep reports ``observed_state=hold`` for a held project whose clone is
+parked, so no launch will ever land the acknowledgement. It reuses
+``LoopControlReader.report_observed`` with the actor ``sweep:dirty-clone-parked``. It takes no value
+on purpose: the sweep may only claim ``hold`` (nothing is running), never ``run``. Whether nothing
+is running is the CALLER's proof (the in-flight ledger, deploy/lib/InflightLedger.ps1); once the
+executor pool exists, how to confirm that no executor is running the project is decided in unit 4.
+Exit 0 = the report landed, 1 = it did not.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ import json
 import sys
 from typing import Any
 
+from spirrow_mindwire.conductor.control import ControlState, LoopControlReader
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 # Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
@@ -88,13 +98,44 @@ async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+#: ``actor`` on the sweep's own observed write-back, so the dashboard shows who acknowledged.
+SWEEP_PARKED_ACTOR = "sweep:dirty-clone-parked"
+
+
+async def report_observed_hold(project: str, url: str | None) -> bool:
+    """Report ``observed_state=hold`` for ``project``; ``True`` only if the report landed."""
+    reader = LoopControlReader(
+        StreamableHttpChatroomMcp(url), project=project, actor=SWEEP_PARKED_ACTOR
+    )
+    await reader.report_observed(ControlState.HOLD)
+    return reader.last_reported is ControlState.HOLD
+
+
+def main(argv: list[str] | None = None) -> int:
+    # allow_abbrev=False: ``--report-observed <value>`` must not resolve to the hold-only flag.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--project", required=True)
     parser.add_argument(
         "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--report-observed-hold",
+        action="store_true",
+        help="report observed_state=hold for --project (the sweep, clone parked); takes no value",
+    )
+    args = parser.parse_args(argv)
+
+    if args.report_observed_hold:
+        try:
+            landed = asyncio.run(report_observed_hold(args.project, args.url))
+        except Exception as exc:  # one line on stderr; the sweep logs it as a WARN and moves on
+            print(f"loop_control: report observed=hold failed: {exc}", file=sys.stderr)
+            return 1
+        if not landed:
+            print("loop_control: report observed=hold did not land", file=sys.stderr)
+            return 1
+        print(json.dumps({"project": args.project, "reported": "hold"}, ensure_ascii=True))
+        return 0
 
     try:
         state = asyncio.run(fetch_control(args.project, args.url))

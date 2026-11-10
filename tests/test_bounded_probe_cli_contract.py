@@ -86,7 +86,16 @@ def test_every_call_site_was_found() -> None:
     # PR-1a of the same thread adds Invoke-CloneRetreat: seventeen.
     # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
     # T-role-exit-leaves-clone-off-default-branch PR-A adds Invoke-CloneRecover -Preserve: nineteen.
-    assert len(_SITES) == 19, _SITES
+    # PR-B of the same thread adds the hold acknowledgement via park -> loop_control.py: twenty.
+    assert len(_SITES) == 20, _SITES
+
+
+def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get('"hold-ack-$proj"') == (
+        "loop_control.py",
+        ["--report-observed-hold", "--project"],
+    )
 
 
 def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:

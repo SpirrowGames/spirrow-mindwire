@@ -800,6 +800,7 @@ tick launches it. The same edit rule applies to every terminal stop reason.
 | `<data_dir>/state/retry-pending.json` | `{ pending, events }` — threads whose first failure is waiting for its one automatic retry, plus the retry events the next digest counts; see *Retry once before quarantine*. Single writer: the sweep |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
+| `<data_dir>/state/conductor-inflight.json` | in-flight launch ledger: one row per launch whose exit is not yet confirmed, plus an optional `*` sentinel. Gates the sweep's hold acknowledgement for a parked clone; see *In-flight ledger and the hold acknowledgement* below. Single writer: the sweep; atomic replace. **Do not delete the file** — remove rows instead |
 | `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **Only shape `{...}` (JSON object) is treated as a valid migration marker** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds any non-object root (root array, root scalar, JSON parse error, blank/whitespace, `[]`), the P4-3 v4.1 policy fails closed: `verdict='unreadable'`, T-5 flush skipped, corrupt file preserved in place as forensic evidence. `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete or truncate without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
@@ -818,6 +819,52 @@ shortcut. Truncating it (blank / whitespace / `[]`) does NOT bypass this: the wr
 shapes as `verdict='unreadable'` fail-closed, not as valid-with-no-holder, so the next tick defers
 rather than granting — but repairing then requires following the same Recovery path. Follow §
 Migration boundary Recovery in either case.
+
+### In-flight ledger and the hold acknowledgement
+
+A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. A project whose clone is
+parked (`dirty-clone-parked`) launches nothing, so its HOLD used to stay `HOLD NOT ACKNOWLEDGED`
+for as long as the clone stayed parked. The sweep now writes that acknowledgement itself
+(`scripts/loop_control.py --report-observed-hold`, actor `sweep:dirty-clone-parked`), once per
+tick per project, but only when **both** hold:
+
+- no candidate of that project launched this tick, and
+- `state/conductor-inflight.json` exists, parses, and has neither a row for that project nor a
+  `*` row.
+
+The ledger is how the sweep knows no orphaned conductor may still be running the project:
+
+- **Before each launch** the sweep adds a row `{ "<GUID>": { project, key, started_at } }`. If that
+  write fails, nothing launches and the tick stops launching (`inflight-mark-unwritable` in the log).
+- **After the launch**, on any exit code but 7, the sweep removes that launch's own row. On exit 7
+  (kill-unconfirmed: an orphan may be alive) the row stays; if the removal fails, the row stays too.
+- **A file that does not parse** is copied to `conductor-inflight.json.corrupt-<ts>` (the original
+  stays in place until replaced) and replaced by a file holding the `*` sentinel, `reason: corrupt`.
+- **A missing file** is created holding the `*` sentinel, `reason: absent` (log line
+  `inflight-file-created (absent; sentinel set)`).
+
+A row left by exit 7, a sweep crash, or a failed delete is never cleared automatically, and neither
+is a `*` sentinel (`corrupt` / `absent`). Launches are not affected by either; only the sweep's own
+hold acknowledgement is withheld, and that project's acknowledgement lands as before, at the first
+launch after the clone is unparked. The log says which: `hold-ack via park <proj>: skipped (<reason>)`.
+
+**Clearing (operator).** On the loop host, check that no `mindwire-loop` / `claude` process of the
+conductor is left for that project (for the `*` sentinel: for any project). Then remove **only**
+the row(s) concerned — the project's GUID rows, or the `*` row — and leave the file in place:
+
+```powershell
+$p = Join-Path $env:MINDWIRE_PATHS__DATA_DIR 'state\conductor-inflight.json'   # or ~/spirrow-mindwire-data
+$o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+$o.PSObject.Properties.Remove('*')            # or the GUID key of the row to clear
+$o | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $p -Encoding utf8
+```
+
+Do not delete the file while a project might have an orphaned conductor: a missing file is
+re-created with the `*` sentinel, so deleting it clears nothing and only discards the rows.
+
+**One-time step after deploying this change.** The first tick creates the file with the `*`
+(`absent`) sentinel, because an orphan from before the deploy cannot be ruled out. Once the process
+check above finds nothing, remove the `*` row as shown.
 
 ## Stall ledger tick (D-16c)
 
