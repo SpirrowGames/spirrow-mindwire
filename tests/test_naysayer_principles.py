@@ -9,6 +9,7 @@ import pytest
 
 from spirrow_mindwire.naysayer.principles import (
     EXPECTED_PRINCIPLES_VERSION,
+    GEMINI_FALLBACK_BACKEND,
     NAYSAYER_GEMINI_TIER,
     NAYSAYER_MODEL_TIER,
     NAYSAYER_UPSTREAM_MODEL,
@@ -61,13 +62,16 @@ def test_allowed_backends_are_the_ledger_field_not_the_model_id() -> None:
     mismatches, every naysayer spawn raises, the daemon exits non-zero. So the values are
     pinned, and the inequality names the specific tidy-up that motivated the pin.
 
-    ``gemini-fallback`` is pinned too: thread msg-6471 gap (d) makes it a constant that
-    Lexora's fallback wrapper must write verbatim, never a config value.
+    ADR-14 §10 (2026-11-10) made the codex tier codex only: ``gemini-fallback`` (the constant
+    Lexora's fallback wrapper writes verbatim, thread msg-6471 gap (d)) is pinned OUT of it, so
+    a Lexora that still fell back fails the attestation closed instead of passing.
     """
     assert dict(TIER_ALLOWED_BACKENDS) == {
-        "naysayer": frozenset({"codex", "gemini-fallback"}),
+        "naysayer": frozenset({"codex"}),
         "naysayer-gemini": frozenset({"gemini"}),
     }
+    assert GEMINI_FALLBACK_BACKEND == "gemini-fallback"
+    assert GEMINI_FALLBACK_BACKEND not in allowed_backends(NAYSAYER_MODEL_TIER)
     for backends in TIER_ALLOWED_BACKENDS.values():
         assert NAYSAYER_UPSTREAM_MODEL not in backends, (
             "allowed backends are compared against the `backend` field of a Lexora accounting "

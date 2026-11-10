@@ -29,6 +29,7 @@ from spirrow_mindwire.naysayer.n3_design_time import (
 from spirrow_mindwire.naysayer.n3_routing import (
     GlobLoad,
     N3Request,
+    classify_n3,
     load_n3_globs,
     route_tier,
 )
@@ -43,6 +44,12 @@ from spirrow_mindwire.naysayer.principles import (
 
 _GEMINI = NAYSAYER_GEMINI_TIER
 _CODEX = NAYSAYER_MODEL_TIER
+
+
+def _n3(decision: Any) -> bool:
+    """ADR-14 §10: an N-3 request still goes to the codex tier; the reason keeps the
+    classification the old rule would have routed to Gemini."""
+    return decision.tier == _CODEX and "N-3 classified" in decision.reason
 
 
 def _toml(*globs: str) -> str:
@@ -74,7 +81,7 @@ def _route(
     marker: bool | None = False,
     prompt_chars: int = 1_000,
 ) -> str:
-    return route_tier(
+    return classify_n3(
         N3Request(marker=marker, paths=paths, globs=globs, prompt_chars=prompt_chars)
     ).tier
 
@@ -100,7 +107,7 @@ async def test_20_summoned_from_a_subdirectory_reads_the_root_config(tmp_path: P
         [str(root / "payments" / "keys.py")], summon_dir=root / "src" / "backend", repo_root=root
     )
     assert problem is None
-    assert route_tier(N3Request(False, paths, globs, 10, path_problem=problem)).tier == _GEMINI
+    assert classify_n3(N3Request(False, paths, globs, 10, path_problem=problem)).tier == _GEMINI
 
 
 @pytest.mark.anyio
@@ -141,7 +148,7 @@ def test_23_out_of_tree_reference_routes_to_gemini(
     )
     assert problem is not None and "outside" in problem
     decision = route_tier(N3Request(False, paths, GlobLoad(frozenset()), 10, path_problem=problem))
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
 
 
 def test_24_symlink_inside_the_tree_pointing_outside_routes_to_gemini(tmp_path: Path) -> None:
@@ -259,7 +266,7 @@ async def test_design_time_unread_tags_route_to_gemini(tmp_path: Path) -> None:
         tmp_path, repo_root_finder=_root_finder(tmp_path), trusted_reader=_trusted(_toml())
     )
     decision = await adapter._turn_tier(_event(None), "prompt")
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
 
 
 @pytest.mark.anyio
@@ -268,7 +275,7 @@ async def test_design_time_tag_marker_routes_to_gemini(tmp_path: Path) -> None:
         tmp_path, repo_root_finder=_root_finder(tmp_path), trusted_reader=_trusted(_toml())
     )
     decision = await adapter._turn_tier(_event(("design", N3_SENSITIVE_MARKER)), "prompt")
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
 
 
 @pytest.mark.anyio
@@ -302,7 +309,7 @@ async def test_12_design_time_trusted_failure_routes_to_gemini_and_notifies(
         n3_notifier=notifier,
     )
     decision = await adapter._turn_tier(_event(()), "prompt")
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
     assert len(told) == 1 and "GitHub 502" in told[0] and "design-time" in told[0]
 
 
@@ -317,7 +324,7 @@ async def test_design_time_out_of_tree_reference_routes_to_gemini(tmp_path: Path
         prompt_files=PromptFiles(host_files=("../secrets.env",), system_assets=()),
     )
     decision = await adapter._turn_tier(_event(()), "prompt")
-    assert decision.tier == _GEMINI and "outside" in decision.reason
+    assert _n3(decision) and "outside" in decision.reason
 
 
 @pytest.mark.anyio
@@ -326,7 +333,7 @@ async def test_design_time_over_limit_prompt_routes_to_gemini(tmp_path: Path) ->
         tmp_path, repo_root_finder=_root_finder(tmp_path), trusted_reader=_trusted(_toml())
     )
     decision = await adapter._turn_tier(_event(()), "x" * (CODEX_TIER_PROMPT_CHAR_LIMIT + 1))
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
 
 
 @pytest.mark.anyio
@@ -460,7 +467,7 @@ async def test_35_principles_override_outside_mindwire_root_routes_to_gemini(
     root = _repo(tmp_path / "host")
     adapter = _adapter(root, repo_root_finder=_root_finder(root), trusted_reader=_trusted(_toml()))
     decision = await adapter._turn_tier(_event(("design",)), "prompt")
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
     assert "outside the MindWire root" in decision.reason
 
 
@@ -492,7 +499,7 @@ def test_35_system_asset_not_in_prompt_assets_routes_to_gemini(tmp_path: Path) -
             path_problem=problem,
         )
     )
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
 
 
 def test_35_missing_system_asset_routes_to_gemini(tmp_path: Path) -> None:
@@ -538,4 +545,4 @@ async def test_36_host_is_mindwire_and_a_glob_covers_an_asset_routes_to_gemini(
         trusted_reader=_trusted(_toml("spec/adr_index.yaml")),
     )
     decision = await adapter._turn_tier(_event(("design",)), "prompt")
-    assert decision.tier == _GEMINI
+    assert _n3(decision)
