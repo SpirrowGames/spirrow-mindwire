@@ -276,9 +276,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
 # Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
 . (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
-# In-flight launch ledger + hold acknowledgement while a clone is parked (T-role-exit-leaves-clone-
-# off-default-branch PR-B): Read-/Update-InflightLedger, Add-/Remove-InflightMark,
-# Test-HoldAckViaParkWanted, Invoke-HoldAckViaPark. Calls Write-Log at call time.
+# In-flight launch ledger + the sweep's own hold acknowledgement when nothing launches (T-role-exit-
+# leaves-clone-off-default-branch PR-B, generalised by T-hold-observed-freshness-and-unlaunched-tick-
+# ack F1): Read-/Update-InflightLedger, Add-/Remove-InflightMark, Invoke-HoldAckViaPark. Calls
+# Write-Log at call time.
 . (Join-Path $PSScriptRoot 'lib/InflightLedger.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
@@ -434,17 +435,27 @@ function ConvertTo-UtcInstant {
 # Parse a magickit-supplied ISO-8601 UTC timestamp (e.g. "2026-09-08T20:32:19.106309Z") into a UTC
 # [datetimeoffset], returning $null when the input is $null, empty, or unparseable.
 #
-# Called by the control probe log (F4b: HOLD NOT ACKNOWLEDGED warning below) and — per Bohr
-# msg-2789 §3 (F2-d) — reserved for reuse by Test-HoldObserved's future freshness gate (F2).
+# Called only through Test-HoldAckStale, which is both the HOLD NOT ACKNOWLEDGED warning (F4b) and
+# — through Test-HoldObserved — the freshness gate on the launch decision (F2; reuse per Bohr
+# msg-2789 §3 F2-d, landed in T-hold-observed-freshness-and-unlaunched-tick-ack).
 #
 # WHY A DEDICATED PARSER, when ConvertTo-UtcInstant already exists just above:
 #
 # 1. **String comparison is unsafe here (F2-a).** ISO-8601 lexical ordering only agrees with
 #    time ordering when precision matches. `desired_at` may be microsecond-precise
 #    (e.g. "2026-09-08T20:32:19.106309Z") while `observed_at` is second-precise
-#    ("2026-09-08T20:32:19Z"). Comparing those as strings puts the microsecond value BEFORE the
-#    second value ('.' 0x2E < 'Z' 0x5A), so a same-second acknowledgement reads as stale. The
-#    caller MUST type-parse both operands.
+#    ("2026-09-08T20:32:19Z"), and '.' (0x2E) sorts before 'Z' (0x5A), so string order is not
+#    time order. That is the ONLY reason the caller type-parses both operands. The typed
+#    comparison is strict (Bohr msg-9146, Obj-1-1): observed_at=…:19Z against
+#    desired_at=…:19.106309Z IS stale — the ack is older than the request — and is read as such.
+#    The cost of a second-truncated ack read as stale is one extra launch or one extra sweep
+#    re-ack; the sweep's own ack lands in a later second and is fresh on the next tick. Loosening
+#    the freshness condition to save that one tick is not worth it.
+# 1a. **A [datetime] input is used as-is, never round-tripped through a string.** The control
+#    probe's ConvertFrom-Json turns an ISO string into a [datetime], and PowerShell's "$dt"
+#    formats it to whole seconds — which would make a sub-second request read as acknowledged by
+#    a same-second ack, the opposite of 1. A Utc or Unspecified kind is taken as UTC (the
+#    AssumeUniversal rule of 3); a Local kind is converted.
 # 2. **Parse failure MUST NOT throw here (F2-c).** The enclosing bug this helper serves is
 #    "hold is silently unacknowledged". An unparseable timestamp on that path must be treated as
 #    "no acknowledgement", not as an unhandled exception that aborts the tick — otherwise the
@@ -458,6 +469,11 @@ function ConvertTo-UtcInstant {
 function ConvertFrom-ControlTimestamp {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value.ToUniversalTime() }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Local) { return ([datetimeoffset]$Value).ToUniversalTime() }
+        return [datetimeoffset]::new([datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc))
+    }
     $s = "$Value"
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
     try {
@@ -573,11 +589,12 @@ function Update-EvaluatedTimestamp {
 
 # May a held project's launch be optimised away this tick?
 #
-# ONLY once the loop has already reported that it saw the hold. `desired_state` is the operator's
-# request; `observed_state` is the loop's acknowledgement, and only a launched conductor writes it
-# (``LoopControlReader.report_observed``). Dropping the launch on `desired` alone therefore starves
-# the very write-back the dashboard uses to tell "stopping" from "stopped" — the hold shows as
-# pending forever, which reads as the loop ignoring the stop switch.
+# ONLY once the loop has acknowledged THIS hold. `desired_state` is the operator's request;
+# `observed_state = 'hold'` is the acknowledgement, written by a launched conductor
+# (``LoopControlReader.report_observed``) or, when nothing launches, by the sweep itself
+# (Invoke-HoldAckViaPark). Dropping the launch on `desired` alone starves that write-back, which the
+# dashboard uses to tell "stopping" from "stopped" — the hold shows as pending forever, which reads
+# as the loop ignoring the stop switch.
 #
 # Confirmed in production, and the way it was confirmed is the point: on 2026-08-06 both projects sat
 # at `hold`, and `spirrow-voxelworld` had `observed_state: null` — never acknowledged, because it was
@@ -585,14 +602,26 @@ function Update-EvaluatedTimestamp {
 # FAIL that tick, so the sweep failed open, launched, and the conductor landed the write-back. A
 # transient outage was the only reason the feedback loop ever closed. (Tier B naysayer on PR #126.)
 #
-# So the first tick of a hold pays for one process start; every tick after it costs one MCP read.
-# That is the whole cost of an operator being able to see their stop switch take effect.
+# FRESHNESS (F2, T-hold-observed-freshness-and-unlaunched-tick-ack). The predicate is exactly
+# "desired = hold AND Test-HoldAckStale returns $null": observed_state = 'hold' AND, when both
+# timestamps parse, observed_at >= desired_at, compared strictly as instants; when either timestamp
+# is missing or unparseable (older magickit), observed_state alone decides, and nothing throws. The
+# warning line, this gate and the sweep's own acknowledgement all use that one verdict, so the log
+# cannot say "not acknowledged" while the sweep withholds the launch, or the reverse. An
+# `observed: hold` left over from an EARLIER hold is stale and does not count: the project launches
+# (fail-open; the cost is one launch) or, when nothing launches this tick, the sweep acknowledges
+# it after the candidate loop (F1, `--why no-launch`). F1 and F2 go together: without the sweep's
+# write, a stale hold of a project with nothing to launch would pay the head probe, 1b and park-wake
+# every tick and never be acknowledged.
+#
+# So a hold pays for at most one process start or one sweep report; every tick after the
+# acknowledgement costs one MCP read.
 function Test-HoldObserved {
     param($Control)
 
     if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
     if ($Control.desired_state -ne 'hold') { return $false }
-    return ($Control.observed_state -eq 'hold')
+    return ($null -eq (Test-HoldAckStale -Control $Control))
 }
 
 # HOLD-acknowledgement freshness verdict — pure predicate, extracted for testability.
@@ -6275,7 +6304,9 @@ try {
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         # Control first: a project whose hold has already landed needs no head probe at all, so asking
         # in this order keeps a settled HOLD to exactly one MCP read per project per tick. A hold the
-        # loop has not acknowledged yet still gets probed and launched — see Test-HoldObserved.
+        # loop has not acknowledged yet — or acknowledged only before this request (stale, F2) — still
+        # gets probed and launched (see Test-HoldObserved) and, if nothing launches, is acknowledged
+        # by the sweep after the candidate loop (F1).
         $phaseStartUtc = Get-SweepNowUtc
         $c = Invoke-ControlProbe -Project $proj
         Add-PreLoopPhase -Phases $preLoopPhases -Name "control[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6296,12 +6327,18 @@ try {
             if ($c.desired_state -eq 'hold') {
                 # Fresh-vs-stale ack decision (F4b). Bohr msg-2789 §3 F2-a: comparison MUST be on
                 # parsed [datetimeoffset] values, not on raw ISO-8601 strings — the parse and the
-                # two-edge verdict now live in Test-HoldAckStale (see that function's block-comment
-                # for the false-positive and lag-source fixes from PR #279 naysayer review). This
-                # line is purely observability: neither verdict gates the launch. F2 (the predicate
-                # change) is a separate, later commit.
+                # verdict live in Test-HoldAckStale (see that function's block-comment for the
+                # false-positive and lag-source fixes from PR #279 naysayer review). The same verdict
+                # gates the launch (Test-HoldObserved, F2) and puts the project up for the sweep's own
+                # acknowledgement after the candidate loop (F1), so this line cannot disagree with
+                # what the sweep does.
                 $ackVerdict = Test-HoldAckStale -Control $c
                 if ($null -ne $ackVerdict) {
+                    # F4c: keep the warning on a tick that does nothing else too; Write-QuietSummary
+                    # would drop the buffer, and this line is the record of how long a hold went
+                    # unacknowledged. While the ack does not land (reports keep failing, an in-flight
+                    # row stays) it is kept every tick, on purpose — there is no throttling.
+                    Confirm-LogWorthKeeping
                     Write-Log ("HOLD NOT ACKNOWLEDGED [{0}] — desired_at={1} observed_at={2} ({3})" -f `
                         $proj, $desiredAtDisplay, $observedAtDisplay, $ackVerdict.Reason)
                 }
@@ -6670,9 +6707,17 @@ try {
     # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
     # $DirtyCloneExitCode). Per tick only; the persistent record is $dirtyClonesParked below.
     $dirtyRepoDirs = @{}
-    # PR-B: projects whose unacknowledged HOLD met a parked clone this tick, and the projects a launch
-    # was attempted for this tick. Both are per tick; Invoke-HoldAckViaPark reads them after the loop.
+    # Projects whose HOLD is not (freshly) acknowledged, each mapped to the `--why` the sweep's own
+    # acknowledgement will carry, and the projects a launch was attempted for this tick. Both are per
+    # tick; Invoke-HoldAckViaPark reads them after the loop. F1 (T-hold-observed-freshness-and-
+    # unlaunched-tick-ack): EVERY such project starts as `no-launch`, not only a parked one (PR-B) —
+    # a held project with nothing to launch otherwise never gets its acknowledgement (the deadlock
+    # msg-3268 named). The parked skip below narrows the reason to `dirty-clone-parked`. The verdict
+    # is Test-HoldAckStale, the same one the warning line and Test-HoldObserved use.
     $holdAckViaPark = @{}
+    foreach ($ackProj in @($controlByProject.Keys | Sort-Object)) {
+        if ($null -ne (Test-HoldAckStale -Control $controlByProject[$ackProj])) { $holdAckViaPark[$ackProj] = 'no-launch' }
+    }
     $launchedProjects = @{}
     # PR-B (PR-gate #560 obj 1): a missing ledger is created holding the `*` (absent) sentinel here,
     # before any candidate, so a tick where every candidate is parked still creates it.
@@ -6788,7 +6833,9 @@ try {
             $dispositions[$cand.key] = 'dirty-clone-parked'
             Write-Log "dirty-clone-parked $($cand.key): repo_dir=$($cand.repo_dir) is parked (clone not clean), not launching"
             # PR-B: no launch will land this hold's acknowledgement; the sweep reports it after the loop.
-            if (Test-HoldAckViaParkWanted -Control $control) { $holdAckViaPark[$cand.project] = $true }
+            # The project is already pending (`no-launch`) if its hold is not freshly acknowledged;
+            # this only names the reason more precisely.
+            if ($holdAckViaPark.ContainsKey($cand.project)) { $holdAckViaPark[$cand.project] = 'dirty-clone-parked' }
             continue
         }
 
@@ -7419,17 +7466,18 @@ try {
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
     }
 
-    # PR-B: acknowledge the HOLD of a project whose clone is parked, since no launch will. Only for a
-    # project that launched nothing this tick and whose in-flight ledger is clear (no row, no `*`) —
-    # see deploy/lib/InflightLedger.ps1. Observability only: a failed report is a WARN, never a stop.
+    # Acknowledge the HOLD of every pending project (F1; PR-B for the parked case), since no launch
+    # did. Only for a project that launched nothing this tick and whose in-flight ledger is clear (no
+    # row, no `*`) — see deploy/lib/InflightLedger.ps1. Observability only: a failed report is a WARN,
+    # never a stop.
     if ($holdAckViaPark.Count -gt 0) {
         Confirm-LogWorthKeeping
         $holdAckProbe = Join-Path $repoRoot "scripts\loop_control.py"
         $null = Invoke-HoldAckViaPark -Pending $holdAckViaPark -LaunchedProjects $launchedProjects `
             -InflightPath $inflightStatePath -Report {
-                param($proj)
+                param($proj, $why)
                 Invoke-BoundedUvProbe -Label "hold-ack-$proj" -TimeoutSeconds $ControlProbeTimeoutSeconds `
-                    -Arguments @($holdAckProbe, '--report-observed-hold', '--project', $proj)
+                    -Arguments @($holdAckProbe, '--report-observed-hold', '--project', $proj, '--why', $why)
             }
     }
 

@@ -5,7 +5,10 @@
 #   * Invoke-HoldAckViaPark reports observed=hold once per pending project that launched nothing
 #     this tick and whose ledger is clear; a launch this tick, a row of the project, a `*` sentinel,
 #     a missing or unreadable ledger all skip it; a failed report is a WARN and the rest go on
-#   * Test-HoldAckViaParkWanted: hold not yet observed -> wanted; already observed / run -> not
+#   * F1 (T-hold-observed-freshness-and-unlaunched-tick-ack): the pending set is every project whose
+#     hold Test-HoldAckStale flags (stale ack included), with `--why no-launch`; the parked skip
+#     narrows it to `dirty-clone-parked`; the why reaches the reporter. The span that builds the set
+#     is lifted from the wrapper and run for real.
 #   * the ledger: a launch's row is added before and only its own row removed after; a failed write
 #     leaves the old file untouched; a corrupt file is copied (never renamed) and replaced by a `*`
 #     sentinel; a missing file is created holding a `*` sentinel; every failure path keeps the next
@@ -30,20 +33,42 @@ function Write-Log { param([string]$Message) $script:logs += $Message }
 
 $now = '2026-11-10T01:00:00.0000000Z'
 
-# A reporter stub shaped like Invoke-BoundedUvProbe's result; records the projects it was called for.
+# A reporter stub shaped like Invoke-BoundedUvProbe's result; records the projects it was called for
+# and the `--why` each was called with.
 $script:reported = @()
-$okReport = { param($p) $script:reported += $p; @{ ok = $true; code = 0; stdout = ''; stderr = ''; error = $null } }
+$script:reportedWhy = @{}
+$okReport = { param($p, $why) $script:reported += $p; $script:reportedWhy[$p] = $why; @{ ok = $true; code = 0; stdout = ''; stderr = ''; error = $null } }
 
 function Invoke-Ack {
-    param([string[]]$Pending, [string[]]$Launched = @(), [string]$Path, [scriptblock]$Report = $okReport)
+    param([string[]]$Pending, [string[]]$Launched = @(), [string]$Path, [scriptblock]$Report = $okReport, [string]$Why = 'dirty-clone-parked')
     $script:reported = @()
-    $pend = @{}; foreach ($p in $Pending) { $pend[$p] = $true }
+    $script:reportedWhy = @{}
+    $pend = @{}; foreach ($p in $Pending) { $pend[$p] = $Why }
     $lp = @{}; foreach ($p in $Launched) { $lp[$p] = $true }
     # The comma keeps a one-result array an array, so callers can index [0].
     return , @(Invoke-HoldAckViaPark -Pending $pend -LaunchedProjects $lp -InflightPath $Path -Report $Report)
 }
 
-function New-Control { param([string]$Desired, $Observed) [pscustomobject]@{ desired_state = $Desired; observed_state = $Observed } }
+# Test-HoldAckStale (and its parser) come from the wrapper's AST: dot-sourcing the wrapper would run
+# the sweep.
+$wrapperPath = Join-Path $repoRoot 'deploy/run-conductor-scheduled.ps1'
+$wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile($wrapperPath, [ref]$null, [ref]$null)
+foreach ($fname in @('ConvertFrom-ControlTimestamp', 'Test-HoldAckStale')) {
+    $fdef = $wrapperAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fname }, $true) | Select-Object -First 1
+    if (-not $fdef) { throw "function not found in sweep script: $fname" }
+    Invoke-Expression $fdef.Extent.Text
+}
+
+# Shaped like the control probe's ConvertFrom-Json result, timestamps included.
+function New-Control {
+    param([string]$Desired, $Observed, [string]$DesiredAt = '', [string]$ObservedAt = '')
+    $j = [ordered]@{
+        desired_state = $Desired; observed_state = $Observed
+        desired_at = $(if ($DesiredAt) { $DesiredAt } else { $null })
+        observed_at = $(if ($ObservedAt) { $ObservedAt } else { $null })
+    }
+    return ($j | ConvertTo-Json -Compress | ConvertFrom-Json)
+}
 
 # Fault-injecting I/O: the named step throws, the others are the real ones.
 function New-FaultyIo {
@@ -62,12 +87,7 @@ try {
     # A ledger that exists and is empty: the state after an operator cleared the `*` row.
     function New-ClearLedger { $p = New-LedgerPath; Write-Ledger $p '{}'; return $p }
 
-    Write-Host "Test-HoldAckViaParkWanted"
-    Check 'hold, not acknowledged -> wanted' (Test-HoldAckViaParkWanted -Control (New-Control 'hold' 'run'))
-    Check 'hold, never acknowledged (null) -> wanted' (Test-HoldAckViaParkWanted -Control (New-Control 'hold' $null))
-    Check 'hold, already acknowledged -> not wanted' (-not (Test-HoldAckViaParkWanted -Control (New-Control 'hold' 'hold')))
-    Check 'run -> not wanted' (-not (Test-HoldAckViaParkWanted -Control (New-Control 'run' 'run')))
-    Check 'unreadable control -> not wanted' (-not (Test-HoldAckViaParkWanted -Control $null))
+    Check 'Test-HoldAckViaParkWanted is gone (one verdict: Test-HoldAckStale)' ($null -eq (Get-Command Test-HoldAckViaParkWanted -ErrorAction SilentlyContinue))
 
     Write-Host "Invoke-HoldAckViaPark (msg-8838 cases)"
     $p = New-ClearLedger
@@ -81,13 +101,31 @@ try {
     Check 'another candidate of P launched this tick -> no call' ($script:reported.Count -eq 0)
     Check 'skip reason names the launch' ($r[0].reason -eq 'launched this tick')
     $script:logs = @()
-    $failFirst = { param($q) $script:reported += $q; if ($q -eq 'A') { @{ ok = $true; code = 1; stderr = 'boom' } } else { @{ ok = $true; code = 0 } } }
+    $failFirst = { param($q, $w) $script:reported += $q; if ($q -eq 'A') { @{ ok = $true; code = 1; stderr = 'boom' } } else { @{ ok = $true; code = 0 } } }
     $r = Invoke-Ack -Pending @('A', 'B') -Path $p -Report $failFirst
     Check 'reporter fails -> WARN logged' (@($script:logs | Where-Object { $_ -like 'WARN hold-ack via park A: report failed*' }).Count -eq 1)
     Check 'reporter fails -> next project still reported' ((($r | Where-Object { $_.project -eq 'B' }).outcome) -eq 'reported')
-    $throwing = { param($q) throw 'launcher exploded' }
+    $throwing = { param($q, $w) throw 'launcher exploded' }
     $r = Invoke-Ack -Pending @('A') -Path $p -Report $throwing
     Check 'reporter throws -> failed outcome, no throw' ($r[0].outcome -eq 'failed')
+
+    Write-Host "Invoke-HoldAckViaPark: the why reaches the reporter (F1)"
+    $p = New-ClearLedger
+    $script:logs = @()
+    $r = Invoke-Ack -Pending @('P') -Path $p -Why 'no-launch'
+    Check '(4) pending, no launch, ledger clear -> reported with why=no-launch' ((($script:reported -join ',') -eq 'P') -and $script:reportedWhy['P'] -eq 'no-launch' -and $r[0].why -eq 'no-launch')
+    Check '(4) the log line names the why' (@($script:logs | Where-Object { $_ -eq 'hold-ack via park P: reported observed=hold (no launch; why=no-launch)' }).Count -eq 1)
+    $r = Invoke-Ack -Pending @('P') -Launched @('P') -Path $p -Why 'no-launch'
+    Check '(4) pending, launched this tick -> skipped' ($script:reported.Count -eq 0 -and $r[0].reason -eq 'launched this tick')
+    $null = Add-InflightMark -Path $p -LaunchId 'Ln' -Project 'P' -Key 'P/T' -NowIso $now
+    $r = Invoke-Ack -Pending @('P') -Path $p -Why 'no-launch'
+    Check '(4) pending, a row of P in the ledger -> skipped' ($script:reported.Count -eq 0 -and $r[0].reason -eq 'inflight-row Ln')
+    $p = New-LedgerPath; Write-Ledger $p '{"*": {"project": "*", "reason": "absent"}}'
+    $r = Invoke-Ack -Pending @('P') -Path $p -Why 'no-launch'
+    Check '(4) pending, a * row -> skipped' ($script:reported.Count -eq 0 -and $r[0].reason -eq 'inflight-sentinel (absent)')
+    $p = New-ClearLedger
+    $r = Invoke-Ack -Pending @('P') -Path $p -Why 'dirty-clone-parked'
+    Check '(5) parked path -> reported with why=dirty-clone-parked' ($script:reportedWhy['P'] -eq 'dirty-clone-parked')
 
     Write-Host "Ledger: normal exit"
     $p = New-ClearLedger
@@ -244,8 +282,9 @@ $src = Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/run-conductor-sched
 Check 'wrapper dot-sources the lib' ($src -match "\. \(Join-Path \`$PSScriptRoot 'lib/InflightLedger\.ps1'\)")
 $iHeld = $src.IndexOf('if (Test-HoldObserved -Control $control) {')
 $iParked = $src.IndexOf("`$dispositions[`$cand.key] = 'dirty-clone-parked'")
-$iWanted = $src.IndexOf('if (Test-HoldAckViaParkWanted -Control $control) { $holdAckViaPark[$cand.project] = $true }')
-Check 'hold check precedes the parked check; the parked skip records the project' ($iHeld -gt 0 -and $iParked -gt $iHeld -and $iWanted -gt $iParked)
+$iWanted = $src.IndexOf('if ($holdAckViaPark.ContainsKey($cand.project)) { $holdAckViaPark[$cand.project] = ''dirty-clone-parked'' }')
+Check 'hold check precedes the parked check; the parked skip narrows the why' ($iHeld -gt 0 -and $iParked -gt $iHeld -and $iWanted -gt $iParked)
+Check 'the PR-B predicate is no longer called' ($src -notmatch 'Test-HoldAckViaParkWanted')
 $iMark = $src.IndexOf('$mark = Add-InflightMark')
 $iInit = $src.IndexOf('$inflightInit = Initialize-InflightLedger -Path $inflightStatePath')
 $iFirstCand = $src.IndexOf('foreach ($cand in $candidates) {')
@@ -260,7 +299,38 @@ Check 'own row removed right after the run, guarded on exit 7' ($iUnmark -gt $iI
 $iAck = $src.IndexOf('Invoke-HoldAckViaPark -Pending $holdAckViaPark')
 $iNotReached = $src.IndexOf("`$dispositions[`$cand.key] = 'not-reached'")
 Check 'report runs after the candidate loop' ($iAck -gt $iUnmark -and $iAck -lt $iNotReached)
-Check 'report uses the hold-only flag through the bounded probe' ($src -match "Invoke-BoundedUvProbe -Label `"hold-ack-\`$proj`"" -and $src -match "'--report-observed-hold', '--project', \`$proj")
+Check 'report uses the hold-only flag through the bounded probe, with the why' ($src -match "Invoke-BoundedUvProbe -Label `"hold-ack-\`$proj`"" -and $src.Contains("'--report-observed-hold', '--project', `$proj, '--why', `$why") -and $src.Contains('param($proj, $why)'))
+
+# F1: the span that builds the pending set, lifted from the wrapper and run for real.
+Write-Host "Pending set (F1): every hold Test-HoldAckStale flags, why=no-launch"
+$iPendStart = $src.IndexOf('    $holdAckViaPark = @{}')
+$iPendEnd = $src.IndexOf('    $launchedProjects = @{}', $iPendStart)
+Check 'the pending set is built before the candidate loop' ($iPendStart -gt 0 -and $iPendEnd -gt $iPendStart -and $iPendEnd -lt $iFirstCand)
+$pendSpan = $src.Substring($iPendStart, $iPendEnd - $iPendStart)
+Check 'the pending set uses Test-HoldAckStale' ($pendSpan.Contains('Test-HoldAckStale -Control $controlByProject[$ackProj]'))
+$controlByProject = @{
+    'Stale'   = New-Control 'hold' 'hold' '2026-09-08T12:00:00.106309Z' '2026-09-08T12:00:00Z'
+    'Old'     = New-Control 'hold' 'hold' '2026-09-08T12:00:00Z' '2026-09-08T11:00:00Z'
+    'Never'   = New-Control 'hold' $null '2026-09-08T12:00:00Z'
+    'RunObs'  = New-Control 'hold' 'run' '2026-09-08T12:00:00Z' '2026-09-08T12:00:05Z'
+    'Fresh'   = New-Control 'hold' 'hold' '2026-09-08T12:00:00Z' '2026-09-08T12:00:00.106309Z'
+    'NoTsAck' = New-Control 'hold' 'hold'
+    'Run'     = New-Control 'run' 'run'
+    'Unread'  = $null
+}
+. ([scriptblock]::Create($pendSpan))
+$keys = (@($holdAckViaPark.Keys | Sort-Object) -join ',')
+Check '(1)/(2a) stale, older, never, run-observed -> pending; fresh, no-timestamp ack, run, unreadable -> not' ($keys -eq 'Never,Old,RunObs,Stale') "got [$keys]"
+Check 'every pending project starts as no-launch' (@($holdAckViaPark.Values | Where-Object { $_ -ne 'no-launch' }).Count -eq 0)
+
+# F4c: the warning line is kept even on a tick that does nothing else.
+Write-Host "HOLD NOT ACKNOWLEDGED is kept (F4c)"
+$iWarn = $src.IndexOf('Write-Log ("HOLD NOT ACKNOWLEDGED [{0}]')
+$iVerdict = $src.LastIndexOf('$ackVerdict = Test-HoldAckStale -Control $c', $iWarn)
+$warnSpan = if ($iVerdict -gt 0 -and $iWarn -gt $iVerdict) { $src.Substring($iVerdict, $iWarn - $iVerdict) } else { '' }
+$iIf = $warnSpan.IndexOf('if ($null -ne $ackVerdict) {')
+$iKeep = $warnSpan.IndexOf('Confirm-LogWorthKeeping')
+Check '(6) Confirm-LogWorthKeeping runs inside the warning branch, before the line' ($iIf -gt 0 -and $iKeep -gt $iIf)
 
 
 # PR-B addendum (Bohr msg-8857, go Einstein): a launch that ends between the mark and `& $inner`

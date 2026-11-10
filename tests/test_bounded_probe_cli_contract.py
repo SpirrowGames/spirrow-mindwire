@@ -92,9 +92,10 @@ def test_every_call_site_was_found() -> None:
 
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
+    # T-hold-observed-freshness-and-unlaunched-tick-ack F1: the caller always names the reason.
     assert sites.get('"hold-ack-$proj"') == (
         "loop_control.py",
-        ["--report-observed-hold", "--project"],
+        ["--report-observed-hold", "--project", "--why"],
     )
 
 

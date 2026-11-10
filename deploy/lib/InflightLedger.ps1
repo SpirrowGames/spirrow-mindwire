@@ -198,20 +198,17 @@ function Test-InflightClearForProject {
     return @{ clear = $true; reason = $null }
 }
 
-# At the dirty-clone-parked skip: does this project's hold still need an acknowledgement? A hold the
-# loop already observed never reaches the parked check (Test-HoldObserved skips it first), but the
-# predicate checks both sides so it means the same thing wherever it is called.
-function Test-HoldAckViaParkWanted {
-    param($Control)
-    if ($null -eq $Control) { return $false }
-    if ($Control.desired_state -ne 'hold') { return $false }
-    return ($Control.observed_state -ne 'hold')
-}
+# Which projects need an acknowledgement is decided by the sweep with Test-HoldAckStale (in
+# deploy/run-conductor-scheduled.ps1), the same verdict as the HOLD NOT ACKNOWLEDGED line and the
+# launch gate Test-HoldObserved. The PR-B predicate that used to live here (Test-HoldAckViaParkWanted,
+# `observed_state -ne 'hold'`) missed a stale `observed: hold` from an earlier hold — the same hole
+# F2 closes — so it is gone (T-hold-observed-freshness-and-unlaunched-tick-ack F1).
 
 # After the candidate loop: report observed=hold once for each project in $Pending that launched
-# nothing this tick and whose in-flight ledger is clear. $Report is the bounded probe call
-# (param($project) -> the Invoke-BoundedUvProbe result). Observability only: never throws, and a
-# failed report is a WARN line. Returns one @{ project; outcome; reason } per pending project.
+# nothing this tick and whose in-flight ledger is clear. $Pending maps project -> the `--why` value
+# (`no-launch` or `dirty-clone-parked`). $Report is the bounded probe call (param($project, $why) ->
+# the Invoke-BoundedUvProbe result). Observability only: never throws, and a failed report is a WARN
+# line. Returns one @{ project; outcome; reason; why } per pending project.
 function Invoke-HoldAckViaPark {
     param(
         [hashtable]$Pending,
@@ -222,6 +219,7 @@ function Invoke-HoldAckViaPark {
     $results = @()
     if ($null -eq $Pending) { return $results }
     foreach ($proj in @($Pending.Keys | Sort-Object)) {
+        $ackWhy = "$($Pending[$proj])"
         $reason = $null
         if ($null -ne $LaunchedProjects -and $LaunchedProjects.ContainsKey($proj)) { $reason = 'launched this tick' }
         else {
@@ -230,24 +228,24 @@ function Invoke-HoldAckViaPark {
         }
         if ($null -ne $reason) {
             Write-Log "hold-ack via park ${proj}: skipped ($reason)"
-            $results += @{ project = $proj; outcome = 'skipped'; reason = $reason }
+            $results += @{ project = $proj; outcome = 'skipped'; reason = $reason; why = $ackWhy }
             continue
         }
         try {
-            $r = & $Report $proj
+            $r = & $Report $proj $ackWhy
             if ($null -ne $r -and $r.ok -and $r.code -eq 0) {
-                Write-Log "hold-ack via park ${proj}: reported observed=hold (no launch; clone parked)"
-                $results += @{ project = $proj; outcome = 'reported'; reason = $null }
+                Write-Log "hold-ack via park ${proj}: reported observed=hold (no launch; why=$ackWhy)"
+                $results += @{ project = $proj; outcome = 'reported'; reason = $null; why = $ackWhy }
             }
             else {
                 $why = if ($null -eq $r) { 'no result' } elseif (-not $r.ok) { "$($r.error)" } else { "exit $($r.code): $("$($r.stderr)".Trim())" }
                 Write-Log "WARN hold-ack via park ${proj}: report failed ($why) — tick continues"
-                $results += @{ project = $proj; outcome = 'failed'; reason = $why }
+                $results += @{ project = $proj; outcome = 'failed'; reason = $why; why = $ackWhy }
             }
         }
         catch {
             Write-Log "WARN hold-ack via park ${proj}: report failed ($($_.Exception.Message)) — tick continues"
-            $results += @{ project = $proj; outcome = 'failed'; reason = $_.Exception.Message }
+            $results += @{ project = $proj; outcome = 'failed'; reason = $_.Exception.Message; why = $ackWhy }
         }
     }
     return $results
