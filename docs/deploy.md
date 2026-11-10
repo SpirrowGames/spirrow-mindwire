@@ -959,6 +959,12 @@ the thread's `N`:
 | C | anything else: `NEXT: none` without `STOP:`, no `NEXT:`, a refused form, field ≠ body | 6h |
 | D | `BLOCKED-ON:` (any trigger, never evaluated), `NEXT: human`, a well-formed `NEXT: operator` | 72h for now; D-16d-2 sets `T_WAIT_AUTO` / `T_WAIT_MANUAL` |
 
+The hand-off to the PR-gate uses only the body line `NEXT: pr-review <owner/repo#n>`. The
+`next_participant` field cannot carry it. Magickit's writer accepts only names of registered
+identities and has no gate sentinel, by the owner's decision (msg-072 §2). It therefore refuses
+`pr-review <ref>` and bare `pr-review`. The reader's field branch for the sentinel is only a
+fail-safe.
+
 A head the tick could not read yet is treated as C with the old 72h. It is counted in the
 heartbeat's `pending_heads` and read on a later tick; `head_fetches` is the number of reads this
 tick. Only a failed read is retried: a thread read in full whose head message is absent or has no

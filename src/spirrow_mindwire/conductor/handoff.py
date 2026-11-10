@@ -1718,17 +1718,31 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
     The field just skips the ``NEXT:``-line scaffolding: the value IS the decision, so there is
     no keyword to strip off the front. Everything else — sentinel matching, roster lookup,
     ref parsing — is byte-identical to :func:`_resolve_body` so the two sides cannot disagree
-    on what a "valid participant" is. The write side (`chatroom_post_message`) enforces the
-    same vocabulary with :class:`NextParticipantUnknownError`; this read-side resolution is the
-    fail-safe when a bad field slipped past that validation (§3-3's escape hatch is "drop the
-    field and re-send", which the row-5 escalation asks the human to do).
+    on what a "valid participant" is.
+
+    The write side does NOT share this vocabulary. Magickit's ``chatroom_post_message``
+    validator checks only that the value names an identity Prismind knows, and refuses any
+    other value with ``NextParticipantUnknownError``; by its owner's decision it knows no
+    consumer routing vocabulary — no ``pr-review <ref>`` sentinel, no reserved word (magickit
+    ``src/magickit/mcp/tools/chatroom.py``, the comment block citing msg-072 §2 "the vocabulary
+    is not shared between owners"; read at magickit commit ``ad8762b5``). So a field of
+    ``pr-review <owner/repo#n>`` — or bare ``pr-review`` — is looked up as an identity name and
+    refused before the write: a message posted through Magickit cannot carry the PR-gate
+    sentinel in the field. The gate is reached through the body's ``NEXT: pr-review <ref>``
+    line only (T-gate-identities-unregistered-next-participant-unusable, msg-1633). This
+    read-side resolution is the fail-safe for a field value that did not pass through that
+    write-time validation (§3-3's escape hatch is "drop the field and re-send", which the
+    row-5 escalation asks the human to do).
 
     Missing the ``pr-review`` sentinel on this side would break the field-driven PR-gate
     (ADR-19 N-1): a field of ``pr-review acme/widgets#7`` would fall out of every branch
     below, resolve to ABSENT, be seen as a field/body mismatch by :func:`_reconcile`, and
     escalate to the human — silently disabling the synchronous Tier B review whenever the
     envelope field is the authoritative handoff. So the sentinel is matched here just as it
-    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair.
+    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair. (As noted
+    above, Magickit's writer does not let such a field through today, so this branch keeps
+    the read side consistent with the body path rather than serving a live write route; it is
+    kept because it is harmless and pinned by tests.)
     """
     sentinel = _PR_REVIEW_RE.match(field_value)
     if sentinel is not None and (operand := sentinel.group("rest").strip()):
