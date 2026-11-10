@@ -224,6 +224,50 @@ $iNotReached = $src.IndexOf("`$dispositions[`$cand.key] = 'not-reached'")
 Check 'report runs after the candidate loop' ($iAck -gt $iUnmark -and $iAck -lt $iNotReached)
 Check 'report uses the hold-only flag through the bounded probe' ($src -match "Invoke-BoundedUvProbe -Label `"hold-ack-\`$proj`"" -and $src -match "'--report-observed-hold', '--project', \`$proj")
 
+
+# PR-B addendum (Bohr msg-8857, go Einstein): a launch that ends between the mark and `& $inner`
+# never spawned a child, so it removes its OWN row only. The span is lifted from the wrapper source
+# and run for real against a commit-launch that declines.
+Write-Host "Not launched after the mark (commit-launch declines)"
+$iTry = $src.IndexOf("        try {`n            `$commitResult = Invoke-HeadSkipCommitLaunch")
+$iCatchEnd = $src.IndexOf("            throw`n        }`n", $iTry)
+Check 'the try opens after the mark block and before commit-launch' ($iTry -gt $iMark -and $iTry -lt $iCommit)
+Check 'the catch closes before the spawn; `& $inner` is outside the try' ($iCatchEnd -gt $iCommit -and $iCatchEnd -lt $iInner -and
+    $src.Substring($iCatchEnd, $iInner - $iCatchEnd) -notmatch '\btry\s*\{')
+$span = $src.Substring($iTry, ($iCatchEnd + "            throw`n        }`n".Length) - $iTry)
+Check 'the catch removes only this launch''s row and rethrows' ($span -match 'catch \{\s*\$undo = Remove-InflightMark -Path \$inflightStatePath -LaunchId \$inflightLaunchId' -and $span -match '\n\s*throw\n\s*\}\s*$')
+function Invoke-HeadSkipCommitLaunch { param($Payload, $StateFilePath) @{ ok = $false; error = 'stub decline' } }
+$tmp2 = Join-Path ([System.IO.Path]::GetTempPath()) ("hold-ack-park-decline-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tmp2 | Out-Null
+try {
+    foreach ($withSentinel in @($true, $false)) {
+        $inflightStatePath = Join-Path $tmp2 "ledger-$withSentinel.json"
+        $seed = if ($withSentinel) { '{"Lq": {"project": "Q", "key": "Q/T"}, "*": {"project": "*", "reason": "absent"}}' } else { '{"Lq": {"project": "Q", "key": "Q/T"}}' }
+        [System.IO.File]::WriteAllText($inflightStatePath, $seed)
+        $mark = Add-InflightMark -Path $inflightStatePath -Project 'P' -Key 'P/T' -NowIso $now
+        $inflightLaunchId = $mark.launch_id
+        $cand = [pscustomobject]@{ key = 'P/T'; project = 'P' }
+        $commitPayload = @{}; $headSkipStatePath = 'unused'
+        $thrown = $null
+        try { . ([scriptblock]::Create($span)) } catch { $thrown = $_.Exception.Message }
+        $rows = (Read-InflightLedger -Path $inflightStatePath).rows
+        $tag = if ($withSentinel) { '[with *]' } else { '[no *]' }
+        Check "$tag the decline is rethrown (tick still aborts)" ("$thrown" -like '*commit-launch systemic failure*')
+        Check "$tag own row removed" ($mark.ok -and -not $rows.ContainsKey($inflightLaunchId))
+        Check "$tag other project's row kept" ($rows.ContainsKey('Lq'))
+        if ($withSentinel) {
+            Check "$tag * sentinel kept" ($rows.ContainsKey('*'))
+            $r = Invoke-Ack -Pending @('P') -Path $inflightStatePath
+            Check "$tag next tick: * present -> still no report" ($script:reported.Count -eq 0 -and $r[0].reason -eq 'inflight-sentinel (absent)')
+        }
+        else {
+            $r = Invoke-Ack -Pending @('P') -Path $inflightStatePath
+            Check "$tag next tick: parked, on hold, no row, no * -> reports" (($script:reported -join ',') -eq 'P')
+        }
+    }
+}
+finally { Remove-Item -LiteralPath $tmp2 -Recurse -Force -ErrorAction SilentlyContinue }
+
 if ($script:failures -gt 0) { Write-Host "$script:failures check(s) FAILED"; exit 1 }
 Write-Host "all checks passed"
 exit 0
