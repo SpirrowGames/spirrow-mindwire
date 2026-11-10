@@ -196,6 +196,16 @@ class LoopControlReader:
         self._actor = actor
         self._last_reported: ControlState | None = None
 
+    @property
+    def last_reported(self) -> ControlState | None:
+        """The last state :meth:`report_observed` landed, or ``None`` if none has landed yet.
+
+        :meth:`report_observed` swallows a failed report on purpose (a running conductor must not
+        die on a stale dashboard); a one-shot caller such as ``scripts/loop_control.py
+        --report-observed-hold`` reads this to tell a landed report from a swallowed one.
+        """
+        return self._last_reported
+
     async def read(self) -> ControlState:
         """The project's desired state, or :data:`FAILSAFE_CONTROL_STATE` if it cannot be read.
 
