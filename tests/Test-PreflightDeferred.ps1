@@ -244,6 +244,7 @@ Check 'branch never quarantines' $false ($bt -match 'quarantineState|New-Quarant
 Check 'branch never touches retry state transitions' $false ($bt -match 'Register-Candidate|New-RetryPendingRecord|pending\.Remove|pending\[\$cand\.key\]\s*=')
 Check 'branch never counts toward K' $false ($bt -match 'sweepFailures')
 Check 'branch gives back the retry-launched count' $true ($bt -match '\$retryLaunched--')
+Check 'exit 11 does not end a git-sync deferral episode' $true ($body -match '\$code -ne \$PreflightDeferredExitCode -and \$code -ne \$GitSyncDeferredExitCode -and\s+\(Clear-GitSyncDeferredNotice')
 
 $skipIf = $loop.Body.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.IfStatementAst] -and

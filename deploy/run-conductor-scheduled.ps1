@@ -7182,8 +7182,9 @@ try {
         }
         else { Write-Log "inflight $($cand.key): exit=$code — row $inflightLaunchId kept (exit not confirmed)" }
         # A launch that did not defer got past git-sync: end this candidate's deferral episode so
-        # its next outage alerts again (see Get-GitSyncDeferredNotice).
-        if ($code -ne $GitSyncDeferredExitCode -and
+        # its next outage alerts again (see Get-GitSyncDeferredNotice). An exit-$PreflightDeferredExitCode
+        # run stopped before git-sync was reached, so it proves nothing about git-sync either way.
+        if ($code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
             (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
