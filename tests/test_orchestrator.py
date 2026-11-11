@@ -1625,8 +1625,11 @@ async def test_a1_preflight_fails_open_when_the_thread_cannot_be_read(
         ("a reply with no control line at all", "no NEXT token"),
         # A broken terminal form: its NEXT token (a persona here) must not be read.
         ("bad\n\nSTOP: finished\nNEXT: Heisenberg", "refused terminal form"),
+        # The retired NEXT: operator token is not a persona, so it must not be refused as one
+        # (PR #569 gate objection: the documented operator fail-open had no test).
+        ("hand work\n\nNEXT: operator", "retired NEXT: operator"),
     ],
-    ids=["no-message", "no-control-line", "refused-terminal-form"],
+    ids=["no-message", "no-control-line", "refused-terminal-form", "retired-operator"],
 )
 async def test_a1_preflight_fails_open_when_the_head_cannot_be_interpreted(
     head: str | None, reason: str, caplog: pytest.LogCaptureFixture
