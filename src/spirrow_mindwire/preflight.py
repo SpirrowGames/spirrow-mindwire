@@ -181,9 +181,12 @@ import json
 import logging
 import re
 import subprocess
+import sys
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +203,106 @@ _SPIRROWGAMES_REPO_RE = re.compile(
 
 _REQUIRED_RULE_TYPES = frozenset({"deletion", "non_fast_forward", "pull_request"})
 
+# --------------------------------------------------------------------------- #
+# Transient GitHub API failures (T-preflight-transient-gh-failure-quarantines-threads,
+# design v3.2: Bohr msg-9200 / msg-9202 / msg-9204 / msg-9206 / msg-9208, go Einstein).
+#
+# P1 stays fail-closed: when it cannot confirm protection the role is never started. What
+# changed is WHERE an unconfirmed run lands. A transient failure (TLS / EOF / 5xx / 429 /
+# rate-limit 403 / timeout) is retried here a few times inside one shared deadline; if the
+# protection is still unconfirmed the run ends with PreflightDeferredError (exit
+# PREFLIGHT_DEFERRED_EXIT_CODE), which the sweep treats like the git-sync deferral (no
+# quarantine, existing retry-pending untouched, launch reverted) instead of exit 1. Anything
+# not positively recognised as transient stays a terminal PreflightError.
+# --------------------------------------------------------------------------- #
+
+# The next free daemon exit code: 1 crash, 2 environment terminal, 3 stand-down, 4 stall, 5/6/7
+# wall-clock budget, 8 dirty clone, 9 git-sync deferred, 10 secrets stop. The sweep wrapper
+# mirrors it as $PreflightDeferredExitCode (a pytest pins the two).
+PREFLIGHT_DEFERRED_EXIT_CODE = 11
+
+# stdout sentinel of the one JSON row ``loop_runner.main`` prints before exiting 11. The
+# wrapper reads it only to key and enrich its notification; the do-not-quarantine decision
+# rides on the exit code alone.
+PREFLIGHT_DEFERRED_PAYLOAD_PREFIX = "MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD "
+
+# stdout sentinel printed right after the preflight passed (design v2 D-5b). The wrapper ends
+# a repo's deferral episode when it sees this line, whatever the run's exit code: a role that
+# fails AFTER a passing preflight still proves the API answered.
+PREFLIGHT_OK_PREFIX = "MINDWIRE_PREFLIGHT_OK "
+
+# One deadline shared by every P1 API call and every wait (design v3 D-2''). Each call's
+# timeout is cut down to what is left, so P1 ends within this plus the time to reap one gh
+# process, whatever the number of endpoints or remotes.
+PREFLIGHT_DEADLINE_S = 150.0
+# Per-call ceiling (design v1 D-1): before it, a hung ``gh`` waited for the hard run budget.
+PREFLIGHT_CALL_TIMEOUT_S = 30.0
+# At most 4 tries of one endpoint, transient failures only; waits 2s -> 5s -> 10s (D-2).
+PREFLIGHT_MAX_ATTEMPTS = 4
+PREFLIGHT_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0)
+# gh's stderr is carried into every P1 error text, capped (D-2).
+PREFLIGHT_STDERR_CAP = 500
+
+_HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
+# Transport failures that never got an HTTP status. Matched case-insensitively against gh's
+# stderr. Real samples from this host: ``schannel: failed to receive handshake`` and
+# ``unexpected EOF`` (msg-9198).
+_TRANSIENT_NETWORK_MARKERS = (
+    "schannel",
+    "unexpected eof",
+    "tls handshake",
+    "connection reset",
+    "connection refused",
+    "i/o timeout",
+    "no such host",
+    "dial tcp",
+)
+
+FailureKind = Literal["transient", "terminal"]
+
+
+def classify_gh_failure(stderr: str) -> FailureKind:
+    """Classify one failed ``gh api`` call by its stderr (design v1 D-1).
+
+    Transient only when positively recognised: HTTP 5xx / 429, an HTTP 403 that names a rate
+    limit, or — with no HTTP status at all — one of the transport markers above. Everything
+    else (401, any other 403, 404, 422, an unrecognised message) is terminal, so an unknown
+    failure keeps today's fail-closed exit 1.
+    """
+    text = stderr or ""
+    low = text.lower()
+    m = _HTTP_STATUS_RE.search(text)
+    if m is not None:
+        status = int(m.group(1))
+        if status >= 500 or status == 429:
+            return "transient"
+        if status == 403 and "rate limit" in low:
+            return "transient"
+        return "terminal"
+    if any(marker in low for marker in _TRANSIENT_NETWORK_MARKERS):
+        return "transient"
+    return "terminal"
+
+
+def _cap(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= PREFLIGHT_STDERR_CAP:
+        return text
+    return text[:PREFLIGHT_STDERR_CAP] + "…"
+
+
+def _classify_exception(exc: BaseException, timeout_s: float) -> tuple[FailureKind, str]:
+    """Map whatever the api caller raised to ``(kind, capped detail)``."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "transient", f"gh api timed out after {timeout_s:.1f}s"
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return classify_gh_failure(stderr), _cap(stderr or str(exc))
+    if isinstance(exc, ValueError):
+        # json.JSONDecodeError: gh exited 0 but the body is not JSON — terminal (D-1).
+        return "terminal", _cap(f"response was not JSON: {exc}")
+    return "terminal", _cap(str(exc))
+
 
 class PreflightError(SystemExit):
     """Halt the daemon: a composition-root precondition failed.
@@ -211,8 +314,79 @@ class PreflightError(SystemExit):
     """
 
 
-ApiCaller = Callable[[str], Any]
-"""``gh api <endpoint>`` → parsed JSON. Injectable for tests."""
+class PreflightDeferredError(Exception):
+    """P1 could not confirm protection because GitHub was transiently unreachable.
+
+    Deliberately NOT a :class:`PreflightError` / :class:`SystemExit`: ``loop_runner.main``
+    maps it to :data:`PREFLIGHT_DEFERRED_EXIT_CODE`, which the sweep treats as "this run did
+    not happen" (launch reverted, no quarantine, existing retry-pending untouched). The role
+    is still never started — fail-closed is unchanged, only the bookkeeping differs.
+    """
+
+    def __init__(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        endpoint: str,
+        attempts: int,
+        last_stderr: str,
+        reason: str,
+        checked: list[str],
+        unchecked: list[str],
+    ) -> None:
+        self.owner = owner
+        self.repo = repo
+        self.endpoint = endpoint
+        self.attempts = attempts
+        self.last_stderr = last_stderr
+        self.reason = reason
+        self.checked = list(checked)
+        self.unchecked = list(unchecked)
+        super().__init__(
+            f"preflight P1 deferred ({reason}): could not confirm server-side protection of "
+            f"{owner}/{repo} — {endpoint} unresolved; {attempts} API attempt(s) in total; "
+            f"unchecked={self.unchecked}; last error: {last_stderr}. The role is NOT started "
+            f"(fail-closed, msg-1267 §4); the next tick checks again."
+        )
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "owner": self.owner,
+            "repo": self.repo,
+            "endpoint": self.endpoint,
+            "attempts": self.attempts,
+            "last_stderr": self.last_stderr,
+            "reason": self.reason,
+            "checked": self.checked,
+            "unchecked": self.unchecked,
+        }
+
+
+def emit_preflight_deferred_payload(exc: PreflightDeferredError) -> None:
+    """Print the one ``MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD <json>`` row the sweep parses."""
+    sys.stdout.write(f"{PREFLIGHT_DEFERRED_PAYLOAD_PREFIX}{json.dumps(exc.payload())}\n")
+    sys.stdout.flush()
+
+
+def emit_preflight_ok(repos: list[str]) -> None:
+    """Print the ``MINDWIRE_PREFLIGHT_OK <json>`` row (design v2 D-5b)."""
+    sys.stdout.write(f"{PREFLIGHT_OK_PREFIX}{json.dumps({'repos': list(repos)})}\n")
+    sys.stdout.flush()
+
+
+ApiCaller = Callable[[str, float], Any]
+"""``gh api <endpoint>`` with a timeout in seconds → parsed JSON. Injectable for tests.
+
+Failures are raised, not returned: :class:`subprocess.TimeoutExpired`, and a
+:class:`subprocess.CalledProcessError` whose stderr :func:`classify_gh_failure` recognises,
+are transient; anything else is terminal."""
+
+Clock = Callable[[], float]
+"""Monotonic clock in seconds. Injectable for tests (default :func:`time.monotonic`)."""
+
+Sleep = Callable[[float], None]
+"""Blocking wait in seconds. Injectable for tests (default :func:`time.sleep`)."""
 
 RemoteReader = Callable[[Path], list[tuple[str, str]]]
 """``git -C repo remote -v`` → ``[(remote_name, url), ...]``. Injectable for tests."""
@@ -241,8 +415,18 @@ def preflight_gate(
     remote_reader: RemoteReader | None = None,
     git_toplevel: GitToplevel | None = None,
     hooks_path_reader: HooksPathReader | None = None,
-) -> None:
+    clock: Clock | None = None,
+    sleep: Sleep | None = None,
+    deadline_s: float = PREFLIGHT_DEADLINE_S,
+) -> list[str]:
     """Enforce P0/P3/P2/P1. Raise :class:`PreflightError` on any failure.
+
+    Returns the ``owner/repo`` slugs P1 confirmed, for the ``MINDWIRE_PREFLIGHT_OK`` row.
+
+    P1's API calls share one monotonic deadline (``deadline_s`` from entry, design v3 D-2''):
+    when protection could not be confirmed only because GitHub was transiently unreachable or
+    the deadline ran out, and no terminal problem is established, this raises
+    :class:`PreflightDeferredError` instead (exit 11 — the role is still not started).
 
     ``daemon_root`` defaults to :func:`Path.cwd`. The composition root invokes
     this once per daemon start; there is no per-turn re-check and no cache —
@@ -281,11 +465,14 @@ def preflight_gate(
     remotes_of = remote_reader or _default_remote_reader
     toplevel_of = git_toplevel or _default_git_toplevel
     hooks_path_of = hooks_path_reader or _default_hooks_path_reader
+    now = clock or time.monotonic
+    # The deadline is fixed once, at entry (D-2''). P0/P3/P2 are local git reads only.
+    fetcher = _P1Fetcher(api, deadline=now() + deadline_s, clock=now, sleep=sleep or time.sleep)
 
     _p0_daemon_checkout_separated(repo_dir, daemon_root, toplevel_of)
     _p3_secret_guard_armed(repo_dir, hooks_path_of, toplevel_of)
     remotes = _p2_remote_urls_under_spirrowgames(repo_dir, remotes_of)
-    _p1_default_branch_protected(remotes, api)
+    repos = _p1_default_branch_protected(remotes, fetcher)
     logger.info(
         "preflight ok (start-time snapshot; no per-turn re-check for dynamic "
         "remotes / URL-direct pushes — msg-1274 §1): "
@@ -294,6 +481,7 @@ def preflight_gate(
         daemon_root,
         len(remotes),
     )
+    return repos
 
 
 # --------------------------------------------------------------------------- #
@@ -441,7 +629,107 @@ def _p2_remote_urls_under_spirrowgames(
 # --------------------------------------------------------------------------- #
 
 
-def _p1_default_branch_protected(remotes: list[tuple[str, str]], api_caller: ApiCaller) -> None:
+@dataclass
+class _Fetched:
+    """The outcome of one P1 endpoint after retries.
+
+    ``ok`` carries the parsed body in ``value``; ``terminal`` and ``undetermined`` carry a
+    capped ``detail``. ``undetermined`` means "not confirmed because GitHub was transiently
+    unreachable" (``reason='transient'``: the attempts ran out) or because the shared deadline
+    came first (``reason='deadline'``, including an endpoint never called at all).
+    """
+
+    kind: Literal["ok", "terminal", "undetermined"]
+    endpoint: str
+    value: Any = None
+    detail: str = ""
+    reason: str = ""
+
+
+@dataclass
+class _Undetermined:
+    owner: str
+    repo: str
+    endpoint: str
+    reason: str
+
+
+class _P1Fetcher:
+    """Every P1 API call goes through here: one shared deadline, transient-only retries.
+
+    Design v3 D-2'': the deadline is checked before EVERY call (first tries included) and
+    before every wait, and each call's timeout is ``min(PREFLIGHT_CALL_TIMEOUT_S, remaining)``.
+    A terminal failure is never retried. Results are returned, not raised, so the caller can
+    aggregate them with the D-3 rules (an unconfirmed provider is not a confirmed problem).
+    """
+
+    def __init__(self, api: ApiCaller, *, deadline: float, clock: Clock, sleep: Sleep) -> None:
+        self._api = api
+        self._deadline = deadline
+        self._clock = clock
+        self._sleep = sleep
+        self.attempts_total = 0
+        self.checked: list[str] = []
+        self.unchecked: list[str] = []
+        self.last_detail = ""
+
+    def fetch(self, endpoint: str) -> _Fetched:
+        attempt = 0
+        last = ""
+        while True:
+            remaining = self._deadline - self._clock()
+            if remaining <= 0:
+                return self._undetermined(endpoint, "deadline", last or "deadline reached")
+            timeout_s = min(PREFLIGHT_CALL_TIMEOUT_S, remaining)
+            attempt += 1
+            self.attempts_total += 1
+            try:
+                value = self._api(endpoint, timeout_s)
+            except Exception as exc:
+                kind, detail = _classify_exception(exc, timeout_s)
+                self.last_detail = detail
+                if kind == "terminal":
+                    return _Fetched("terminal", endpoint, detail=detail)
+                last = detail
+                if attempt >= PREFLIGHT_MAX_ATTEMPTS:
+                    return self._undetermined(endpoint, "transient", detail)
+                delay = PREFLIGHT_RETRY_DELAYS_S[attempt - 1]
+                if self._clock() + delay >= self._deadline:
+                    return self._undetermined(endpoint, "deadline", detail)
+                logger.info(
+                    "preflight P1: transient failure on %s (attempt %d/%d), retrying in %.0fs: %s",
+                    endpoint,
+                    attempt,
+                    PREFLIGHT_MAX_ATTEMPTS,
+                    delay,
+                    detail,
+                )
+                self._sleep(delay)
+                continue
+            self.checked.append(endpoint)
+            return _Fetched("ok", endpoint, value=value)
+
+    def _undetermined(self, endpoint: str, reason: str, detail: str) -> _Fetched:
+        self.unchecked.append(endpoint)
+        return _Fetched("undetermined", endpoint, detail=detail, reason=reason)
+
+
+@dataclass
+class _RepoVerdict:
+    """D-2''' aggregation result for one repo: confirmed problems vs. unconfirmed parts."""
+
+    problems: list[str] = field(default_factory=list)
+    undetermined: list[_Undetermined] = field(default_factory=list)
+
+
+def _p1_default_branch_protected(remotes: list[tuple[str, str]], fetcher: _P1Fetcher) -> list[str]:
+    """Run P1 on every repo the remotes name; return the confirmed ``owner/repo`` slugs.
+
+    The verdict order is the same whether every endpoint was read or the deadline came first
+    (design v3.1 D-2'''): (1) any CONFIRMED terminal problem, in any repo → PreflightError;
+    (2) otherwise anything unconfirmed → PreflightDeferredError; (3) otherwise pass. A repo
+    with confirmed problems raises as soon as it is evaluated (the verdict cannot change).
+    """
     # Deduplicate: several named remotes may point at the same repo (fetch/push
     # split), and asking GitHub 4x for the same rules is only wasted quota.
     unique_repos: dict[tuple[str, str], str] = {}
@@ -457,12 +745,74 @@ def _p1_default_branch_protected(remotes: list[tuple[str, str]], api_caller: Api
             )
         unique_repos[(m["owner"], m["repo"])] = name
 
+    undetermined: list[_Undetermined] = []
     for (owner, repo), name in unique_repos.items():
-        default_branch = _fetch_default_branch(owner, repo, api_caller)
-        rules = _fetch_effective_rules(owner, repo, default_branch, api_caller)
-        _p1_required_types_covered_by_unbypassable_rulesets(
-            owner, repo, default_branch, name, rules, api_caller
+        verdict = _p1_check_repo(owner, repo, name, fetcher)
+        if verdict.problems:
+            raise PreflightError("\n".join(verdict.problems))
+        undetermined.extend(verdict.undetermined)
+    if undetermined:
+        first = undetermined[0]
+        reason = "deadline" if any(u.reason == "deadline" for u in undetermined) else "transient"
+        raise PreflightDeferredError(
+            owner=first.owner,
+            repo=first.repo,
+            endpoint=first.endpoint,
+            attempts=fetcher.attempts_total,
+            last_stderr=fetcher.last_detail,
+            reason=reason,
+            checked=fetcher.checked,
+            unchecked=fetcher.unchecked,
         )
+    return [f"{owner}/{repo}" for owner, repo in unique_repos]
+
+
+def _p1_check_repo(owner: str, repo: str, remote_name: str, fetcher: _P1Fetcher) -> _RepoVerdict:
+    """D-2''' for one repo. ``repos/{repo}`` and ``rules/branches/{b}`` have no substitute:
+    a terminal failure of either is a confirmed problem (item 4), an unconfirmed one makes
+    the whole repo unconfirmed (nothing after it can be read)."""
+    out = _RepoVerdict()
+    meta = fetcher.fetch(f"repos/{owner}/{repo}")
+    if meta.kind == "undetermined":
+        out.undetermined.append(_Undetermined(owner, repo, meta.endpoint, meta.reason))
+        # The rules endpoint needs the default branch: it can never be called this run.
+        fetcher.unchecked.append(f"repos/{owner}/{repo}/rules/branches/<default_branch>")
+        return out
+    if meta.kind == "terminal":
+        out.problems.append(
+            f"preflight P1 failed: could not fetch repos/{owner}/{repo}: {meta.detail}. "
+            f"API unreachable / unauthorised → fail-closed (msg-1267 §4)."
+        )
+        return out
+    body = meta.value
+    default_branch = body.get("default_branch") if isinstance(body, dict) else None
+    if not isinstance(default_branch, str) or not default_branch:
+        out.problems.append(
+            f"preflight P1 failed: repos/{owner}/{repo} did not return a default_branch "
+            f"(got {default_branch!r})."
+        )
+        return out
+
+    rules_res = fetcher.fetch(f"repos/{owner}/{repo}/rules/branches/{default_branch}")
+    if rules_res.kind == "undetermined":
+        out.undetermined.append(_Undetermined(owner, repo, rules_res.endpoint, rules_res.reason))
+        return out
+    if rules_res.kind == "terminal":
+        out.problems.append(
+            f"preflight P1 failed: could not fetch rules for {owner}/{repo}@"
+            f"{default_branch}: {rules_res.detail}. Fail-closed (msg-1267 §4)."
+        )
+        return out
+    rules = rules_res.value
+    if not isinstance(rules, list):
+        out.problems.append(
+            f"preflight P1 failed: rules endpoint for {owner}/{repo}@{default_branch} "
+            f"returned non-list {type(rules).__name__}."
+        )
+        return out
+    return _p1_required_types_covered_by_unbypassable_rulesets(
+        owner, repo, default_branch, remote_name, rules, fetcher
+    )
 
 
 def _p1_required_types_covered_by_unbypassable_rulesets(
@@ -471,9 +821,15 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
     default_branch: str,
     remote_name: str,
     rules: list[dict[str, Any]],
-    api_caller: ApiCaller,
-) -> None:
+    fetcher: _P1Fetcher,
+) -> _RepoVerdict:
     """Enforce the P1 invariant on the effective-rules response.
+
+    Returns the D-2''' verdict instead of raising (T-preflight-transient-gh-failure-
+    quarantines-threads design v3.2): per required type, satisfied when ANY provider is
+    ``ok``; a confirmed problem only when EVERY provider was read and is ``terminal`` (a
+    provider whose ruleset fetch failed terminally — 404 etc. — is a ``terminal`` provider,
+    item 4', not a problem on its own); otherwise unconfirmed. The caller raises.
 
     The invariant (msg-1265 §5 I-1): for the loop's identity, each required
     rule type on the default branch must be enforced by AT LEAST ONE ruleset
@@ -541,11 +897,13 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
 
     # Per-call ruleset verdict cache (msg-1305 naysayer follow-up). Keyed
     # by ruleset_id — source_type / source are provenance metadata that ride
-    # along with the (ok, reason) tuple only for error-message context; two
-    # rules with the same ruleset_id necessarily have the same source
-    # metadata, so keying on the id is sufficient.
-    evaluated: dict[int, tuple[bool, str]] = {}
+    # along with the verdict only for error-message context; two rules with the
+    # same ruleset_id necessarily have the same source metadata, so keying on
+    # the id is sufficient. An unconfirmed verdict is cached too: within one
+    # run a retry of the same ruleset would only spend the shared deadline again.
+    evaluated: dict[int, tuple[str, str]] = {}
 
+    out = _RepoVerdict()
     problems: list[str] = []
     for rtype in sorted(_REQUIRED_RULE_TYPES):
         providers = by_type.get(rtype, [])
@@ -575,6 +933,7 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
             continue
 
         reasons: list[str] = []
+        unconfirmed: list[_Undetermined] = []
         satisfied = False
         for p in verifiable:
             rs_id = p["ruleset_id"]
@@ -583,28 +942,38 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
             cached = evaluated.get(rs_id)
             if cached is None:
                 cached = _ruleset_actively_enforces(
-                    owner, repo, rs_id, source_type, source, api_caller
+                    owner, repo, rs_id, source_type, source, fetcher
                 )
                 evaluated[rs_id] = cached
-            ok, reason = cached
-            if ok:
+            verdict, reason = cached
+            if verdict == "ok":
                 satisfied = True
                 break
-            reasons.append(reason)
-        if not satisfied:
-            provider_ids = sorted({p["ruleset_id"] for p in verifiable})
-            problems.append(
-                f"required rule type {rtype!r} has verifiable provider ruleset(s) "
-                f"{provider_ids} but none is unbypassable for the loop identity. "
-                f"Reasons: {reasons}"
-            )
+            if verdict == "undetermined":
+                endpoint, _, why = reason.partition("\n")
+                unconfirmed.append(_Undetermined(owner, repo, endpoint, why))
+            else:
+                reasons.append(reason)
+        if satisfied:
+            continue
+        if unconfirmed:
+            # D-3 / D-2''': no provider is ok and at least one could not be read — the type
+            # is unconfirmed, whatever the providers that WERE read said.
+            out.undetermined.extend(unconfirmed)
+            continue
+        provider_ids = sorted({p["ruleset_id"] for p in verifiable})
+        problems.append(
+            f"required rule type {rtype!r} has verifiable provider ruleset(s) "
+            f"{provider_ids} but none is unbypassable for the loop identity. "
+            f"Reasons: {reasons}"
+        )
 
     if problems:
         # One bulleted PreflightError per repo; each bullet names a distinct
         # problem so the operator can see all of them at once instead of
         # fixing one and rediscovering the next on the next daemon start.
         bullets = "\n  - ".join(problems)
-        raise PreflightError(
+        out.problems.append(
             f"preflight P1 failed: {owner}/{repo}@{default_branch} "
             f"(remote {remote_name!r}) is not adequately server-protected:\n  - "
             f"{bullets}\n"
@@ -612,41 +981,7 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
             f"force-push / ref-deletion reaches main' after the local prediction "
             f"machinery was retired on 2026-08-19."
         )
-
-
-def _fetch_default_branch(owner: str, repo: str, api_caller: ApiCaller) -> str:
-    try:
-        meta = api_caller(f"repos/{owner}/{repo}")
-    except Exception as exc:
-        raise PreflightError(
-            f"preflight P1 failed: could not fetch repos/{owner}/{repo}: {exc}. "
-            f"API unreachable / unauthorised → fail-closed (msg-1267 §4)."
-        ) from exc
-    default_branch = meta.get("default_branch") if isinstance(meta, dict) else None
-    if not isinstance(default_branch, str) or not default_branch:
-        raise PreflightError(
-            f"preflight P1 failed: repos/{owner}/{repo} did not return a default_branch "
-            f"(got {default_branch!r})."
-        )
-    return default_branch
-
-
-def _fetch_effective_rules(
-    owner: str, repo: str, default_branch: str, api_caller: ApiCaller
-) -> list[dict[str, Any]]:
-    try:
-        rules = api_caller(f"repos/{owner}/{repo}/rules/branches/{default_branch}")
-    except Exception as exc:
-        raise PreflightError(
-            f"preflight P1 failed: could not fetch rules for {owner}/{repo}@"
-            f"{default_branch}: {exc}. Fail-closed (msg-1267 §4)."
-        ) from exc
-    if not isinstance(rules, list):
-        raise PreflightError(
-            f"preflight P1 failed: rules endpoint for {owner}/{repo}@{default_branch} "
-            f"returned non-list {type(rules).__name__}."
-        )
-    return rules
+    return out
 
 
 def _ruleset_actively_enforces(
@@ -655,12 +990,15 @@ def _ruleset_actively_enforces(
     ruleset_id: int,
     source_type: str | None,
     source: str | None,
-    api_caller: ApiCaller,
-) -> tuple[bool, str]:
+    fetcher: _P1Fetcher,
+) -> tuple[str, str]:
     """Check whether one ruleset actively protects the branch for this identity.
 
-    Returns ``(True, "")`` when BOTH invariants hold, ``(False, reason)``
-    otherwise (fetch failure, non-active enforcement, or bypassable):
+    Returns ``("ok", "")`` when BOTH invariants hold, ``("terminal", reason)`` when the
+    ruleset is confirmed not to protect (non-active enforcement, bypassable, a body it cannot
+    read, or a terminal fetch failure — 404 etc., design v3.2 item 4': a terminal provider,
+    which the caller aggregates), and ``("undetermined", "<endpoint>\\n<reason>")`` when the
+    fetch was transiently unavailable or the shared deadline came first:
 
     * ``enforcement == "active"`` — GitHub rulesets have three enforcement
       levels (``active`` / ``evaluate`` / ``disabled``). Only ``active``
@@ -693,25 +1031,27 @@ def _ruleset_actively_enforces(
     "a repo-local ruleset is misconfigured" without re-tracing the code.
     """
     origin = f"source_type={source_type!r} source={source!r}"
-    try:
-        rs = api_caller(f"repos/{owner}/{repo}/rulesets/{ruleset_id}")
-    except Exception as exc:
-        return False, (
-            f"could not fetch ruleset {ruleset_id} ({origin}): {exc}. "
+    res = fetcher.fetch(f"repos/{owner}/{repo}/rulesets/{ruleset_id}")
+    if res.kind == "undetermined":
+        return "undetermined", f"{res.endpoint}\n{res.reason}"
+    if res.kind == "terminal":
+        return "terminal", (
+            f"could not fetch ruleset {ruleset_id} ({origin}): {res.detail}. "
             f"Fail-closed (msg-1267 §4). If GitHub has tightened the "
             f"repos/rulesets endpoint to reject Organization-source rulesets, "
             f"the mitigation is a token upgrade to include admin:org scope + "
             f"routing by source_type — see the module docstring 'Ruleset "
             f"endpoint choice' block."
         )
+    rs = res.value
     if not isinstance(rs, dict):
-        return False, (
+        return "terminal", (
             f"ruleset {ruleset_id} ({origin}) response was not an object "
             f"(got {type(rs).__name__}); cannot verify enforcement/bypass."
         )
     enforcement = rs.get("enforcement")
     if enforcement != "active":
-        return False, (
+        return "terminal", (
             f"ruleset {ruleset_id} ({origin}) has enforcement={enforcement!r}; "
             f"required 'active'. An 'evaluate'-mode ruleset only logs "
             f"violations — the server does NOT block pushes — so the loop "
@@ -720,14 +1060,14 @@ def _ruleset_actively_enforces(
         )
     bypass = rs.get("current_user_can_bypass")
     if bypass != "never":
-        return False, (
+        return "terminal", (
             f"ruleset {ruleset_id} ({origin}) has current_user_can_bypass="
             f"{bypass!r}; required 'never'. The loop's identity can bypass this "
             f"ruleset → the server-side protection it provides is unreliable "
             f"(msg-1265 §5 I-1: '執行者はサーバであってよい' → but only if the "
             f"server actually executes)."
         )
-    return True, ""
+    return "ok", ""
 
 
 # --------------------------------------------------------------------------- #
@@ -781,18 +1121,23 @@ def _default_hooks_path_reader(repo_dir: Path) -> str | None:
     return proc.stdout.strip()
 
 
-def _default_api_caller(endpoint: str) -> Any:
+def _default_api_caller(endpoint: str, timeout_s: float) -> Any:
     """Call ``gh api <endpoint>`` and return the parsed JSON body.
 
-    Any non-zero exit from ``gh`` becomes :class:`subprocess.CalledProcessError`,
-    which the P1 helpers catch and re-raise as :class:`PreflightError` — an
-    unreachable API is fail-closed by construction.
+    ``gh`` stays the client (design v1 D-1): P1 asks whether the identity that pushes can
+    bypass, and that identity is gh's own credential. A non-zero exit becomes
+    :class:`subprocess.CalledProcessError` carrying gh's stderr, which :func:`classify_gh_failure`
+    reads; ``timeout`` makes :func:`subprocess.run` kill the child and raise
+    :class:`subprocess.TimeoutExpired` (transient). Either way the role is not started.
     """
     proc = subprocess.run(
         ["gh", "api", endpoint],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
+        timeout=timeout_s,
     )
     return json.loads(proc.stdout)
 
@@ -826,10 +1171,23 @@ def _default_git_toplevel(path: Path) -> Path | None:
 
 
 __all__ = [
+    "PREFLIGHT_CALL_TIMEOUT_S",
+    "PREFLIGHT_DEADLINE_S",
+    "PREFLIGHT_DEFERRED_EXIT_CODE",
+    "PREFLIGHT_DEFERRED_PAYLOAD_PREFIX",
+    "PREFLIGHT_MAX_ATTEMPTS",
+    "PREFLIGHT_OK_PREFIX",
+    "PREFLIGHT_RETRY_DELAYS_S",
     "ApiCaller",
+    "Clock",
     "GitToplevel",
     "HooksPathReader",
+    "PreflightDeferredError",
     "PreflightError",
     "RemoteReader",
+    "Sleep",
+    "classify_gh_failure",
+    "emit_preflight_deferred_payload",
+    "emit_preflight_ok",
     "preflight_gate",
 ]

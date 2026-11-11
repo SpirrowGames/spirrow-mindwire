@@ -142,7 +142,7 @@ def _fake_api_caller(responses: dict[str, Any]) -> Any:
     key rather than a special sentinel).
     """
 
-    def _call(endpoint: str) -> Any:
+    def _call(endpoint: str, timeout_s: float = 30.0) -> Any:
         if endpoint not in responses:
             raise RuntimeError(f"no fake for {endpoint}")
         return responses[endpoint]
@@ -1221,7 +1221,7 @@ def _counting_api_caller(responses: dict[str, Any]) -> tuple[Any, dict[str, int]
     """
     counts: dict[str, int] = {}
 
-    def _call(endpoint: str) -> Any:
+    def _call(endpoint: str, timeout_s: float = 30.0) -> Any:
         counts[endpoint] = counts.get(endpoint, 0) + 1
         if endpoint not in responses:
             raise RuntimeError(f"no fake for {endpoint}")
