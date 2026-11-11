@@ -3296,8 +3296,10 @@ function Update-PreflightDeferredEpisode {
     return @{ action = 'quiet'; signature = $null; record = $rec }
 }
 
-# End every episode a passing preflight proves over: the repos the OK row names, and any episode
-# opened from this same repo_dir (covers an episode keyed 'dir:…' after an unreadable payload).
+# End every episode a passing preflight proves over: the repos the OK row names, and the fallback
+# 'dir:…' episode of this same repo_dir (opened after an unreadable payload). A named
+# '<owner>/<repo>' episode ends ONLY when the OK row names that repo: a clone whose remotes moved
+# from A to B proves nothing about A, so the same repo_dir alone never clears it (PR #573 gate).
 # Drops the notification key with the record, so the next outage alerts from 'open' again.
 # Returns the repo keys removed.
 function Clear-PreflightDeferredEpisodes {
@@ -3306,8 +3308,11 @@ function Clear-PreflightDeferredEpisodes {
     $removed = @()
     foreach ($k in @($Episodes.Keys)) {
         $rec = $Episodes[$k]
-        $sameDir = $dirKey -and $rec.repo_dir -and ((ConvertTo-DirtyCloneRepoKey -RepoDir "$($rec.repo_dir)") -eq $dirKey)
-        if ((@($Repos) -contains $k) -or $sameDir -or ($dirKey -and $k -eq "dir:$dirKey")) {
+        $isDirEpisode = "$k".StartsWith('dir:')
+        $sameDir = $isDirEpisode -and $dirKey -and $rec.repo_dir -and
+            ((ConvertTo-DirtyCloneRepoKey -RepoDir "$($rec.repo_dir)") -eq $dirKey)
+        $namedOk = (-not $isDirEpisode) -and (@($Repos) -contains $k)
+        if ($namedOk -or $sameDir -or ($dirKey -and $k -eq "dir:$dirKey")) {
             [void]$Episodes.Remove($k)
             $nk = Get-PreflightDeferredNoticeKey -RepoKey $k
             if ($null -ne $NotifyState -and $NotifyState.ContainsKey($nk)) { [void]$NotifyState.Remove($nk) }

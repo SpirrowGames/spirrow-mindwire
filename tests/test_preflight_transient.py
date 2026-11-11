@@ -365,9 +365,15 @@ def test_3a_every_provider_terminal_is_confirmed_even_with_a_later_endpoint_unre
 def test_3b_evaluate_provider_with_an_unread_alternative_defers(tmp_path: Path) -> None:
     rules = _rules({"deletion": [1, 2], "non_fast_forward": [3], "pull_request": [3]})
     script = _repo_steps(REPO, rules, cost=10.0)
-    script[_ep(REPO, "/rulesets/1")] = [(40.0, _evaluate())]
-    gh, _clock, _sleeps, result = _run(tmp_path, script, deadline_s=60.0)
+    # 25s fits the 30s per-call ceiling, so A's 'evaluate' is really observed; it lands exactly on
+    # the 45s deadline, so the alternative B is never read (PR #573 gate advisory).
+    script[_ep(REPO, "/rulesets/1")] = [(25.0, _evaluate())]
+    gh, clock, _sleeps, result = _run(tmp_path, script, deadline_s=45.0)
+    assert clock.now == 45.0
+    assert gh.calls[2] == (_ep(REPO, "/rulesets/1"), 25.0)
     assert isinstance(result, PreflightDeferredError)
+    assert _ep(REPO, "/rulesets/1") in result.checked  # A was observed, not timed out
+    assert result.reason == "deadline"
     assert _ep(REPO, "/rulesets/2") in result.unchecked
     assert _ep(REPO, "/rulesets/2") not in gh.endpoints()
 
@@ -407,10 +413,19 @@ def test_3e_provider_404_with_ok_alternative_passes(tmp_path: Path) -> None:
 def test_3f_provider_404_with_unread_alternative_defers(tmp_path: Path) -> None:
     rules = _rules({"deletion": [1, 2], "non_fast_forward": [3], "pull_request": [3]})
     script = _repo_steps(REPO, rules, cost=10.0)
-    script[_ep(REPO, "/rulesets/1")] = [(40.0, _cpe(STDERR_404))]
-    _gh, _clock, _sleeps, result = _run(tmp_path, script, deadline_s=60.0)
+    # 25s fits the 30s per-call ceiling, so A's 404 is really observed (and not retried); the 45s
+    # deadline then stops before the alternative B is read (PR #573 gate advisory).
+    script[_ep(REPO, "/rulesets/1")] = [(25.0, _cpe(STDERR_404))]
+    gh, clock, sleeps, result = _run(tmp_path, script, deadline_s=45.0)
+    assert clock.now == 45.0
+    assert gh.endpoints().count(_ep(REPO, "/rulesets/1")) == 1 and sleeps == []
+    # A's 404 was observed (the call returned within its 25s timeout) and left the unread set.
+    assert gh.calls[2] == (_ep(REPO, "/rulesets/1"), 25.0)
     assert isinstance(result, PreflightDeferredError)
+    assert _ep(REPO, "/rulesets/1") not in result.unchecked
+    assert result.reason == "deadline"
     assert _ep(REPO, "/rulesets/2") in result.unchecked
+    assert _ep(REPO, "/rulesets/2") not in gh.endpoints()
 
 
 def test_3g_provider_404_and_evaluate_alternative_is_confirmed(tmp_path: Path) -> None:

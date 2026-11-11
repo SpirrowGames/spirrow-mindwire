@@ -157,6 +157,15 @@ $null = Invoke-RunForEpisodes -Episodes $eps3 -Notify $notify3 -Code 11 -Output 
 $null = Invoke-RunForEpisodes -Episodes $eps3 -Notify $notify3 -Code 0 -Output @('MINDWIRE_PREFLIGHT_OK {"repos": ["SpirrowGames/other"]}') `
     -Now $t0.AddMinutes(5) -RepoDir (Join-Path ([System.IO.Path]::GetTempPath()) 'MindWire-OtherClone')
 Check 'another repo passing does not end this episode' $true $eps3.ContainsKey('SpirrowGames/r1')
+# PR #573 gate: the SAME repo_dir whose remotes moved from r1 to r2 passing for r2 only proves
+# nothing about r1 -- the named episode survives; only the fallback dir: episode follows repo_dir.
+$eps4 = @{}; $notify4 = @{}
+$null = Invoke-RunForEpisodes -Episodes $eps4 -Notify $notify4 -Code 11 -Output $out11 -Now $t0
+$null = Invoke-RunForEpisodes -Episodes $eps4 -Notify $notify4 -Code 11 -Output @('MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD {bad') -Now $t0
+$null = Invoke-RunForEpisodes -Episodes $eps4 -Notify $notify4 -Code 0 -Output @('MINDWIRE_PREFLIGHT_OK {"repos": ["SpirrowGames/r2"]}') -Now $t0.AddMinutes(5)
+Check 'same repo_dir passing for another repo keeps the named episode' $true $eps4.ContainsKey('SpirrowGames/r1')
+Check 'same repo_dir passing for another repo keeps its notice key' $true $notify4.ContainsKey('__preflight_deferred__/SpirrowGames/r1')
+Check 'same repo_dir passing ends the fallback dir: episode' $false $eps4.ContainsKey("dir:$baseKey")
 
 # Round trip through the state file shape (JSON -> PSCustomObject -> hashtable).
 $json = ($eps | ConvertTo-Json -Depth 5) | ConvertFrom-Json
