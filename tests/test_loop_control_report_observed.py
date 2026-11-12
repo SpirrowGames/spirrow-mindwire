@@ -5,6 +5,10 @@ T-role-exit-leaves-clone-off-default-branch PR-B.
 Pins the hold-only contract (Bohr msg-8840 Obj-1-2): the flag reports ``state=hold`` with the
 ``sweep:dirty-clone-parked`` actor exactly once; there is no value argument, so ``run`` or any other
 value is rejected by argparse (exit 2) before any MCP call; a transport failure exits non-zero.
+
+T-hold-observed-freshness-and-unlaunched-tick-ack F1 (Bohr msg-9146 revision 4): ``--why`` is a
+fixed choice. Omitted, the actor stays ``sweep:dirty-clone-parked`` (the PR-B caller is unchanged);
+``--why no-launch`` gives ``sweep:no-launch``; any other value is rejected by argparse.
 """
 
 from __future__ import annotations
@@ -77,6 +81,43 @@ def test_any_value_is_rejected_before_the_reporter(
     monkeypatch.setattr(mod, "StreamableHttpChatroomMcp", rec.factory)
     with pytest.raises(SystemExit) as exc:
         mod.main(argv)
+    assert exc.value.code == 2
+    assert rec.calls == []
+
+
+def test_why_no_launch_reports_with_its_own_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load()
+    rec = _Recorder()
+    monkeypatch.setattr(mod, "StreamableHttpChatroomMcp", rec.factory)
+    assert mod.main(["--report-observed-hold", "--project", "P", "--why", "no-launch"]) == 0
+    assert rec.calls == [
+        (
+            "loop_control_report_observed",
+            {"project": "P", "state": "hold", "actor": "sweep:no-launch"},
+        )
+    ]
+
+
+def test_why_dirty_clone_parked_explicit_matches_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _load()
+    rec = _Recorder()
+    monkeypatch.setattr(mod, "StreamableHttpChatroomMcp", rec.factory)
+    argv = ["--report-observed-hold", "--project", "P", "--why", "dirty-clone-parked"]
+    assert mod.main(argv) == 0
+    assert rec.calls[0][1]["actor"] == "sweep:dirty-clone-parked"
+
+
+@pytest.mark.parametrize("why", ["run", "anything", "", "sweep:no-launch", "No-Launch"])
+def test_why_outside_the_choices_is_rejected_before_the_reporter(
+    monkeypatch: pytest.MonkeyPatch, why: str
+) -> None:
+    mod = _load()
+    rec = _Recorder()
+    monkeypatch.setattr(mod, "StreamableHttpChatroomMcp", rec.factory)
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--report-observed-hold", "--project", "P", "--why", why])
     assert exc.value.code == 2
     assert rec.calls == []
 

@@ -822,15 +822,25 @@ Migration boundary Recovery in either case.
 
 ### In-flight ledger and the hold acknowledgement
 
-A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. A project whose clone is
-parked (`dirty-clone-parked`) launches nothing, so its HOLD used to stay `HOLD NOT ACKNOWLEDGED`
-for as long as the clone stayed parked. The sweep now writes that acknowledgement itself
-(`scripts/loop_control.py --report-observed-hold`, actor `sweep:dirty-clone-parked`), once per
-tick per project, but only when **both** hold:
+A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. An acknowledgement counts
+only if it is not older than the request: `observed_at >= desired_at`, compared as instants; when
+a timestamp is missing, `observed_state` alone decides. An `observed: hold` left over from an
+earlier hold is stale, so the project is probed and launched again like an unacknowledged one. A
+project that launches nothing this tick (its clone is parked, or it simply has nothing to launch)
+used to stay `HOLD NOT ACKNOWLEDGED` indefinitely. The sweep now writes that acknowledgement itself
+(`scripts/loop_control.py --report-observed-hold --why <why>`, actor `sweep:dirty-clone-parked`
+for a parked clone, `sweep:no-launch` otherwise), once per tick per project, but only when
+**both** hold:
 
 - no candidate of that project launched this tick, and
 - `state/conductor-inflight.json` exists, parses, and has neither a row for that project nor a
   `*` row.
+
+This covers a project with **no candidate at all** too: a project listed only under `clones` or
+sweep.json `projects` has its control read by the 1c / declared-projects scans, and a hold there
+that is not freshly acknowledged is logged as `HOLD NOT ACKNOWLEDGED [<project>]: no candidate …`
+and acknowledged with `sweep:no-launch`. A held project the sweep config does not mention anywhere
+is never read, so it is not acknowledged.
 
 The ledger is how the sweep knows no orphaned conductor may still be running the project:
 
