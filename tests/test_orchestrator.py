@@ -354,9 +354,10 @@ async def test_a_re_review_posts_into_the_existing_thread_without_reopening_it()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
     ref, _outcome = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
-    # reads: resolve the ledger id, then check the relay destination exists (D-2c, pre-payment).
+    # reads: resolve the ledger id, check the relay destination exists (D-2c, pre-payment), then
+    # read the design thread's head for the A-1 preflight (T3, also pre-payment).
     # writes: the critique into the ledger, the verdict into the design thread.
-    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread"] * 2 + [
+    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread"] * 3 + [
         "chatroom_post_message"
     ] * 2
 
@@ -1525,3 +1526,119 @@ async def test_a_real_verdict_relay_carries_no_ci_hold_marker() -> None:
 
     body = await _relay_for(CiState.SUCCESS, ci_gated=False)
     assert ci_hold_head(body) is None
+
+
+# ---------- A-1 preflight: the design thread's head must not hand to a persona ---------- #
+# T-gate-firing-ignores-loop-state-and-prior-verdicts T3 (msg-1623 §1/§2, go msg-1624).
+
+
+class _HeadMcp(_FakeMcp):
+    """``_FakeMcp`` whose design thread carries one message: ``head``.
+
+    ``read_fails`` makes the second read of the design thread -- the preflight's; the first is
+    the existence check (:meth:`_validate_design_thread`) -- raise a transport failure.
+    """
+
+    def __init__(self, head: str | None, *, read_fails: bool = False) -> None:
+        super().__init__()
+        self._head = head
+        self._read_fails = read_fails
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "chatroom_get_thread" and arguments["thread_id"] == _DESIGN_THREAD:
+            self.calls.append((name, arguments))
+            reads = sum(1 for n, a in self.calls if n == name and a["thread_id"] == _DESIGN_THREAD)
+            if self._read_fails and reads == 2:
+                raise MagickitMcpError("transport down")
+            messages = [] if self._head is None else [{"author": "Bohr", "content": self._head}]
+            return {"thread": {"title": "design"}, "messages": messages}
+        return await super().call_tool(name, arguments)
+
+
+_A1_LOGGER = "spirrow_mindwire.orchestrator"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "head",
+    [
+        "done\n\nNEXT: pr-review o/r#7",
+        "decide this\n\nTIER-C: cost\nNEXT: human",
+        "finished\n\nSTOP: done",
+        # Obj-1-1 regression: the wake names a persona, yet the parked head must pass, because
+        # the accepted terminal form is read before the NEXT token.
+        "waiting\n\nBLOCKED-ON: queue-empty spirrow-mindwire\nNEXT: Bohr",
+        "legacy\n\nNEXT: none",
+    ],
+    ids=["pr-review", "human", "stop-done", "blocked-on-wake", "legacy-none"],
+)
+async def test_a1_preflight_lets_a_ready_head_fire(head: str) -> None:
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(_HeadMcp(head), driver=driver)  # type: ignore[arg-type]
+    await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+
+
+@pytest.mark.anyio
+async def test_a1_preflight_refuses_a_persona_head_before_the_paid_review(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # R-A-1 (msg-456): conclair #21 was fired while its head still read NEXT: <implementer>.
+    mcp = _HeadMcp("4 items back to you\n\nNEXT: Heisenberg")
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with (
+        caplog.at_level("WARNING", logger=_A1_LOGGER),
+        pytest.raises(ValueError, match="role persona"),
+    ):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert driver.reviewed == []  # nothing judged, nothing billed
+    assert all(
+        name not in ("chatroom_open_thread", "chatroom_post_message") for name, _ in mcp.calls
+    )
+    refused = [r.getMessage() for r in caplog.records if "REFUSED" in r.getMessage()]
+    assert len(refused) == 1
+    assert _DESIGN_THREAD in refused[0] and "o/r#7" in refused[0] and "Heisenberg" in refused[0]
+
+
+@pytest.mark.anyio
+async def test_a1_preflight_fails_open_when_the_thread_cannot_be_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    driver = _FakeDriver()
+    mcp = _HeadMcp("NEXT: Heisenberg", read_fails=True)
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger=_A1_LOGGER):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+    assert any(
+        "A-1 preflight" in r.getMessage() and "could not read" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("head", "reason"),
+    [
+        (None, "no readable latest message"),
+        ("a reply with no control line at all", "no NEXT token"),
+        # A broken terminal form: its NEXT token (a persona here) must not be read.
+        ("bad\n\nSTOP: finished\nNEXT: Heisenberg", "refused terminal form"),
+        # The retired NEXT: operator token is not a persona, so it must not be refused as one
+        # (PR #569 gate objection: the documented operator fail-open had no test).
+        ("hand work\n\nNEXT: operator", "retired NEXT: operator"),
+    ],
+    ids=["no-message", "no-control-line", "refused-terminal-form", "retired-operator"],
+)
+async def test_a1_preflight_fails_open_when_the_head_cannot_be_interpreted(
+    head: str | None, reason: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(_HeadMcp(head), driver=driver)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger=_A1_LOGGER):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+    assert any(
+        "A-1 preflight" in r.getMessage() and reason in r.getMessage() for r in caplog.records
+    )
