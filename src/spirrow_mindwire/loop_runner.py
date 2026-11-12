@@ -152,7 +152,14 @@ from .naysayer.pr_review import NaysayerPrReviewDriver
 from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
-from .preflight import PreflightError, preflight_gate
+from .preflight import (
+    PREFLIGHT_DEFERRED_EXIT_CODE,
+    PreflightDeferredError,
+    PreflightError,
+    emit_preflight_deferred_payload,
+    emit_preflight_ok,
+    preflight_gate,
+)
 from .repo_projects import load_repo_project_map
 from .spec_pin import SpecPinWriter
 from .value_objects import Capability, Event, Role, ThreadRef
@@ -1434,8 +1441,10 @@ def _preflight(cfg: Stage3LoopConfig) -> None:
         # failure per issue rather than two overlapping ones.
         return
     try:
-        preflight_gate(Path(cfg.repo_dir))
-    except PreflightError:
+        repos = preflight_gate(Path(cfg.repo_dir))
+    except (PreflightError, PreflightDeferredError):
+        # PreflightDeferredError: transiently unconfirmed, not a failure of the thread —
+        # ``main`` maps it to exit PREFLIGHT_DEFERRED_EXIT_CODE (the role is still not started).
         raise
     except Exception as exc:
         # Any unexpected exception at this layer is itself a fail-closed event —
@@ -1443,6 +1452,9 @@ def _preflight(cfg: Stage3LoopConfig) -> None:
         raise PreflightError(
             f"preflight raised an unexpected exception (fail-closed by design): {exc}"
         ) from exc
+    # Design v2 D-5b: the sweep ends a repo's preflight-deferral episode on this row, whatever
+    # the run's exit code (a role failing AFTER a passing preflight still proves the API answered).
+    emit_preflight_ok(repos)
 
 
 def _ensure_utf8_runtime() -> None:
@@ -1650,6 +1662,21 @@ def main() -> None:
             deferred_exc.detail,
         )
         sys.exit(GIT_SYNC_DEFERRED_EXIT_CODE)
+    except PreflightDeferredError as preflight_exc:
+        # T-preflight-transient-gh-failure-quarantines-threads (design v3.2 D-4): P1 could not
+        # confirm protection because GitHub stayed transiently unreachable (or the shared
+        # deadline ran out) with no terminal problem established. The role was never started
+        # (fail-closed). Not this thread's fault, so it must not reach exit 1 (retry ->
+        # quarantine): a dedicated code the wrapper handles like exit 9 — launch reverted, no
+        # quarantine, any existing retry-pending kept as is. The payload row only keys and
+        # enriches the wrapper's notification.
+        emit_preflight_deferred_payload(preflight_exc)
+        logger.warning(
+            "preflight deferred exit=%d: %s",
+            PREFLIGHT_DEFERRED_EXIT_CODE,
+            preflight_exc,
+        )
+        sys.exit(PREFLIGHT_DEFERRED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not

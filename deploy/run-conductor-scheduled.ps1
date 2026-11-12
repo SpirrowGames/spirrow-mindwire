@@ -164,6 +164,15 @@ $DirtyCloneExitCode = 8
 # src/spirrow_mindwire/git_sync/errors.py (a pytest pins the two). No park, no quarantine, no repo
 # parking: the launch is reverted and the next tick re-derives the name.
 $GitSyncDeferredExitCode = 9
+# Exit code of mindwire-loop when preflight P1 could not confirm the repo's protection because
+# GitHub stayed transiently unreachable or P1's shared deadline ran out, with no terminal problem
+# established (T-preflight-transient-gh-failure-quarantines-threads, design v3.2 D-4). Mirrors
+# PREFLIGHT_DEFERRED_EXIT_CODE in src/spirrow_mindwire/preflight.py (a pytest pins the two). Not
+# 10: SECRETS_STOP_EXIT_CODE. No quarantine, retry-pending untouched, launch reverted.
+$PreflightDeferredExitCode = 11
+# A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
+# a permanent failure misclassified as transient must not stay silent.
+$PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
 # Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
 # guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
 $CloneCheckTimeoutSeconds = 60
@@ -188,6 +197,9 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 # Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
 # D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
 $dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
+# Preflight-deferral episodes per GitHub repo (T-preflight-transient-gh-failure-quarantines-threads
+# design v2 D-5b): { repo_key: { first_at, last_at, count, escalated, repo_dir } }. Sweep-only writer.
+$preflightDeferredStatePath = Join-Path $dataDir "state\preflight-deferred.json"
 # PR-B (T-role-exit-leaves-clone-off-default-branch): one row per launch whose exit is not yet
 # confirmed. Written before each launch, its own row dropped after a confirmed exit; the sweep's
 # hold acknowledgement for a parked clone requires the project to have no row and no `*` sentinel.
@@ -3207,6 +3219,159 @@ function Get-GitSyncDeferredNotice {
               signature = $sig; message = $body; repo_key = $repoKey }
 }
 
+# --- preflight deferral (T-preflight-transient-gh-failure-quarantines-threads, design v3.2) ---
+# The daemon exits $PreflightDeferredExitCode when preflight P1 could not confirm the target
+# repo's server-side protection because GitHub stayed transiently unreachable (TLS / EOF / 5xx /
+# 429 / timeout) or P1's shared deadline ran out, with no terminal problem established. The role
+# never started (fail-closed is unchanged). Not the thread's fault: nobody is quarantined, any
+# EXISTING retry-pending record is left exactly as it is (D-5a: the retry is not consumed), the
+# LAUNCH commit is reverted, and the rest of this tick's candidates on the same repo_dir are
+# skipped as 'preflight-deferred-skipped' (per tick only) so an outage is not hammered.
+#
+# Reader of the notification: the operator. One deferral EPISODE per GitHub repo
+# ("<owner>/<repo>" from the payload; "dir:<repo key>" when the payload is unreadable) is kept in
+# $preflightDeferredStatePath (D-5b): opened with one alert, escalated with exactly one more
+# alert once it has lasted $PreflightDeferredEscalateAfter (a misclassified permanent failure
+# must not stay silent forever), silent otherwise. It ends — record and notification key both
+# dropped — when any later run of that repo prints MINDWIRE_PREFLIGHT_OK, whatever its exit
+# code, so the next outage alerts again from 'open'.
+
+function Get-PreflightDeferredPayload {
+    param($Output)
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD\s+(.*)$') {
+            try { return ($Matches[1] | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+        }
+    }
+    return $null
+}
+
+# @{ seen = [bool]; repos = [string[]] } — seen is true only when the daemon printed the row
+# (the preflight passed in that run).
+function Get-PreflightOkRepos {
+    param($Output)
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_PREFLIGHT_OK\s+(.*)$') {
+            $repos = @()
+            try {
+                $p = $Matches[1] | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $p -and $p.PSObject.Properties.Name -contains 'repos') { $repos = @($p.repos | ForEach-Object { "$_" }) }
+            } catch { $repos = @() }
+            return @{ seen = $true; repos = $repos }
+        }
+    }
+    return @{ seen = $false; repos = @() }
+}
+
+function Get-PreflightDeferredRepoKey {
+    param($Payload, [string]$RepoDir)
+    if ($null -ne $Payload -and $Payload.PSObject.Properties.Name -contains 'owner' -and
+        $Payload.PSObject.Properties.Name -contains 'repo' -and $Payload.owner -and $Payload.repo) {
+        return "$($Payload.owner)/$($Payload.repo)"
+    }
+    return "dir:$(ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir)"
+}
+
+function Get-PreflightDeferredNoticeKey {
+    param([string]$RepoKey)
+    return "__preflight_deferred__/$RepoKey"
+}
+
+# Normalise the state file's rows into hashtables (Get-JsonState returns PSCustomObjects inside).
+function ConvertTo-PreflightDeferredEpisodes {
+    param($State)
+    $out = @{}
+    if ($null -eq $State) { return $out }
+    $pairs = if ($State -is [hashtable]) { $State.GetEnumerator() | ForEach-Object { @{ k = $_.Key; v = $_.Value } } }
+             else { $State.PSObject.Properties | ForEach-Object { @{ k = $_.Name; v = $_.Value } } }
+    foreach ($pair in $pairs) {
+        $v = $pair.v
+        if ($null -eq $v) { continue }
+        $get = { param($n) if ($v -is [hashtable]) { $v[$n] } else { $v.$n } }
+        $out[$pair.k] = @{
+            first_at  = ConvertTo-RetryIso (& $get 'first_at')
+            last_at   = ConvertTo-RetryIso (& $get 'last_at')
+            count     = [int](& $get 'count')
+            escalated = [bool](& $get 'escalated')
+            repo_dir  = "$(& $get 'repo_dir')"
+        }
+    }
+    return $out
+}
+
+# The episode transition for one exit-$PreflightDeferredExitCode run (D-5b). Pure apart from
+# mutating $Episodes; the clock is a parameter. Returns @{ action; signature; record } where
+# action is 'open' (alert), 'escalate' (alert once more) or 'quiet' (no alert).
+function Update-PreflightDeferredEpisode {
+    param([hashtable]$Episodes, [string]$RepoKey, [string]$RepoDir, [datetime]$NowUtc,
+          [TimeSpan]$EscalateAfter = $PreflightDeferredEscalateAfter)
+    $nowIso = $NowUtc.ToUniversalTime().ToString('o')
+    if (-not $Episodes.ContainsKey($RepoKey)) {
+        $rec = @{ first_at = $nowIso; last_at = $nowIso; count = 1; escalated = $false; repo_dir = $RepoDir }
+        $Episodes[$RepoKey] = $rec
+        return @{ action = 'open'; signature = "preflight-deferred:${RepoKey}:open"; record = $rec }
+    }
+    $rec = $Episodes[$RepoKey]
+    $rec.last_at = $nowIso
+    $rec.count = [int]$rec.count + 1
+    if ($RepoDir) { $rec.repo_dir = $RepoDir }
+    $first = $null
+    try { $first = ConvertTo-UtcInstant $rec.first_at } catch { $first = $null }
+    if ($null -eq $first) { $first = $NowUtc.ToUniversalTime(); $rec.first_at = $nowIso }
+    if (-not $rec.escalated -and ($NowUtc.ToUniversalTime() - $first) -ge $EscalateAfter) {
+        $rec.escalated = $true
+        return @{ action = 'escalate'; signature = "preflight-deferred:${RepoKey}:escalated"; record = $rec }
+    }
+    return @{ action = 'quiet'; signature = $null; record = $rec }
+}
+
+# End every episode a passing preflight proves over: the repos the OK row names, and the fallback
+# 'dir:…' episode of this same repo_dir (opened after an unreadable payload). A named
+# '<owner>/<repo>' episode ends ONLY when the OK row names that repo: a clone whose remotes moved
+# from A to B proves nothing about A, so the same repo_dir alone never clears it (PR #573 gate).
+# Drops the notification key with the record, so the next outage alerts from 'open' again.
+# Returns the repo keys removed.
+function Clear-PreflightDeferredEpisodes {
+    param([hashtable]$Episodes, [hashtable]$NotifyState, [string[]]$Repos, [string]$RepoDir)
+    $dirKey = if ($RepoDir) { ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } else { $null }
+    $removed = @()
+    foreach ($k in @($Episodes.Keys)) {
+        $rec = $Episodes[$k]
+        $isDirEpisode = "$k".StartsWith('dir:')
+        $sameDir = $isDirEpisode -and $dirKey -and $rec.repo_dir -and
+            ((ConvertTo-DirtyCloneRepoKey -RepoDir "$($rec.repo_dir)") -eq $dirKey)
+        $namedOk = (-not $isDirEpisode) -and (@($Repos) -contains $k)
+        if ($namedOk -or $sameDir -or ($dirKey -and $k -eq "dir:$dirKey")) {
+            [void]$Episodes.Remove($k)
+            $nk = Get-PreflightDeferredNoticeKey -RepoKey $k
+            if ($null -ne $NotifyState -and $NotifyState.ContainsKey($nk)) { [void]$NotifyState.Remove($nk) }
+            $removed += $k
+        }
+    }
+    return ,$removed
+}
+
+function Get-PreflightDeferredNotice {
+    param([string]$RepoKey, [hashtable]$Transition, [string]$CandidateKey, [string]$RepoDir, $Payload, [int]$ExitCode)
+    $detail = '(payload parse failed)'
+    if ($null -ne $Payload) {
+        $detail = "endpoint=$($Payload.endpoint) attempts=$($Payload.attempts) reason=$($Payload.reason)"
+        if ($Payload.last_stderr) { $detail += "`n$($Payload.last_stderr)" }
+    }
+    $rec = $Transition.record
+    if ($Transition.action -eq 'escalate') {
+        $body = ("MindWire: preflight の GitHub API 確認が一時的な失敗と判定され続けています — **$RepoKey**（first_at=$($rec.first_at)、$($rec.count) 回）。" +
+                 "分類の誤り（恒常的な失敗を一時的と判定している）を疑ってください。role は起動していません（fail-closed）。スレッドは quarantine していません。`n" +
+                 "直近: $CandidateKey exit=$ExitCode clone: $RepoDir`n$detail")
+    }
+    else {
+        $body = ("MindWire: preflight で GitHub API が一時的に使えず、起動を見送りました — **$RepoKey**（$CandidateKey exit=$ExitCode）。" +
+                 "role は起動していません（fail-closed）。quarantine せず、retry-pending もそのまま。同じ repo の候補はこの tick では起動せず、次の tick で再確認します。`n" +
+                 "clone: $RepoDir`n$detail")
+    }
+    return @{ key = (Get-PreflightDeferredNoticeKey -RepoKey $RepoKey); signature = $Transition.signature; message = $body }
+}
+
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
 # An exit $DirtyCloneExitCode used to be counted like any launch: the LAUNCH commit stayed in
 # head_skip.json, so three refused runs on one head reached T42's threshold and the conductor
@@ -3346,7 +3511,8 @@ function Invoke-LaunchEndRetreat {
     param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
           [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
           [scriptblock]$Recover = $null)
-    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode) { return 'skipped' }
+    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode -or
+        $ExitCode -eq $PreflightDeferredExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
     $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
@@ -6718,6 +6884,11 @@ try {
     # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
     # $DirtyCloneExitCode). Per tick only; the persistent record is $dirtyClonesParked below.
     $dirtyRepoDirs = @{}
+    # repo keys whose preflight was deferred (exit $PreflightDeferredExitCode) this tick: the rest of
+    # that repo_dir's candidates are skipped this tick only (design v1 D-5); nothing is persisted.
+    $preflightDeferredRepoDirs = @{}
+    $preflightDeferredEpisodes = ConvertTo-PreflightDeferredEpisodes -State (Get-JsonState -Path $preflightDeferredStatePath)
+    # PR-B: projects whose unacknowledged HOLD met a parked clone this tick, and the projects a launch
     # Projects whose HOLD is not (freshly) acknowledged, each mapped to the `--why` the sweep's own
     # acknowledgement will carry, and the projects a launch was attempted for this tick. Both are per
     # tick; Invoke-HoldAckViaPark reads them after the loop. F1 (T-hold-observed-freshness-and-
@@ -6858,6 +7029,13 @@ try {
             # The project is already pending (`no-launch`) if its hold is not freshly acknowledged;
             # this only names the reason more precisely.
             if ($holdAckViaPark.ContainsKey($cand.project)) { $holdAckViaPark[$cand.project] = 'dirty-clone-parked' }
+            continue
+        }
+        # Preflight deferred earlier this tick on this same repo_dir (GitHub transiently unreachable):
+        # no LAUNCH commit, no daemon. Its retry-pending record, if any, is not touched (D-5a).
+        if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $preflightDeferredRepoDirs) {
+            $dispositions[$cand.key] = 'preflight-deferred-skipped'
+            Write-Log "preflight-deferred-skipped $($cand.key): repo_dir=$($cand.repo_dir) had its preflight deferred earlier this tick, not launching"
             continue
         }
 
@@ -7079,11 +7257,24 @@ try {
         }
         else { Write-Log "inflight $($cand.key): exit=$code — row $inflightLaunchId kept (exit not confirmed)" }
         # A launch that did not defer got past git-sync: end this candidate's deferral episode so
-        # its next outage alerts again (see Get-GitSyncDeferredNotice).
-        if ($code -ne $GitSyncDeferredExitCode -and
+        # its next outage alerts again (see Get-GitSyncDeferredNotice). An exit-$PreflightDeferredExitCode
+        # run stopped before git-sync was reached, so it proves nothing about git-sync either way.
+        if ($code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
             (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
+        # A run whose preflight passed (MINDWIRE_PREFLIGHT_OK, any exit code) ends that repo's
+        # preflight-deferral episode, so its next outage alerts from 'open' again (D-5b).
+        $preflightOk = Get-PreflightOkRepos -Output $output
+        if ($preflightOk.seen -and $preflightDeferredEpisodes.Count -gt 0) {
+            $endedEpisodes = Clear-PreflightDeferredEpisodes -Episodes $preflightDeferredEpisodes -NotifyState $notifyState `
+                -Repos $preflightOk.repos -RepoDir $cand.repo_dir
+            if ($endedEpisodes.Count -gt 0) {
+                Save-JsonState -Path $preflightDeferredStatePath -State $preflightDeferredEpisodes
+                Save-JsonState -Path $notifyStatePath -State $notifyState
+                Write-Log "preflight-deferred $($cand.key): episode over for $($endedEpisodes -join ', ') (preflight passed, exit=$code) — record and notice key cleared"
+            }
         }
         $verdict = Get-ConductorVerdict -Output $output
         # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
@@ -7275,6 +7466,38 @@ try {
             continue
         }
 
+        # EXIT CODE $PreflightDeferredExitCode — preflight deferral (T-preflight-transient-gh-failure-
+        # quarantines-threads, design v3.2). P1 could not confirm protection because GitHub was
+        # transiently unreachable; the role never started. MUST stay above the generic non-zero
+        # branch below (which would retry and then quarantine). Like exit 9: the launch is reverted
+        # (no backoff, no launches_same_head), no quarantine, not counted toward K. D-5a: an existing
+        # retry-pending record is neither read nor written here — its one retry is not consumed, and
+        # the next launch's outcome is the outcome of that retry.
+        if ($code -eq $PreflightDeferredExitCode) {
+            $dispositions[$cand.key] = 'preflight-deferred'
+            $preflightDeferredRepoDirs[(ConvertTo-DirtyCloneRepoKey -RepoDir $cand.repo_dir)] = $true
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "preflight-deferred $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN preflight-deferred $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched--
+                Write-Log "retry-launch $($cand.key): deferred (exit $code) — retry-pending kept, retry not consumed"
+            }
+            $pfPayload = Get-PreflightDeferredPayload -Output $output
+            $pfRepoKey = Get-PreflightDeferredRepoKey -Payload $pfPayload -RepoDir $cand.repo_dir
+            $pfTransition = Update-PreflightDeferredEpisode -Episodes $preflightDeferredEpisodes -RepoKey $pfRepoKey `
+                -RepoDir $cand.repo_dir -NowUtc ((Get-Date).ToUniversalTime())
+            Save-JsonState -Path $preflightDeferredStatePath -State $preflightDeferredEpisodes
+            if ($pfTransition.action -ne 'quiet') {
+                $pfNotice = Get-PreflightDeferredNotice -RepoKey $pfRepoKey -Transition $pfTransition -CandidateKey $cand.key `
+                    -RepoDir $cand.repo_dir -Payload $pfPayload -ExitCode $code
+                Send-NotificationIfChanged -State $notifyState -Key $pfNotice.key -Signature $pfNotice.signature -Message $pfNotice.message
+                Save-JsonState -Path $notifyStatePath -State $notifyState
+            }
+            Write-Log "preflight-deferred $($cand.key): exit=$code repo=$pfRepoKey episode=$($pfTransition.action) count=$($pfTransition.record.count) — no quarantine, retry-pending untouched; other candidates on this repo_dir skipped this tick, other repos CONTINUE"
+            continue
+        }
+
         # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
         # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
         # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
@@ -7283,7 +7506,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode/$PreflightDeferredExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
