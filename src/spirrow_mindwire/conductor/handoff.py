@@ -33,8 +33,11 @@ pattern that describes *it*:
   can close in — ``**NEXT: X**``, ``**NEXT**: X`` and ``**NEXT:** X`` — because a rule that admits
   only some of them is another enumeration wearing a closed rule's clothes.
 - **the token** — :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name, so whatever
-  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and
-  therefore falls away for free.
+  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss``, a fullwidth
+  parenthetical — is outside the match and therefore falls away for free. Except: when an
+  alphanumeric (Unicode included) follows the name directly, or after a run of ``_`` / ``-``, the
+  line carries no name at all (``Bohr太郎`` / ``Bohr-太郎`` / ``Bohr_太郎`` resolve to ``None``,
+  not to ``Bohr``) — :data:`_NAME_END`.
 - **the PR ref** — *not matched here at all*. What counts as a PR reference is owned by
   :func:`~spirrow_mindwire.github.client.parse_pr_ref`, and this module asks it rather than
   re-spelling its grammar. The revision before this one did spell it out a second time, with a
@@ -137,7 +140,22 @@ _NEXT_LINE_RE = re.compile(
 # ``_NEXT: human_`` falls outside the match, while ``some_bot`` keeps its underscore. Everything
 # after the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of
 # the pattern either, so no list of trailing characters has to be maintained.
-_PARTICIPANT_NAME_RE = re.compile(_DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)")
+#
+# The name has an END, though, and the end is not "wherever the ASCII class stops matching". Left
+# to ``re.match``'s prefix semantics, ``NEXT: Bohr太郎`` matched ``Bohr`` and dispatched a real role
+# for a name nobody wrote (T-handoff-participant-name-has-no-terminator). ``_NAME_END`` refuses the
+# match when an alphanumeric (Unicode included) follows the name directly, OR after a run of ``_`` /
+# ``-``: ``Bohr-太郎`` / ``Bohr_太郎`` stop the ASCII name at ``Bohr`` with a separator next, which
+# ``_NOT_WORD_CONTINUATION`` alone would let through. The ``[_-]*`` is a lookahead and consumes
+# nothing, so the underscore stays decoration — ``_NEXT: human_`` still routes, because nothing
+# alphanumeric follows its trailing ``_`` — and the non-ASCII punctuation the gloss shapes rely on
+# (a fullwidth parenthesis, ``。``, ``—``) is still a separator. Backtracking cannot revive a
+# prefix either: every shorter cut of the name is followed by an alphanumeric or by ``[_-]+`` and
+# one, so the result is the whole name or no match.
+_NAME_END = r"(?![_-]*[^\W_])"
+_PARTICIPANT_NAME_RE = re.compile(
+    _DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)" + _NAME_END
+)
 
 # Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
 # single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
@@ -1718,17 +1736,30 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
     The field just skips the ``NEXT:``-line scaffolding: the value IS the decision, so there is
     no keyword to strip off the front. Everything else — sentinel matching, roster lookup,
     ref parsing — is byte-identical to :func:`_resolve_body` so the two sides cannot disagree
-    on what a "valid participant" is. The write side (`chatroom_post_message`) enforces the
-    same vocabulary with :class:`NextParticipantUnknownError`; this read-side resolution is the
-    fail-safe when a bad field slipped past that validation (§3-3's escape hatch is "drop the
-    field and re-send", which the row-5 escalation asks the human to do).
+    on what a "valid participant" is.
 
-    Missing the ``pr-review`` sentinel on this side would break the field-driven PR-gate
-    (ADR-19 N-1): a field of ``pr-review acme/widgets#7`` would fall out of every branch
-    below, resolve to ABSENT, be seen as a field/body mismatch by :func:`_reconcile`, and
-    escalate to the human — silently disabling the synchronous Tier B review whenever the
-    envelope field is the authoritative handoff. So the sentinel is matched here just as it
-    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair.
+    The write side does NOT share this vocabulary. Magickit's ``chatroom_post_message``
+    validator checks only that the value names an identity Prismind knows, and refuses any
+    other value with ``NextParticipantUnknownError``; by its owner's decision it knows no
+    consumer routing vocabulary — no ``pr-review <ref>`` sentinel, no reserved word (magickit
+    ``src/magickit/mcp/tools/chatroom.py``, the comment block citing msg-072 §2 "the vocabulary
+    is not shared between owners"; read at magickit commit ``ad8762b5``). So a field of
+    ``pr-review <owner/repo#n>`` — or bare ``pr-review`` — is looked up as an identity name and
+    refused before the write: a message posted through Magickit cannot carry the PR-gate
+    sentinel in the field. The gate is reached through the body's ``NEXT: pr-review <ref>``
+    line only (T-gate-identities-unregistered-next-participant-unusable, msg-1633). This
+    read-side resolution is the fail-safe for a field value that did not pass through that
+    write-time validation (§3-3's escape hatch is "drop the field and re-send", which the
+    row-5 escalation asks the human to do).
+
+    For a field that arrives outside Magickit's validation, matching the ``pr-review``
+    sentinel here keeps the read side consistent with the body resolver (the PR-gate handoff,
+    ADR-19 N-1): without it, a field of ``pr-review acme/widgets#7`` would fall out of
+    every branch below, resolve to ABSENT, be seen as a field/body mismatch by
+    :func:`_reconcile`, and escalate to the human. So the sentinel is matched here just as it
+    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair. This is
+    not a live write route through Magickit today (see above); the branch is kept because it
+    is harmless and pinned by tests.
     """
     sentinel = _PR_REVIEW_RE.match(field_value)
     if sentinel is not None and (operand := sentinel.group("rest").strip()):
