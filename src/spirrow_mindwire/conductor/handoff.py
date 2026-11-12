@@ -33,8 +33,11 @@ pattern that describes *it*:
   can close in — ``**NEXT: X**``, ``**NEXT**: X`` and ``**NEXT:** X`` — because a rule that admits
   only some of them is another enumeration wearing a closed rule's clothes.
 - **the token** — :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name, so whatever
-  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and
-  therefore falls away for free.
+  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss``, a fullwidth
+  parenthetical — is outside the match and therefore falls away for free. Except: when an
+  alphanumeric (Unicode included) follows the name directly, or after a run of ``_`` / ``-``, the
+  line carries no name at all (``Bohr太郎`` / ``Bohr-太郎`` / ``Bohr_太郎`` resolve to ``None``,
+  not to ``Bohr``) — :data:`_NAME_END`.
 - **the PR ref** — *not matched here at all*. What counts as a PR reference is owned by
   :func:`~spirrow_mindwire.github.client.parse_pr_ref`, and this module asks it rather than
   re-spelling its grammar. The revision before this one did spell it out a second time, with a
@@ -137,7 +140,22 @@ _NEXT_LINE_RE = re.compile(
 # ``_NEXT: human_`` falls outside the match, while ``some_bot`` keeps its underscore. Everything
 # after the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of
 # the pattern either, so no list of trailing characters has to be maintained.
-_PARTICIPANT_NAME_RE = re.compile(_DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)")
+#
+# The name has an END, though, and the end is not "wherever the ASCII class stops matching". Left
+# to ``re.match``'s prefix semantics, ``NEXT: Bohr太郎`` matched ``Bohr`` and dispatched a real role
+# for a name nobody wrote (T-handoff-participant-name-has-no-terminator). ``_NAME_END`` refuses the
+# match when an alphanumeric (Unicode included) follows the name directly, OR after a run of ``_`` /
+# ``-``: ``Bohr-太郎`` / ``Bohr_太郎`` stop the ASCII name at ``Bohr`` with a separator next, which
+# ``_NOT_WORD_CONTINUATION`` alone would let through. The ``[_-]*`` is a lookahead and consumes
+# nothing, so the underscore stays decoration — ``_NEXT: human_`` still routes, because nothing
+# alphanumeric follows its trailing ``_`` — and the non-ASCII punctuation the gloss shapes rely on
+# (a fullwidth parenthesis, ``。``, ``—``) is still a separator. Backtracking cannot revive a
+# prefix either: every shorter cut of the name is followed by an alphanumeric or by ``[_-]+`` and
+# one, so the result is the whole name or no match.
+_NAME_END = r"(?![_-]*[^\W_])"
+_PARTICIPANT_NAME_RE = re.compile(
+    _DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)" + _NAME_END
+)
 
 # Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
 # single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
