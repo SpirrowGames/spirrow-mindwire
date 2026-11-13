@@ -23,7 +23,7 @@ import asyncio
 import importlib.util
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -96,9 +96,21 @@ class _FakeMcp:
         raise AssertionError(f"unexpected tool {name}")
 
 
-def _item(
-    tid: str, *, tags: Any = "drop", at: str | None = "2026-11-08T00:00:00+00:00"
-) -> dict[str, Any]:
+#: The clock these fixtures are dated against. ``_CLI._enumerate_all`` reads the real clock (it
+#: has no ``now`` argument), so a thread that must count as recently active is dated relative to
+#: it. A fixed date goes stale: ``2026-11-08`` fell outside ``max_idle_days: 5`` on 2026-11-13
+#: and turned ``test_fallback_targets_follow_the_wrapper_rule_order`` red on every branch.
+_NOW = datetime.now(UTC).replace(microsecond=0)
+
+
+def _days_ago(days: float) -> str:
+    return (_NOW - timedelta(days=days)).isoformat()
+
+
+_FRESH = _days_ago(1)
+
+
+def _item(tid: str, *, tags: Any = "drop", at: str | None = _FRESH) -> dict[str, Any]:
     it: dict[str, Any] = {"thread_id": tid, "status": "active", "last_activity_at": at}
     if tags != "drop":
         it["tags"] = tags
@@ -265,11 +277,11 @@ def test_fallback_targets_follow_the_wrapper_rule_order() -> None:
 
 def test_fallback_order_and_cap() -> None:
     n = TAG_LOOKUP_CAP + 5
-    items = [_item(f"T-{i:02d}", at=f"2026-11-{(i % 9) + 1:02d}T00:00:00+00:00") for i in range(n)]
+    # 1 to 9 days idle, all inside the default 14-day window on whatever day the suite runs.
+    items = [_item(f"T-{i:02d}", at=_days_ago(9 - (i % 9))) for i in range(n)]
     reg = parse_registered(_sweep())
     listed = [ListedThread(i, classify_activity_at(i["last_activity_at"])) for i in items]
-    now = datetime.fromisoformat("2026-11-10T00:00:00+00:00")
-    pre = EnumerateReport(projects=(enumerate_project("p", listed, reg, now=now),))
+    pre = EnumerateReport(projects=(enumerate_project("p", listed, reg, now=_NOW),))
     targets = tag_lookup_targets(pre.projects, reg)
     idles = [
         next(t.idle_days or 0.0 for t in pre.projects[0].threads if t.thread_id == tid)
