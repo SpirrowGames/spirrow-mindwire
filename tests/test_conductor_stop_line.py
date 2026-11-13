@@ -18,6 +18,7 @@ What this file pins, item by item:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from legacy_none_time import PRE_CUTOFF
@@ -406,14 +407,38 @@ def test_protocol_block_keeps_finished_and_waiting_in_separate_paragraphs() -> N
 
 def test_protocol_block_says_next_none_is_retired() -> None:
     """Boundary 5-B (msg-9235 §3-2): the block names ``NEXT: none`` only to say it is retired
-    and refused, and no longer says it is accepted. The opening rule names both control
-    lines."""
+    and from when it is refused, and no longer says it is accepted. The opening rule names both
+    control lines.
+
+    PR-gate msg-9243: the refusal is dated with the shipped cutoff. Sessions read this block
+    before that instant too, while a ``NEXT: none`` still settles, so an undated "is refused"
+    would describe conductor behaviour that does not exist yet."""
     core = handoff_mod._HANDOFF_PROTOCOL_CORE
+    shipped = handoff_mod.NONE_MALFORMED_AFTER
+    assert shipped is not None
     assert "`NEXT: none` — retired: do NOT write it" in core
-    assert "It is refused as malformed" in core
+    assert (
+        f"A message posted at or after {shipped:%Y-%m-%d %H:%M} UTC that ends with it is "
+        "refused as malformed and the conductor stops. Write one of the two forms below instead."
+    ) in core
+    assert "posted at or after 2026-11-18 00:00 UTC" in core
+    assert "It is refused as malformed" not in core
     assert "still accepted" not in core
     assert "exactly one control line" in core
     assert "write NO `NEXT:` line after it" in core
+
+
+def test_next_none_refusal_sentence_follows_the_cutoff() -> None:
+    """The sentence is a function of the cutoff: a moved cutoff moves the date, a cutoff in
+    another timezone is rendered in UTC, and no cutoff claims no refusal in the present tense."""
+    moved = handoff_mod._none_refusal_prose(datetime(2026, 11, 20, 0, 0, tzinfo=UTC))
+    assert "posted at or after 2026-11-20 00:00 UTC" in moved
+    jst = handoff_mod._none_refusal_prose(
+        datetime(2026, 11, 18, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+    )
+    assert "posted at or after 2026-11-18 00:00 UTC" in jst
+    unset = handoff_mod._none_refusal_prose(None)
+    assert unset == "It will be refused as malformed once its retirement cutoff is set."
 
 
 def test_protocol_block_does_not_promise_a_close_or_a_park() -> None:

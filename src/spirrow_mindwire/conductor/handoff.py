@@ -2009,6 +2009,26 @@ _STOP_TRIGGER_PROSE = "; ".join(_STOP_TRIGGER_MEANINGS[arm] for arm in STOP_TRIG
 
 _STOP_WAKE_ROLES_PROSE = " or ".join(role.value for role in STOP_WAKE_ROLES)
 
+
+def _none_refusal_prose(cutoff: datetime | None) -> str:
+    """The sentence of the protocol block that says when a ``NEXT: none`` is refused.
+
+    Built from the cutoff the readers apply (:data:`NONE_MALFORMED_AFTER`), so the prompt cannot
+    claim a refusal the conductor does not perform yet (PR-gate msg-9243): before that instant a
+    ``NEXT: none`` still settles, and the block says from when it stops doing so. Moving the
+    constant moves this sentence with it.
+    """
+    if cutoff is None:
+        return "It will be refused as malformed once its retirement cutoff is set."
+    instant = cutoff.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"A message posted at or after {instant} that ends with it is refused as malformed "
+        "and the conductor stops."
+    )
+
+
+_NONE_REFUSAL_PROSE = _none_refusal_prose(NONE_MALFORMED_AFTER)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -2038,8 +2058,7 @@ mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — retired: do NOT write it (with or without a `STOP:` line above \
-it). It is refused as malformed and the conductor stops. Write one of the two forms below \
-instead.
+it). {_NONE_REFUSAL_PROSE} Write one of the two forms below instead.
 
 `NEXT: {OPERATOR_TOKEN}` is retired: do NOT write it (it is still read, but will be refused as \
 malformed once its retirement cutoff is set). When a \
