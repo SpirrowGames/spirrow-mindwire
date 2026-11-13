@@ -10,11 +10,13 @@ last_activity_at)``) and msg-8480 (the eviction rule).
 
 * **A** -- ``nominated``: the head names a participant (``NEXT: <persona>`` or the
   ``pr-review`` gate), and the ``next_participant`` field, when set, names the same one.
-* **B** -- ``done``: ``STOP: done``, either as the final control line or above ``NEXT: none``.
+* **B** -- ``done``: ``STOP: done``, either as the final control line or -- on a head posted
+  before :data:`handoff.NONE_MALFORMED_AFTER` -- above ``NEXT: none``.
 * **C** -- ``unexplained``: no stop reason a machine can read. Every head that is not
   positively A, B or D lands here, including a head the ledger has not read yet. Examples:
-  ``NEXT: none`` without a ``STOP:`` line, no ``NEXT:`` line at all, a refused terminal form,
-  a ``next_participant`` field that disagrees with the body's ``NEXT:`` (the M-1 shape).
+  ``NEXT: none`` without a ``STOP:`` line, a ``NEXT: none`` the boundary-5 cutoff refuses (with
+  or without ``STOP: done`` above it), no ``NEXT:`` line at all, a refused terminal form, a
+  ``next_participant`` field that disagrees with the body's ``NEXT:`` (the M-1 shape).
 * **D** -- ``waiting``: ``BLOCKED-ON:`` (any trigger -- never evaluated, msg-8363), ``NEXT:
   human`` (MERGE-WAIT included) and a well-formed ``NEXT: operator`` (with ``OPERATOR-TASK``).
 
@@ -29,13 +31,21 @@ threshold; a head not read yet keeps today's ``other_thread`` 72h. ``T_WAIT_AUTO
 ``T_WAIT_MANUAL`` are fixed in D-16d-2 from the distribution D-16d-1 measures (msg-8363 /
 msg-8365); until then both are the 72h every thread used before D-16d-1, so a D thread opens no
 later and no earlier than it did.
+
+**The posting time (boundary 5-C, T-done-disposition-auto-close msg-9237 §4).** The conductor and
+the settled-closer refuse a ``NEXT: none`` posted at or after the cutoff, ``STOP: done`` above it
+or not. :func:`classify_head` reads the same rule (``none_refused_after_cutoff``), so such a head
+is C here too instead of a B nobody acts on. ``posted_at`` has no default: a caller that does not
+know the time passes ``None``, which the rule reads as "after the cutoff" (the loud side). A
+cached B written before this rule carries no posting time; :func:`cached_head_needs_reread` says
+when it has to be read again.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -48,8 +58,11 @@ from spirrow_mindwire.conductor.handoff import (
     StopLine,
     StopStatus,
     TerminalView,
+    _after_cutoff,
     _stop_line_above_last_next,
+    none_refused_after_cutoff,
     parse_next_token,
+    posted_at_of,
     resolve_handoff,
     terminal_form_roster_free,
     terminal_form_view,
@@ -115,8 +128,17 @@ def _norm(token: str | None) -> str:
     return (token or "").strip().casefold()
 
 
-def classify_head(body: str, *, next_participant: str | None) -> HeadClass:
-    """The group of a thread head (module docstring). Total: never raises, always a group."""
+#: The detail of a B head read from the legacy ``STOP: done`` above ``NEXT: none``.
+STOP_DONE_LEGACY = "stop_done_legacy"
+
+
+def classify_head(
+    body: str, *, next_participant: str | None, posted_at: datetime | None
+) -> HeadClass:
+    """The group of a thread head (module docstring). Total: never raises, always a group.
+
+    ``posted_at`` is the head's posting time (``posted_at_of(message)``), ``None`` if unknown.
+    """
     field = next_participant.strip() if isinstance(next_participant, str) else ""
     token = parse_next_token(body)
 
@@ -147,11 +169,17 @@ def classify_head(body: str, *, next_participant: str | None) -> HeadClass:
         return HeadClass(HeadGroup.UNEXPLAINED, "no_next", token)
     name = _norm(effective)
     if name == NONE_TOKEN:
+        # Boundary 5: a NEXT: none posted at or after the cutoff (or at an unknown time) is
+        # refused by the conductor and the closer whatever stands above it, so it is C here.
+        if none_refused_after_cutoff(body, posted_at=posted_at):
+            return HeadClass(
+                HeadGroup.UNEXPLAINED, MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF.value, token
+            )
         # The legacy STOP line above NEXT: none. Read roster-free: DONE needs no roster; a
         # blocked-on line's wake does, so it comes back MALFORMED and lands in C (docstring).
         stop = _stop_line_above_last_next(body, {})
         if stop.status is StopStatus.DONE:
-            return HeadClass(HeadGroup.DONE, "stop_done_legacy", token)
+            return HeadClass(HeadGroup.DONE, STOP_DONE_LEGACY, token)
         return HeadClass(HeadGroup.UNEXPLAINED, f"none_stop_{stop.status.value}", token)
     if name == HUMAN_TOKEN:
         return HeadClass(HeadGroup.WAITING, "next_human", token, WaitKind.HUMAN)
@@ -182,6 +210,11 @@ class CachedHead:
     head: HeadClass
     next_participant: str | None
     read_at: str
+    #: The head's posting time as classified (ISO string, ``None`` = unknown). ``timed`` is
+    #: ``False`` only for an entry loaded from a store written before boundary 5-C, which has
+    #: no ``posted_at`` key at all: its group was decided without the posting time.
+    posted_at: str | None = None
+    timed: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -194,6 +227,7 @@ class CachedHead:
             "wait": self.head.wait.value if self.head.wait is not None else None,
             "trigger": self.head.trigger,
             "read_at": self.read_at,
+            "posted_at": self.posted_at,
         }
 
     @staticmethod
@@ -212,10 +246,30 @@ class CachedHead:
                 trigger=_opt_str(raw.get("trigger")),
             )
             return CachedHead(
-                key, head, _opt_str(raw.get("next_participant")), _str(raw["read_at"])
+                key,
+                head,
+                _opt_str(raw.get("next_participant")),
+                _str(raw["read_at"]),
+                posted_at=_opt_str(raw.get("posted_at")),
+                timed="posted_at" in raw,
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+
+def cached_head_needs_reread(cached: CachedHead) -> bool:
+    """Must a cached head be read again although its key did not change? (msg-9237 §4-4)
+
+    ``True`` for exactly one shape: a legacy-done B that was classified without its posting
+    time (an entry from before boundary 5-C) on a thread whose last activity the cutoff rule
+    reads as "at or after the cutoff" -- an unparseable ``last_activity_at`` included. The head
+    is the thread's newest message, so a last activity before the cutoff means the head was
+    posted before it and the B stands. The re-read stores a timed entry, so this is ``True`` at
+    most once per head; with no cutoff set it is never ``True``.
+    """
+    if cached.timed or cached.head.detail != STOP_DONE_LEGACY:
+        return False
+    return _after_cutoff(posted_at_of({"timestamp": cached.key.last_activity_at}), None)
 
 
 def _str(value: object) -> str:
@@ -263,6 +317,7 @@ def apply_head(obs: UnitObservation, head: HeadClass | None) -> UnitObservation:
 
 __all__ = [
     "N_UNREAD",
+    "STOP_DONE_LEGACY",
     "T_WAIT_AUTO",
     "T_WAIT_HUMAN",
     "T_WAIT_MANUAL",
@@ -273,6 +328,7 @@ __all__ = [
     "HeadKey",
     "WaitKind",
     "apply_head",
+    "cached_head_needs_reread",
     "classify_head",
     "threshold_for",
     "wait_kind_for_arm",
