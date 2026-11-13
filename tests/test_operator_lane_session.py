@@ -243,3 +243,32 @@ def test_logon_start_refuses_an_environment_with_runner_settings(
         for f in files:
             f.close()
     assert fake.calls == []  # nothing was started
+
+
+# --- 2026-11-13: the runner opens no console window ----------------------------------------------
+
+
+def test_runner_is_spawned_without_a_console_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DETACHED_PROCESS runner has no console, so each console child it starts got a new one,
+    and the default terminal opened it as a window that took focus from the operator."""
+    seen: list[int] = []
+
+    class _Proc:
+        pid = 4242
+
+    def fake_popen(argv: object, *, creationflags: int = 0, **_: object) -> _Proc:
+        seen.append(creationflags)
+        return _Proc()
+
+    monkeypatch.setattr(sess.sys, "platform", "win32")
+    monkeypatch.setattr(sess.subprocess, "Popen", fake_popen)
+    pid = DetachedRunnerSpawner(python="py").spawn_runner(
+        run_id="r", data_dir=tmp_path, log_path=tmp_path / "r.log"
+    )
+    assert pid == 4242
+    (flags,) = seen
+    assert flags & sess._CREATE_NO_WINDOW
+    assert flags & sess._CREATE_NEW_PROCESS_GROUP
+    assert not flags & 0x00000008  # DETACHED_PROCESS
