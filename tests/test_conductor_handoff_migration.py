@@ -47,6 +47,7 @@ from typing import Any
 
 from legacy_handoff_c4c66c2 import parse_next_token as legacy_parse_next_token
 from legacy_handoff_c4c66c2 import resolve_handoff as legacy_resolve_handoff
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.conductor.handoff import parse_next_token, resolve_handoff
 from spirrow_mindwire.github.client import parse_pr_ref
@@ -235,7 +236,9 @@ def _losses(lines: Iterator[str] | list[str]) -> list[tuple[str, tuple[str, str 
         legacy = _destination(legacy_resolve_handoff(line, _ROSTER))
         if legacy == _UNROUTED:
             continue  # only losses count; anything newly routed is an improvement
-        current = _destination(resolve_handoff(line, _ROSTER))
+        # Parser against parser, on the shapes: the legacy parser has no cutoff, so the
+        # current one reads each line as a head posted before boundary 5.
+        current = _destination(resolve_handoff(line, _ROSTER, posted_at=PRE_CUTOFF))
         if current != legacy and line not in _ACCEPTED_LOSSES:
             lost.append((line, legacy))
     return lost
@@ -384,6 +387,6 @@ class TestNothingRoutableBecameUnroutable:
             line
             for line in _ACCEPTED_LOSSES
             if _destination(legacy_resolve_handoff(line, _ROSTER))
-            != _destination(resolve_handoff(line, _ROSTER))
+            != _destination(resolve_handoff(line, _ROSTER, posted_at=PRE_CUTOFF))
         ]
         assert sorted(still_lost) == sorted(_ACCEPTED_LOSSES)

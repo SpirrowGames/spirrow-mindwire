@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 import spirrow_mindwire.conductor.handoff as handoff_mod
 from spirrow_mindwire.conductor.handoff import (
@@ -294,7 +295,8 @@ def test_resolve_is_case_insensitive_and_canonicalizes_identity() -> None:
 def test_resolve_human_and_none_sentinels() -> None:
     assert resolve_handoff("NEXT: human", _ROSTER).kind is HandoffKind.HUMAN
     assert resolve_handoff("NEXT: Human", _ROSTER).kind is HandoffKind.HUMAN
-    assert resolve_handoff("NEXT: none", _ROSTER).kind is HandoffKind.NONE
+    # ``none`` is the legacy settle: a sentinel only for a head posted before boundary 5.
+    assert resolve_handoff("NEXT: none", _ROSTER, posted_at=PRE_CUTOFF).kind is HandoffKind.NONE
 
 
 def test_resolve_absent_when_no_next_line() -> None:
@@ -824,7 +826,7 @@ class TestNextParticipantFieldConsumer:
             ("no handoff", HandoffKind.ABSENT),
             ("NEXT: Schrodinger", HandoffKind.ABSENT),
         ):
-            h = resolve_handoff(body, _ROSTER)
+            h = resolve_handoff(body, _ROSTER, posted_at=PRE_CUTOFF)
             assert h.kind is expected_kind, body
             assert h.mismatch_reason is None, body
             assert h.mismatch_body_token is None, body
@@ -1048,7 +1050,10 @@ class TestPersonaHandoffToleratesMarkdownNoise:
 
     def test_markdown_wrapped_sentinel_still_resolves(self) -> None:
         assert resolve_handoff("body\n\n> **NEXT: human**", _ROSTER).kind is HandoffKind.HUMAN
-        assert resolve_handoff("body\n\n- `NEXT: none`", _ROSTER).kind is HandoffKind.NONE
+        assert (
+            resolve_handoff("body\n\n- `NEXT: none`", _ROSTER, posted_at=PRE_CUTOFF).kind
+            is HandoffKind.NONE
+        )
 
     def test_markdown_wrapped_persona_resolves_case_insensitive(self) -> None:
         h = resolve_handoff("body\n\n**NEXT: einstein**", _ROSTER)
@@ -1220,7 +1225,7 @@ class TestPayloadCharactersAreInsideTheRefPattern:
         assert parse_next_token("NEXT: Heisenberg") == "Heisenberg"
         assert parse_next_token("NEXT: Heisenberg — do the thing") == "Heisenberg"
         assert parse_next_token("NEXT: Heisenberg（実装を進める）") == "Heisenberg"  # noqa: RUF001
-        assert resolve_handoff("NEXT: none", _ROSTER).kind is HandoffKind.NONE
+        assert resolve_handoff("NEXT: none", _ROSTER, posted_at=PRE_CUTOFF).kind is HandoffKind.NONE
 
 
 # --------------------------------------------------------------------------- #
@@ -1375,8 +1380,9 @@ class TestRealTrafficCorpus:
 
     def test_every_real_line_resolves_as_recorded(self) -> None:
         mismatches = []
+        # The corpus is harvested history: every line in it was posted before boundary 5.
         for kind, token, text in self._records():
-            handoff = resolve_handoff(text, _ROSTER)
+            handoff = resolve_handoff(text, _ROSTER, posted_at=PRE_CUTOFF)
             actual_token = handoff.token if handoff.kind is not HandoffKind.ABSENT else None
             if (handoff.kind.value, actual_token or "") != (kind, token):
                 mismatches.append((text, (kind, token), (handoff.kind.value, actual_token)))
