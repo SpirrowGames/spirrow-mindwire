@@ -262,8 +262,9 @@ def test_runner_is_spawned_without_a_console_window(
         seen.append(creationflags)
         return _Proc()
 
-    monkeypatch.setattr(sess.sys, "platform", "win32")
-    monkeypatch.setattr(sess.subprocess, "Popen", fake_popen)
+    # The module reads sys.platform and subprocess.Popen through the shared modules.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     pid = DetachedRunnerSpawner(python="py").spawn_runner(
         run_id="r", data_dir=tmp_path, log_path=tmp_path / "r.log"
     )
