@@ -20,6 +20,9 @@ param(
     [string[]]$Repo = @(),
     [string[]]$Project = @(),
     [string]$TaskName = 'mindwire-stall-ledger',
+    # pythonw.exe of a base (non-venv) interpreter, to run deploy\headless_launch.py. Default: the
+    # interpreter `uv python find --system` names, with pythonw.exe beside it.
+    [string]$Pythonw = '',
     # Print what would be registered and stop.
     [switch]$DryRun
 )
@@ -43,28 +46,45 @@ if (-not $pwshPath -or -not [System.IO.Path]::IsPathRooted($pwshPath)) {
     throw "could not resolve an absolute path for pwsh (got '$pwshPath'); not registering"
 }
 
-# The task runs pwsh inside a headless console host. Launched directly, pwsh opens a console window
-# on every tick of an Interactive-logon task, and that window takes keyboard focus from whatever the
-# operator is typing into (2026-11-13). `conhost.exe --headless` gives the tick a console without a
-# window. conhost lives in System32; resolve it from the OS root and refuse if it is not there, for
-# the same reason pwsh is resolved above.
-$conhostPath = Join-Path $env:SystemRoot 'System32\conhost.exe'
-if (-not (Test-Path -LiteralPath $conhostPath -PathType Leaf)) {
-    throw "conhost.exe not found at '$conhostPath'; not registering"
+# The task runs pwsh through deploy\headless_launch.py under pythonw. Launched directly, pwsh opens a
+# console window on every tick of an Interactive-logon task, and that window takes keyboard focus
+# from whatever the operator is typing into (2026-11-13). `conhost.exe --headless` hid the window but
+# made the ExecutionTimeLimit stop only conhost, leaving a hung pwsh running (PR #576 gate,
+# msg-9268; measured by tests/Test-StallLedgerTaskHeadless.ps1). The launcher has no window, starts
+# pwsh with CREATE_NO_WINDOW, and terminates pwsh itself at $launcherLimitSeconds, which is a little
+# below the task limit so the task limit stays an outer backstop. The full reasoning is in the
+# launcher's docstring.
+if (-not $Pythonw) {
+    $basePython = (& uv python find --system 2>$null | Select-Object -First 1)
+    if ($basePython) { $Pythonw = Join-Path (Split-Path -Parent "$basePython".Trim()) 'pythonw.exe' }
 }
+if (-not $Pythonw -or -not [System.IO.Path]::IsPathRooted($Pythonw) -or
+    -not (Test-Path -LiteralPath $Pythonw -PathType Leaf)) {
+    throw "could not resolve pythonw.exe (got '$Pythonw'); pass -Pythonw; not registering"
+}
+# A venv's pythonw.exe is a launcher that starts the real interpreter as a second process; use the
+# base interpreter so the task's process is the launcher itself.
+if ($Pythonw -match '\\(\.venv|Scripts)\\') {
+    throw "pythonw '$Pythonw' is inside a venv; pass a base interpreter's pythonw.exe; not registering"
+}
+$launcher = Join-Path $Checkout 'deploy\headless_launch.py'
+if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw "launcher not found: $launcher" }
+$LauncherMarginSeconds = 30
 
-$argList = @('--headless', "`"$pwshPath`"", '-NoProfile', '-File', "`"$wrapper`"")
+$interval = [System.Xml.XmlConvert]::ToTimeSpan($HeartbeatInterval)
+$limit = [System.Xml.XmlConvert]::ToTimeSpan($ExecutionTimeLimit)
+$launcherLimitSeconds = [int]$limit.TotalSeconds - $LauncherMarginSeconds
+
+$argList = @('-I', "`"$launcher`"", '--limit-seconds', "$launcherLimitSeconds",
+    "`"$pwshPath`"", '-NoProfile', '-File', "`"$wrapper`"")
 if ($Repo.Count -gt 0) { $argList += @('-Repo', ($Repo -join ',')) }
 if ($Project.Count -gt 0) { $argList += @('-Project', ($Project -join ',')) }
 $argString = $argList -join ' '
 
-$interval = [System.Xml.XmlConvert]::ToTimeSpan($HeartbeatInterval)
-$limit = [System.Xml.XmlConvert]::ToTimeSpan($ExecutionTimeLimit)
-
 if ($DryRun) {
     [pscustomobject]@{
         TaskName           = $TaskName
-        Execute            = $conhostPath
+        Execute            = $Pythonw
         Arguments          = $argString
         RepetitionInterval = $HeartbeatInterval
         ExecutionTimeLimit = $ExecutionTimeLimit
@@ -73,7 +93,7 @@ if ($DryRun) {
     return
 }
 
-$action = New-ScheduledTaskAction -Execute $conhostPath -Argument $argString -WorkingDirectory $Checkout
+$action = New-ScheduledTaskAction -Execute $Pythonw -Argument $argString -WorkingDirectory $Checkout
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $interval
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit $limit `
     -StartWhenAvailable
@@ -110,7 +130,7 @@ $actual = [ordered]@{
     ExecutionTimeLimit = ConvertTo-Duration ([string]$task.Settings.ExecutionTimeLimit)
 }
 $expected = [ordered]@{
-    Execute            = $conhostPath
+    Execute            = $Pythonw
     Arguments          = $argString
     RepetitionInterval = $interval
     ExecutionTimeLimit = $limit
@@ -121,4 +141,4 @@ if ($mismatch.Count -gt 0) {
     throw "task $TaskName does not match this script's definition: $($mismatch -join '; ')"
 }
 $note = if ($registerError) { ' (registration failed, but the existing definition already matches; nothing replaced)' } else { '' }
-Write-Output "verified $TaskName ($conhostPath --headless $pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)$note"
+Write-Output "verified $TaskName ($Pythonw headless_launch.py $pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)$note"

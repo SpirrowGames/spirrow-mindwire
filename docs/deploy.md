@@ -935,11 +935,26 @@ the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`
 does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
 without writing a line. Registration stops if no absolute path can be resolved.
 
-That pwsh is launched through `%SystemRoot%\System32\conhost.exe --headless`, which is the
-task's `Execute`; the pwsh path and the wrapper arguments follow in `Arguments`. Launched
-directly, pwsh opened a console window on every tick and took keyboard focus from whatever the
-operator was typing into. The headless console host gives the tick a console without a window.
-Registration stops if `conhost.exe` is not where the script expects it.
+That pwsh is started by `deploy\headless_launch.py` running under `pythonw.exe`. The task's
+`Execute` is `pythonw.exe`, and `Arguments` is
+`-I "<checkout>\deploy\headless_launch.py" --limit-seconds <N> "<pwsh>" -NoProfile -File ...`.
+
+- **No window.** Launched directly, pwsh opened a console window on every tick and took keyboard
+  focus from whatever the operator was typing into. pythonw has no window, and it starts pwsh with
+  `CREATE_NO_WINDOW`.
+- **The limit still stops a hung tick.** `conhost.exe --headless` also hides the window, but then
+  the task's `ExecutionTimeLimit` stops only conhost and leaves pwsh running. So the launcher stops
+  pwsh itself after `<N>` seconds: the task limit minus 30 s, which keeps the task limit as an
+  outer backstop. A tick stopped this way reports `LastTaskResult` 121. Otherwise the task
+  reports pwsh's own exit code.
+- **Which pythonw.** By default it is the one next to `uv python find --system`; pass `-Pythonw`
+  to choose another. A venv's `pythonw.exe` is refused, because it is only a stub that starts the
+  real interpreter as a second process. Registration stops if no pythonw or launcher is found.
+
+After changing the registered action, run `pwsh -NoProfile -File tests\Test-StallLedgerTaskHeadless.ps1`
+on the loop host. It registers throwaway tasks from the script's own `-DryRun` output, and checks
+that the wrapper runs with no visible window, that a hung wrapper is stopped at the limit, and that
+the exit code comes through.
 
 Re-running it replaces an existing `mindwire-stall-ledger` task with this script's definition
 (`-Force`). Success is decided by reading the task back, not by whether `Register-ScheduledTask`

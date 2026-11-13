@@ -260,19 +260,30 @@ def test_register_task_resolves_an_absolute_pwsh() -> None:
     assert re.search(r"Get-Command\s+pwsh\b[^\n]*-ErrorAction\s+SilentlyContinue", code)
     assert "could not resolve an absolute path for pwsh" in code
     assert re.search(r"IsPathRooted\(\$pwshPath\)", code)
-    # The absolute pwsh is launched through a headless conhost, so a tick opens no console
-    # window and does not take keyboard focus from the operator (2026-11-13).
-    assert re.search(r"\$argList\s*=\s*@\('--headless',\s*\"`\"\$pwshPath`\"\"", code)
-    assert re.search(r"-Execute\s+\$conhostPath", code)
+    # The absolute pwsh is launched by deploy/headless_launch.py under pythonw, so a tick opens no
+    # console window and still stops at a limit (2026-11-13, PR #576 gate msg-9268).
+    assert re.search(r"-Execute\s+\$Pythonw\b", code)
     # -DryRun shows the path that would be registered.
-    assert re.search(r"Execute\s*=\s*\$conhostPath", code)
+    assert re.search(r"Execute\s*=\s*\$Pythonw\b", code)
+    assert not re.search(r"-Execute\s+\$pwshPath", code)
+    assert "conhost" not in code
 
 
-def test_register_task_resolves_conhost_or_refuses() -> None:
+def test_register_task_runs_pwsh_through_the_launcher_with_a_limit() -> None:
     code = _code_lines(_ps1("Register-StallLedgerTask.ps1"))
     assert re.search(
-        r"\$conhostPath\s*=\s*Join-Path\s+\$env:SystemRoot\s+'System32\\conhost\.exe'", code
+        r"\$argList\s*=\s*@\('-I',\s*\"`\"\$launcher`\"\",\s*'--limit-seconds',\s*"
+        r"\"\$launcherLimitSeconds\",\s*\"`\"\$pwshPath`\"\"",
+        code,
     )
-    assert re.search(r"Test-Path\s+-LiteralPath\s+\$conhostPath", code)
-    assert "conhost.exe not found at" in code
-    assert not re.search(r"-Execute\s+\$pwshPath", code)
+    # The launcher acts before the task limit, which stays an outer backstop.
+    assert re.search(
+        r"\$launcherLimitSeconds\s*=\s*\[int\]\$limit\.TotalSeconds\s*-\s*\$LauncherMarginSeconds",
+        code,
+    )
+    assert re.search(r"\$LauncherMarginSeconds\s*=\s*[1-9]\d*\s*$", code, re.MULTILINE)
+    # pythonw is resolved or registration refuses; a venv launcher is refused.
+    assert "could not resolve pythonw.exe" in code
+    assert re.search(r"IsPathRooted\(\$Pythonw\)", code)
+    assert "is inside a venv" in code
+    assert "launcher not found" in code
