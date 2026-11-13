@@ -281,7 +281,16 @@ def test_register_task_runs_pwsh_through_the_launcher_with_a_limit() -> None:
         r"\$launcherLimitSeconds\s*=\s*\[int\]\$limit\.TotalSeconds\s*-\s*\$LauncherMarginSeconds",
         code,
     )
-    assert re.search(r"\$LauncherMarginSeconds\s*=\s*[1-9]\d*\s*$", code, re.MULTILINE)
+    margin = re.search(r"\$LauncherMarginSeconds\s*=\s*([1-9]\d*)\s*$", code, re.MULTILINE)
+    assert margin
+    # A limit that leaves no positive launcher time is refused before -DryRun or registration
+    # (PR #576 gate msg-9271): the refusal sits above the DryRun block.
+    refusal = _line_of(r"if\s*\(\$launcherLimitSeconds\s+-lt\s+1\)", code)
+    assert refusal < _line_of(r"^\s*if\s*\(\$DryRun\)", code)
+    assert "leaves no launcher time" in code
+    # The registered limit itself clears the margin.
+    limit = re.search(r"\$ExecutionTimeLimit\s*=\s*'PT(\d+)M'", code)
+    assert limit and int(limit.group(1)) * 60 - int(margin.group(1)) >= 1
     # pythonw is resolved or registration refuses; a venv launcher is refused.
     assert "could not resolve pythonw.exe" in code
     assert re.search(r"IsPathRooted\(\$Pythonw\)", code)

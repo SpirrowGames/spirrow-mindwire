@@ -74,6 +74,12 @@ $LauncherMarginSeconds = 30
 $interval = [System.Xml.XmlConvert]::ToTimeSpan($HeartbeatInterval)
 $limit = [System.Xml.XmlConvert]::ToTimeSpan($ExecutionTimeLimit)
 $launcherLimitSeconds = [int]$limit.TotalSeconds - $LauncherMarginSeconds
+# The launcher refuses a limit that is not positive (it would exit at once, every tick, without
+# running the wrapper). Refuse here instead, before -DryRun or registration can report success
+# (PR #576 gate msg-9271).
+if ($launcherLimitSeconds -lt 1) {
+    throw "ExecutionTimeLimit $ExecutionTimeLimit leaves no launcher time after the $LauncherMarginSeconds s margin; not registering"
+}
 
 $argList = @('-I', "`"$launcher`"", '--limit-seconds', "$launcherLimitSeconds",
     "`"$pwshPath`"", '-NoProfile', '-File', "`"$wrapper`"")
