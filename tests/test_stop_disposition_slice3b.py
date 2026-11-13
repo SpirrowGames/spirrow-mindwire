@@ -15,7 +15,15 @@ for ``human``. What this file pins:
 from __future__ import annotations
 
 import pytest
-from test_stop_disposition_slice3 import _ROSTER, _Gh, _post, _PostMcp, _TickMcp
+from legacy_none_time import PRE_CUTOFF
+from test_stop_disposition_slice3 import (
+    _ROSTER,
+    _Gh,
+    _post,
+    _PostMcp,
+    _TickMcp,
+    gateway_clock_before_cutoff,  # noqa: F401  (a fixture, used by name)
+)
 
 from spirrow_mindwire.conductor.disposition import disposition_payload
 from spirrow_mindwire.conductor.handoff import (
@@ -30,7 +38,8 @@ from spirrow_mindwire.value_objects import Role
 
 
 def _status(line: str, roster: dict[str, Role] = _ROSTER) -> StopStatus:
-    stop = resolve_handoff(f"x\n\n{line}\nNEXT: none", roster).stop_line
+    # The legacy wait form, read as a head posted before the boundary-5 cutoff.
+    stop = resolve_handoff(f"x\n\n{line}\nNEXT: none", roster, posted_at=PRE_CUTOFF).stop_line
     assert stop is not None
     return stop.status
 
@@ -44,7 +53,7 @@ def test_wake_roles_are_proposer_and_naysayer_only() -> None:
 def test_an_implementer_wake_is_malformed(wake: str) -> None:
     line = f"STOP: blocked-on thread:T-a wake:{wake}"
     assert _status(line) is StopStatus.MALFORMED
-    stop = resolve_handoff(f"x\n\n{line}\nNEXT: none", _ROSTER).stop_line
+    stop = resolve_handoff(f"x\n\n{line}\nNEXT: none", _ROSTER, posted_at=PRE_CUTOFF).stop_line
     assert stop is not None and disposition_payload(stop) is None
 
 
@@ -61,6 +70,7 @@ def test_acceptance_follows_the_wake_roles_for_every_role(role: Role) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 async def test_gateway_sends_no_disposition_for_an_implementer_wake() -> None:
     mcp = _PostMcp()
     body = "x\n\nSTOP: blocked-on thread:T-1 wake:Heisenberg\nNEXT: none"

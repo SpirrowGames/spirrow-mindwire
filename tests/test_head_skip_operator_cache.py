@@ -28,6 +28,7 @@ import pytest
 from spirrow_mindwire.conductor.handoff import OPERATOR_TOKEN
 from spirrow_mindwire.conductor.head_skip import (
     BODY_DEPENDENT_STOP_TOKENS,
+    CACHED_TOKEN_POSTED_AT,
     HEAD_CACHE_TTL,
     STOP_TOKENS,
     Record,
@@ -166,10 +167,11 @@ def test_body_dependent_tokens_are_the_conditional_stop_members() -> None:
     assert BODY_DEPENDENT_STOP_TOKENS <= STOP_TOKENS
     # Every stop token NOT listed here must be decidable from the synthesised one-line body,
     # otherwise the cache would mis-serve it the same way.
+    # The synthesised body is read with CACHED_TOKEN_POSTED_AT, as the cache replay reads it.
     for token in STOP_TOKENS - BODY_DEPENDENT_STOP_TOKENS:
-        assert stage1_skips(f"NEXT: {token}") is True, token
+        assert stage1_skips(f"NEXT: {token}", posted_at=CACHED_TOKEN_POSTED_AT) is True, token
     for token in BODY_DEPENDENT_STOP_TOKENS:
-        assert stage1_skips(f"NEXT: {token}") is False, token
+        assert stage1_skips(f"NEXT: {token}", posted_at=CACHED_TOKEN_POSTED_AT) is False, token
 
 
 def test_cache_predicate_refuses_a_cached_operator_token_but_serves_others() -> None:

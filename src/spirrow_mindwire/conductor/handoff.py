@@ -61,7 +61,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -435,8 +435,8 @@ _STOP_BLOCKED_ON_RE = re.compile(
 # stops with a notice that ends ``NEXT: human``, so nothing settles silently and no naysayer is
 # force-summoned for it (msg-8171 B-1). The tests keep pinning that OFF column through the explicit
 # ``accept_new_forms`` argument. ``NEXT: none`` (with or without the legacy ``STOP:`` line above
-# it) is still accepted and keeps its meaning; it becomes MALFORMED only at boundary 5
-# (``none_malformed_after``).
+# it) keeps its meaning only for a message posted before boundary 5
+# (:data:`NONE_MALFORMED_AFTER`); from that instant it is MALFORMED.
 ACCEPT_NEW_FORMS: bool = True
 
 # Boundary 5 (T-done-disposition-auto-close, Bohr msg-8455 §3 / msg-8556 §3): the instant from
@@ -445,9 +445,13 @@ ACCEPT_NEW_FORMS: bool = True
 # reason as :data:`ACCEPT_NEW_FORMS`: every reader of a head must switch in the same deploy, and a
 # constant changes in exactly one reviewed commit.
 #
-# 5-A ships the rule with the cutoff ``None``, which applies it nowhere: every reader answers as it
-# did before. 5-B is the one-line commit that puts a timezone-aware instant here, after the
-# proposer has measured that no machine writer still produces ``NEXT: none``.
+# 5-A shipped the rule with the cutoff ``None``, which applied it nowhere. 5-B (Bohr msg-9235 §3)
+# set the instant below -- 2026-11-18 00:00 UTC (09:00 JST) -- after the proposer measured no new
+# ``NEXT: none`` from any writer in the 24 h after the manual sessions' documents were switched.
+# The value must stay at least 24 h ahead of the moment the daemon starts running the commit that
+# carries it: ``head_skip.CACHED_TOKEN_POSTED_AT`` relies on no cached token predating the rule it
+# was read under. A merge that cannot meet that moves the value forward, in whole days, first.
+# ``None`` still means "no cutoff"; the tests of the pre-cutoff columns set it by name.
 #
 # Rule (:func:`_after_cutoff`): a message posted at or after the cutoff is refused. A message
 # whose posting time is unknown (``None``) or carries no timezone is treated as posted AFTER the
@@ -456,7 +460,7 @@ ACCEPT_NEW_FORMS: bool = True
 # message posted before the cutoff is read as LEGACY_NONE under the rules it was written under,
 # so history keeps its classification. The new forms (``STOP: done`` / ``BLOCKED-ON:``) and
 # ``NEXT: <participant>`` / ``human`` / ``operator`` / ``pr-review`` are never affected.
-NONE_MALFORMED_AFTER: datetime | None = None
+NONE_MALFORMED_AFTER: datetime | None = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
 
 # The ``NEXT: operator`` cutoff (T-retire-operator-identity-and-scope-next-fermi, Bohr msg-8935 §1 /
 # msg-8941 §1 / msg-8943 §2). The same shape as :data:`NONE_MALFORMED_AFTER` and the same rule
@@ -2033,9 +2037,9 @@ refactor extent, work order, splitting PRs or threads, approving an internal \
 mechanism's design, whether to fix a finding in the current PR or a follow-up \
 (fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
 gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
-  - `NEXT: {NONE_TOKEN}` — still accepted, but do NOT write it any more (with or without a \
-`STOP:` line above it). It will be refused as malformed once the legacy forms are retired. \
-Write one of the two forms below instead.
+  - `NEXT: {NONE_TOKEN}` — retired: do NOT write it (with or without a `STOP:` line above \
+it). It is refused as malformed and the conductor stops. Write one of the two forms below \
+instead.
 
 `NEXT: {OPERATOR_TOKEN}` is retired: do NOT write it (it is still read, but will be refused as \
 malformed once its retirement cutoff is set). When a \

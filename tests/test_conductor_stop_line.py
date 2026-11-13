@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 from test_conductor_core import _attested, _FakeChatroomMcp, _ScriptedDispatcher
 from test_decider_step2 import _conductor_with, _dr, _run, _StubDecider, _v
 
@@ -41,7 +42,9 @@ _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Ro
 
 
 def _stop(body: str, *, field: str | None = None) -> StopLine | None:
-    return resolve_handoff(body, _ROSTER, next_participant=field).stop_line
+    # The legacy ``STOP:`` line is read off a ``NEXT: none`` head, which settles only when
+    # posted before the boundary-5 cutoff: these cells pin how such a head is read.
+    return resolve_handoff(body, _ROSTER, next_participant=field, posted_at=PRE_CUTOFF).stop_line
 
 
 # --------------------------------------------------------------------------- item 1: parse
@@ -194,8 +197,8 @@ def test_a_bare_stop_done_is_a_terminal_settle() -> None:
 def test_stop_line_does_not_change_the_rest_of_the_handoff() -> None:
     """Routing is unchanged: only ``stop_line`` differs between with/without."""
     for line in ("STOP: done", "STOP: blocked-on human wake:human", "STOP: garbage"):
-        plain = resolve_handoff("x\n\nNEXT: none", _ROSTER)
-        withline = resolve_handoff(f"x\n\n{line}\nNEXT: none", _ROSTER)
+        plain = resolve_handoff("x\n\nNEXT: none", _ROSTER, posted_at=PRE_CUTOFF)
+        withline = resolve_handoff(f"x\n\n{line}\nNEXT: none", _ROSTER, posted_at=PRE_CUTOFF)
         assert withline.kind is plain.kind is HandoffKind.NONE
         assert (withline.token, withline.mismatch_reason, withline.tier_c_label) == (
             plain.token,
@@ -401,11 +404,14 @@ def test_protocol_block_keeps_finished_and_waiting_in_separate_paragraphs() -> N
         assert core[:index].endswith("\n\n"), f"{opener!r} does not start a paragraph"
 
 
-def test_protocol_block_says_next_none_is_legacy() -> None:
-    """``NEXT: none`` is still accepted until boundary 5, so the block names it, but only to say
-    it is no longer written (msg-8328 §2 3-D). The opening rule names both control lines."""
+def test_protocol_block_says_next_none_is_retired() -> None:
+    """Boundary 5-B (msg-9235 §3-2): the block names ``NEXT: none`` only to say it is retired
+    and refused, and no longer says it is accepted. The opening rule names both control
+    lines."""
     core = handoff_mod._HANDOFF_PROTOCOL_CORE
-    assert "do NOT write it any more" in core
+    assert "`NEXT: none` — retired: do NOT write it" in core
+    assert "It is refused as malformed" in core
+    assert "still accepted" not in core
     assert "exactly one control line" in core
     assert "write NO `NEXT:` line after it" in core
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF_STAMP
 
 from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR, render_relay_heading
 from spirrow_mindwire.github.client import PrRef, PrResolution, PrState
@@ -299,12 +300,27 @@ def _park(content_trigger: str = "thread:T-target") -> str:
     return f"waiting\n\nSTOP: blocked-on {content_trigger} wake:Bohr\nNEXT: none"
 
 
+def _park_msg() -> dict[str, Any]:
+    """The legacy wait as a chatroom message, posted before the boundary-5 cutoff."""
+    return {
+        "msg_id": "msg-1",
+        "author": "Bohr",
+        "content": _park(),
+        "timestamp": PRE_CUTOFF_STAMP,
+    }
+
+
 @pytest.mark.anyio
 async def test_park_wake_a_hit_costs_no_read(tmp_path: Path) -> None:
     chat = _Chat(
         {
             "T-done": [
-                {"msg_id": "msg-1", "author": "Bohr", "content": "x\n\nSTOP: done\nNEXT: none"}
+                {
+                    "msg_id": "msg-1",
+                    "author": "Bohr",
+                    "content": "x\n\nSTOP: done\nNEXT: none",
+                    "timestamp": PRE_CUTOFF_STAMP,  # a legacy settle, posted before boundary 5
+                }
             ],
             "T-live": [{"msg_id": "msg-2", "author": "Bohr", "content": "x\n\nNEXT: Einstein"}],
         }
@@ -337,7 +353,7 @@ async def test_park_wake_a_hit_costs_no_read(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_park_wake_wake_drops_the_thread_and_reports_its_head(tmp_path: Path) -> None:
-    chat = _Chat({"T-park": [{"msg_id": "msg-1", "author": "Bohr", "content": _park()}]})
+    chat = _Chat({"T-park": [_park_msg()]})
     path = tmp_path / "p.json"
     report = await park_runner.run_tick(
         mcp=chat,
@@ -356,7 +372,7 @@ async def test_park_wake_wake_drops_the_thread_and_reports_its_head(tmp_path: Pa
 
 @pytest.mark.anyio
 async def test_park_wake_blank_msg_id_is_reported_blank() -> None:
-    chat = _Chat({"T-park": [{"msg_id": "msg-1", "author": "Bohr", "content": _park()}]})
+    chat = _Chat({"T-park": [_park_msg()]})
     chat.blank_msg_id.add("T-park")
     report = await park_runner.run_tick(mcp=chat, gh=_Gh(_merged()), project="p", roster=_ROSTER)
     assert report.as_dict()["posted_heads"] == {"T-park": ""}
