@@ -40,18 +40,20 @@ def _dry_run(tmp_path: Path, limit: str) -> subprocess.CompletedProcess[str]:
     pythonw.parent.mkdir()
     pythonw.write_text("", encoding="utf-8")
     assert _PWSH is not None
+
+    def q(path: Path) -> str:
+        return "'" + str(path).replace("'", "''") + "'"
+
+    # -DryRun prints through Format-List, which wraps at the console width and adds colour codes
+    # on a terminal-less runner. Render it at a fixed wide width with plain text so the assertions
+    # see whole lines.
+    command = (
+        "$PSStyle.OutputRendering = 'PlainText'; "
+        f"& {q(script)} -Checkout {q(checkout)} -Pythonw {q(pythonw)} -DryRun "
+        "| Out-String -Width 8192"
+    )
     return subprocess.run(
-        [
-            _PWSH,
-            "-NoProfile",
-            "-File",
-            str(script),
-            "-Checkout",
-            str(checkout),
-            "-Pythonw",
-            str(pythonw),
-            "-DryRun",
-        ],
+        [_PWSH, "-NoProfile", "-NonInteractive", "-Command", command],
         capture_output=True,
         text=True,
         encoding="utf-8",
