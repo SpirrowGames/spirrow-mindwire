@@ -1,7 +1,8 @@
 """D-16d-1: thread-head classification (A-D), the head cache, its budget and its eviction.
 
 Spec: T-stalled-pr-has-no-detector msg-8359 §2-2, msg-8361 Obj-1-2, msg-8363, msg-8365,
-msg-8368 ①, msg-8370 Obj-4-3, msg-8477 and msg-8480.
+msg-8368 ①, msg-8370 Obj-4-3, msg-8477 and msg-8480. Boundary 5-C (the head's posting time and
+the ``NEXT: none`` cutoff): T-done-disposition-auto-close msg-9237 §4.
 """
 
 from __future__ import annotations
@@ -15,15 +16,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
+from spirrow_mindwire.conductor import handoff as handoff_mod
 from spirrow_mindwire.stall_ledger.adapters import ChatroomThreadAdapter
 from spirrow_mindwire.stall_ledger.driver import TickOutcome, TickPaths, run_tick
 from spirrow_mindwire.stall_ledger.heads import (
     N_UNREAD,
     WAIT_KIND_BY_ARM,
+    CachedHead,
     HeadClass,
     HeadGroup,
+    HeadKey,
     WaitKind,
+    cached_head_needs_reread,
     classify_head,
     threshold_for,
     wait_kind_for_arm,
@@ -38,7 +44,9 @@ FOOTER = "\n\n<!-- source: tools=3 · mcp=0 -->"
 
 
 def _cls(body: str, field_value: str | None = None) -> HeadClass:
-    return classify_head(body, next_participant=field_value)
+    # These cells pin how a head posted before boundary 5 is grouped, so they say when it was
+    # posted. The cells that vary the posting time call ``classify_head`` themselves.
+    return classify_head(body, next_participant=field_value, posted_at=PRE_CUTOFF)
 
 
 # ─── Classification (msg-8359 §2-2, msg-8361 Obj-1-2, msg-8363, msg-8365) ──────────────
@@ -94,6 +102,72 @@ def test_c_is_the_default_for_any_head_that_matches_nothing(body: str) -> None:
 def test_b_stop_done_terminal_and_legacy() -> None:
     assert _cls("finished\n\nSTOP: done" + FOOTER).group is HeadGroup.DONE
     assert _cls("finished\n\nSTOP: done\nNEXT: none").group is HeadGroup.DONE
+
+
+# ─── Boundary 5-C: the posting time (msg-9237 §4), at the SHIPPED cutoff ───────────────
+
+LEGACY_DONE = "finished\n\nSTOP: done\nNEXT: none"
+
+
+def _shipped_cutoff() -> datetime:
+    cutoff = handoff_mod.NONE_MALFORMED_AFTER
+    assert cutoff is not None, "boundary 5-B ships a cutoff; these cells read the shipped value"
+    return cutoff
+
+
+def test_legacy_done_before_the_shipped_cutoff_is_b() -> None:
+    for posted_at in (PRE_CUTOFF, _shipped_cutoff() - timedelta(microseconds=1)):
+        head = classify_head(LEGACY_DONE, next_participant=None, posted_at=posted_at)
+        assert (head.group, head.detail) == (HeadGroup.DONE, "stop_done_legacy")
+
+
+def test_legacy_done_at_after_or_without_a_posting_time_is_c() -> None:
+    cutoff = _shipped_cutoff()
+    naive = cutoff.replace(tzinfo=None) - timedelta(days=30)  # no timezone: unknown, not "old"
+    for posted_at in (cutoff, cutoff + timedelta(days=1), None, naive):
+        head = classify_head(LEGACY_DONE + FOOTER, next_participant=None, posted_at=posted_at)
+        assert (head.group, head.detail) == (
+            HeadGroup.UNEXPLAINED,
+            "legacy_none_after_cutoff",
+        ), posted_at
+        assert head.next_token == "none"
+
+
+def test_terminal_stop_done_is_b_whenever_it_was_posted() -> None:
+    cutoff = _shipped_cutoff()
+    for posted_at in (PRE_CUTOFF, cutoff, cutoff + timedelta(days=1), None):
+        head = classify_head("finished\n\nSTOP: done", next_participant=None, posted_at=posted_at)
+        assert (head.group, head.detail) == (HeadGroup.DONE, "stop_done"), posted_at
+
+
+def test_bare_next_none_is_c_on_both_sides_and_names_the_refusal_after() -> None:
+    cutoff = _shipped_cutoff()
+    before = classify_head("x\n\nNEXT: none", next_participant=None, posted_at=PRE_CUTOFF)
+    after = classify_head("x\n\nNEXT: none", next_participant=None, posted_at=cutoff)
+    assert (before.group, before.detail) == (HeadGroup.UNEXPLAINED, "none_stop_absent")
+    assert (after.group, after.detail) == (HeadGroup.UNEXPLAINED, "legacy_none_after_cutoff")
+
+
+def test_the_posting_time_changes_no_other_group() -> None:
+    cutoff = _shipped_cutoff()
+    for body in ("x\n\nNEXT: Bohr", "x\n\nNEXT: human", "x\n\nBLOCKED-ON: pr o/r#1\nNEXT: Bohr"):
+        groups = {
+            classify_head(body, next_participant=None, posted_at=at).group
+            for at in (PRE_CUTOFF, cutoff, None)
+        }
+        assert len(groups) == 1, body
+
+
+def test_the_ledger_reads_the_cutoff_the_conductor_reads() -> None:
+    # Same body, same time: the ledger says C exactly when resolve_handoff says "refused".
+    cutoff = _shipped_cutoff()
+    for posted_at in (PRE_CUTOFF, cutoff, cutoff + timedelta(hours=1), None):
+        refused = (
+            handoff_mod.resolve_handoff(LEGACY_DONE, {}, posted_at=posted_at).malformed
+            is handoff_mod.MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF
+        )
+        head = classify_head(LEGACY_DONE, next_participant=None, posted_at=posted_at)
+        assert (head.group is HeadGroup.UNEXPLAINED) is refused, posted_at
 
 
 @pytest.mark.parametrize(
@@ -168,7 +242,13 @@ class FakeChatroom:
         at: datetime = LAST,
         status: str = "active",
         field_value: str | None = None,
+        stamp: str | None = "",
     ) -> None:
+        # The head's ``timestamp`` is the thread's last activity, as in the chatroom. ``stamp``
+        # overrides it; ``None`` builds a head message with no timestamp at all.
+        head: dict[str, Any] = {"msg_id": msg, "content": body, "next_participant": field_value}
+        if stamp is not None:
+            head["timestamp"] = stamp or at.isoformat()
         self.threads[tid] = {
             "row": {
                 "thread_id": tid,
@@ -177,10 +257,7 @@ class FakeChatroom:
                 "last_msg_id": msg,
                 "last_activity_at": at.isoformat(),
             },
-            "messages": [
-                {"msg_id": "m-0", "content": "older"},
-                {"msg_id": msg, "content": body, "next_participant": field_value},
-            ],
+            "messages": [{"msg_id": "m-0", "content": "older"}, head],
         }
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -432,3 +509,124 @@ def test_broken_cache_value_is_reread_not_corrupt(tmp_path: Path) -> None:
     assert _heartbeat(out)["store"] == "valid"
     assert room.reads == {"T-a": 2}
     assert _heads(tmp_path)[_key("T-a")]["group"] == "A"
+
+
+# ─── Boundary 5-C at tick level: the head's time reaches the classifier, and the cache ─
+
+
+def _after_cutoff_at() -> datetime:
+    return _shipped_cutoff() + timedelta(hours=1)
+
+
+def test_legacy_done_head_posted_before_the_cutoff_never_opens(tmp_path: Path) -> None:
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE)  # posted at LAST, long before the cutoff
+    out = _tick(tmp_path, room, LAST + timedelta(hours=200))
+    assert out.counters.opened == 0
+    entry = _heads(tmp_path)[_key("T-b")]
+    assert (entry["group"], entry["detail"]) == ("B", "stop_done_legacy")
+    assert entry["posted_at"] == LAST.isoformat()
+
+
+def test_legacy_done_head_posted_after_the_cutoff_opens_like_any_c(tmp_path: Path) -> None:
+    at = _after_cutoff_at()
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE, at=at)
+    assert _tick(tmp_path, room, at + timedelta(hours=5)).counters.opened == 0
+    out = _tick(tmp_path, room, at + timedelta(hours=7))
+    assert out.counters.opened == 1
+    entry = _heads(tmp_path)[_key("T-b")]
+    assert (entry["group"], entry["detail"]) == ("C", "legacy_none_after_cutoff")
+    assert room.reads == {"T-b": 1}
+
+
+def test_legacy_done_head_without_a_timestamp_is_c(tmp_path: Path) -> None:
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE, stamp=None)
+    out = _tick(tmp_path, room, LAST + timedelta(hours=7))
+    assert out.counters.opened == 1
+    entry = _heads(tmp_path)[_key("T-b")]
+    assert (entry["group"], entry["detail"]) == ("C", "legacy_none_after_cutoff")
+    assert entry["posted_at"] is None
+
+
+def _write_pre_5c_legacy_done_entry(state: Path, tid: str) -> None:
+    """Rewrite the cached head as a store from before 5-C held it: B, and no ``posted_at``."""
+    path = state / "stall-ledger.json"
+    data = _store(state)
+    entry = data[THREAD_HEADS_KEY][_key(tid)]
+    del entry["posted_at"]
+    entry.update({"group": "B", "detail": "stop_done_legacy"})
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_pre_5c_cached_b_after_the_cutoff_is_read_again_once(tmp_path: Path) -> None:
+    # msg-9237 §4-4: 5-C deployed after the cutoff finds heads cached as B that are now C.
+    at = _after_cutoff_at()
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE, at=at)
+    _tick(tmp_path, room, at + timedelta(minutes=1))
+    _write_pre_5c_legacy_done_entry(tmp_path, "T-b")
+    out = _tick(tmp_path, room, at + timedelta(hours=7))
+    assert room.reads == {"T-b": 2}  # same key, read again
+    assert out.counters.opened == 1
+    assert _heads(tmp_path)[_key("T-b")]["detail"] == "legacy_none_after_cutoff"
+    _tick(tmp_path, room, at + timedelta(hours=8))
+    assert room.reads == {"T-b": 2}  # and not a third time
+
+
+def test_pre_5c_cached_b_before_the_cutoff_is_kept(tmp_path: Path) -> None:
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE)
+    _tick(tmp_path, room, LAST + timedelta(hours=1))
+    _write_pre_5c_legacy_done_entry(tmp_path, "T-b")
+    out = _tick(tmp_path, room, LAST + timedelta(hours=200))
+    assert room.reads == {"T-b": 1}
+    assert out.counters.opened == 0
+
+
+def test_pre_5c_cached_b_that_reads_as_b_again_is_not_read_every_tick(tmp_path: Path) -> None:
+    # The listing's activity time is after the cutoff but the head itself is older: the re-read
+    # says B again. The new entry carries its posting time, so the re-read does not repeat.
+    at = _after_cutoff_at()
+    room = FakeChatroom(FakeClock())
+    room.put("T-b", LEGACY_DONE, at=at, stamp=LAST.isoformat())
+    _tick(tmp_path, room, at + timedelta(minutes=1))
+    _write_pre_5c_legacy_done_entry(tmp_path, "T-b")
+    _tick(tmp_path, room, at + timedelta(hours=1))
+    _tick(tmp_path, room, at + timedelta(hours=2))
+    assert room.reads == {"T-b": 2}
+    assert _heads(tmp_path)[_key("T-b")]["group"] == "B"
+
+
+def _cached(detail: str, group: HeadGroup, last_activity_at: str, *, timed: bool) -> CachedHead:
+    raw = CachedHead(
+        HeadKey("m-1", last_activity_at), HeadClass(group, detail), None, "2026-11-01T00:00:00Z"
+    ).to_json()
+    if not timed:
+        del raw["posted_at"]
+    loaded = CachedHead.from_json(raw)
+    assert loaded is not None
+    return loaded
+
+
+def test_which_cached_heads_are_read_again() -> None:
+    cutoff = _shipped_cutoff()
+    after, before = (cutoff + timedelta(hours=1)).isoformat(), LAST.isoformat()
+    done, c = HeadGroup.DONE, HeadGroup.UNEXPLAINED
+    assert cached_head_needs_reread(_cached("stop_done_legacy", done, after, timed=False))
+    assert cached_head_needs_reread(
+        _cached("stop_done_legacy", done, cutoff.isoformat(), timed=False)
+    )
+    assert cached_head_needs_reread(_cached("stop_done_legacy", done, "not a time", timed=False))
+    assert not cached_head_needs_reread(_cached("stop_done_legacy", done, before, timed=False))
+    assert not cached_head_needs_reread(_cached("stop_done_legacy", done, after, timed=True))
+    assert not cached_head_needs_reread(_cached("stop_done", done, after, timed=False))
+    assert not cached_head_needs_reread(_cached("none_stop_absent", c, after, timed=False))
+
+
+def test_no_cutoff_means_no_cached_head_is_read_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    after = (_shipped_cutoff() + timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(handoff_mod, "NONE_MALFORMED_AFTER", None)
+    entry = _cached("stop_done_legacy", HeadGroup.DONE, after, timed=False)
+    assert not cached_head_needs_reread(entry)

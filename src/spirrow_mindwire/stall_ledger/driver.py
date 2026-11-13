@@ -53,6 +53,7 @@ from spirrow_mindwire.stall_ledger.heads import (
     HeadGroup,
     HeadKey,
     apply_head,
+    cached_head_needs_reread,
     classify_head,
 )
 from spirrow_mindwire.stall_ledger.heartbeat import HeartbeatRecord, derive_state
@@ -329,7 +330,7 @@ async def _head_for(
 ) -> HeadClass | None:
     wanted = HeadKey(row.last_msg_id, row.last_activity_at)
     cached = CachedHead.from_json(store.thread_heads.get(key))
-    if cached is not None and cached.key == wanted:
+    if cached is not None and cached.key == wanted and not cached_head_needs_reread(cached):
         return cached.head
     if not budget.try_start():
         counters.pending_heads += 1
@@ -345,8 +346,12 @@ async def _head_for(
         head = HeadClass(HeadGroup.UNEXPLAINED, f"head_{body.reason}")
         store.cache_head(key, CachedHead(wanted, head, None, utc_iso(now)).to_json())
         return head
-    head = classify_head(body.content, next_participant=body.next_participant)
-    store.cache_head(key, CachedHead(wanted, head, body.next_participant, utc_iso(now)).to_json())
+    head = classify_head(
+        body.content, next_participant=body.next_participant, posted_at=body.posted_at
+    )
+    posted = body.posted_at.isoformat() if body.posted_at is not None else None
+    entry = CachedHead(wanted, head, body.next_participant, utc_iso(now), posted_at=posted)
+    store.cache_head(key, entry.to_json())
     return head
 
 
