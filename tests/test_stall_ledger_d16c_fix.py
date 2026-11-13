@@ -260,6 +260,39 @@ def test_register_task_resolves_an_absolute_pwsh() -> None:
     assert re.search(r"Get-Command\s+pwsh\b[^\n]*-ErrorAction\s+SilentlyContinue", code)
     assert "could not resolve an absolute path for pwsh" in code
     assert re.search(r"IsPathRooted\(\$pwshPath\)", code)
-    assert re.search(r"-Execute\s+\$pwshPath", code)
+    # The absolute pwsh is launched by deploy/headless_launch.py under pythonw, so a tick opens no
+    # console window and still stops at a limit (2026-11-13, PR #576 gate msg-9268).
+    assert re.search(r"-Execute\s+\$Pythonw\b", code)
     # -DryRun shows the path that would be registered.
-    assert re.search(r"Execute\s*=\s*\$pwshPath", code)
+    assert re.search(r"Execute\s*=\s*\$Pythonw\b", code)
+    assert not re.search(r"-Execute\s+\$pwshPath", code)
+    assert "conhost" not in code
+
+
+def test_register_task_runs_pwsh_through_the_launcher_with_a_limit() -> None:
+    code = _code_lines(_ps1("Register-StallLedgerTask.ps1"))
+    assert re.search(
+        r"\$argList\s*=\s*@\('-I',\s*\"`\"\$launcher`\"\",\s*'--limit-seconds',\s*"
+        r"\"\$launcherLimitSeconds\",\s*\"`\"\$pwshPath`\"\"",
+        code,
+    )
+    # The launcher acts before the task limit, which stays an outer backstop.
+    assert re.search(
+        r"\$launcherLimitSeconds\s*=\s*\[int\]\$limit\.TotalSeconds\s*-\s*\$LauncherMarginSeconds",
+        code,
+    )
+    margin = re.search(r"\$LauncherMarginSeconds\s*=\s*([1-9]\d*)\s*$", code, re.MULTILINE)
+    assert margin
+    # A limit that leaves no positive launcher time is refused before -DryRun or registration
+    # (PR #576 gate msg-9271): the refusal sits above the DryRun block.
+    refusal = _line_of(r"if\s*\(\$launcherLimitSeconds\s+-lt\s+1\)", code)
+    assert refusal < _line_of(r"^\s*if\s*\(\$DryRun\)", code)
+    assert "leaves no launcher time" in code
+    # The registered limit itself clears the margin.
+    limit = re.search(r"\$ExecutionTimeLimit\s*=\s*'PT(\d+)M'", code)
+    assert limit and int(limit.group(1)) * 60 - int(margin.group(1)) >= 1
+    # pythonw is resolved or registration refuses; a venv launcher is refused.
+    assert "could not resolve pythonw.exe" in code
+    assert re.search(r"IsPathRooted\(\$Pythonw\)", code)
+    assert "is inside a venv" in code
+    assert "launcher not found" in code
