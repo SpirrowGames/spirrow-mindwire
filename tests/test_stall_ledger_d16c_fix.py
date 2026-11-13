@@ -260,6 +260,19 @@ def test_register_task_resolves_an_absolute_pwsh() -> None:
     assert re.search(r"Get-Command\s+pwsh\b[^\n]*-ErrorAction\s+SilentlyContinue", code)
     assert "could not resolve an absolute path for pwsh" in code
     assert re.search(r"IsPathRooted\(\$pwshPath\)", code)
-    assert re.search(r"-Execute\s+\$pwshPath", code)
+    # The absolute pwsh is launched through a headless conhost, so a tick opens no console
+    # window and does not take keyboard focus from the operator (2026-11-13).
+    assert re.search(r"\$argList\s*=\s*@\('--headless',\s*\"`\"\$pwshPath`\"\"", code)
+    assert re.search(r"-Execute\s+\$conhostPath", code)
     # -DryRun shows the path that would be registered.
-    assert re.search(r"Execute\s*=\s*\$pwshPath", code)
+    assert re.search(r"Execute\s*=\s*\$conhostPath", code)
+
+
+def test_register_task_resolves_conhost_or_refuses() -> None:
+    code = _code_lines(_ps1("Register-StallLedgerTask.ps1"))
+    assert re.search(
+        r"\$conhostPath\s*=\s*Join-Path\s+\$env:SystemRoot\s+'System32\\conhost\.exe'", code
+    )
+    assert re.search(r"Test-Path\s+-LiteralPath\s+\$conhostPath", code)
+    assert "conhost.exe not found at" in code
+    assert not re.search(r"-Execute\s+\$pwshPath", code)

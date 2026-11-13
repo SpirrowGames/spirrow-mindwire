@@ -43,7 +43,17 @@ if (-not $pwshPath -or -not [System.IO.Path]::IsPathRooted($pwshPath)) {
     throw "could not resolve an absolute path for pwsh (got '$pwshPath'); not registering"
 }
 
-$argList = @('-NoProfile', '-File', "`"$wrapper`"")
+# The task runs pwsh inside a headless console host. Launched directly, pwsh opens a console window
+# on every tick of an Interactive-logon task, and that window takes keyboard focus from whatever the
+# operator is typing into (2026-11-13). `conhost.exe --headless` gives the tick a console without a
+# window. conhost lives in System32; resolve it from the OS root and refuse if it is not there, for
+# the same reason pwsh is resolved above.
+$conhostPath = Join-Path $env:SystemRoot 'System32\conhost.exe'
+if (-not (Test-Path -LiteralPath $conhostPath -PathType Leaf)) {
+    throw "conhost.exe not found at '$conhostPath'; not registering"
+}
+
+$argList = @('--headless', "`"$pwshPath`"", '-NoProfile', '-File', "`"$wrapper`"")
 if ($Repo.Count -gt 0) { $argList += @('-Repo', ($Repo -join ',')) }
 if ($Project.Count -gt 0) { $argList += @('-Project', ($Project -join ',')) }
 $argString = $argList -join ' '
@@ -54,7 +64,7 @@ $limit = [System.Xml.XmlConvert]::ToTimeSpan($ExecutionTimeLimit)
 if ($DryRun) {
     [pscustomobject]@{
         TaskName           = $TaskName
-        Execute            = $pwshPath
+        Execute            = $conhostPath
         Arguments          = $argString
         RepetitionInterval = $HeartbeatInterval
         ExecutionTimeLimit = $ExecutionTimeLimit
@@ -63,7 +73,7 @@ if ($DryRun) {
     return
 }
 
-$action = New-ScheduledTaskAction -Execute $pwshPath -Argument $argString -WorkingDirectory $Checkout
+$action = New-ScheduledTaskAction -Execute $conhostPath -Argument $argString -WorkingDirectory $Checkout
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $interval
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit $limit `
     -StartWhenAvailable
@@ -100,7 +110,7 @@ $actual = [ordered]@{
     ExecutionTimeLimit = ConvertTo-Duration ([string]$task.Settings.ExecutionTimeLimit)
 }
 $expected = [ordered]@{
-    Execute            = $pwshPath
+    Execute            = $conhostPath
     Arguments          = $argString
     RepetitionInterval = $interval
     ExecutionTimeLimit = $limit
@@ -111,4 +121,4 @@ if ($mismatch.Count -gt 0) {
     throw "task $TaskName does not match this script's definition: $($mismatch -join '; ')"
 }
 $note = if ($registerError) { ' (registration failed, but the existing definition already matches; nothing replaced)' } else { '' }
-Write-Output "verified $TaskName ($pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)$note"
+Write-Output "verified $TaskName ($conhostPath --headless $pwshPath, every $HeartbeatInterval, killed after $ExecutionTimeLimit)$note"

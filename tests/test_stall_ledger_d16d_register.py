@@ -80,7 +80,7 @@ def test_read_back_checks_the_four_fields() -> None:
         assert re.search(rf"{field}\s*=\s*ConvertTo-Duration\s*\(\[string\]{source}\)", text), field
     assert re.search(r"\[System\.Xml\.XmlConvert\]::ToTimeSpan\(\$Iso\)", text)
     for field, intended in [
-        ("Execute", r"\$pwshPath"),
+        ("Execute", r"\$conhostPath"),
         ("Arguments", r"\$argString"),
         ("RepetitionInterval", r"\$interval"),
         ("ExecutionTimeLimit", r"\$limit"),

@@ -935,6 +935,12 @@ the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`
 does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
 without writing a line. Registration stops if no absolute path can be resolved.
 
+That pwsh is launched through `%SystemRoot%\System32\conhost.exe --headless`, which is the
+task's `Execute`; the pwsh path and the wrapper arguments follow in `Arguments`. Launched
+directly, pwsh opened a console window on every tick and took keyboard focus from whatever the
+operator was typing into. The headless console host gives the tick a console without a window.
+Registration stops if `conhost.exe` is not where the script expects it.
+
 Re-running it replaces an existing `mindwire-stall-ledger` task with this script's definition
 (`-Force`). Success is decided by reading the task back, not by whether `Register-ScheduledTask`
 threw: the script compares Execute / Arguments / RepetitionInterval / ExecutionTimeLimit of the
