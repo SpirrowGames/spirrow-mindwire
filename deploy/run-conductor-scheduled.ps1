@@ -281,6 +281,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # quarantine-stalls msg-5889 D-2 / msg-5893 D-2.1-D-2.4). Pure helpers; the probe call and the
 # append live in the run section below.
 . (Join-Path $PSScriptRoot 'lib/UnregisteredIntake.ps1')
+# Project liveness view (T-digest-lacks-project-liveness-view): the per-project join, 判定表 v3, the
+# L0/L1 digest lines, the numbered follow-ups and the snapshot. Pure helpers; the probes, the send
+# and the snapshot write live in the run section below.
+. (Join-Path $PSScriptRoot 'lib/ProjectLiveness.ps1')
 # The operator pass (T-operator-task-lane PR2): Test-OperatorLaneEnabled / ConvertTo-OperatorLaneCandidates /
 # Invoke-OperatorLanePass / Publish-OperatorLaneResult. Calls Write-Log and Send-NotificationIfChanged
 # at call time, so they may be defined further down.
@@ -817,6 +821,11 @@ $ParkedHumansProbeTimeoutSeconds = 120
 $JevMaterialProbeTimeoutSeconds = 120
 # scripts/unregistered_threads.py: one paged chatroom_list_threads walk per project (msg-5889 D-2).
 $UnregisteredThreadsProbeTimeoutSeconds = 120
+# scripts/open_prs_by_project.py (T-digest-lacks-project-liveness-view): one GitHub listing per
+# clones repo, on the digest tick only.
+$OpenPrsByProjectProbeTimeoutSeconds = 120
+# The liveness view's same-tick snapshot (R-10): the future L2's content. Never linked from Discord.
+$projectLivenessSnapshotPath = Join-Path $dataDir "state\project-liveness.json"
 $ControlProbeTimeoutSeconds = 120
 $PredictedResourceProbeTimeoutSeconds = 120
 $GateBootstrapProbeTimeoutSeconds = 120
@@ -1971,14 +1980,38 @@ function Test-DigestFullSuccess {
 # Extracted so the transformation is testable in isolation — tests/Test-SweepDigest.ps1's
 # "PR-gate regression" block pins the four combinations. If a future edit ever collapses this
 # back to inline code that discards the degraded class, the pinned tests fail loudly.
+#
+# -FollowUpResults (T-digest-lacks-project-liveness-view R-11 / R-12, msg-8384 / msg-8386): the send
+# results of the liveness follow-ups `続報 @HH:mmZ (k/n)`, in k order. They are sent only after a
+# FULL digest landed, so they can only ever downgrade a full success: when any of them did not land,
+# the result becomes `{status='degraded'; class='ok'}` — cadence advances (the digest itself DID land,
+# so resending it next tick would duplicate it) but Test-DigestFullSuccess is false, so
+# last_full_success_period is not advanced and the ⚠ line reports the gap. The error names the
+# missing parts. No resend: the next period redraws digest and follow-ups from fresh facts.
 function Resolve-DigestSendResult {
-    param($FullResult, $DegradedResult = $null)
-    if ($null -eq $DegradedResult) { return $FullResult }
-    if ($DegradedResult -is [hashtable] -and $DegradedResult['status'] -eq 'sent') {
-        $httpStatus = if ($DegradedResult.ContainsKey('http_status')) { $DegradedResult['http_status'] } else { 200 }
-        return @{ status = 'degraded'; class = 'ok'; http_status = $httpStatus; error = 'full-payload rejected, degraded landed' }
+    param($FullResult, $DegradedResult = $null, [object[]]$FollowUpResults = @())
+    $result = $FullResult
+    if ($null -ne $DegradedResult) {
+        if ($DegradedResult -is [hashtable] -and $DegradedResult['status'] -eq 'sent') {
+            $httpStatus = if ($DegradedResult.ContainsKey('http_status')) { $DegradedResult['http_status'] } else { 200 }
+            $result = @{ status = 'degraded'; class = 'ok'; http_status = $httpStatus; error = 'full-payload rejected, degraded landed' }
+        }
+        else { $result = $DegradedResult }
     }
-    return $DegradedResult
+    $fu = @($FollowUpResults)
+    if ($fu.Count -eq 0) { return $result }
+    if (-not ($result -is [hashtable] -and $result['status'] -eq 'sent' -and $result['class'] -eq 'ok')) { return $result }
+    $missing = @()
+    for ($i = 0; $i -lt $fu.Count; $i++) {
+        $r = $fu[$i]
+        if (-not ($r -is [hashtable] -and $r['status'] -eq 'sent')) {
+            $why = if ($r -is [hashtable] -and $r['error']) { "$($r['error'])" } else { 'not sent' }
+            $missing += "$($i + 1)/$($fu.Count) ($why)"
+        }
+    }
+    if ($missing.Count -eq 0) { return $result }
+    $httpStatus = if ($result.ContainsKey('http_status')) { $result['http_status'] } else { 200 }
+    return @{ status = 'degraded'; class = 'ok'; http_status = $httpStatus; error = "digest landed, liveness follow-up not delivered: $($missing -join ', ')" }
 }
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
@@ -2200,7 +2233,16 @@ function New-DailyDigest {
         # $SummonDigestMaxLines + 1 lines). Emitted as the FIRST lines of the digest, above the ⚠
         # line and the header: a person's thread holding the loop is what the reader must see in
         # the notification preview. Empty (the default) leaves the digest exactly as it was.
-        [string[]]$SummonLines = @()
+        [string[]]$SummonLines = @(),
+        # T-digest-lacks-project-liveness-view (msg-8380 §3): the project liveness lines, built by
+        # the caller from Get-ProjectLivenessDigestLines — L0 first, then the L1 section. Emitted
+        # right under the summary line. NOT put on this function's budget ladder: L1 is already held
+        # to its own 400-char budget by the lib, and every row the lib cut goes out as a numbered
+        # follow-up (R-12). Cutting rows again here would drop them without a follow-up, which is
+        # the INV-VIS failure the follow-ups exist to prevent. The block is a fixed cost, like the
+        # header, so later sections' running length counts it. Empty (the default) leaves the
+        # digest exactly as it was.
+        [string[]]$ProjectLivenessLines = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -2360,6 +2402,10 @@ function New-DailyDigest {
     $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
     $lines += $summary
     $lines += ""
+    if ($ProjectLivenessLines.Count -gt 0) {
+        $lines += $ProjectLivenessLines
+        $lines += ""
+    }
 
     # T-digest-exceeds-discord-limit-and-is-dropped D-1: emit-with-budget helper. When $Budget is 0
     # every list is emitted in full (legacy behaviour, preserves existing tests). When $Budget > 0,
@@ -5461,10 +5507,36 @@ function Invoke-UnregisteredThreadsProbe {
     if (-not (Test-Path -LiteralPath $probe)) { return @{ report = $null; error = "script not found: $probe" } }
     try {
         $r = Invoke-BoundedUvProbe -Label 'unregistered-threads' -TimeoutSeconds $UnregisteredThreadsProbeTimeoutSeconds `
-            -Arguments @($probe, '--sweep-config', $SweepConfigPath)
+            -Arguments @($probe, '--sweep-config', $SweepConfigPath, '--liveness')
     }
     catch { return @{ report = $null; error = "invocation failed: $($_.Exception.Message)" } }
     if ($r.timedOut) { return @{ report = $null; error = "timed out after ${UnregisteredThreadsProbeTimeoutSeconds}s (process tree killed)" } }
+    if (-not $r.ok) { return @{ report = $null; error = "invocation failed: $($r.error)" } }
+    if ($r.code -ne 0) {
+        $tail = ((Get-ProbeOutputLines -Result $r) | ForEach-Object { "$_" }) -join ' / '
+        return @{ report = $null; error = "exit=$($r.code): $tail" }
+    }
+    $json = Get-ProbeJsonLine -Result $r
+    if (-not $json) { return @{ report = $null; error = 'no JSON on stdout' } }
+    try { return @{ report = ($json | ConvertFrom-Json); error = $null } }
+    catch { return @{ report = $null; error = "JSON unparseable: $($_.Exception.Message)" } }
+}
+
+# --- open-PRs-by-project probe (T-digest-lacks-project-liveness-view) -----------------------------
+# Runs scripts/open_prs_by_project.py and returns @{ report; error }, exactly one set, like the
+# unregistered-threads probe above. Never throws. Called only on the tick that sends the digest, so
+# it costs one GitHub listing per clones repo per day. Its only reader is the liveness view: a
+# failure makes every project's PR count unmeasured (ConvertFrom-LivenessProbeReports), never 0.
+function Invoke-OpenPrsByProjectProbe {
+    param([string]$SweepConfigPath)
+    $probe = Join-Path $repoRoot "scripts\open_prs_by_project.py"
+    if (-not (Test-Path -LiteralPath $probe)) { return @{ report = $null; error = "script not found: $probe" } }
+    try {
+        $r = Invoke-BoundedUvProbe -Label 'open-prs-by-project' -TimeoutSeconds $OpenPrsByProjectProbeTimeoutSeconds `
+            -Arguments @($probe, '--sweep-config', $SweepConfigPath)
+    }
+    catch { return @{ report = $null; error = "invocation failed: $($_.Exception.Message)" } }
+    if ($r.timedOut) { return @{ report = $null; error = "timed out after ${OpenPrsByProjectProbeTimeoutSeconds}s (process tree killed)" } }
     if (-not $r.ok) { return @{ report = $null; error = "invocation failed: $($r.error)" } }
     if ($r.code -ne 0) {
         $tail = ((Get-ProbeOutputLines -Result $r) | ForEach-Object { "$_" }) -join ' / '
@@ -6393,6 +6465,10 @@ try {
     $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error `
         -IntakeConfig $sweepIntakeConfig -DaemonRoot $repoRoot
     $candidates = Join-UnregisteredCandidates -Candidates $candidates -Intake $unregisteredIntake
+    # The liveness view's "tracked" set: what the loop reaches this tick, i.e. sweep.json's entries
+    # plus this tick's auto-registered threads. Captured here because $candidates is re-ordered and
+    # filtered below.
+    $livenessSweepEntries = @($candidates | ForEach-Object { [PSCustomObject]@{ project = "$($_.project)"; thread_id = "$($_.thread_id)" } })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'intake' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
     if ($unregisteredIntake.probe_error) {
         Write-Log "unregistered intake: ? — $($unregisteredIntake.probe_error) (nothing auto-registered this tick)"
@@ -7908,6 +7984,47 @@ try {
         }
         else {
             $healthWarning = Get-DigestHealthWarning -Health $notifyHealth -CurrentPeriod $currentPeriod
+            # Project liveness (T-digest-lacks-project-liveness-view, msg-8380 / R-10..R-12). The facts
+            # are joined ONCE here, and the log line, the digest section, the follow-ups and the
+            # snapshot all read them — never a second derivation. Inputs: this tick's thread listing
+            # (the intake's own walk, run with --liveness), the open-PR probe (digest tick only),
+            # the loop's reach this tick, and head_skip.json's nominations.
+            #
+            # Reader and fallback surface (OBL-CHATROOM-PRODUCER-READER-SURFACE does not apply: this
+            # posts to the Discord webhook, not to a chatroom thread). The reader is the digest's human
+            # reader; the cut rows reach that reader in the numbered follow-ups below, and the
+            # snapshot file is never linked from Discord text (R-12).
+            #
+            # A failure anywhere in the view is ONE visible line in the digest, never a dropped digest
+            # and never a silently absent section.
+            $livenessLines = @()
+            $livenessChunks = @()
+            try {
+                $prProbe = Invoke-OpenPrsByProjectProbe -SweepConfigPath $sweepConfigPath
+                $livIn = ConvertFrom-LivenessProbeReports -ListingReport $unregProbe.report -ListingError $unregProbe.error `
+                    -PrReport $prProbe.report -PrError $prProbe.error -SweepEntries $livenessSweepEntries `
+                    -HeadSkip (Get-JsonState -Path $headSkipStatePath)
+                $livFacts = Get-ProjectLivenessFacts -Threads $livIn.Threads -SweepEntries $livIn.SweepEntries `
+                    -Nominations $livIn.Nominations -OpenPrs $livIn.OpenPrs -Projects $livIn.Projects -Now $nowUtc
+                $liv = Get-ProjectLivenessDigestLines -Facts $livFacts -GeneratedAt $nowUtc -Unmeasured @($livIn.Unmeasured.Keys)
+                $livenessLines = @($liv.L0) + @($liv.L1)
+                $livenessChunks = @(Get-ProjectLivenessContinuationChunks -Omitted $liv.Omitted -GeneratedAt $nowUtc -Budget $DigestBudget)
+                Write-Log "project liveness: $($liv.L0) (omitted $(@($liv.Omitted).Count), follow-ups $($livenessChunks.Count))"
+                foreach ($u in $livIn.Unmeasured.Keys) { Write-Log "project liveness: unmeasured $u — $($livIn.Unmeasured[$u])" }
+                if (@($livIn.NoPrSource).Count -gt 0) {
+                    Write-Log "project liveness: no clones entry, open PRs not observed for $(@($livIn.NoPrSource) -join ', ')"
+                }
+                try {
+                    $snap = ConvertTo-ProjectLivenessSnapshot -Rows $liv.Rows -GeneratedAt $nowUtc
+                    Save-JsonState -Path $projectLivenessSnapshotPath -State @{ generated_at = $snap.generated_at; rows = $snap.rows }
+                }
+                catch { Write-Log "project liveness: snapshot write failed ($($_.Exception.Message)) — digest unaffected" }
+            }
+            catch {
+                Write-Log "project liveness: view failed ($($_.Exception.Message)) — digest carries a ? line"
+                $livenessLines = @("プロジェクト liveness: ? — 描画失敗 ($($_.Exception.Message))")
+                $livenessChunks = @()
+            }
             $digest = New-DailyDigest -QuarantineState $quarantineState `
                 -EvaluatedState $evaluatedState `
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
@@ -7926,7 +8043,8 @@ try {
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake `
                 -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
-                    -Dispositions $dispositions -EvaluatedState $evaluatedState -Now $nowUtc)
+                    -Dispositions $dispositions -EvaluatedState $evaluatedState -Now $nowUtc) `
+                -ProjectLivenessLines $livenessLines
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
@@ -7982,6 +8100,21 @@ try {
                 # Combine into the single result that drives cadence/health decisions below.
                 # See Resolve-DigestSendResult's docstring for the four combinations.
                 $result = Resolve-DigestSendResult -FullResult $result -DegradedResult $degradedResult
+            }
+
+            # Liveness follow-ups (R-12): the rows the section cut, numbered `続報 @HH:mmZ (k/n)`, sent
+            # only after the FULL digest landed — the degraded fallback does not carry the section,
+            # so there is nothing for a follow-up to complete. A follow-up that does not land turns
+            # the result into degraded/ok (cadence advances, ⚠ stays lit); no resend this period.
+            if ($livenessChunks.Count -gt 0 -and (Test-DigestFullSuccess -Result $result)) {
+                $followUpResults = @()
+                foreach ($chunk in $livenessChunks) { $followUpResults += , (Send-Notification -Message $chunk) }
+                Write-Log "project liveness: sent $($livenessChunks.Count) follow-up(s): $((@($followUpResults) | ForEach-Object { $_['status'] }) -join ', ')"
+                $result = Resolve-DigestSendResult -FullResult $result -FollowUpResults $followUpResults
+                if ($result['status'] -eq 'degraded') {
+                    $notifyHealth['last_error'] = $result['error']
+                    $notifyHealth['last_error_class'] = $result['class']
+                }
             }
 
             # Cadence advance: any DELIVERED outcome (sent full, sent degraded, skipped-no-webhook)

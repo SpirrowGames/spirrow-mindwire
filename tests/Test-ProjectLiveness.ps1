@@ -158,5 +158,40 @@ $res = Get-ProjectLivenessDigestLines -Facts (Get-ProjectLivenessFacts -Threads 
 Check 'quiet line counts tier-0 projects' (@($res.L1) -contains 'quiet: 3 projects — EMPTY/DONE, no defects') ($res.L1 -join ' | ')
 Check 'no omitted line when nothing cut' (-not (@($res.L1) | Where-Object { $_ -like '+*omitted*' }))
 
+Write-Host "ages from ConvertFrom-Json-typed timestamps"
+# ConvertFrom-Json turns an ISO string into a [datetime]; the age must not shift by the host offset.
+$typed = ('{"t":"' + (Ago 2) + '"}' | ConvertFrom-Json).t
+$a = ConvertTo-LivenessAge -Value $typed -Now $now
+Check 'typed [datetime] age is 2 days' ([math]::Abs($a.days - 2.0) -lt 0.001) "$($a.days) ($($typed.GetType().Name) $($typed.Kind))"
+$a = ConvertTo-LivenessAge -Value ([DateTimeOffset]::new($now.AddDays(-3), [TimeSpan]::Zero)) -Now $now
+Check 'typed [DateTimeOffset] age is 3 days' ([math]::Abs($a.days - 3.0) -lt 0.001) "$($a.days)"
+
+Write-Host "probe reports -> facts inputs (ConvertFrom-LivenessProbeReports)"
+$listingJson = @'
+{"liveness":{
+  "pa":{"threads":[{"thread_id":"T-1","status":"active","last_activity_at":"2026-11-07T13:40:00+00:00"},
+                   {"thread_id":"T-2","status":"resolved","last_activity_at":null}],"error":null},
+  "pb":{"threads":null,"error":"chatroom_list_threads failed: boom"},
+  "pc":{"threads":[],"error":null}}}
+'@ | ConvertFrom-Json
+$prJson = '{"projects":{"pa":{"prs":[{"number":5,"created_at":"2026-11-01T00:00:00+00:00"}],"error":null},"pc":{"prs":null,"error":"http_error: 502"}}}' | ConvertFrom-Json
+$hsJson = '{"T-1":{"last_observed_nomination":"human"},"T-9":{"last_observed_nomination":"bohr"}}' | ConvertFrom-Json
+$in = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrReport $prJson -SweepEntries @((S pa T-1), (S pb T-3)) -HeadSkip $hsJson
+Check 'a listed project with threads and PRs is measured' (@($in.Projects) -contains 'pa') (@($in.Projects) -join ',')
+Check 'a failed listing is unmeasured, never an empty project' ($in.Unmeasured.Contains('pb') -and @($in.Projects) -notcontains 'pb')
+Check 'a failed PR listing is unmeasured, never PR 0' ($in.Unmeasured.Contains('pc') -and $in.Unmeasured['pc'] -match 'http_error')
+Check 'every status is carried (rot needs the closed set)' (@($in.Threads | Where-Object { $_.status -eq 'resolved' }).Count -eq 1)
+Check 'nominations are looked up by thread_id and keyed project/thread_id' ($in.Nominations['pa/T-1'] -eq 'human' -and $in.Nominations.Count -eq 1)
+Check 'sweep entries of an unmeasured project are dropped' (@($in.SweepEntries | Where-Object { $_.project -eq 'pb' }).Count -eq 0)
+Check 'open PRs carry their project' (@($in.OpenPrs).Count -eq 1 -and $in.OpenPrs[0].project -eq 'pa')
+$f = Get-ProjectLivenessFacts -Threads $in.Threads -SweepEntries $in.SweepEntries -Nominations $in.Nominations -OpenPrs $in.OpenPrs -Projects $in.Projects -Now $now
+$res = Get-ProjectLivenessDigestLines -Facts $f -GeneratedAt $now -Unmeasured @($in.Unmeasured.Keys)
+Check 'the joined facts render: pa is HUMAN' ((@($res.Rows) | Where-Object { $_.name -eq 'pa' }).state -eq 'HUMAN') (($res.Rows | ForEach-Object { "$($_.name)=$($_.state)" }) -join ',')
+Check 'L0 counts the unmeasured' ($res.L0 -match 'unmeasured 2') $res.L0
+$whole = ConvertFrom-LivenessProbeReports -ListingError 'timed out' -PrReport $prJson -SweepEntries @((S pa T-1))
+Check 'a whole listing failure leaves no row' (@($whole.Projects).Count -eq 0 -and $whole.Unmeasured['pa'] -match 'timed out')
+$noPr = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrReport ('{"projects":{}}' | ConvertFrom-Json)
+Check 'a project with no clones entry is named NoPrSource, not unmeasured' (@($noPr.NoPrSource) -contains 'pa' -and -not $noPr.Unmeasured.Contains('pa'))
+
 if ($script:failures -gt 0) { Write-Host "$script:failures failure(s)"; exit 1 }
 Write-Host "all passed"

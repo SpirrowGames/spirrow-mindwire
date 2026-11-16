@@ -87,7 +87,8 @@ def test_every_call_site_was_found() -> None:
     # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
     # T-role-exit-leaves-clone-off-default-branch PR-A adds Invoke-CloneRecover -Preserve: nineteen.
     # PR-B of the same thread adds the hold acknowledgement via park -> loop_control.py: twenty.
-    assert len(_SITES) == 20, _SITES
+    # T-digest-lacks-project-liveness-view adds Invoke-OpenPrsByProjectProbe: twenty-one.
+    assert len(_SITES) == 21, _SITES
 
 
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
@@ -109,7 +110,16 @@ def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
-    assert sites.get("'unregistered-threads'") == ("unregistered_threads.py", ["--sweep-config"])
+    # T-digest-lacks-project-liveness-view: the same walk also emits the liveness listing.
+    assert sites.get("'unregistered-threads'") == (
+        "unregistered_threads.py",
+        ["--sweep-config", "--liveness"],
+    )
+
+
+def test_open_prs_call_site_resolves_to_the_liveness_script() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites.get("'open-prs-by-project'") == ("open_prs_by_project.py", ["--sweep-config"])
 
 
 def test_clone_check_call_site_resolves_to_the_cli_subcommand() -> None:

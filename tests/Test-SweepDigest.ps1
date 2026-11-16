@@ -1248,6 +1248,38 @@ Check "the decision row survives 40 merge waits" 1 $mwBigCounts.parked
 CheckTrue "the merge-wait section keeps a floor of one row" ($mwBigCounts.mergewait -ge 1) $mwBigCounts.mergewait
 CheckTrue "truncated merge waits are reported" ($mwBig -match '\+\d+ 件（省略）') $mwBig
 
+# --- T-digest-lacks-project-liveness-view: follow-up results and the section placement ----------
+Write-Host 'liveness follow-ups fold into the send result (R-11 / R-12)'
+$fullOk = @{ status='sent'; class='ok'; http_status=200; error=$null }
+$fuOk = @{ status='sent'; class='ok'; http_status=200; error=$null }
+$fuFail = @{ status='failed'; class='transient'; http_status=503; error='service unavailable' }
+$rF0 = Resolve-DigestSendResult -FullResult $fullOk -FollowUpResults @($fuOk, $fuOk)
+Check "follow-ups all landed -> full success kept" $true (Test-DigestFullSuccess -Result $rF0)
+$rF1 = Resolve-DigestSendResult -FullResult $fullOk -FollowUpResults @($fuOk, $fuFail)
+Check "a follow-up missing -> degraded" 'degraded' $rF1['status']
+Check "a follow-up missing -> still delivered (no resend of the digest)" $true (Test-DigestDelivered -Result $rF1)
+Check "a follow-up missing -> not a full success (the warning stays lit)" $false (Test-DigestFullSuccess -Result $rF1)
+CheckTrue "a follow-up missing -> the error names part 2/2" ($rF1['error'] -match '2/2') $rF1['error']
+$rF2 = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $degradedSent -FollowUpResults @($fuFail)
+Check "follow-ups never upgrade or replace a non-full result" 'full-payload rejected, degraded landed' $rF2['error']
+$rF3 = Resolve-DigestSendResult -FullResult $fullOk
+Check "no follow-ups -> pass-through" $true (Test-DigestFullSuccess -Result $rF3)
+
+Write-Host 'liveness section sits right under the summary line'
+$livLines = @('3 projects — attention: 1 critical / 0 watch / 0 hygiene · states U1/D2 · open 2 · PR 0',
+              'プロジェクト liveness（日数は last_activity_at の投稿者申告値に依存）',
+              'p1 UNTRACKED · dark 2/2 (oldest 9d)')
+$withLiv = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -Budget $script:DigestBudget -ProjectLivenessLines $livLines
+$withoutLiv = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $now -LiveKeys @() -Budget $script:DigestBudget
+$wl = $withLiv -split "`n"
+$sumIdx = [array]::IndexOf($wl, ($wl | Where-Object { $_ -like 'human-parked *' } | Select-Object -First 1))
+Check "L0 is the first line after the summary block" $livLines[0] $wl[$sumIdx + 2]
+Check "L1 follows L0" $livLines[2] $wl[$sumIdx + 4]
+Check "a blank line closes the section" '' $wl[$sumIdx + 5]
+Check "without the parameter the digest is unchanged" $withoutLiv (($wl[0..($sumIdx + 1)] + $wl[($sumIdx + 6)..($wl.Count - 1)]) -join "`n")
+
 if ($script:failures -gt 0) {
     Write-Host ""
     Write-Host "sweep digest: $script:failures check(s) FAILED"

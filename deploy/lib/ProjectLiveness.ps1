@@ -85,6 +85,16 @@ function ConvertTo-LivenessThreadClass {
 # 'clock?' (msg-2191 D-7: last_activity_at is caller-supplied, not the ordering truth).
 function ConvertTo-LivenessAge {
     param($Value, [datetime]$Now)
+    $nowUtc = [DateTimeOffset]::new($Now.ToUniversalTime(), [TimeSpan]::Zero)
+    # ConvertFrom-Json turns an ISO string into a [datetime] before it gets here. Stringifying that
+    # would drop its Kind and the AssumeUniversal parse below would then shift it by the host's UTC
+    # offset, so a typed value is converted directly.
+    if ($Value -is [DateTimeOffset] -or $Value -is [datetime]) {
+        $at = if ($Value -is [DateTimeOffset]) { $Value.ToUniversalTime() } else { [DateTimeOffset]::new($Value.ToUniversalTime(), [TimeSpan]::Zero) }
+        $d = ($nowUtc - $at).TotalDays
+        if ($d -lt 0) { return @{ days = 0.0; flag = 'clock?' } }
+        return @{ days = [double]$d; flag = $null }
+    }
     $s = "$Value".Trim()
     if (-not $s) { return @{ days = [double]::PositiveInfinity; flag = 'age?' } }
     $dto = [DateTimeOffset]::MinValue
@@ -545,5 +555,93 @@ function ConvertTo-ProjectLivenessSnapshot {
     return [ordered]@{
         generated_at = $GeneratedAt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
         rows = $list
+    }
+}
+
+# The caller's join of this tick's probe outputs into Get-ProjectLivenessFacts' inputs. Pure: every
+# input is already in memory. Inputs:
+#   -ListingReport / -ListingError  scripts/unregistered_threads.py --liveness (its `liveness` key:
+#                                   project -> { threads: [{thread_id,status,last_activity_at}] | null;
+#                                   error })
+#   -PrReport / -PrError            scripts/open_prs_by_project.py (`projects`: project ->
+#                                   { prs: [{number,created_at}] | null; error })
+#   -SweepEntries                   objects { project; thread_id } — what the loop reaches this tick
+#   -HeadSkip                       state\head_skip.json as read: thread_id -> record. It is keyed by
+#                                   thread_id ALONE (no project), so the nomination is looked up by
+#                                   the listed thread's id and stored under "project/thread_id".
+# Fail direction: a project whose threads OR whose PRs were not measured is Unmeasured — it gets no
+# row (a partial row could read DONE / EMPTY) and is counted on L0. A whole-probe failure makes every
+# known project unmeasured. A project with no `clones` entry has no PR source at all; that is not a
+# failure of this tick, so its PR list is empty and it is named in NoPrSource for the log line.
+function ConvertFrom-LivenessProbeReports {
+    param(
+        $ListingReport = $null,
+        [string]$ListingError = $null,
+        $PrReport = $null,
+        [string]$PrError = $null,
+        [object[]]$SweepEntries = @(),
+        $HeadSkip = $null
+    )
+    $toMap = {
+        param($obj)
+        $m = [ordered]@{}
+        if ($null -eq $obj) { return $m }
+        if ($obj -is [System.Collections.IDictionary]) { foreach ($k in $obj.Keys) { $m["$k"] = $obj[$k] } }
+        else { foreach ($p in $obj.PSObject.Properties) { $m[$p.Name] = $p.Value } }
+        return $m
+    }
+    $get = { param($o, [string]$k) if ($null -eq $o) { return $null }; if ($o -is [System.Collections.IDictionary]) { return $o[$k] }; return $o.$k }
+
+    $listing = if ($ListingReport) { & $toMap (& $get $ListingReport 'liveness') } else { [ordered]@{} }
+    $prMap = if ($PrReport) { & $toMap (& $get $PrReport 'projects') } else { [ordered]@{} }
+    $hs = & $toMap $HeadSkip
+
+    $projects = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in $listing.Keys) { if (-not $projects.Contains($k)) { $projects.Add($k) } }
+    foreach ($k in $prMap.Keys) { if (-not $projects.Contains($k)) { $projects.Add($k) } }
+    foreach ($e in @($SweepEntries)) { $p = "$(& $get $e 'project')"; if ($p -and -not $projects.Contains($p)) { $projects.Add($p) } }
+
+    $unmeasured = [ordered]@{}
+    $threads = @(); $nominations = @{}; $openPrs = @(); $noPrSource = @()
+    $listingWhole = if ($ListingError) { "listing: $ListingError" } elseif ($null -eq $ListingReport) { 'listing: no report' } elseif ($null -eq (& $get $ListingReport 'liveness')) { 'listing: report has no liveness key' } else { $null }
+    $prWhole = if ($PrError) { "open PRs: $PrError" } elseif ($null -eq $PrReport) { 'open PRs: no report' } else { $null }
+
+    foreach ($proj in $projects) {
+        $reasons = @()
+        if ($listingWhole) { $reasons += $listingWhole }
+        elseif (-not $listing.Contains($proj)) { $reasons += 'listing: project not listed' }
+        else {
+            $entry = $listing[$proj]
+            if ($null -eq (& $get $entry 'threads')) { $reasons += "listing: $(& $get $entry 'error')" }
+        }
+        if ($prWhole) { $reasons += $prWhole }
+        elseif ($prMap.Contains($proj) -and $null -eq (& $get $prMap[$proj] 'prs')) { $reasons += "open PRs: $(& $get $prMap[$proj] 'error')" }
+        if ($reasons.Count -gt 0) { $unmeasured[$proj] = ($reasons -join '; '); continue }
+
+        foreach ($t in @(& $get $listing[$proj] 'threads')) {
+            if ($null -eq $t) { continue }
+            $id = "$(& $get $t 'thread_id')"
+            if (-not $id) { continue }
+            $threads += [PSCustomObject]@{ project = $proj; thread_id = $id; status = "$(& $get $t 'status')"; last_activity_at = (& $get $t 'last_activity_at') }
+            if ($hs.Contains($id)) {
+                $nom = & $get $hs[$id] 'last_observed_nomination'
+                if ("$nom") { $nominations["$proj/$id"] = "$nom" }
+            }
+        }
+        if ($prMap.Contains($proj)) {
+            foreach ($pr in @(& $get $prMap[$proj] 'prs')) {
+                if ($null -ne $pr) { $openPrs += [PSCustomObject]@{ project = $proj; created_at = (& $get $pr 'created_at') } }
+            }
+        }
+        else { $noPrSource += $proj }
+    }
+    return @{
+        Threads      = $threads
+        SweepEntries = @(@($SweepEntries) | Where-Object { -not $unmeasured.Contains("$(& $get $_ 'project')") })
+        Nominations  = $nominations
+        OpenPrs      = $openPrs
+        Projects     = @($projects | Where-Object { -not $unmeasured.Contains($_) })
+        Unmeasured   = $unmeasured
+        NoPrSource   = $noPrSource
     }
 }
