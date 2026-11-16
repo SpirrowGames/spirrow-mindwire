@@ -577,3 +577,27 @@ def test_slots_root_is_refused_until_the_loop_wiring_lands(tmp_path: Path) -> No
     assert "[loop].slots_root" in text
     assert "not wired into the loop" in text
     assert "Leave it unset to keep the single shared repo_dir clone" in text
+
+
+# --- [loop].slots_per_repo (msg-9386 D-1 改訂 1) ---------------------------------------------
+
+
+def test_slots_per_repo_defaults_to_one_without_an_executor_pool(tmp_path: Path) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("schema_version = 1\n\n[loop]\n", encoding="utf-8")
+    loop = load_settings(cfg).loop
+    assert loop.slots_per_repo is None
+    assert loop.resolved_slots_per_repo() == 1
+
+
+def test_slots_per_repo_explicit_value_is_used(tmp_path: Path) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("schema_version = 1\n\n[loop]\nslots_per_repo = 3\n", encoding="utf-8")
+    assert load_settings(cfg).loop.resolved_slots_per_repo() == 3
+
+
+def test_slots_per_repo_below_one_is_refused(tmp_path: Path) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("schema_version = 1\n\n[loop]\nslots_per_repo = 0\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_settings(cfg)

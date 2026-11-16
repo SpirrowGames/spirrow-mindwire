@@ -1,60 +1,44 @@
-"""Register a new clone slot as a trusted Claude Code workspace (A-4, msg-8053 / msg-8234).
+"""Read-only trust check for a pooled clone slot (T-ephemeral-impl-clone-slot-per-thread).
 
-Measured on the loop host (T-ephemeral-impl-clone-slot-per-thread):
+The human ruling of 2026-11-17 (msg-9385, option A; design msg-9386 D-1 改訂 7) fixes the
+slots at ``<slots_root>/<repo>/slot-NN/`` and has a person mark each of them trusted ONCE, at
+deploy time (``docs/deploy.md``). MindWire never writes Claude Code's config file: a write races
+a running Claude Code's own update of the same file and can silently drop it, which is the
+"silent stop" this thread exists to remove. So this module only reads.
+
+Measured on the loop host:
 
 * trust does **not** inherit from a parent directory: ``C:/workspace`` is trusted, yet
-  ``claude --bg --dangerously-skip-permissions`` in a new directory under it exits 1 within a
-  second with ``Workspace not trusted`` on stderr. No interactive prompt appears and the process
-  does not wait for input; nothing is written to ``.claude.json``, so a second launch in the
-  same directory fails the same way. Re-measured 2026-11-08T17:09Z (Claude Code 2.1.319, stdin
-  closed, 60 s tree-kill bound, Bohr msg-8502), first measured 2026-11-08 in the retreated WIP;
-* an entry ``projects["<absolute path, forward slashes>"].hasTrustDialogAccepted = true`` in
-  ``<config dir>/.claude.json`` is enough: the same launch, with only that entry added to an
-  otherwise empty config, prints ``backgrounded`` and exits 0. First measured 2026-11-08 in the
-  retreated WIP session; confirmed against the loop host's real ``~/.claude.json`` at
-  2026-11-10T03:04:06Z (Claude Code 2.1.321, step 1b, msg-8915): the path registered by
-  :func:`ensure_trusted` launched with exit 0 in 3.9 s and the session was ``busy/working``.
-  The stdout/stderr of that launch were not kept (the one-off probe script failed while
-  printing them), so only the exit code, timing and session state are on record.
+  ``claude --bg`` in a git root below it exits 1 at once with ``Workspace not trusted`` (first
+  measured 2026-11-08, re-measured 2026-11-08T17:09Z, Claude Code 2.1.319; re-observed
+  2026-11-17 on Claude Code 2.1.325 in ``C:/workspace/sandbox/mindwire-impl`` and in a fresh
+  git root under it). :func:`is_trusted` therefore looks at the slot's own entry only and never
+  walks to an ancestor: the slot is its own git root;
+* the entry Claude Code reads is ``projects["<absolute path, forward slashes>"]
+  .hasTrustDialogAccepted = true`` in ``<config dir>/.claude.json``; every key on the loop host's
+  real file (read-only, 2026-11-17) has an upper-case drive letter and forward slashes
+  (``C:/workspace/spirrow/spirrow-mindwire``). :func:`project_key` produces exactly that shape.
+  A lower-case-drive key was NOT measured (that needs a write this module must not make), so it
+  is not accepted: a key Claude Code might not honour would make a slot look trusted and then
+  fail its launch.
 
-So every slot is registered once, when it is provisioned. The config file is Claude Code's own
-(``$CLAUDE_CONFIG_DIR/.claude.json``, else ``~/.claude.json``). It is never created here: a missing
-or unreadable file raises, which fails the provision loudly (counted, then parked, by
-:class:`~spirrow_mindwire.clone_slot_prep.SlotPrep`) instead of inventing a user config; a file
-that is not JSON is never overwritten to "fix" it. The file is written only when the entry is
-missing (once per slot path). The write (Bohr msg-8505 / msg-8507, Einstein go) is guarded:
-
-* every byte outside the edited entry is kept — the writer refuses a file whose untouched content
-  would not re-serialize to exactly its own bytes (Claude Code's own ``indent=2`` shape does:
-  checked against the loop host's real file 2026-11-08, read-only);
-* temp file in the same directory + ``os.replace``; right before the replace the file is read
-  again and compared BYTE for byte with what was read (mtime is too coarse); any difference
-  throws the temp file away and starts over;
-* afterwards the entry is read back; up to 3 rounds, then ``claude.json changed during update``
-  (or ``entry missing after write``) fails the provision.
-
-Our own writers never overlap: ``prepare_slot`` runs inside slot-prep, one at a time under
-``conductor-tick.lock`` and the per-candidate synchronous sweep, so the only other writer is a
-running Claude Code. Known gap: a write that lands between the compare and the replace
-(milliseconds, once per slot) is still lost, as between two Claude Code processes. Entries are
-never removed in PR-A, so ``projects`` grows by one key per thread slot.
+A missing, unreadable or non-JSON config raises :class:`TrustReadError` (the caller parks the
+turn that wanted the slot, loudly); it is never created or repaired here.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 TRUST_KEY = "hasTrustDialogAccepted"
 
 
-class TrustRegistrationError(RuntimeError):
-    """The slot could not be registered as trusted; the message says why, with the path."""
+class TrustReadError(RuntimeError):
+    """The trust state could not be read; the message says why, with the path."""
 
 
 def claude_config_file(env: Mapping[str, str] | None = None) -> Path:
@@ -65,176 +49,32 @@ def claude_config_file(env: Mapping[str, str] | None = None) -> Path:
 
 
 def project_key(slot_dir: Path) -> str:
-    """The key Claude Code uses for a project: absolute path, forward slashes, upper-case drive.
-
-    Matches the measured key shape (``C:/workspace``): a key in another shape registers nothing
-    the launch will find, so the slot would be refused although "registered".
-    """
+    """The key Claude Code uses for a project: absolute path, forward slashes, upper-case drive."""
     key = str(Path(os.path.abspath(slot_dir))).replace("\\", "/")
     if len(key) >= 2 and key[1] == ":" and key[0].isalpha():
         key = key[0].upper() + key[1:]
     return key
 
 
-def _parse(raw: bytes, config: Path) -> dict[str, Any]:
+def _read(config: Path) -> dict[str, Any]:
+    try:
+        raw = config.read_bytes()
+    except OSError as exc:
+        raise TrustReadError(f"cannot read {config}: {exc}") from exc
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TrustRegistrationError(f"{config} is not JSON: {exc}") from exc
+        raise TrustReadError(f"{config} is not JSON: {exc}") from exc
     if not isinstance(data, dict):
-        raise TrustRegistrationError(f"{config} is not a JSON object")
+        raise TrustReadError(f"{config} is not a JSON object")
     return data
 
 
-def _read_bytes(config: Path) -> bytes:
-    try:
-        return config.read_bytes()
-    except OSError as exc:
-        raise TrustRegistrationError(f"cannot read {config}: {exc}") from exc
-
-
-def _read(config: Path) -> dict[str, Any]:
-    return _parse(_read_bytes(config), config)
-
-
-def _serialize(data: dict[str, Any], suffix: str) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2) + suffix
-
-
-def _entry_trusted(data: dict[str, Any], key: str) -> bool:
+def is_trusted(slot_dir: Path, config: Path | None = None) -> bool:
+    """Whether ``slot_dir``'s own entry is trusted. Reads ``config``; never writes anything."""
+    data = _read(config if config is not None else claude_config_file())
     projects = data.get("projects")
     if not isinstance(projects, dict):
         return False
-    entry = projects.get(key)
+    entry = projects.get(project_key(slot_dir))
     return isinstance(entry, dict) and entry.get(TRUST_KEY) is True
-
-
-def is_trusted(slot_dir: Path, config: Path) -> bool:
-    return _entry_trusted(_read(config), project_key(slot_dir))
-
-
-MAX_ATTEMPTS = 3
-CHANGED_DURING_UPDATE = "claude.json changed during update"
-
-
-def _edit(
-    config: Path,
-    mutate: Callable[[dict[str, Any]], bool],
-    check: Callable[[dict[str, Any]], bool],
-    *,
-    before_replace: Callable[[], None] | None = None,
-) -> bool:
-    """Read-modify-replace ``config`` without clobbering a concurrent writer (Bohr msg-8507).
-
-    ``mutate`` edits the parsed object and returns ``False`` when nothing needs writing (then
-    nothing is written, and the file's shape is never judged). The original BYTES are kept;
-    right before ``os.replace`` the file is read again and the temp file is thrown away unless
-    it is byte-identical (not mtime: too coarse).
-    After the replace, ``check`` must hold on a fresh read. Up to :data:`MAX_ATTEMPTS` rounds; then
-    :class:`TrustRegistrationError`. Every byte outside the edited entry is kept: the write is
-    refused when the untouched file would not re-serialize to exactly its own bytes (checked only
-    once a write is known to be needed). Known gap:
-    a write landing between the compare and the replace (milliseconds, once per slot) is lost.
-    """
-    last = ""
-    for _ in range(MAX_ATTEMPTS):
-        raw = _read_bytes(config)
-        data = _parse(raw, config)
-        text = raw.decode("utf-8")
-        suffix = text[len(text.rstrip()) :]
-        # Whether a write is needed is decided first (PR #582 gate Obj-2): a file that needs no
-        # write is only read, whatever its shape, so an already trusted slot in a compact (or
-        # otherwise reformatted) config passes. The shape check guards every actual write: it
-        # runs on the untouched bytes, before the edit is serialized.
-        untouched_ok = _serialize(data, suffix) == text
-        if not mutate(data):
-            return False
-        if not untouched_ok:
-            raise TrustRegistrationError(
-                f"{config}: not in the shape this writer reproduces byte for byte; "
-                "refusing to rewrite it"
-            )
-        fd, tmp = tempfile.mkstemp(prefix=".claude.json.", suffix=".tmp", dir=config.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(_serialize(data, suffix))
-            if before_replace is not None:
-                before_replace()
-            if _read_bytes(config) != raw:
-                last = CHANGED_DURING_UPDATE
-                os.unlink(tmp)
-                continue
-            os.replace(tmp, config)
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise TrustRegistrationError(f"cannot write {config}: {exc}") from exc
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
-        if check(_read(config)):
-            return True
-        last = "entry missing after write"
-    raise TrustRegistrationError(f"{config}: {last} ({MAX_ATTEMPTS} attempts)")
-
-
-def ensure_trusted(
-    slot_dir: Path, config: Path, *, before_replace: Callable[[], None] | None = None
-) -> bool:
-    """Make ``slot_dir`` a trusted project in ``config``. ``True`` = the file was written."""
-    key = project_key(slot_dir)
-
-    def mutate(data: dict[str, Any]) -> bool:
-        projects = data.setdefault("projects", {})
-        if not isinstance(projects, dict):
-            raise TrustRegistrationError(f"{config}: 'projects' is not a JSON object")
-        entry = projects.setdefault(key, {})
-        if not isinstance(entry, dict):
-            raise TrustRegistrationError(f"{config}: projects[{key!r}] is not a JSON object")
-        if entry.get(TRUST_KEY) is True:
-            return False
-        entry[TRUST_KEY] = True
-        return True
-
-    return _edit(config, mutate, lambda d: _entry_trusted(d, key), before_replace=before_replace)
-
-
-def remove_project_entries(
-    config: Path,
-    matches: Callable[[str], bool],
-    *,
-    before_replace: Callable[[], None] | None = None,
-) -> list[str]:
-    """Drop every ``projects`` key for which ``matches`` holds; returns the keys dropped.
-
-    Same guarded write as :func:`ensure_trusted`. Used by the trust measurement's cleanup only
-    (Bohr msg-8507 Obj-22-2): entries go one by one, never by restoring a whole-file backup.
-    """
-    dropped: list[str] = []
-
-    def mutate(data: dict[str, Any]) -> bool:
-        dropped.clear()
-        projects = data.get("projects")
-        if not isinstance(projects, dict):
-            return False
-        dropped.extend(k for k in projects if matches(k))
-        for k in dropped:
-            del projects[k]
-        return bool(dropped)
-
-    def check(data: dict[str, Any]) -> bool:
-        projects = data.get("projects")
-        return not isinstance(projects, dict) or not any(matches(k) for k in projects)
-
-    _edit(config, mutate, check, before_replace=before_replace)
-    return list(dropped)
-
-
-def trust_preparer(config: Path | None = None) -> Callable[[Path], None]:
-    """``SlotPrep.prepare_slot`` that registers the new slot as trusted (raises on failure)."""
-
-    def _prepare(slot_dir: Path) -> None:
-        ensure_trusted(slot_dir, config if config is not None else claude_config_file())
-
-    return _prepare

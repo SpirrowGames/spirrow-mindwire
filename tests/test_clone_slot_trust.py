@@ -1,265 +1,131 @@
-"""clone_slot_trust: slot trust registration (Bohr msg-8234 判断 3, measured 2026-11-08)."""
+"""clone_slot_trust: read-only trust check (msg-9385 option A, msg-9386 D-1 改訂 7)."""
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
+from spirrow_mindwire import clone_slot_trust as cst
 from spirrow_mindwire.clone_slot_trust import (
-    CHANGED_DURING_UPDATE,
-    MAX_ATTEMPTS,
-    TrustRegistrationError,
+    TrustReadError,
     claude_config_file,
-    ensure_trusted,
     is_trusted,
     project_key,
-    remove_project_entries,
-    trust_preparer,
 )
 
 
 def _cfg(tmp_path: Path, data: object) -> Path:
     p = tmp_path / ".claude.json"
-    # Claude Code's own shape (indent=2, no trailing newline), which the writer reproduces.
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     return p
 
 
+def _has_drive(key: str) -> bool:
+    return len(key) >= 2 and key[1] == ":"
+
+
 def test_project_key_is_absolute_with_forward_slashes(tmp_path: Path) -> None:
-    key = project_key(tmp_path / "slots" / "demo" / "abc")
-    assert "\\" not in key and key.endswith("/slots/demo/abc")
+    key = project_key(tmp_path / "slots" / "demo" / "slot-01")
+    assert "\\" not in key and key.endswith("/slots/demo/slot-01")
     assert Path(key).is_absolute()
 
 
-def test_ensure_trusted_adds_entry_and_keeps_every_other_key(tmp_path: Path) -> None:
-    slot = tmp_path / "slot"
-    other = {"hasTrustDialogAccepted": False, "lastCost": 1.5}
-    cfg = _cfg(tmp_path, {"hasCompletedOnboarding": True, "projects": {"C:/x": other}})
-    assert ensure_trusted(slot, cfg) is True
-    data = json.loads(cfg.read_text(encoding="utf-8"))
-    assert data["hasCompletedOnboarding"] is True
-    assert data["projects"]["C:/x"] == other
-    assert data["projects"][project_key(slot)] == {"hasTrustDialogAccepted": True}
-    assert is_trusted(slot, cfg)
-    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+def test_project_key_upper_cases_the_drive_letter(tmp_path: Path) -> None:
+    key = project_key(tmp_path)
+    if not _has_drive(key):
+        pytest.skip("drive letters exist on Windows paths only")
+    lower = Path(key[0].lower() + key[1:])
+    assert project_key(lower) == key and key[0].isupper()
 
 
-def test_ensure_trusted_is_idempotent_and_keeps_existing_entry_fields(tmp_path: Path) -> None:
-    slot = tmp_path / "slot"
-    entry = {"hasTrustDialogAccepted": True, "allowedTools": ["x"]}
-    cfg = _cfg(tmp_path, {"projects": {project_key(slot): entry}})
-    before = cfg.read_text(encoding="utf-8")
-    assert ensure_trusted(slot, cfg) is False
-    assert cfg.read_text(encoding="utf-8") == before  # not rewritten
+def test_trusted_entry_is_trusted(tmp_path: Path) -> None:
+    slot = tmp_path / "slot-01"
+    cfg = _cfg(tmp_path, {"projects": {project_key(slot): {"hasTrustDialogAccepted": True}}})
+    assert is_trusted(slot, cfg) is True
 
 
-def test_untrusted_existing_entry_is_flipped_keeping_its_fields(tmp_path: Path) -> None:
-    slot = tmp_path / "slot"
+@pytest.mark.parametrize(
+    "entry",
+    [None, {"hasTrustDialogAccepted": False}, {"hasTrustDialogAccepted": "true"}, ["x"]],
+)
+def test_anything_but_a_true_entry_is_untrusted(tmp_path: Path, entry: object) -> None:
+    slot = tmp_path / "slot-01"
+    projects = {} if entry is None else {project_key(slot): entry}
+    assert is_trusted(slot, _cfg(tmp_path, {"projects": projects})) is False
+
+
+@pytest.mark.parametrize("data", [{}, {"projects": []}, {"projects": "x"}])
+def test_no_projects_object_is_untrusted(tmp_path: Path, data: dict[str, object]) -> None:
+    assert is_trusted(tmp_path / "slot-01", _cfg(tmp_path, data)) is False
+
+
+def test_trust_is_not_inherited_from_an_ancestor(tmp_path: Path) -> None:
+    """Measured: a trusted parent does not trust a git root below it; the slot is its own root."""
+    slot = tmp_path / "repo" / "slot-01"
+    trusted = {"hasTrustDialogAccepted": True}
     cfg = _cfg(
-        tmp_path, {"projects": {project_key(slot): {"hasTrustDialogAccepted": False, "k": 1}}}
+        tmp_path,
+        {"projects": {project_key(tmp_path): trusted, project_key(tmp_path / "repo"): trusted}},
     )
-    assert ensure_trusted(slot, cfg) is True
-    entry = json.loads(cfg.read_text(encoding="utf-8"))["projects"][project_key(slot)]
-    assert entry == {"hasTrustDialogAccepted": True, "k": 1}
+    assert is_trusted(slot, cfg) is False
 
 
-def test_missing_config_raises_and_creates_nothing(tmp_path: Path) -> None:
+def test_lower_case_drive_key_is_not_accepted(tmp_path: Path) -> None:
+    """Only the measured key shape counts (upper-case drive); an unmeasured shape is untrusted."""
+    slot = tmp_path / "slot-01"
+    key = project_key(slot)
+    if not _has_drive(key):
+        pytest.skip("drive letters exist on Windows paths only")
+    lower = key[0].lower() + key[1:]
+    cfg = _cfg(tmp_path, {"projects": {lower: {"hasTrustDialogAccepted": True}}})
+    assert is_trusted(slot, cfg) is False
+
+
+def test_missing_config_raises_and_is_not_created(tmp_path: Path) -> None:
     cfg = tmp_path / ".claude.json"
-    with pytest.raises(TrustRegistrationError, match="cannot read"):
-        ensure_trusted(tmp_path / "slot", cfg)
+    with pytest.raises(TrustReadError, match="cannot read"):
+        is_trusted(tmp_path / "slot-01", cfg)
     assert not cfg.exists()
 
 
-@pytest.mark.parametrize("text", ["{not json", "[]", '{"projects": []}'])
-def test_unusable_config_raises_and_is_left_unchanged(tmp_path: Path, text: str) -> None:
+@pytest.mark.parametrize("raw", [b"{not json", b"[1, 2]", b"\xff\xfe"])
+def test_unparseable_config_raises_and_is_left_alone(tmp_path: Path, raw: bytes) -> None:
     cfg = tmp_path / ".claude.json"
-    cfg.write_text(text, encoding="utf-8", newline="\n")
-    with pytest.raises(TrustRegistrationError):
-        ensure_trusted(tmp_path / "slot", cfg)
-    assert cfg.read_text(encoding="utf-8") == text
+    cfg.write_bytes(raw)
+    with pytest.raises(TrustReadError):
+        is_trusted(tmp_path / "slot-01", cfg)
+    assert cfg.read_bytes() == raw
 
 
-def test_config_file_follows_claude_config_dir(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trusted", [True, False])
+def test_claude_json_bytes_never_change_on_any_path(tmp_path: Path, trusted: bool) -> None:
+    """msg-9386 A1: whatever the outcome, the config bytes and its directory are unchanged."""
+    slot = tmp_path / "slot-01"
+    # Compact with a trailing newline: a rewriter would normalize this shape.
+    body = {"projects": {project_key(slot): {"hasTrustDialogAccepted": trusted}}, "x": 1}
+    raw = json.dumps(body, separators=(",", ":")).encode("utf-8") + b"\n"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_bytes(raw)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    mtime = cfg.stat().st_mtime_ns
+    assert is_trusted(slot, cfg) is trusted
+    assert cfg.read_bytes() == raw
+    assert cfg.stat().st_mtime_ns == mtime
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+def test_module_has_no_write_path() -> None:
+    """The write / remove paths of the earlier A1 are gone, not merely unused."""
+    for gone in ("ensure_trusted", "remove_project_entries", "trust_preparer", "_edit"):
+        assert not hasattr(cst, gone)
+    src = inspect.getsource(cst)
+    for writer in ("os.replace", "write_text", "write_bytes", "mkstemp", ".open(", "unlink"):
+        assert writer not in src
+
+
+def test_config_file_location(tmp_path: Path) -> None:
     assert claude_config_file({"CLAUDE_CONFIG_DIR": str(tmp_path)}) == tmp_path / ".claude.json"
-    assert claude_config_file({}) == Path.home() / ".claude.json"
     assert claude_config_file({"CLAUDE_CONFIG_DIR": "  "}) == Path.home() / ".claude.json"
-
-
-def test_trust_preparer_resolves_config_at_call_time(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = _cfg(tmp_path, {"projects": {}})
-    prepare = trust_preparer()
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    prepare(tmp_path / "slot")
-    assert is_trusted(tmp_path / "slot", cfg)
-
-
-# -- Bohr msg-8505 / msg-8507 (Obj-22-1): key shape and the guarded write ----------------------
-
-
-def test_project_key_upper_cases_the_drive_letter() -> None:
-    key = project_key(Path("c:/workspace/slots/demo/abc"))
-    if key[1:2] == ":":  # Windows: the measured shape is ``C:/workspace``
-        assert key.startswith("C:/") and "\\" not in key
-
-
-def test_other_keys_keep_every_byte(tmp_path: Path) -> None:
-    data = {
-        "numStartups": 12,
-        "ratio": 1.5,
-        "name": "日本語 ✓",
-        "projects": {"C:/x": {"hasTrustDialogAccepted": False, "allowedTools": []}},
-        "z": None,
-    }
-    cfg = _cfg(tmp_path, data)
-    before = cfg.read_text(encoding="utf-8")
-    assert ensure_trusted(tmp_path / "slot", cfg) is True
-    after = json.loads(cfg.read_text(encoding="utf-8"))
-    del after["projects"][project_key(tmp_path / "slot")]
-    assert json.dumps(after, ensure_ascii=False, indent=2) == before
-
-
-def test_trailing_newline_is_kept(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude.json"
-    cfg.write_text(json.dumps({"projects": {}}, indent=2) + "\n", encoding="utf-8", newline="\n")
-    ensure_trusted(tmp_path / "slot", cfg)
-    assert cfg.read_text(encoding="utf-8").endswith("}\n")
-
-
-def test_file_in_another_shape_is_refused_unchanged(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude.json"
-    cfg.write_text(
-        '{"projects": {}}', encoding="utf-8", newline="\n"
-    )  # compact: would be reformatted
-    with pytest.raises(TrustRegistrationError, match="byte for byte"):
-        ensure_trusted(tmp_path / "slot", cfg)
-    assert cfg.read_text(encoding="utf-8") == '{"projects": {}}'
-
-
-def test_concurrent_write_is_detected_and_kept_on_retry(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path, {"projects": {}})
-    calls = {"n": 0}
-
-    def other_writer() -> None:  # a running Claude Code writes between our read and replace
-        calls["n"] += 1
-        if calls["n"] == 1:
-            d = json.loads(cfg.read_text(encoding="utf-8"))
-            d["projects"]["C:/other"] = {"hasTrustDialogAccepted": True}
-            cfg.write_text(json.dumps(d, indent=2), encoding="utf-8", newline="\n")
-
-    assert ensure_trusted(tmp_path / "slot", cfg, before_replace=other_writer) is True
-    projects = json.loads(cfg.read_text(encoding="utf-8"))["projects"]
-    assert projects["C:/other"] == {"hasTrustDialogAccepted": True}  # not clobbered
-    assert projects[project_key(tmp_path / "slot")] == {"hasTrustDialogAccepted": True}
-    assert calls["n"] == 2
-    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
-
-
-def test_file_changing_every_attempt_fails_and_keeps_the_other_writes(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path, {"projects": {}})
-    calls = {"n": 0}
-
-    def busy_writer() -> None:
-        calls["n"] += 1
-        d = json.loads(cfg.read_text(encoding="utf-8"))
-        d["projects"][f"C:/other{calls['n']}"] = {}
-        cfg.write_text(json.dumps(d, indent=2), encoding="utf-8", newline="\n")
-
-    with pytest.raises(TrustRegistrationError, match=CHANGED_DURING_UPDATE):
-        ensure_trusted(tmp_path / "slot", cfg, before_replace=busy_writer)
-    assert calls["n"] == MAX_ATTEMPTS == 3
-    projects = json.loads(cfg.read_text(encoding="utf-8"))["projects"]
-    assert sorted(projects) == ["C:/other1", "C:/other2", "C:/other3"]  # only theirs
-    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
-
-
-def test_unchanged_file_is_written_in_one_attempt(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path, {"projects": {}})
-    calls = {"n": 0}
-
-    def quiet() -> None:
-        calls["n"] += 1
-
-    assert ensure_trusted(tmp_path / "slot", cfg, before_replace=quiet) is True
-    assert calls["n"] == 1
-
-
-def test_registered_slot_reads_only(tmp_path: Path) -> None:
-    slot = tmp_path / "slot"
-    cfg = _cfg(tmp_path, {"projects": {project_key(slot): {"hasTrustDialogAccepted": True}}})
-    calls = {"n": 0}
-
-    def hook() -> None:
-        calls["n"] += 1
-
-    assert ensure_trusted(slot, cfg, before_replace=hook) is False
-    assert calls["n"] == 0  # never reached the write
-
-
-def test_remove_project_entries_drops_only_matching_keys(tmp_path: Path) -> None:
-    cfg = _cfg(
-        tmp_path,
-        {
-            "keep": 1,
-            "projects": {
-                "C:/a/.git/mindwire-scratch/trust-probe-1/slot": {"hasTrustDialogAccepted": True},
-                "C:/workspace": {"hasTrustDialogAccepted": True},
-            },
-        },
-    )
-    dropped = remove_project_entries(cfg, lambda k: "/.git/mindwire-scratch/trust-probe-" in k)
-    assert dropped == ["C:/a/.git/mindwire-scratch/trust-probe-1/slot"]
-    data = json.loads(cfg.read_text(encoding="utf-8"))
-    assert data == {"keep": 1, "projects": {"C:/workspace": {"hasTrustDialogAccepted": True}}}
-    before = cfg.read_text(encoding="utf-8")
-    assert remove_project_entries(cfg, lambda k: "trust-probe-" in k) == []
-    assert cfg.read_text(encoding="utf-8") == before
-
-
-@pytest.mark.parametrize("trailing", ["", "\n"])
-def test_already_trusted_slot_in_compact_config_reads_only(tmp_path: Path, trailing: str) -> None:
-    # PR #582 gate Obj-2: no write needed -> no shape check, no error, file untouched.
-    slot = tmp_path / "slot"
-    text = (
-        json.dumps(
-            {"projects": {project_key(slot): {"hasTrustDialogAccepted": True}}},
-            separators=(",", ":"),
-        )
-        + trailing
-    )
-    cfg = tmp_path / ".claude.json"
-    cfg.write_text(text, encoding="utf-8", newline="\n")
-    calls = {"n": 0}
-
-    def hook() -> None:
-        calls["n"] += 1
-
-    assert ensure_trusted(slot, cfg, before_replace=hook) is False
-    assert calls["n"] == 0
-    assert cfg.read_text(encoding="utf-8") == text
-
-
-def test_compact_config_needing_a_write_is_still_refused(tmp_path: Path) -> None:
-    # The shape requirement still guards every write (PR #582 gate Obj-2 fix_min).
-    slot = tmp_path / "slot"
-    text = json.dumps(
-        {"projects": {project_key(slot): {"hasTrustDialogAccepted": False}}}, separators=(",", ":")
-    )
-    cfg = tmp_path / ".claude.json"
-    cfg.write_text(text, encoding="utf-8", newline="\n")
-    with pytest.raises(TrustRegistrationError, match="byte for byte"):
-        ensure_trusted(slot, cfg)
-    assert cfg.read_text(encoding="utf-8") == text
-
-
-def test_remove_with_no_match_in_compact_config_reads_only(tmp_path: Path) -> None:
-    text = json.dumps(
-        {"projects": {"C:/workspace": {"hasTrustDialogAccepted": True}}}, separators=(",", ":")
-    )
-    cfg = tmp_path / ".claude.json"
-    cfg.write_text(text, encoding="utf-8", newline="\n")
-    assert remove_project_entries(cfg, lambda k: "trust-probe-" in k) == []
-    assert cfg.read_text(encoding="utf-8") == text

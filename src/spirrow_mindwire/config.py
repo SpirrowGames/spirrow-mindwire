@@ -360,15 +360,29 @@ class Stage3LoopConfig(_StrictModel):
     """Root of the per-thread clone slots (T-ephemeral-impl-clone-slot-per-thread, msg-8061).
 
     ``None`` (the default) keeps the single shared ``repo_dir`` clone with exactly today's
-    behaviour (INV-0). When set, each thread works in its own ``<slots_root>/<repo>/<hash12>[-N]/``
-    clone provisioned from the bare mirror ``<slots_root>/<repo>.git``
-    (:mod:`spirrow_mindwire.clone_slot_prep`).
+    behaviour (INV-0). When set, each turn borrows one slot of a finite per-repo pool
+    ``<slots_root>/<repo>/slot-NN/`` (``NN`` = ``01`` .. :attr:`slots_per_repo`), provisioned from
+    the bare mirror ``<slots_root>/<repo>.git`` and returned when the turn ends (human ruling
+    msg-9385 option A, design msg-9386 D-1 改訂; :mod:`spirrow_mindwire.clone_slot`). Each slot
+    path is marked trusted by a person at deploy time; MindWire never writes Claude Code's config.
 
     **Not accepted yet.** The pre-turn prep exists, but the loop / wrapper wiring and the
     slot-scoped park key (D-5) do not, so a configured value would be silently ignored while every
     thread kept sharing ``repo_dir``. Per msg-8055 R-7 / msg-8061 the value is refused at load
     until the PR that wires provisioning and the slot park key together accepts it.
     """
+
+    slots_per_repo: int | None = Field(default=None, ge=1)
+    """How many slots each repo's pool has (msg-9386 D-1 改訂 1). ``None`` = the default.
+
+    The default is the executor pool's parallelism when an executor pool is configured, else 1
+    (1 is today's one-clone-per-repo parallelism). No executor-pool setting exists in this config
+    yet, so the default currently resolves to 1 (:meth:`resolved_slots_per_repo`).
+    """
+
+    def resolved_slots_per_repo(self) -> int:
+        """:attr:`slots_per_repo` when set; else 1 (no executor-pool parallelism is configured)."""
+        return self.slots_per_repo if self.slots_per_repo is not None else 1
 
     watches: tuple[LoopWatchConfig, ...] = ()
 
