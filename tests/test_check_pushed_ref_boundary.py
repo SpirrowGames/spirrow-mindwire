@@ -316,15 +316,18 @@ def test_snapshot_is_per_repo_dir(tmp_path: Path) -> None:
     assert store.baseline_for(scope, tmp_path / "b") is None
 
 
-def test_unreadable_store_refuses_record_and_judges_all(tmp_path: Path) -> None:
+def test_unreadable_store_is_recovered_not_recorded_and_judges_all(tmp_path: Path) -> None:
+    # T-ref-snapshot-unreadable-file-blocks-thread-forever: an unreadable file no longer refuses
+    # the launch forever; it is recovered (degraded) and the key stays unrecorded. The full
+    # recovery contract is in tests/test_ref_snapshot_unreadable_recovery.py.
     store = TurnRefSnapshotStore(tmp_path / "s")
     path = store.path_for("p", "t")
     path.parent.mkdir(parents=True)
     path.write_text("{not json", encoding="utf-8")
-    from spirrow_mindwire.turn_ref_snapshot import SnapshotStoreError
-
-    with pytest.raises(SnapshotStoreError):
+    assert (
         store.record(project="p", thread_id="t", trigger_msg_id="m1", repo_dir=tmp_path, refs={})
+        is False
+    )
     scope = ContinuationScope(project="p", thread_id="t", trigger_msg_id="m1")
     assert store.baseline_for(scope, tmp_path) is None
 
@@ -396,10 +399,13 @@ async def test_10_snapshot_write_failure_refuses_before_the_adapter(
     adapter = _Adapter()
     disp = _dispatcher(narrow, adapter, TurnRefSnapshotStore(blocker))
     handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
-    with pytest.raises(DirtyCloneError) as ei:
+    # T-ref-snapshot-unreadable-file-blocks-thread-forever D-2: a state-file fault is its own
+    # error (exit 12), no longer the clone's git_unavailable (exit 8).
+    from spirrow_mindwire.turn_ref_snapshot import RefSnapshotUnrecordedError
+
+    with pytest.raises(RefSnapshotUnrecordedError) as ei:
         await disp.dispatch(handle, _event("m1"))
-    assert ei.value.reason is DirtyCloneReason.GIT_UNAVAILABLE
-    assert "ref snapshot not recorded" in ei.value.detail
+    assert ei.value.kind in ("read", "write")
     assert adapter.delivered == 0
 
     # Relaunch on the same trigger once the store works: that launch's state is the boundary
