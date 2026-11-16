@@ -12,8 +12,10 @@ change in either column (its retirement is boundary 5).
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher
 from test_decider_step2 import _conductor_with
 from test_stop_disposition_slice3 import _ROSTER, _Gh, _TickMcp
@@ -32,6 +34,7 @@ from spirrow_mindwire.conductor.handoff import (
     settles_by_terminal_form,
 )
 from spirrow_mindwire.conductor.head_skip import (
+    CACHED_TOKEN_POSTED_AT,
     TERMINAL_STOP_REASONS,
     parse_head_token,
     stage1_skips,
@@ -154,9 +157,10 @@ def test_broken_forms_are_malformed_whether_or_not_accepted(
 )
 def test_the_existing_forms_are_untouched(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", False)
-    off = resolve_handoff(body, _ROSTER)
+    # The existing forms include the legacy ``NEXT: none``: read as a pre-cutoff head.
+    off = resolve_handoff(body, _ROSTER, posted_at=PRE_CUTOFF)
     monkeypatch.setattr(handoff_mod, "ACCEPT_NEW_FORMS", True)
-    assert resolve_handoff(body, _ROSTER) == off
+    assert resolve_handoff(body, _ROSTER, posted_at=PRE_CUTOFF) == off
     assert off.malformed is None
 
 
@@ -285,7 +289,7 @@ def test_an_indented_stop_above_a_next_keeps_its_reading() -> None:
     # Not in Slice I's scope (msg-8455 §1 lists the final line and BLOCKED-ON above NEXT only):
     # the legacy reading of a line above ``NEXT: none`` and the ROLE route are unchanged.
     assert resolve_handoff("x\n    STOP: done\nNEXT: Bohr", _ROSTER).identity == "Bohr"
-    legacy = resolve_handoff("x\n    STOP: done\nNEXT: none", _ROSTER)
+    legacy = resolve_handoff("x\n    STOP: done\nNEXT: none", _ROSTER, posted_at=PRE_CUTOFF)
     assert legacy.kind is HandoffKind.NONE and legacy.malformed is None
 
 
@@ -380,21 +384,28 @@ def test_head_skip_reads_accepted_forms_as_none(accepting: None) -> None:
     for body in (DONE, BLOCKED):
         assert parse_head_token(body) == NONE_TOKEN
         assert stage1_skips(body)
-        # The head cache replays the token alone; it must SKIP again.
-        assert stage1_skips(f"NEXT: {parse_head_token(body)}")
+        # The head cache replays the token alone; it must SKIP again. The replay is read
+        # with CACHED_TOKEN_POSTED_AT, as scripts/head_skip_decide.py reads it.
+        assert stage1_skips(f"NEXT: {parse_head_token(body)}", posted_at=CACHED_TOKEN_POSTED_AT)
 
 
 def test_malformed_handoff_is_a_terminal_stop_reason() -> None:
     assert StopReason.MALFORMED_HANDOFF.value in TERMINAL_STOP_REASONS
 
 
-def _gate(body: str, roster: object = _ROSTER, field: str | None = None) -> object:
+def _gate(
+    body: str,
+    roster: object = _ROSTER,
+    field: str | None = None,
+    posted_at: datetime | None = None,
+) -> object:
     return tail_decision(
         body,
         repo="a/b",
         number=1,
         roster=roster,  # type: ignore[arg-type]
         next_participant=field,
+        posted_at=posted_at,
     )
 
 
@@ -441,8 +452,9 @@ def test_auto_gate_without_a_roster_holds_every_settled_tail(
 
 @pytest.mark.parametrize("roster", [None, {}])
 def test_auto_gate_without_a_roster_still_fires_on_a_legacy_idle_tail(roster: object) -> None:
-    # The roster is read for terminal forms only; ``NEXT: none`` keeps its pre-change reading.
-    assert isinstance(_gate("x\n\nNEXT: none", roster=roster), Post)
+    # The roster is read for terminal forms only; a ``NEXT: none`` posted before boundary 5
+    # keeps its pre-change reading.
+    assert isinstance(_gate("x\n\nNEXT: none", roster=roster, posted_at=PRE_CUTOFF), Post)
     assert settled_tail_refusal("x\n\nNEXT: none", roster=roster) is None  # type: ignore[arg-type]
 
 
@@ -646,9 +658,14 @@ async def test_no_cell_of_the_matrix_is_silent(
     assert handoff_mod.terminal_form_view(body) is not handoff_mod.TerminalView.LEGACY
     refused = resolve_handoff(body, _ROSTER, next_participant=field).malformed
 
-    # Sweep (roster-free, field-blind), on the fetched body and on the cached token.
+    # Sweep (roster-free, field-blind), on the fetched body and on the cached token. The
+    # cached token is replayed with CACHED_TOKEN_POSTED_AT, as scripts/head_skip_decide.py
+    # replays it: the cutoff was applied when the token was cached.
     sweep_skips = stage1_skips(body)
-    assert stage1_skips(f"NEXT: {parse_head_token(body)}") is sweep_skips
+    assert (
+        stage1_skips(f"NEXT: {parse_head_token(body)}", posted_at=CACHED_TOKEN_POSTED_AT)
+        is sweep_skips
+    )
 
     # Park-wake tick (roster + field).
     tick = _TickMcp()

@@ -822,15 +822,25 @@ Migration boundary Recovery in either case.
 
 ### In-flight ledger and the hold acknowledgement
 
-A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. A project whose clone is
-parked (`dirty-clone-parked`) launches nothing, so its HOLD used to stay `HOLD NOT ACKNOWLEDGED`
-for as long as the clone stayed parked. The sweep now writes that acknowledgement itself
-(`scripts/loop_control.py --report-observed-hold`, actor `sweep:dirty-clone-parked`), once per
-tick per project, but only when **both** hold:
+A HOLD is acknowledged (`observed_state=hold`) by a launched conductor. An acknowledgement counts
+only if it is not older than the request: `observed_at >= desired_at`, compared as instants; when
+a timestamp is missing, `observed_state` alone decides. An `observed: hold` left over from an
+earlier hold is stale, so the project is probed and launched again like an unacknowledged one. A
+project that launches nothing this tick (its clone is parked, or it simply has nothing to launch)
+used to stay `HOLD NOT ACKNOWLEDGED` indefinitely. The sweep now writes that acknowledgement itself
+(`scripts/loop_control.py --report-observed-hold --why <why>`, actor `sweep:dirty-clone-parked`
+for a parked clone, `sweep:no-launch` otherwise), once per tick per project, but only when
+**both** hold:
 
 - no candidate of that project launched this tick, and
 - `state/conductor-inflight.json` exists, parses, and has neither a row for that project nor a
   `*` row.
+
+This covers a project with **no candidate at all** too: a project listed only under `clones` or
+sweep.json `projects` has its control read by the 1c / declared-projects scans, and a hold there
+that is not freshly acknowledged is logged as `HOLD NOT ACKNOWLEDGED [<project>]: no candidate …`
+and acknowledged with `sweep:no-launch`. A held project the sweep config does not mention anywhere
+is never read, so it is not acknowledged.
 
 The ledger is how the sweep knows no orphaned conductor may still be running the project:
 
@@ -925,6 +935,27 @@ the **absolute** path of `pwsh` (resolved at registration and shown by `-DryRun`
 does not resolve a bare `pwsh`, and a Store-installed one failed every launch with `0x80070002`
 without writing a line. Registration stops if no absolute path can be resolved.
 
+That pwsh is started by `deploy\headless_launch.py` running under `pythonw.exe`. The task's
+`Execute` is `pythonw.exe`, and `Arguments` is
+`-I "<checkout>\deploy\headless_launch.py" --limit-seconds <N> "<pwsh>" -NoProfile -File ...`.
+
+- **No window.** Launched directly, pwsh opened a console window on every tick and took keyboard
+  focus from whatever the operator was typing into. pythonw has no window, and it starts pwsh with
+  `CREATE_NO_WINDOW`.
+- **The limit still stops a hung tick.** `conhost.exe --headless` also hides the window, but then
+  the task's `ExecutionTimeLimit` stops only conhost and leaves pwsh running. So the launcher stops
+  pwsh itself after `<N>` seconds: the task limit minus 30 s, which keeps the task limit as an
+  outer backstop. A tick stopped this way reports `LastTaskResult` 121. Otherwise the task
+  reports pwsh's own exit code.
+- **Which pythonw.** By default it is the one next to `uv python find --system`; pass `-Pythonw`
+  to choose another. A venv's `pythonw.exe` is refused, because it is only a stub that starts the
+  real interpreter as a second process. Registration stops if no pythonw or launcher is found.
+
+After changing the registered action, run `pwsh -NoProfile -File tests\Test-StallLedgerTaskHeadless.ps1`
+on the loop host. It registers throwaway tasks from the script's own `-DryRun` output, and checks
+that the wrapper runs with no visible window, that a hung wrapper is stopped at the limit, and that
+the exit code comes through.
+
 Re-running it replaces an existing `mindwire-stall-ledger` task with this script's definition
 (`-Force`). Success is decided by reading the task back, not by whether `Register-ScheduledTask`
 threw: the script compares Execute / Arguments / RepetitionInterval / ExecutionTimeLimit of the
@@ -958,6 +989,12 @@ the thread's `N`:
 | B | `STOP: done` | never opens; an open record closes |
 | C | anything else: `NEXT: none` without `STOP:`, no `NEXT:`, a refused form, field ≠ body | 6h |
 | D | `BLOCKED-ON:` (any trigger, never evaluated), `NEXT: human`, a well-formed `NEXT: operator` | 72h for now; D-16d-2 sets `T_WAIT_AUTO` / `T_WAIT_MANUAL` |
+
+The hand-off to the PR-gate uses only the body line `NEXT: pr-review <owner/repo#n>`. The
+`next_participant` field cannot carry it. Magickit's writer accepts only names of registered
+identities and has no gate sentinel, by the owner's decision (msg-072 §2). It therefore refuses
+`pr-review <ref>` and bare `pr-review`. The reader's field branch for the sentinel is only a
+fail-safe.
 
 A head the tick could not read yet is treated as C with the old 72h. It is counted in the
 heartbeat's `pending_heads` and read on a later tick; `head_fetches` is the number of reads this

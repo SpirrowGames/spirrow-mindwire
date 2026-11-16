@@ -256,7 +256,9 @@ def _seed_r5(mcp: _FakeChatroomMcp) -> None:
         author=RELAY_AUTHOR,
         content=(
             "earlier route\n\nNEXT: Heisenberg\n\n"
-            + render_ci_route_marker(head=_HEAD, conclusion="failure", checks=["CI"])
+            + render_ci_route_marker(
+                head=_HEAD, cause="ci-red", conclusion="failure", checks=["CI"]
+            )
         ),
     )
     mcp.seed(author="Heisenberg", content=f"tried\n\nNEXT: pr-review {_PR}")

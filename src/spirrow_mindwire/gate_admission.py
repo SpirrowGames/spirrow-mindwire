@@ -27,7 +27,8 @@ sized in §A-2.
 
 *Signature-level enforcement of the boundary (design §B-2, INV-CI-2 改).* The
 function takes ``rollup``, ``head_sha``, ``head_committed_date``, ``now``,
-``nomination_is_self``, ``verdict_heads``, ``ci_red_routed_heads`` — and no
+``nomination_is_self``, ``verdict_heads``, ``implementer_routed_heads``,
+``head_conflicting``, ``mergeable_unknown_since`` — and no
 ``verdict``. Reading the PR-gate verdict content is therefore *structurally*
 out of reach here. That is the invariant PR-review msg-2554 asked for by
 name: carve-out ② (the PR-gate verdict relay) cannot be re-expressed inside
@@ -69,6 +70,21 @@ carries the ID for auditability and metrics.
   from R6-only to all admission states. Without this, an operator summoned by
   R3 or R5 was trapped: their manual re-nomination hit the same escalation
   and re-summoned them (PR-review msg-(gate) BLOCKING-2).
+* **R1c** — ``head_conflicting is True`` (GitHub ``mergeable == CONFLICTING``) AND the head is
+  NOT in ``implementer_routed_heads``. ``ROUTE_IMPLEMENTER``: merge the base, resolve the
+  conflict, push, and hand back with ``NEXT: pr-review``. Judged BEFORE every rollup rule and
+  whatever the rollup says (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.2, Obj-1-1): a
+  conflicting head cannot be merged as it stands, and its CI — empty because GitHub could not
+  build the merge ref, or green / red / pending against an old base — is about a merge that
+  will not happen. Waiting on it (R2), routing a CI fix for it (R4), deduping on it (R6), or
+  approving it (R1b / R7) all answer the wrong question. The empty-rollup case is how this
+  rule was found: a conflicting PR got no pull_request CI run, R1a deferred for 5 min, and R1b
+  then read the empty rollup as "no CI configured" (#370).
+* **R1d** — ``head_conflicting is True`` AND the head IS in ``implementer_routed_heads``.
+  ``ROUTE_HUMAN`` (the R5 treatment): the implementer was already sent back once on this head
+  — for a conflict, or for red CI — and did not push. ``implementer_routed_heads`` is ONE set
+  for both causes, so the two cross-cause cases (R4, then the same head conflicts → R1d; R1c,
+  then the same head goes red → R5) both end at a human, by design (v0.2).
 * **R1a** — rollup is empty AND ``now - head_pushed_at <= CAP_EMPTY_RACE``.
   ``DEFER``. The GitHub Actions CheckSuite is not populated instantly on push
   — the checks API can return ``[]`` for several seconds after the ref moves
@@ -109,7 +125,7 @@ carries the ID for auditability and metrics.
   one round should not be dispatched again without a human deciding. Operator
   who wants a retry on the same red head does so by manual handoff (R0-OVERRIDE
   path) or by pushing a new commit (which rotates the head out of
-  ``ci_red_routed_heads``).
+  ``implementer_routed_heads``).
 * **R6** — CI green and a prior gate verdict already lives on this head in
   this thread. ``ALREADY_REVIEWED``. Do not re-invoke the model; the earlier
   verdict's ``NEXT:`` line is authoritative. This branch is only reached from
@@ -117,6 +133,19 @@ carries the ID for auditability and metrics.
   handoffs), so the ``nomination_is_self`` check that used to guard it is
   redundant and has been removed in v0.3.2 — the semantics are unchanged.
 * **R7** — CI green (default). ``INVOKE``.
+* **R1e / R1f** — applied LAST, as a replacement: when the rows above answered ``INVOKE``
+  (R1b or R7 — the only rows from which the gate can APPROVE) and ``head_conflicting is None``
+  (GitHub ``mergeable == UNKNOWN``, still computing — typically right after the base moved),
+  the gate is not fired on a PR whose mergeability nobody knows yet. **R1e** ``DEFER`` while
+  ``mergeable_unknown_since`` is ``None`` (the caller then records the start) or no more than
+  :data:`CAP_MERGE_UNKNOWN` ago; **R1f** ``ROUTE_HUMAN`` past it. Every other row is left as it
+  was: DEFER / ROUTE_* / ALREADY_REVIEWED cannot APPROVE (v0.3). The clock is NOT a GitHub
+  timestamp: ``updatedAt`` moves on every PR event, so a busy PR never reached the cap
+  (Obj-3-1), and ``committedDate`` predates the UNKNOWN by the whole review, so nearly every PR
+  went straight to R1f (Obj-4-1). It is the time the conductor first observed UNKNOWN on this
+  (head, base), recorded in a ``mindwire:mergeable-unknown`` marker (v0.5 / v0.5') and passed
+  back in. R0-OVERRIDE still precedes everything: a person who writes the ``pr-review``
+  hand-off by hand fires the gate whatever ``mergeable`` says.
 
 INV-CI-1 (design §A-1): the naysayer model is invoked at most once per
 ``(head_sha, ci_conclusion)`` pair *along the self-nomination path*. Manual
@@ -294,6 +323,14 @@ CAP_NOCLOCK: timedelta = timedelta(hours=12)
 #: cherry-pick or a re-pushed existing branch stays in the grace window.
 CAP_EMPTY_RACE: timedelta = timedelta(minutes=5)
 
+#: How long R1e may DEFER a would-be INVOKE while GitHub answers ``mergeable == UNKNOWN``
+#: (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.3). Measured from ``mergeable_unknown_since``
+#: — the conductor's own record of the first UNKNOWN on this (head, base) — never from a GitHub
+#: clock (see the R1e / R1f entry in the module docstring). GitHub normally settles
+#: ``mergeable`` within seconds of being asked, and the caller re-reads twice within the tick
+#: before deferring at all, so 15 min of UNKNOWN means GitHub is not settling it: a human looks.
+CAP_MERGE_UNKNOWN: timedelta = timedelta(minutes=15)
+
 
 def _concluded(rollup: Sequence[CheckRow]) -> bool:
     """Rollup is non-empty and every check's ``status`` equals :data:`COMPLETED`.
@@ -390,11 +427,13 @@ def gate_admission(
     now: datetime,
     nomination_is_self: bool,
     verdict_heads: frozenset[str],
-    ci_red_routed_heads: frozenset[str],
+    implementer_routed_heads: frozenset[str],
+    head_conflicting: bool | None,
+    mergeable_unknown_since: datetime | None,
 ) -> AdmissionResult:
     """Answer whether the PR gate may be invoked now, and if not who is next.
 
-    See the module docstring for the admission table (R0 / R1a / R1b / R2-R7).
+    See the module docstring for the admission table (R0 / R1a-R1f / R2-R7).
     This function is pure — no I/O, no clock reads (``now`` is passed in), no
     mutable state. Every observation the caller must lift from the world is a
     parameter, so a fake CI rollup + a fixed ``now`` deterministically drives
@@ -417,7 +456,7 @@ def gate_admission(
         fetch should be raised at the caller, not passed in as empty.
     head_sha :
         The PR's current head SHA. Used to key ``verdict_heads`` and
-        ``ci_red_routed_heads`` and to identify the PR in the escalation
+        ``implementer_routed_heads`` and to identify the PR in the escalation
         message (R3/R5).
     head_committed_date :
         The commit's ``committedDate`` (the ``authored_date`` is not right —
@@ -459,12 +498,29 @@ def gate_admission(
         The set of head SHAs on which a PR-gate verdict already exists in
         this thread. Derived by the caller from the thread's ``pr-gate-relay``
         author messages (a marker or heading naming the head is enough).
-    ci_red_routed_heads :
-        The set of head SHAs the implementer has already been dispatched for
-        a CI-red fix on. Derived from ``<!-- mindwire:ci-route v1 ... -->``
-        markers the conductor writes on R4 (design §A-5). A head appears
-        here at most once per red-then-push cycle: R5 fires the second time
-        the same head goes red *without* an intervening push.
+    implementer_routed_heads :
+        The set of head SHAs the implementer has already been sent back on,
+        for either cause: a CI-red fix (R4) or a base conflict (R1c). Derived
+        from the ``<!-- mindwire:ci-route v1 ... -->`` markers the conductor
+        writes on both rules (design §A-5; the marker's ``cause`` tells a
+        reader which, and is not read here). Renamed from
+        ``ci_red_routed_heads`` when R1c started writing the same marker
+        (v0.2, Obj-1-2): the old name would now misdescribe the set. R5 / R1d
+        fire the second time the same head needs the implementer *without*
+        an intervening push.
+    head_conflicting :
+        GitHub's ``PullRequest.mergeable`` for the head: ``True`` for
+        ``CONFLICTING`` (R1c / R1d), ``False`` for ``MERGEABLE``, ``None`` for
+        ``UNKNOWN`` (still computing — R1e / R1f may replace an INVOKE). No
+        default, deliberately: a caller that forgot to pass it would
+        otherwise silently re-open the misread this parameter exists to close.
+    mergeable_unknown_since :
+        When the conductor first observed ``mergeable == UNKNOWN`` on this
+        (head, base), read back from its ``mindwire:mergeable-unknown``
+        marker, or ``None`` when there is no such record yet. Read only by
+        R1e / R1f; ``None`` there means "start the clock now" (R1e, and the
+        caller writes the marker). The reader drops a marker whose time lies
+        in the future, so a caller never passes a value later than ``now``.
 
     Returns
     -------
@@ -488,6 +544,74 @@ def gate_admission(
             ),
         )
 
+    # R1c / R1d: the head conflicts with its base. Whatever the rollup says — empty (no merge
+    # ref, so no pull_request CI: the #370 misread), pending, red or green — it is about a merge
+    # that cannot happen, so it is judged before every rollup rule (v0.2, Obj-1-1).
+    if head_conflicting is True:
+        if head_sha in implementer_routed_heads:
+            return AdmissionResult(
+                admission=GateAdmission.ROUTE_HUMAN,
+                rule="R1d",
+                reason=(
+                    f"{head_sha[:12]} conflicts with its base, and the implementer was already "
+                    f"sent back on this head with no new push — implementer loop-safety "
+                    f"escalation"
+                ),
+            )
+        return AdmissionResult(
+            admission=GateAdmission.ROUTE_IMPLEMENTER,
+            rule="R1c",
+            reason=(
+                f"{head_sha[:12]} conflicts with its base (mergeable=CONFLICTING): routing to "
+                f"implementer to merge the base and resolve"
+            ),
+        )
+
+    table = _rollup_table(
+        rollup=rollup,
+        head_sha=head_sha,
+        head_committed_date=head_committed_date,
+        head_pushed_at=head_pushed_at,
+        now=now,
+        verdict_heads=verdict_heads,
+        implementer_routed_heads=implementer_routed_heads,
+    )
+    # R1e / R1f replace only an INVOKE (R1b / R7) — the one exit from which the gate can APPROVE
+    # — and only while GitHub has not said whether the head merges (v0.3).
+    if table.admission is not GateAdmission.INVOKE or head_conflicting is not None:
+        return table
+    if mergeable_unknown_since is None or now - mergeable_unknown_since <= CAP_MERGE_UNKNOWN:
+        since = "now" if mergeable_unknown_since is None else mergeable_unknown_since.isoformat()
+        return AdmissionResult(
+            admission=GateAdmission.DEFER,
+            rule="R1e",
+            reason=(
+                f"mergeable UNKNOWN on {head_sha[:12]} (would have been {table.rule}); "
+                f"unknown since {since}, cap={CAP_MERGE_UNKNOWN}: waiting for GitHub to settle it"
+            ),
+        )
+    return AdmissionResult(
+        admission=GateAdmission.ROUTE_HUMAN,
+        rule="R1f",
+        reason=(
+            f"GitHub has not settled mergeable on {head_sha[:12]}: UNKNOWN since "
+            f"{mergeable_unknown_since.isoformat()}, past cap={CAP_MERGE_UNKNOWN} "
+            f"(would have been {table.rule})"
+        ),
+    )
+
+
+def _rollup_table(
+    *,
+    rollup: Sequence[CheckRow],
+    head_sha: str,
+    head_committed_date: datetime,
+    head_pushed_at: datetime,
+    now: datetime,
+    verdict_heads: frozenset[str],
+    implementer_routed_heads: frozenset[str],
+) -> AdmissionResult:
+    """R1a / R1b / R2-R7: the rollup half of the table, which the mergeable rules leave as is."""
     # R1a / R1b: empty rollup. Distinguish "CheckSuite has not populated yet"
     # (a transient race on GitHub Actions startup latency, PR-review msg-(gate)
     # BLOCKING-1) from "this PR genuinely has no CI configured" by the age of
@@ -554,8 +678,8 @@ def gate_admission(
         # second time without a human deciding. An operator who wants to
         # retry the implementer despite the loop-safety escalation does so
         # via a manual handoff (R0-OVERRIDE path above) or by pushing a new
-        # commit (which rotates the head out of ci_red_routed_heads).
-        if head_sha in ci_red_routed_heads:
+        # commit (which rotates the head out of implementer_routed_heads).
+        if head_sha in implementer_routed_heads:
             return AdmissionResult(
                 admission=GateAdmission.ROUTE_HUMAN,
                 rule="R5",

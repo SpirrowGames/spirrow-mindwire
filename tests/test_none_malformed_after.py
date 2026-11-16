@@ -1,12 +1,16 @@
-"""Boundary 5-A: the ``NEXT: none`` cutoff (``handoff.NONE_MALFORMED_AFTER``), shipped as ``None``.
+"""Boundary 5: the ``NEXT: none`` cutoff (``handoff.NONE_MALFORMED_AFTER``).
 
 T-done-disposition-auto-close, Bohr msg-8455 §3 / msg-8556 §3. The rule: with a cutoff set, a
 legacy ``NEXT: none`` (with or without the old ``STOP:`` line above it) posted at or after the
 cutoff -- or at an unknown time, or at a time with no timezone -- is MALFORMED
 (``legacy_none_after_cutoff``) and stops with the notice; one posted before it is read as it always
-was. The new forms and every other ``NEXT:`` token are not affected. 5-A ships no cutoff, so every
-reader answers exactly as before; the cells below set one through the explicit argument (or by
-monkeypatching the constant for readers that do not take the argument), as the 5-B commit will.
+was. The new forms and every other ``NEXT:`` token are not affected.
+
+5-A shipped the rule with no cutoff; 5-B (Bohr msg-9235 §3) set the constant. Three groups of
+cells: the SHIPPED value, read through the constant exactly as production reads it
+(``test_the_shipped_cutoff_*``); the rule at a test-local cutoff, through the explicit argument or
+the ``cut`` fixture; and the no-cutoff column (``no_cutoff`` fixture: the constant set to
+``None`` by name, the pre-5-B state that a revert of 5-B returns to).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from legacy_none_time import PRE_CUTOFF, PRE_CUTOFF_STAMP
 from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher
 from test_decider_step2 import _conductor_with
 from test_stop_disposition_slice3 import _ROSTER, _Gh, _TickMcp
@@ -76,11 +81,74 @@ OTHER_BODIES = [
 ]
 
 
-def test_the_cutoff_ships_unset() -> None:
-    """5-A is code only: no cutoff, so no reader changes (msg-8556 §3 5A-1)."""
-    assert handoff_mod.NONE_MALFORMED_AFTER is None
+SHIPPED = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
+
+# (cell id, posted_at, refused?) around the SHIPPED value. No argument, no monkeypatch.
+SHIPPED_CELLS = [
+    ("before", SHIPPED - timedelta(seconds=1), False),
+    ("exactly", SHIPPED, True),
+    ("after", SHIPPED + timedelta(hours=1), True),
+    ("unknown", None, True),
+    ("naive", datetime(2026, 11, 1, 0, 0), True),  # no timezone: unknown, whatever it says
+]
 
 
+def test_the_shipped_cutoff_value() -> None:
+    """5-B (msg-9235 §3-1): the instant, and that it carries a timezone.
+
+    A timezone-less cutoff would raise on the first comparison with a real ``posted_at``; a
+    non-UTC one would still compare correctly, but the constant is written in UTC so that it
+    reads the same in a log line and in the source.
+    """
+    assert handoff_mod.NONE_MALFORMED_AFTER == SHIPPED
+    assert handoff_mod.NONE_MALFORMED_AFTER is not None
+    assert handoff_mod.NONE_MALFORMED_AFTER.utcoffset() == timedelta(0)
+
+
+def test_the_shared_pre_cutoff_time_is_before_the_shipped_cutoff() -> None:
+    """``legacy_none_time.PRE_CUTOFF`` is what the tests of the legacy reading pass as the posting
+    time; they only read history while it is before the cutoff. The string form is the same
+    instant."""
+    assert PRE_CUTOFF < SHIPPED
+    assert posted_at_of({"timestamp": PRE_CUTOFF_STAMP}) == PRE_CUTOFF
+
+
+@pytest.mark.parametrize("body", LEGACY_BODIES)
+@pytest.mark.parametrize(("cell", "posted_at", "refused"), SHIPPED_CELLS)
+def test_the_shipped_cutoff_is_what_the_readers_apply(
+    body: str, cell: str, posted_at: datetime | None, refused: bool
+) -> None:
+    """Before / exactly / after / no time, through the constant as shipped (msg-9235 §3-4)."""
+    got = resolve_handoff(body, _ROSTER, posted_at=posted_at)
+    if refused:
+        assert got.kind is HandoffKind.ABSENT, cell
+        assert got.malformed is MalformedHandoff.LEGACY_NONE_AFTER_CUTOFF
+        assert got.stop_line is None
+    else:
+        assert got.kind is HandoffKind.NONE, cell
+        assert got.malformed is None
+    assert none_refused_after_cutoff(body, posted_at=posted_at) is refused
+    assert (parse_head_token(body, posted_at=posted_at) == "") is refused
+    assert stage1_skips(body, posted_at=posted_at) is not refused
+    assert (stop_line_of(body, _ROSTER, posted_at=posted_at) is None) is refused
+
+
+def test_the_shipped_cutoff_leaves_the_new_forms_and_other_tokens() -> None:
+    after = SHIPPED + timedelta(hours=1)
+    assert body_disposition("x\n\nSTOP: done", _ROSTER, posted_at=after) == {"kind": "done"}
+    assert parse_head_token("x\n\nSTOP: done", posted_at=after) == "none"
+    for body in OTHER_BODIES:
+        assert not none_refused_after_cutoff(body, posted_at=after)
+        assert not none_refused_after_cutoff(body, posted_at=None)
+
+
+@pytest.fixture
+def no_cutoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-5-B column: no cutoff at all (the constant ``None``), so no reader changes."""
+    monkeypatch.setattr(handoff_mod, "NONE_MALFORMED_AFTER", None)
+
+
+@pytest.mark.usefixtures("no_cutoff")
 @pytest.mark.parametrize("body", LEGACY_BODIES + OTHER_BODIES)
 @pytest.mark.parametrize("posted_at", [None, BEFORE, CUTOFF, AFTER, NAIVE])
 def test_no_cutoff_changes_nothing(body: str, posted_at: datetime | None) -> None:
@@ -91,11 +159,14 @@ def test_no_cutoff_changes_nothing(body: str, posted_at: datetime | None) -> Non
     assert stage1_skips(body, posted_at=posted_at) is stage1_skips(body)
 
 
+@pytest.mark.usefixtures("no_cutoff")
 @pytest.mark.parametrize("body", LEGACY_BODIES)
 @pytest.mark.parametrize(("cell", "posted_at", "refused"), TIME_CELLS)
 def test_legacy_none_with_a_cutoff(
     body: str, cell: str, posted_at: datetime | None, refused: bool
 ) -> None:
+    # ``no_cutoff`` only makes the time-less baseline below the legacy reading; the cutoff under
+    # test is the explicit argument.
     got = resolve_handoff(body, _ROSTER, posted_at=posted_at, none_malformed_after=CUTOFF)
     if refused:
         assert got.kind is HandoffKind.ABSENT, cell

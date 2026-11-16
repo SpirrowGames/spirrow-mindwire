@@ -99,7 +99,13 @@ from ..decider.hook import (
 from ..decider.result import DecisionResult
 from ..decider.verdict import TierCV2Verdict, TierCVerdictKind
 from ..exceptions import AdapterSpawnTimeoutError
-from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
+from ..gate_admission import (
+    CAP_MERGE_UNKNOWN,
+    RED_CONCLUSIONS,
+    AdmissionResult,
+    GateAdmission,
+    gate_admission,
+)
 from ..git_sync import GitSyncDeferredError, GitSyncParkError
 from ..git_sync.notice import git_sync_park_event, render_git_sync_park_notice
 from ..github.client import CheckRollup, PrRef, PrState, parse_pr_ref
@@ -153,14 +159,18 @@ from .continuation_ledger import AttemptOutcome, record_admitted, record_attempt
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
 from .disposition import StopClass, classify_stop
 from .gate_records import (
+    CI_ROUTE_CI_RED,
+    CI_ROUTE_CONFLICT,
     MERGE_WAIT_LINE,
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
     is_merge_wait_relay,
+    mergeable_unknown_since,
     normalize_sha,
     render_admission_heading,
     render_ci_route_marker,
+    render_mergeable_unknown_marker,
     verdict_heads,
 )
 from .gate_resume import (
@@ -173,8 +183,9 @@ from .gate_resume import (
     verify_resume,
 )
 from .handoff import (
+    HUMAN_TASK_FORM_EXAMPLE,
+    HUMAN_TASK_KEYWORD,
     HUMAN_TOKEN,
-    OPERATOR_FORM_EXAMPLE,
     OPERATOR_TOKEN,
     STOP_DONE,
     Handoff,
@@ -188,6 +199,7 @@ from .handoff import (
     parse_next_token,
     posted_at_of,
     resolve_handoff,
+    scope_fermi_handoff,
 )
 from .head_skip import stage1_skips
 from .human_identity import is_human_identity
@@ -271,6 +283,13 @@ DEFAULT_REVIEW_LOGIN: str = NaysayerGatingConfig.model_fields["review_login"].de
 #: legitimate list, so a route around the invariant is structurally impossible).
 CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
 
+#: In-tick re-reads of the rollup while GitHub answers ``mergeable == UNKNOWN``
+#: (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.3 §1). Asking for ``mergeable`` is what makes
+#: GitHub start computing it, and it normally settles within seconds, so most UNKNOWNs end
+#: inside the tick and never reach R1e. At most two extra GraphQL reads, and only on UNKNOWN.
+MERGEABLE_REREADS = 2
+MERGEABLE_REREAD_DELAY_S = 2.0
+
 GUARD_I_REDIRECT_TITLE = "Conductor stop — guard (i) redirect"
 """The first-line prefix of every guard-(i) redirect relay — how a reader (the read-only census,
 ``scripts/guard_i_latch_census.py``) recognises one without re-spelling the body."""
@@ -299,8 +318,9 @@ def _operator_fault_notice(fault: OperatorFault) -> str:
     """
     if fault is OperatorFault.TIER_C_CONFLICT:
         cause = (
-            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は operator には"
-            "渡せません (protocol 違反: Tier-C を operator に渡そうとした)。"
+            "同じメッセージに `TIER-C:` 行があります。Tier-C を宣言した作業は手作業の依頼"
+            f"(`{HUMAN_TASK_KEYWORD}:` 形式 / 旧 `NEXT: {OPERATOR_TOKEN}`) としては渡せません "
+            "(protocol 違反: Tier-C を手作業として渡そうとした)。"
         )
         fix = (
             "次にやること: Tier-C の作業として、次の形で human に渡し直してください。\n\n"
@@ -308,17 +328,21 @@ def _operator_fault_notice(fault: OperatorFault) -> str:
         )
     else:
         if fault is OperatorFault.NO_TASK:
-            cause = "`OPERATOR-TASK:` 行がありません (`NEXT:` の 2 行上に必要です)。"
+            cause = (
+                f"作業を書いた `{HUMAN_TASK_KEYWORD}:` 行 (旧形式では `OPERATOR-TASK:` 行) が "
+                "`NEXT:` の 2 行上にありません。"
+            )
         else:
-            cause = f"`NEXT: {OPERATOR_TOKEN}` の直上の行が `TIER-C-CHECK: none` ではありません。"
-        indented = "\n".join(f"    {line}" for line in OPERATOR_FORM_EXAMPLE.splitlines())
+            cause = "`NEXT:` の直上の行が `TIER-C-CHECK: none` ではありません。"
+        indented = "\n".join(f"    {line}" for line in HUMAN_TASK_FORM_EXAMPLE.splitlines())
         fix = (
             "次にやること: 作業が Tier-C のどの型にも当たらないなら、次の 3 行で書き直して"
             f"ください。当たる、または当たりうるなら `TIER-C: <type>` / `NEXT: {HUMAN_TOKEN}` "
             f"で渡してください。\n\n{indented}"
         )
     return (
-        f"Conductor stand-down — `NEXT: {OPERATOR_TOKEN}` を受け付けませんでした\n\n"
+        f"Conductor stand-down — 手作業の依頼 (`{HUMAN_TASK_KEYWORD}:` 形式 / 旧 "
+        f"`NEXT: {OPERATOR_TOKEN}`) を受け付けませんでした\n\n"
         f"理由 (`{fault.value}`): {cause}\n\n"
         f"∴ 誰も spawn せず停止しました。{fix}\n\n"
         f"head が動くまでループは再開しません。\n\n"
@@ -469,6 +493,14 @@ class StopReason(StrEnum):
     # roster-free sweep parks as settled but the roster refuses never reaches the conductor; the
     # park-wake tick posts the same notice for it (park_wake/runner.py, PR #531 gate msg-8190).
     MALFORMED_HANDOFF = "malformed_handoff"
+    # T-next-names-unspawnable-identity (Bohr msg-8709 PR-1, D2): the head's ``NEXT:`` names an
+    # identity whose embodiment no adapter here can run (ADR-2026-09-14-21 D-2 / D-3 — Fermi is
+    # the first such identity). Nobody is spawned and a notice ending ``NEXT: human`` says so. Kept
+    # apart from ``HUMAN`` because it is not a decision: the request was never delivered, and the
+    # notification must say that and name the target instead of "判断待ち". The stop line carries
+    # ``blocked_target=<ADR-11 partition key>`` after ``last_msg=`` so the sweep can put the name
+    # in that notification.
+    UNSPAWNABLE_TARGET = "unspawnable_target_to_human"
 
 
 class SummonOwnerSource(Protocol):
@@ -664,6 +696,9 @@ class Conductor:
         # The tags of the last ``chatroom_get_thread`` read (None until one succeeds or when
         # the response carries none) — handed to every event for the naysayer's N-3 routing.
         self._thread_tags: tuple[str, ...] | None = None
+        # ``thread.owner`` of the same read (None until one succeeds or when it carries none):
+        # the D2 scope of ``NEXT: Fermi`` (:func:`.handoff.scope_fermi_handoff`).
+        self._thread_owner: str | None = None
         self._roster = dict(roster)
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
@@ -916,8 +951,22 @@ class Conductor:
                 # read the conductor stopped on NO_HANDOFF. Absent field ⇒ backward-compatible
                 # body-only routing (rows 1-2 of §3-1's truth table).
                 next_participant=_next_participant(latest),
-                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED.
+                # Boundary 5: a legacy ``NEXT: none`` posted after the cutoff is MALFORMED (and,
+                # once its cutoff is set, a ``NEXT: operator``).
                 posted_at=posted_at_of(latest),
+            )
+            # D2 (msg-8871 / msg-8874): ``NEXT: Fermi`` only on a thread Fermi owns. Applied to
+            # the handoff every branch below reads, so the refusal reaches ``_route`` as a
+            # malformed head -- stopped, with its notice, ahead of the spawnability check that
+            # would otherwise park it as an ordinary spawn-blocked stop.
+            # Both raw sides go in with the reconciled handoff: a Fermi named on either side is
+            # refused even when reconciliation made the target something else (PR #562 gate,
+            # finding 1).
+            handoff = scope_fermi_handoff(
+                handoff,
+                thread_owner=self._thread_owner,
+                body=_content(latest),
+                next_participant=_next_participant(latest),
             )
             # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
             # HUMAN (safety valve) and carries the divergence so we can log it as observability
@@ -988,11 +1037,22 @@ class Conductor:
                 # read) falls through to the pre-wiring path below unchanged.
                 admitted = await self._admit(parsed_ref, latest, messages)
                 if admitted is not None:
-                    decision, rollup = admitted
+                    decision, rollup, unknown_since = admitted
                     if decision.admission is GateAdmission.DEFER:
-                        # R1a / R2. Post nothing, summon nobody: the next tick re-derives this
-                        # from a fresh rollup. This is where §5.2A.7's "pending gate invocations
-                        # 3 → 0" and "relay COMMENT noise 3 → 0" are actually paid.
+                        # R1a / R2 / R1e. Post nothing, summon nobody: the next tick re-derives
+                        # this from a fresh rollup. This is where §5.2A.7's "pending gate
+                        # invocations 3 → 0" and "relay COMMENT noise 3 → 0" are actually paid.
+                        # The one exception is the FIRST R1e on a (head, base): it records when
+                        # the UNKNOWN started, which is the R1e / R1f clock (v0.5').
+                        if decision.rule == "R1e" and unknown_since is None:
+                            wait_msg = await self._post_mergeable_unknown(parsed_ref.slug, rollup)
+                            return self._stop(
+                                round_index,
+                                StopReason.CI_WAIT,
+                                _msg_id(wait_msg) or latest_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
                         return self._stop(
                             round_index, StopReason.CI_WAIT, latest_msg_id, forced, forced_saveable
                         )
@@ -1017,7 +1077,9 @@ class Conductor:
                             forced_saveable,
                         )
                     if decision.admission is GateAdmission.ROUTE_HUMAN:
-                        # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push).
+                        # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push) /
+                        # R1d (sent back once already, still conflicting on the same head) /
+                        # R1f (GitHub left mergeable UNKNOWN past CAP_MERGE_UNKNOWN).
                         # The escalation is POSTED, not merely returned: a human summoned without
                         # the reason in the thread is a stop nobody can act on, and ``reason``
                         # already names the stuck checks and which clock decided.
@@ -1033,8 +1095,10 @@ class Conductor:
                         )
                     if decision.admission is GateAdmission.ROUTE_IMPLEMENTER:
                         # R4: first red on this head (E-CI-RED — the CI-fix edge, NOT carve-out
-                        # ②; no verdict exists to relay). The ci-route marker on this post is
-                        # what lets the NEXT tick's R5 tell a second red apart from this one.
+                        # ②; no verdict exists to relay). R1c: first conflict on this head — the
+                        # same edge and the same single path; only the post's instruction and
+                        # its marker's ``cause`` differ. The ci-route marker on this post is what
+                        # lets the NEXT tick's R5 / R1d tell a second time apart from this one.
                         route_msg = await self._post_ci_route(parsed_ref.slug, decision, rollup)
                         route_msg_id = _msg_id(route_msg)
                         implementer_identity = self._implementer_identity
@@ -1077,7 +1141,8 @@ class Conductor:
                             return gave_up
                         processed_msg_id = route_msg_id
                         continue
-                    # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
+                    # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through. R1b / R7
+                    # reach here only when mergeable is known (R1e / R1f replace them otherwise).
                 relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
@@ -1343,6 +1408,7 @@ class Conductor:
                     forced,
                     forced_saveable,
                     stop_class=self._none_stop_class(handoff, latest, stop_reason),
+                    blocked_target=self._blocked_target(handoff, stop_reason),
                 )
             # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
             # count describes the head this launch started on; a later round is on a head this
@@ -1835,14 +1901,16 @@ class Conductor:
         # arriving at the human with "NEXT: could not be read" — a true statement that names the
         # wrong cause.
         #
-        # The stop is ``StopReason.HUMAN``: the ADR says ``NEXT: Fermi`` is the same stop
-        # condition as ``NEXT: human``, and an operator's notification set is keyed on the reason
-        # string. What it deliberately does NOT do is route through :meth:`_human_terminal`, i.e.
-        # it does not force an Obj2 naysayer consult first. That consult exists to put an
-        # independent review in front of an *un-reviewed agent proposal* before a human approves
-        # it; a nomination nobody can start is a routing dead end, not a proposal. Forcing a
-        # Gemini call on it would spend the review budget on a turn that has nothing to review,
-        # and it would also delay the thread post below by a round.
+        # The stop is ``StopReason.UNSPAWNABLE_TARGET`` (msg-8709 D2; it was ``HUMAN`` before): the
+        # ADR says ``NEXT: Fermi`` is the same stop condition as ``NEXT: human`` — a person has to
+        # act — but it is not a decision, and a ``human`` notification read "あなたの判断待ち" with
+        # no sign that the request never reached its target. The reason is in the sweep's
+        # notification map, so it is still heard. What it deliberately does NOT do is route
+        # through :meth:`_human_terminal`, i.e. it does not force an Obj2 naysayer consult first.
+        # That consult exists to put an independent review in front of an *un-reviewed agent
+        # proposal* before a human approves it; a nomination nobody can start is a routing dead
+        # end, not a proposal. Forcing a Gemini call on it would spend the review budget on a turn
+        # that has nothing to review, and it would also delay the thread post below by a round.
         if (blocked := self._spawn_blocked(handoff)) is not None:
             identity, embodiment = blocked
             logger.warning(
@@ -1858,7 +1926,7 @@ class Conductor:
                 is_forced=False,
                 is_saveable=False,
                 spawn_blocked=True,
-                stop_reason=StopReason.HUMAN,
+                stop_reason=StopReason.UNSPAWNABLE_TARGET,
             )
 
         # Self-handoff (design §6.1): the head hands to its own author. Detected here, before
@@ -2387,6 +2455,23 @@ class Conductor:
         embodiment = blocked_embodiment(name, self._embodiments)
         return None if embodiment is None else (name, embodiment)
 
+    def _blocked_target(self, handoff: Handoff, reason: StopReason) -> str | None:
+        """The ``blocked_target=`` value for the stop line, or ``None`` when it carries none.
+
+        Only on :attr:`StopReason.UNSPAWNABLE_TARGET`, and only the ADR-2026-05-29-11 partition
+        key of the blocked identity (``Fermi`` / ``fermi`` → ``fermi``; msg-8707 v0.4 item 1),
+        never the token as the author typed it. A key holds no whitespace by construction, and
+        :func:`normalize_embodiment_table` refuses a key holding ``=`` at load, so the value
+        cannot break the line's ``key=value`` shape. A typo such as ``NEXT: Fermii`` is not in
+        the embodiment table, so it never reaches this stop (it is ``IDENTITY_UNRESOLVED``).
+        """
+        if reason is not StopReason.UNSPAWNABLE_TARGET:
+            return None
+        blocked = self._spawn_blocked(handoff)
+        if blocked is None:
+            return None
+        return normalize_identity_key(blocked[0]) or None
+
     def _is_self_handoff(self, handoff: Handoff, author: str) -> bool:
         """Does ``handoff`` hand back to ``author``?
 
@@ -2444,6 +2529,7 @@ class Conductor:
                 f"(ADR-2026-09-14-21 D-2 / D-3)。\n\n"
                 f"∴ spawn せず、`NEXT: human` と同じ停止として扱いました。"
                 f"これは特例ではなく、adapter を持たない稼働形態すべてに適用される一般則です。\n\n"
+                f"依頼は `{identity}` に配送されていません。\n\n"
                 f"次にやること: `{identity}` に依頼する内容であれば、その本人が投稿してから"
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
@@ -3062,6 +3148,7 @@ class Conductor:
             )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         self._thread_tags = _thread_tags(result)
+        self._thread_owner = _thread_owner(result)
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
@@ -3482,7 +3569,7 @@ class Conductor:
 
     async def _admit(
         self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]
-    ) -> tuple[AdmissionResult, CheckRollup] | None:
+    ) -> tuple[AdmissionResult, CheckRollup, datetime | None] | None:
         """Run pre-gate CI-wait admission for ``pr``, or ``None`` to keep the pre-wiring path.
 
         ``None`` is returned for exactly two situations, and they are deliberately given the
@@ -3528,6 +3615,20 @@ class Conductor:
         a deviation rather than absorbed, because it is the single decision that determines
         whether the mechanism runs at all. Nothing about it weakens a guard: every rule it makes
         reachable ends in the conductor doing *less* (defer, don't re-fire, or stop and ask).
+
+        The mergeable-unknown self-wake (:meth:`_post_mergeable_unknown`) is the one relay post
+        that DOES end ``NEXT: pr-review``. Its author is not the human, so it reads as
+        ``nomination_is_self=True`` and the table applies again on the next tick — which is the
+        point: it is the conductor's own deferral, not an override.
+
+        ``mergeable`` (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.3 / v0.5')
+        ---------------------------------------------------------------------
+
+        When the read says UNKNOWN, the rollup is re-read up to :data:`MERGEABLE_REREADS` times,
+        :data:`MERGEABLE_REREAD_DELAY_S` apart, before admission is asked; a re-read that fails
+        keeps the last good read. The third element of the result is the UNKNOWN start recorded
+        on this thread for the final read's (head, base) — ``None`` when there is none, which on
+        an R1e tells the caller to write one.
         """
         if self._rollup_source is None:
             return None
@@ -3539,16 +3640,28 @@ class Conductor:
                 pr.slug,
             )
             return None
+        for _ in range(MERGEABLE_REREADS):
+            if rollup.head_conflicting is not None:
+                break
+            await asyncio.sleep(MERGEABLE_REREAD_DELAY_S)
+            reread = await self._rollup_source.fetch_check_rollup(pr)
+            if reread is None:
+                break
+            rollup = reread
         relay_bodies = [_content(msg) for msg in messages if _author(msg) == RELAY_AUTHOR]
+        now = datetime.now(UTC)
+        unknown_since = mergeable_unknown_since(relay_bodies, rollup.head_sha, rollup.base_sha, now)
         decision = gate_admission(
             rollup=rollup.rows,
             head_sha=normalize_sha(rollup.head_sha),
             head_committed_date=rollup.head_committed_date,
             head_pushed_at=rollup.head_pushed_at,
-            now=datetime.now(UTC),
+            now=now,
             nomination_is_self=not self._is_human(_author(latest)),
             verdict_heads=verdict_heads(relay_bodies),
-            ci_red_routed_heads=ci_route_heads(relay_bodies),
+            implementer_routed_heads=ci_route_heads(relay_bodies),
+            head_conflicting=rollup.head_conflicting,
+            mergeable_unknown_since=unknown_since,
         )
         logger.info(
             "gate admission for %s: rule=%s admission=%s reason=%s",
@@ -3557,17 +3670,20 @@ class Conductor:
             decision.admission.value,
             decision.reason,
         )
-        return decision, rollup
+        return decision, rollup, unknown_since
 
     async def _post_admission_escalation(
         self, pr_ref: str, decision: AdmissionResult
     ) -> dict[str, Any]:
-        """Post the R3 / R5 escalation so the summoned human can see WHY they were summoned.
+        """Post the R3 / R5 / R1d / R1f escalation so the summoned human can see WHY.
 
-        ``decision.reason`` already names the stuck checks and which clock decided (R3) or that
-        the same head went red twice with no intervening push (R5), so this adds no judgement of
-        its own — it carries a machine string to a human surface. Rare by construction: R3 needs
-        a 6 h / 12 h cap to elapse and R5 needs a second red on an unchanged head.
+        ``decision.reason`` already names the stuck checks and which clock decided (R3), that
+        the same head went red twice with no intervening push (R5), that the implementer was
+        already sent back on a head that still conflicts (R1d), or how long GitHub has left
+        ``mergeable`` UNKNOWN (R1f), so this adds no judgement of its own — it carries a machine
+        string to a human surface. Rare by construction: R3 needs a 6 h / 12 h cap to elapse,
+        R5 / R1d a second send-back on an unchanged head, R1f a 15 min UNKNOWN that two in-tick
+        re-reads did not settle.
         """
         body = (
             f"{render_admission_heading(pr_ref)}\n\n"
@@ -3681,16 +3797,35 @@ class Conductor:
     async def _post_ci_route(
         self, pr_ref: str, decision: AdmissionResult, rollup: CheckRollup
     ) -> dict[str, Any]:
-        """Post the R4 CI-fix dispatch, carrying the one new record design §5.2A.5 sanctions.
+        """Post the R4 CI-fix / R1c conflict dispatch, carrying the ci-route record (§5.2A.5).
 
         The marker is written **only here** — never on a deferral, never on a verdict relay —
         which is what keeps the thread cost of this whole mechanism at "one line, on the rare
-        red". It is also the only reason R5 can exist: a deferral leaves no message, so the
-        thread cannot otherwise distinguish a first red from a second one on the same head.
+        red / conflict". It is also the only reason R5 / R1d can exist: a deferral leaves no
+        message, so the thread cannot otherwise distinguish a first send-back from a second one
+        on the same head. R1c shares this one path (T-ci-wait-misreads-conflicting-pr-as-no-ci
+        v0.2, Obj-1-2); ``decision.rule`` picks the instruction and the marker's ``cause``.
         """
+        if decision.rule == "R1c":
+            marker = render_ci_route_marker(head=rollup.head_sha, cause=CI_ROUTE_CONFLICT)
+            base = rollup.base_sha[:12] or "<unread>"
+            body = (
+                f"{render_admission_heading(pr_ref)}\n\n"
+                f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+                f"{rollup.head_sha[:12]} conflicts with its base (base {base}).\n\n"
+                f"{decision.reason}\n\n"
+                f"The gate was NOT fired — a conflicting head cannot be merged, so its CI is "
+                f"not the question. Merge the PR's base branch into your branch (merge, never "
+                f"rebase), resolve the conflicts, run the gate, push, and hand back with "
+                f"`NEXT: pr-review {pr_ref}`.\n\n"
+                f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
+                f"{marker}"
+            )
+            return await self._post_as_relay(body)
         failing = [row.name for row in rollup.rows if (row.conclusion or "") in RED_CONCLUSIONS]
         marker = render_ci_route_marker(
             head=rollup.head_sha,
+            cause=CI_ROUTE_CI_RED,
             conclusion="failure",
             checks=failing,
         )
@@ -3704,6 +3839,42 @@ class Conductor:
             f"the next tick re-reads the rollup on the new head.\n\n"
             f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
             f"{marker}"
+        )
+        return await self._post_as_relay(body)
+
+    async def _post_mergeable_unknown(self, pr_ref: str, rollup: CheckRollup) -> dict[str, Any]:
+        """Record the first R1e on (head, base) and wake this thread's gate admission again.
+
+        T-ci-wait-misreads-conflicting-pr-as-no-ci v0.5'. Written once per (head, base) — only
+        when :func:`~.gate_records.mergeable_unknown_since` found no record — so an ordinary
+        UNKNOWN, which settles inside the tick's re-reads, posts nothing, and a lasting one posts
+        exactly this. The marker's ``since`` is the R1e / R1f clock; ``NEXT: pr-review`` makes
+        the next tick run admission again (a relay-authored hand-off is ``nomination_is_self``).
+
+        The first line is deliberately neither :func:`~.gate_records.render_admission_heading`
+        nor :func:`~.gate_records.render_relay_heading`, and the post carries no ci-route
+        marker: it is not a verdict (``verdict_heads``), not a send-back
+        (``implementer_routed_heads``), and not an admission post for 1b to report on.
+
+        Chatroom producer surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the intended reader is
+        the conductor itself on its next tick (and a person auditing why the gate waited). When
+        the thread is resolved, :meth:`_post_as_relay` catches :class:`ThreadResolvedError` and
+        logs it — disposition **(3)**, fail loudly in the run log: a resolved thread has no gate
+        left to wait for.
+        """
+        now = datetime.now(UTC)
+        marker = render_mergeable_unknown_marker(
+            head=rollup.head_sha, base=rollup.base_sha, since=now
+        )
+        minutes = int(CAP_MERGE_UNKNOWN.total_seconds() // 60)
+        base = rollup.base_sha[:12] or "<unread>"
+        body = (
+            f"ADMISSION: R1e — mergeable UNKNOWN on {rollup.head_sha[:12]} (base {base}); "
+            f"waiting up to {minutes} min\n\n"
+            f"GitHub has not yet said whether this head merges into its base, so the gate was "
+            f"NOT fired. This is a machine observation, not a review.\n\n"
+            f"{marker}\n\n"
+            f"NEXT: pr-review {pr_ref}"
         )
         return await self._post_as_relay(body)
 
@@ -4150,20 +4321,25 @@ class Conductor:
         *,
         stop_class: StopClass | None = None,
         yield_to: str | None = None,
+        blocked_target: str | None = None,
     ) -> ConductorOutcome:
         # ``stop_class=`` is appended only on a ``NEXT: none`` settle (see ``_none_stop_class``),
         # after ``last_msg=``: the wrapper reads each ``key=`` with its own match
         # (Get-ConductorVerdict), so a field it does not know is ignored. Summon (v1.5 / v1.6):
         # ``yield_to=`` only on SUMMON_YIELD, and ``resume_notice=delivered`` whenever this run sent
         # the turn carrying the resume notice — both can appear on one line (I-SY5).
+        # ``blocked_target=`` only on UNSPAWNABLE_TARGET, directly after ``last_msg=`` (msg-8709
+        # D2): an ADR-11 partition key, which has no whitespace and no ``=`` (see
+        # :meth:`_blocked_target`), so it reads as one token like every other field.
         logger.info(
             "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
-            "forced_naysayer_saveable=%d last_msg=%s%s%s%s",
+            "forced_naysayer_saveable=%d last_msg=%s%s%s%s%s",
             reason.value,
             rounds,
             forced,
             forced_saveable,
             last_msg_id,
+            f" blocked_target={blocked_target}" if blocked_target else "",
             f" stop_class={stop_class.value}" if stop_class is not None else "",
             f" yield_to={yield_to}" if yield_to else "",
             " resume_notice=delivered" if self._resume_notice_delivered else "",
@@ -4191,6 +4367,13 @@ def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
         if bounced:
             ids.add(bounced)
     return frozenset(ids)
+
+
+def _thread_owner(result: Any) -> str | None:
+    """``thread.owner`` of a ``chatroom_get_thread`` response, or None if absent/malformed."""
+    thread = result.get("thread") if isinstance(result, dict) else None
+    owner = thread.get("owner") if isinstance(thread, dict) else None
+    return owner if isinstance(owner, str) and owner.strip() else None
 
 
 def _thread_tags(result: Any) -> tuple[str, ...] | None:

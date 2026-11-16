@@ -29,6 +29,7 @@ from io import StringIO as _StringIO
 from pathlib import Path
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.magickit.client import MagickitMcpError
 
@@ -185,7 +186,8 @@ def test_empty_roster_never_raises_for_any_handoff_shape() -> None:
     # ``none`` is a reserved sentinel — it resolves BEFORE the roster, so an empty roster does
     # not change its outcome. Included so a regression that starts routing NONE through the
     # roster (breaking the resolution order) is caught here too.
-    assert resolve_handoff("NEXT: none", {}).kind is HandoffKind.NONE
+    # (Read as a head posted before the boundary-5 cutoff; after it ``none`` is refused.)
+    assert resolve_handoff("NEXT: none", {}, posted_at=PRE_CUTOFF).kind is HandoffKind.NONE
 
     # ``human`` is the positive control. Same reservation — resolved before roster lookup —
     # so an empty roster must still resolve to HUMAN. This is the specific case parked_humans.py

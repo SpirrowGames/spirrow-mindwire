@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF_STAMP
 
 from spirrow_mindwire import cli
 from spirrow_mindwire.adapters.implementer import _build_prompt
@@ -372,7 +373,13 @@ class _Dispatcher:
 def _thread(head_author: str, head_next: str) -> list[dict[str, Any]]:
     return [
         {"msg_id": "msg-1", "author": "Bohr", "content": "the design", "timestamp": ""},
-        {"msg_id": "msg-2", "author": head_author, "content": f"go\n\nNEXT: {head_next}"},
+        # Stamped before the boundary-5 cutoff, so the ``NEXT: none`` cell is the settle it pins.
+        {
+            "msg_id": "msg-2",
+            "author": head_author,
+            "content": f"go\n\nNEXT: {head_next}",
+            "timestamp": PRE_CUTOFF_STAMP,
+        },
     ]
 
 

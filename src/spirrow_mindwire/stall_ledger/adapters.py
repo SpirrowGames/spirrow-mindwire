@@ -44,6 +44,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
 
+from spirrow_mindwire.conductor.handoff import posted_at_of
 from spirrow_mindwire.github.client import (
     GitHubClient,
     GitHubError,
@@ -241,10 +242,16 @@ class HeadRow:
 
 @dataclass(frozen=True)
 class HeadBody:
-    """The head message as read: its body and its ``next_participant`` field."""
+    """The head message as read: its body, its ``next_participant`` field, its posting time.
+
+    ``posted_at`` is ``posted_at_of(message)``: ``None`` when the message carries no usable
+    timestamp, which the boundary-5 cutoff reads as "after the cutoff". No default -- whoever
+    builds a head says when it was posted.
+    """
 
     content: str
     next_participant: str | None
+    posted_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -695,7 +702,11 @@ class ChatroomThreadAdapter:
                 field_value = msg.get("next_participant")
                 if not isinstance(content, str):
                     return HeadMissing("malformed")
-                return HeadBody(content, field_value if isinstance(field_value, str) else None)
+                return HeadBody(
+                    content,
+                    field_value if isinstance(field_value, str) else None,
+                    posted_at_of(msg),
+                )
         return HeadMissing("missing")
 
     def _row_key(self, item: object) -> str | None:

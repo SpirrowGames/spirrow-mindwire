@@ -96,11 +96,13 @@ $map = Get-StopReasonPhraseMap
 # `NEXT: operator` is work a person must do, so it is heard; its phrase is not 判断待ち.
 # 2026-11-08 (T-done-disposition-auto-close, design v2.4): grew to nine with 'malformed_handoff' —
 # a refused STOP: done / BLOCKED-ON: form stops with a notice and must be heard, never silent.
-$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'operator_work_to_human', 'malformed_handoff', 'round_cap', 'empty_thread')
+# 2026-11-10 (T-next-names-unspawnable-identity D2): grew to ten with 'unspawnable_target_to_human' —
+# NEXT: named an identity no adapter can run, so the request was never delivered and must be heard.
+$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'operator_work_to_human', 'malformed_handoff', 'unspawnable_target_to_human', 'round_cap', 'empty_thread')
 foreach ($k in $expectedKeys) {
     CheckTrue "map has key '$k'" ($map.ContainsKey($k))
 }
-Check 'map has exactly 9 keys (narrowing = notification loss, §4 §W-4)' 9 $map.Count
+Check 'map has exactly 10 keys (narrowing = notification loss, §4 §W-4)' 10 $map.Count
 
 Write-Host 'Get-StopReasonPhraseMap — returns a fresh hashtable each call (no shared state)'
 $m1 = Get-StopReasonPhraseMap
@@ -131,11 +133,45 @@ foreach ($k in $map.Keys) {
 # Get-StopReasonPhrase: known reason returns the map entry; unknown reason falls open.
 # ---------------------------------------------------------------------------------------
 Write-Host ''
-Write-Host 'Get-StopReasonPhrase — every known key returns its map value verbatim'
+Write-Host 'Get-StopReasonPhrase — every known key returns its map value verbatim (a template with {0} → 不明)'
 $map = Get-StopReasonPhraseMap
 foreach ($k in $map.Keys) {
-    Check "Get-StopReasonPhrase '$k' == map[`$k`]" $map[$k] (Get-StopReasonPhrase -StopReason $k)
+    $expected = $map[$k].Replace('{0}', '不明')
+    Check "Get-StopReasonPhrase '$k' == map[`$k`]" $expected (Get-StopReasonPhrase -StopReason $k)
+    # -BlockedTarget changes nothing for a phrase without {0}.
+    if (-not $map[$k].Contains('{0}')) {
+        Check "Get-StopReasonPhrase '$k' ignores -BlockedTarget" $map[$k] (Get-StopReasonPhrase -StopReason $k -BlockedTarget 'fermi')
+    }
 }
+
+# ---------------------------------------------------------------------------------------
+# T-next-names-unspawnable-identity (Bohr msg-8707 v0.4 item 3 / msg-8709 D2): the header names
+# the target and says the request was not delivered; an empty target reads 不明, never a broken
+# sentence; neither says 判断待ち. Only this one key is a template.
+# ---------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host 'unspawnable_target_to_human — the header names the target, or 不明'
+$templated = @($map.Keys | Where-Object { $map[$_].Contains('{0}') })
+Check 'exactly one template phrase in the map' 1 $templated.Count
+Check 'the template phrase is unspawnable_target_to_human' 'unspawnable_target_to_human' "$($templated[0])"
+$hNamed = New-NotificationHeader -ThreadId 'T-x' -Project 'p' -StopReason 'unspawnable_target_to_human' `
+    -Rounds 0 -LastMsgId 'msg-1' -BlockedTarget 'fermi'
+CheckTrue 'named: header says 指名先（fermi）は' ($hNamed.Contains('指名先（fermi）は')) $hNamed
+CheckTrue 'named: header says the request was not delivered' ($hNamed.Contains('依頼は届いていません')) $hNamed
+CheckTrue 'named: header does NOT say 判断待ち' (-not $hNamed.Contains('判断待ち')) $hNamed
+CheckTrue 'named: no unfilled {0}' (-not $hNamed.Contains('{0}')) $hNamed
+CheckTrue 'named: reason=<raw> survives' ($hNamed.Contains('reason=unspawnable_target_to_human')) $hNamed
+foreach ($empty in @('', $null)) {
+    $label = if ($null -eq $empty) { '$null' } else { "''" }
+    $hEmpty = New-NotificationHeader -ThreadId 'T-x' -Project 'p' -StopReason 'unspawnable_target_to_human' `
+        -Rounds 0 -LastMsgId 'msg-1' -BlockedTarget $empty
+    CheckTrue "empty ($label): header says 指名先（不明）は" ($hEmpty.Contains('指名先（不明）は')) $hEmpty
+    CheckTrue "empty ($label): header does NOT say 判断待ち" (-not $hEmpty.Contains('判断待ち')) $hEmpty
+    CheckTrue "empty ($label): no unfilled {0}" (-not $hEmpty.Contains('{0}')) $hEmpty
+}
+$hDefault = New-NotificationHeader -ThreadId 'T-x' -Project 'p' -StopReason 'unspawnable_target_to_human' `
+    -Rounds 0 -LastMsgId 'msg-1'
+CheckTrue 'no -BlockedTarget at all: header says 指名先（不明）は' ($hDefault.Contains('指名先（不明）は')) $hDefault
 
 # ---------------------------------------------------------------------------------------
 # D-4-5: unknown reason must not throw, must degrade loudly, must NOT contain "判断待ち".
@@ -180,8 +216,9 @@ foreach ($k in $map.Keys) {
     $header = New-NotificationHeader -ThreadId $fixed.ThreadId -Project $fixed.Project `
         -StopReason $k -Rounds $fixed.Rounds -LastMsgId $fixed.LastMsgId
 
-    # D-4-1: the phrase for $k is present verbatim.
-    CheckTrue "reason '$k': header contains the SOT phrase for '$k'" ($header.Contains($map[$k])) $header
+    # D-4-1: the phrase for $k is present verbatim (a template's {0} filled with 不明, since no
+    # -BlockedTarget is passed here).
+    CheckTrue "reason '$k': header contains the SOT phrase for '$k'" ($header.Contains($map[$k].Replace('{0}', '不明'))) $header
 
     # D-4-2: no known reason regresses to the old fixed-label header shape.
     CheckTrue "reason '$k': header does NOT match the old fixed-label form '— 判断待ち (reason='" `

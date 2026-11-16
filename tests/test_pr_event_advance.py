@@ -621,7 +621,7 @@ async def test_r4_unresolved_roster_writes_the_fact_with_the_operator_block() ->
         thread_id=_THREAD,
         proposer=None,
     )
-    assert out.action == "posted" and out.next_line == "NEXT: operator"
+    assert out.action == "posted" and out.next_line == "NEXT: human"
     assert chat.threads[_THREAD][-1]["content"].endswith(operator_handoff(_THREAD))
 
 

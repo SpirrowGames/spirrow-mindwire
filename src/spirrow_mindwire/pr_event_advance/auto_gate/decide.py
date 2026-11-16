@@ -52,7 +52,9 @@ from ...conductor.handoff import (
     OPERATOR_TOKEN,
     PR_REVIEW_TOKEN,
     HandoffKind,
+    HumanAsk,
     none_refused_after_cutoff,
+    operator_refused_after_cutoff,
     parse_next_token,
     refused_by_terminal_form,
     resolve_handoff,
@@ -284,6 +286,16 @@ def settled_tail_refusal(
     return None
 
 
+def _is_human_task_tail(tail_body: str) -> bool:
+    """A tail in the ``HUMAN-TASK:`` form: idle exactly as a ``NEXT: operator`` tail is.
+
+    The successor form asks a person for work by hand (``HumanAsk.OPERATOR_WORK``) under the
+    ``human`` token. A plain ``NEXT: human`` -- a decision -- stays a live turn, as before.
+    """
+    resolved = resolve_handoff(tail_body, {})
+    return resolved.kind is HandoffKind.HUMAN and resolved.human_ask is HumanAsk.OPERATOR_WORK
+
+
 def tail_decision(
     tail_body: str,
     *,
@@ -312,6 +324,11 @@ def tail_decision(
     # would bury that head the same way.
     if none_refused_after_cutoff(tail_body, posted_at=posted_at):
         return AutoGateNoop.QUEUED_BEHIND
+    # The same for a ``NEXT: operator`` the operator cutoff retires
+    # (T-retire-operator-identity-and-scope-next-fermi): its ``operator_retired`` notice is the
+    # conductor's to post.
+    if operator_refused_after_cutoff(tail_body, posted_at=posted_at):
+        return AutoGateNoop.QUEUED_BEHIND
     # The same holds for a form only the roster refuses: its notice is the park-wake tick's, and
     # a gate fired first would bury it (msg-8218 §2b-2). So does a settled tail 1c cannot check.
     if settled_tail_refusal(
@@ -319,7 +336,9 @@ def tail_decision(
     ):
         return AutoGateNoop.QUEUED_BEHIND
     token = NONE_TOKEN if settles_by_terminal_form(tail_body) else parse_next_token(tail_body)
-    if token is None or token.casefold() not in (NONE_TOKEN, OPERATOR_TOKEN):
+    if token is None or not (
+        token.casefold() in (NONE_TOKEN, OPERATOR_TOKEN) or _is_human_task_tail(tail_body)
+    ):
         return AutoGateNoop.QUEUED_BEHIND
     slug = f"{repo}#{number}"
     return Post(

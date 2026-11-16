@@ -16,11 +16,13 @@ What this file pins:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from legacy_none_time import PRE_CUTOFF, PRE_CUTOFF_STAMP
 from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 from test_decider_step2 import _conductor_with
 
@@ -39,6 +41,7 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.github.client import PrRef, PrResolution, PrState
+from spirrow_mindwire.magickit import gateway as gateway_mod
 from spirrow_mindwire.magickit.client import MagickitMcpError, ThreadResolvedError
 from spirrow_mindwire.magickit.gateway import (
     DISPOSITION_UNAVAILABLE_ERROR,
@@ -65,7 +68,8 @@ _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Ro
 
 
 def _line(body: str) -> StopLine:
-    stop = resolve_handoff(body, _ROSTER).stop_line
+    # Legacy ``STOP:`` lines above ``NEXT: none``: read as posted before the boundary-5 cutoff.
+    stop = resolve_handoff(body, _ROSTER, posted_at=PRE_CUTOFF).stop_line
     assert stop is not None
     return stop
 
@@ -96,7 +100,8 @@ def test_payload_for_done_and_blocked_on() -> None:
     ],
 )
 def test_nothing_is_sent_without_a_valid_line_on_next_none(body: str) -> None:
-    assert body_disposition(body, _ROSTER) is None
+    # Before the cutoff, so that ``None`` is the missing / invalid line and not the cutoff.
+    assert body_disposition(body, _ROSTER, posted_at=PRE_CUTOFF) is None
 
 
 @pytest.mark.parametrize(
@@ -116,6 +121,28 @@ def test_classification(status: StopStatus, human: bool, expected: StopClass) ->
 
 
 # --------------------------------------------------------------------------- 2: gateway
+
+
+class _ClockBeforeCutoff(datetime):
+    """``datetime`` whose ``now`` is :data:`PRE_CUTOFF` (the gateway reads its own clock)."""
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> _ClockBeforeCutoff:
+        del tz
+        return cls.fromtimestamp(PRE_CUTOFF.timestamp(), UTC)
+
+
+@pytest.fixture
+def gateway_clock_before_cutoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway posts at a time before the boundary-5 cutoff.
+
+    The gateway stamps a post with its own clock, and from the cutoff on it sends no
+    ``disposition`` for a legacy ``STOP:`` + ``NEXT: none`` body
+    (``test_none_malformed_after.py``). The tests below pin what it sent for the legacy form
+    while that form was accepted, so they say when: without this they would pass or fail by
+    the date the suite runs on.
+    """
+    monkeypatch.setattr(gateway_mod, "datetime", _ClockBeforeCutoff)
 
 
 class _PostMcp:
@@ -145,6 +172,7 @@ async def _post(gw: MagickitChatroomGateway, body: str) -> str:
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 async def test_gateway_sends_the_disposition() -> None:
     mcp = _PostMcp()
     await _post(MagickitChatroomGateway(mcp, roster=_ROSTER), "x\n\nSTOP: done\nNEXT: none")
@@ -154,6 +182,7 @@ async def test_gateway_sends_the_disposition() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 @pytest.mark.parametrize("body", ["x\n\nNEXT: none", "x\n\nSTOP: dun\nNEXT: none", "x\nNEXT: Bohr"])
 async def test_gateway_sends_no_field_without_a_valid_line(body: str) -> None:
     mcp = _PostMcp()
@@ -163,6 +192,7 @@ async def test_gateway_sends_no_field_without_a_valid_line(body: str) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 async def test_gateway_without_roster_never_sends() -> None:
     mcp = _PostMcp()
     await _post(MagickitChatroomGateway(mcp), "x\n\nSTOP: done\nNEXT: none")
@@ -171,6 +201,7 @@ async def test_gateway_without_roster_never_sends() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 async def test_gateway_reposts_without_the_field_only_on_a_registry_outage(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -186,6 +217,7 @@ async def test_gateway_reposts_without_the_field_only_on_a_registry_outage(
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 @pytest.mark.parametrize("error_type", sorted(DISPOSITION_VALUE_ERRORS))
 async def test_a_refused_disposition_never_stalls_the_post(
     error_type: str, caplog: pytest.LogCaptureFixture
@@ -205,6 +237,7 @@ async def test_a_refused_disposition_never_stalls_the_post(
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("gateway_clock_before_cutoff")
 @pytest.mark.parametrize("error_type", ["RoleNotAllowed", "ThreadResolvedError", None])
 async def test_gateway_propagates_refusals_that_are_not_about_the_disposition(
     error_type: str | None,
@@ -387,7 +420,17 @@ class _TickMcp:
     ) -> None:
         self.threads[(project, thread_id)] = {
             "status": status,
-            "messages": [{"msg_id": msg_id, "author": author, "content": content}],
+            # A chatroom message always carries its ``timestamp``; this one is before the
+            # boundary-5 cutoff, so the legacy ``NEXT: none`` heads these ticks classify and
+            # wake are read under the rules they were written under.
+            "messages": [
+                {
+                    "msg_id": msg_id,
+                    "author": author,
+                    "content": content,
+                    "timestamp": PRE_CUTOFF_STAMP,
+                }
+            ],
         }
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:

@@ -142,42 +142,43 @@ async def test_a_handoff_to_a_different_participant_is_untouched() -> None:
 
 @pytest.mark.anyio
 async def test_next_fermi_stops_exactly_where_next_human_stops() -> None:
-    """(b) ``NEXT: Fermi`` is the same stop condition as ``NEXT: human`` (ADR D-3).
+    """(b) ``NEXT: Fermi`` stops at the human like ``NEXT: human`` (ADR D-3), under its own reason.
 
-    Asserted as a comparison rather than against a literal so the two cannot drift: whatever
-    reason an explicit human handoff produces from this fixture is the reason the Fermi handoff
-    has to produce.
+    Both stop without spawning anyone and both are heard. Since T-next-names-unspawnable-identity
+    (msg-8709 D2) the Fermi stop is ``unspawnable_target_to_human`` rather than ``human``, so the
+    notification can say the request was not delivered instead of "判断待ち".
     """
     human_mcp = _FakeChatroomMcp()
     human_mcp.seed(author="Einstein", content="review done\n\nNEXT: human")
     human_outcome = await _conductor(human_mcp, _ScriptedDispatcher(human_mcp, {})).run()
 
-    fermi_mcp = _FakeChatroomMcp()
+    # On a thread Fermi owns: elsewhere ``NEXT: Fermi`` is refused (ADR-21 §7 Amendment).
+    fermi_mcp = _FakeChatroomMcp(owner="Fermi")
     fermi_mcp.seed(author="Einstein", content="review done\n\nNEXT: Fermi")
     fermi_disp = _ScriptedDispatcher(fermi_mcp, {})
     fermi_outcome = await _conductor(fermi_mcp, fermi_disp).run()
 
     assert human_outcome.stop_reason is StopReason.HUMAN
-    assert fermi_outcome.stop_reason is human_outcome.stop_reason
+    assert fermi_outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert fermi_disp.spawns == [], "the ADR forbids an adapter for web_ai_chat"
 
 
 @pytest.mark.anyio
 async def test_fermi_is_blocked_without_any_configuration() -> None:
     """The ADR's entry ships as a default; a host that wrote no config still refuses."""
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="ask the chat\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {})
 
     outcome = await _conductor(mcp, disp, identity_embodiment=None).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 
 @pytest.mark.anyio
 async def test_spawn_unavailable_writes_the_general_rule_into_the_thread() -> None:
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="ask the chat\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {})
 
@@ -200,7 +201,7 @@ async def test_the_rule_is_general_not_a_fermi_special_case() -> None:
 
     outcome = await _conductor(mcp, disp, identity_embodiment={"Sagan": "web_ai_chat"}).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 
@@ -213,7 +214,7 @@ async def test_an_unknown_embodiment_blocks_rather_than_falling_through() -> Non
 
     outcome = await _conductor(mcp, disp, identity_embodiment={"Sagan": "carrier-pigeon"}).run()
 
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.spawns == []
 
 
@@ -223,9 +224,10 @@ async def test_an_operator_entry_can_unblock_a_shipped_default() -> None:
 
     Fermi is put in the roster here too, because unblocking it only means anything if there is
     a role to dispatch — which is exactly what a deployment that gave Fermi a terminal
-    embodiment would have had to do.
+    embodiment would have had to do. The thread is Fermi's own, the one place ``NEXT: Fermi``
+    is valid (ADR-21 §7 Amendment).
     """
-    mcp = _FakeChatroomMcp()
+    mcp = _FakeChatroomMcp(owner="Fermi")
     mcp.seed(author="Bohr", content="hand over\n\nNEXT: Fermi")
     disp = _ScriptedDispatcher(mcp, {Role.PROPOSER: ["from fermi\n\nNEXT: none"]})
     conductor = Conductor(

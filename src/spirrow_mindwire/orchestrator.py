@@ -36,7 +36,15 @@ from .conductor.gate_records import (
     render_merge_self_line,
     render_relay_heading,
 )
-from .conductor.handoff import HUMAN_TOKEN
+from .conductor.handoff import (
+    HUMAN_TOKEN,
+    NONE_TOKEN,
+    OPERATOR_TOKEN,
+    PR_REVIEW_TOKEN,
+    parse_next_token,
+    refused_by_terminal_form,
+    settles_by_terminal_form,
+)
 from .design_conditions import DesignConditionsPolicy
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, ReviewEvent, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
@@ -244,6 +252,9 @@ class PrReviewOrchestrator:
         resolved = await self._resolve_thread_id(project=project, pr=pr)
         thread_id = resolved.thread_id
         await self._validate_design_thread(project=project, design_thread=design_thread)
+        await self._preflight_loop_state(
+            project=project, design_thread=design_thread, pr_ref=pr_ref
+        )
         title = title or f"PR review (develop→main) — {pr_ref}"
         propose = (
             f"naysayer review request — develop→main PR {pr_ref}\n\n"
@@ -442,6 +453,109 @@ class PrReviewOrchestrator:
             raise ValueError(
                 f"design_thread {design_thread!r} does not exist in project {project!r}"
             )
+
+    async def _preflight_loop_state(self, *, project: str, design_thread: str, pr_ref: str) -> None:
+        """A-1: refuse a fire whose design thread's head still hands to a role persona.
+
+        T-gate-firing-ignores-loop-state-and-prior-verdicts T3 (msg-694 §6, msg-1623 §1, go
+        msg-1624). A head that names a persona (``NEXT: Heisenberg``) is inside the fix loop, so
+        the diff the gate would read is not final yet and the fire is wasted (R-A-1, msg-456:
+        conclair #21 was fired 3h19m after the proposer had sent it back). Runs right after
+        :meth:`_validate_design_thread` for the same reason: a refused fire must cost nothing.
+
+        The head is read with the conductor's own handoff parser and in the order
+        ``conductor.handoff`` prescribes for token-only readers -- no second grammar here:
+
+        1. ``refused_by_terminal_form`` -> a broken terminal form; its ``NEXT:`` token is never
+           read. **fail-open**: fire, and log why.
+        2. ``settles_by_terminal_form`` -> an accepted ``STOP: done`` or ``BLOCKED-ON`` + wake.
+           **pass**. The wake persona is NOT read, so a parked head is not mistaken for a
+           persona handoff (msg-1622 Obj-1-1).
+        3. ``parse_next_token`` is ``pr-review`` / ``human`` / ``none`` -> **pass**.
+        4. Any other token -> a persona handoff: log one line (thread, PR, observed state) and
+           raise ``ValueError`` before the review is paid for and before the ledger is opened.
+        5. Thread unreadable, no message, or no token / the retired ``operator`` token (not a
+           persona, and not one of the forms the hand-fire policy names) -> **fail-open**: fire,
+           and log why. Never a silent drop (msg-456 §R-A: a silent skip is indistinguishable
+           from a forgotten fire).
+
+        ``human`` passes because T3 only mechanises the existing hand-fire policy
+        (``scripts/naysayer_review.py``, #249); changing that policy is possible but out of scope.
+
+        Limits, stated rather than hidden: this does NOT check that the PR a ``NEXT: pr-review``
+        head names equals ``pr_ref`` (msg-1623 §3), and it narrows but does not close the window
+        between a reader seeing the head and the fire (a post can land after this read; no lock
+        is taken, msg-1622 Obj-1-3).
+        """
+        try:
+            payload = await self._mcp.call_tool(
+                "chatroom_get_thread",
+                {"project": project, "thread_id": design_thread, "mode": "full"},
+            )
+        except Exception as exc:  # fail-open by design (msg-1623 §1 row 5)
+            logger.warning(
+                "pr-gate A-1 preflight: could not read design thread %r for %s (%s); "
+                "firing anyway (fail-open)",
+                design_thread,
+                pr_ref,
+                exc,
+            )
+            return
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        last = messages[-1] if isinstance(messages, list) and messages else None
+        body = last.get("content") if isinstance(last, dict) else None
+        if not isinstance(body, str):
+            logger.warning(
+                "pr-gate A-1 preflight: design thread %r has no readable latest message for %s; "
+                "firing anyway (fail-open)",
+                design_thread,
+                pr_ref,
+            )
+            return
+        if refused_by_terminal_form(body):
+            logger.warning(
+                "pr-gate A-1 preflight: design thread %r head is a refused terminal form for %s; "
+                "its NEXT token is not read; firing anyway (fail-open)",
+                design_thread,
+                pr_ref,
+            )
+            return
+        if settles_by_terminal_form(body):
+            return
+        token = parse_next_token(body)
+        if token is None:
+            logger.warning(
+                "pr-gate A-1 preflight: design thread %r head carries no NEXT token for %s; "
+                "firing anyway (fail-open)",
+                design_thread,
+                pr_ref,
+            )
+            return
+        folded = token.casefold()
+        if folded in (PR_REVIEW_TOKEN, HUMAN_TOKEN, NONE_TOKEN):
+            return
+        if folded == OPERATOR_TOKEN:
+            logger.warning(
+                "pr-gate A-1 preflight: design thread %r head is the retired NEXT: %s for %s; "
+                "not a persona, firing anyway (fail-open)",
+                design_thread,
+                token,
+                pr_ref,
+            )
+            return
+        logger.warning(
+            "pr-gate A-1 preflight REFUSED: design thread %r, PR %s, head NEXT: %s "
+            "(a role persona -- the head is still inside the fix loop)",
+            design_thread,
+            pr_ref,
+            token,
+        )
+        raise ValueError(
+            f"design_thread {design_thread!r} head hands to {token!r}, a role persona: the head "
+            f"is still inside the fix loop, so {pr_ref} is not ready for the gate (A-1, "
+            "T-gate-firing-ignores-loop-state-and-prior-verdicts). Fire once the head reads "
+            "NEXT: pr-review / NEXT: human / STOP: done / BLOCKED-ON + wake."
+        )
 
     async def _post_design_relay(
         self,

@@ -164,6 +164,15 @@ $DirtyCloneExitCode = 8
 # src/spirrow_mindwire/git_sync/errors.py (a pytest pins the two). No park, no quarantine, no repo
 # parking: the launch is reverted and the next tick re-derives the name.
 $GitSyncDeferredExitCode = 9
+# Exit code of mindwire-loop when preflight P1 could not confirm the repo's protection because
+# GitHub stayed transiently unreachable or P1's shared deadline ran out, with no terminal problem
+# established (T-preflight-transient-gh-failure-quarantines-threads, design v3.2 D-4). Mirrors
+# PREFLIGHT_DEFERRED_EXIT_CODE in src/spirrow_mindwire/preflight.py (a pytest pins the two). Not
+# 10: SECRETS_STOP_EXIT_CODE. No quarantine, retry-pending untouched, launch reverted.
+$PreflightDeferredExitCode = 11
+# A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
+# a permanent failure misclassified as transient must not stay silent.
+$PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
 # Bound on one `mindwire clone-check` (ensure + read-only guard: a handful of git calls plus the
 # guard's up-to-5 s index.lock wait). A timeout is a probe failure: the repo stays parked.
 $CloneCheckTimeoutSeconds = 60
@@ -188,6 +197,9 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 # Repos parked after a dirty-clone exit (T-clone-guard-pin-ignored-only-in-mindwire, design v2.1
 # D-3b, Bohr msg-6162 / msg-6164). Keyed by ConvertTo-DirtyCloneRepoKey; written only by this sweep.
 $dirtyClonesStatePath = Join-Path $dataDir "state\dirty-clones.json"
+# Preflight-deferral episodes per GitHub repo (T-preflight-transient-gh-failure-quarantines-threads
+# design v2 D-5b): { repo_key: { first_at, last_at, count, escalated, repo_dir } }. Sweep-only writer.
+$preflightDeferredStatePath = Join-Path $dataDir "state\preflight-deferred.json"
 # PR-B (T-role-exit-leaves-clone-off-default-branch): one row per launch whose exit is not yet
 # confirmed. Written before each launch, its own row dropped after a confirmed exit; the sweep's
 # hold acknowledgement for a parked clone requires the project to have no row and no `*` sentinel.
@@ -276,9 +288,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
 # Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
 . (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
-# In-flight launch ledger + hold acknowledgement while a clone is parked (T-role-exit-leaves-clone-
-# off-default-branch PR-B): Read-/Update-InflightLedger, Add-/Remove-InflightMark,
-# Test-HoldAckViaParkWanted, Invoke-HoldAckViaPark. Calls Write-Log at call time.
+# In-flight launch ledger + the sweep's own hold acknowledgement when nothing launches (T-role-exit-
+# leaves-clone-off-default-branch PR-B, generalised by T-hold-observed-freshness-and-unlaunched-tick-
+# ack F1): Read-/Update-InflightLedger, Add-/Remove-InflightMark, Invoke-HoldAckViaPark. Calls
+# Write-Log at call time.
 . (Join-Path $PSScriptRoot 'lib/InflightLedger.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
@@ -434,17 +447,27 @@ function ConvertTo-UtcInstant {
 # Parse a magickit-supplied ISO-8601 UTC timestamp (e.g. "2026-09-08T20:32:19.106309Z") into a UTC
 # [datetimeoffset], returning $null when the input is $null, empty, or unparseable.
 #
-# Called by the control probe log (F4b: HOLD NOT ACKNOWLEDGED warning below) and — per Bohr
-# msg-2789 §3 (F2-d) — reserved for reuse by Test-HoldObserved's future freshness gate (F2).
+# Called only through Test-HoldAckStale, which is both the HOLD NOT ACKNOWLEDGED warning (F4b) and
+# — through Test-HoldObserved — the freshness gate on the launch decision (F2; reuse per Bohr
+# msg-2789 §3 F2-d, landed in T-hold-observed-freshness-and-unlaunched-tick-ack).
 #
 # WHY A DEDICATED PARSER, when ConvertTo-UtcInstant already exists just above:
 #
 # 1. **String comparison is unsafe here (F2-a).** ISO-8601 lexical ordering only agrees with
 #    time ordering when precision matches. `desired_at` may be microsecond-precise
 #    (e.g. "2026-09-08T20:32:19.106309Z") while `observed_at` is second-precise
-#    ("2026-09-08T20:32:19Z"). Comparing those as strings puts the microsecond value BEFORE the
-#    second value ('.' 0x2E < 'Z' 0x5A), so a same-second acknowledgement reads as stale. The
-#    caller MUST type-parse both operands.
+#    ("2026-09-08T20:32:19Z"), and '.' (0x2E) sorts before 'Z' (0x5A), so string order is not
+#    time order. That is the ONLY reason the caller type-parses both operands. The typed
+#    comparison is strict (Bohr msg-9146, Obj-1-1): observed_at=…:19Z against
+#    desired_at=…:19.106309Z IS stale — the ack is older than the request — and is read as such.
+#    The cost of a second-truncated ack read as stale is one extra launch or one extra sweep
+#    re-ack; the sweep's own ack lands in a later second and is fresh on the next tick. Loosening
+#    the freshness condition to save that one tick is not worth it.
+# 1a. **A [datetime] input is used as-is, never round-tripped through a string.** The control
+#    probe's ConvertFrom-Json turns an ISO string into a [datetime], and PowerShell's "$dt"
+#    formats it to whole seconds — which would make a sub-second request read as acknowledged by
+#    a same-second ack, the opposite of 1. A Utc or Unspecified kind is taken as UTC (the
+#    AssumeUniversal rule of 3); a Local kind is converted.
 # 2. **Parse failure MUST NOT throw here (F2-c).** The enclosing bug this helper serves is
 #    "hold is silently unacknowledged". An unparseable timestamp on that path must be treated as
 #    "no acknowledgement", not as an unhandled exception that aborts the tick — otherwise the
@@ -458,6 +481,11 @@ function ConvertTo-UtcInstant {
 function ConvertFrom-ControlTimestamp {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value.ToUniversalTime() }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Local) { return ([datetimeoffset]$Value).ToUniversalTime() }
+        return [datetimeoffset]::new([datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc))
+    }
     $s = "$Value"
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
     try {
@@ -573,11 +601,12 @@ function Update-EvaluatedTimestamp {
 
 # May a held project's launch be optimised away this tick?
 #
-# ONLY once the loop has already reported that it saw the hold. `desired_state` is the operator's
-# request; `observed_state` is the loop's acknowledgement, and only a launched conductor writes it
-# (``LoopControlReader.report_observed``). Dropping the launch on `desired` alone therefore starves
-# the very write-back the dashboard uses to tell "stopping" from "stopped" — the hold shows as
-# pending forever, which reads as the loop ignoring the stop switch.
+# ONLY once the loop has acknowledged THIS hold. `desired_state` is the operator's request;
+# `observed_state = 'hold'` is the acknowledgement, written by a launched conductor
+# (``LoopControlReader.report_observed``) or, when nothing launches, by the sweep itself
+# (Invoke-HoldAckViaPark). Dropping the launch on `desired` alone starves that write-back, which the
+# dashboard uses to tell "stopping" from "stopped" — the hold shows as pending forever, which reads
+# as the loop ignoring the stop switch.
 #
 # Confirmed in production, and the way it was confirmed is the point: on 2026-08-06 both projects sat
 # at `hold`, and `spirrow-voxelworld` had `observed_state: null` — never acknowledged, because it was
@@ -585,14 +614,26 @@ function Update-EvaluatedTimestamp {
 # FAIL that tick, so the sweep failed open, launched, and the conductor landed the write-back. A
 # transient outage was the only reason the feedback loop ever closed. (Tier B naysayer on PR #126.)
 #
-# So the first tick of a hold pays for one process start; every tick after it costs one MCP read.
-# That is the whole cost of an operator being able to see their stop switch take effect.
+# FRESHNESS (F2, T-hold-observed-freshness-and-unlaunched-tick-ack). The predicate is exactly
+# "desired = hold AND Test-HoldAckStale returns $null": observed_state = 'hold' AND, when both
+# timestamps parse, observed_at >= desired_at, compared strictly as instants; when either timestamp
+# is missing or unparseable (older magickit), observed_state alone decides, and nothing throws. The
+# warning line, this gate and the sweep's own acknowledgement all use that one verdict, so the log
+# cannot say "not acknowledged" while the sweep withholds the launch, or the reverse. An
+# `observed: hold` left over from an EARLIER hold is stale and does not count: the project launches
+# (fail-open; the cost is one launch) or, when nothing launches this tick, the sweep acknowledges
+# it after the candidate loop (F1, `--why no-launch`). F1 and F2 go together: without the sweep's
+# write, a stale hold of a project with nothing to launch would pay the head probe, 1b and park-wake
+# every tick and never be acknowledged.
+#
+# So a hold pays for at most one process start or one sweep report; every tick after the
+# acknowledgement costs one MCP read.
 function Test-HoldObserved {
     param($Control)
 
     if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
     if ($Control.desired_state -ne 'hold') { return $false }
-    return ($Control.observed_state -eq 'hold')
+    return ($null -eq (Test-HoldAckStale -Control $Control))
 }
 
 # HOLD-acknowledgement freshness verdict — pure predicate, extracted for testability.
@@ -2863,7 +2904,9 @@ function Get-StarvedKeys {
 # --- parse the conductor's own verdict ----------------------------------------------------------
 # The daemon's last word on stdout looks like:
 #   conductor stopped: reason=none rounds=0 forced_naysayer=0 ... last_msg=msg-1919
-# Returns @{ reason; rounds; last_msg; error_code }; nulls mean "could not tell".
+# Returns @{ reason; rounds; last_msg; error_code; blocked_target }; nulls mean "could not tell".
+# `blocked_target=` is only on `reason=unspawnable_target_to_human` (T-next-names-unspawnable-identity
+# msg-8709 D2): the ADR-11 key of the identity the run could not spawn, after `last_msg=`.
 # `error_code=` is only on the adapter-error line loop_runner.main prints when an adapter's
 # deliver_event raised (`reason=adapter_error`, T-successful-turn-quarantined-on-sdk-lifecycle-
 # failure Bohr msg-4440 D-2'); every other stop line has none and leaves it $null.
@@ -2871,7 +2914,7 @@ function Get-ConductorVerdict {
     param([string[]]$Output)
 
     $line = $Output | Where-Object { $_ -match 'conductor stopped:' } | Select-Object -Last 1
-    $verdict = @{ reason = $null; rounds = $null; last_msg = $null; error_code = $null }
+    $verdict = @{ reason = $null; rounds = $null; last_msg = $null; error_code = $null; blocked_target = $null }
     if (-not $line) { return $verdict }
     if ($line -match 'reason=(\S+)') { $verdict.reason = $Matches[1] }
     if ($line -match 'error_code=(\S+)') { $verdict.error_code = $Matches[1] }
@@ -2881,6 +2924,7 @@ function Get-ConductorVerdict {
     # equal to a real id (so it failed open, harmlessly) but it made "no head recorded yet"
     # indistinguishable from a real head in both the state file and the log.
     if ($line -match 'last_msg=(\S+)' -and $Matches[1] -ne 'None') { $verdict.last_msg = $Matches[1] }
+    if ($line -match '(^|\s)blocked_target=(\S+)') { $verdict.blocked_target = $Matches[2] }
     return $verdict
 }
 
@@ -3292,6 +3336,159 @@ function Get-GitSyncDeferredNotice {
               signature = $sig; message = $body; repo_key = $repoKey }
 }
 
+# --- preflight deferral (T-preflight-transient-gh-failure-quarantines-threads, design v3.2) ---
+# The daemon exits $PreflightDeferredExitCode when preflight P1 could not confirm the target
+# repo's server-side protection because GitHub stayed transiently unreachable (TLS / EOF / 5xx /
+# 429 / timeout) or P1's shared deadline ran out, with no terminal problem established. The role
+# never started (fail-closed is unchanged). Not the thread's fault: nobody is quarantined, any
+# EXISTING retry-pending record is left exactly as it is (D-5a: the retry is not consumed), the
+# LAUNCH commit is reverted, and the rest of this tick's candidates on the same repo_dir are
+# skipped as 'preflight-deferred-skipped' (per tick only) so an outage is not hammered.
+#
+# Reader of the notification: the operator. One deferral EPISODE per GitHub repo
+# ("<owner>/<repo>" from the payload; "dir:<repo key>" when the payload is unreadable) is kept in
+# $preflightDeferredStatePath (D-5b): opened with one alert, escalated with exactly one more
+# alert once it has lasted $PreflightDeferredEscalateAfter (a misclassified permanent failure
+# must not stay silent forever), silent otherwise. It ends — record and notification key both
+# dropped — when any later run of that repo prints MINDWIRE_PREFLIGHT_OK, whatever its exit
+# code, so the next outage alerts again from 'open'.
+
+function Get-PreflightDeferredPayload {
+    param($Output)
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD\s+(.*)$') {
+            try { return ($Matches[1] | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+        }
+    }
+    return $null
+}
+
+# @{ seen = [bool]; repos = [string[]] } — seen is true only when the daemon printed the row
+# (the preflight passed in that run).
+function Get-PreflightOkRepos {
+    param($Output)
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_PREFLIGHT_OK\s+(.*)$') {
+            $repos = @()
+            try {
+                $p = $Matches[1] | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $p -and $p.PSObject.Properties.Name -contains 'repos') { $repos = @($p.repos | ForEach-Object { "$_" }) }
+            } catch { $repos = @() }
+            return @{ seen = $true; repos = $repos }
+        }
+    }
+    return @{ seen = $false; repos = @() }
+}
+
+function Get-PreflightDeferredRepoKey {
+    param($Payload, [string]$RepoDir)
+    if ($null -ne $Payload -and $Payload.PSObject.Properties.Name -contains 'owner' -and
+        $Payload.PSObject.Properties.Name -contains 'repo' -and $Payload.owner -and $Payload.repo) {
+        return "$($Payload.owner)/$($Payload.repo)"
+    }
+    return "dir:$(ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir)"
+}
+
+function Get-PreflightDeferredNoticeKey {
+    param([string]$RepoKey)
+    return "__preflight_deferred__/$RepoKey"
+}
+
+# Normalise the state file's rows into hashtables (Get-JsonState returns PSCustomObjects inside).
+function ConvertTo-PreflightDeferredEpisodes {
+    param($State)
+    $out = @{}
+    if ($null -eq $State) { return $out }
+    $pairs = if ($State -is [hashtable]) { $State.GetEnumerator() | ForEach-Object { @{ k = $_.Key; v = $_.Value } } }
+             else { $State.PSObject.Properties | ForEach-Object { @{ k = $_.Name; v = $_.Value } } }
+    foreach ($pair in $pairs) {
+        $v = $pair.v
+        if ($null -eq $v) { continue }
+        $get = { param($n) if ($v -is [hashtable]) { $v[$n] } else { $v.$n } }
+        $out[$pair.k] = @{
+            first_at  = ConvertTo-RetryIso (& $get 'first_at')
+            last_at   = ConvertTo-RetryIso (& $get 'last_at')
+            count     = [int](& $get 'count')
+            escalated = [bool](& $get 'escalated')
+            repo_dir  = "$(& $get 'repo_dir')"
+        }
+    }
+    return $out
+}
+
+# The episode transition for one exit-$PreflightDeferredExitCode run (D-5b). Pure apart from
+# mutating $Episodes; the clock is a parameter. Returns @{ action; signature; record } where
+# action is 'open' (alert), 'escalate' (alert once more) or 'quiet' (no alert).
+function Update-PreflightDeferredEpisode {
+    param([hashtable]$Episodes, [string]$RepoKey, [string]$RepoDir, [datetime]$NowUtc,
+          [TimeSpan]$EscalateAfter = $PreflightDeferredEscalateAfter)
+    $nowIso = $NowUtc.ToUniversalTime().ToString('o')
+    if (-not $Episodes.ContainsKey($RepoKey)) {
+        $rec = @{ first_at = $nowIso; last_at = $nowIso; count = 1; escalated = $false; repo_dir = $RepoDir }
+        $Episodes[$RepoKey] = $rec
+        return @{ action = 'open'; signature = "preflight-deferred:${RepoKey}:open"; record = $rec }
+    }
+    $rec = $Episodes[$RepoKey]
+    $rec.last_at = $nowIso
+    $rec.count = [int]$rec.count + 1
+    if ($RepoDir) { $rec.repo_dir = $RepoDir }
+    $first = $null
+    try { $first = ConvertTo-UtcInstant $rec.first_at } catch { $first = $null }
+    if ($null -eq $first) { $first = $NowUtc.ToUniversalTime(); $rec.first_at = $nowIso }
+    if (-not $rec.escalated -and ($NowUtc.ToUniversalTime() - $first) -ge $EscalateAfter) {
+        $rec.escalated = $true
+        return @{ action = 'escalate'; signature = "preflight-deferred:${RepoKey}:escalated"; record = $rec }
+    }
+    return @{ action = 'quiet'; signature = $null; record = $rec }
+}
+
+# End every episode a passing preflight proves over: the repos the OK row names, and the fallback
+# 'dir:…' episode of this same repo_dir (opened after an unreadable payload). A named
+# '<owner>/<repo>' episode ends ONLY when the OK row names that repo: a clone whose remotes moved
+# from A to B proves nothing about A, so the same repo_dir alone never clears it (PR #573 gate).
+# Drops the notification key with the record, so the next outage alerts from 'open' again.
+# Returns the repo keys removed.
+function Clear-PreflightDeferredEpisodes {
+    param([hashtable]$Episodes, [hashtable]$NotifyState, [string[]]$Repos, [string]$RepoDir)
+    $dirKey = if ($RepoDir) { ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir } else { $null }
+    $removed = @()
+    foreach ($k in @($Episodes.Keys)) {
+        $rec = $Episodes[$k]
+        $isDirEpisode = "$k".StartsWith('dir:')
+        $sameDir = $isDirEpisode -and $dirKey -and $rec.repo_dir -and
+            ((ConvertTo-DirtyCloneRepoKey -RepoDir "$($rec.repo_dir)") -eq $dirKey)
+        $namedOk = (-not $isDirEpisode) -and (@($Repos) -contains $k)
+        if ($namedOk -or $sameDir -or ($dirKey -and $k -eq "dir:$dirKey")) {
+            [void]$Episodes.Remove($k)
+            $nk = Get-PreflightDeferredNoticeKey -RepoKey $k
+            if ($null -ne $NotifyState -and $NotifyState.ContainsKey($nk)) { [void]$NotifyState.Remove($nk) }
+            $removed += $k
+        }
+    }
+    return ,$removed
+}
+
+function Get-PreflightDeferredNotice {
+    param([string]$RepoKey, [hashtable]$Transition, [string]$CandidateKey, [string]$RepoDir, $Payload, [int]$ExitCode)
+    $detail = '(payload parse failed)'
+    if ($null -ne $Payload) {
+        $detail = "endpoint=$($Payload.endpoint) attempts=$($Payload.attempts) reason=$($Payload.reason)"
+        if ($Payload.last_stderr) { $detail += "`n$($Payload.last_stderr)" }
+    }
+    $rec = $Transition.record
+    if ($Transition.action -eq 'escalate') {
+        $body = ("MindWire: preflight の GitHub API 確認が一時的な失敗と判定され続けています — **$RepoKey**（first_at=$($rec.first_at)、$($rec.count) 回）。" +
+                 "分類の誤り（恒常的な失敗を一時的と判定している）を疑ってください。role は起動していません（fail-closed）。スレッドは quarantine していません。`n" +
+                 "直近: $CandidateKey exit=$ExitCode clone: $RepoDir`n$detail")
+    }
+    else {
+        $body = ("MindWire: preflight で GitHub API が一時的に使えず、起動を見送りました — **$RepoKey**（$CandidateKey exit=$ExitCode）。" +
+                 "role は起動していません（fail-closed）。quarantine せず、retry-pending もそのまま。同じ repo の候補はこの tick では起動せず、次の tick で再確認します。`n" +
+                 "clone: $RepoDir`n$detail")
+    }
+    return @{ key = (Get-PreflightDeferredNoticeKey -RepoKey $RepoKey); signature = $Transition.signature; message = $body }
+}
+
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
 # An exit $DirtyCloneExitCode used to be counted like any launch: the LAUNCH commit stayed in
 # head_skip.json, so three refused runs on one head reached T42's threshold and the conductor
@@ -3431,7 +3628,8 @@ function Invoke-LaunchEndRetreat {
     param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
           [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
           [scriptblock]$Recover = $null)
-    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode) { return 'skipped' }
+    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode -or
+        $ExitCode -eq $PreflightDeferredExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
     $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
@@ -4876,7 +5074,10 @@ function Format-DecisionMessage {
         [string]$LastMsgId,
         [string]$RawFallback,
         $Envelope = $null,
-        [int]$Budget = $DecisionMessageDiscordBudget
+        [int]$Budget = $DecisionMessageDiscordBudget,
+        # The stop line's blocked_target= (T-next-names-unspawnable-identity D2); feeds the
+        # header phrase's {0} only.
+        [string]$BlockedTarget = ''
     )
 
     # Background: 2 lines the ladder never touches (D-29). A truncated form without them collapses
@@ -4889,7 +5090,7 @@ function Format-DecisionMessage {
     # phrase for the actual stop reason from the SOT map in deploy/lib/StopReason.ps1 instead of
     # the fixed "判断待ち" literal. Every other field on this line is preserved byte-for-byte.
     $header = New-NotificationHeader -ThreadId $ThreadId -Project $Project `
-        -StopReason $StopReason -Rounds $Rounds -LastMsgId $LastMsgId
+        -StopReason $StopReason -Rounds $Rounds -LastMsgId $LastMsgId -BlockedTarget $BlockedTarget
     $background = "$header`n$link"
 
     if (-not $Envelope) { return $null }   # caller falls back to $RawFallback
@@ -5152,7 +5353,9 @@ function Send-HumanParkAlert {
         [string]$RawFallback,
         # D-3: state\material-missing.json. $null (tests that predate D-3) records nothing; the ⚠
         # line is added either way, because it depends only on this tick's outcome.
-        [hashtable]$MaterialMissingState = $null
+        [hashtable]$MaterialMissingState = $null,
+        # The stop line's blocked_target= (T-next-names-unspawnable-identity D2), for the header.
+        [string]$BlockedTarget = ''
     )
 
     # T-next-operator-is-silent D4' (Bohr msg-5932 / msg-5934): operator work is not a decision,
@@ -5198,7 +5401,8 @@ function Send-HumanParkAlert {
     if ($warning) { $formatBudget -= ($warning.Length + 1) }
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `
-        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget
+        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope -Budget $formatBudget `
+        -BlockedTarget $BlockedTarget
     $message = if ($enriched) { $enriched } else { $RawFallback }
     if ($warning) { $message = "$warning`n$message" }
 
@@ -5775,14 +5979,16 @@ function Get-SweepDeclaredProjects {
 # its fired parks woken). Control first and the same HOLD skip as the candidate loop, so a held
 # project gets no writes; no 1b and no head probe — with no candidate there is nothing to launch.
 # The control answer is NOT put in $controlByProject: that map feeds the resource-axis HOLD gate
-# and the digest's per-candidate view, and new rows would change them.
+# and the digest's per-candidate view, and new rows would change them. It goes into -ControlSink
+# instead (when given), which only the hold-ack pending set reads: a held project with no candidate
+# is otherwise never acknowledged (F1, PR #571 gate round 1).
 #
 # Returns @{ byProject = @{ <project> = <tick JSON> }; failed = <string[]> } for
 # Get-StopClassDigestLines. A tick that failed (thread listing unreadable, crash, no JSON) and a
 # malformed `projects` key ('sweep.json:projects') are in `failed`, which the digest names: never a
 # silent zero.
 function Invoke-DeclaredProjectsParkWake {
-    param([hashtable]$Declared, [string[]]$CandidateProjects = @())
+    param([hashtable]$Declared, [string[]]$CandidateProjects = @(), [hashtable]$ControlSink = $null)
 
     $byProject = @{}
     $failed = @()
@@ -5792,6 +5998,7 @@ function Invoke-DeclaredProjectsParkWake {
     }
     foreach ($proj in @($Declared.projects | Where-Object { $CandidateProjects -notcontains $_ })) {
         $control = Invoke-ControlProbe -Project $proj
+        if ($null -ne $ControlSink) { $ControlSink[$proj] = $control }
         if (Test-HoldObserved -Control $control) { continue }
         $parkWake = Invoke-ParkWakeTick -Project $proj
         if ($null -ne $parkWake) { $byProject[$proj] = $parkWake } else { $failed += $proj }
@@ -6038,16 +6245,18 @@ function Invoke-AutoGateTick {
 # case 1c exists for: its design thread idles at NEXT: none and nobody is left to write the line.
 # Only `clones` widens the scan, because a project's repo is read from its clone. Control first and
 # the same HOLD skip as the candidate loop, so a held project gets no 1c write. As in
-# Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject.
+# Invoke-DeclaredProjectsParkWake, the answer stays out of $controlByProject and goes into
+# -ControlSink (when given) for the hold-ack pending set only (F1, PR #571 gate round 1).
 # -Clones is $sweepIntakeConfig.clones: the OrderedDictionary ConvertFrom-SweepIntakeConfig builds
 # from sweep.json, not ConvertFrom-Json's PSCustomObject, so `.Keys` names the projects (PR #512
 # review msg-7820 #1; Test-SweepDigest.ps1 pins it on the sweep.json path).
 function Get-AutoGateProjects {
-    param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones)
+    param([string[]]$PassedHold = @(), [string[]]$CandidateProjects = @(), $Clones, [hashtable]$ControlSink = $null)
 
     $out = @($PassedHold)
     foreach ($proj in @($Clones.Keys | ForEach-Object { [string]$_ } | Where-Object { $CandidateProjects -notcontains $_ })) {
         $control = Invoke-ControlProbe -Project $proj
+        if ($null -ne $ControlSink) { $ControlSink[$proj] = $control }
         if (Test-HoldObserved -Control $control) { continue }
         $out += $proj
     }
@@ -6383,7 +6592,9 @@ try {
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         # Control first: a project whose hold has already landed needs no head probe at all, so asking
         # in this order keeps a settled HOLD to exactly one MCP read per project per tick. A hold the
-        # loop has not acknowledged yet still gets probed and launched — see Test-HoldObserved.
+        # loop has not acknowledged yet — or acknowledged only before this request (stale, F2) — still
+        # gets probed and launched (see Test-HoldObserved) and, if nothing launches, is acknowledged
+        # by the sweep after the candidate loop (F1).
         $phaseStartUtc = Get-SweepNowUtc
         $c = Invoke-ControlProbe -Project $proj
         Add-PreLoopPhase -Phases $preLoopPhases -Name "control[$proj]" -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6404,12 +6615,18 @@ try {
             if ($c.desired_state -eq 'hold') {
                 # Fresh-vs-stale ack decision (F4b). Bohr msg-2789 §3 F2-a: comparison MUST be on
                 # parsed [datetimeoffset] values, not on raw ISO-8601 strings — the parse and the
-                # two-edge verdict now live in Test-HoldAckStale (see that function's block-comment
-                # for the false-positive and lag-source fixes from PR #279 naysayer review). This
-                # line is purely observability: neither verdict gates the launch. F2 (the predicate
-                # change) is a separate, later commit.
+                # verdict live in Test-HoldAckStale (see that function's block-comment for the
+                # false-positive and lag-source fixes from PR #279 naysayer review). The same verdict
+                # gates the launch (Test-HoldObserved, F2) and puts the project up for the sweep's own
+                # acknowledgement after the candidate loop (F1), so this line cannot disagree with
+                # what the sweep does.
                 $ackVerdict = Test-HoldAckStale -Control $c
                 if ($null -ne $ackVerdict) {
+                    # F4c: keep the warning on a tick that does nothing else too; Write-QuietSummary
+                    # would drop the buffer, and this line is the record of how long a hold went
+                    # unacknowledged. While the ack does not land (reports keep failing, an in-flight
+                    # row stays) it is kept every tick, on purpose — there is no throttling.
+                    Confirm-LogWorthKeeping
                     Write-Log ("HOLD NOT ACKNOWLEDGED [{0}] — desired_at={1} observed_at={2} ({3})" -f `
                         $proj, $desiredAtDisplay, $observedAtDisplay, $ackVerdict.Reason)
                 }
@@ -6442,10 +6659,15 @@ try {
         $headsByProject[$proj] = $h
     }
 
+    # Control answers of the projects no candidate names (`clones` and sweep.json `projects`), probed by
+    # Get-AutoGateProjects and Invoke-DeclaredProjectsParkWake. Kept apart from $controlByProject (see
+    # those functions); only the hold-ack pending set below reads it, so a held project with zero
+    # candidates is acknowledged too (F1, PR #571 gate round 1). Later probe of the same project wins.
+    $offCandidateControl = @{}
     $phaseStartUtc = Get-SweepNowUtc
     $passedHoldProjects = Get-AutoGateProjects -PassedHold $autoGateProjects `
         -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
-        -Clones $sweepIntakeConfig.clones
+        -Clones $sweepIntakeConfig.clones -ControlSink $offCandidateControl
     $autoGate = Invoke-AutoGateTick -Projects $passedHoldProjects
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'autogate' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6462,7 +6684,8 @@ try {
     $phaseStartUtc = Get-SweepNowUtc
     $declaredScan = Invoke-DeclaredProjectsParkWake `
         -Declared (Get-SweepDeclaredProjects -Path $sweepConfigPath) `
-        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)
+        -CandidateProjects @($candidates | ForEach-Object { $_.project } | Sort-Object -Unique) `
+        -ControlSink $offCandidateControl
     foreach ($k in $declaredScan.byProject.Keys) { $stopClassByProject[$k] = $declaredScan.byProject[$k] }
     $stopClassFailed += @($declaredScan.failed)
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'declaredparkwake' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
@@ -6778,9 +7001,33 @@ try {
     # repo keys (ConvertTo-DirtyCloneRepoKey) whose clone the daemon refused this tick (exit
     # $DirtyCloneExitCode). Per tick only; the persistent record is $dirtyClonesParked below.
     $dirtyRepoDirs = @{}
+    # repo keys whose preflight was deferred (exit $PreflightDeferredExitCode) this tick: the rest of
+    # that repo_dir's candidates are skipped this tick only (design v1 D-5); nothing is persisted.
+    $preflightDeferredRepoDirs = @{}
+    $preflightDeferredEpisodes = ConvertTo-PreflightDeferredEpisodes -State (Get-JsonState -Path $preflightDeferredStatePath)
     # PR-B: projects whose unacknowledged HOLD met a parked clone this tick, and the projects a launch
-    # was attempted for this tick. Both are per tick; Invoke-HoldAckViaPark reads them after the loop.
+    # Projects whose HOLD is not (freshly) acknowledged, each mapped to the `--why` the sweep's own
+    # acknowledgement will carry, and the projects a launch was attempted for this tick. Both are per
+    # tick; Invoke-HoldAckViaPark reads them after the loop. F1 (T-hold-observed-freshness-and-
+    # unlaunched-tick-ack): EVERY such project starts as `no-launch`, not only a parked one (PR-B) —
+    # a held project with nothing to launch otherwise never gets its acknowledgement (the deadlock
+    # msg-3268 named). The parked skip below narrows the reason to `dirty-clone-parked`. The verdict
+    # is Test-HoldAckStale, the same one the warning line and Test-HoldObserved use. The projects come
+    # from the candidate-derived $controlByProject AND from $offCandidateControl (`clones` / declared
+    # projects no candidate names): a held project with zero candidates has nothing to launch by
+    # definition, and is exactly the case F1 exists for (PR #571 gate round 1).
     $holdAckViaPark = @{}
+    foreach ($ackProj in @($controlByProject.Keys | Sort-Object)) {
+        if ($null -ne (Test-HoldAckStale -Control $controlByProject[$ackProj])) { $holdAckViaPark[$ackProj] = 'no-launch' }
+    }
+    foreach ($ackProj in @($offCandidateControl.Keys | Where-Object { -not $controlByProject.ContainsKey($_) } | Sort-Object)) {
+        $ackVerdictOff = Test-HoldAckStale -Control $offCandidateControl[$ackProj]
+        if ($null -ne $ackVerdictOff) {
+            Confirm-LogWorthKeeping
+            Write-Log "HOLD NOT ACKNOWLEDGED [$ackProj]: no candidate — $($ackVerdictOff.Reason); the sweep acknowledges it after the candidate loop"
+            $holdAckViaPark[$ackProj] = 'no-launch'
+        }
+    }
     $launchedProjects = @{}
     # PR-B (PR-gate #560 obj 1): a missing ledger is created holding the `*` (absent) sentinel here,
     # before any candidate, so a tick where every candidate is parked still creates it.
@@ -6896,7 +7143,16 @@ try {
             $dispositions[$cand.key] = 'dirty-clone-parked'
             Write-Log "dirty-clone-parked $($cand.key): repo_dir=$($cand.repo_dir) is parked (clone not clean), not launching"
             # PR-B: no launch will land this hold's acknowledgement; the sweep reports it after the loop.
-            if (Test-HoldAckViaParkWanted -Control $control) { $holdAckViaPark[$cand.project] = $true }
+            # The project is already pending (`no-launch`) if its hold is not freshly acknowledged;
+            # this only names the reason more precisely.
+            if ($holdAckViaPark.ContainsKey($cand.project)) { $holdAckViaPark[$cand.project] = 'dirty-clone-parked' }
+            continue
+        }
+        # Preflight deferred earlier this tick on this same repo_dir (GitHub transiently unreachable):
+        # no LAUNCH commit, no daemon. Its retry-pending record, if any, is not touched (D-5a).
+        if (Test-DirtyCloneSkip -RepoDir $cand.repo_dir -DirtyRepoDirs $preflightDeferredRepoDirs) {
+            $dispositions[$cand.key] = 'preflight-deferred-skipped'
+            Write-Log "preflight-deferred-skipped $($cand.key): repo_dir=$($cand.repo_dir) had its preflight deferred earlier this tick, not launching"
             continue
         }
 
@@ -7118,11 +7374,24 @@ try {
         }
         else { Write-Log "inflight $($cand.key): exit=$code — row $inflightLaunchId kept (exit not confirmed)" }
         # A launch that did not defer got past git-sync: end this candidate's deferral episode so
-        # its next outage alerts again (see Get-GitSyncDeferredNotice).
-        if ($code -ne $GitSyncDeferredExitCode -and
+        # its next outage alerts again (see Get-GitSyncDeferredNotice). An exit-$PreflightDeferredExitCode
+        # run stopped before git-sync was reached, so it proves nothing about git-sync either way.
+        if ($code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
             (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
+        # A run whose preflight passed (MINDWIRE_PREFLIGHT_OK, any exit code) ends that repo's
+        # preflight-deferral episode, so its next outage alerts from 'open' again (D-5b).
+        $preflightOk = Get-PreflightOkRepos -Output $output
+        if ($preflightOk.seen -and $preflightDeferredEpisodes.Count -gt 0) {
+            $endedEpisodes = Clear-PreflightDeferredEpisodes -Episodes $preflightDeferredEpisodes -NotifyState $notifyState `
+                -Repos $preflightOk.repos -RepoDir $cand.repo_dir
+            if ($endedEpisodes.Count -gt 0) {
+                Save-JsonState -Path $preflightDeferredStatePath -State $preflightDeferredEpisodes
+                Save-JsonState -Path $notifyStatePath -State $notifyState
+                Write-Log "preflight-deferred $($cand.key): episode over for $($endedEpisodes -join ', ') (preflight passed, exit=$code) — record and notice key cleared"
+            }
         }
         $verdict = Get-ConductorVerdict -Output $output
         # Summon, path (a) of the summon_yield record (I-SY3 / I-SY5): the stop line converted to
@@ -7314,6 +7583,38 @@ try {
             continue
         }
 
+        # EXIT CODE $PreflightDeferredExitCode — preflight deferral (T-preflight-transient-gh-failure-
+        # quarantines-threads, design v3.2). P1 could not confirm protection because GitHub was
+        # transiently unreachable; the role never started. MUST stay above the generic non-zero
+        # branch below (which would retry and then quarantine). Like exit 9: the launch is reverted
+        # (no backoff, no launches_same_head), no quarantine, not counted toward K. D-5a: an existing
+        # retry-pending record is neither read nor written here — its one retry is not consumed, and
+        # the next launch's outcome is the outcome of that retry.
+        if ($code -eq $PreflightDeferredExitCode) {
+            $dispositions[$cand.key] = 'preflight-deferred'
+            $preflightDeferredRepoDirs[(ConvertTo-DirtyCloneRepoKey -RepoDir $cand.repo_dir)] = $true
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "preflight-deferred $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN preflight-deferred $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched--
+                Write-Log "retry-launch $($cand.key): deferred (exit $code) — retry-pending kept, retry not consumed"
+            }
+            $pfPayload = Get-PreflightDeferredPayload -Output $output
+            $pfRepoKey = Get-PreflightDeferredRepoKey -Payload $pfPayload -RepoDir $cand.repo_dir
+            $pfTransition = Update-PreflightDeferredEpisode -Episodes $preflightDeferredEpisodes -RepoKey $pfRepoKey `
+                -RepoDir $cand.repo_dir -NowUtc ((Get-Date).ToUniversalTime())
+            Save-JsonState -Path $preflightDeferredStatePath -State $preflightDeferredEpisodes
+            if ($pfTransition.action -ne 'quiet') {
+                $pfNotice = Get-PreflightDeferredNotice -RepoKey $pfRepoKey -Transition $pfTransition -CandidateKey $cand.key `
+                    -RepoDir $cand.repo_dir -Payload $pfPayload -ExitCode $code
+                Send-NotificationIfChanged -State $notifyState -Key $pfNotice.key -Signature $pfNotice.signature -Message $pfNotice.message
+                Save-JsonState -Path $notifyStatePath -State $notifyState
+            }
+            Write-Log "preflight-deferred $($cand.key): exit=$code repo=$pfRepoKey episode=$($pfTransition.action) count=$($pfTransition.record.count) — no quarantine, retry-pending untouched; other candidates on this repo_dir skipped this tick, other repos CONTINUE"
+            continue
+        }
+
         # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
         # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
         # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
@@ -7322,7 +7623,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode/$PreflightDeferredExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
@@ -7495,8 +7796,12 @@ try {
             # the sequence a named function is what makes the two invariants testable in isolation
             # (the AST-lift harness in Test-DecisionComposerWiring.ps1 cannot reach code inlined
             # inside the sweep body).
+            # The phrase goes through Get-StopReasonPhrase, not $needsHuman[...] directly, so the
+            # one template phrase gets its {0} filled (T-next-names-unspawnable-identity D2). For
+            # every other reason the two are the same string.
             $rawFallback = ("MindWire: **$thread** ($($cand.project)) — " +
-                            $needsHuman[$verdict.reason] +
+                            (Get-StopReasonPhrase -StopReason $verdict.reason `
+                                -BlockedTarget "$($verdict.blocked_target)") +
                             " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
                             "chatroom を確認してください。")
             Send-HumanParkAlert -PendingDecisionsState $pendingDecisionsState `
@@ -7505,7 +7810,7 @@ try {
                 -Project $cand.project -ThreadId $thread `
                 -Signature $sig -LastMsgId $verdict.last_msg `
                 -StopReason $verdict.reason -Rounds $verdict.rounds `
-                -RawFallback $rawFallback
+                -RawFallback $rawFallback -BlockedTarget "$($verdict.blocked_target)"
         }
 
         if ($verdict.rounds -gt 0) {
@@ -7523,17 +7828,18 @@ try {
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
     }
 
-    # PR-B: acknowledge the HOLD of a project whose clone is parked, since no launch will. Only for a
-    # project that launched nothing this tick and whose in-flight ledger is clear (no row, no `*`) —
-    # see deploy/lib/InflightLedger.ps1. Observability only: a failed report is a WARN, never a stop.
+    # Acknowledge the HOLD of every pending project (F1; PR-B for the parked case), since no launch
+    # did. Only for a project that launched nothing this tick and whose in-flight ledger is clear (no
+    # row, no `*`) — see deploy/lib/InflightLedger.ps1. Observability only: a failed report is a WARN,
+    # never a stop.
     if ($holdAckViaPark.Count -gt 0) {
         Confirm-LogWorthKeeping
         $holdAckProbe = Join-Path $repoRoot "scripts\loop_control.py"
         $null = Invoke-HoldAckViaPark -Pending $holdAckViaPark -LaunchedProjects $launchedProjects `
             -InflightPath $inflightStatePath -Report {
-                param($proj)
+                param($proj, $why)
                 Invoke-BoundedUvProbe -Label "hold-ack-$proj" -TimeoutSeconds $ControlProbeTimeoutSeconds `
-                    -Arguments @($holdAckProbe, '--report-observed-hold', '--project', $proj)
+                    -Arguments @($holdAckProbe, '--report-observed-hold', '--project', $proj, '--why', $why)
             }
     }
 

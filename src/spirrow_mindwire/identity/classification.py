@@ -28,6 +28,8 @@ calls it to build findings. One derivation, two callers — msg-1493 §2's "**�
 
 from __future__ import annotations
 
+import datetime
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +81,14 @@ class ClassificationEntry:
         in the YAML (one place for the machine value, msg-1706 §2). A
         participant that omits it loads (the read half does not need it) but
         cannot be registered — the constructor refuses.
+      retired: the ISO date (``YYYY-MM-DD``) the identity was retired, or
+        ``None``. A retired identity keeps its row so its past posts and the
+        threads it owns still classify, but it may claim no role: the loader
+        requires ``legitimate=[]`` for it, whatever its ``kind``, so the
+        registration constructor writes ``allowed_roles=[]`` and a store
+        record that still holds a role is reported as drift
+        (T-retire-operator-identity-and-scope-next-fermi msg-8898 / msg-8899
+        D1-4).
     """
 
     name: str
@@ -88,6 +98,7 @@ class ClassificationEntry:
     primary_source: str
     reason: str
     independence_class: str | None = None
+    retired: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +276,13 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         raise ClassificationError(
             f"{path}: identities[{index}].legitimate must be a list of strings"
         )
+    retired = _parse_retired(raw.get("retired"), index, path)
+    if retired is not None and legitimate:
+        raise ClassificationError(
+            f"{path}: identities[{index}] is retired ({retired}) and requires legitimate=[] "
+            f"(a retired identity claims no role; "
+            f"T-retire-operator-identity-and-scope-next-fermi msg-8898)"
+        )
     if kind == "machine" and legitimate and not machine_roles_are_excepted(name, legitimate):
         raise ClassificationError(
             f"{path}: identities[{index}] kind=machine requires legitimate=[] unless listed "
@@ -272,7 +290,7 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
             f"(machinery has no honest role claim; msg-1484 §2, "
             f"T-done-disposition-auto-close msg-8589)"
         )
-    if kind == "participant" and not legitimate:
+    if kind == "participant" and not legitimate and retired is None:
         raise ClassificationError(
             f"{path}: identities[{index}] kind=participant requires len(legitimate) >= 1 "
             f"(a participant with no honest role would erase attestation; msg-1484 §5)"
@@ -309,6 +327,33 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         primary_source=primary_source,
         reason=reason,
         independence_class=independence_class,
+        retired=retired,
+    )
+
+
+_RETIRED_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _parse_retired(value: Any, index: int, path: Path) -> str | None:
+    """Return the ``retired`` date as ``YYYY-MM-DD``, or ``None`` if absent.
+
+    YAML reads an unquoted ``2026-11-10`` as a :class:`datetime.date`; a quoted
+    one stays a string. Both are accepted. A string must be spelled exactly
+    ``YYYY-MM-DD``: the compact (``20261110``) and ISO week-date
+    (``2026-W46-2``) forms that :meth:`datetime.date.fromisoformat` also
+    takes are refused. Anything else is a schema violation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, str) and _RETIRED_DATE_RE.fullmatch(value.strip()):
+        try:
+            return datetime.date.fromisoformat(value.strip()).isoformat()
+        except ValueError:
+            pass
+    raise ClassificationError(
+        f"{path}: identities[{index}].retired must be a date (YYYY-MM-DD), got {value!r}"
     )
 
 

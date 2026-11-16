@@ -121,6 +121,8 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Get-StopClassDigestLines',
                   # Slice 3b S3b-1: sweep.json `projects` and the declared-only park-wake scan.
                   'Get-SweepDeclaredProjects', 'Invoke-DeclaredProjectsParkWake', 'Test-HoldObserved',
+                  # Test-HoldObserved's freshness gate (F2) calls these two.
+                  'Test-HoldAckStale', 'ConvertFrom-ControlTimestamp',
                   # T-D8-codex-backend-adr14-15-amendment msg-6582 gap 1: the N-3 fail-safe line.
                   'Get-N3UnresolvedCount', 'Add-N3UnresolvedCount', 'Get-N3UnresolvedDigestLines',
                   # T-gate-fires-on-pr-open: 1c also scans clones no candidate names.

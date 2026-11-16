@@ -1373,13 +1373,14 @@ async def test_conductor_spawn_blocked_human_leaves_one_spawn_blocked_line(
             replies={},
             identity_embodiment=_HUMAN_UNSPAWNABLE,
         )
-    assert outcome.stop_reason is StopReason.HUMAN
+    # T-next-names-unspawnable-identity D2: the spawn-blocked stop has its own reason now.
+    assert outcome.stop_reason is StopReason.UNSPAWNABLE_TARGET
     assert disp.dispatches == []
     assert outcome.forced_naysayer_turns == 0
     assert outcome.forced_naysayer_turns_saveable == 0
     assert len(stub.states) == 1
     (line,) = _decider_lines(caplog)
-    assert line["routed"] == "spawn_blocked" and line["stop"] == "human"
+    assert line["routed"] == "spawn_blocked" and line["stop"] == "unspawnable_target_to_human"
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
     assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
@@ -1389,12 +1390,17 @@ def _route_of(
 ) -> RouteDecision:
     """``Conductor._route`` on a thread of ``(author, body)`` messages, the head resolved the way
     ``run`` resolves it."""
-    from spirrow_mindwire.conductor.handoff import resolve_handoff
+    from spirrow_mindwire.conductor.handoff import posted_at_of, resolve_handoff
 
     mcp = _FakeChatroomMcp()
     conductor = _conductor_with(mcp, _ScriptedDispatcher(mcp, {}), None, identity_embodiment)
-    messages = [{"msg_id": f"m{i}", "author": a, "content": b} for i, (a, b) in enumerate(msgs, 1)]
-    handoff = resolve_handoff(msgs[-1][1], ROSTER)
+    # Stamped like ``_FakeChatroomMcp`` stamps its messages, and resolved with the head's
+    # ``posted_at`` as ``run`` does (boundary 5: a ``NEXT: none`` settles by its posting time).
+    messages = [
+        {"msg_id": f"m{i}", "author": a, "content": b, "timestamp": "2026-06-07T00:00:00Z"}
+        for i, (a, b) in enumerate(msgs, 1)
+    ]
+    handoff = resolve_handoff(msgs[-1][1], ROSTER, posted_at=posted_at_of(messages[-1]))
     return conductor._route(handoff, messages)
 
 
@@ -1411,7 +1417,7 @@ def _route_of(
                 is_forced=False,
                 is_saveable=False,
                 spawn_blocked=True,
-                stop_reason=StopReason.HUMAN,
+                stop_reason=StopReason.UNSPAWNABLE_TARGET,
             ),
         ),
         # forced consult on an explicit NEXT: human (not saveable)

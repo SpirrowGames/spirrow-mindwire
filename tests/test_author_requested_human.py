@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 from test_conductor_core import _ROSTER as ROSTER
 from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 
@@ -80,8 +81,10 @@ def test_field_unresolvable_is_not_an_author_request(body: str) -> None:
     ],
 )
 def test_non_human_handoffs_are_not_author_requests(body: str, field: str | None) -> None:
-    h = resolve_handoff(body, _R, next_participant=field)
+    # Before the boundary-5 cutoff, so the ``none`` cells are the settle and not a refusal.
+    h = resolve_handoff(body, _R, next_participant=field, posted_at=PRE_CUTOFF)
     assert h.kind is not HandoffKind.HUMAN
+    assert h.malformed is None
     assert h.author_requested_human is False
 
 
@@ -100,7 +103,9 @@ def test_stop_line_head_resolves_absent_on_this_tree() -> None:
 def test_stop_line_above_next_none_is_not_an_author_request() -> None:
     # The #363 form: ``STOP:`` annotates a final ``NEXT: none``. It resolves NONE (never HUMAN),
     # so it can never read as the author naming the human, whatever the STOP line says.
-    h = resolve_handoff("x\n\nSTOP: blocked-on human wake:human\nNEXT: none", _R)
+    h = resolve_handoff(
+        "x\n\nSTOP: blocked-on human wake:human\nNEXT: none", _R, posted_at=PRE_CUTOFF
+    )
     assert h.kind is HandoffKind.NONE
     assert h.stop_line is not None
     assert h.author_requested_human is False

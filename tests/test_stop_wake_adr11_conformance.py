@@ -37,6 +37,7 @@ import json
 from pathlib import Path
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.conductor.disposition import disposition_payload
 from spirrow_mindwire.conductor.handoff import (
@@ -93,6 +94,7 @@ def test_the_wake_mindwire_sends_is_one_magickit_finds(wake: str, registered: bo
     stop = resolve_handoff(
         f"x\n\nSTOP: blocked-on thread:T-a wake:{wake}\nNEXT: none",
         _roster(_MAGICKIT_AGENT_REGISTRY),
+        posted_at=PRE_CUTOFF,  # the legacy wait form: a pre-cutoff head
     ).stop_line
     assert stop is not None
     payload = disposition_payload(stop)
@@ -129,7 +131,9 @@ def test_every_spelling_magickit_resolves_by_key_resolves_here(raw: str, key: st
     registry = frozenset({key})
     assert _magickit_lookup_wake(registry, raw) == key
     stop = resolve_handoff(
-        f"x\n\nSTOP: blocked-on thread:T-a wake:{raw}\nNEXT: none", _roster([key])
+        f"x\n\nSTOP: blocked-on thread:T-a wake:{raw}\nNEXT: none",
+        _roster([key]),
+        posted_at=PRE_CUTOFF,
     ).stop_line
     assert stop is not None and stop.status is StopStatus.BLOCKED_ON
     assert stop.wake == key
