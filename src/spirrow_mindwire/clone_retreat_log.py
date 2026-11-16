@@ -81,6 +81,9 @@ QUARANTINE_REASONS = frozenset(
 INDEX_LOCK_STALE_PARK_CODE = "clone_slot_index_lock_stale"
 # clone_slot.PARK_SESSION_UNKNOWN, repeated for the same reason (Bohr msg-8234 判断 2).
 SESSION_UNKNOWN_PARK_CODE = "clone_slot_session_unknown"
+# The wrapper's slot-mode exit-7 park (Bohr msg-8246) reuses that code with this detail
+# ($SlotKillUnconfirmedDetail in deploy/run-conductor-scheduled.ps1).
+KILL_UNCONFIRMED_DETAIL = "kill-unconfirmed (exit=7)"
 SLOT_NOTICE_TAG = "[slot の記録 / clone-slot record]"
 # clone_retreat.RetreatOutcome values that are a no-op: the clone was left alone, nothing to tell.
 NO_OP_OUTCOMES = frozenset({"clean", "not_eligible"})
@@ -484,7 +487,18 @@ def render_slot_notice(record: dict[str, Any]) -> str:
             "- the slot was not moved or changed. To resume: confirm no git process is still "
             "running in it, remove the index.lock named in the detail above, then unpark."
         )
-    if record.get("park_code") == SESSION_UNKNOWN_PARK_CODE:
+    if record.get("park_code") == SESSION_UNKNOWN_PARK_CODE and str(
+        record.get("detail") or ""
+    ).startswith(KILL_UNCONFIRMED_DETAIL):
+        # msg-8246: the wrapper's slot-mode exit-7 park (row written by the wrapper itself). An
+        # orphaned conductor tree may still be working in the slot, so it was left as it was.
+        lines.append(
+            "- the slot was not moved or changed. The previous turn's conductor was stopped at "
+            "its time limit but its process tree was not confirmed gone. To resume: confirm on "
+            "the loop host that no `mindwire-loop` or `claude` process is left (none with this "
+            "slot as its working directory), then unpark."
+        )
+    elif record.get("park_code") == SESSION_UNKNOWN_PARK_CODE:
         # msg-8234 判断 2: the session list could not be read, so nobody could tell whether the
         # slot is in use; it was left as it was.
         lines.append(

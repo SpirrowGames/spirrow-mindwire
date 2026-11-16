@@ -3210,6 +3210,95 @@ function Get-SlotPrepVerdict {
               detail = "$($payload.detail)"; record = $payload.record }
 }
 
+# --- slot mode: conductor exit 7 parks the thread (Bohr msg-8246, step 2b of msg-8499) -------------
+# Exit 7 = the wall-clock budget killed the conductor but could not confirm its process tree is gone.
+# The IgnoreNew + one-candidate-at-a-time premise the slot's check-to-rename window rests on does not
+# hold then: an orphan may still be working in the slot, and if it is not in `claude agents` the next
+# tick's prep would see "no session" and rename the slot under it. So in slot mode the thread is
+# parked on THAT tick with clone_slot_session_unknown (no new park code), the slot left where it is.
+# This is IN ADDITION to the existing exit-7 handling (retry/quarantine bookkeeping, the
+# kill-unconfirmed notice, the tick stop), which stays as it is. OFF (no slots_root, INV-0): returns
+# $null, so exit 7 behaves exactly as before. Pure: reads its arguments, touches nothing.
+# Not yet called by the sweep loop: wired in step 2e.
+$SlotKillUnconfirmedParkCode = 'clone_slot_session_unknown'
+$SlotKillUnconfirmedDetail = 'kill-unconfirmed (exit=7)'
+function Get-SlotKillUnconfirmedPark {
+    param([int]$ExitCode, [bool]$SlotMode, [string]$CandidateKey, [string]$SlotDir)
+    if (-not $SlotMode) { return $null }
+    if ($ExitCode -ne $ConductorKillUnconfirmedExitCode) { return $null }
+    $body = "MindWire: **$CandidateKey** の conductor を時間上限で止めましたが、プロセスツリーが終了したことを確認できませんでした (exit=$ExitCode)。" +
+            "slot モードなので、このスレッドを $SlotKillUnconfirmedParkCode で park しました。`n" +
+            "slot は移動も変更もしていません: $SlotDir`n" +
+            "unpark の前に、ループ host で mindwire-loop と claude のプロセスが残っていないこと（この slot を cwd にするものが無いこと）を確かめてください。"
+    return @{ action = 'park'; crashed = $false; slot_dir = $SlotDir
+              park_code = $SlotKillUnconfirmedParkCode; detail = $SlotKillUnconfirmedDetail
+              notice_key = "__clone_slot_park__/$CandidateKey"
+              signature = "${SlotKillUnconfirmedParkCode}:${SlotKillUnconfirmedDetail}"
+              message = $body }
+}
+
+# Write one slot-mode park decided by the WRAPPER (this exit-7 park; clone_slot_prep_crashed uses the
+# same writer when 2e wires it), in the order of Bohr msg-8236:
+#   1. the park, through the wrapper's existing park path (Set-DirtyCloneParked) under $ParkKey —
+#      the caller passes the slot-scoped key (step 2d), this function does not choose it;
+#   2. the notice on Send-NotificationIfChanged (best effort: a throwing notifier is logged and the
+#      park stays);
+#   3. ONE D-7 `slot_quarantine` row in state\clone-retreats.jsonl, best effort (action parked,
+#      quarantine_reason provision_failed, quarantine path and saved artefacts null). Written here in
+#      PowerShell, not through Python, because the crash case means the Python side may be broken.
+#      A row that cannot be written (missing state dir — not created, unwritable file) is logged and
+#      never written later; the park and the notice carry everything a reader needs.
+# Returns @{ parked = $true; notified; row_written }.
+function Complete-SlotThreadPark {
+    param([hashtable]$Parked, [string]$ParkKey, [hashtable]$Verdict, [string]$NowIso,
+          [hashtable]$NotifyState, [string]$LogPath, [string]$ThreadId, [string]$Repo)
+    $notice = @{ repo_key = $ParkKey; reason = "$($Verdict.park_code)"; head = ''
+                 detail = "$($Verdict.detail)"; signature = "$($Verdict.signature)" }
+    Set-DirtyCloneParked -Parked $Parked -RepoDir "$($Verdict.slot_dir)" -Notice $notice -NowIso $NowIso
+    Write-Log "slot park $ThreadId -> $($Verdict.park_code): $($Verdict.detail) (slot left in place: $($Verdict.slot_dir))"
+    $notified = $false
+    try {
+        Send-NotificationIfChanged -State $NotifyState -Key "$($Verdict.notice_key)" `
+            -Signature "$($Verdict.signature)" -Message "$($Verdict.message)"
+        $notified = $true
+    } catch {
+        try { Write-Log "slot park notice could not be sent for ${ThreadId}: $($_.Exception.Message)" } catch { }
+    }
+    $rowWritten = $false
+    try {
+        $at = ([datetime]::Parse($NowIso, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)).ToString(
+                "yyyy-MM-ddTHH:mm:ss.ffffff+00:00", [Globalization.CultureInfo]::InvariantCulture)
+        $row = [ordered]@{
+            kind = 'slot_quarantine'
+            record_id = "$ThreadId@$at#" + ([guid]::NewGuid().ToString('N').Substring(0, 12))
+            at = $at; thread_id = $ThreadId; repo = $Repo; slot_path = "$($Verdict.slot_dir)"
+            action = 'parked'; quarantine_path = $null; quarantine_reason = 'provision_failed'
+            park_code = "$($Verdict.park_code)"; patch = $null; untracked = $null; bundle = $null
+            clone_seconds = $null; slot_bytes = $null; detail = "$($Verdict.detail)"
+        }
+        $line = ($row | ConvertTo-Json -Compress -Depth 3)
+        $full = [System.IO.Path]::GetFullPath($LogPath)
+        if (-not [System.IO.Directory]::Exists([System.IO.Path]::GetDirectoryName($full))) {
+            throw "state directory does not exist: $([System.IO.Path]::GetDirectoryName($full))"
+        }
+        # A torn earlier write stays one malformed line instead of swallowing this row
+        # (clone_retreat_log._ends_with_newline_or_empty).
+        $prefix = ''
+        if ([System.IO.File]::Exists($full)) {
+            $fs = [System.IO.File]::Open($full, 'Open', 'Read', 'ReadWrite')
+            try {
+                if ($fs.Length -gt 0) { $null = $fs.Seek(-1, 'End'); if ($fs.ReadByte() -ne 10) { $prefix = "`n" } }
+            } finally { $fs.Dispose() }
+        }
+        [System.IO.File]::AppendAllText($full, $prefix + $line + "`n", [System.Text.UTF8Encoding]::new($false))
+        $rowWritten = $true
+    } catch {
+        try { Write-Log "slot park D-7 row not written for ${ThreadId} (park stands): $($_.Exception.Message)" } catch { }
+    }
+    return @{ parked = $true; notified = $notified; row_written = $rowWritten }
+}
+
 # --- slot-mode tick lock (T-ephemeral-impl-clone-slot-per-thread, Bohr msg-8249 / msg-8251) -------
 # In slot mode the wrapper holds state\conductor-tick.lock for the whole tick, so two wrappers (a
 # direct run, a task registered under another name) can never prep the same slot at once. IgnoreNew
