@@ -239,15 +239,26 @@ def test_hook_ignores_other_tools() -> None:
     assert _run({"tool_name": "Read", "tool_input": {"file_path": MARK}}) == {}
 
 
-#: Classified for completeness, but not gh writes under the approved definition (msg-8646 §4,
-#: msg-9287 §2), so the hook never classifies them and lets them run.
-NOT_WRITES = {"gh label create x", "gh pr merge 1 --squash"}
+#: The scope boundary (msg-9306 §1): gh calls that write to GitHub but fall outside the approved
+#: gh-write definition (msg-8646 §4, msg-9287 §2). L-p does not judge them and lets them run.
+#: That is the intended, documented boundary — whether to widen it is L-p2 in
+#: T-real-infra-values-egress-from-agent-context (a human goal decision after M-10i). This test
+#: exists so the boundary cannot move in either direction without someone deciding it.
+OUT_OF_SCOPE = {
+    "gh label create x",
+    "gh pr merge 1 --squash",
+    "gh variable set X --body v",
+    "gh secret set X",
+    "gh repo edit --description d",
+}
+#: CASES entries that are out of scope (classified above for completeness only).
+NOT_WRITES = OUT_OF_SCOPE & {c for c, _ in CASES}
 
 
-def test_cases_outside_the_write_definition_pass() -> None:
-    for cmd in NOT_WRITES:
-        assert not g.is_gh_write(cmd)
-        assert _run(_bash(cmd)) == {}
+def test_scope_boundary_calls_outside_the_definition_pass() -> None:
+    for cmd in OUT_OF_SCOPE:
+        assert not g.is_gh_write(cmd), cmd
+        assert _run(_bash(cmd)) == {}, cmd
 
 
 @pytest.mark.parametrize(
@@ -360,6 +371,26 @@ def test_production_implementer_attaches_the_guard_to_bash(tmp_path: Path) -> No
         assert "Bash" in options.tools
     # the compaction observer is still there on the primary path
     assert "PreCompact" in adapter._make_options(telemetry=TurnTelemetryState()).hooks
+
+
+def test_production_bash_hook_is_the_one_the_live_session_checked(tmp_path: Path) -> None:
+    """msg-9304 §2 / msg-9306 §2. Guarantees only this: the production builder registers the
+    same PreToolUse callback with the same matcher as ``gh_write_guard_hooks()``, which is what the
+    one live SDK session (fake ``gh`` on PATH, PR #579) was run with. It does NOT show that the
+    other production options, the hook's coexistence with ``PreCompact``, or the hand-off to the
+    SDK behave as in that session; no live session was run with the production options."""
+    from spirrow_mindwire.adapters._turn_telemetry import TurnTelemetryState
+
+    [checked] = g.gh_write_guard_hooks()["PreToolUse"]
+    adapter = _implementer_adapter(tmp_path)
+    for options in (
+        adapter._make_options(),
+        adapter._make_options(telemetry=TurnTelemetryState()),
+    ):
+        [prod] = options.hooks["PreToolUse"]
+        assert prod.matcher == checked.matcher == "Bash"
+        assert prod.hooks == checked.hooks == [g.gh_write_pretooluse]
+        assert prod.timeout == checked.timeout
 
 
 def test_prompts_carry_p1() -> None:

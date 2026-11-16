@@ -15,6 +15,18 @@ classified into exactly one of nine classes (:data:`CLASSES`, first match wins).
 are allowed; everything else is denied before the command runs. A Bash call with no ``gh`` write
 passes untouched.
 
+Scope: what it judges and what it lets through untouched (msg-9306 §1). Only calls that match the
+approved gh-write definition (:func:`gh_write`: ``pr``/``issue`` ``create|comment|edit|review``;
+``api`` with a write method or a field / ``--input``; ``pr``/``issue``/``release``/``gist`` with a
+body option; the four positional-file commands) are classified. Every other ``gh`` call is NOT
+judged and runs as it is — for example ``gh label create``, ``gh pr merge --squash`` (no body
+option), ``gh variable set``, ``gh secret set``, ``gh repo edit --description``. That is a known,
+intended boundary, not an oversight: whether to bring those calls under the guard (L-p2, measured
+first by M-10i) changes behaviour that is allowed today, so it is a human goal decision taken in
+the thread, not here. Making the boundary explicit does not make it safer; those writes still go
+out unjudged. ``test_scope_boundary_calls_outside_the_definition_pass`` (in
+``tests/test_gh_write_guard.py``) pins it so it cannot move silently.
+
 What it does NOT do (ADR-2026-05-23-07 §8 decision 3, msg-9299 §6). This narrows the *shape* of
 ``gh`` writes so that the body of a write is a literal fixed in the command string. It does not
 close the path to GitHub: ``git push``, another program going out through the proxy, and the
