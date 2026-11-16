@@ -10,7 +10,8 @@ text and the measurement script used for M-10f / M-10g (``m10g_run2.py``, sha256
 
 What it does. A Bash call whose command contains a ``gh`` write (:func:`is_gh_write`) is
 classified into exactly one of nine classes (:data:`CLASSES`, first match wins). Only
-``a_prime_heredoc`` (a lone ``gh`` write whose body arrives through one quoted heredoc) and
+``a_prime_heredoc`` (a lone ``gh`` write whose body arrives through one quoted heredoc and whose
+other arguments pass the inline allowlist plus the stdin option) and
 ``a_prime_inline`` (a lone ``gh`` write whose arguments are all literal and on the allowlist)
 are allowed; everything else is denied before the command runs. A Bash call with no ``gh`` write
 passes untouched.
@@ -39,6 +40,14 @@ not a name denylist standing in for it.
 
 Fail-closed (ADR-2026-05-23-07 §2.6, msg-9299 §5). An exception anywhere in the guard, a parse
 failure, an unparsed gap in the tree, or a class outside the allowlist all deny.
+
+Detection when the tree is unusable (PR-gate on #579, objection 4). If the command does not parse,
+detection is *indeterminate*; it is never settled by the gh-write regex. An indeterminate command
+is treated as a gh write — and so denied as ``ts_parse_fail`` — whenever its text, with quotes and
+backslashes removed, contains ``gh`` / ``gh.exe`` as a word (``'gh'``, ``g"h"``, ``/usr/bin/gh``
+all count). Only an unparsable command with no such word passes. The residual is the one the
+parsed path has too: a ``gh`` whose name is built at run time (``$G``, ``$(...)``, ANSI-C quoting)
+is an indirect call and is recognised in neither path.
 
 Output discipline (C-8', msg-9297 §3). The deny reason is a fixed string chosen by
 (class, command family). No part of the command, no parser diagnostic and no exception text is
@@ -259,6 +268,17 @@ WRAPPER_SHELLS = frozenset(
         "cmd.exe",
     }
 )
+#: Options gh resolves before the command path (cobra strips them while finding the
+#: subcommand). Value-taking ones consume the next word; an unknown option is tried both ways.
+GH_PRE_BOOL = frozenset({"-h", "--help", "--version"})
+GH_PRE_VAL = frozenset({"-R", "--repo", "--hostname"})
+#: Bound on the readings explored for unknown leading options; past it, detection says write.
+_MAX_PATHS = 256
+#: A ``gh`` word anywhere in a de-quoted text (the indeterminate-detection net, objection 4).
+GH_TOKEN = re.compile(r"(?<![\w.-])gh(?:\.exe)?(?![\w.-])", re.IGNORECASE)
+#: Unescaped characters that make an unquoted word expand (tilde, pathname, brace; objection 3).
+WORD_EXPANDING = frozenset("*?[]{}~")
+_MAX_WRAP_DEPTH = 3
 LEX_GH = re.compile(r"(?<![\w./\\-])gh(?:\.exe)?[ \t]+(?:pr|issue|release|gist|api)\b")
 LEX_STOP = re.compile(r"&&|\|\||[;|\n)`]")
 
@@ -280,9 +300,62 @@ def parse(src: bytes) -> Node:
 
 
 # ----------------------------------------------------------------------------- gh-write test
+def _command_paths(args: list[str]) -> list[tuple[int, ...]] | None:
+    """Every command path (indices of the group and sub words in ``args`` = ``argv[1:]``) gh
+    could resolve when options precede them (objection 1: ``gh --repo o/r pr comment ...``).
+    ``None`` when the readings exceed :data:`_MAX_PATHS` (the caller treats that as a write).
+    """
+    out: set[tuple[int, ...]] = set()
+    stack: list[tuple[int, tuple[int, ...]]] = [(0, ())]
+    seen = 0
+    while stack:
+        seen += 1
+        if seen > _MAX_PATHS:
+            return None
+        i, path = stack.pop()
+        if len(path) == 2 or i >= len(args):
+            out.add(path)
+            continue
+        t = args[i]
+        if t.startswith("-") and t != "-":
+            if t == "--" or "=" in t or t in GH_PRE_BOOL:
+                stack.append((i + 1, path))
+            elif t in GH_PRE_VAL:
+                stack.append((i + 2, path))
+            elif not t.startswith("--") and len(t) > 2 and t[:2] in GH_PRE_VAL:
+                stack.append((i + 1, path))
+            else:
+                stack.extend(((i + 1, path), (i + 2, path)))
+        else:
+            stack.append((i + 1, (*path, i)))
+    return sorted(out)
+
+
 def gh_write(argv: list[str], legacy: bool = False) -> bool:
     """Whether ``argv`` (``argv[0] == "gh"``) is a gh write (msg-8645 §3 4 + msg-8646 §4 +
-    msg-9287 §2). ``legacy`` drops the msg-9287 §2 widening (kept for measurement parity)."""
+    msg-9287 §2). ``legacy`` drops the msg-9287 §2 widening (kept for measurement parity), and
+    with it the leading-option normalisation, so the M-10f definition is reproduced as it was.
+
+    Options before the group or the sub are normalised away first (objection 1): every command
+    path gh could resolve is checked, the other words keep their order after it, and the call is
+    a write if any of those readings is.
+    """
+    if legacy:
+        return _gh_write_flat(argv, legacy)
+    args = argv[1:]
+    paths = _command_paths(args)
+    if paths is None:
+        return True
+    for path in paths:
+        head = [args[j] for j in path]
+        tail = [a for j, a in enumerate(args) if j not in path]
+        if _gh_write_flat([argv[0], *head, *tail]):
+            return True
+    return False
+
+
+def _gh_write_flat(argv: list[str], legacy: bool = False) -> bool:
+    """The definition on an argv whose group and sub are ``argv[1]`` / ``argv[2]``."""
     if len(argv) < 2:
         return False
     g = argv[1]
@@ -341,9 +414,26 @@ def _text(n: Node) -> str:
     return (n.text or b"").decode("utf-8", "replace")
 
 
+def _word_is_fixed(s: str) -> bool:
+    """No unescaped tilde / glob / brace character in an unquoted word (objection 3)."""
+    esc = False
+    for ch in s:
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch in WORD_EXPANDING:
+            return False
+    return True
+
+
 def literal(n: Node) -> bool:
+    """Whether ``n`` is fixed in the command string. An unquoted word is not if Bash would expand
+    it (tilde, pathname or brace expansion): ``--body ~`` sends the home directory."""
     t = n.type
-    if t in ("word", "number", "raw_string"):
+    if t == "word":
+        return not any(c.type in NONLITERAL for c in n.children) and _word_is_fixed(_text(n))
+    if t in ("number", "raw_string"):
         return not any(c.type in NONLITERAL for c in n.children)
     if t == "string":
         return all(c.type in ('"', "string_content") for c in n.children)
@@ -444,16 +534,62 @@ def _tree_has_gh_write(root: Node, legacy: bool = False) -> bool:
     return False
 
 
+def maybe_gh(text: str) -> bool:
+    """The indeterminate-detection net: ``gh`` as a word once quotes are gone, reading each
+    backslash both as an escape (``g\\h``) and as a Windows path separator (``C:\\x\\gh.exe``)."""
+    unquoted = re.sub(r"[\"']", "", text)
+    return any(GH_TOKEN.search(unquoted.replace("\\", sep)) for sep in ("", "/"))
+
+
+def _detect(text: str, depth: int = 0) -> bool | None:
+    """Current-definition detection. ``None`` = indeterminate (the text does not parse)."""
+    src = text.encode("utf-8", "replace")
+    try:
+        root = parse(src)
+        if root.has_error or not gap_scan(root, src)[0]:
+            return None
+    except Exception:
+        return None
+    for n in walk(root):
+        if n.type != "command":
+            continue
+        name = cmd_name(n)
+        if name is None:
+            continue
+        argv = [value(name)] + [value(a) for a in n.children_by_field_name("argument")]
+        base = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if base in GH_NAMES:
+            argv[0] = "gh"
+            if gh_write(argv):
+                return True
+        elif base in WRAPPER_SHELLS:
+            for a in argv[1:]:
+                r = _detect(a, depth + 1) if depth < _MAX_WRAP_DEPTH else None
+                if r is None:
+                    r = maybe_gh(a)
+                if r:
+                    return True
+    return False
+
+
 def gh_write_kind(cmd: str) -> tuple[bool, bool]:
-    """``(gh write under the current definition, gh write under the M-10f definition)``."""
+    """``(gh write under the current definition, gh write under the M-10f definition)``.
+
+    The current definition never settles an unparsable command by the gh-write regex: it is a
+    write whenever :func:`maybe_gh` finds a ``gh`` word in it (objection 4). The M-10f column
+    keeps the measurement-time behaviour (lexical fallback) for parity only; nothing decides on
+    it."""
+    cur = _detect(cmd)
+    if cur is None:
+        cur = maybe_gh(cmd)
     src = cmd.encode("utf-8", "replace")
     try:
         root = parse(src)
         if not root.has_error and gap_scan(root, src)[0]:
-            return _tree_has_gh_write(root), _tree_has_gh_write(root, True)
+            return cur, _tree_has_gh_write(root, True)
     except Exception:
         pass
-    return lex_has_gh_write(cmd), lex_has_gh_write(cmd, True)
+    return cur, lex_has_gh_write(cmd, True)
 
 
 def is_gh_write(cmd: str) -> bool:
@@ -560,12 +696,16 @@ def classify_ex(cmd: str) -> tuple[str, bool, bool]:
     if not literal(args[0]):
         return "other", True, rec
     group = value(args[0])
+    if group.startswith("-"):  # options before the command path have no allowed form (obj. 1)
+        return "other", True, rec
     if group == "api":
         sub, rest = "", args[1:]
     else:
         if len(args) < 2 or not literal(args[1]):
             return "other", True, rec
         sub, rest = value(args[1]), args[2:]
+        if sub.startswith("-"):
+            return "other", True, rec
     # ---- 4 (ii), msg-9289 §1: positional-file commands are class 4 whatever their arguments,
     # and the '-' recovery does not apply to them (msg-9289 §4, third condition).
     if (group, sub) in POSFILE_CMDS:
@@ -610,23 +750,31 @@ def classify_ex(cmd: str) -> tuple[str, bool, bool]:
             if has and not lit:
                 return "body_expansion", True, rec
     # ---- 6 / 7
-    if stdin and qh == 1 and not others and len(heredocs) == 1:
-        return "a_prime_heredoc", True, rec
+    heredoc_form = stdin and qh == 1 and not others and len(heredocs) == 1 and not dash_pos
     if stdin and not heredocs:
         return "stdin_no_heredoc", True, rec
-    # ---- 8 (allowlist, fail-closed: anything not listed is 9)
-    if heredocs or others or stdin or dash_pos:
+    if not heredoc_form and (heredocs or others or stdin or dash_pos):
         return "other", True, rec
+    # ---- 6 and 8 share one allowlist (objection 2). The quoted heredoc fixes the body only; the
+    # rest of the command must be as literal and as listed as the inline form. The heredoc form
+    # additionally permits its group's stdin option; a group with no inline allowlist (release)
+    # has no heredoc form either. Anything not listed is 9 (fail-closed).
+    allowed_cls = "a_prime_heredoc" if heredoc_form else "a_prime_inline"
     if any(c.type == "variable_assignment" for c in body.named_children):
         return "other", True, rec
     if nm != "gh" or not all(literal(a) for a in args):
         return "other", True, rec
     opts = [it for it in items if it[0] == "opt"]
+    stdin_opts = FILE_OPTS.get(group, frozenset()) if heredoc_form else frozenset()
     if group in ("pr", "issue") and sub in ALLOW_PI_SUBS:
-        if all(o[1] in ALLOW_PI_OPTS for o in opts) and len(pos_vals) <= 1:
-            return "a_prime_inline", True, rec
-    elif group == "api" and all(o[1] in ALLOW_API_OPTS for o in opts) and len(pos_vals) == 1:
-        return "a_prime_inline", True, rec
+        if all(o[1] in ALLOW_PI_OPTS | stdin_opts for o in opts) and len(pos_vals) <= 1:
+            return allowed_cls, True, rec
+    elif (
+        group == "api"
+        and all(o[1] in ALLOW_API_OPTS | stdin_opts for o in opts)
+        and len(pos_vals) == 1
+    ):
+        return allowed_cls, True, rec
     return "other", True, rec
 
 

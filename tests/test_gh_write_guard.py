@@ -305,7 +305,7 @@ def test_parser_exception_is_denied_without_leaking(
 
     monkeypatch.setattr(g, "parse", boom)
     caplog.set_level(logging.DEBUG)
-    # detection falls back to the lexer; classification raises -> class 1, denied
+    # detection is indeterminate and the text names gh -> a write; classification raises -> 1
     reason = _reason(_run(_bash(f"gh pr comment 1 --body {MARK}")))
     assert "[ts_parse_fail]" in reason
     out = capsys.readouterr()
@@ -399,3 +399,163 @@ def test_prompts_carry_p1() -> None:
 
     assert g.P1_PROMPT_BLOCK in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert g.P1_PROMPT_BLOCK in _DEFAULT_SYSTEM_PROMPT
+
+
+# ------------------------------------------- PR-gate on #579: the four blocking findings
+#: Objection 1: options before the group or the sub must not hide a write from detection.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh --repo o/r pr comment 1 --body-file /tmp/" + MARK,
+        "gh -R o/r pr comment 1 --body-file /tmp/" + MARK,
+        "gh -Ro/r pr comment 1 --body x",
+        "gh --repo=o/r pr comment 1 --body x",
+        "gh pr -R o/r create --fill",
+        "gh pr --repo o/r comment 1 --body-file - " + H,
+        "gh --unknown-flag v pr comment 1 --body x",
+        "gh --unknown-bool pr comment 1 --body x",
+        "gh --repo o/r api repos/o/r/issues -f title=x",
+    ],
+)
+def test_leading_options_are_detected_and_denied(cmd: str) -> None:
+    assert g.is_gh_write(cmd), cmd
+    allowed, reason = g.decide(cmd)
+    assert not allowed
+    assert reason is not None and "[other]" in reason and MARK not in reason
+
+
+@pytest.mark.parametrize("cmd", ["gh --version", "gh --help", "gh -R o/r pr view 1"])
+def test_leading_options_on_reads_still_pass(cmd: str) -> None:
+    assert not g.is_gh_write(cmd)
+    assert g.decide(cmd) == (True, None)
+
+
+def test_leading_option_readings_are_bounded() -> None:
+    cmd = "gh " + " ".join(f"--u{i}" for i in range(40)) + " pr view 1"
+    assert g.is_gh_write(cmd)  # past the bound, detection says write (fail-closed)
+    assert not g.decide(cmd)[0]
+
+
+#: Objection 2: the heredoc form validates assignments, every argument and the option list.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'gh api repos/o/r/issues --input - -H "X-Leak: $SECRET" ' + H,
+        'gh api repos/o/r/issues --input - -H "X-Leak: $(cat f)" ' + H,
+        "X=1 gh pr comment 1 --body-file - " + H,
+        'gh pr comment 1 --body-file - -R "$R" ' + H,
+        "gh pr comment 1 --body-file - --foo y " + H,
+        "gh pr comment 1 2 --body-file - " + H,
+        "gh pr comment ~ --body-file - " + H,
+        "gh pr checkout 1 --body-file - " + H,
+        "gh release edit v1 --notes-file - " + H,
+        "/usr/bin/gh pr comment 1 --body-file - " + H,
+    ],
+)
+def test_heredoc_form_validates_the_rest_of_the_command(cmd: str) -> None:
+    cls = g.classify(cmd)
+    assert cls not in g.ALLOWED_CLASSES, (cmd, cls)
+    if g.is_gh_write(cmd):
+        assert not g.decide(cmd)[0]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'gh api repos/o/r/issues --input - -H "X-A: b" ' + H,
+        "gh pr comment 1 -R o/r --body-file - " + H,
+        "gh issue create -t x --body-file - " + H,
+        "gh pr review 3 --approve --body-file - " + H,
+    ],
+)
+def test_heredoc_form_with_listed_literal_options_is_allowed(cmd: str) -> None:
+    assert g.classify(cmd) == "a_prime_heredoc"
+    assert g.decide(cmd) == (True, None)
+
+
+#: Objection 3: an unquoted word that Bash expands is not a literal.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr comment 1 --body ~",
+        "gh pr comment 1 --body ~/x",
+        "gh pr comment 1 --body=~",
+        "gh pr comment 1 --body *",
+        "gh pr comment 1 --body a?",
+        "gh pr comment 1 --body [ab]",
+        "gh pr comment 1 --body {a,b}",
+        "gh pr comment 1 --body x{1..3}",
+        "gh api repos/o/r/* -f title=x",
+        "gh api repos/o/r/issues -f title=~",
+    ],
+)
+def test_expanding_unquoted_words_are_not_literal(cmd: str) -> None:
+    assert g.is_gh_write(cmd)
+    assert g.classify(cmd) not in g.ALLOWED_CLASSES
+    assert not g.decide(cmd)[0]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr comment 1 --body '~'",
+        'gh pr comment 1 --body "a*b"',
+        r"gh pr comment 1 --body \~",
+        r"gh pr comment 1 --body a\*",
+    ],
+)
+def test_quoted_or_escaped_expansion_characters_stay_literal(cmd: str) -> None:
+    assert g.classify(cmd) == "a_prime_inline"
+
+
+#: Objection 4: a parser failure leaves detection indeterminate, which is denied for any command
+#: naming gh — never settled by the gh-write regex.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "'gh' pr comment 1 --body-file /tmp/" + MARK,
+        '"gh" pr comment 1 --body-file /tmp/' + MARK,
+        'g"h" pr comment 1 --body x',
+        r"g\h pr comment 1 --body x",
+        "/usr/bin/gh pr comment 1 --body-file /tmp/" + MARK,
+        r"C:\tools\gh.exe pr comment 1 --body x",
+        "gh --repo o/r pr comment 1 --body x",
+        "gh pr view 1",
+    ],
+)
+def test_parser_exception_denies_any_command_naming_gh(
+    monkeypatch: pytest.MonkeyPatch, cmd: str
+) -> None:
+    def boom(_src: bytes) -> Any:
+        raise RuntimeError(MARK)
+
+    monkeypatch.setattr(g, "parse", boom)
+    assert g.is_gh_write(cmd)
+    reason = _reason(_run(_bash(cmd)))
+    assert "[ts_parse_fail]" in reason
+    assert MARK not in reason
+
+
+def test_parser_exception_lets_commands_without_gh_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_src: bytes) -> Any:
+        raise RuntimeError(MARK)
+
+    monkeypatch.setattr(g, "parse", boom)
+    for cmd in ("git status", "uv run pytest", "cat github.txt", "ls ./ghost"):
+        assert _run(_bash(cmd)) == {}, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "'gh' pr comment 1 --body 'unterminated",
+        "gh --repo o/r pr comment 1 --body 'unterminated",
+        "bash -c \"'gh' pr comment 1 --body-file f\"",
+        'bash -c "gh --repo o/r pr comment 1 --body-file f"',
+    ],
+)
+def test_unparsable_or_wrapped_gh_writes_are_denied(cmd: str) -> None:
+    assert g.is_gh_write(cmd)
+    assert not g.decide(cmd)[0]
