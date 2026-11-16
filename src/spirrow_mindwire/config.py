@@ -356,9 +356,35 @@ class Stage3LoopConfig(_StrictModel):
     Lexora-gateway route outright (HTTP 422). See ``adapters/_cli_selection``.
     """
 
+    slots_root: Path | None = None
+    """Root of the per-thread clone slots (T-ephemeral-impl-clone-slot-per-thread, msg-8061).
+
+    ``None`` (the default) keeps the single shared ``repo_dir`` clone with exactly today's
+    behaviour (INV-0). When set, each thread works in its own ``<slots_root>/<repo>/<hash12>[-N]/``
+    clone provisioned from the bare mirror ``<slots_root>/<repo>.git``
+    (:mod:`spirrow_mindwire.clone_slot_prep`).
+
+    **Not accepted yet.** The pre-turn prep exists, but the loop / wrapper wiring and the
+    slot-scoped park key (D-5) do not, so a configured value would be silently ignored while every
+    thread kept sharing ``repo_dir``. Per msg-8055 R-7 / msg-8061 the value is refused at load
+    until the PR that wires provisioning and the slot park key together accepts it.
+    """
+
     watches: tuple[LoopWatchConfig, ...] = ()
 
-    @field_validator("role_model", "role_cli_path", "repo_dir", mode="before")
+    @field_validator("slots_root", mode="after")
+    @classmethod
+    def _slots_root_not_wired_yet(cls, v: Path | None) -> Path | None:
+        """Refuse ``slots_root`` until slot provisioning is wired into the loop (msg-8061 R-7)."""
+        if v is not None:
+            raise ValueError(
+                "[loop].slots_root is not accepted yet: per-thread clone slots are not wired into "
+                "the loop (T-ephemeral-impl-clone-slot-per-thread PR-A in progress). Leave it "
+                "unset to keep the single shared repo_dir clone."
+            )
+        return v
+
+    @field_validator("role_model", "role_cli_path", "repo_dir", "slots_root", mode="before")
     @classmethod
     def _blank_means_unset(cls, v: object) -> object:
         """Treat an empty / whitespace-only value as "not configured".
