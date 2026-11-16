@@ -60,7 +60,13 @@ param(
 
     # The data root; the sweep respects the same env var, and defaulting to the same location keeps
     # this script usable without any env setup on the operator's side.
-    [string]$DataDir = $(if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" })
+    [string]$DataDir = $(if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }),
+
+    # -SlotParkKey only: how long to wait for state/dirty-clones.json.lock before failing with no
+    # change (Bohr msg-9328 §3). The sweep holds that lock only to read, change one key and save.
+    [Parameter(ParameterSetName = 'SlotPark')]
+    [ValidateRange(1, 600)]
+    [int]$LockTimeoutSeconds = 10
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,7 +83,8 @@ if ($PSCmdlet.ParameterSetName -eq 'SlotPark') {
             $n.Left.Extent.Text -eq '$SlotParkKeyPrefix' }, $true) | Select-Object -First 1
     if (-not $prefixAssign) { throw "cannot classify the key: `$SlotParkKeyPrefix not found in $sweepScript" }
     Invoke-Expression $prefixAssign.Extent.Text
-    foreach ($fname in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKeyKind') {
+    foreach ($fname in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKeyKind', 'Read-DirtyClonesStateForUpdate',
+                       'Write-DirtyClonesStateAtomic') {
         $fn = $sweepAst.FindAll({ param($n)
                 $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fname }, $true) |
             Select-Object -First 1
@@ -87,21 +94,47 @@ if ($PSCmdlet.ParameterSetName -eq 'SlotPark') {
     if (-not (Test-Path -LiteralPath $dirtyClonesStatePath)) {
         throw "no dirty-clone state file at $dirtyClonesStatePath — nothing to unpark"
     }
-    $draw = Get-Content -LiteralPath $dirtyClonesStatePath -Raw -Encoding utf8
-    $dstate = if ($draw.Trim()) { $draw | ConvertFrom-Json -AsHashtable } else { @{} }
-    if ($null -eq $dstate) { $dstate = @{} }
-    if (-not $dstate.ContainsKey($SlotParkKey)) {
-        throw "not parked: $SlotParkKey (state keys: $($dstate.Keys -join ', '))"
-    }
     $kind = Get-DirtyCloneParkKeyKind -Key $SlotParkKey
     if ($kind -eq 'repo') {
         throw "$SlotParkKey is a repo-keyed dirty-clone park: the tick's clone-check releases it once the clone is clean; -SlotParkKey only releases slot parks"
     }
-    $sremoved = $dstate[$SlotParkKey]
+    # Confirm before taking the lock, so a -Confirm prompt never holds it.
     if (-not $PSCmdlet.ShouldProcess($SlotParkKey, "unpark clone slot (reason: $Reason)")) { return }
-    $dstate.Remove($SlotParkKey)
+    # The read-again -> remove ONE key -> save happens inside the same short lock the sweep uses
+    # (Bohr msg-9328 §3, Obj-25-1), so a park the sweep saves meanwhile is never lost and this unpark
+    # is never written back by it. No lock within -LockTimeoutSeconds, or a file that cannot be read:
+    # fail with no change to the state or the history.
+    $lockPath = "$dirtyClonesStatePath.lock"
+    $deadline = [DateTime]::UtcNow.AddSeconds($LockTimeoutSeconds)
+    $lockStream = $null
+    $lockError = ''
+    while ($null -eq $lockStream) {
+        try {
+            $lockStream = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        } catch {
+            $lockError = $_.Exception.Message
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "could not take $lockPath within $LockTimeoutSeconds s (the sweep may be saving; run this again): $lockError — nothing changed"
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    try {
+        $read = Read-DirtyClonesStateForUpdate -StatePath $dirtyClonesStatePath
+        if (-not $read.ok) { throw "$($read.error) — nothing changed" }
+        $dstate = $read.state
+        if (-not $dstate.ContainsKey($SlotParkKey)) {
+            throw "not parked: $SlotParkKey (state keys: $($dstate.Keys -join ', '))"
+        }
+        $sremoved = $dstate[$SlotParkKey]
+        [void]$dstate.Remove($SlotParkKey)
+        Write-DirtyClonesStateAtomic -StatePath $dirtyClonesStatePath -State $dstate
+    } finally {
+        $lockStream.Dispose()
+    }
+    # History only after the state was saved.
     $utf8NoBomSlot = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($dirtyClonesStatePath, ($dstate | ConvertTo-Json -Depth 5), $utf8NoBomSlot)
     $shistory = @()
     if (Test-Path -LiteralPath $slotHistoryPath) {
         $shraw = Get-Content -LiteralPath $slotHistoryPath -Raw -Encoding utf8

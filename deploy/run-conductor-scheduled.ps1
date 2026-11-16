@@ -3692,6 +3692,118 @@ function Set-DirtyCloneParked {
     }
 }
 
+# --- dirty-clones.json under a short lock (step 2e, Bohr msg-9328 / msg-9330, Obj-25-1 / 26-1 / 26-2) ---
+# In slot mode a person can unpark one slot (deploy/Clear-Quarantine.ps1 -SlotParkKey) while a tick
+# runs. Both writers therefore change dirty-clones.json only inside state\dirty-clones.json.lock (an
+# exclusive OS handle, held for read-again -> change ONE key -> save; never a file-exists flag, so a
+# dead holder frees it), and the tick saves each change the moment it makes it. The contract is the
+# save order fixed inside the lock: a park the tick saves after a person's unpark stands; an unpark
+# saved after the tick's park stands. There is no give-up and no save-later path on the tick side
+# (Obj-26-1 / 26-2): it waits until the change is saved before it goes on, still holding
+# conductor-tick.lock, so no later tick can prep a slot whose park is not on disk. The wait is not
+# silent: a log line every $DirtyClonesLockLogSeconds and one notice past $DirtyClonesLockNoticeSeconds.
+# A file that exists but cannot be read is never overwritten (that would drop every other park):
+# it is waited on and reported the same way. Saves are atomic (temp file, then replace), so a reader
+# outside the lock sees the old or the new file, never half of one. Known limit (msg-9330 §5): a
+# wrapper killed from outside while it waits loses the park, as it would before the first save
+# without this lock. Not yet called by the sweep loop: wired in step 2e with slot mode; OFF keeps
+# Save-JsonState as it is.
+$DirtyClonesLockLogSeconds = 30
+$DirtyClonesLockNoticeSeconds = 60
+$DirtyClonesLockNoticeKey = '__dirty_clones_lock__'
+
+# Read dirty-clones.json for a locked update. @{ ok; state } or @{ ok = $false; error }. A missing or
+# empty file is an empty state; anything unparseable, or a root that is not an object, is an error.
+function Read-DirtyClonesStateForUpdate {
+    param([string]$StatePath)
+    if (-not [System.IO.File]::Exists($StatePath)) { return @{ ok = $true; state = @{} } }
+    try {
+        $raw = [System.IO.File]::ReadAllText($StatePath, [System.Text.Encoding]::UTF8)
+        if (-not $raw.Trim()) { return @{ ok = $true; state = @{} } }
+        $obj = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        if ($obj -isnot [hashtable]) { return @{ ok = $false; error = "root is not an object: $StatePath" } }
+        return @{ ok = $true; state = $obj }
+    } catch {
+        return @{ ok = $false; error = "cannot read ${StatePath}: $($_.Exception.Message)" }
+    }
+}
+
+function Write-DirtyClonesStateAtomic {
+    param([string]$StatePath, [hashtable]$State)
+    $tmp = "$StatePath.tmp"
+    [System.IO.File]::WriteAllText($tmp, ($State | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::Move($tmp, $StatePath, $true)
+}
+
+# Change ONE key of dirty-clones.json under the lock: -Row sets it, -Remove deletes it. Waits until
+# saved (see above). On return $Parked holds the file as saved (normalised), so a person's unpark made
+# earlier in the tick is seen by the rest of it. $Now / $Wait exist so tests can drive the clock;
+# $OnWait (tests only) runs once per failed attempt.
+function Update-DirtyClonesStateKey {
+    param([string]$StatePath, [string]$Key, [hashtable]$Row, [switch]$Remove, [hashtable]$Parked,
+          [hashtable]$NotifyState, [scriptblock]$Now = { [DateTime]::UtcNow },
+          [scriptblock]$Wait = { param($ms) Start-Sleep -Milliseconds $ms }, [scriptblock]$OnWait = $null)
+    if (-not $Key) { throw 'Update-DirtyClonesStateKey: -Key is empty' }
+    if (-not $Remove -and $null -eq $Row) { throw 'Update-DirtyClonesStateKey: give -Row or -Remove' }
+    $lockPath = "$StatePath.lock"
+    $start = & $Now
+    $nextLog = $DirtyClonesLockLogSeconds
+    $noticed = $false
+    $lastError = ''
+    while ($true) {
+        $stream = $null
+        try {
+            $stream = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        } catch {
+            $ex = $_.Exception
+            while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }
+            $lastError = "lock ${lockPath}: $($ex.GetType().FullName): $($ex.Message)"
+        }
+        if ($null -ne $stream) {
+            try {
+                $read = Read-DirtyClonesStateForUpdate -StatePath $StatePath
+                if ($read.ok) {
+                    $state = $read.state
+                    if ($Remove) { [void]$state.Remove($Key) } else { $state[$Key] = $Row }
+                    Write-DirtyClonesStateAtomic -StatePath $StatePath -State $state
+                    if ($null -ne $Parked) {
+                        $norm = ConvertTo-DirtyCloneParking -State $state
+                        $Parked.Clear()
+                        foreach ($k in $norm.Keys) { $Parked[$k] = $norm[$k] }
+                    }
+                    $waited = ((& $Now) - $start).TotalSeconds
+                    if ($waited -ge $DirtyClonesLockLogSeconds) {
+                        Write-Log ("dirty-clones.json saved after waiting {0:N0}s: {1} {2}" -f $waited, $(if ($Remove) { 'removed' } else { 'set' }), $Key)
+                    }
+                    return @{ saved = $true; waited_seconds = $waited; noticed = $noticed }
+                }
+                $lastError = $read.error
+            } finally {
+                $stream.Dispose()
+            }
+        }
+        if ($null -ne $OnWait) { & $OnWait }
+        $elapsed = ((& $Now) - $start).TotalSeconds
+        if ($elapsed -ge $nextLog) {
+            Write-Log ("dirty-clones.json: waiting {0:N0}s to save {1} — {2}" -f $elapsed, $Key, $lastError)
+            while ($nextLog -le $elapsed) { $nextLog += $DirtyClonesLockLogSeconds }
+        }
+        if (-not $noticed -and $elapsed -gt $DirtyClonesLockNoticeSeconds) {
+            $noticed = $true
+            $body = "MindWire: ``dirty-clones.json.lock`` を握ったままのプロセスがあるか、``dirty-clones.json`` を読めないため、park の保存を $([int]$elapsed) 秒待っています。保存できるまで tick は先に進みません（次の tick も始まりません）。`n" +
+                    "``Clear-Quarantine.ps1`` が残っていないか確かめ、あれば止めてください。`nkey: $Key`n$lastError"
+            try {
+                Send-NotificationIfChanged -State $NotifyState -Key $DirtyClonesLockNoticeKey `
+                    -Signature ("dirty-clones-lock-wait:{0:o}" -f $start) -Message $body
+            } catch {
+                try { Write-Log "dirty-clones.json lock-wait notice could not be sent: $($_.Exception.Message)" } catch { }
+            }
+        }
+        & $Wait 250
+    }
+}
+
 # Run `python -m spirrow_mindwire.cli clone-check --repo-dir <dir>` once, bounded. Returns
 # @{ code; output (stdout lines); stderr }. A probe that could not run or timed out reports code -1.
 function Invoke-CloneCheck {
