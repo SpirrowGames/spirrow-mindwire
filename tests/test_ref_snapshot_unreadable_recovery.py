@@ -69,6 +69,8 @@ UNREADABLE: dict[str, bytes] = {
     "bad_shape": json.dumps({"version": SCHEMA_VERSION, "entries": [{"refs": 3}]}).encode(),
     "not_utf8": b"\xff\xfe\x00garbage",
     "degraded_version_without_flag": json.dumps({"version": DEGRADED_SCHEMA_VERSION}).encode(),
+    # json.loads raises RecursionError (not ValueError) on deep nesting (PR #583 gate r1).
+    "deeply_nested": b"[" * 100_000 + b"]" * 100_000,
 }
 
 
@@ -148,6 +150,19 @@ def test_unreadable_file_is_copied_aside_and_replaced_by_degraded(
         notices[0].getMessage()
     )
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_deeply_nested_json_really_raises_recursion_error_in_the_parser() -> None:
+    # Guards the fixture: if json.loads ever stops recursing, "deeply_nested" would
+    # silently degrade into a plain ValueError case and stop covering this path.
+    with pytest.raises(RecursionError):
+        json.loads(UNREADABLE["deeply_nested"].decode("utf-8"))
+
+
+def test_deeply_nested_json_is_conservative_on_the_lookup_path(tmp_path: Path) -> None:
+    store = TurnRefSnapshotStore(tmp_path / "s")
+    _seed(store, UNREADABLE["deeply_nested"])
+    assert store.baseline_for(_scope("msg-100"), tmp_path) is None
 
 
 def test_degraded_version_is_one_above_the_schema_so_old_code_refuses_it() -> None:

@@ -418,7 +418,12 @@ class TurnRefSnapshotStore:
     @staticmethod
     def _parse(blob: bytes) -> _Loaded:
         """Parse a file's bytes; ``ValueError`` = unreadable (bad JSON / version / shape)."""
-        data = json.loads(blob.decode("utf-8"))  # decode and JSON errors are both ValueError
+        try:
+            data = json.loads(blob.decode("utf-8"))  # decode and JSON errors are both ValueError
+        except RecursionError as exc:
+            # Deeply nested JSON exhausts the parser's recursion instead of raising
+            # ValueError; it is just as unreadable, so route it into recovery.
+            raise ValueError(f"snapshot JSON nested too deeply: {exc}") from exc
         if isinstance(data, dict) and data.get("version") == DEGRADED_SCHEMA_VERSION:
             if data.get("degraded") is not True:
                 raise ValueError("degraded-version file without degraded: true")

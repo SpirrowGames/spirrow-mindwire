@@ -133,10 +133,52 @@ Check 'branch never parks the repo' $false ($branchText -match 'Set-DirtyClonePa
 Check 'branch never puts the thread on retry-pending' $false ($branchText -match 'retryPending|Set-RetryPending|retryState')
 Check 'branch never uses the dirty-clone notice' $false ($branchText -match 'Get-DirtyCloneNotice')
 
-# Behavioural: a repo is skipped only through $dirtyRepoDirs, which this branch never writes, so the
-# next candidate on the same repo_dir is not skipped this sweep.
-$dirtyRepoDirs = @{}
-Check 'same-repo sibling is not skipped after an exit 12' $false (Test-DirtyCloneSkip -RepoDir $base -DirtyRepoDirs $dirtyRepoDirs)
+# Behavioural (PR #583 gate round 1 advisory): EXECUTE the real exit-12 branch, lifted verbatim
+# from the loop's AST, inside a two-candidate mini sweep that applies the loop's real per-repo skip
+# checks (the same three Test-DirtyCloneSkip inputs as the sweep) before each launch. Candidate A on
+# the repo exits 12; sibling B on the SAME repo_dir must then launch in the same sweep, and none of
+# the park / quarantine / retry state may have been written by the branch.
+$skipChecks = $loop.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -match '^Test-DirtyCloneSkip -RepoDir \$cand\.repo_dir' }, $false) |
+    ForEach-Object { $_.Clauses[0].Item1.Extent.Text }
+Check 'the loop has the three per-repo skip inputs' 3 @($skipChecks).Count
+$skipExpr = ($skipChecks | ForEach-Object { "($_)" }) -join ' -or '
+$harness = [scriptblock]::Create(@"
+foreach (`$cand in `$cands) {
+    if ($skipExpr) { `$skipped += `$cand.key; continue }
+    `$launched += `$cand.key
+    `$code = `$exitByKey[`$cand.key]
+    `$output = `$outputByKey[`$cand.key]
+$($branch.Extent.Text)
+    `$after += `$cand.key
+}
+"@)
+function Invoke-HeadSkipRevertLaunch { param($CommitOutput, $StateFilePath) $script:reverts += $CommitOutput; return @{ ok = $true } }
+function Send-NotificationIfChanged { param($State, $Key, $Signature, $Message) $script:sentKeys += $Key; $State[$Key] = $Signature }
+function Save-JsonState { param($Path, $State) }
+function Write-Log { param($Message) }
+$script:reverts = @(); $script:sentKeys = @()
+$cands = @(@{ key = 'p::T-a'; repo_dir = $base }, @{ key = 'p::T-b'; repo_dir = $base })
+$exitByKey = @{ 'p::T-a' = $RefSnapshotUnrecordedExitCode; 'p::T-b' = 0 }
+$outputByKey = @{ 'p::T-a' = $okOutput; 'p::T-b' = @() }
+$dirtyRepoDirs = @{}; $dirtyClonesParked = @{}; $preflightDeferredRepoDirs = @{}
+$dispositions = @{}; $notifyState = @{}; $commitResult = @{ commit_output = 'LAUNCH-A' }
+$retryState = @{ pending = @{} }; $quarantineState = @{}
+$headSkipStatePath = 'unused'; $notifyStatePath = 'unused'
+$skipped = @(); $launched = @(); $after = @()
+. $harness
+Check 'executed branch: both candidates launched (sibling not skipped)' 'p::T-a,p::T-b' ($launched -join ',')
+Check 'executed branch: nothing skipped this sweep' 0 @($skipped).Count
+Check 'executed branch: exit-12 candidate left via continue' 'p::T-b' ($after -join ',')
+Check 'executed branch: disposition recorded' 'ref-snapshot-unrecorded' $dispositions['p::T-a']
+Check 'executed branch: LAUNCH commit reverted once' 'LAUNCH-A' ($script:reverts -join ',')
+Check 'executed branch: one notice on the per-candidate key' "__ref_snapshot__/$k/p::T-a" ($script:sentKeys -join ',')
+Check 'executed branch: repo not parked (dirtyRepoDirs)' 0 $dirtyRepoDirs.Count
+Check 'executed branch: repo not parked (dirtyClonesParked)' 0 $dirtyClonesParked.Count
+Check 'executed branch: repo not parked (preflightDeferredRepoDirs)' 0 $preflightDeferredRepoDirs.Count
+Check 'executed branch: no retry-pending written' 0 $retryState.pending.Count
+Check 'executed branch: no quarantine written' 0 $quarantineState.Count
 
 $loopText = $loop.Body.Extent.Text
 $posClear = $loopText.IndexOf('Clear-RefSnapshotNotice')
