@@ -8,6 +8,7 @@ Test numbers below are the design's.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -263,6 +264,49 @@ def test_11_retention_drops_only_the_oldest_launches(tmp_path: Path) -> None:
     assert store.baseline_for(scope(0), tmp_path) is None  # dropped: every branch is judged
     assert store.baseline_for(scope(1), tmp_path) == {}
     assert store.baseline_for(scope(RETAIN_PER_THREAD), tmp_path) == {}
+
+
+def test_evicted_trigger_relaunch_does_not_absorb_earlier_unpushed_work(
+    narrow: Path, tmp_path: Path
+) -> None:
+    """PR #581 gate round 1 Obj-1: launch m0, leave unpushed work, evict m0, relaunch m0.
+
+    The relaunch must not record a replacement baseline that already holds the unpushed branch;
+    the continuation judges every branch and refuses it.
+    """
+    store = TurnRefSnapshotStore(tmp_path / "s")
+    guard = CloneGuard(narrow)
+    common: dict[str, Any] = {"project": "p", "thread_id": "t", "repo_dir": narrow}
+    assert store.record(trigger_msg_id="m0", refs=guard.ref_snapshot(), **common)
+    _feature(narrow, "feature/w", "w", push=False)  # the first attempt's unpushed work
+    for i in range(1, RETAIN_PER_THREAD + 1):
+        store.record(trigger_msg_id=f"m{i}", refs={}, **common)
+    scope = ContinuationScope(project="p", thread_id="t", trigger_msg_id="m0")
+    assert store.baseline_for(scope, narrow) is None  # evicted
+
+    # Redispatch of the evicted trigger: nothing recorded, the tombstone survives later writes.
+    assert store.record(trigger_msg_id="m0", refs=guard.ref_snapshot(), **common) is False
+    store.record(trigger_msg_id="m99", refs={}, **common)
+    assert store.record(trigger_msg_id="m0", refs=guard.ref_snapshot(), **common) is False
+    assert store.baseline_for(scope, narrow) is None
+    with pytest.raises(DirtyCloneError):
+        guard.check_pushed(baseline=store.baseline_for(scope, narrow))
+
+
+def test_file_without_tombstones_still_loads(tmp_path: Path) -> None:
+    store = TurnRefSnapshotStore(tmp_path / "s")
+    path = store.path_for("p", "t")
+    path.parent.mkdir(parents=True)
+    entry = {
+        "trigger_msg_id": "m1",
+        "repo_dir": os.path.normcase(os.path.abspath(str(tmp_path))),
+        "recorded_at": "x",
+        "refs": {},
+    }
+    path.write_text(json.dumps({"version": 1, "entries": [entry]}), encoding="utf-8")
+    scope = ContinuationScope(project="p", thread_id="t", trigger_msg_id="m1")
+    assert store.baseline_for(scope, tmp_path) == {}
+    assert store.record(project="p", thread_id="t", trigger_msg_id="m2", repo_dir=tmp_path, refs={})
 
 
 def test_snapshot_is_per_repo_dir(tmp_path: Path) -> None:

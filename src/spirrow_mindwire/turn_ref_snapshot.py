@@ -15,7 +15,11 @@ sha (:meth:`~spirrow_mindwire.clone_guard.CloneGuard.ref_snapshot`) and :meth:`r
 succeeded; a failure refuses the dispatch (exit 8), so a turn that ran always has a snapshot. A
 key that already has a snapshot is never overwritten: a relaunch on the same trigger keeps the
 first launch's state as its boundary, so a failed attempt's unpushed commit is not absorbed into
-the baseline (msg-9351 Obj-1).
+the baseline (msg-9351 Obj-1). That holds past retention too: a key dropped by the
+:data:`RETAIN_PER_THREAD` bound is remembered as a tombstone (ids only, never pruned), and a
+relaunch on a tombstoned key records nothing, so its continuation judges every branch instead of
+diffing against a replacement baseline that already contains the first attempt's unpushed work
+(PR #581 gate round 1, Obj-1).
 
 **Look up (D-2' 2).** :meth:`baseline_for` takes the trigger message the conductor identified for
 the CONTINUE turn and returns that exact snapshot. It never substitutes another launch's snapshot:
@@ -25,7 +29,9 @@ message between the trigger and the CONTINUE (the identification disagrees with 
 dispatcher saw) all return ``None``: judge every branch, as before this module existed.
 
 Storage: ``<state_dir>/turn_ref_snapshots/<project>/<thread_id>.json``, the last
-:data:`RETAIN_PER_THREAD` launches per thread, written atomically (temp file + ``os.replace``).
+:data:`RETAIN_PER_THREAD` launches per thread, plus the ``evicted`` tombstone list of
+``[trigger_msg_id, repo_dir]`` keys (optional on read, so a file written before tombstones
+existed still loads), written atomically (temp file + ``os.replace``).
 """
 
 from __future__ import annotations
@@ -102,7 +108,12 @@ class TurnRefSnapshotStore:
         refs: Mapping[str, str],
         now: datetime | None = None,
     ) -> bool:
-        """Save ``refs`` for this launch; ``False`` = a snapshot for the key already existed.
+        """Save ``refs`` for this launch; ``False`` = nothing written for the key.
+
+        ``False`` covers two cases: the key already has a snapshot (kept, it is the first
+        launch's boundary), or the key was evicted earlier (tombstoned: a fresh snapshot now would
+        absorb the earlier attempt's unpushed work, so none is made and the continuation judges
+        every branch). Either way the dispatch may start.
 
         Raises :class:`SnapshotStoreError` when the snapshot is not on disk afterwards for any
         reason, including an existing file that cannot be read: rewriting it from scratch could
@@ -113,10 +124,19 @@ class TurnRefSnapshotStore:
         path = self.path_for(project, thread_id)
         repo = _norm_repo(repo_dir)
         try:
-            entries = self._read_entries(path) if path.exists() else []
+            entries, evicted = self._read_file(path) if path.exists() else ([], [])
         except (OSError, ValueError) as exc:
             raise SnapshotStoreError(f"cannot read {path}: {exc}") from exc
         if any(e["trigger_msg_id"] == trigger_msg_id and e["repo_dir"] == repo for e in entries):
+            return False
+        if [trigger_msg_id, repo] in evicted:
+            logger.warning(
+                "turn ref snapshot: trigger %s (%s/%s) was evicted earlier; not re-recording, its "
+                "continuation judges all branches",
+                trigger_msg_id,
+                project,
+                thread_id,
+            )
             return False
         entries.append(
             {
@@ -126,13 +146,19 @@ class TurnRefSnapshotStore:
                 "refs": dict(sorted(refs.items())),
             }
         )
+        dropped = entries[:-RETAIN_PER_THREAD]
         entries = entries[-RETAIN_PER_THREAD:]
+        evicted = evicted + [[e["trigger_msg_id"], e["repo_dir"]] for e in dropped]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=path.parent)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump({"version": SCHEMA_VERSION, "entries": entries}, fh, indent=1)
+                    json.dump(
+                        {"version": SCHEMA_VERSION, "entries": entries, "evicted": evicted},
+                        fh,
+                        indent=1,
+                    )
                 os.replace(tmp, path)
             except BaseException:
                 if os.path.exists(tmp):
@@ -157,7 +183,7 @@ class TurnRefSnapshotStore:
             return None
         path = self.path_for(scope.project, scope.thread_id)
         try:
-            entries = self._read_entries(path) if path.exists() else []
+            entries, _evicted = self._read_file(path) if path.exists() else ([], [])
         except (OSError, ValueError) as exc:
             logger.warning(
                 "turn ref snapshot: cannot read %s (%s); judging all branches", path, exc
@@ -188,7 +214,7 @@ class TurnRefSnapshotStore:
         return dict(refs)
 
     @staticmethod
-    def _read_entries(path: Path) -> list[dict[str, Any]]:
+    def _read_file(path: Path) -> tuple[list[dict[str, Any]], list[list[str]]]:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION:
             raise ValueError("unexpected snapshot file shape or version")
@@ -206,7 +232,13 @@ class TurnRefSnapshotStore:
             ):
                 raise ValueError("malformed snapshot entry")
             out.append(e)
-        return out
+        raw_evicted = data.get("evicted", [])
+        if not isinstance(raw_evicted, list) or not all(
+            isinstance(k, list) and len(k) == 2 and all(isinstance(x, str) for x in k)
+            for k in raw_evicted
+        ):
+            raise ValueError("malformed evicted list")
+        return out, [list(k) for k in raw_evicted]
 
 
 __all__ = [
