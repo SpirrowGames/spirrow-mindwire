@@ -217,3 +217,49 @@ def test_remove_project_entries_drops_only_matching_keys(tmp_path: Path) -> None
     before = cfg.read_text(encoding="utf-8")
     assert remove_project_entries(cfg, lambda k: "trust-probe-" in k) == []
     assert cfg.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("trailing", ["", "\n"])
+def test_already_trusted_slot_in_compact_config_reads_only(tmp_path: Path, trailing: str) -> None:
+    # PR #582 gate Obj-2: no write needed -> no shape check, no error, file untouched.
+    slot = tmp_path / "slot"
+    text = (
+        json.dumps(
+            {"projects": {project_key(slot): {"hasTrustDialogAccepted": True}}},
+            separators=(",", ":"),
+        )
+        + trailing
+    )
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(text, encoding="utf-8", newline="\n")
+    calls = {"n": 0}
+
+    def hook() -> None:
+        calls["n"] += 1
+
+    assert ensure_trusted(slot, cfg, before_replace=hook) is False
+    assert calls["n"] == 0
+    assert cfg.read_text(encoding="utf-8") == text
+
+
+def test_compact_config_needing_a_write_is_still_refused(tmp_path: Path) -> None:
+    # The shape requirement still guards every write (PR #582 gate Obj-2 fix_min).
+    slot = tmp_path / "slot"
+    text = json.dumps(
+        {"projects": {project_key(slot): {"hasTrustDialogAccepted": False}}}, separators=(",", ":")
+    )
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(TrustRegistrationError, match="byte for byte"):
+        ensure_trusted(slot, cfg)
+    assert cfg.read_text(encoding="utf-8") == text
+
+
+def test_remove_with_no_match_in_compact_config_reads_only(tmp_path: Path) -> None:
+    text = json.dumps(
+        {"projects": {"C:/workspace": {"hasTrustDialogAccepted": True}}}, separators=(",", ":")
+    )
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(text, encoding="utf-8", newline="\n")
+    assert remove_project_entries(cfg, lambda k: "trust-probe-" in k) == []
+    assert cfg.read_text(encoding="utf-8") == text

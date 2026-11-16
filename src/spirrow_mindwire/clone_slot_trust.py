@@ -127,11 +127,13 @@ def _edit(
     """Read-modify-replace ``config`` without clobbering a concurrent writer (Bohr msg-8507).
 
     ``mutate`` edits the parsed object and returns ``False`` when nothing needs writing (then
-    nothing is written). The original BYTES are kept; right before ``os.replace`` the file is read
-    again and the temp file is thrown away unless it is byte-identical (not mtime: too coarse).
+    nothing is written, and the file's shape is never judged). The original BYTES are kept;
+    right before ``os.replace`` the file is read again and the temp file is thrown away unless
+    it is byte-identical (not mtime: too coarse).
     After the replace, ``check`` must hold on a fresh read. Up to :data:`MAX_ATTEMPTS` rounds; then
     :class:`TrustRegistrationError`. Every byte outside the edited entry is kept: the write is
-    refused when the untouched file would not re-serialize to exactly its own bytes. Known gap:
+    refused when the untouched file would not re-serialize to exactly its own bytes (checked only
+    once a write is known to be needed). Known gap:
     a write landing between the compare and the replace (milliseconds, once per slot) is lost.
     """
     last = ""
@@ -140,13 +142,18 @@ def _edit(
         data = _parse(raw, config)
         text = raw.decode("utf-8")
         suffix = text[len(text.rstrip()) :]
-        if _serialize(data, suffix) != text:
+        # Whether a write is needed is decided first (PR #582 gate Obj-2): a file that needs no
+        # write is only read, whatever its shape, so an already trusted slot in a compact (or
+        # otherwise reformatted) config passes. The shape check guards every actual write: it
+        # runs on the untouched bytes, before the edit is serialized.
+        untouched_ok = _serialize(data, suffix) == text
+        if not mutate(data):
+            return False
+        if not untouched_ok:
             raise TrustRegistrationError(
                 f"{config}: not in the shape this writer reproduces byte for byte; "
                 "refusing to rewrite it"
             )
-        if not mutate(data):
-            return False
         fd, tmp = tempfile.mkstemp(prefix=".claude.json.", suffix=".tmp", dir=config.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
