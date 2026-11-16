@@ -28,14 +28,28 @@
 # Not `Remove-`, not `Reset-`: `Clear-` is the PowerShell verb that means "empty the container but
 # leave it in place" (Approved Verbs table). The container is quarantine.json's map — the thread's
 # entry is emptied, the map itself stays.
+#
+# -SlotParkKey (T-ephemeral-impl-clone-slot-per-thread step 2d, Bohr msg-9319 / msg-9321): the same
+# human act for a per-thread clone-slot park. Such a park lives in state/dirty-clones.json under a
+# slot key (`slot|<repo>|<thread_id>`, or any key the sweep cannot classify) and, unlike a
+# repo-keyed dirty-clone park, is never released by the tick's clone-check: only this releases it.
+# It removes exactly that ONE key — never a repo-keyed park (those are released by clone-check) and
+# never another slot of the same repo — and appends the removed row to the same history file
+# (`kind: slot_park`). No new command (msg-9321 §2). Key classification is the sweep's own
+# Get-DirtyCloneParkKeyKind, lifted from its AST, so the two can never disagree.
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium', DefaultParameterSetName = 'Thread')]
 param(
     # State key: "project/thread_id". This is the composite key the sweep uses everywhere. Not just
     # thread_id because thread ids are only unique WITHIN a project (see sweep.json.example).
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Thread')]
     [ValidatePattern('^[^/]+/[^/]+$')]
     [string]$Thread,
+
+    # A slot park's key in state/dirty-clones.json, exactly as the digest / log line shows it.
+    [Parameter(Mandatory = $true, ParameterSetName = 'SlotPark')]
+    [ValidateNotNullOrEmpty()]
+    [string]$SlotParkKey,
 
     # Free-text explanation. REQUIRED — the whole reason the history file exists is so this text
     # accumulates as first-hand data on which quarantines fired legitimately vs. from over-sensitive
@@ -50,6 +64,64 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($PSCmdlet.ParameterSetName -eq 'SlotPark') {
+    $dirtyClonesStatePath = Join-Path $DataDir "state\dirty-clones.json"
+    $slotHistoryPath = Join-Path $DataDir "state\quarantine-history.json"
+    $sweepScript = Join-Path $PSScriptRoot "run-conductor-scheduled.ps1"
+    $parseErrors = $null
+    $sweepAst = [System.Management.Automation.Language.Parser]::ParseFile($sweepScript, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors) { throw "cannot classify the key: $sweepScript does not parse" }
+    $prefixAssign = $sweepAst.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$SlotParkKeyPrefix' }, $true) | Select-Object -First 1
+    if (-not $prefixAssign) { throw "cannot classify the key: `$SlotParkKeyPrefix not found in $sweepScript" }
+    Invoke-Expression $prefixAssign.Extent.Text
+    foreach ($fname in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKeyKind') {
+        $fn = $sweepAst.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fname }, $true) |
+            Select-Object -First 1
+        if (-not $fn) { throw "cannot classify the key: $fname not found in $sweepScript" }
+        Invoke-Expression $fn.Extent.Text
+    }
+    if (-not (Test-Path -LiteralPath $dirtyClonesStatePath)) {
+        throw "no dirty-clone state file at $dirtyClonesStatePath — nothing to unpark"
+    }
+    $draw = Get-Content -LiteralPath $dirtyClonesStatePath -Raw -Encoding utf8
+    $dstate = if ($draw.Trim()) { $draw | ConvertFrom-Json -AsHashtable } else { @{} }
+    if ($null -eq $dstate) { $dstate = @{} }
+    if (-not $dstate.ContainsKey($SlotParkKey)) {
+        throw "not parked: $SlotParkKey (state keys: $($dstate.Keys -join ', '))"
+    }
+    $kind = Get-DirtyCloneParkKeyKind -Key $SlotParkKey
+    if ($kind -eq 'repo') {
+        throw "$SlotParkKey is a repo-keyed dirty-clone park: the tick's clone-check releases it once the clone is clean; -SlotParkKey only releases slot parks"
+    }
+    $sremoved = $dstate[$SlotParkKey]
+    if (-not $PSCmdlet.ShouldProcess($SlotParkKey, "unpark clone slot (reason: $Reason)")) { return }
+    $dstate.Remove($SlotParkKey)
+    $utf8NoBomSlot = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($dirtyClonesStatePath, ($dstate | ConvertTo-Json -Depth 5), $utf8NoBomSlot)
+    $shistory = @()
+    if (Test-Path -LiteralPath $slotHistoryPath) {
+        $shraw = Get-Content -LiteralPath $slotHistoryPath -Raw -Encoding utf8
+        if ($shraw.Trim()) { $shistory = @($shraw | ConvertFrom-Json) }
+    }
+    $shistory += [ordered]@{
+        kind       = 'slot_park'
+        park_key   = $SlotParkKey
+        key_kind   = $kind
+        cleared_at = [DateTime]::UtcNow.ToString("o")
+        cleared_by = if ($env:USERNAME) { $env:USERNAME } else { "unknown" }
+        reason     = $Reason
+        record     = $sremoved
+    }
+    [System.IO.File]::WriteAllText($slotHistoryPath, (ConvertTo-Json -InputObject $shistory -Depth 6 -AsArray), $utf8NoBomSlot)
+    Write-Host "unparked: $SlotParkKey ($kind)"
+    Write-Host "reason:   $Reason"
+    Write-Host "history:  $slotHistoryPath ($($shistory.Count) entries)"
+    return
+}
 
 $quarantineStatePath = Join-Path $DataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $DataDir "state\quarantine-history.json"

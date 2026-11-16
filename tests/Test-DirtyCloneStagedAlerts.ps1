@@ -27,7 +27,13 @@ function Send-Notification { param([string]$Message) $script:sent += $Message; r
 
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Test-DirtyCloneSkip', 'Get-DirtyCloneNotice',
+$slotPrefixAssign = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$SlotParkKeyPrefix' }, $true) | Select-Object -First 1
+if (-not $slotPrefixAssign) { throw '$SlotParkKeyPrefix not assigned in sweep script' }
+Invoke-Expression $slotPrefixAssign.Extent.Text
+foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKey', 'Get-DirtyCloneParkKeyKind',
+                  'Test-DirtyCloneSkip', 'Get-DirtyCloneNotice',
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged', 'ConvertTo-DirtyCloneParking',
                   'Set-DirtyCloneParked', 'Update-DirtyCloneParking', 'Format-DurationDigest',
                   'ConvertFrom-AlertIso', 'Get-DirtyCloneAlertStage', 'Get-LaunchWaitAlertStage',

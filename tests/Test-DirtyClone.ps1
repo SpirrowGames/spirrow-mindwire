@@ -29,7 +29,13 @@ function Send-Notification { param([string]$Message) $script:sent += $Message; r
 
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Test-DirtyCloneSkip', 'Get-DirtyCloneNotice',
+$slotPrefixAssign = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$SlotParkKeyPrefix' }, $true) | Select-Object -First 1
+if (-not $slotPrefixAssign) { throw '$SlotParkKeyPrefix not assigned in sweep script' }
+Invoke-Expression $slotPrefixAssign.Extent.Text
+foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKey', 'Get-DirtyCloneParkKeyKind',
+                  'Test-DirtyCloneSkip', 'Get-DirtyCloneNotice',
                   'Test-NotificationSuppressed', 'Send-NotificationIfChanged') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
@@ -353,7 +359,12 @@ Write-Host 'parking — state file rows normalise'
 $fromJson = '{"k": {"repo_dir": "C:/x", "reason": "wrong_head", "head": "f", "detail": "", "since": "s", "signature": "g"}, "bad": {"reason": "x"}}' | ConvertFrom-Json -AsHashtable
 $norm = ConvertTo-DirtyCloneParking -State $fromJson
 Check 'normalise: row kept' 'wrong_head' $norm['k'].reason
-Check 'normalise: row without repo_dir dropped' $false $norm.ContainsKey('bad')
+Check 'normalise: unclassifiable key without repo_dir is KEPT (step 2d: never vanishes)' $true $norm.ContainsKey('bad')
+$repoShaped = ConvertTo-DirtyCloneRepoKey -RepoDir ([System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'gone-clone'))
+$noDir = @{}; $noDir[$repoShaped] = @{ reason = 'x' }; $noDir['slot|demo|T-crash'] = @{ reason = 'clone_slot_prep_crashed' }
+$norm2 = ConvertTo-DirtyCloneParking -State $noDir
+Check 'normalise: repo-keyed row without repo_dir still dropped (INV-0)' $false $norm2.ContainsKey($repoShaped)
+Check 'normalise: slot-keyed row without repo_dir kept (crash park has no slot_dir)' $true $norm2.ContainsKey('slot|demo|T-crash')
 
 # --- the real loop: D-3 wiring (AST) ------------------------------------------------------------------
 Write-Host ''

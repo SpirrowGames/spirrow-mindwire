@@ -31,6 +31,7 @@ pwsh -NoProfile -File tests/Test-CloneDiscardAlerts.ps1
 pwsh -NoProfile -File tests/Test-SlotPrepVerdict.ps1
 pwsh -NoProfile -File tests/Test-ConductorTickLock.ps1
 pwsh -NoProfile -File tests/Test-SlotKillUnconfirmedPark.ps1
+pwsh -NoProfile -File tests/Test-SlotParkKey.ps1
 pwsh -NoProfile -File tests/Test-GitSyncDeferred.ps1
 pwsh -NoProfile -File tests/Test-PreflightDeferred.ps1
 pwsh -NoProfile -File tests/Test-UnregisteredIntake.ps1

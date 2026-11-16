@@ -18,7 +18,7 @@ The pieces, and which file owns each:
 |---|---|
 | `deploy/run-conductor.ps1` | drives **one** thread to a stop condition and exits. Env + secrets + UTF-8 |
 | `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Deploys, picks the thread, skips threads that have not moved, logs, notifies, **quarantines failures** |
-| `deploy/Clear-Quarantine.ps1` | the one legitimate way to release a quarantined thread — records the reason to `state/quarantine-history.json` |
+| `deploy/Clear-Quarantine.ps1` | the one legitimate way to release a quarantined thread (`-Thread`) or a parked clone slot (`-SlotParkKey`) — records the reason to `state/quarantine-history.json` |
 | `deploy/sync-repo.ps1` | fast-forwards this checkout to `origin/main` — merging is not deploying |
 | `scripts/thread_heads.py` | the work detector — one chatroom call, every thread's head message id |
 | `deploy/sync-clock-http.ps1` | clock correction, because NTP cannot leave this host |
@@ -1190,6 +1190,25 @@ operator-cleared entries survive the merge. This narrows the race from "the whol
 "between the re-read and the write" (sub-millisecond). Closing that residual window would take a
 file lock, and a multi-minute sweep holding a lock would block the operator for that entire time,
 defeating the point of a human-operable clear.
+
+### Unparking a clone slot (slot mode)
+
+```powershell
+pwsh deploy/Clear-Quarantine.ps1 -SlotParkKey 'slot|spirrow-mindwire|T-foo-bar' -Reason 'no mindwire-loop / claude left on the host'
+```
+
+In slot mode a thread whose clone slot could not be prepared (or whose conductor was stopped at its
+time limit without the process tree being confirmed gone, exit 7) is parked in
+`state/dirty-clones.json` under a slot key `slot|<repo>|<thread_id>`. Unlike a repo-keyed dirty-clone
+park, the tick's `clone-check` never releases it — a clean slot does not prove an orphan is gone —
+so this is the only way it is released. It removes exactly that one key (another slot of the same
+repo and any repo-keyed park stay), refuses a repo key, and appends a `kind: slot_park` entry with
+the `-Reason` to `state/quarantine-history.json`. A key the sweep cannot classify is held the same
+way and is released the same way.
+
+`dirty-clones.json` has no merge-on-write yet: run this **between ticks**. An unpark written while a
+tick is running can be overwritten when that tick saves the file, and the park reappears (it fails
+closed: the thread stays visibly parked). Re-run the command if it does.
 
 ## Human-handoff notifications
 

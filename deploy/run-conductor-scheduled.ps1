@@ -3123,6 +3123,42 @@ function ConvertTo-DirtyCloneRepoKey {
     return $full.TrimEnd([char[]]@([char]'\', [char]'/')).ToLowerInvariant()
 }
 
+# --- D-5: the park key in slot mode (T-ephemeral-impl-clone-slot-per-thread step 2d) ---------------
+# Bohr msg-8231 / msg-9319 / msg-9321 (Obj-24-1, Einstein go msg-9322). In slot mode a park belongs to
+# ONE slot, keyed by repo + thread id, so a slot park never stops another thread of the same repo.
+# OFF (INV-0) returns ConvertTo-DirtyCloneRepoKey's string, character for character. This is a
+# separate function, not a mode switch inside ConvertTo-DirtyCloneRepoKey, because that one also
+# keys per-REPO bookkeeping (candidate counts, preflight deferral, retreat records) that must stay
+# per repo in either mode. The slot mode decision itself stays with the caller (msg-8231: one place).
+$SlotParkKeyPrefix = 'slot|'
+function Get-DirtyCloneParkKey {
+    param([string]$RepoDir, [bool]$SlotMode, [string]$Repo, [string]$ThreadId)
+    if (-not $SlotMode) { return ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir }
+    foreach ($pair in @(@('Repo', $Repo), @('ThreadId', $ThreadId))) {
+        $v = "$($pair[1])"
+        if (-not $v -or $v -match '[|\s]') { throw "Get-DirtyCloneParkKey: -$($pair[0]) '$v' is empty or holds '|' / whitespace" }
+    }
+    return "$SlotParkKeyPrefix$($Repo.ToLowerInvariant())|$ThreadId"
+}
+
+# The ONE judgement of what a dirty-clones.json key is (msg-9321 §1: by the key's shape, never by the
+# park code). 'repo' = exactly the shape ConvertTo-DirtyCloneRepoKey writes (a rooted path already in
+# its normalised form); 'slot' = slot|<repo>|<thread_id>; anything else 'unknown'. Only 'repo' keys are
+# re-judged by clone-check and released automatically; 'slot' and 'unknown' are held until a person
+# unparks them (deploy/Clear-Quarantine.ps1 -SlotParkKey): a key nobody can classify stays visibly
+# parked instead of being released silently. Every key the OFF path writes is a 'repo' key, so the
+# OFF re-judge loop is unchanged (INV-0).
+function Get-DirtyCloneParkKeyKind {
+    param([string]$Key)
+    if (-not $Key) { return 'unknown' }
+    if ($Key -cmatch '^slot\|[^|\s]+\|[^|\s]+$') { return 'slot' }
+    if ($Key.StartsWith($SlotParkKeyPrefix)) { return 'unknown' }
+    try {
+        if ([System.IO.Path]::IsPathRooted($Key) -and (ConvertTo-DirtyCloneRepoKey -RepoDir $Key) -ceq $Key) { return 'repo' }
+    } catch { }
+    return 'unknown'
+}
+
 function Test-DirtyCloneSkip {
     param([string]$RepoDir, [hashtable]$DirtyRepoDirs)
     if ($null -eq $DirtyRepoDirs -or $DirtyRepoDirs.Count -eq 0) { return $false }
@@ -3627,7 +3663,9 @@ function ConvertTo-DirtyCloneParking {
             $val = if ($v -is [hashtable]) { $v[$f] } elseif ($v.PSObject.Properties.Name -contains $f) { $v.$f } else { $null }
             $row[$f] = if ($null -ne $val) { "$val" } else { $null }
         }
-        if (-not $row.repo_dir) { continue }  # unprobeable without it; a fresh exit 8 re-adds it
+        # unprobeable without it; a fresh exit 8 re-adds it. A slot park (or an unclassifiable key) is
+        # never probed and must not vanish on load: a crash park has no slot_dir (step 2d).
+        if (-not $row.repo_dir -and (Get-DirtyCloneParkKeyKind -Key "$k") -eq 'repo') { continue }
         $out["$k"] = $row
     }
     return $out
@@ -3809,6 +3847,13 @@ function Update-DirtyCloneParking {
     $recordsByRepo = if ($Parked.Count -gt 0) { Read-LatestRetreatRecordsByRepo -RecordsPath $RecordsPath } else { @{} }
     foreach ($key in @($Parked.Keys)) {
         $rec = $Parked[$key]
+        # Step 2d (msg-9321 §1): only repo-keyed parks are re-judged. A slot park (any code) or a key
+        # that cannot be classified is held as it is until a person unparks it; clean is not proof
+        # that an orphan is gone (Einstein msg-9320).
+        if ((Get-DirtyCloneParkKeyKind -Key "$key") -ne 'repo') {
+            Write-Log "slot-park-held ${key}: reason=$($rec.reason) since=$($rec.since) — not re-judged; only an explicit unpark releases it"
+            continue
+        }
         $repoDir = "$($rec.repo_dir)"
         if ($null -ne $Recover -and "$($rec.reason)" -eq 'wrong_head') {
             $rr = & $Recover $repoDir
