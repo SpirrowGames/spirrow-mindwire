@@ -671,3 +671,86 @@ def test_a_failed_listing_has_unknown_absent_and_listed_counts() -> None:
         )
     )
     assert (report.field_absent_count, report.listed_count) == (None, None)
+
+
+# ----------------------- T-digest-lacks-project-liveness-view: the opt-in liveness walk
+
+
+def test_liveness_walk_widens_the_filter_but_the_intake_sees_only_live_threads() -> None:
+    """One walk, two readers: the liveness list gets every status; the intake still gets only
+    LIVE_STATUSES, with field_absent counted on the live items alone."""
+    items = [
+        _real_item("T-live", "active"),
+        _real_item("T-parked", "parked", drop=("last_activity_at",)),
+        _real_item("T-done", "resolved"),
+        _real_item("T-old", "superseded", last_activity_at=None),
+    ]
+    inner = _RecordingMcp({"p": items})
+    rows: list[dict[str, Any]] = []
+    threads, malformed, field_absent = asyncio.run(_MODULE._list_live_threads(inner, "p", rows))
+    assert inner.calls[0][1]["status_filter"] == list(_MODULE.LIVENESS_STATUSES)
+    assert set(_MODULE.LIVENESS_STATUSES) == {
+        "active",
+        "awaiting_reply",
+        "parked",
+        "resolved",
+        "superseded",
+    }
+    assert [t.thread["thread_id"] for t in threads] == ["T-live"]
+    assert (malformed, field_absent) == (0, 0)
+    assert [(r["thread_id"], r["status"]) for r in rows] == [
+        ("T-live", "active"),
+        ("T-parked", "parked"),
+        ("T-done", "resolved"),
+        ("T-old", "superseded"),
+    ]
+    # Raw time, unparsed; absent and null both become None.
+    assert rows[0]["last_activity_at"] == _REAL_ITEM["last_activity_at"]
+    assert rows[1]["last_activity_at"] is None and rows[3]["last_activity_at"] is None
+
+
+def test_without_liveness_the_request_is_unchanged() -> None:
+    inner = _RecordingMcp({"p": [_real_item("T-a", "active")]})
+    asyncio.run(_MODULE._list_live_threads(inner, "p"))
+    assert inner.calls[0][1]["status_filter"] == sorted(LIVE_STATUSES)
+
+
+def test_a_failed_listing_records_null_threads_not_an_empty_list() -> None:
+    """An empty list would read as "measured, no threads" (EMPTY/DONE); a failure must not."""
+    inner = _FailingMcp(_RecordingMcp({"ok": [_real_item("T-a", "active")]}), "bad")
+    liveness: dict[str, Any] = {}
+    registered = RegisteredIndex(projects=("ok", "bad"), pairs=frozenset())
+    asyncio.run(_MODULE._enumerate_all(inner, registered, liveness))
+    assert liveness["ok"]["error"] is None
+    assert [r["thread_id"] for r in liveness["ok"]["threads"]] == ["T-a"]
+    assert liveness["bad"]["threads"] is None
+    assert "boom" in liveness["bad"]["error"]
+
+
+def test_main_emits_liveness_only_with_the_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_sweep(tmp_path, [{"project": "p1", "thread_id": "T-x", "repo_dir": "/x"}])
+    listing = {"p1": [_real_item("T-x", "resolved"), _real_item("T-y", "active")]}
+
+    class _Stub(_RecordingMcp):
+        def __init__(self, url: str | None = None) -> None:
+            super().__init__(listing)
+
+    monkeypatch.setattr(_MODULE, "StreamableHttpChatroomMcp", _Stub)
+    for argv, expect in (([], False), (["--liveness"], True)):
+        old = sys.argv
+        try:
+            sys.argv = ["prog", "--sweep-config", str(path), *argv]
+            assert _MODULE.main() == 0
+        finally:
+            sys.argv = old
+        payload = json.loads(capsys.readouterr().out)
+        assert ("liveness" in payload) is expect
+        # The intake answer is the same either way: the resolved T-x is not live.
+        assert payload["projects"][0]["unregistered"] == ["T-y"]
+        if expect:
+            assert [r["status"] for r in payload["liveness"]["p1"]["threads"]] == [
+                "resolved",
+                "active",
+            ]
