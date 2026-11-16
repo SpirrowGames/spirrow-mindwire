@@ -116,6 +116,7 @@ from .config import (
     resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
     resolve_tierc_rules_snapshot_dir,
+    resolve_turn_ref_snapshot_dir,
 )
 from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
@@ -162,6 +163,7 @@ from .preflight import (
 )
 from .repo_projects import load_repo_project_map
 from .spec_pin import SpecPinWriter
+from .turn_ref_snapshot import ContinuationScope, TurnRefSnapshotStore
 from .value_objects import Capability, Event, Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -760,8 +762,12 @@ def _build_dispatcher(
     # any role onto ``loop.repo_dir`` while it is dirty, mid-operation, or off its default branch.
     # Same condition as the pin writer: no repo_dir = adapters were injected by a test.
     clone_guard: CloneGuard | None = None
+    ref_snapshot_store: TurnRefSnapshotStore | None = None
     if cfg.repo_dir is not None:
         clone_guard = CloneGuard(Path(cfg.repo_dir))
+        # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
+        # implementer launch records its starting ref state before the adapter runs.
+        ref_snapshot_store = TurnRefSnapshotStore(resolve_turn_ref_snapshot_dir(settings))
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,
@@ -769,19 +775,32 @@ def _build_dispatcher(
         spec_pin_writer=pin_writer,
         clone_guard=clone_guard,
         git_sync=build_git_sync_hook(settings),
+        ref_snapshot_store=ref_snapshot_store,
     )
     return mcp, registry, dispatcher
 
 
-def _continuation_clone_check(dispatcher: object) -> Callable[[], None] | None:
-    """``CloneGuard.check`` + ``check_pushed`` for the CONTINUE path, or ``None`` (fail-closed)."""
+def _continuation_clone_check(
+    dispatcher: object,
+) -> Callable[[ContinuationScope], None] | None:
+    """``CloneGuard.check`` + ``check_pushed`` for the CONTINUE path, or ``None`` (fail-closed).
+
+    ``check_pushed`` is given the launch snapshot of the CONTINUE turn as its baseline when the
+    dispatcher recorded one for exactly that trigger; otherwise ``None`` (every branch judged).
+    """
     guard = getattr(dispatcher, "clone_guard", None)
     if not isinstance(guard, CloneGuard):
         return None
+    store = getattr(dispatcher, "ref_snapshot_store", None)
 
-    def check() -> None:
+    def check(scope: ContinuationScope) -> None:
         guard.check()
-        guard.check_pushed()
+        baseline = (
+            store.baseline_for(scope, guard.repo_dir)
+            if isinstance(store, TurnRefSnapshotStore)
+            else None
+        )
+        guard.check_pushed(baseline=baseline)
 
     return check
 
