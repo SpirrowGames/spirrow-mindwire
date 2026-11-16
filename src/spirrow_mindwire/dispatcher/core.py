@@ -19,12 +19,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
-from ..clone_guard import CloneGuard
+from ..clone_guard import CloneGuard, DirtyCloneError, DirtyCloneReason
 from ..git_sync import GitSyncHook, GitSyncParkError, ThreadBranch
 from ..pin_ignore import ensure_pin_ignored
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..source_marker import append_markers
 from ..spec_pin import SpecPinWriter
+from ..turn_ref_snapshot import SnapshotStoreError, TurnRefSnapshotStore
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
 from .event_log import delivery_failed_event, reply_sent_event
@@ -74,6 +75,7 @@ class Dispatcher:
         spec_pin_writer: SpecPinWriter | None = None,
         clone_guard: CloneGuard | None = None,
         git_sync: GitSyncHook | None = None,
+        ref_snapshot_store: TurnRefSnapshotStore | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -99,6 +101,17 @@ class Dispatcher:
         # no git runs here beyond the clone guard's (INV-0). Pre-turn runs after the guard, so a
         # clone an earlier turn left dirty is exit 8, never this thread's park (B-3).
         self._git_sync = git_sync
+        # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: before every
+        # implementer dispatch the clone's ``refs/heads`` state is recorded here, and the adapter
+        # starts only once that write succeeded. Used only together with ``clone_guard`` (same
+        # repo_dir). ``None`` = not wired: nothing is recorded and the CONTINUE check judges
+        # every branch, exactly as before.
+        self._ref_snapshot_store = ref_snapshot_store
+
+    @property
+    def ref_snapshot_store(self) -> TurnRefSnapshotStore | None:
+        """Where implementer launches record their starting ref state (``None`` = not wired)."""
+        return self._ref_snapshot_store
 
     @property
     def clone_guard(self) -> CloneGuard | None:
@@ -195,6 +208,10 @@ class Dispatcher:
         if self._clone_guard is not None:
             await asyncio.to_thread(ensure_pin_ignored, self._clone_guard.repo_dir)
             await asyncio.to_thread(self._clone_guard.check)
+            if self._ref_snapshot_store is not None and handle.role is Role.IMPLEMENTER:
+                await asyncio.to_thread(
+                    self._record_ref_snapshot, self._clone_guard, self._ref_snapshot_store, event
+                )
         # Git sync, pre-turn (ADR-2026-10-09-23 unit 1, B-3): after the guard, before the pin
         # write. A park / defer raises out of here with the clone back on the default branch
         # whenever it is clean; the role never sees the event.
@@ -232,6 +249,35 @@ class Dispatcher:
         finally:
             if self._git_sync is not None and thread_branch is not None:
                 await self._post_turn(handle, thread_branch, delivered=delivered)
+
+    @staticmethod
+    def _record_ref_snapshot(
+        guard: CloneGuard, store: TurnRefSnapshotStore, event: ChatroomEvent
+    ) -> None:
+        """D-2' 1: save the launch's ref state, or refuse the dispatch (exit 8) before the adapter.
+
+        Runs after the clone guard and before git sync / the pin write, so a refusal leaves the
+        clone as found. Keyed on the trigger message; an existing snapshot for the key is kept.
+        """
+        msg_id = getattr(event.payload, "msg_id", None)
+        try:
+            if not isinstance(msg_id, str) or not msg_id:
+                raise SnapshotStoreError("event carries no trigger message id")
+            refs = guard.ref_snapshot()
+            store.record(
+                project=event.thread_ref.project_id,
+                thread_id=event.thread_ref.thread_id,
+                trigger_msg_id=msg_id,
+                repo_dir=guard.repo_dir,
+                refs=refs,
+            )
+        except (SnapshotStoreError, DirtyCloneError) as exc:
+            raise DirtyCloneError(
+                repo_dir=guard.repo_dir,
+                reason=DirtyCloneReason.GIT_UNAVAILABLE,
+                head=None,
+                detail=f"ref snapshot not recorded: {exc}",
+            ) from exc
 
     async def _post_turn(
         self, handle: SessionHandle, branch: ThreadBranch, *, delivered: bool
