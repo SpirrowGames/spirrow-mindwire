@@ -78,6 +78,60 @@ Check 'branch never quarantines' $false ($branchText -match 'quarantineState|New
 Check 'branch never parks the repo' $false ($branchText -match 'Set-DirtyCloneParked|dirtyRepoDirs')
 Check 'branch never writes retry-pending' $false ($branchText -match 'Set-RetryPending|pending\.Remove|pending\[')
 
+# --- the real branch, executed with stubbed dependencies (PR #584 gate advisory) --------------------
+# The name checks above pin source shape; this runs the branch's own text inside a two-candidate
+# loop and checks the state it hands on: which commit and state path the revert gets, that the
+# retry-pending record is untouched and the retry not consumed, what the notifier receives, that
+# the notify state is saved to its path, and that the second candidate is never reached (break).
+$script:revertCalls = @(); $script:notifyCalls = @(); $script:saveCalls = @(); $script:logLines = @()
+function Invoke-HeadSkipRevertLaunch { param($CommitOutput, $StateFilePath)
+    $script:revertCalls += , @{ commit = $CommitOutput; path = $StateFilePath }; @{ ok = $true } }
+function Send-NotificationIfChanged { param($State, $Key, $Signature, $Message)
+    $script:notifyCalls += , @{ state = $State; key = $Key; signature = $Signature; message = $Message } }
+function Save-JsonState { param($Path, $State) $script:saveCalls += , @{ path = $Path; state = $State } }
+function Write-Log { param($Line) $script:logLines += $Line }
+
+$headSkipStatePath = 'X:\state\head-skip.json'
+$notifyStatePath = 'X:\state\notify.json'
+$notifyState = @{ marker = 'notify-state' }
+$retryState = @{ pending = @{ 'p::T-a' = @{ attempts = 1; since = '2026-11-17T00:00:00Z' } } }
+$retryLaunched = 1
+$dispositions = @{}
+$output = @('turn-isolation: STOP turn isolation check failed (exit 3)')
+$TurnIsolationStopExitCode = [int]$assign.Right.Extent.Text   # the sweep's own value
+$code = 10
+$reached = @()
+$runner = [scriptblock]::Create(@"
+foreach (`$cand in @(@{ key = 'p::T-a' }, @{ key = 'p::T-b' })) {
+    `$reached += `$cand.key
+    `$commitResult = @{ commit_output = "launch-commit-for-`$(`$cand.key)" }
+    if (`$code -eq `$TurnIsolationStopExitCode) $branchText
+}
+"@)
+. $runner
+
+Check 'executed: only the first candidate is reached (break)' 'p::T-a' ($reached -join ',')
+Check 'executed: disposition recorded' 'turn-isolation-stop' $dispositions['p::T-a']
+Check 'executed: revert called once' 1 $script:revertCalls.Count
+Check 'executed: revert gets this launch commit' 'launch-commit-for-p::T-a' $script:revertCalls[0].commit
+Check 'executed: revert gets the head-skip state path' $headSkipStatePath $script:revertCalls[0].path
+Check 'executed: retry-pending record kept' $true ($retryState.pending.ContainsKey('p::T-a'))
+Check 'executed: retry-pending record unchanged' 1 $retryState.pending['p::T-a'].attempts
+Check 'executed: retry not consumed (counter given back)' 0 $retryLaunched
+Check 'executed: notified once' 1 $script:notifyCalls.Count
+Check 'executed: notifier gets the notify state' $true ([object]::ReferenceEquals($script:notifyCalls[0].state, $notifyState))
+Check 'executed: notifier key is host-wide' '__turn_isolation__' $script:notifyCalls[0].key
+Check 'executed: notifier signature carries the reason' 'turn-isolation:turn isolation check failed (exit 3)' $script:notifyCalls[0].signature
+Check 'executed: notify state saved once to its path' $notifyStatePath (($script:saveCalls | ForEach-Object { $_.path }) -join ',')
+
+# A candidate without a retry-pending record must not touch the retry counter.
+$script:revertCalls = @(); $script:notifyCalls = @(); $script:saveCalls = @()
+$retryState = @{ pending = @{} }; $retryLaunched = 0; $reached = @(); $dispositions = @{}
+. $runner
+Check 'executed (no pending): retry counter untouched' 0 $retryLaunched
+Check 'executed (no pending): no pending record created' 0 $retryState.pending.Count
+Check 'executed (no pending): still stops after the first candidate' 'p::T-a' ($reached -join ',')
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "all checks passed"
 exit 0
