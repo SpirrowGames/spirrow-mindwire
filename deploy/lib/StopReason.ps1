@@ -83,6 +83,13 @@
 # MAP. A refused terminal form (STOP: done / BLOCKED-ON:) stops with a notice ending NEXT: human;
 # the design requires that a refused stop is never silent (msg-8172 §1), so it is heard (note 1).
 #
+# 2026-11-10 (T-next-names-unspawnable-identity, Bohr msg-8709 PR-1 / D2): 'unspawnable_target_to_human'
+# joined the MAP. `NEXT:` named an identity no adapter can run (ADR-2026-09-14-21; Fermi), so the
+# request was never delivered and a person has to pass it on (note 1). Its phrase is the one
+# TEMPLATE in the map: `{0}` is the target's name, read from the stop line's `blocked_target=`
+# field and filled in by Get-StopReasonPhrase (never by the caller), with 不明 when the field is
+# missing, so the sentence still reads (msg-8707 v0.4 item 3). It does not say 判断待ち.
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
@@ -110,6 +117,7 @@ function Get-StopReasonPhraseMap {
         'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
         'operator_work_to_human' = "operator の手作業待ちで停止しました"
         'malformed_handoff'     = "決着・待ちの書き方（STOP: done / BLOCKED-ON:）が受け付けられず停止しました"
+        'unspawnable_target_to_human' = "指名先（{0}）は spawn できない identity のため、依頼は届いていません。本人に直接渡してください"
         'round_cap'             = "ラウンド上限で停止しました（暴走バックストップ発動）"
         'empty_thread'          = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }
@@ -128,11 +136,21 @@ function Get-StopReasonPhrase {
     #
     # The default phrase MUST NOT contain the substring "判断待ち" (pinned in
     # Test-StopReasonPhrase.ps1). Empty / $null $StopReason takes the same default path.
-    param([string]$StopReason)
+    #
+    # -BlockedTarget fills the `{0}` of a template phrase ('unspawnable_target_to_human', see the
+    # file header): the stop line's `blocked_target=` value, or 不明 when it is empty / $null. A
+    # phrase without `{0}` is returned verbatim whatever -BlockedTarget says. Replace, not -f, so
+    # a target holding `{` cannot throw.
+    param([string]$StopReason, [string]$BlockedTarget = '')
 
     $map = Get-StopReasonPhraseMap
     if (-not [string]::IsNullOrEmpty($StopReason) -and $map.ContainsKey($StopReason)) {
-        return $map[$StopReason]
+        $phrase = $map[$StopReason]
+        if ($phrase.Contains('{0}')) {
+            $name = if ([string]::IsNullOrEmpty($BlockedTarget)) { '不明' } else { $BlockedTarget }
+            $phrase = $phrase.Replace('{0}', $name)
+        }
+        return $phrase
     }
     return "未知の停止理由で停止しました（通知側がこの reason を知りません）"
 }
@@ -152,15 +170,19 @@ function New-NotificationHeader {
     #
     # Signature is deliberately verbose (five named params) rather than accepting a bag of
     # fields — the pin tests want to be able to vary each one independently.
+    #
+    # -BlockedTarget (T-next-names-unspawnable-identity D2) only feeds the phrase's `{0}`; it adds no
+    # field to the line, so the shape above is unchanged for every reason.
     param(
         [string]$ThreadId,
         [string]$Project,
         [string]$StopReason,
         [int]$Rounds,
-        [string]$LastMsgId
+        [string]$LastMsgId,
+        [string]$BlockedTarget = ''
     )
 
-    $phrase = Get-StopReasonPhrase -StopReason $StopReason
+    $phrase = Get-StopReasonPhrase -StopReason $StopReason -BlockedTarget $BlockedTarget
     return "MindWire: **$ThreadId** ($Project) — $phrase (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
 }
 

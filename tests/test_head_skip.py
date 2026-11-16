@@ -75,6 +75,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.conductor.head_skip import (
     BASE,
@@ -137,13 +138,17 @@ def test_acceptance_launches_a_fresh_thread_with_role_next() -> None:
 
 @pytest.mark.parametrize("token", ["none", "human", "None", "HUMAN", "  human  "])
 def test_stop_tokens_return_skip(token: str) -> None:
-    """Every rendering of ``none`` / ``human`` (case + whitespace variants) → SKIP."""
+    """Every rendering of ``none`` / ``human`` (case + whitespace variants) → SKIP.
+
+    ``none`` is a stop token for a head posted before the boundary-5 cutoff (the refused
+    side is pinned in test_none_malformed_after.py)."""
     verdict = decide(
         now=_T0,
         head_msg_id="msg-1",
         head_body=_body(token),
         control_state="run",
         record=None,
+        posted_at=PRE_CUTOFF,
     )
     assert verdict.decision is Decision.SKIP
     assert verdict.reason == "stop-token"

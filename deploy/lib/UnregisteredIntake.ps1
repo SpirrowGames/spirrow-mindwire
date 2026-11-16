@@ -51,6 +51,17 @@
 # tick log gets a WARN and the digest's 時刻不明 header the same N/M — stated as a count, never as a claim
 # about the API (Einstein msg-7444).
 #
+# Exclusion by tag (T-sweep-exclude-by-tag, Bohr msg-8731 as amended by msg-8749). A thread whose tags
+# carry one of the enumerator's EXCLUDE_TAGS (do-not-sweep / not-swept / scratch / probe) is counted as
+# excluded, like an `exclude` entry; `exclude` stays, for threads nobody can tag. The rule order is
+#   explicit -> PR-review -> exclude list -> clone -> time -> idle -> TAG -> mode,
+# so a tag is judged only for a thread that would otherwise be registered (or shadowed). The enumerator
+# reads the tags (listing `tags`, or a capped chatroom_get_thread fallback) and hands over exclude_tag and
+# tag_state; this file only compares. A tag_state other than ok is refused as "tags <state>" — fail
+# closed: an unread tag must never let a probe through. The per-project P/M counters (listing items
+# carrying tags, of all listed items) and the null / lookup-cap facts are reported in the tick log and
+# the digest; "移行可" is said only at P == M.
+#
 # Pure: no I/O except the injectable $PathExists / $IsLinkedWorktree checks, so
 # tests/Test-UnregisteredIntake.ps1 can dot-source this file without running the sweep.
 
@@ -196,6 +207,9 @@ function Get-CloneCandidateMismatches {
 #   @{ added = [candidate]; shadow = [row]; idle = [row]; time_unknown = [row]; excluded_count = <int>;
 #      refused = [{ project; thread_id; key; reason }]; unmeasured = [{ project; reason }];
 #      field_absent = [{ project; absent; listed; field }]; activity_field = <string>;
+#      excluded_list_count / excluded_tag_count = <int> (they sum to excluded_count);
+#      tags_null = [{ project; null; listed }] (only while the listing-null constant is unmeasured);
+#      tags_presence = [{ project; present; listed; complete }] (P >= 1); tag_lookup = { needed; done; cap };
 #      probe_error = <string or $null>; mode; max_idle_days }   (the last two echo the config in force)
 # field_absent has one row per MEASURED project whose listing had >= 1 item with no last_activity_at
 # key (msg-7445), whether or not that project has any unregistered thread.
@@ -217,6 +231,7 @@ function Resolve-UnregisteredIntake {
     )
     $cfg = if ($null -ne $IntakeConfig) { $IntakeConfig } else { ConvertFrom-SweepIntakeConfig -Raw $null }
     $out = @{ added = @(); shadow = @(); idle = @(); time_unknown = @(); excluded_count = 0
+        excluded_list_count = 0; excluded_tag_count = 0; tags_null = @(); tags_presence = @(); tag_lookup = $null
         refused = @(); unmeasured = @(); field_absent = @(); activity_field = '?'; probe_error = $null; mode = $cfg.mode; max_idle_days = $cfg.max_idle_days }
     if (-not [string]::IsNullOrWhiteSpace($ProbeError)) {
         $out.probe_error = "unregistered_threads probe failed: $ProbeError"
@@ -233,6 +248,14 @@ function Resolve-UnregisteredIntake {
         $field = [string]$Report.activity_field
     }
     $out.activity_field = $field
+    $rNames = @($Report.PSObject.Properties.Name)
+    # The listing-null constant is unmeasured unless the report says it was measured.
+    $nullMeasured = ($rNames -contains 'listing_tags_null_measured' -and $Report.listing_tags_null_measured -eq $true)
+    if ($rNames -contains 'tag_lookup_needed' -and $null -ne $Report.tag_lookup_needed) {
+        $cap = if ($rNames -contains 'tag_lookup_cap' -and $null -ne $Report.tag_lookup_cap) { [int]$Report.tag_lookup_cap } else { 0 }
+        $done = if ($rNames -contains 'tag_lookup_done' -and $null -ne $Report.tag_lookup_done) { [int]$Report.tag_lookup_done } else { 0 }
+        $out.tag_lookup = [pscustomobject]@{ needed = [int]$Report.tag_lookup_needed; done = $done; cap = $cap }
+    }
     $known = @{}
     foreach ($c in @($Candidates)) { $known[[string]$c.key] = $true }
     $cloneOrder = @{}
@@ -258,6 +281,20 @@ function Resolve-UnregisteredIntake {
             $listed = if ($pNames -contains 'listed_count' -and $null -ne $p.listed_count) { [string][int]$p.listed_count } else { '?' }
             $out.field_absent += [pscustomobject]@{ project = $proj; absent = $absent; listed = $listed; field = $field }
         }
+        # Tag counters (msg-8731 D-1, msg-8729), also before the early exit: P and M cover the whole
+        # listing, so a tick with no unregistered thread cannot make P < M read as "移行可".
+        if ($pNames -contains 'listed_count' -and $null -ne $p.listed_count) {
+            $m = [int]$p.listed_count
+            if ($pNames -contains 'tags_null_count' -and $null -ne $p.tags_null_count -and [int]$p.tags_null_count -ge 1 -and -not $nullMeasured) {
+                $out.tags_null += [pscustomobject]@{ project = $proj; null = [int]$p.tags_null_count; listed = $m }
+            }
+            if ($pNames -contains 'tags_field_present_count' -and $null -ne $p.tags_field_present_count) {
+                $pc = [int]$p.tags_field_present_count
+                if ($pc -ge 1) {
+                    $out.tags_presence += [pscustomobject]@{ project = $proj; present = $pc; listed = $m; complete = ($pc -eq $m) }
+                }
+            }
+        }
         # Per-thread detail from the enumerator. A row it did not describe (an id in `unregistered` with
         # no `threads` entry) is time-unknown: fail closed, never assume fresh.
         $detail = @{}
@@ -279,7 +316,7 @@ function Resolve-UnregisteredIntake {
                     reason = 'pr-review thread: never swept (paid PR-gate)' }
                 continue
             }
-            if ($cfg.exclude.ContainsKey($key)) { $out.excluded_count++; continue }
+            if ($cfg.exclude.ContainsKey($key)) { $out.excluded_count++; $out.excluded_list_count++; continue }
             if (-not $clone.ok) {
                 $out.refused += [pscustomobject]@{ project = $proj; thread_id = $tid; key = $key; reason = $clone.reason }
                 continue
@@ -297,6 +334,18 @@ function Resolve-UnregisteredIntake {
             }
             $row = [pscustomobject]@{ project = $proj; thread_id = $tid; key = $key; idle_days = $idleDays }
             if ($idleDays -gt [double]$cfg.max_idle_days) { $out.idle += $row; continue }
+            # Tag (msg-8731 D-2): after idle, before mode. A row without tag_state (an enumerator that
+            # did not read tags) is unread: refused, never assumed untagged.
+            $dNames = @($d.PSObject.Properties.Name)
+            $tagState = if ($dNames -contains 'tag_state' -and -not [string]::IsNullOrWhiteSpace([string]$d.tag_state)) { [string]$d.tag_state } else { 'unread' }
+            $exTag = if ($dNames -contains 'exclude_tag') { [string]$d.exclude_tag } else { '' }
+            if ($tagState -eq 'ok' -and -not [string]::IsNullOrWhiteSpace($exTag)) {
+                $out.excluded_count++; $out.excluded_tag_count++; continue
+            }
+            if ($tagState -ne 'ok') {
+                $out.refused += [pscustomobject]@{ project = $proj; thread_id = $tid; key = $key; reason = "tags $tagState" }
+                continue
+            }
             if ($cfg.mode -ne 'on') { $out.shadow += $row; continue }
             $added += [pscustomobject]@{
                 order     = $cloneOrder[$proj]
@@ -372,6 +421,35 @@ function Get-UnregisteredIntakeSchemaWarnings {
     return $out
 }
 
+# Tick-log WARN lines for the tag reading (msg-8731 D-3), kept even on a quiet tick (the caller runs
+# Confirm-LogWorthKeeping): the lookup cap was hit, or the listing returned tags: null while
+# LISTING_TAGS_NULL_MEANS_EMPTY is unmeasured. Emits the lines (wrap the call in @()).
+function Get-UnregisteredIntakeTagWarnings {
+    param($Intake)
+    $out = @()
+    if ($null -eq $Intake) { return $out }
+    $l = $Intake['tag_lookup']
+    if ($null -ne $l -and [int]$l.needed -gt [int]$l.done) {
+        $out += "WARN tag lookup cap: $($l.needed) threads need a tag lookup, $($l.done) looked up (cap $($l.cap)) — the rest are refused as 'tags unread' this tick"
+    }
+    foreach ($n in (Get-IntakeBucket $Intake 'tags_null')) {
+        $out += "WARN listing tags null: $($n.project) $($n.null)/$($n.listed) — LISTING_TAGS_NULL_MEANS_EMPTY unmeasured; measure (D-0') and set it"
+    }
+    return $out
+}
+
+# Tick-log INFO lines for the listing's tags rollout (msg-8729): "partial" at 0 < P < M, "complete" (and
+# only then "migration possible") at P == M. Not a reason to keep a tick's log. Emits the lines.
+function Get-UnregisteredIntakeTagInfo {
+    param($Intake)
+    $out = @()
+    foreach ($t in (Get-IntakeBucket $Intake 'tags_presence')) {
+        if ($t.complete) { $out += "INFO listing tags complete: $($t.project) $($t.listed)/$($t.listed) — exclude migration (D-4 tags-present route) possible" }
+        else { $out += "INFO listing tags partial: $($t.project) $($t.present)/$($t.listed) — fallback still in use" }
+    }
+    return $out
+}
+
 # The section header. "?" is appended whenever some part of the population was not measured, so a
 # day that could not look is never shown as a clean 0. Every bucket is counted, so a truncated row
 # list never hides how many threads are waiting in shadow. The 時刻不明 count carries the schema-drift
@@ -385,9 +463,21 @@ function Get-UnregisteredIntakeHeader {
     $idle = (Get-IntakeBucket $Intake 'idle').Count
     $timeUnknown = (Get-IntakeBucket $Intake 'time_unknown').Count
     $excluded = [int]$Intake['excluded_count']
+    $exTag = [int]$Intake['excluded_tag_count']
+    $exList = if ($null -ne $Intake['excluded_list_count']) { [int]$Intake['excluded_list_count'] } else { $excluded - $exTag }
+    $refusedNotes = ''
+    $l = $Intake['tag_lookup']
+    if ($null -ne $l -and [int]$l.needed -gt [int]$l.done) { $refusedNotes += "［tag 照会上限 $($l.needed)/$($l.cap)］" }
+    $nulls = @(foreach ($n in (Get-IntakeBucket $Intake 'tags_null')) { "$($n.project) $($n.null)/$($n.listed)" })
+    if ($nulls.Count -gt 0) { $refusedNotes += "［listing tags null 未測定: $($nulls -join ' / ')］" }
+    $partial = @(foreach ($t in (Get-IntakeBucket $Intake 'tags_presence')) { if (-not $t.complete) { "$($t.project) $($t.present)/$($t.listed)" } })
+    $complete = @(foreach ($t in (Get-IntakeBucket $Intake 'tags_presence')) { if ($t.complete) { "$($t.project) $($t.listed)/$($t.listed)" } })
+    $excludedNotes = ''
+    if ($partial.Count -gt 0) { $excludedNotes += "［listing tags 一部: $($partial -join ' / ')］" }
+    if ($complete.Count -gt 0) { $excludedNotes += "［listing tags 全件: $($complete -join ' / ')・移行可］" }
     $unknown = if ($Intake['probe_error'] -or (Get-IntakeBucket $Intake 'unmeasured').Count -gt 0) { ' + ?' } else { '' }
     $drift = @(foreach ($f in (Get-IntakeBucket $Intake 'field_absent')) { "$($f.project)：一覧の $($f.absent)/$($f.listed) 件に $($f.field) が無い" })
     $driftNote = if ($drift.Count -gt 0) { "［$($drift -join ' / ')］" } else { '' }
-    return ("未登録（登録不可）: $refused 件$unknown（この tick の自動登録 $added 件 / 登録予定（shadow） $shadow 件 / " +
-            "放置 $idle 件 / 時刻不明 $timeUnknown 件$driftNote / 除外 $excluded 件）")
+    return ("未登録（登録不可）: $refused 件$unknown$refusedNotes（この tick の自動登録 $added 件 / 登録予定（shadow） $shadow 件 / " +
+            "放置 $idle 件 / 時刻不明 $timeUnknown 件$driftNote / 除外 $excluded 件（列挙 $exList / tag $exTag）$excludedNotes）")
 }

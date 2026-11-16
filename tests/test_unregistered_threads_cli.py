@@ -512,14 +512,15 @@ def test_list_live_threads_classifies_time_without_dropping() -> None:
     assert malformed == 0
 
 
-def test_no_per_thread_read_is_possible() -> None:
-    """Einstein msg-6769 (N+1): the listing is the only tool this script may call.
+def test_per_thread_reads_are_only_the_bounded_tag_lookup() -> None:
+    """Einstein msg-6769 (N+1) as narrowed by T-sweep-exclude-by-tag msg-8731 D-1.
 
-    The time comes from the listing's ``last_activity_at``; a per-thread read
-    (chatroom_get_thread) would be refused by ReadOnlyMcp before it left
-    the process.
+    The time still comes from the listing's ``last_activity_at``. The one
+    per-thread read is the tag fallback (chatroom_get_thread), capped at
+    TAG_LOOKUP_CAP per tick and pinned by tests/test_unregistered_threads_tags.py;
+    every other tool is refused by ReadOnlyMcp before it leaves the process.
     """
-    assert frozenset({"chatroom_list_threads"}) == _MODULE.READ_ONLY_TOOLS
+    assert frozenset({"chatroom_list_threads", "chatroom_get_thread"}) == _MODULE.READ_ONLY_TOOLS
 
 
 def test_the_timestamp_is_parsed_in_exactly_one_place() -> None:

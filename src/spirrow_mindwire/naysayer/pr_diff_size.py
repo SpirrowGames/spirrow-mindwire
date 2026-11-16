@@ -21,6 +21,12 @@ Fidelity choices, each made on purpose:
 - **Boundary is ``>``** (DECIDED wording: "超える"). Exactly at the threshold is fix-now even
   though the gate's ``DiffView.in_headroom`` (``>=``) already warns there; the mismatch is
   intended (msg-5234 §4).
+- **Same exclusion as the gate** (``.naysayer-ignore``, T-diff-cap-has-no-escape-for-indivisible-
+  data-artifacts msg-8470 §4). The head-side rules are read and applied by the same
+  :func:`naysayer_ignore.apply_ignore` the gate uses, so ``original_chars`` is the post-exclusion
+  length the gate caps; ``excluded_chars=`` says how much was taken out. No hashing here (msg-8470
+  §5): whether a file is excluded never depends on a blob read, so the two always agree. An
+  unreadable ignore file means no exclusion, as in the gate — the number only grows.
 - **Fail-loud.** A fetch failure (unpushed SHA → compare 404, auth, network) exits non-zero
   WITHOUT printing a ``decision=`` line, so a script cannot read a failure as fix-now.
 """
@@ -34,7 +40,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from ..github.client import GitHubHTTPError, PrRef
-from . import pr_review
+from . import naysayer_ignore, pr_review
 
 Decision = Literal["fix-now", "split"]
 
@@ -60,6 +66,7 @@ class DiffSize:
     original_chars: int
     warn_threshold: int
     limit: int
+    excluded_chars: int = 0
 
     @property
     def decision(self) -> Decision:
@@ -68,7 +75,8 @@ class DiffSize:
     def render(self) -> str:
         return (
             f"base={self.base_ref} head={self.head_sha} "
-            f"original_chars={self.original_chars} warn_threshold={self.warn_threshold} "
+            f"original_chars={self.original_chars} excluded_chars={self.excluded_chars} "
+            f"warn_threshold={self.warn_threshold} "
             f"limit={self.limit} decision={self.decision}"
         )
 
@@ -83,10 +91,13 @@ async def measure(client: _DiffSource, pr: PrRef, head_sha: str) -> DiffSize:
     """Measure ``pr``'s gate diff at ``head_sha``. Raises :class:`GitHubHTTPError` on failure."""
     base_ref, _stale_head = await client.fetch_pr_base_and_head(pr)
     diff = await client.fetch_compare_diff(pr.owner, pr.repo, base_ref, head_sha)
+    rules = await naysayer_ignore.read_head_rules(client, pr.owner, pr.repo, head_sha)
+    exclusion = naysayer_ignore.apply_ignore(diff, rules)
     return DiffSize(
         base_ref=base_ref,
         head_sha=head_sha,
-        original_chars=len(diff),
+        original_chars=len(exclusion.text),
+        excluded_chars=exclusion.excluded_chars,
         warn_threshold=pr_review._DIFF_WARN_THRESHOLD,
         limit=pr_review._MAX_DIFF_CHARS,
     )

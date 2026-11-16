@@ -43,6 +43,7 @@ import asyncio
 import re
 import sys
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,14 @@ OUT_PATH = REPO_ROOT / "tests" / "data" / "next_line_corpus.tsv"
 # (deploy/mindwire.toml.example) — the personas these two chatrooms actually run on. Recorded in the
 # fixture header so the expectations are reproducible.
 ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
+
+# The posting time every corpus line is resolved at. The corpus records line SHAPES from past
+# traffic and keeps no per-line time, so the reader's boundary-5 cutoff
+# (``handoff.NONE_MALFORMED_AFTER``) needs one stated here: without it a ``NEXT: none`` line would
+# be recorded as ``absent`` from the cutoff on. A fixed instant before the cutoff -- the last
+# ``NEXT: none`` any writer posted (spirrow-voxelworld msg-6652) -- and the same instant the tests
+# that replay the corpus pass (``tests/legacy_none_time.PRE_CUTOFF``; pinned equal by a test).
+CORPUS_POSTED_AT = datetime(2026, 11, 11, 21, 32, 33, tzinfo=UTC)
 
 _KEYWORD_RE = re.compile(r"NEXT\s*[:：]", re.IGNORECASE)  # noqa: RUF001 (fullwidth colon)
 _FIRST_WORD_RE = re.compile(r"^[^\w]*[\w][\w/#.:_-]*")
@@ -91,7 +100,7 @@ def decision_head(line: str) -> str:
 
 def expectation(line: str) -> tuple[str, str]:
     """``(kind, token)`` the parser must produce for ``line``; token is "" when it carries none."""
-    handoff = resolve_handoff(line, ROSTER)
+    handoff = resolve_handoff(line, ROSTER, posted_at=CORPUS_POSTED_AT)
     token = handoff.token if handoff.kind is not HandoffKind.ABSENT else None
     return handoff.kind.value, token or ""
 

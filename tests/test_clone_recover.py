@@ -9,18 +9,20 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from spirrow_mindwire import cli
-from spirrow_mindwire.clone_guard import CloneGuard
+from spirrow_mindwire.clone_guard import CloneGuard, DirtyCloneError, GitResult
 from spirrow_mindwire.clone_recover import (
     NOT_ELIGIBLE_EXIT,
     RECOVER_PREFIX,
     RECOVERED_EXIT,
     CloneRecoverer,
     RecoverOutcome,
+    _subprocess_git,
 )
 
 
@@ -201,4 +203,186 @@ def test_cli_prints_one_row_and_maps_exit_codes(
     assert len(rows) == 2
     assert json.loads(rows[0][len(RECOVER_PREFIX) :])["outcome"] == "not_eligible"
     last = json.loads(rows[1][len(RECOVER_PREFIX) :])
-    assert last == {"outcome": "recovered", "branch": "feature/x", "default": "main", "detail": ""}
+    assert last == {
+        "outcome": "recovered",
+        "branch": "feature/x",
+        "default": "main",
+        "detail": "",
+        "preserved_ref": None,
+        "preserved_sha": None,
+        "branch_deleted": True,
+    }
+
+
+# --- T-role-exit-leaves-clone-off-default-branch PR-A: --preserve (Bohr msg-8698) ---
+
+STAMP = "20261110T000000Z"
+
+
+def _stamp() -> str:
+    return STAMP
+
+
+def _remote_refs(origin: Path) -> list[str]:
+    return sorted(_git(origin, "for-each-ref", "--format=%(refname)").split())
+
+
+def _local_commit(clone: Path, name: str = "g.txt") -> str:
+    (clone / name).write_text("g\n", encoding="utf-8")
+    _git(clone, "add", name)
+    _git(clone, "commit", "-q", "-m", "local only")
+    return _git(clone, "rev-parse", "HEAD").strip()
+
+
+def test_preserve_keeps_unpushed_commits_on_a_local_wip_ref(origin: Path, clone: Path) -> None:
+    sha = _feature_commit(clone, push=False)
+    remote_before = _remote_refs(origin)
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    ref = f"wip/feature/x-{STAMP}"
+    assert (res.branch, res.preserved_ref, res.preserved_sha) == ("feature/x", ref, sha)
+    assert res.branch_deleted is True
+    assert _head(clone) == "main"
+    assert _branches(clone) == ["main", ref]  # the original branch is gone, the commits are not
+    assert _git(clone, "rev-parse", ref).strip() == sha
+    CloneGuard(clone).check()
+    assert _remote_refs(origin) == remote_before  # nothing pushed
+    _git(clone, "checkout", "-q", "-b", "feature/x")  # the name is free for the next session
+
+
+def test_preserve_pushed_but_unmerged_branch_is_kept_too(origin: Path, clone: Path) -> None:
+    sha = _feature_commit(clone)  # on origin/feature/x but not on origin/main
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    assert res.preserved_sha == sha
+    assert _head(clone) == "main"
+
+
+def test_preserve_with_nothing_to_keep_is_a_plain_recover(
+    tmp_path: Path, origin: Path, clone: Path
+) -> None:
+    _feature_commit(clone)
+    _merge_on_remote(tmp_path, origin, "feature/x")
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    assert (res.preserved_ref, res.preserved_sha, res.detail) == (None, None, "")
+    assert _branches(clone) == ["main"]
+
+
+def test_preserve_detached_head_reachable_from_remote_switches_without_a_ref(
+    clone: Path,
+) -> None:
+    _git(clone, "switch", "-q", "--detach", "HEAD")
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    assert (res.branch, res.preserved_ref) == (None, None)
+    assert res.branch_deleted is False
+    assert _head(clone) == "main"
+    assert _branches(clone) == ["main"]
+
+
+def test_preserve_detached_head_with_local_commits_gets_a_detached_ref(
+    origin: Path, clone: Path
+) -> None:
+    _git(clone, "switch", "-q", "--detach", "HEAD")
+    sha = _local_commit(clone)
+    remote_before = _remote_refs(origin)
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    ref = f"wip/detached-{sha[:8]}-{STAMP}"
+    assert (res.preserved_ref, res.preserved_sha) == (ref, sha)
+    assert _head(clone) == "main"
+    assert _git(clone, "rev-parse", ref).strip() == sha
+    assert _remote_refs(origin) == remote_before
+
+
+def test_preserve_ref_that_cannot_be_made_fails_and_changes_nothing(clone: Path) -> None:
+    _feature_commit(clone, push=False)
+    before = (_head(clone), _branches(clone), _git(clone, "rev-parse", "HEAD"))
+    res = CloneRecoverer(clone, preserve=True, clock=lambda: "bad..name").recover()
+    assert res.outcome is RecoverOutcome.FAILED, res
+    assert res.detail.startswith("preserve: creating wip/feature/x-bad..name failed")
+    assert res.preserved_ref is None
+    assert (_head(clone), _branches(clone), _git(clone, "rev-parse", "HEAD")) == before
+    with pytest.raises(DirtyCloneError):  # still parked
+        CloneGuard(clone).check()
+
+
+def test_preserve_dirty_tree_is_not_eligible(clone: Path) -> None:
+    _feature_commit(clone, push=False)
+    (clone / "untracked.txt").write_text("u\n", encoding="utf-8")
+    res = CloneRecoverer(clone, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.NOT_ELIGIBLE
+    assert "dirty_tree" in res.detail
+    assert _head(clone) == "feature/x"
+    assert not any(b.startswith("wip/") for b in _branches(clone))
+
+
+def test_plain_mode_still_refuses_unpushed_commits(clone: Path) -> None:
+    _feature_commit(clone, push=False)
+    res = CloneRecoverer(clone, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.NOT_ELIGIBLE
+    assert _branches(clone) == ["feature/x", "main"]
+
+
+def test_cli_preserve_writes_one_record_for_the_thread(
+    tmp_path: Path, clone: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sha = _feature_commit(clone, push=False)
+    state = tmp_path / "state"
+    with pytest.raises(SystemExit) as ok:
+        cli.main(
+            [
+                "clone-recover",
+                "--repo-dir",
+                str(clone),
+                "--preserve",
+                "--thread-id",
+                "T-a",
+                "--state-dir",
+                str(state),
+            ]
+        )
+    assert ok.value.code == RECOVERED_EXIT
+    [line] = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(RECOVER_PREFIX)]
+    row = json.loads(line[len(RECOVER_PREFIX) :])
+    assert row["preserved_sha"] == sha
+    assert row["preserved_ref"].startswith("wip/feature/x-")
+    [rec] = [
+        json.loads(x) for x in (state / "clone-retreats.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert (rec["kind"], rec["thread_id"], rec["outcome"]) == ("retreat", "T-a", "preserved")
+    assert (rec["preserved_ref"], rec["preserved_sha"]) == (row["preserved_ref"], sha)
+    assert rec["pushed"] is False
+    assert rec["branch_deleted"] is True
+
+
+def test_cli_preserve_needs_thread_and_state_dir(clone: Path) -> None:
+    with pytest.raises(SystemExit) as bad:
+        cli.main(["clone-recover", "--repo-dir", str(clone), "--preserve"])
+    assert bad.value.code == 2
+
+
+def test_cli_plain_mode_writes_no_record(tmp_path: Path, clone: Path) -> None:
+    _feature_commit(clone, push=False)
+    with pytest.raises(SystemExit) as nope:
+        cli.main(["clone-recover", "--repo-dir", str(clone)])
+    assert nope.value.code == NOT_ELIGIBLE_EXIT
+    assert not (tmp_path / "state").exists()
+
+
+def test_preserve_branch_delete_that_fails_is_recorded_as_not_deleted(clone: Path) -> None:
+    # PR-gate #558 round 2 advisory: the notice reads ``branch_deleted``, not ``detail``.
+    _feature_commit(clone, push=False)
+
+    def git(repo_dir: Path, args: Sequence[str]) -> GitResult:
+        if list(args[:2]) == ["branch", "-D"]:
+            return GitResult(1, "", "error: cannot lock ref")
+        return _subprocess_git(repo_dir, args)
+
+    res = CloneRecoverer(clone, git=git, preserve=True, clock=_stamp).recover()
+    assert res.outcome is RecoverOutcome.RECOVERED, res
+    assert res.branch_deleted is False
+    assert "branch delete failed" in res.detail
+    assert _head(clone) == "main"
+    assert "feature/x" in _branches(clone)

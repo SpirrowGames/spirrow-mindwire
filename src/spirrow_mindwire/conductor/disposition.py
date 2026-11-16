@@ -26,6 +26,7 @@ them is what keeps an agent's reply from being refused for them.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -75,23 +76,35 @@ def disposition_payload(stop: StopLine) -> dict[str, Any] | None:
 
 
 def stop_line_of(
-    body: str, roster: Mapping[str, Role], *, next_participant: str | None = None
+    body: str,
+    roster: Mapping[str, Role],
+    *,
+    next_participant: str | None = None,
+    posted_at: datetime | None = None,
 ) -> StopLine | None:
     """The ``STOP:`` parse of a message that resolves to ``NEXT: none``, else ``None``.
 
     Resolved exactly as the conductor resolves the head (:func:`~.handoff.resolve_handoff`, with
-    the ``next_participant`` field when the reader has one), so a thread the conductor settled on
-    is the thread classified here. The gateway passes no field: it posts none.
+    the ``next_participant`` field when the reader has one, and the message's ``posted_at`` for
+    the boundary-5 cutoff), so a thread the conductor settled on is the thread classified here.
+    A legacy ``NEXT: none`` the cutoff refuses is ``None``: it does not settle. The gateway passes
+    no field: it posts none.
     """
-    handoff = resolve_handoff(body, roster, next_participant=next_participant)
+    handoff = resolve_handoff(body, roster, next_participant=next_participant, posted_at=posted_at)
     if handoff.kind is not HandoffKind.NONE:
         return None
     return handoff.stop_line
 
 
-def body_disposition(body: str, roster: Mapping[str, Role]) -> dict[str, Any] | None:
-    """The ``disposition`` to send with ``body`` (only a valid ``STOP:`` line has one)."""
-    stop = stop_line_of(body, roster)
+def body_disposition(
+    body: str, roster: Mapping[str, Role], *, posted_at: datetime | None = None
+) -> dict[str, Any] | None:
+    """The ``disposition`` to send with ``body`` (only a valid ``STOP:`` line has one).
+
+    ``posted_at`` is when ``body`` is being posted (the gateway passes its clock): a legacy
+    ``NEXT: none`` the boundary-5 cutoff refuses carries no disposition.
+    """
+    stop = stop_line_of(body, roster, posted_at=posted_at)
     return disposition_payload(stop) if stop is not None else None
 
 

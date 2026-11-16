@@ -5,12 +5,12 @@ touching any core (watcher / dispatcher / adapter):
 
 - **role resolution**: with the three production adapters registered, the
   registry routes PROPOSER → read-only ``Stage3ProposerAdapter``, IMPLEMENTER →
-  the allow-list-gated ``ImplementerSdkAdapter``, NAYSAYER → the independent
+  ``ImplementerSdkAdapter``, NAYSAYER → the independent
   design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
   unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
   the wrinkle the runner solves: the base ``ClaudeCodeSdkAdapter`` declares
-  EXECUTE_CODE and would otherwise shadow the gated implementer under
-  first-qualified.
+  EXECUTE_CODE and, registered first, would otherwise take the IMPLEMENTER slot
+  under first-qualified.
 - **config**: ``[loop].watches`` parse into ``WatchSpec``s with the right role.
 - **assembly**: a fully built loop dispatches a proposer reply over a fake
   chatroom (the registry→dispatcher→watcher→gateway composition is sound).
@@ -384,8 +384,8 @@ def test_bohr_persona_tools_today_do_not_include_write_or_execute_tools() -> Non
     role's invariant (see the block comment atop this section) — the proposer
     *role* stays read-only regardless of what future Bohr embodiments carry,
     because the role's read-only-ness is enforced by ``capabilities`` (the
-    IMPLEMENTER slot resolves to the gated adapter) and by the
-    ``can_use_tool`` guard (:class:`_PathScopeGuard` admits only
+    IMPLEMENTER slot resolves to ImplementerSdkAdapter, not the proposer) and
+    by the ``can_use_tool`` guard (:class:`_PathScopeGuard` admits only
     ``Read`` / ``Glob`` / ``Grep`` today). If a future change widens Bohr's
     persona 面 to include a write or execute tool it must also widen the guard
     (or a per-persona equivalent) — the role invariant is protected there.
@@ -409,7 +409,8 @@ def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None
 
     ``capabilities`` is a class attribute and independent of the tool list, so
     widening the tools cannot make first-qualified hand the IMPLEMENTER slot to
-    the un-gated adapter. That was the whole point of the split.
+    this proposer adapter instead of ImplementerSdkAdapter. That was the whole
+    point of the split.
     """
     assert Capability.EXECUTE_CODE not in Stage3ProposerAdapter.capabilities
 
@@ -418,8 +419,8 @@ def test_stage3_proposer_capabilities_are_unchanged() -> None:
     caps = Stage3ProposerAdapter.capabilities
     assert Capability.READ_THREAD in caps
     assert Capability.POST_REPLY in caps
-    # Dropping EXECUTE_CODE is what lets the IMPLEMENTER slot resolve to the
-    # gated adapter rather than the proposer (registry first-qualified).
+    # Dropping EXECUTE_CODE is what lets the IMPLEMENTER slot resolve to
+    # ImplementerSdkAdapter rather than the proposer (registry first-qualified).
     assert Capability.EXECUTE_CODE not in caps
     # Same-model family as main → never qualifies as naysayer (ADR-05 §5).
     assert Capability.NAYSAYER_QUALIFIED not in caps
@@ -452,7 +453,8 @@ def test_build_registry_rejects_non_independent_naysayer(tmp_path: Path) -> None
 
 def test_build_registry_rejects_proposer_that_shadows_implementer(tmp_path: Path) -> None:
     # If the "proposer" advertises EXECUTE_CODE it also qualifies for IMPLEMENTER
-    # and, registered first, would shadow the gated implementer — caught fail-loud.
+    # and, registered first, would take the IMPLEMENTER slot ahead of
+    # ImplementerSdkAdapter — caught fail-loud.
     exec_proposer = _StubAdapter("exec-proposer", _exec_caps())
     implementer = ImplementerSdkAdapter(
         cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lexora.local"

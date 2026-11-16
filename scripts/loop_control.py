@@ -27,6 +27,18 @@ values were written at. They are surfaced here so the sweep wrapper can log them
 Bohr msg-2789 §3 / F4b — warn on the sweep log when a HOLD's acknowledgement has not landed
 (``observed_at`` older than ``desired_at``, or ``null``). This is a strictly-observability
 addition: this script does not gate on either value.
+
+``--report-observed-hold`` (T-role-exit-leaves-clone-off-default-branch PR-B) is the one write
+this script makes: the sweep reports ``observed_state=hold`` for a held project that launched
+nothing this tick, so no conductor landed the acknowledgement. It reuses
+``LoopControlReader.report_observed`` with the actor ``sweep:<why>``. ``--why`` is a fixed choice
+(T-hold-observed-freshness-and-unlaunched-tick-ack F1): ``dirty-clone-parked`` (the clone is parked;
+the default, so a call without ``--why`` keeps the PR-B actor) or ``no-launch`` (nothing of the
+project launched this tick). The flag itself takes no value on purpose: the sweep may only claim
+``hold`` (nothing is running), never ``run``. Whether nothing
+is running is the CALLER's proof (the in-flight ledger, deploy/lib/InflightLedger.ps1); once the
+executor pool exists, how to confirm that no executor is running the project is decided in unit 4.
+Exit 0 = the report landed, 1 = it did not.
 """
 
 from __future__ import annotations
@@ -37,6 +49,7 @@ import json
 import sys
 from typing import Any
 
+from spirrow_mindwire.conductor.control import ControlState, LoopControlReader
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 # Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
@@ -88,13 +101,58 @@ async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+#: ``--why`` choices; the actor on the sweep's own observed write-back is ``sweep:<why>``, so the
+#: dashboard shows who acknowledged and why. Fixed, never free text.
+REPORT_WHY_CHOICES = ("dirty-clone-parked", "no-launch")
+#: ``--why`` when omitted: the PR-B caller's reason, so its actor is unchanged.
+REPORT_WHY_DEFAULT = "dirty-clone-parked"
+SWEEP_PARKED_ACTOR = f"sweep:{REPORT_WHY_DEFAULT}"
+
+
+async def report_observed_hold(
+    project: str, url: str | None, why: str = REPORT_WHY_DEFAULT
+) -> bool:
+    """Report ``observed_state=hold`` for ``project``; ``True`` only if the report landed."""
+    if why not in REPORT_WHY_CHOICES:
+        raise ValueError(f"unknown --why: {why!r}")
+    reader = LoopControlReader(
+        StreamableHttpChatroomMcp(url), project=project, actor=f"sweep:{why}"
+    )
+    await reader.report_observed(ControlState.HOLD)
+    return reader.last_reported is ControlState.HOLD
+
+
+def main(argv: list[str] | None = None) -> int:
+    # allow_abbrev=False: ``--report-observed <value>`` must not resolve to the hold-only flag.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--project", required=True)
     parser.add_argument(
         "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--report-observed-hold",
+        action="store_true",
+        help="report observed_state=hold for --project (sweep, nothing launched); takes no value",
+    )
+    parser.add_argument(
+        "--why",
+        choices=REPORT_WHY_CHOICES,
+        default=REPORT_WHY_DEFAULT,
+        help="with --report-observed-hold: why the sweep acknowledges (actor sweep:<why>)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.report_observed_hold:
+        try:
+            landed = asyncio.run(report_observed_hold(args.project, args.url, args.why))
+        except Exception as exc:  # one line on stderr; the sweep logs it as a WARN and moves on
+            print(f"loop_control: report observed=hold failed: {exc}", file=sys.stderr)
+            return 1
+        if not landed:
+            print("loop_control: report observed=hold did not land", file=sys.stderr)
+            return 1
+        print(json.dumps({"project": args.project, "reported": "hold"}, ensure_ascii=True))
+        return 0
 
     try:
         state = asyncio.run(fetch_control(args.project, args.url))

@@ -6,7 +6,7 @@ type: adr
 status: active
 version: 1.0
 created: 2026-09-14
-last_verified: 2026-09-14
+last_verified: 2026-11-10
 supersedes: []
 related: [platform:claude-usage-cost-reduction-design]
 keywords: [identity, fermi, independence-class, embodiment, routing, conductor]
@@ -78,6 +78,8 @@ Fermi の embodiment に対応する adapter は存在せず、**作らない**�
 外部から駆動することであり、ADR-2026-05-31-14 がそれを撤回している。
 
 ### D-3: `NEXT: Fermi` は `NEXT: human` と同じ停止
+
+> **適用範囲は §7 Amendment (2026-11-10) で限定された**: owner が Fermi のスレッドでだけ成り立ち、それ以外のスレッドでは malformed handoff（`fermi_outside_own_thread`）として止まる。
 
 ルーティングが Fermi に解決したとき、Conductor は spawn を試みず、human-class の停止に
 落として operator に通知する。スレッドは「人間待ち」として滞留し、Takahito が
@@ -187,3 +189,28 @@ ADR 番号 `21` は、`spec/adr_index.yaml` の既存最大連番が `20`（ADR-
 あることを実測して割り当てた（ADR-20 §6 と同じ手順）。本体は `docs/adr/` に置き、
 索引の `body:` locator を `repo:docs/adr/ADR-2026-09-14-21-fermi-identity.md` に設定する
 （`docs/adr/README.md` の規律）。
+
+---
+
+## 7. Amendment (2026-11-10): `NEXT: Fermi` は Fermi が owner のスレッドでだけ有効（D-3 の適用範囲）
+
+- **Status**: Proposed。設計の収束は chatroom `spirrow-mindwire/T-retire-operator-identity-and-scope-next-fermi`（Bohr 設計 v1〜v8: msg-8874 / msg-8899 / msg-8935 / msg-8941 / msg-8943 / msg-8947 / msg-8952 / msg-8954、Einstein の承認 msg-8955）。決定の根拠は msg-8871 の Takahito 発言（**Takahito 承認済み 2026-11-10**、D-5 の明記。逐語「Fermi が起票したスレッド以外で Fermi を NEXT に指定することは出来ないようにして、僕への相談が必要なら Human を NEXT に指定すべき」）。**この節が main に merge されることを、Takahito による承認とする**（merge-protected）。
+- **変えること**: D-3 の適用範囲だけ。D-1 / D-2 / D-4 / D-5 / D-6 は変えない。
+
+### 7.1 何が変わるか
+
+- D-3「`NEXT: Fermi` は `NEXT: human` と同じ停止」は、**スレッドの owner（`thread.owner`）が Fermi のときだけ**成り立つ。owner の比較は ADR-2026-05-29-11 の partition キーで行う（`fermi` / `Fermi` は同じ）。
+- owner が Fermi でないスレッド、または owner を読めなかったスレッドで `NEXT:` が Fermi を指したとき（本文の `NEXT: Fermi`、または構造化フィールド `next_participant=Fermi`）は、Conductor は spawn 不能の停止ではなく **malformed handoff**（reason `fermi_outside_own_thread`）として止まり、notice を投稿する。本文と構造化フィールドが食い違う場合も、**どちらか一方でも** Fermi を指していれば同じ扱いとする（本文と field を突き合わせた後の宛先ではなく、両側の元の宛先で判定する。突き合わせ後は Fermi が `human` などに置き換わって見えなくなるため）。notice は「人の判断なら `NEXT: human`、人の手作業なら `HUMAN-TASK:` の 3 行形式」で書き直すよう案内し、`NEXT: human` で終わる。
+- `NEXT: human` への**黙った読み替えはしない**。読み替えると書き手の誤りが消え、Fermi の受け皿と人の受け皿のどちらに積むべき依頼だったかも見えなくなる（msg-8874 D2）。
+- 強制点は Conductor の 1 箇所だけ（`conductor/handoff.py` の `scope_fermi_handoff`、`conductor/core.py` で routing に使う handoff へ適用）。magickit の `next_participant` 検証には入れない（本文の `NEXT:` 行が正本、強制点を 1 箇所に保つ）。
+
+### 7.2 判定に `thread.owner` を使う理由
+
+- close 権限が見ているのと同じ field で、Conductor は既に `chatroom_get_thread` の応答で読んでいる（`thread.tags` と同じ応答）。
+- スレッドを開いたとき owner は propose の author なので、Fermi が起票したスレッドの owner は Fermi になる。owner と起票者がずれるのは、後継スレッド等で Fermi が owner になった場合で、そこで `NEXT: Fermi` を許すのは意図どおりである。
+- owner を読めないときに止まる側へ倒すのは、どちらに転んでも人に止まるので、失うのが notice 1 件だけだからである。
+
+### 7.3 範囲外（追跡先）
+
+- D-1 の embodiment 表（`web_ai_chat`）と D-2（Conductor は Fermi を spawn しない）を「Fermi は人が駆動する identity なので embodiment に関係なく spawn しない」に意味付け直すことは、この節では扱わない（実態は terminal からの投稿もある: msg-8871 / msg-8898）。同スレッドの残件 R-1 として独立スレッドで扱い、その thread_id を同スレッドに記録するまでスレッドを close しない（msg-8935 §3）。
+- `NEXT: operator` の廃止（`HUMAN-TASK:` 形式への移行と cutoff）は同スレッドの設計の範囲で、この ADR は改訂しない。

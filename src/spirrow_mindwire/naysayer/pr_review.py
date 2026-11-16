@@ -47,7 +47,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, TypedDict
 
@@ -55,6 +55,7 @@ from ..github.client import (
     PR_FILES_LIST_CAP,
     CiState,
     CiStatus,
+    CoverageLookup,
     CrossPrApproveCoverage,
     EnvironmentTerminalError,
     GitHubClient,
@@ -71,6 +72,8 @@ from ..github.client import (
     TargetTerminalError,
     classify_http_error,
     naysayer_github_token,
+    render_reviewed_diff_sha256_marker,
+    reviewed_diff_sha256,
     scope_from_probe,
 )
 from ..github.reviews import (
@@ -100,6 +103,20 @@ from .n3_routing import (
     load_n3_globs,
     notify_unresolved,
     route_tier,
+)
+from .naysayer_ignore import (
+    IGNORE_FILE,
+    NO_RULES,
+    ExcludedFile,
+    IgnoreReport,
+    IgnoreRules,
+    KeptSpan,
+    apply_ignore,
+    files_beyond,
+    hash_excluded,
+    new_rules,
+    read_head_rules,
+    read_ignore_text,
 )
 from .pr_review_adr_pointers import (
     AdrPointerSelection,
@@ -1432,6 +1449,31 @@ def derive_verdict(report: ObjectionReport) -> ReviewEvent:
     return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
 
 
+def _status_suffix(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None)
+    return f" status={status}" if isinstance(status, int) else ""
+
+
+def find_identical_input_approve(
+    lookup: CoverageLookup | None, digest: str | None
+) -> CrossPrApproveCoverage | None:
+    """The first prior head-bound APPROVE whose reviewed diff text hashed the same, else ``None``.
+
+    A fingerprint match over the diff text the model read (msg-8810 D-2''), never a tree match:
+    a shared head tree over a different base is a different diff (msg-8423 Obj-1). Only the
+    diff text is proven equal — the rest of the prompt may differ (msg-8812 Obj-3-1). A prior
+    review without a ``v1`` marker contributes no fingerprint and never matches — silence
+    means "cannot compare". Every fingerprint of every qualifying APPROVE on a row is checked,
+    not just the first approval's (PR-gate #556 round 1 obj 2).
+    """
+    if lookup is None or digest is None:
+        return None
+    for c in lookup.coverage:
+        if digest in c.prior_diff_sha256s:
+            return c
+    return None
+
+
 @dataclass(frozen=True)
 class VerdictDecision:
     """The full verdict picture of a single review — model side, gate side, and the diff view.
@@ -1485,6 +1527,13 @@ class VerdictDecision:
     # overrode the gate verdict (FAIL -> REQUEST_CHANGES, HOLD -> COMMENT), so the F-conditions
     # note can say why. ``None`` on every other path, including a passing check.
     design_conditions: DesignConditionsCheck | None = None
+    # T-gate-verdict-not-a-function-of-its-input (msg-8810 D-1' / D-2''). The B-(a)
+    # lookup outcome and the fingerprint of the diff text this run's model read. Both are
+    # observation only: nothing reads them into ``gate_verdict`` (msg-473 — the driver does
+    # not decide verdicts); ``render_gate_notice`` turns them into the G-coverage / H-reversal
+    # notes. ``None`` on the paths that read no diff.
+    coverage_lookup: CoverageLookup | None = None
+    diff_sha256: str | None = None
 
     @property
     def diverged(self) -> bool:
@@ -1568,6 +1617,8 @@ _MARKER_C_DEMOTED = "<!-- mindwire:note C-demoted -->"
 _MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
 _MARKER_E_AMBIGUOUS = "<!-- mindwire:note E-ambiguous -->"
 _MARKER_F_CONDITIONS = "<!-- mindwire:note F-conditions -->"
+_MARKER_G_COVERAGE = "<!-- mindwire:note G-coverage -->"
+_MARKER_H_REVERSAL = "<!-- mindwire:note H-reversal -->"
 
 
 # ─── verify_citations: single-line where + empty-line predicate ─────────────────────
@@ -1814,6 +1865,18 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_e = decision.model_verdict is ModelVerdict.AMBIGUOUS
     conditions = decision.design_conditions
     fire_f = conditions is not None and conditions.overrides
+    # G-coverage (msg-8810 D-1'): ``ok-empty`` / no lookup stays silent so the body is
+    # byte-identical to the pre-change shape; ``ok`` and ``failed`` each print one line.
+    lookup = decision.coverage_lookup
+    fire_g = lookup is not None and lookup.state != "ok-empty"
+    # H-reversal (msg-8810 D-2'' / msg-8812): a prior head-bound APPROVE on the same reviewed-
+    # diff fingerprint, and this run's GATE verdict is not APPROVE.
+    reversed_approve = (
+        find_identical_input_approve(lookup, decision.diff_sha256)
+        if decision.gate_verdict is not ReviewEvent.APPROVE
+        else None
+    )
+    fire_h = reversed_approve is not None
     if not (
         fire_a
         or fire_b_diff
@@ -1823,6 +1886,8 @@ def render_gate_notice(decision: VerdictDecision) -> str:
         or fire_d
         or fire_e
         or fire_f
+        or fire_g
+        or fire_h
     ):
         return ""
 
@@ -1832,6 +1897,43 @@ def render_gate_notice(decision: VerdictDecision) -> str:
         f"> model verdict: {_model_verdict_label(decision.model_verdict)}"
         f"   gate verdict: {_gate_verdict_label(decision.gate_verdict)}"
     )
+    if reversed_approve is not None and decision.diff_sha256 is not None:
+        # Placed first among the notes: it is about the verdict itself. The verdict is NOT
+        # rewritten (msg-473); the note only makes the disagreement the gate's own statement
+        # instead of something an operator finds by hand with ``cmp`` (msg-4155 §1).
+        lines.append(">")
+        lines.append(f"> {_MARKER_H_REVERSAL}")
+        # Wording from msg-8812 Obj-3-1: the hash proves the diff text only, and which verdict
+        # stands is a policy question kept in its own sentence, apart from the hash claim.
+        lines.append(
+            f"> **Identical reviewed diff, differing verdicts.** The diff text this review read "
+            f"hashes to {decision.diff_sha256[:12]}, the same as the diff text read by the "
+            f"review that APPROVED {reversed_approve.other_pr.slug} at "
+            f"{reversed_approve.sha[:12]}. Only the diff text is shown to match; other prompt "
+            f"context (PR slug, prior-verdict marker) may differ."
+        )
+        lines.append(
+            "> This notice records the disagreement; it does not decide which verdict stands."
+        )
+    if fire_g and lookup is not None:
+        lines.append(">")
+        lines.append(f"> {_MARKER_G_COVERAGE}")
+        failed_reads = len(lookup.read_failures)
+        if lookup.state == "failed":
+            lines.append(
+                f"> prior-verdict coverage lookup FAILED ({lookup.read_failures[0]}, "
+                f"{failed_reads} read(s)) — reviewed WITHOUT the marker"
+            )
+        else:
+            commits = len({c.sha for c in lookup.coverage})
+            slugs = ", ".join(dict.fromkeys(c.other_pr.slug for c in lookup.coverage))
+            partial_note = (
+                f"; {failed_reads} read(s) failed — coverage may be partial" if failed_reads else ""
+            )
+            lines.append(
+                f"> prior-verdict coverage: {commits} commit(s) already head-bound APPROVED on "
+                f"{slugs} — marker was in the prompt{partial_note}"
+            )
     if fire_a:
         remaining = view.limit - view.original_chars
         pct = round(100.0 * view.original_chars / view.limit) if view.limit else 0
@@ -1857,6 +1959,9 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"about the remainder is not approval. **No number of further rounds will "
             f"produce APPROVE while the diff exceeds {view.limit:,} chars. Split the PR.**"
         )
+        never_sent, partial = view.never_sent_and_partial
+        lines += [f"> NEVER SENT: {path}" for path in never_sent]
+        lines += [f"> PARTIAL: {path}" for path in partial]
     if fire_b_len:
         # STRICTLY ON THE OUTPUT AXIS. This note may only describe what happened to the
         # model's response — never make claims about the DIFF-size axis (A-headroom / B-diff).
@@ -2058,6 +2163,17 @@ def _log_pr_round(
     )
 
 
+def append_ignore_report(body: str, view: DiffView) -> str:
+    """Append the driver-written ``.naysayer-ignore`` report (msg-8470 §6), or ``body`` as is.
+
+    Appended, not prepended: the gate-notice header stays rare (it is the only thing above the
+    critique), and the report appears only when the PR's head carries an ignore file that did
+    something or had invalid lines.
+    """
+    section = view.ignore_report.render()
+    return f"{body}\n\n{section}" if section else body
+
+
 def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
     """Return ``body`` with the gate notice prepended (or unchanged when the notice is empty).
 
@@ -2128,6 +2244,21 @@ class DiffView:
     original_chars: int
     limit: int
     warn_threshold: int
+    # ``.naysayer-ignore`` (T-diff-cap-has-no-escape-for-indivisible-data-artifacts, msg-8470
+    # §4): ``original_chars`` is the length AFTER exclusion — the cap and warn band apply there
+    # — and ``pre_exclusion_chars`` the raw compare length. With no exclusion the two are equal.
+    pre_exclusion_chars: int = -1
+    excluded: tuple[ExcludedFile, ...] = ()
+    ignore_report: IgnoreReport = field(default_factory=IgnoreReport)
+    # Sections sent in full, with their spans in the post-exclusion diff; names what a cut drops.
+    kept: tuple[KeptSpan, ...] = ()
+
+    @property
+    def never_sent_and_partial(self) -> tuple[list[str], list[str]]:
+        """Files the cap dropped whole / cut part-way (msg-4152 §4, msg-8470 §6)."""
+        if not self.truncated:
+            return [], []
+        return files_beyond(self.kept, self.limit)
 
     @property
     def truncated(self) -> bool:
@@ -2303,20 +2434,43 @@ def _is_whole_content_review(body: str) -> bool:
     return _MARKER_B_DIFF not in body and _MARKER_B_LEN not in body
 
 
-def _make_diff_view(diff: str) -> DiffView:
-    """Truncate ``diff`` to the review cap and pair the result with the pre-cap length.
+def _make_diff_view(
+    diff: str,
+    *,
+    rules: IgnoreRules = NO_RULES,
+    report: IgnoreReport | None = None,
+) -> DiffView:
+    """Exclude per ``rules``, truncate to the review cap, and pair the result with the lengths.
 
     Replaces the bare ``str``-returning ``_truncate_diff``: an earlier design lost
     ``original_chars`` on the way to the verdict-resolution site, and the gate notice
     could not honestly say "51,829 chars were never sent to the model" from a truncated
     string alone. Here the length is captured BEFORE truncation, at the same call.
+
+    ``.naysayer-ignore`` runs first (msg-8470 §4): :func:`apply_ignore` replaces excluded
+    sections with pointer lines, and the cap applies to what is left. ``report`` is the
+    driver-written section; when omitted it carries the exclusion facts alone.
     """
-    text = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]" if len(diff) > _MAX_DIFF_CHARS else diff
+    exclusion = apply_ignore(diff, rules)
+    kept_text = exclusion.text
+    text = (
+        kept_text[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
+        if len(kept_text) > _MAX_DIFF_CHARS
+        else kept_text
+    )
+    if report is None:
+        report = IgnoreReport(
+            excluded=exclusion.excluded, refused=exclusion.refused, invalid=rules.invalid
+        )
     return DiffView(
         text=text,
-        original_chars=len(diff),
+        original_chars=len(kept_text),
         limit=_MAX_DIFF_CHARS,
         warn_threshold=_DIFF_WARN_THRESHOLD,
+        pre_exclusion_chars=exclusion.pre_exclusion_chars,
+        excluded=report.excluded,
+        ignore_report=report,
+        kept=exclusion.kept,
     )
 
 
@@ -2362,6 +2516,7 @@ def _build_messages(
     coverage: list[CrossPrApproveCoverage] | None = None,
     round_context: PrRoundContext | None = None,
     conditions: DesignConditionsCheck | None = None,
+    ignore_report: IgnoreReport | None = None,
 ) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
@@ -2396,11 +2551,20 @@ def _build_messages(
     marker_section = f"{marker}\n\n" if marker else ""
     round_section = round_context.render() if round_context is not None else ""
     conditions_section = conditions.render_prompt_section() if conditions is not None else ""
+    ignore_text = ignore_report.render() if ignore_report is not None else ""
+    ignore_section = (
+        f"{ignore_text}\n\nThe files above were not sent to you in full; each appears in the "
+        f"diff as one `[excluded by {IGNORE_FILE}:L<n>]` line. If a rule should not exclude a "
+        f"file, say so.\n\n"
+        if ignore_text
+        else ""
+    )
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
         f"{marker_section}"
         f"{conditions_section}"
+        f"{ignore_section}"
         f"{round_section}"
         f"```diff\n{text}\n```"
     )
@@ -2727,7 +2891,8 @@ class NaysayerPrReviewDriver:
         # builders take ``view.text`` rather than the raw diff, so the truncation is computed
         # ONCE and never recomputed (T-gate-silently-suppresses-approve-on-truncated-diff,
         # round-3 PR-gate finding on PR #186 corrected the earlier draft that recomputed).
-        view = _make_diff_view(diff)
+        rules = await read_head_rules(self._github, pr.owner, pr.repo, diff_head)
+        view = await self._ignore_view(pr, diff, rules, base_ref=base_ref, head_sha=diff_head)
         truncated = view.truncated
 
         # B-(a) accountability marker (msg-473 §5, msg-475 §5): resolve which commits in this
@@ -2736,9 +2901,10 @@ class NaysayerPrReviewDriver:
         # exception on the lookup path is logged and swallowed, and the review proceeds with
         # ``coverage = []``. The marker never gates the fire; it enriches the request when
         # available and gets out of the way when not.
-        coverage: list[CrossPrApproveCoverage] = []
+        # D-1' (msg-8810): the client records its own failed reads in ``read_failures``; this
+        # catch is the driver-side belt for anything that still escapes it.
         try:
-            coverage = await self._github.find_cross_pr_head_bound_approves(
+            coverage_lookup = await self._github.find_cross_pr_head_bound_approves(
                 pr, reviewer_login=self._review_login
             )
         except Exception as exc:  # fail-open by design (msg-473 §5)
@@ -2747,7 +2913,14 @@ class NaysayerPrReviewDriver:
                 pr.slug,
                 exc,
             )
-            coverage = []
+            # Class name (+ status) only — the message stays in the log above (Obj-1-2).
+            coverage_lookup = CoverageLookup(
+                read_failures=(f"{type(exc).__name__}{_status_suffix(exc)}",)
+            )
+        coverage: list[CrossPrApproveCoverage] = list(coverage_lookup.coverage)
+        # Fingerprint of the diff text the model reads (``view.text``: after ignore filtering
+        # and truncation) — msg-8810 D-2''.
+        this_diff_sha256 = reviewed_diff_sha256(view.text)
 
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
@@ -2755,7 +2928,7 @@ class NaysayerPrReviewDriver:
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        round_context = await self._round_context(pr, diff_head, read_review_thread)
+        round_context = await self._round_context(pr, diff_head, read_review_thread, rules=rules)
         routing = (
             None
             if self._model is not None
@@ -2882,6 +3055,7 @@ class NaysayerPrReviewDriver:
                 gate_verdict=conditions.cap(decision.gate_verdict),
                 design_conditions=conditions,
             )
+        decision = replace(decision, coverage_lookup=coverage_lookup, diff_sha256=this_diff_sha256)
         verdict = decision.gate_verdict
         _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
@@ -2890,6 +3064,11 @@ class NaysayerPrReviewDriver:
         # tail (msg-1872 D-4). The notice is "" when no axis fired, in which case body is
         # returned unchanged (msg-1876 invariant 6: no marker → no sentinel).
         body = prepend_gate_notice(body, decision)
+        body = append_ignore_report(body, view)
+        # The diff fingerprint goes BELOW the critique (so the last-match parse can never pick a
+        # marker the model quoted) and above the verdict footer / ADR marker, which keep their
+        # fixed tail positions. The driver never truncates the body, so nothing cuts it off.
+        body = f"{body.rstrip()}\n\n{render_reviewed_diff_sha256_marker(this_diff_sha256)}"
         # Stamp the ADR-pointer section + marker onto the body BEFORE posting / submitting, so
         # the chat-room copy, the GitHub review, and the outcome all carry the same rendered
         # body (the marker is the final line — the driver relies on that fixed position).
@@ -2949,8 +3128,32 @@ class NaysayerPrReviewDriver:
                 reasons=(f"the design-conditions check could not run ({type(exc).__name__})",),
             )
 
+    async def _ignore_view(
+        self, pr: PrRef, diff: str, rules: IgnoreRules, *, base_ref: str, head_sha: str
+    ) -> DiffView:
+        """The :class:`DiffView` with ``.naysayer-ignore`` applied and its report (msg-8470).
+
+        What is excluded is decided by :func:`_make_diff_view` from ``rules`` alone; the two
+        reads here (base-side rules for ``NEW RULE``, blobs for ``sha256``) only fill in the
+        report, and a failure of either never changes what the model is sent.
+        """
+        bare = _make_diff_view(diff, rules=rules)
+        if not rules.rules and not rules.invalid:
+            return bare
+        base_text = await read_ignore_text(self._github, pr.owner, pr.repo, base_ref)
+        hashed = await hash_excluded(
+            self._github, pr.owner, pr.repo, base_ref, head_sha, bare.excluded
+        )
+        report = replace(bare.ignore_report, excluded=hashed, new=new_rules(rules, base_text))
+        return replace(bare, excluded=hashed, ignore_report=report)
+
     async def _round_context(
-        self, pr: PrRef, head_sha: str, read_review_thread: ReadReviewThread | None
+        self,
+        pr: PrRef,
+        head_sha: str,
+        read_review_thread: ReadReviewThread | None,
+        *,
+        rules: IgnoreRules = NO_RULES,
     ) -> PrRoundContext:
         """Resolve D2 for this review. Every path that cannot prove a delta reviews the whole PR.
 
@@ -2994,6 +3197,8 @@ class NaysayerPrReviewDriver:
         except GitHubHTTPError as exc:
             logger.warning("naysayer round: no delta for %s (%s)", pr.slug, exc)
             return fallback
+        # The same exclusion as the whole diff (msg-8470 §4), with the same head rules.
+        delta = apply_ignore(delta, rules).text
         if not delta.strip() or len(delta) > _MAX_DIFF_CHARS:
             return fallback
         return PrRoundContext(
@@ -3073,6 +3278,7 @@ class NaysayerPrReviewDriver:
             coverage=coverage,
             round_context=round_context,
             conditions=conditions,
+            ignore_report=view.ignore_report,
         )
         decision = route_tier(
             N3Request(
@@ -3196,6 +3402,7 @@ class NaysayerPrReviewDriver:
                 coverage=coverage,
                 round_context=round_context,
                 conditions=conditions,
+                ignore_report=view.ignore_report,
             ),
             # The codex tier's prompt limit is derived from CODEX_OUTPUT_RESERVE_TOKENS, so the
             # request stays within it. At the default budget this changes nothing; it caps a

@@ -125,11 +125,15 @@ def test_check_body_locator_formats_accepts_valid_shapes() -> None:
         "  - id: ADR-2\n"
         '    title: "t"\n'
         "    body: drive\n"
-        "  - id: ADR-3\n"
-        '    title: "t"\n'
-        "    body: drive:some-file-id\n"
     )
     assert check_body_locator_formats(manifest) == []
+
+
+def test_check_body_locator_formats_rejects_dropped_drive_pointer_form() -> None:
+    # T-adr-index-locator-grammar-fail-open-edges (b), human decision: the ``drive:<ptr>``
+    # arm was removed rather than tightened, so a manifest carrying it now fails the check.
+    manifest = 'adrs:\n  - id: ADR-3\n    title: "t"\n    body: drive:some-file-id\n'
+    assert dict(check_body_locator_formats(manifest)) == {"ADR-3": "drive:some-file-id"}
 
 
 def test_check_body_locator_formats_rejects_broken_shapes() -> None:
@@ -239,6 +243,28 @@ def test_check_in_repo_bodies_are_registered_flags_unregistered_body(tmp_path: P
     ]
 
 
+def test_check_in_repo_bodies_are_registered_flags_bare_id_filename(tmp_path: Path) -> None:
+    # T-adr-index-locator-grammar-fail-open-edges (a): a body filed as exactly ``<id>.md``
+    # (no slug) is still that ADR's body. The old ``glob(f"{adr_id}-*.md")`` required the
+    # hyphen, so this file was invisible and the entry stayed on its weak locator in silence.
+    root = _tree(tmp_path, "ADR-2026-01-01-2.md")
+    manifest = 'adrs:\n  - id: ADR-2026-01-01-2\n    title: "t"\n    body: unknown\n'
+    assert check_in_repo_bodies_are_registered(manifest, root) == [
+        ("ADR-2026-01-01-2", "unknown", "ADR-2026-01-01-2.md")
+    ]
+
+
+def test_check_in_repo_bodies_are_registered_does_not_prefix_match_serials(
+    tmp_path: Path,
+) -> None:
+    # (a), the other side: the fix is NOT the looser ``glob(f"{adr_id}*.md")``. Under that,
+    # serial ``2`` would claim ``…-20``'s body. The bare-id lookup and the ``<id>-`` glob
+    # must both leave it alone.
+    root = _tree(tmp_path, "ADR-2026-01-01-20-x.md")
+    manifest = 'adrs:\n  - id: ADR-2026-01-01-2\n    title: "t"\n    body: unknown\n'
+    assert check_in_repo_bodies_are_registered(manifest, root) == []
+
+
 def test_check_in_repo_bodies_are_registered_excludes_amendment_memos(tmp_path: Path) -> None:
     # The ADR-06 trap (msg-2671 §4-5) as a unit-level fixture: an amendment memo is a diff
     # against a body, not the body, so its presence must NOT force a repo: locator. Drop
@@ -325,9 +351,14 @@ def test_legacy_drive_locators_are_still_accepted() -> None:
     would turn a historical value into a CI failure for a decision made after it was
     written. Accepted, and preserved on regenerate like any other hand-set value — what
     changed is only that a new entry never defaults to it.
+
+    The ``drive:<pointer>`` form is the exception: it had zero entries, its ``.+``
+    admitted whitespace, and it was dropped from the grammar
+    (T-adr-index-locator-grammar-fail-open-edges (b), human decision).
     """
     assert body_locator_is_valid("drive")
-    assert body_locator_is_valid("drive:some-file-id")
+    assert not body_locator_is_valid("drive:some-file-id")
+    assert not body_locator_is_valid("drive:   ")
 
 
 def test_committed_manifest_matches_regeneration() -> None:

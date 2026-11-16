@@ -29,6 +29,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkShutdownError,
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
+    design_time_tier_decision,
 )
 from spirrow_mindwire.naysayer.preflight import (
     CUSTOM_HEADERS_ENV,
@@ -240,7 +241,9 @@ async def test_spawn_fails_closed_without_base_url(
 
 
 @pytest.mark.anyio
-async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
+async def test_options_route_to_the_codex_tier_with_the_n3_classification_kept(
+    tmp_path: Path,
+) -> None:
     opts: list[Any] = []
     client = _FakeClient([_assistant("…"), _result()])
     adapter = NaysayerSdkAdapter(
@@ -260,11 +263,17 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     # from there pins the wiring without depending on when ``deliver_event``
     # happens to run.
     stored_opts = adapter.source_marker_options(handle)
-    # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
+    # Independence: inference is pinned to a Lexora tier, never api.anthropic.com.
     assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
-    # ADR-14 §7.3 / §7.6: decided by route_tier — the Gemini-only tier while the design-time
-    # marker is not read (fail-safe), so N-3 cannot reach the codex tier.
-    assert stored_opts.model == "naysayer-gemini"
+    # ADR-14 §7.6 / §10: decided by route_tier — the codex tier, although the design-time
+    # marker is not read. The old §7.3 fail-safe still classifies that as N-3, and the
+    # decision's reason keeps saying so.
+    assert stored_opts.model == "naysayer"
+    decision = design_time_tier_decision()
+    assert decision.tier == stored_opts.model
+    assert decision.allowed_backends == frozenset({"codex"})
+    assert "N-3 classified" in decision.reason
+    assert "marker not read" in decision.reason
     # Principles injected (D-1). The prompt reaches the CLI as a file (``_command_line``).
     prompt_text = Path(stored_opts.system_prompt["path"]).read_text(encoding="utf-8")
     assert "silence is negligence" in prompt_text
@@ -781,13 +790,19 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
             self.posts.append(body)
             return "posted-1"
 
+    async def codex_preflight() -> AttestationRecord:
+        # ADR-14 §10: the turn goes to the codex tier, so the probe and the turn's own row are
+        # the codex tier's. The shared stubs answer for the Gemini tier, which route_tier no
+        # longer picks; with them the attest line would name a tier the source line does not.
+        return replace(_attestation(backend="codex"), tier="naysayer", expected="codex")
+
     adapter = NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
         inference_base_url="http://{{IP_SERVICES}}:8110",
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), []),
-        preflight=_preflight_ok(),
-        turn_rows=_turn_rows_ok(),
+        preflight=codex_preflight,
+        turn_rows=_turn_rows_ok(backend="codex"),
     )
     registry = InMemoryAdapterRegistry()
     registry.register(adapter)
@@ -801,12 +816,12 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
-        "· route={{IP_SERVICES}}:8110 · tier=naysayer-gemini -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
     # The stamp is the TURN's attestation: its own row (7001, from the trace-id
     # read-back), ``scope=turn`` — not the preflight probe's row 6032.
     assert re.fullmatch(
-        r"<!-- attest: tier=naysayer-gemini · backend=gemini · expected=gemini "
+        r"<!-- attest: tier=naysayer · backend=codex · expected=codex "
         r"· route=lexora\.local:8110 · probe=cost-row#7001 · scope=turn "
         r"· at=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -->",
         lines[-1],

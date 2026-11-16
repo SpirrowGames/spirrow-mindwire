@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.conductor import handoff as handoff_mod
 from spirrow_mindwire.conductor.gate_records import RELAY_AUTHOR, render_relay_heading
@@ -426,7 +427,10 @@ def test_manual_line_for_another_pr_does_not_count() -> None:
 
 
 def test_post_has_marker_directly_above_next_and_routes_to_the_gate() -> None:
-    decision = tail_decision("NEXT: none", repo=_REPO, number=7, roster=_ROSTER)
+    # The idle legacy tail 1c was built for: a ``NEXT: none`` posted before boundary 5.
+    decision = tail_decision(
+        "NEXT: none", repo=_REPO, number=7, roster=_ROSTER, posted_at=PRE_CUTOFF
+    )
     assert isinstance(decision, Post)
     lines = decision.render().splitlines()
     assert lines[-1] == "NEXT: pr-review acme/widgets#7"
@@ -438,7 +442,10 @@ def test_post_has_marker_directly_above_next_and_routes_to_the_gate() -> None:
 
 @pytest.mark.parametrize("token", ["none", "operator", "None"])
 def test_idle_tail_fires(token: str) -> None:
-    assert isinstance(tail_decision(f"NEXT: {token}", repo=_REPO, number=7, roster=_ROSTER), Post)
+    decision = tail_decision(
+        f"NEXT: {token}", repo=_REPO, number=7, roster=_ROSTER, posted_at=PRE_CUTOFF
+    )
+    assert isinstance(decision, Post)
 
 
 @pytest.mark.parametrize(

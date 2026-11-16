@@ -63,7 +63,10 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 * The proposer persona is consulted only on the rows that need it. A ``Closes-thread:`` merge
   and the (ii) re-fire never read the roster, so a broken roster cannot misroute them. When it
   IS needed and is ``None``, the fact is still written and the hand-off becomes the 3-line
-  ``NEXT: operator`` form (msg-5904 B2) — silence would re-fail every tick unseen.
+  request for work by hand (msg-5904 B2) — silence would re-fail every tick unseen. It is written
+  in the ``HUMAN-TASK:`` form, the successor of the retired ``NEXT: operator`` form
+  (T-retire-operator-identity-and-scope-next-fermi): this module is a machine writer, and the
+  operator cutoff may only be set once no machine writer produces the retired form.
 * Rows 3 and 4 are :func:`lifecycle_post`, which the conductor also calls on a
   ``NEXT: pr-review`` head (T-merged-pr-fact-never-reaches-design-thread, msg-7560 v0.4). The two
   callers read disjoint tails: this module reads only :data:`RELAY_AUTHOR` headings, and no
@@ -91,9 +94,9 @@ from ..conductor.gate_records import (
     normalize_sha,
 )
 from ..conductor.handoff import (
+    HUMAN_TASK_KEYWORD,
+    HUMAN_TOKEN,
     NONE_TOKEN,
-    OPERATOR_TASK_KEYWORD,
-    OPERATOR_TOKEN,
     PR_REVIEW_TOKEN,
     STOP_DONE,
     TIER_C_CHECK_KEYWORD,
@@ -369,12 +372,16 @@ def closes_thread(
 
 
 def operator_handoff(thread_id: str) -> str:
-    """The 3-line ``NEXT: operator`` block used when the proposer cannot be resolved (B2)."""
+    """The 3-line request for work by hand used when the proposer cannot be resolved (B2).
+
+    Written in the ``HUMAN-TASK:`` form (``NEXT: human``); the name is kept because the block's
+    meaning -- operator work, :attr:`~..conductor.handoff.HumanAsk.OPERATOR_WORK` -- is unchanged.
+    """
     return (
-        f"{OPERATOR_TASK_KEYWORD}: {thread_id} の proposer persona を roster で解決できない。"
+        f"{HUMAN_TASK_KEYWORD}: {thread_id} の proposer persona を roster で解決できない。"
         "roster を直し、このスレッドの proposer に手で渡す\n"
         f"{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}\n"
-        f"NEXT: {OPERATOR_TOKEN}"
+        f"NEXT: {HUMAN_TOKEN}"
     )
 
 

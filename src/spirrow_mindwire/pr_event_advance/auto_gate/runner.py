@@ -36,7 +36,7 @@ from typing import Any, Protocol
 
 from ...chatroom.status import is_terminal_status
 from ...conductor.gate_records import RELAY_AUTHOR, normalize_sha, verdict_heads
-from ...conductor.handoff import parse_next_token
+from ...conductor.handoff import parse_next_token, posted_at_of
 from ...github.client import GatePr, GatePrListing, OpenPrListingError, PrRef, ReviewInfo
 from ...magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ...repo_projects import INCOMPLETE, PrProject, RepoProjectMap, RepoTarget, repo_key
@@ -336,12 +336,14 @@ async def _judge_thread(
     tail_body = str(tail.get("content", ""))
     raw_np = tail.get("next_participant")
     tail_np = raw_np if isinstance(raw_np, str) and raw_np else None
+    tail_at = posted_at_of(tail)
     decision = tail_decision(
         tail_body,
         repo=repo_slug,
         number=pr.ref.number,
         roster=roster,
         next_participant=tail_np,
+        posted_at=tail_at,
     )
     if isinstance(decision, Post):
         return _Judged(thread_id=thread_id, project=project, post=decision)
@@ -353,7 +355,9 @@ async def _judge_thread(
     }
     # Why a tail the sweep reads as settled was still held (msg-8218 §2b-2): the roster refused
     # it (the park-wake tick owns its notice), or there was no roster to check it with.
-    refusal = settled_tail_refusal(tail_body, roster=roster, next_participant=tail_np)
+    refusal = settled_tail_refusal(
+        tail_body, roster=roster, next_participant=tail_np, posted_at=tail_at
+    )
     if refusal is not None:
         detail["tail_refusal"] = refusal
     return _Judged(thread_id=thread_id, project=project, noop=decision, detail=detail)

@@ -93,7 +93,7 @@ _HEADER = """\
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
 #     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
-#     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
+#     drive                                 — legacy: accepted, and preserved on regenerate
 #                                             like any hand-set value; never defaulted to
 # CI regenerates this and fails on drift (test_committed_manifest_matches_regeneration);
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
@@ -379,7 +379,14 @@ def check_in_repo_bodies_are_registered(
     for adr_id, body in _manifest_bodies(manifest_text):
         if body.startswith("repo:"):
             continue
-        for path in sorted(body_dir.glob(f"{adr_id}-*.md")):
+        # A body is ``<id>.md`` exactly, or ``<id>-<slug>.md``. Two precise queries, not
+        # one looser glob: ``glob(f"{adr_id}*.md")`` would let serial ``2`` match
+        # ``…-20-x.md``, while the hyphen-only glob on its own missed a bare ``<id>.md``
+        # and failed open (T-adr-index-locator-grammar-fail-open-edges (a)).
+        exact = body_dir / f"{adr_id}.md"
+        candidates = [exact] if exact.is_file() else []
+        candidates.extend(sorted(body_dir.glob(f"{adr_id}-*.md")))
+        for path in candidates:
             if _AMENDMENT_MARKER in path.name.lower():
                 continue
             stale.append((adr_id, body, path.name))

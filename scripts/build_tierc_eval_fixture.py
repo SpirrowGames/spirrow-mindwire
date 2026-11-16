@@ -277,6 +277,7 @@ def build_eval_row(
         head.content,
         routing_roster(upto, current_roster),
         next_participant=head.next_participant,
+        posted_at=head.timestamp,
     )
     author_requested_human = handoff.author_requested_human
     # The conductor states the resolved head's parsed_next as the reserved token
@@ -355,6 +356,7 @@ def rows_for_thread(
             m.content,
             routing_roster(messages[: i + 1], current_roster),
             next_participant=m.next_participant,
+            posted_at=m.timestamp,
         )
         if handoff.kind is not HandoffKind.HUMAN:
             continue
@@ -609,11 +611,14 @@ def corrections_for(
             }
         elif k not in new_pop:
             m = msgs[i]
-            old = resolve_handoff(m.content, {}, next_participant=m.next_participant)
+            old = resolve_handoff(
+                m.content, {}, next_participant=m.next_participant, posted_at=m.timestamp
+            )
             now = resolve_handoff(
                 m.content,
                 routing_roster(msgs[: i + 1], current_roster),
                 next_participant=m.next_participant,
+                posted_at=m.timestamp,
             )
             entry["reason"] = "not_an_escalation"
             entry["detail"] = {

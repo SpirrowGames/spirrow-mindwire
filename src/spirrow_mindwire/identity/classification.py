@@ -28,9 +28,12 @@ calls it to build findings. One derivation, two callers — msg-1493 §2's "**�
 
 from __future__ import annotations
 
+import datetime
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -39,11 +42,14 @@ from .normalize import IdentityCollisionError, find_collisions, normalize_identi
 
 __all__ = [
     "MACHINE_INDEPENDENCE_CLASS",
+    "MACHINE_ROLE_EXCEPTIONS",
+    "SETTLED_CLOSER",
     "ClassificationEntry",
     "ClassificationError",
     "LegitimateRolesFile",
     "derive_allowed_and_residual",
     "load_legitimate_roles",
+    "machine_roles_are_excepted",
 ]
 
 
@@ -75,6 +81,14 @@ class ClassificationEntry:
         in the YAML (one place for the machine value, msg-1706 §2). A
         participant that omits it loads (the read half does not need it) but
         cannot be registered — the constructor refuses.
+      retired: the ISO date (``YYYY-MM-DD``) the identity was retired, or
+        ``None``. A retired identity keeps its row so its past posts and the
+        threads it owns still classify, but it may claim no role: the loader
+        requires ``legitimate=[]`` for it, whatever its ``kind``, so the
+        registration constructor writes ``allowed_roles=[]`` and a store
+        record that still holds a role is reported as drift
+        (T-retire-operator-identity-and-scope-next-fermi msg-8898 / msg-8899
+        D1-4).
     """
 
     name: str
@@ -84,6 +98,7 @@ class ClassificationEntry:
     primary_source: str
     reason: str
     independence_class: str | None = None
+    retired: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,45 @@ _VALID_KINDS = frozenset({"participant", "machine"})
 #: verification that the deployed service accepts it is the live ``upsert_identity``
 #: result (msg-1706 §2 / DoD 2), not a tuple or import pinned here.
 MACHINE_INDEPENDENCE_CLASS = "machine"
+
+#: The identity the settled-disposition closer (``settled_close``) closes threads
+#: as. This is the ONE place the name string lives in this repo: the
+#: ``settled_close`` default author and :data:`MACHINE_ROLE_EXCEPTIONS` both read
+#: it (T-done-disposition-auto-close msg-8601 §1-2 S-1 / S-5).
+SETTLED_CLOSER = "settled-closer"
+
+#: The ONLY machines that may carry a non-empty ``legitimate`` role set, mapped to
+#: the exact role set each may carry. Every other ``kind: machine`` identity still
+#: requires ``legitimate: []`` (msg-1484 §2).
+#:
+#: ``settled-closer`` closes threads with a fixed text that never passes through an
+#: LLM (msg-8172 §3), so it is a machine. magickit nonetheless requires a
+#: registered closing author to hold one of its ``CLOSEABLE_ROLES``, so the
+#: identity needs exactly one role. The recorded ``integrator`` is a capability
+#: marker ("may close"), not a claim of having authored a judgement; the sanction
+#: for each close is ``close_sanction.kind=settled_disposition`` plus the
+#: proposer's ``STOP: done`` head. Decided by Takahito, T-done-disposition-auto-close
+#: msg-8589.
+#:
+#: Keys are matched against the RAW ``name`` exactly — deliberately NOT the ADR-11
+#: normalised key — so no alternative spelling (``Settled_Closer`` …) can inherit
+#: the exception. The role set must also match exactly. Widening the table is a
+#: source change and therefore passes the PR gate; a YAML edit alone cannot.
+#: Writing ``legitimate: []`` for the same name stays valid (the rollback shape).
+MACHINE_ROLE_EXCEPTIONS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {SETTLED_CLOSER: frozenset({"integrator"})}
+)
+
+
+def machine_roles_are_excepted(name: str, roles: Iterable[str]) -> bool:
+    """True iff the machine ``name`` may carry exactly ``roles`` (non-empty).
+
+    The single predicate both the loader (:func:`_parse_entry`) and the
+    registration check (:func:`~.registration.check_identity_against_classification`)
+    use, so the exception cannot be spelled two ways.
+    """
+    allowed = MACHINE_ROLE_EXCEPTIONS.get(name)
+    return allowed is not None and frozenset(roles) == allowed
 
 
 def load_legitimate_roles(path: Path) -> LegitimateRolesFile:
@@ -222,12 +276,21 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         raise ClassificationError(
             f"{path}: identities[{index}].legitimate must be a list of strings"
         )
-    if kind == "machine" and legitimate:
+    retired = _parse_retired(raw.get("retired"), index, path)
+    if retired is not None and legitimate:
         raise ClassificationError(
-            f"{path}: identities[{index}] kind=machine requires legitimate=[] "
-            f"(machinery has no honest role claim; msg-1484 §2)"
+            f"{path}: identities[{index}] is retired ({retired}) and requires legitimate=[] "
+            f"(a retired identity claims no role; "
+            f"T-retire-operator-identity-and-scope-next-fermi msg-8898)"
         )
-    if kind == "participant" and not legitimate:
+    if kind == "machine" and legitimate and not machine_roles_are_excepted(name, legitimate):
+        raise ClassificationError(
+            f"{path}: identities[{index}] kind=machine requires legitimate=[] unless listed "
+            f"in MACHINE_ROLE_EXCEPTIONS (settled-closer: integrator only) "
+            f"(machinery has no honest role claim; msg-1484 §2, "
+            f"T-done-disposition-auto-close msg-8589)"
+        )
+    if kind == "participant" and not legitimate and retired is None:
         raise ClassificationError(
             f"{path}: identities[{index}] kind=participant requires len(legitimate) >= 1 "
             f"(a participant with no honest role would erase attestation; msg-1484 §5)"
@@ -264,6 +327,33 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
         primary_source=primary_source,
         reason=reason,
         independence_class=independence_class,
+        retired=retired,
+    )
+
+
+_RETIRED_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _parse_retired(value: Any, index: int, path: Path) -> str | None:
+    """Return the ``retired`` date as ``YYYY-MM-DD``, or ``None`` if absent.
+
+    YAML reads an unquoted ``2026-11-10`` as a :class:`datetime.date`; a quoted
+    one stays a string. Both are accepted. A string must be spelled exactly
+    ``YYYY-MM-DD``: the compact (``20261110``) and ISO week-date
+    (``2026-W46-2``) forms that :meth:`datetime.date.fromisoformat` also
+    takes are refused. Anything else is a schema violation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, str) and _RETIRED_DATE_RE.fullmatch(value.strip()):
+        try:
+            return datetime.date.fromisoformat(value.strip()).isoformat()
+        except ValueError:
+            pass
+    raise ClassificationError(
+        f"{path}: identities[{index}].retired must be a date (YYYY-MM-DD), got {value!r}"
     )
 
 

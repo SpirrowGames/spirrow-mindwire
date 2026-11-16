@@ -182,7 +182,7 @@ def test_p3_halts_when_default_reader_fails(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _must_not_reach(_x: Any) -> Any:
+def _must_not_reach(_x: Any, *_rest: Any) -> Any:
     raise AssertionError("P2/P1 reached although P3 should have halted first")
 
 

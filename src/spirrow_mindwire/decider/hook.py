@@ -324,6 +324,11 @@ _STOP_HUMAN = "human"
 ``stop_reason.value`` and ``conductor.core`` imports this module (importing ``StopReason`` back
 would be circular)."""
 
+_STOP_UNSPAWNABLE = "unspawnable_target_to_human"
+"""``StopReason.UNSPAWNABLE_TARGET.value`` — the stop ``_route``'s ``_spawn_blocked`` branch returns
+(T-next-names-unspawnable-identity msg-8709 D2; it returned ``HUMAN`` before). String-spelled for
+the same circular-import reason as :data:`_STOP_HUMAN`."""
+
 ROUTED_STOP = "stop"
 """``_route`` stopped the turn at the human (``original_stop == HUMAN``)."""
 ROUTED_FORCED_NAYSAYER = "forced_naysayer"
@@ -419,8 +424,15 @@ def routed_from_route(
     definition) — raises :class:`RoutingInvariantError` (Einstein msg-4240 advisory: fail loudly
     rather than record an ``other`` label).
     """
-    if stop == _STOP_HUMAN and not is_forced and target_role is None:
-        return ROUTED_SPAWN_BLOCKED if spawn_blocked else ROUTED_STOP
+    if stop == _STOP_HUMAN and not is_forced and target_role is None and not spawn_blocked:
+        return ROUTED_STOP
+    if (
+        stop in (_STOP_HUMAN, _STOP_UNSPAWNABLE)
+        and not is_forced
+        and target_role is None
+        and spawn_blocked
+    ):
+        return ROUTED_SPAWN_BLOCKED
     if stop is None and is_forced and target_role is naysayer_role and not spawn_blocked:
         return ROUTED_FORCED_NAYSAYER
     raise RoutingInvariantError(

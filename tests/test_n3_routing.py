@@ -28,6 +28,7 @@ from spirrow_mindwire.naysayer.n3_routing import (
     GlobLoad,
     N3Request,
     TierDecision,
+    classify_n3,
     has_marker,
     lexical_path_problem,
     load_n3_globs,
@@ -77,7 +78,9 @@ def _route(
     marker: bool | None = False,
     prompt_chars: int = 1_000,
 ) -> str:
-    return route_tier(
+    # The §7.3 classification itself (what the old rule routed where). Since ADR-14 §10
+    # ``route_tier`` sends every request to the codex tier; ``test_route_tier_*`` below pin that.
+    return classify_n3(
         N3Request(marker=marker, paths=paths, globs=globs, prompt_chars=prompt_chars)
     ).tier
 
@@ -397,9 +400,12 @@ def test_normalize_path() -> None:
 @pytest.mark.anyio
 async def test_decision_carries_the_allowed_set_from_the_same_table() -> None:
     codex = route_tier(N3Request(False, ("a.py",), await _globs(_toml()), 10))
-    gemini = route_tier(N3Request(True, ("a.py",), await _globs(_toml()), 10))
-    assert codex.allowed_backends == frozenset({"codex", "gemini-fallback"})
-    assert gemini.allowed_backends == frozenset({"gemini"})
+    n3 = route_tier(N3Request(True, ("a.py",), await _globs(_toml()), 10))
+    # ADR-14 §10: codex only, N-3 included; ``gemini-fallback`` is no longer accepted.
+    assert codex.allowed_backends == n3.allowed_backends == frozenset({"codex"})
+    assert classify_n3(N3Request(True, ("a.py",), await _globs(_toml()), 10)).allowed_backends == (
+        frozenset({"gemini"})
+    )
 
 
 def test_has_marker() -> None:
@@ -444,13 +450,15 @@ def test_lexical_path_problem(path: str, bad: bool) -> None:
 # ---------- design-time call site ----------------------------------------- #
 
 
-def test_design_time_adapter_is_fail_safe_gemini_until_wired() -> None:
-    """With no turn inputs yet (spawn time), the design-time tier is Gemini-only."""
+def test_design_time_adapter_routes_to_codex_even_with_nothing_read() -> None:
+    """With no turn inputs yet (spawn time) the old rule chose Gemini (marker not read);
+    since ADR-14 §10 the tier is codex and the reason keeps the classification."""
     from spirrow_mindwire.adapters.naysayer_sdk import design_time_tier_decision
 
     decision = design_time_tier_decision()
-    assert decision.tier == _GEMINI
-    assert decision.allowed_backends == frozenset({"gemini"})
+    assert decision.tier == _CODEX
+    assert decision.allowed_backends == frozenset({"codex"})
+    assert "N-3 classified" in decision.reason and "marker not read" in decision.reason
 
 
 # ---------- structure: one name, one place (§7.3 "names drifting apart") --- #
@@ -691,7 +699,7 @@ async def test_both_passes_carry_the_band_trace_so_it_counts_one_review() -> Non
 
 
 def _band_decision(prompt_chars: int, *, globs: frozenset[str] = frozenset()) -> TierDecision:
-    return route_tier(
+    return classify_n3(
         N3Request(
             marker=False, paths=("src/app.py",), globs=GlobLoad(globs), prompt_chars=prompt_chars
         )
@@ -781,3 +789,42 @@ def test_band_count_cli_fails_loudly_when_the_ledger_read_stalls(
     captured = capsys.readouterr()
     assert "reviews=" not in captured.out
     assert "exceeded 0.01s" in captured.err
+
+
+# ---------- ADR-14 §10: route_tier always returns the codex tier ------------ #
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("marker", "paths", "trusted", "prompt_chars", "cause"),
+    [
+        (True, ("src/app.py",), _toml(), 1_000, "marker"),
+        (None, ("src/app.py",), _toml(), 1_000, "marker not read"),
+        (False, ("deploy/app.service",), _toml(), 1_000, "matches"),
+        (False, (N3_CONFIG_PATH,), _toml(), 1_000, "touches"),
+        (False, ("../x.py",), _toml(), 1_000, "repository boundary"),
+        (False, ("src/app.py",), "not = = toml", 1_000, "unresolved"),
+        (False, ("src/app.py",), _toml(), CODEX_TIER_PROMPT_CHAR_LIMIT + 1, "codex tier limit"),
+    ],
+)
+async def test_route_tier_sends_every_n3_case_to_codex(
+    marker: bool | None, paths: tuple[str, ...], trusted: str, prompt_chars: int, cause: str
+) -> None:
+    request = N3Request(
+        marker=marker, paths=paths, globs=await _globs(trusted), prompt_chars=prompt_chars
+    )
+    assert classify_n3(request).tier == _GEMINI  # what the old rule did
+    decision = route_tier(request)
+    assert decision.tier == _CODEX
+    assert decision.allowed_backends == frozenset({"codex"})
+    assert decision.in_codex_limit_band is False
+    assert decision.reason.startswith(
+        "codex tier (N-3 classified, routed to codex per ADR-14 §10: "
+    )
+    assert cause in decision.reason
+
+
+@pytest.mark.anyio
+async def test_route_tier_leaves_a_plain_codex_decision_as_it_was() -> None:
+    request = N3Request(False, ("src/app.py",), await _globs(_toml("secrets/*")), 1_000)
+    assert route_tier(request) == classify_n3(request)

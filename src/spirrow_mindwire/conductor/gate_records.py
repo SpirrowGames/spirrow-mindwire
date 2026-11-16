@@ -3,7 +3,7 @@
 ``gate_admission`` is stateless by design (v0.3.1 §A-2: GitHub is the state store, never a
 mindwire-side counter or a ``next_at`` file). Two of its inputs are nevertheless *history* —
 "has the gate already produced a verdict on this head?" (``verdict_heads``, R6) and "has the
-implementer already been dispatched at this head's red CI?" (``ci_red_routed_heads``, R5) — so
+implementer already been sent back on this head?" (``implementer_routed_heads``, R5 / R1d) — so
 they have to be recovered from somewhere durable. The design's answer is: from the design
 thread itself, off the conductor's own ``pr-gate-relay`` messages. This module is that reader,
 and the writer for the one record that does not already exist.
@@ -23,6 +23,13 @@ What is a NEW record here and what is not (design §5.2A.5)
 Only ONE new record is sanctioned: the ci-route marker, written **on R4 only**. Deferrals — the
 frequent case — write nothing at all, which is precisely why R5's input cannot be derived by
 counting messages and needs this marker. The byte form below is the design's, verbatim.
+
+T-ci-wait-misreads-conflicting-pr-as-no-ci (D2 v0.5') amends this in two places. R1c (a
+conflicting head sent back to the implementer) writes the SAME ci-route marker with a ``cause``
+field, so R5 / R1d read one head set (Obj-1-2). And one deferral does write: the first R1e on a
+(head, base) whose ``mergeable`` stays UNKNOWN through the in-tick re-reads posts the
+mergeable-unknown marker, because the R1e / R1f cap needs a start time GitHub does not provide
+(:func:`mergeable_unknown_since`). Every other deferral still writes nothing.
 
 ``verdict_heads`` adds no record. The verdict relay is a message the conductor already posts on
 every gate firing; this only *names the head in its heading*, which is the form
@@ -69,7 +76,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Final, Literal
 
 from ..github.client import CiState, ReviewEvent
 from ..github.reviews import parse_verdict_footer
@@ -113,20 +122,47 @@ def normalize_sha(sha: str) -> str:
     return sha.strip().lower()
 
 
-def render_ci_route_marker(*, head: str, conclusion: str, checks: Sequence[str]) -> str:
-    """The R4 marker for ``head``, in the design's compact form.
+#: Why the implementer was sent back on a head (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.2,
+#: Obj-1-2). ``ci-red`` is R4; ``conflict`` is R1c. One marker, one head set
+#: (``implementer_routed_heads``) for both — the field exists so a person reading the thread, and
+#: the resume check (:mod:`.gate_resume`), can tell the two apart. A marker written before the
+#: field existed has no ``cause`` and was written by R4, so it reads as :data:`CI_ROUTE_CI_RED`.
+CI_ROUTE_CI_RED: Final = "ci-red"
+CI_ROUTE_CONFLICT: Final = "conflict"
+CiRouteCause = Literal["ci-red", "conflict"]
 
-    ``checks`` names the red checks, for a human reading the thread; only ``head`` is read back
-    by :func:`ci_route_heads`, so a change to the other fields cannot break R5 — the ``>`` escape
-    below is what makes that true. Without it a check name containing ``}`` followed by ``-->``
-    (GitHub check-run names are arbitrary strings, written in the target repo's workflow) would
-    close this comment early, and the reader's non-greedy capture would truncate the payload.
+
+def render_ci_route_marker(
+    *,
+    head: str,
+    cause: CiRouteCause,
+    conclusion: str | None = None,
+    checks: Sequence[str] = (),
+) -> str:
+    """The R4 / R1c marker for ``head``, in the design's compact form.
+
+    ``cause`` has no default: a writer must say which rule sent the implementer back. For
+    ``ci-red`` (R4) ``conclusion`` is required and ``checks`` names the red checks; for
+    ``conflict`` (R1c) neither is written — a merge state is not a check conclusion, and
+    putting ``"conflicting"`` into ``conclusion`` would mix two kinds of value in one field
+    (v0.2). Only ``head`` is read back by :func:`ci_route_heads`, so a change to the other fields
+    cannot break R5 / R1d — the ``>`` escape below is what makes that true. Without it a check
+    name containing ``}`` followed by ``-->`` (GitHub check-run names are arbitrary strings,
+    written in the target repo's workflow) would close this comment early, and the reader's
+    non-greedy capture would truncate the payload.
     """
-    payload = json.dumps(
-        {"head": normalize_sha(head), "conclusion": conclusion, "checks": list(checks)},
-        separators=(",", ":"),
-        ensure_ascii=True,
-    )
+    fields: dict[str, object] = {"head": normalize_sha(head), "cause": cause}
+    if cause == CI_ROUTE_CI_RED:
+        if conclusion is None:
+            raise ValueError("a ci-red ci-route marker needs a conclusion")
+        fields["conclusion"] = conclusion
+        fields["checks"] = list(checks)
+    elif cause == CI_ROUTE_CONFLICT:
+        if conclusion is not None or checks:
+            raise ValueError("a conflict ci-route marker carries no conclusion or checks")
+    else:
+        raise ValueError(f"unknown ci-route cause: {cause!r}")
+    payload = json.dumps(fields, separators=(",", ":"), ensure_ascii=True)
     # ``>`` is never JSON syntax — it can only occur inside a string value — so escaping it here
     # makes ``-->`` structurally impossible inside the payload, and _CI_ROUTE_RE's non-greedy
     # capture can no longer stop short of this marker's own closing brace. json.loads restores
@@ -160,6 +196,111 @@ def ci_route_heads(bodies: Iterable[str]) -> frozenset[str]:
             if isinstance(head, str) and head.strip():
                 heads.add(normalize_sha(head))
     return frozenset(heads)
+
+
+def ci_route_entries(bodies: Iterable[str]) -> frozenset[tuple[str, str]]:
+    """Every ``(head, cause)`` named by a ci-route marker in ``bodies``.
+
+    The same tolerant read as :func:`ci_route_heads`, plus the cause. A marker with no ``cause``
+    predates the field and was written by R4, so it reads as :data:`CI_ROUTE_CI_RED`; a marker
+    whose ``cause`` is anything else is skipped (a reader must not guess which rule wrote it).
+    Admission never reads this — R5 / R1d key on the head alone; the resume check does, because
+    "verify the implementer may be resumed" means a red rollup for one cause and a conflicting
+    head for the other.
+    """
+    entries: set[tuple[str, str]] = set()
+    for body in bodies:
+        for raw in _CI_ROUTE_RE.findall(body):
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            head = payload.get("head")
+            cause = payload.get("cause", CI_ROUTE_CI_RED)
+            if not (isinstance(head, str) and head.strip()):
+                continue
+            if cause not in (CI_ROUTE_CI_RED, CI_ROUTE_CONFLICT):
+                continue
+            entries.add((normalize_sha(head), cause))
+    return frozenset(entries)
+
+
+#: The mergeable-unknown marker (T-ci-wait-misreads-conflicting-pr-as-no-ci v0.5 / v0.5'):
+#: ``<!-- mindwire:mergeable-unknown v1 {"head":"<sha>","base":"<sha>","since":"<ISO 8601>"} -->``
+#: Written once per (head, base), by the conductor, on the first R1e that GitHub's in-tick
+#: re-reads did not settle. ``since`` is the R1e / R1f clock: GitHub offers no timestamp for
+#: "mergeable became UNKNOWN" (``updatedAt`` moves on every PR event, Obj-3-1; ``committedDate``
+#: predates it by the whole review, Obj-4-1), so the conductor records its own. The time is in
+#: the payload, not taken from the post's server timestamp, because readers here take bodies
+#: only (Obj-5-1); trusting a time written in a body is why the reader is narrowed to relay
+#: posts by its caller and drops a time in the future.
+_MERGEABLE_UNKNOWN_OPEN = "<!-- mindwire:mergeable-unknown v1 "
+_MERGEABLE_UNKNOWN_CLOSE = " -->"
+_MERGEABLE_UNKNOWN_RE = re.compile(
+    r"<!--\s*mindwire:mergeable-unknown\s+v1\s+(\{.*?\})\s*-->", re.DOTALL
+)
+
+
+def render_mergeable_unknown_marker(*, head: str, base: str, since: datetime) -> str:
+    """The marker recording that ``mergeable`` was first seen UNKNOWN on (head, base) at ``since``.
+
+    ``since`` must be timezone-aware; it is written in UTC. The payload is two hex SHAs and an
+    ISO timestamp, so nothing in it can close the comment early.
+    """
+    if since.tzinfo is None:
+        raise ValueError("since must be timezone-aware")
+    payload = json.dumps(
+        {
+            "head": normalize_sha(head),
+            "base": normalize_sha(base),
+            "since": since.astimezone(UTC).isoformat(),
+        },
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return f"{_MERGEABLE_UNKNOWN_OPEN}{payload}{_MERGEABLE_UNKNOWN_CLOSE}"
+
+
+def mergeable_unknown_since(
+    bodies: Iterable[str], head: str, base: str, now: datetime
+) -> datetime | None:
+    """The oldest well-formed ``since`` recorded for (``head``, ``base``), or ``None``.
+
+    Callers pass :data:`RELAY_AUTHOR` bodies only, as for every reader here: a person's post, or
+    a marker quoted inside another author's post, must not set the clock. Tolerant on read: a
+    payload that is not JSON, names another (head, base), lacks a parseable timezone-aware
+    ``since``, or has a ``since`` later than ``now`` contributes nothing. The last rule is the
+    one that matters — a future ``since`` would keep ``now - since`` under the cap forever and
+    bring back the endless DEFER Obj-3-1 closed. A dropped marker means ``None``: the caller
+    writes a fresh one and the cap counts from there. The OLDEST valid time wins, so a later
+    marker for the same pair cannot push the cap out.
+    """
+    want = (normalize_sha(head), normalize_sha(base))
+    oldest: datetime | None = None
+    for body in bodies:
+        for raw in _MERGEABLE_UNKNOWN_RE.findall(body):
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            h, b, t = payload.get("head"), payload.get("base"), payload.get("since")
+            if not (isinstance(h, str) and isinstance(b, str) and isinstance(t, str)):
+                continue
+            if (normalize_sha(h), normalize_sha(b)) != want:
+                continue
+            try:
+                at = datetime.fromisoformat(t)
+            except ValueError:
+                continue
+            if at.tzinfo is None or at > now:
+                continue
+            if oldest is None or at < oldest:
+                oldest = at
+    return oldest
 
 
 #: The ci-hold marker (T-pr-event-advances-thread design §4 / R2). Same envelope shape as the
@@ -545,19 +686,24 @@ def decide_relay_route(
 __all__ = [
     "ADVISORY_SELF_TRIAGE_INSTRUCTION",
     "AUTO_MERGE_BASES",
+    "CI_ROUTE_CI_RED",
+    "CI_ROUTE_CONFLICT",
     "MERGE_SELF_INSTRUCTION",
     "MERGE_SELF_MARK",
     "MERGE_WAIT_LINE",
     "MERGE_WAIT_MARK",
     "RELAY_AUTHOR",
+    "CiRouteCause",
     "RelayRoute",
     "admission_heading_pr_ref",
     "carries_advisory",
     "ci_hold_head",
+    "ci_route_entries",
     "ci_route_heads",
     "decide_relay_route",
     "is_merge_self_relay",
     "is_merge_wait_relay",
+    "mergeable_unknown_since",
     "normalize_sha",
     "prior_advisory_approvals",
     "relay_heading_pr_ref",
@@ -565,6 +711,7 @@ __all__ = [
     "render_ci_hold_marker",
     "render_ci_route_marker",
     "render_merge_self_line",
+    "render_mergeable_unknown_marker",
     "render_relay_heading",
     "verdict_heads",
 ]

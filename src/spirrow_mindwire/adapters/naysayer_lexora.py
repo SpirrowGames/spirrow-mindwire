@@ -160,6 +160,8 @@ def _build_messages(event: ChatroomEvent, own_role: Role, system_prompt: str) ->
     user = (
         f"You are acting as the {own_role.value} role in thread "
         f"{event.thread_ref.thread_id}.\n\n"
+        # T-naysayer-invents-next-participant D-1: same block, same place as build_turn_prompt.
+        + (f"{event.roster_notice}\n\n" if event.roster_notice else "")
         + (f"{event.review_round_notice}\n\n" if event.review_round_notice else "")
         + (f"{event.conditional_proceed_notice}\n\n" if event.conditional_proceed_notice else "")
         + (f"{history}\n\n" if history else "")

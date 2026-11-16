@@ -49,9 +49,9 @@ $fnOwnerMap = $functions | Where-Object { $_.Name -eq 'Get-SweepOwnerMap' } | Se
 if (-not $fnOwnerMap) { throw "function not found in sweep script: Get-SweepOwnerMap" }
 Invoke-Expression $fnOwnerMap.Extent.Text
 
-# ConvertFrom-ControlTimestamp is F4b's parse helper. It is used from the control probe log's
-# HOLD-ack freshness check today, and per Bohr msg-2789 §3 F2-d it will be reused by
-# Test-HoldObserved's freshness gate when F2 lands. The fail-mode is load-bearing (F2-c):
+# ConvertFrom-ControlTimestamp is F4b's parse helper. It serves Test-HoldAckStale, which is both
+# the control probe log's HOLD-ack warning and — per Bohr msg-2789 §3 F2-d, landed in
+# T-hold-observed-freshness-and-unlaunched-tick-ack — Test-HoldObserved's freshness gate. The fail-mode is load-bearing (F2-c):
 # an unparseable timestamp MUST return $null (fall-through → launch), never raise (would flip
 # the sweep's fail direction from launch-anyway to abort-tick). Extracted via the same AST
 # idiom so a rename or inlining fails loudly here.
@@ -462,13 +462,87 @@ Check "desired_at null, observed_at present, observed='run' -> stale (state quot
 
 # Stale-observed branch (observed_at < desired_at) is unchanged by round 2: lag is measured from
 # desired_at regardless of observed_state, because the observation is stale either way. But
-# ensure the observed_state=hold case (the §2c "stale ack that Test-HoldObserved currently
-# mistakes for fresh") still surfaces the stale lag — F4b MUST warn even though F2 hasn't
-# landed yet, or the operator sees no signal that observed=hold is chronologically wrong.
+# ensure the observed_state=hold case (the §2c stale ack, which Test-HoldObserved now also treats
+# as unacknowledged — F2, pinned below) still surfaces the stale lag.
 $verdictStaleHold = Test-HoldAckStale -Now $now -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
     -DesiredAt '2026-09-17T03:59:50Z' -ObservedAt '2026-09-12T04:00:00Z')
 Check "stale ack (observed_at < desired_at) with observed='hold' -> still warns 'N minutes stale'" `
     '0.2 minutes stale' $verdictStaleHold.Reason
+
+Write-Host ""
+Write-Host "Test-HoldObserved — freshness gate (F2, T-hold-observed-freshness-and-unlaunched-tick-ack)"
+# Every control below goes through ConvertFrom-Json (New-ControlWithTs), exactly like the real
+# probe: that turns the ISO strings into [datetime], so these checks also pin that the sub-second
+# part survives the parse (formatting a [datetime] as "$dt" would drop it).
+
+# (1) The hole F2 closes: observed=hold left over from before the current request.
+Check "F2 (1): observed=hold, observed_at < desired_at -> NOT observed (launch / pending)" $false `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00Z' -ObservedAt '2026-09-08T11:00:00Z'))
+Check "F2 (1): observed=hold, observed_at > desired_at -> observed (skip)" $true `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00Z' -ObservedAt '2026-09-08T12:00:05Z'))
+
+# (2a)/(2b) Bohr msg-9146 Obj-1-1: strict comparison on parsed instants, both directions named.
+Check "F2 (2a): desired_at=12:00:00.106309Z, observed_at=12:00:00Z -> STALE (NOT observed)" $false `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00.106309Z' -ObservedAt '2026-09-08T12:00:00Z'))
+Check "F2 (2a): the warning agrees (verdict not null)" $true `
+    ($null -ne (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00.106309Z' -ObservedAt '2026-09-08T12:00:00Z')))
+Check "F2 (2b): desired_at=12:00:00Z, observed_at=12:00:00.106309Z -> FRESH (observed, skip)" $true `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00Z' -ObservedAt '2026-09-08T12:00:00.106309Z'))
+
+# (3) No timestamps (older magickit) -> observed_state decides; unparseable -> no throw.
+Check "F2 (3): both timestamps null, observed=hold -> observed" $true `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' -DesiredAt '' -ObservedAt ''))
+Check "F2 (3): both timestamps null, observed=run -> NOT observed" $false `
+    (Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' -DesiredAt '' -ObservedAt ''))
+$threw = $null
+try {
+    $r1 = Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt 'not-a-date' -ObservedAt '2026-09-08T12:00:00Z')
+    $r2 = Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T12:00:00Z' -ObservedAt 'garbage')
+    $r3 = Test-HoldObserved -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+        -DesiredAt 'not-a-date' -ObservedAt '2026-09-08T12:00:00Z')
+} catch { $threw = $_.Exception.Message }
+Check "F2 (3): an unparseable timestamp never throws" $null $threw
+Check "F2 (3): desired_at unparseable, observed=hold -> observed_state decides (observed)" $true $r1
+Check "F2 (3): observed_at unparseable, observed=hold -> observed_state decides (observed)" $true $r2
+Check "F2 (3): desired_at unparseable, observed=run -> observed_state decides (NOT observed)" $false $r3
+
+# The predicate is the warning's verdict, nothing else: every control above that the warning flags
+# is one the gate does not treat as observed, and vice versa.
+foreach ($pair in @(
+        @('hold', 'hold', '2026-09-08T12:00:00Z', '2026-09-08T11:00:00Z'),
+        @('hold', 'hold', '2026-09-08T12:00:00.106309Z', '2026-09-08T12:00:00Z'),
+        @('hold', 'hold', '2026-09-08T12:00:00Z', '2026-09-08T12:00:00.106309Z'),
+        @('hold', 'run', '2026-09-08T12:00:00Z', '2026-09-08T12:00:05Z'),
+        @('hold', 'hold', '', ''),
+        @('hold', $null, '', ''))) {
+    $ctl = New-ControlWithTs -Desired $pair[0] -Observed $pair[1] -DesiredAt $pair[2] -ObservedAt $pair[3]
+    Check ("one verdict: observed={0} desired_at={1} observed_at={2}" -f $pair[1], $pair[2], $pair[3]) `
+        ($null -eq (Test-HoldAckStale -Control $ctl)) (Test-HoldObserved -Control $ctl)
+}
+
+Write-Host ""
+Write-Host "ConvertFrom-ControlTimestamp — [datetime] input keeps its sub-second part"
+$jsonDt = ('{"t":"2026-09-08T12:00:00.106309Z"}' | ConvertFrom-Json).t
+Check "ConvertFrom-Json yields a [datetime] here (the case this pins)" $true ($jsonDt -is [datetime])
+$parsedDt = ConvertFrom-ControlTimestamp $jsonDt
+Check "[datetime] -> [datetimeoffset]" ([datetimeoffset]) $parsedDt.GetType()
+Check "[datetime] -> sub-second part kept" 1063090 ($parsedDt.Ticks % 10000000)
+Check "[datetime] -> UTC offset" ([TimeSpan]::Zero) $parsedDt.Offset
+$localDt = [datetime]::SpecifyKind([datetime]'2026-09-08T12:00:00', [System.DateTimeKind]::Local)
+Check "Local [datetime] -> converted to the same instant in UTC" `
+    ([datetimeoffset]$localDt).UtcTicks (ConvertFrom-ControlTimestamp $localDt).UtcTicks
+$unspec = [datetime]::SpecifyKind([datetime]'2026-09-08T12:00:00', [System.DateTimeKind]::Unspecified)
+Check "Unspecified [datetime] -> taken as UTC (AssumeUniversal)" `
+    '2026-09-08T12:00:00.0000000+00:00' (ConvertFrom-ControlTimestamp $unspec).ToString('o')
+$dto = [datetimeoffset]::Parse('2026-09-08T21:00:00+09:00', [System.Globalization.CultureInfo]::InvariantCulture)
+Check "[datetimeoffset] -> UTC" '2026-09-08T12:00:00.0000000+00:00' (ConvertFrom-ControlTimestamp $dto).ToString('o')
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }

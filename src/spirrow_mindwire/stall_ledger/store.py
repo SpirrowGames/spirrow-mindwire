@@ -26,6 +26,10 @@ case this module refuses to write:
     5b each record has the v1 fields      no  -> that record is QUARANTINED
     5c each key == its record's unit.key  no  -> that record is QUARANTINED
 
+D-16d-1 adds an optional top-level ``thread_heads`` object: the thread-head cache
+(:attr:`LoadedStore.thread_heads`). It is a cache, so a broken value never makes the store
+corrupt; it is just read again.
+
 Preservation (msg-4687 §3-1): every record is kept as the dict it was read. D-16ab
 changes only ``klass`` / ``class_history`` on a record that stays open; it adds new
 records and removes closed ones. D-16c adds one more change, :meth:`LoadedStore.settle_marker`:
@@ -63,6 +67,14 @@ from spirrow_mindwire.stall_ledger.model import (
 
 STORE_FILENAME = "stall-ledger.json"
 REQUESTS_DIRNAME = "stall-ledger.requests"
+
+#: D-16d-1: the top-level key of the thread-head cache. An older binary keeps it untouched
+#: (unknown top-level keys survive a load/save), so the schema version does not change.
+THREAD_HEADS_KEY = "thread_heads"
+
+#: D-16d-1 part 2: the heads the last evaluated tick could not read yet (``pending_heads``),
+#: kept so ``--report`` can show them without fetching (msg-8477 ⑤). Rewritten every tick.
+PENDING_HEADS_KEY = "thread_heads_pending"
 
 #: The major version this binary understands, and the version it writes on a new store.
 KNOWN_MAJOR = 1
@@ -311,6 +323,37 @@ class LoadedStore:
 
     def clear_quarantined(self, key: str) -> bool:
         return self.quarantined.pop(key, None) is not None
+
+    # ── D-16d-1: the thread-head cache (msg-8368 ①, msg-8480) ─────────────────────────
+
+    @property
+    def thread_heads(self) -> dict[str, Any]:
+        """``thread_heads``: unit key -> cached head (``heads.CachedHead.to_json``).
+
+        A cache, not a record: a top-level value that is not an object is replaced by an
+        empty one (every head is then read again) rather than making the store corrupt.
+        """
+        assert self.envelope is not None
+        heads = self.envelope.get(THREAD_HEADS_KEY)
+        if not isinstance(heads, dict):
+            heads = {}
+            self.envelope[THREAD_HEADS_KEY] = heads
+        return heads
+
+    def cache_head(self, key: str, raw: dict[str, Any]) -> None:
+        self.thread_heads[key] = raw
+
+    def evict_head(self, key: str) -> bool:
+        return self.thread_heads.pop(key, None) is not None
+
+    def set_pending_heads(self, keys: list[str]) -> None:
+        """Record this tick's unread heads for ``--report`` (replaces the previous tick's).
+
+        No timestamp: a tick that changes nothing must leave the store as it was (the
+        idempotent re-run of ``test_crash_between_store_write_and_request_delete_is_idempotent``).
+        """
+        assert self.envelope is not None
+        self.envelope[PENDING_HEADS_KEY] = {"keys": sorted(set(keys))}
 
 
 def fresh_envelope() -> dict[str, Any]:

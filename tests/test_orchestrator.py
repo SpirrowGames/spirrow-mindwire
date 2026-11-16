@@ -16,6 +16,7 @@ import pytest
 
 from spirrow_mindwire.conductor.gate_records import (
     MERGE_WAIT_LINE,
+    RELAY_AUTHOR,
     RelayRoute,
     render_relay_heading,
     verdict_heads,
@@ -353,9 +354,10 @@ async def test_a_re_review_posts_into_the_existing_thread_without_reopening_it()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
     ref, _outcome = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
-    # reads: resolve the ledger id, then check the relay destination exists (D-2c, pre-payment).
+    # reads: resolve the ledger id, check the relay destination exists (D-2c, pre-payment), then
+    # read the design thread's head for the A-1 preflight (T3, also pre-payment).
     # writes: the critique into the ledger, the verdict into the design thread.
-    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread"] * 2 + [
+    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread"] * 3 + [
         "chatroom_post_message"
     ] * 2
 
@@ -1181,6 +1183,67 @@ async def test_one_fire_lands_in_both_the_ledger_and_the_design_thread() -> None
 
 
 @pytest.mark.anyio
+async def test_a_relay_dropped_on_a_resolved_design_thread_returns_the_empty_msg_id_stub() -> None:
+    # T-relay-drop-stub-pinned-only-against-the-fake (Bohr msg-2777 / msg-8407 / msg-8409 /
+    # msg-8411): the empty ``msg_id`` that ``_post_design_relay`` returns when the design thread
+    # is resolved is the ONLY observable that the verdict did not land there — the conductor
+    # fails safe to the human on it and the driver exits 2 (D-5). Until this test, that value
+    # was pinned only against the conductor's fake ``_ScriptedPrGate``, so production could
+    # have returned a non-empty ``msg_id`` with the whole suite green.
+    #
+    # Targeted by ``thread_id``, not by tool name: only the design-thread post is refused, the
+    # ledger post succeeds. The callable goes through ``_FakeMcp``, so the envelope is elevated
+    # to ThreadResolvedError at ``raise_if_envelope`` — the same point production elevates it.
+    ledger_thread = "T-pr-review-r-7"
+
+    def _post(*, drop_relay: bool) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def answer(arguments: dict[str, Any]) -> dict[str, Any]:
+            thread_id = arguments["thread_id"]
+            if drop_relay and thread_id == _DESIGN_THREAD:
+                return _error_envelope(
+                    "ChatroomStateError",
+                    f"Cannot post to thread '{thread_id}' in status='resolved'",
+                    project="p",
+                    thread_id=thread_id,
+                )
+            return {"msg": {"msg_id": f"msg-for-{thread_id}"}}
+
+        return answer
+
+    async def fire(*, drop_relay: bool) -> tuple[_FakeMcp, _SubmittingDriver, dict[str, Any]]:
+        mcp = _FakeMcp(results={"chatroom_post_message": _post(drop_relay=drop_relay)})
+        driver = _SubmittingDriver()
+        orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+        _ref, _outcome, relay = await orch.fire_pr_review(
+            project="p", pr_ref="o/r#7", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+        )
+        return mcp, driver, relay
+
+    _mcp_ok, _driver_ok, relay_ok = await fire(drop_relay=False)
+    mcp, driver, relay_dropped = await fire(drop_relay=True)
+
+    # 1. Premise: the landed relay carries a real msg_id, else the equality in 3. means nothing.
+    assert relay_ok["msg_id"] != ""
+
+    # 2. Absolute contract (Obj-2-1): the keys downstream reads exist on BOTH paths, so a change
+    #    that drops one from the success and the stub together cannot hide behind 3.
+    for relay in (relay_ok, relay_dropped):
+        assert {"msg_id", "author", "content", "route"} <= set(relay)
+        assert relay["author"] == RELAY_AUTHOR
+        assert relay["content"]
+
+    # 3. Relative contract (Obj-1-1): the stub is the landed relay with msg_id emptied — every
+    #    other key, including any added to the success path later, must match.
+    assert relay_dropped == {**relay_ok, "msg_id": ""}
+
+    # Disposition (1): the drop did not roll back the ledger post, and the GitHub review — the
+    # primary artifact — was still submitted.
+    posts = [args["thread_id"] for name, args in mcp.calls if name == "chatroom_post_message"]
+    assert posts == [ledger_thread, _DESIGN_THREAD]
+    assert driver.submitted is True
+
+
+@pytest.mark.anyio
 async def test_verdict_heads_reads_the_head_out_of_the_production_relay_body() -> None:
     # T-pr-gate-relay-belongs-to-the-conductor msg-2835 §5 R-5(c): the ROUND TRIP over
     # production. render_relay_heading → chatroom body → verdict_heads → the same head. This is
@@ -1285,12 +1348,12 @@ class _FakeGitHubCi:
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
         return []
 
-    async def find_cross_pr_head_bound_approves(
-        self, pr: PrRef, *, reviewer_login: str
-    ) -> list[Any]:
+    async def find_cross_pr_head_bound_approves(self, pr: PrRef, *, reviewer_login: str) -> Any:
         # Orchestrator L2 tests never exercise B-(a); return empty (the fail-open baseline).
         # Kept for GitHubReviewClient Protocol compliance.
-        return []
+        from spirrow_mindwire.github.client import CoverageLookup
+
+        return CoverageLookup()
 
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
@@ -1463,3 +1526,119 @@ async def test_a_real_verdict_relay_carries_no_ci_hold_marker() -> None:
 
     body = await _relay_for(CiState.SUCCESS, ci_gated=False)
     assert ci_hold_head(body) is None
+
+
+# ---------- A-1 preflight: the design thread's head must not hand to a persona ---------- #
+# T-gate-firing-ignores-loop-state-and-prior-verdicts T3 (msg-1623 §1/§2, go msg-1624).
+
+
+class _HeadMcp(_FakeMcp):
+    """``_FakeMcp`` whose design thread carries one message: ``head``.
+
+    ``read_fails`` makes the second read of the design thread -- the preflight's; the first is
+    the existence check (:meth:`_validate_design_thread`) -- raise a transport failure.
+    """
+
+    def __init__(self, head: str | None, *, read_fails: bool = False) -> None:
+        super().__init__()
+        self._head = head
+        self._read_fails = read_fails
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "chatroom_get_thread" and arguments["thread_id"] == _DESIGN_THREAD:
+            self.calls.append((name, arguments))
+            reads = sum(1 for n, a in self.calls if n == name and a["thread_id"] == _DESIGN_THREAD)
+            if self._read_fails and reads == 2:
+                raise MagickitMcpError("transport down")
+            messages = [] if self._head is None else [{"author": "Bohr", "content": self._head}]
+            return {"thread": {"title": "design"}, "messages": messages}
+        return await super().call_tool(name, arguments)
+
+
+_A1_LOGGER = "spirrow_mindwire.orchestrator"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "head",
+    [
+        "done\n\nNEXT: pr-review o/r#7",
+        "decide this\n\nTIER-C: cost\nNEXT: human",
+        "finished\n\nSTOP: done",
+        # Obj-1-1 regression: the wake names a persona, yet the parked head must pass, because
+        # the accepted terminal form is read before the NEXT token.
+        "waiting\n\nBLOCKED-ON: queue-empty spirrow-mindwire\nNEXT: Bohr",
+        "legacy\n\nNEXT: none",
+    ],
+    ids=["pr-review", "human", "stop-done", "blocked-on-wake", "legacy-none"],
+)
+async def test_a1_preflight_lets_a_ready_head_fire(head: str) -> None:
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(_HeadMcp(head), driver=driver)  # type: ignore[arg-type]
+    await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+
+
+@pytest.mark.anyio
+async def test_a1_preflight_refuses_a_persona_head_before_the_paid_review(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # R-A-1 (msg-456): conclair #21 was fired while its head still read NEXT: <implementer>.
+    mcp = _HeadMcp("4 items back to you\n\nNEXT: Heisenberg")
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with (
+        caplog.at_level("WARNING", logger=_A1_LOGGER),
+        pytest.raises(ValueError, match="role persona"),
+    ):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert driver.reviewed == []  # nothing judged, nothing billed
+    assert all(
+        name not in ("chatroom_open_thread", "chatroom_post_message") for name, _ in mcp.calls
+    )
+    refused = [r.getMessage() for r in caplog.records if "REFUSED" in r.getMessage()]
+    assert len(refused) == 1
+    assert _DESIGN_THREAD in refused[0] and "o/r#7" in refused[0] and "Heisenberg" in refused[0]
+
+
+@pytest.mark.anyio
+async def test_a1_preflight_fails_open_when_the_thread_cannot_be_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    driver = _FakeDriver()
+    mcp = _HeadMcp("NEXT: Heisenberg", read_fails=True)
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger=_A1_LOGGER):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+    assert any(
+        "A-1 preflight" in r.getMessage() and "could not read" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("head", "reason"),
+    [
+        (None, "no readable latest message"),
+        ("a reply with no control line at all", "no NEXT token"),
+        # A broken terminal form: its NEXT token (a persona here) must not be read.
+        ("bad\n\nSTOP: finished\nNEXT: Heisenberg", "refused terminal form"),
+        # The retired NEXT: operator token is not a persona, so it must not be refused as one
+        # (PR #569 gate objection: the documented operator fail-open had no test).
+        ("hand work\n\nNEXT: operator", "retired NEXT: operator"),
+    ],
+    ids=["no-message", "no-control-line", "refused-terminal-form", "retired-operator"],
+)
+async def test_a1_preflight_fails_open_when_the_head_cannot_be_interpreted(
+    head: str | None, reason: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(_HeadMcp(head), driver=driver)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger=_A1_LOGGER):
+        await _fire(orch, project="p", pr_ref="o/r#7")
+    assert len(driver.reviewed) == 1
+    assert any(
+        "A-1 preflight" in r.getMessage() and reason in r.getMessage() for r in caplog.records
+    )

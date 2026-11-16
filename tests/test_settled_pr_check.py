@@ -189,7 +189,8 @@ def test_closed_unmerged_always_goes_to_the_proposer_even_with_closes_thread() -
     assert "close された" in post.body
 
 
-def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
+def test_unresolved_proposer_becomes_the_three_line_human_task_form() -> None:
+    # The successor of the retired operator form (T-retire-operator-identity-and-scope-next-fermi).
     post = lifecycle_post(
         thread_project="p",
         thread_id=_THREAD,
@@ -201,9 +202,9 @@ def test_unresolved_proposer_becomes_the_three_line_operator_form() -> None:
     assert post is not None
     lines = post.next_line.splitlines()
     assert len(lines) == 3
-    assert lines[0].startswith("OPERATOR-TASK: ")
+    assert lines[0].startswith("HUMAN-TASK: ")
     assert lines[1] == "TIER-C-CHECK: none"
-    assert lines[2] == "NEXT: operator"
+    assert lines[2] == "NEXT: human"
 
 
 @pytest.mark.parametrize(

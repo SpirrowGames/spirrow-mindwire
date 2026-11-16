@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ import pytest
 
 from spirrow_mindwire.identity import (
     MACHINE_INDEPENDENCE_CLASS,
+    MACHINE_ROLE_EXCEPTIONS,
+    SETTLED_CLOSER,
     ClassificationEntry,
     ClassificationError,
     RegistrationRefusedError,
@@ -331,3 +334,80 @@ class TestFindingsStoreCheck:
             },
         )
         assert row["violations"] == []
+
+
+# --- the one machine role exception (T-done-disposition-auto-close msg-8589 / msg-8601 §1-4) ----
+
+_CLOSER_ARGS = {
+    "identity_name": SETTLED_CLOSER,
+    "independence_class": MACHINE_INDEPENDENCE_CLASS,
+    "allowed_roles": ["integrator"],
+}
+
+
+def _closer_entry() -> ClassificationEntry:
+    entry = load_legitimate_roles(default_classification_path()).by_key(SETTLED_CLOSER)
+    assert entry is not None
+    return entry
+
+
+class TestSettledCloserException:
+    def test_constructor_payload(self) -> None:
+        # C-5: the constructor body is unchanged; sorted(legitimate) yields ["integrator"].
+        assert build_upsert_identity_args(_closer_entry()) == _CLOSER_ARGS
+
+    def test_store_record_with_exactly_integrator_is_clean(self) -> None:
+        # C-6 (1)
+        row = check_store_record(
+            _closer_entry(),
+            {
+                "status": "found",
+                "identity": {
+                    "independence_class": MACHINE_INDEPENDENCE_CLASS,
+                    "allowed_roles": ["integrator"],
+                },
+            },
+        )
+        assert row["violations"] == []
+
+    def test_store_record_with_a_superset_is_a_violation(self) -> None:
+        # C-6 (2): a superset is not the excepted set, so it is reported on both checks.
+        codes = _codes(_closer_entry(), MACHINE_INDEPENDENCE_CLASS, ["integrator", "proposer"])
+        assert "allowed_roles_differ_from_legitimate" in codes
+        assert "machine_has_roles" in codes
+
+    def test_store_record_with_a_participant_class_is_a_violation(self) -> None:
+        # C-6 (3)
+        codes = _codes(_closer_entry(), "main-chain", ["integrator"])
+        assert codes == ["machine_wrong_independence_class"]
+
+    @pytest.mark.parametrize(
+        "name",
+        sorted(
+            e.name
+            for e in load_legitimate_roles(default_classification_path()).entries
+            if e.kind == "machine" and e.name not in MACHINE_ROLE_EXCEPTIONS
+        ),
+    )
+    def test_any_other_machine_with_integrator_is_still_machine_has_roles(self, name: str) -> None:
+        # C-6 (4): the exception keys on the raw name; every other shipped machine is unchanged.
+        entry = _shipped().by_key(name)
+        assert entry is not None
+        codes = _codes(entry, MACHINE_INDEPENDENCE_CLASS, ["integrator"])
+        assert "machine_has_roles" in codes
+
+    def test_dry_run_plan_carries_the_settled_closer_payload(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # C-9: the register_identities dry-run plan the operator checks before the one upsert.
+        assert _REGISTER.main([]) == _REGISTER.EXIT_OK
+        report = json.loads(capsys.readouterr().out)
+        rows = [r for r in report["results"] if r["identity_name"] == SETTLED_CLOSER]
+        assert rows == [
+            {
+                "identity_name": SETTLED_CLOSER,
+                "args": _CLOSER_ARGS,
+                "upsert": None,
+                "readback": None,
+            }
+        ]

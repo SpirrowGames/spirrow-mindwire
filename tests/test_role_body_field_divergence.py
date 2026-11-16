@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 from test_conductor_core import _attested, _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 
 from spirrow_mindwire.conductor.core import Conductor, StopReason
@@ -289,8 +290,16 @@ _STAGE1_BODIES = [
 
 @pytest.mark.parametrize("body", _STAGE1_BODIES)
 def test_stage1_skips_is_exactly_decide_stage1(body: str) -> None:
-    verdict = decide(now=_T0, head_msg_id="msg-1", head_body=body, control_state="run", record=None)
-    assert stage1_skips(body) is (verdict.reason == "stop-token")
+    # Both readers at the same pre-cutoff time, so the ``NEXT: none`` cell is the stop token.
+    verdict = decide(
+        now=_T0,
+        head_msg_id="msg-1",
+        head_body=body,
+        control_state="run",
+        record=None,
+        posted_at=PRE_CUTOFF,
+    )
+    assert stage1_skips(body, posted_at=PRE_CUTOFF) is (verdict.reason == "stop-token")
 
 
 # --------------------------------------------------------------------------- #

@@ -633,10 +633,13 @@ async def test_comparing_against_the_upstream_model_id_fails_every_attestation()
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("backend", ["codex", "gemini-fallback"])
-async def test_codex_tier_accepts_codex_and_gemini_fallback(backend: str) -> None:
-    """ADR-14 §7.6: the codex tier accepts ``codex`` (primary) and ``gemini-fallback``."""
-    gateway = _FakeGateway(append_on_call=[[_row(7001, tier="naysayer", backend=backend)]])
+async def test_codex_tier_accepts_codex_only() -> None:
+    """ADR-14 §10: the codex tier accepts ``codex`` and nothing else (``expected=codex``).
+
+    Until §10 it also accepted ``gemini-fallback`` (``expected=codex|gemini-fallback``); that
+    row is now a mismatch, pinned in :func:`test_backend_outside_the_tier_set_fails_closed`.
+    """
+    gateway = _FakeGateway(append_on_call=[[_row(7001, tier="naysayer", backend="codex")]])
     record = await attest_backend(
         base_url=_ROUTE,
         tier=NAYSAYER_MODEL_TIER,
@@ -644,8 +647,9 @@ async def test_codex_tier_accepts_codex_and_gemini_fallback(backend: str) -> Non
         client=gateway,
         now=lambda: _NOW,
     )
-    assert record.backend == backend
-    assert record.expected == "codex|gemini-fallback"
+    assert record.backend == "codex"
+    assert record.expected == "codex"
+    assert record.probe == "cost-row#7001"
 
 
 @pytest.mark.anyio
@@ -653,13 +657,16 @@ async def test_codex_tier_accepts_codex_and_gemini_fallback(backend: str) -> Non
     ("tier", "backend"),
     [
         (NAYSAYER_MODEL_TIER, "gemini"),
+        (NAYSAYER_MODEL_TIER, "gemini-fallback"),
         (NAYSAYER_GEMINI_TIER, "codex"),
         (NAYSAYER_GEMINI_TIER, "gemini-fallback"),
     ],
 )
 async def test_backend_outside_the_tier_set_fails_closed(tier: str, backend: str) -> None:
     """ADR-14 §7.6: plain ``gemini`` on the codex tier, or codex/fallback on the Gemini tier,
-    is a downstream wiring mismatch and fails closed (never retried)."""
+    is a downstream wiring mismatch and fails closed (never retried). Since ADR-14 §10 the
+    codex tier is codex only, so a Lexora that still answered with ``gemini-fallback`` there
+    is the same mismatch."""
     gateway = _FakeGateway(append_on_call=[[_row(7002, tier=tier, backend=backend)]] * 3)
     with pytest.raises(PreflightError, match="did not resolve to an allowed backend"):
         await attest_backend(
@@ -673,19 +680,34 @@ async def test_backend_outside_the_tier_set_fails_closed(tier: str, backend: str
 
 
 @pytest.mark.anyio
-async def test_codex_tier_turn_with_both_codex_and_fallback_rows_passes() -> None:
-    """A turn whose codex attempt failed and fell back writes a row for each; both allowed."""
-    ledger = _Ledger([[_turn_row(1, backend="codex"), _turn_row(2, backend="gemini-fallback")]])
-    record = await attest_turn(
-        route=_ROUTE,
-        tier=NAYSAYER_MODEL_TIER,
-        allowed=allowed_backends(NAYSAYER_MODEL_TIER),
-        trace_id=_TRACE,
-        read_rows=ledger,
-        now=lambda: _NOW,
+async def test_codex_tier_turn_with_both_codex_and_fallback_rows_fails_closed() -> None:
+    """A turn whose codex attempt failed and fell back writes a row for each (ADR-14 §10).
+
+    Until §10 both were allowed and the turn passed as ``codex|gemini-fallback``. Now the
+    fallback row is outside the codex tier's set, and the codex row beside it does not license
+    it: the turn fails closed at once, as a verdict that is never re-read.
+    """
+    ledger = _Ledger(
+        [
+            [_turn_row(1, backend="codex"), _turn_row(2, backend="gemini-fallback")],
+            [_turn_row(1, backend="codex")],
+        ]
     )
-    assert record.backend == "codex|gemini-fallback"
-    assert record.probe == "cost-row#1+2"
+    sleeps = _Sleeps()
+    with pytest.raises(PreflightError, match="did not resolve to an allowed backend") as info:
+        await attest_turn(
+            route=_ROUTE,
+            tier=NAYSAYER_MODEL_TIER,
+            allowed=allowed_backends(NAYSAYER_MODEL_TIER),
+            trace_id=_TRACE,
+            read_rows=ledger,
+            sleep=sleeps,
+            now=lambda: _NOW,
+        )
+    assert "['codex', 'gemini-fallback']" in str(info.value)
+    assert "allowed ['codex']" in str(info.value)
+    assert ledger.asked == [_TRACE]
+    assert sleeps.calls == []
 
 
 # --------------------------------------------------------------------------- #

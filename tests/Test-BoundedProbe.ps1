@@ -421,7 +421,15 @@ exit 3
     # +1 for Invoke-CloneRecover (T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0): no
     # -UvOptions, like Invoke-CloneCheck.
     # +1 for Invoke-CloneRetreat (same thread, PR-1a): no -UvOptions; passes -Environment.
-    Check 'nineteen helper call sites in the sweep script' 19 $helperCalls.Count
+    # +1 for the settled_close tick (T-done-disposition-auto-close boundary 6): the -Invoke
+    # scriptblock handed to Invoke-SettledCloseTick, like the operator pass; no -UvOptions.
+    # +1 for Get-JevMaterial (T-decider-conductor-hook 2e-2b-2): scripts/jev_material.py for the
+    # material PUT's `jev`; no -UvOptions, like Invoke-ParkedHumansProbe.
+    # +1 for Invoke-CloneRecover -Preserve (T-role-exit-leaves-clone-off-default-branch PR-A): a second
+    # literal call in the same function; no -UvOptions, like the plain clone-recover call.
+    # +1 for the hold acknowledgement via park (same thread, PR-B): the -Report scriptblock handed to
+    # Invoke-HoldAckViaPark, like the operator pass; no -UvOptions.
+    Check 'twenty-three helper call sites in the sweep script' 23 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

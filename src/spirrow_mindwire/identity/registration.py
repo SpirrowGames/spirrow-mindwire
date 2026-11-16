@@ -19,9 +19,13 @@ Two entry points, both pure (no I/O):
   ``kind``      required of the record
   ============  ==========================================================
   machine       ``allowed_roles == []`` **and** ``independence_class ==
-                MACHINE_INDEPENDENCE_CLASS``
+                MACHINE_INDEPENDENCE_CLASS``. Exception:
+                ``MACHINE_ROLE_EXCEPTIONS`` (settled-closer → {integrator}),
+                whose ``allowed_roles`` must equal that exact set instead
   participant   ``allowed_roles != []`` **and** ``independence_class !=
-                MACHINE_INDEPENDENCE_CLASS``
+                MACHINE_INDEPENDENCE_CLASS``. Exception: a ``retired``
+                entry, whose ``allowed_roles`` must be ``[]`` (the loader
+                requires ``legitimate=[]`` for it)
   ============  ==========================================================
 
   The participant side is deliberately NOT written as ``∈ {main-chain,
@@ -51,7 +55,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .classification import MACHINE_INDEPENDENCE_CLASS, ClassificationEntry
+from .classification import (
+    MACHINE_INDEPENDENCE_CLASS,
+    MACHINE_ROLE_EXCEPTIONS,
+    ClassificationEntry,
+    machine_roles_are_excepted,
+)
 
 __all__ = [
     "GuardViolation",
@@ -76,6 +85,10 @@ class GuardViolation:
 
 class RegistrationRefusedError(ValueError):
     """The constructor refused to build a payload for this entry."""
+
+
+def _exceptions_text() -> str:
+    return ", ".join(f"{k}: {sorted(v)}" for k, v in MACHINE_ROLE_EXCEPTIONS.items())
 
 
 def check_identity_against_classification(
@@ -107,11 +120,16 @@ def check_identity_against_classification(
         )
 
     if entry.kind == "machine":
-        if roles is not None and roles:
+        # The one carve-out is MACHINE_ROLE_EXCEPTIONS (exact raw name + exact
+        # role set, T-done-disposition-auto-close msg-8589). A record that holds
+        # more than the excepted set is not excepted, so it is still reported
+        # here (and as allowed_roles_differ_from_legitimate below).
+        if roles is not None and roles and not machine_roles_are_excepted(entry.name, roles):
             violations.append(
                 GuardViolation(
                     "machine_has_roles",
-                    f"kind=machine requires allowed_roles=[]; got {sorted(roles)}",
+                    f"kind=machine requires allowed_roles=[] unless listed in "
+                    f"MACHINE_ROLE_EXCEPTIONS {_exceptions_text()}; got {sorted(roles)}",
                 )
             )
         if independence_class != MACHINE_INDEPENDENCE_CLASS:
@@ -123,7 +141,10 @@ def check_identity_against_classification(
                 )
             )
     else:  # participant — the loader admits no third kind
-        if roles is not None and not roles:
+        # A retired participant holds no role by construction (the loader requires
+        # legitimate=[] for it); the differ check below still reports a store record
+        # that kept one (T-retire-operator-identity-and-scope-next-fermi msg-8898).
+        if roles is not None and not roles and entry.retired is None:
             violations.append(
                 GuardViolation(
                     "participant_has_no_roles",
@@ -173,7 +194,9 @@ def build_upsert_identity_args(entry: ClassificationEntry) -> dict[str, Any]:
     """Build the ``upsert_identity`` arguments for ``entry``, the one constructor.
 
     - machine → ``independence_class = MACHINE_INDEPENDENCE_CLASS``,
-      ``allowed_roles = []``.
+      ``allowed_roles = sorted(entry.legitimate)``, which is ``[]`` for every
+      machine except those in ``MACHINE_ROLE_EXCEPTIONS`` (settled-closer →
+      ``["integrator"]``; the loader admits no other non-empty machine set).
     - participant → ``independence_class = entry.independence_class`` (from the
       YAML), ``allowed_roles = sorted(entry.legitimate)``.
 

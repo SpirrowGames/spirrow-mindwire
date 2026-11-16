@@ -75,6 +75,8 @@ $needed = @(
     'New-MaterialUrl',
     'Get-ComposerReadHead',
     'Get-ParkedLaneFields',
+    # 2e-2b-2: lifted so its output parsing is tested below; then replaced by a stub (the seam).
+    'Get-JevMaterial',
     'Push-DecisionMaterial',
     'Test-NotificationSuppressed',
     'Send-NotificationIfChanged',
@@ -92,6 +94,8 @@ foreach ($name in $needed) {
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
 }
+# The real Get-JevMaterial, kept before the stub below replaces it (2e-2b-2 tests at the end).
+$script:realGetJevMaterial = ${function:Get-JevMaterial}
 
 # The wrapper's Invoke-ComposerCli is what we override for A-2 / A-3 without ever running uv.
 # The counter records how many times the composer was actually shelled out to.
@@ -568,6 +572,16 @@ function Invoke-MaterialPut {
     $script:callOrder.Add('material')
     if ($script:materialThrow) { throw $script:materialThrow }
     return $script:materialReturn
+}
+
+# 2e-2b-2: the jev lookup seam. Default: no annotation for the head (what every test above the
+# 2e-2b-2 section expects). The calls are recorded so the lookup's head can be pinned.
+$script:jevReturn = @{ jev = $null; error = $null }
+$script:jevCalls = New-Object System.Collections.Generic.List[object]
+function Get-JevMaterial {
+    param([string]$Project, [string]$ThreadId, [string]$HeadMsgId)
+    $script:jevCalls.Add(@{ Project = $Project; ThreadId = $ThreadId; HeadMsgId = $HeadMsgId })
+    return $script:jevReturn
 }
 
 function Send-Notification {
@@ -1366,6 +1380,131 @@ $digestMany = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByP
 CheckTrue 'many records: digest stays within budget' ($digestMany.Length -le 1900) "len=$($digestMany.Length)"
 CheckTrue 'many records: header keeps the true count' ($digestMany.Contains(': 60 件'))
 CheckTrue 'many records: overflow marker present' ($digestMany -match '\+\d+ 件（省略）')
+
+# ===============================================================================================
+# T-decider-conductor-hook 2e-2b-2 (Bohr msg-8616, against magickit#109 per operator msg-8577):
+# the material PUT carries Jev's `jev` for exactly the head the composer read, unchanged, and
+# leaves the key out when there is none. One push, fail-open; the log line says jev=present|absent.
+# ===============================================================================================
+Write-Host ''
+Write-Host '--- 2e-2b-2: jev on the material PUT ---'
+$script:logLines = New-Object System.Collections.Generic.List[string]
+function Write-Log { param([string]$Message) $script:logLines.Add($Message) }
+function Invoke-JevPush {
+    param($Jev, [string]$Err = $null)
+    Reset-MaterialSpy
+    $script:jevCalls.Clear()
+    $script:logLines.Clear()
+    $script:jevReturn = @{ jev = $Jev; error = $(if ($Err) { $Err } else { $null }) }
+    return Push-DecisionMaterial -NotifyState @{} -Key 'p/T-jev' -Signature 'human:msg-1' `
+        -Project 'p' -ThreadId 'T-jev' -StopReason 'human' -Envelope $freshEnvelope
+}
+function Get-Logged { return ($script:logLines -join "`n") }
+$jevObj = [PSCustomObject]@{ should_ask_human = 0.12; rule = 'R3'; model_version = 'jev/tierc-v4' }
+
+$r = Invoke-JevPush -Jev $jevObj
+Check 'jev present: the PUT is sent once' 1 $script:materialCallCount
+Check 'jev present: looked up once' 1 $script:jevCalls.Count
+Check 'jev present: looked up for the composer-read head' 'msg-777' $script:jevCalls[0].HeadMsgId
+Check 'jev present: looked up for this project' 'p' $script:jevCalls[0].Project
+Check 'jev present: looked up for this thread' 'T-jev' $script:jevCalls[0].ThreadId
+$b = $script:materialLastCall.BodyJson | ConvertFrom-Json
+CheckTrue 'jev present: the body carries jev' ($b.PSObject.Properties.Name -contains 'jev') $script:materialLastCall.BodyJson
+Check 'jev present: should_ask_human unchanged' 0.12 $b.jev.should_ask_human
+Check 'jev present: rule unchanged' 'R3' $b.jev.rule
+Check 'jev present: model_version unchanged' 'jev/tierc-v4' $b.jev.model_version
+Check 'jev present: outcome pushed' 'pushed' $r.outcome
+CheckTrue 'jev present: log line says jev=present' ((Get-Logged) -match 'material push: p/T-jev .*jev=present') (Get-Logged)
+
+# Not validated or stripped by the wrapper (msg-6648): an object magickit will refuse goes out as is.
+$bad = [PSCustomObject]@{ should_ask_human = 0.5; rule = 'R1'; extra = 'x' }
+$null = Invoke-JevPush -Jev $bad
+$b = $script:materialLastCall.BodyJson | ConvertFrom-Json
+CheckTrue 'jev as given: a key magickit drops is not stripped here' ($b.jev.PSObject.Properties.Name -contains 'extra') $script:materialLastCall.BodyJson
+CheckTrue 'jev as given: a missing model_version is not filled in here' (-not ($b.jev.PSObject.Properties.Name -contains 'model_version')) $script:materialLastCall.BodyJson
+
+# No annotation -> the key is absent (not null), so magickit clears an older head's jev.
+$r = Invoke-JevPush -Jev $null
+$b = $script:materialLastCall.BodyJson | ConvertFrom-Json
+Check 'jev absent: the PUT is still sent' 1 $script:materialCallCount
+CheckTrue 'jev absent: no jev key in the body' (-not ($b.PSObject.Properties.Name -contains 'jev')) $script:materialLastCall.BodyJson
+CheckTrue 'jev absent: log line says jev=absent' ((Get-Logged) -match 'material push: p/T-jev head=msg-777 replaced=False jev=absent \(42 ms\)') (Get-Logged)
+Check 'jev absent: outcome pushed' 'pushed' $r.outcome
+
+# A failed lookup is fail-open: PUT without jev, the reason on the push line, one PUT (no retry).
+$r = Invoke-JevPush -Jev $null -Err 'timed out'
+$b = $script:materialLastCall.BodyJson | ConvertFrom-Json
+Check 'lookup failed: the PUT is still sent once' 1 $script:materialCallCount
+CheckTrue 'lookup failed: no jev key in the body' (-not ($b.PSObject.Properties.Name -contains 'jev')) $script:materialLastCall.BodyJson
+CheckTrue 'lookup failed: the reason is on the push line' ((Get-Logged) -match 'jev=absent \(lookup failed: timed out\)') (Get-Logged)
+
+# A rejected PUT with jev is one attempt, and the failure line says jev was sent.
+$script:materialReturn = @{ ok = $false; status = 400; body = '{"detail":"invalid jev"}'; elapsed_ms = 3; error = 'HTTP 400' }
+$r = Invoke-JevPush -Jev $jevObj
+Check 'PUT 400 with jev: one PUT, no retry without jev' 1 $script:materialCallCount
+Check 'PUT 400 with jev: outcome missing (existing fail-open path)' 'missing' $r.outcome
+CheckTrue 'PUT 400 with jev: failure line says jev=present' ((Get-Logged) -match 'material push FAILED \(non-fatal\): p/T-jev head=msg-777 jev=present — HTTP 400') (Get-Logged)
+$script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
+
+# A throwing seam is a wiring bug, but must not sink the push.
+function Get-JevMaterial { param([string]$Project, [string]$ThreadId, [string]$HeadMsgId) throw 'boom' }
+Reset-MaterialSpy
+$script:logLines.Clear()
+$r = Push-DecisionMaterial -NotifyState @{} -Key 'p/T-jev' -Signature 'human:msg-1' `
+    -Project 'p' -ThreadId 'T-jev' -StopReason 'human' -Envelope $freshEnvelope
+Check 'throwing lookup: the PUT is still sent' 1 $script:materialCallCount
+Check 'throwing lookup: outcome pushed' 'pushed' $r.outcome
+CheckTrue 'throwing lookup: the reason is on the push line' ((Get-Logged) -match 'jev=absent \(lookup failed: unhandled') (Get-Logged)
+
+# Skip branches never look up (no PUT, nothing to attach).
+function Get-JevMaterial {
+    param([string]$Project, [string]$ThreadId, [string]$HeadMsgId)
+    $script:jevCalls.Add(@{ HeadMsgId = $HeadMsgId }); return @{ jev = $null; error = $null }
+}
+$script:jevCalls.Clear()
+$null = Push-DecisionMaterial -NotifyState @{} -Key 'p/T-jev' -Signature 'human:msg-1' `
+    -Project 'p' -ThreadId 'T-jev' -StopReason 'human' -Envelope ([PSCustomObject]@{ composer_status = 'failed' })
+Check 'skipped push: no lookup' 0 $script:jevCalls.Count
+
+# The real Get-JevMaterial: argv and output handling, with Invoke-BoundedUvProbe stubbed.
+Write-Host ''
+Write-Host 'Get-JevMaterial (real) — argv and output parsing'
+$script:probeArgs = $null
+$script:probeReturn = $null
+function Invoke-BoundedUvProbe {
+    param([string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label)
+    $script:probeArgs = $Arguments
+    return $script:probeReturn
+}
+$JevMaterialProbeTimeoutSeconds = 5
+$tiercAnnotationsPath = 'C:\data\state\tierc_annotations.jsonl'
+function Get-ArgAfter { param([string]$Flag) return $script:probeArgs[([array]::IndexOf($script:probeArgs, $Flag) + 1)] }
+$script:probeReturn = @{ ok = $true; timedOut = $false; code = 0; stdout = '{"jev": {"should_ask_human": 0.12, "rule": "R3", "model_version": "jev/tierc-v4"}}'; stderr = ''; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+CheckTrue 'real: argv runs scripts\jev_material.py' ("$($script:probeArgs[0])".EndsWith('jev_material.py')) ($script:probeArgs -join ' ')
+Check 'real: argv carries the annotations path' 'C:\data\state\tierc_annotations.jsonl' (Get-ArgAfter '--annotations')
+Check 'real: argv carries the project' 'p' (Get-ArgAfter '--project')
+Check 'real: argv carries the thread' 'T-a' (Get-ArgAfter '--thread-id')
+Check 'real: argv carries the head' 'msg-9' (Get-ArgAfter '--head-msg-id')
+Check 'real: jev rule parsed' 'R3' $g.jev.rule
+Check 'real: jev model_version parsed' 'jev/tierc-v4' $g.jev.model_version
+CheckTrue 'real: no error on success' ($null -eq $g.error)
+$script:probeReturn = @{ ok = $true; timedOut = $false; code = 0; stdout = '{"jev": null}'; stderr = ''; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+CheckTrue 'real: jev null -> $null, no error' (($null -eq $g.jev) -and ($null -eq $g.error))
+$script:probeReturn = @{ ok = $false; timedOut = $true; code = $null; stdout = ''; stderr = ''; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+Check 'real: timeout -> error, no jev' 'timed out' $g.error
+$script:probeReturn = @{ ok = $false; timedOut = $false; code = 1; stdout = ''; stderr = 'jev_material: annotations unreadable: denied'; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+CheckTrue 'real: exit 1 -> error carries the exit and stderr' ("$($g.error)" -match '^exit 1 — jev_material: annotations unreadable') "$($g.error)"
+$script:probeReturn = @{ ok = $true; timedOut = $false; code = 0; stdout = 'not json'; stderr = ''; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+Check 'real: unparseable stdout -> error' 'output unparseable' $g.error
+$script:probeReturn = @{ ok = $true; timedOut = $false; code = 0; stdout = '{"other": 1}'; stderr = ''; error = $null }
+$g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
+Check 'real: no jev key -> error' 'output has no jev key' $g.error
+function Write-Log { param([string]$Message) }
 
 Write-Host ''
 if ($script:failures -gt 0) {

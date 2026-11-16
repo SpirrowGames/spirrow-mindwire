@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol, assert_never
 
 from ..conductor.disposition import StopClass, classify_stop, stop_line_of
@@ -51,6 +52,7 @@ from ..conductor.handoff import (
     MalformedHandoff,
     StopStatus,
     malformed_notice,
+    posted_at_of,
     resolve_handoff,
     settles_by_terminal_form,
 )
@@ -105,6 +107,8 @@ class Head:
     author: str
     content: str
     next_participant: str | None
+    # Boundary 5: the tail's posting time (``None`` when unknown), for the ``NEXT: none`` cutoff.
+    posted_at: datetime | None = None
 
 
 @dataclass
@@ -195,6 +199,7 @@ def _head_of(thread_id: str, tail: CachedTail) -> Head:
         author=tail.author,
         content=tail.content,
         next_participant=tail.next_participant,
+        posted_at=posted_at_of(tail.as_message()),
     )
 
 
@@ -240,7 +245,12 @@ def live_roles(heads: list[Head], roster: Mapping[str, Role]) -> list[Role | Non
     """
     out: list[Role | None] = []
     for head in heads:
-        handoff = resolve_handoff(head.content, roster, next_participant=head.next_participant)
+        handoff = resolve_handoff(
+            head.content,
+            roster,
+            next_participant=head.next_participant,
+            posted_at=head.posted_at,
+        )
         out.append(handoff.role if handoff.kind is HandoffKind.ROLE else None)
     return out
 
@@ -368,7 +378,12 @@ async def run_tick(
     roles = RoleLookup(mcp)
     parks: list[Park] = []
     for head in heads:
-        stop = stop_line_of(head.content, roster, next_participant=head.next_participant)
+        stop = stop_line_of(
+            head.content,
+            roster,
+            next_participant=head.next_participant,
+            posted_at=head.posted_at,
+        )
         if stop is None:
             if settles_by_terminal_form(head.content):
                 # The sweep reads this head without a roster and parks it as settled, but with the
@@ -384,7 +399,10 @@ async def run_tick(
                 # re-reads every head. The one machine writer that could move the head meanwhile
                 # is 1c's gate fire, and 1c holds such a tail (msg-8218 §2b-2 / §2b-3).
                 handoff = resolve_handoff(
-                    head.content, roster, next_participant=head.next_participant
+                    head.content,
+                    roster,
+                    next_participant=head.next_participant,
+                    posted_at=head.posted_at,
                 )
                 report.classify(StopClass.UNCLASSIFIED, head.thread_id)
                 if handoff.malformed is None:

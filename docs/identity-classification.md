@@ -42,7 +42,8 @@ write half exists to register — `observed = ∅` is a certainty, so the inters
 machinery. Registration could not bootstrap (msg-1585 §1).
 
 `legitimate = ∅` is the honest value for a **machine**; its `upsert_identity` MUST carry
-`allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485). The `independence_class` it
+`allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485). There is exactly one exception,
+[§ settled-closer](#settled-closer--machine-legitimate--integrator唯一の例外). The `independence_class` it
 carries is **not restated here**: see [§ Write half](#write-half--revised-by-msg-1704--msg-1706).
 (The earlier text said `independence_class = null`. The live API rejects that value, as
 msg-1703 §2 measured.)
@@ -83,7 +84,8 @@ The two questions Bohr's §5 posed:
 1. **participant** (the identity IS an LLM actor whose voice the post carries verbatim) →
    `legitimate = {role(s) the actor plays}`.
 2. **machine** (the identity IS harness code; no LLM speaks under this name) →
-   `legitimate = ∅` (`allowed_roles = []`; `independence_class`: see § Write half).
+   `legitimate = ∅` (`allowed_roles = []`; `independence_class`: see § Write half). Exception: 1
+   entry, [§ settled-closer](#settled-closer--machine-legitimate--integrator唯一の例外).
 
 ### `naysayer-pr-review` — **participant**, `legitimate = {naysayer}`
 
@@ -243,6 +245,39 @@ and nothing else, so no role spoke it: `kind = machine`, `legitimate = ∅`, and
 `chatroom_close_thread` status change, so this identity needs no closeable role
 (msg-5906; R10 pins that the module never calls the close API).
 
+### `settled-closer` — machine, legitimate = {integrator}（唯一の例外）
+
+**Primary source**: `src/spirrow_mindwire/settled_close/runner.py::attempt_close`; the exception
+itself lives in one place, `src/spirrow_mindwire/identity/classification.py::MACHINE_ROLE_EXCEPTIONS`
+(T-done-disposition-auto-close: Takahito Tier-C msg-8589; Bohr msg-8601 §1 / msg-8612 / msg-8615;
+Einstein msg-8606 / msg-8613 / msg-8618).
+
+`settled_close` closes a thread whose head is a proposer's `STOP: done` that has stood for the grace
+period. The close text is fixed and never passes through an LLM (msg-8172 §3), so the identity is a
+**machine**. magickit, however, requires a *registered* closing author to hold one of its
+`CLOSEABLE_ROLES` (implementer / integrator / proposer), so this one machine needs exactly one
+role. The recorded `integrator` is **not** a claim that anyone wrote a judgement; it is the
+capability marker "may close". What sanctions each close is `close_sanction.kind=settled_disposition`
+and the proposer's `STOP: done` head (`settled_head_msg_id`).
+
+Why the exception does not widen anything else (msg-8601 §1-3):
+
+1. The table has one row and requires both the **raw** name (not the ADR-11 key, so no alternative
+   spelling inherits it) and the **exact** role set. Any other machine with a role, or this one
+   with any other set, is refused by the loader and by the registration guard. Widening the table
+   is a source change, so it passes the PR gate.
+2. `integrator` only makes the identity a closing role. It holds no proposer / naysayer /
+   implementer role and is not human, so none of guard (i)'s carve-outs or G2 apply to it, and it
+   is not a `tier_c_recorder`.
+3. It owns no thread, and its MCP client is close-only (`ReadOnlyMcp(…, CLOSE_TOOLS)`). Closing a
+   thread it does not own needs magickit's `settled_close.closers` allowlist plus the server's own
+   re-check of the head.
+4. It is not on the conductor roster and its `independence_class` stays `machine`, so the findings
+   participant test (class != machine) keeps it machinery.
+
+`legitimate: []` for the same name stays valid: that is the rollback shape. The
+`settled_close` default author (`settled_close/config.py::DEFAULT_AUTHOR`) is this name.
+
 ## Names written outside this repo
 
 The D-8 ② owner audit in spirrow-magickit (`chatroom_check_integrity`, first run 2026-10-21T19:02Z
@@ -256,7 +291,17 @@ human (Takahito) chose it on 2026-10-22, when he approved the registry change th
 as Tier-C in spirrow-magickit `T-conclair-persist-disposition-and-d8-readback` msg-1344. The
 registration and its read-back are in msg-1355 of that thread.
 
-### `operator` — **participant**, `legitimate = {integrator}`
+### `operator` — **participant**, retired 2026-11-10, `legitimate = {}` (was `{integrator}`)
+
+**Retired.** Takahito retired this name on 2026-11-10 (spirrow-mindwire
+`T-retire-operator-identity-and-scope-next-fermi` msg-8871): the session it stood for is now `Fermi`,
+which takes over its work (deploy requests, firing gates, develop merges, filing threads, sweep
+edits). The store record was set to `allowed_roles=[]` that day (msg-8898), and the YAML row now
+carries `retired: "2026-11-10"` with `legitimate: []`, so `scripts/register_identities.py` writes
+`[]` and a store record that still holds a role is reported as drift. The row is kept, not removed,
+so past posts and the threads it still owns classify. `NEXT: operator` is being retired in the
+conductor separately (the `HUMAN-TASK:` form, `OPERATOR_MALFORMED_AFTER`). The rest of this section
+is the history.
 
 The operator lane is a Claude Code session acting as Takahito's hands: it files threads, deploys,
 runs probes and posts raw observations. Every post is LLM-written, so it is a participant. It owned
@@ -289,7 +334,7 @@ author.
 | --------------- | ------- | ---------------------------------------------------------------------------- |
 | `claude.ai`     | 17      | Superseded by `Fermi` (ADR-2026-09-14-21); the latest was opened 2026-08-28 |
 | `main`          | 3       | Bootstrap threads from 2026-05-21 and 05-22; all resolved                   |
-| `operator-lane` | 1       | A spelling variant of `operator` (one thread, opened 2026-09-09)           |
+| `operator-lane` | 1       | A spelling variant of `operator` (one thread, opened 2026-09-09); retired with `operator` on 2026-11-10 |
 
 ## What this classification does NOT decide
 

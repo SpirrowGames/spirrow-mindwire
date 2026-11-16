@@ -1,4 +1,14 @@
-"""Which naysayer tier answers a request — the ONE decision point (ADR-14 §7.3 / §7.5 / §7.6).
+"""Which naysayer tier answers a request — the ONE decision point (ADR-14 §7.3 / §7.5 / §7.6 / §10).
+
+**ADR-14 §10 (2026-11-10, Takahito): every naysayer request goes to the codex tier.**
+"Secrets themselves go to neither vendor (Lexora's redaction carries that); a file being
+security-related is not, on its own, a reason to keep it from codex." So :func:`route_tier`
+now always returns the codex tier (``naysayer``), whose only accepted backend is ``codex``
+(Lexora's wrapper is ``codex_only``: no Gemini behind it). The N-3 classification below is
+kept as :func:`classify_n3` and still runs, but only as the decision's *reason*, so the logs
+keep saying which requests the old rule would have sent to Gemini. The text that follows
+describes that classification as it was decided under §7.3; read "routes to Gemini" as
+"is classified N-3".
 
 A naysayer request goes either to the codex tier (``naysayer``: codex primary,
 gemini-fallback backup) or to the Gemini-only tier (``naysayer-gemini``). The codex
@@ -273,6 +283,24 @@ def lexical_path_problem(path: str) -> str | None:
 def route_tier(request: N3Request) -> TierDecision:
     """Decide the tier for one request. The only decision point (§7.6).
 
+    ADR-14 §10 (2026-11-10): always the codex tier. When :func:`classify_n3` would have chosen
+    the Gemini tier, the reason says so (``N-3 classified, routed to codex per ADR-14 §10: ...``)
+    so the observation the old rule gave is not lost. Never flags the codex-limit band: the
+    request goes to codex whatever its size.
+    """
+    classified = classify_n3(request)
+    if classified.tier == NAYSAYER_MODEL_TIER:
+        return classified
+    return TierDecision(
+        NAYSAYER_MODEL_TIER,
+        allowed_backends(NAYSAYER_MODEL_TIER),
+        f"codex tier (N-3 classified, routed to codex per ADR-14 §10: {classified.reason})",
+    )
+
+
+def classify_n3(request: N3Request) -> TierDecision:
+    """The ADR-14 §7.3 / §7.5 classification, as :func:`route_tier` applied it until §10.
+
     Order: marker → path boundary (the design-time resolver's problem, then the lexical
     check on every path) → incomplete file list → the config file itself → unresolvable
     config → globs → prompt size. Every path is normalised before BOTH the config-file
@@ -320,13 +348,17 @@ async def notify_unresolved(
 ) -> None:
     """Log at WARNING with the stable token ``n3-routing-unresolved``, then call ``notifier``.
 
-    Fires only for a trusted-side failure. A persistent one would otherwise turn every
-    request into a Gemini request without anyone noticing (msg-6477). A failing notifier is
-    logged and swallowed: the routing decision (Gemini) is already safe.
+    Fires only for a trusted-side failure. Before ADR-14 §10 a persistent one turned every
+    request into a Gemini request without anyone noticing (msg-6477); since §10 the request
+    goes to codex anyway, and this only reports that the N-3 classification could not be
+    made. A failing notifier is logged and swallowed.
     """
     if not globs.trusted_unresolved:
         return
-    line = f"n3-routing-unresolved: {where}: {globs.failure}; routing to the Gemini tier"
+    line = (
+        f"n3-routing-unresolved: {where}: {globs.failure}; "
+        f"N-3 cannot be classified (routing is codex regardless, ADR-14 §10)"
+    )
     logger.warning("%s", line)
     if notifier is not None:
         try:

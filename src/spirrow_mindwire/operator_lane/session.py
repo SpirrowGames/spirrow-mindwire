@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-_DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _CREATE_SUSPENDED = 0x00000004
@@ -77,7 +76,13 @@ class DetachedRunnerSpawner:
                 "env": {**os.environ, "PYTHONIOENCODING": "utf-8"},
             }
             if sys.platform == "win32":
-                flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+                # CREATE_NO_WINDOW, not DETACHED_PROCESS: a detached runner has no console, so
+                # every console program it starts (the venv launcher's real python, git, gh)
+                # gets a new console, which the default terminal opens as a visible window that
+                # takes focus from the operator. CREATE_NO_WINDOW gives the runner its own
+                # console without a window; its children inherit it, and it is still separate
+                # from the conductor's console (2026-11-13).
+                flags = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
                 try:
                     proc = subprocess.Popen(
                         self.argv(run_id, data_dir),
@@ -85,7 +90,8 @@ class DetachedRunnerSpawner:
                         **kwargs,
                     )
                 except OSError:
-                    # The scheduler's Job may forbid breakaway; detached is still detached.
+                    # The scheduler's Job may forbid breakaway; the runner is still in its own
+                    # windowless console and process group.
                     proc = subprocess.Popen(
                         self.argv(run_id, data_dir), creationflags=flags, **kwargs
                     )

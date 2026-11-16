@@ -149,7 +149,8 @@ def test_real_manifest_body_locators_are_well_formed() -> None:
     bad = check_body_locator_formats(manifest_text)
     assert not bad, (
         f"spec/adr_index.yaml carries body locators that fail the format check: {bad}. "
-        f"Valid shapes: chatroom:<project>/<thread>#msg-<n> | drive | drive:<pointer>"
+        f"Valid shapes: chatroom:<project>/<thread>#msg-<n> | unknown | repo:<path>.md | "
+        f"drive (legacy)"
     )
 
 
@@ -158,7 +159,11 @@ def test_body_locator_regex_shape() -> None:
     assert BODY_LOCATOR_RE.match("chatroom:spirrow-mindwire/T-foo#msg-1")
     assert BODY_LOCATOR_RE.match("chatroom:proj.name/T.thread-x#msg-999")
     assert BODY_LOCATOR_RE.match("drive")
-    assert BODY_LOCATOR_RE.match("drive:1a2b3c-file-id")
+    # The ``drive:<pointer>`` arm was dropped (T-adr-index-locator-grammar-fail-open-edges
+    # (b), human decision): its ``.+`` admitted whitespace, and no entry ever used it.
+    assert not BODY_LOCATOR_RE.match("drive:1a2b3c-file-id")
+    assert not BODY_LOCATOR_RE.match("drive:   ")
+    assert not BODY_LOCATOR_RE.match("drive:a b")
     # Rejections listed by Bohr in msg-2583 §4-4:
     assert not BODY_LOCATOR_RE.match("TODO")
     assert not BODY_LOCATOR_RE.match("")
@@ -187,9 +192,9 @@ def test_repo_locator_path_predicate_rejects_escapes() -> None:
     assert body_locator_is_valid(
         "repo:docs/adr/ADR-2026-08-25-20-independence-class-machine-value.md"
     )
-    # The three older forms are untouched by the predicate.
+    # The older forms are untouched by the predicate.
     assert body_locator_is_valid("drive")
-    assert body_locator_is_valid("drive:file-id")
+    assert not body_locator_is_valid("drive:file-id")  # the dropped pointer arm
     assert body_locator_is_valid("chatroom:spirrow-mindwire/T-foo#msg-1")
     assert not body_locator_is_valid("TODO")
 
@@ -365,11 +370,10 @@ def test_section_m_rows_all_parse() -> None:
         causes.append(
             f"UNPARSED §M row(s) for {unparsed}: those ADRs silently drop out of the index "
             f"and out of spec/adr_index.yaml. The leading cause is a row missing its third "
-            f"(``thread``) column — the cell may be empty, but the closing pipe is required. "
-            f"Inspect the row ABOVE each id named here as well: _ADR_INDEX_ROW_RE spells its "
-            f"cells ``[^|]``, which crosses newlines, so a row whose closing pipe is missing "
-            f"swallows the next line as its own third cell and it is the NEIGHBOUR that goes "
-            f"missing from this list (measured, msg-2754 §5-5)."
+            f"(``thread``) column, or one missing its closing pipe — the cell may be empty, "
+            f"but the closing pipe is required. The ids named here are the broken rows "
+            f"themselves: _ADR_INDEX_ROW_RE is line-bounded, so a broken row cannot "
+            f"borrow the next row's pipe."
         )
     if not causes:
         causes.append(
@@ -433,3 +437,20 @@ def test_parse_adr_index_with_thread_returns_third_column() -> None:
         ("ADR-2026-05-29-12", "embodiment", "T-embodiment-self-declared"),
         ("ADR-2026-05-29-13", "readback", "T-implementer-spec-readback-checklist"),
     )
+
+
+def test_broken_section_m_row_does_not_swallow_the_next_row() -> None:
+    # T-adr-index-locator-grammar-fail-open-edges (c). Before the fix, _ADR_INDEX_ROW_RE
+    # used ``[^|]`` and ``\s*``, which both match a newline, so each broken shape below
+    # matched by borrowing the NEXT row's leading ``|``: ``-12`` parsed (with ``T-12`` /
+    # an empty thread) and the well-formed ``-13`` VANISHED. Now the broken row is the
+    # one that drops out and its neighbour parses.
+    header = "## §M\n| ADR | x | y |\n|---|---|---|\n"
+    good = "| ADR-2026-05-29-13 | thirteen | T-13 |\n"
+    shapes = {
+        "closing pipe missing": "| ADR-2026-05-29-12 | twelve | T-12\n",
+        "third column missing": "| ADR-2026-05-29-12 | twelve |\n",
+    }
+    for label, broken in shapes.items():
+        rows = parse_adr_index_with_thread(header + broken + good)
+        assert rows == (("ADR-2026-05-29-13", "thirteen", "T-13"),), label

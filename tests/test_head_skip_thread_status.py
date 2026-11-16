@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from legacy_none_time import PRE_CUTOFF
 
 from spirrow_mindwire.chatroom.status import FINISHED_STATUSES, is_terminal_status
 from spirrow_mindwire.conductor.head_skip import (
@@ -123,6 +124,7 @@ def test_finished_status_skips_regardless_of_head_and_record(
         control_state="run",
         record=record,
         thread_status=status,
+        posted_at=PRE_CUTOFF,
     )
     assert v.decision is Decision.SKIP
     # The reason names the actual status, so the wrapper log cannot mislabel it (advisory 2).
@@ -146,6 +148,8 @@ def test_unknown_or_live_status_matches_the_pre_stage0_verdict(
         "head_body": body,
         "control_state": "run",
         "record": record,
+        # Before the boundary-5 cutoff, so the ``NEXT: none`` head is the stop token it was.
+        "posted_at": PRE_CUTOFF,
     }
     assert decide(**kwargs, thread_status=status) == decide(**kwargs)
 

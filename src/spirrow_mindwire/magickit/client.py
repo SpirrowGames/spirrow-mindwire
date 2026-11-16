@@ -158,10 +158,23 @@ class MagickitMcpError(RuntimeError):
     """
 
     error_type: str | None
+    #: The envelope's ``details.reason`` when it is a string, bounded like ``error_type``, else
+    #: ``None``. Set only by :func:`raise_if_envelope`, for the same reason ``error_type`` is: it
+    #: is the machine-readable refusal code (magickit's settled-disposition carve-out answers
+    #: ``SettledDispositionNotClosableError`` with ``details.reason`` naming the failed check,
+    #: T-done-disposition-auto-close msg-8455 §2 6-1), read before any prose is formatted.
+    details_reason: str | None
 
-    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str | None = None,
+        details_reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.details_reason = details_reason
 
 
 class ThreadResolvedError(MagickitMcpError):
@@ -559,6 +572,10 @@ def raise_if_envelope(payload: Any) -> None:
     if is_envelope(payload):
         message = _elevation_message(payload)
         error_type = _elevation_snippet(payload, "error_type")
+        details = payload.get("details")
+        details_reason = (
+            _elevation_snippet(details, "reason") if isinstance(details, dict) else None
+        )
         # W5 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
         # msg-536): specialize the "target thread is resolved" refusal into
         # a domain-typed subclass so producers can catch it without
@@ -569,8 +586,8 @@ def raise_if_envelope(payload: Any) -> None:
         # side). See :func:`_is_thread_resolved_envelope` for the
         # classifier's design rationale.
         if _is_thread_resolved_envelope(payload):
-            raise ThreadResolvedError(message, error_type=error_type)
-        raise MagickitMcpError(message, error_type=error_type)
+            raise ThreadResolvedError(message, error_type=error_type, details_reason=details_reason)
+        raise MagickitMcpError(message, error_type=error_type, details_reason=details_reason)
 
 
 def parse_tool_result(result: Any) -> Any:
