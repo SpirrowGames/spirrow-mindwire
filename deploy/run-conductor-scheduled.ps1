@@ -4018,17 +4018,32 @@ function Update-DirtyCloneParking {
 # One 駐機中 row per parked repo for the daily digest (D-3d), oldest first. Each row is bounded so
 # a long detail cannot crowd out the budgeted sections below it. Empty when nothing is parked, so
 # a digest without parked repos is byte-identical to before.
+# Step 2e (Bohr msg-9326 §6): a slot park (any key Get-DirtyCloneParkKeyKind does not call 'repo') is
+# not a dirty shared clone and is released only by a person, so its row is tagged [slot] and names the
+# key to pass to `Clear-Quarantine.ps1 -SlotParkKey`, and the header counts the two kinds apart. With
+# no slot park the header and rows are byte-identical to before (INV-0).
 function Get-DirtyCloneDigestLines {
     param([hashtable]$Parked)
     if ($null -eq $Parked -or $Parked.Count -eq 0) { return , @() }
+    $slotCount = 0
     $rows = foreach ($k in $Parked.Keys) {
         $r = $Parked[$k]
         $head = if ($r.head) { "$($r.head)" } else { '-' }
-        $line = "  $($r.repo_dir)   reason=$($r.reason) head=$head since=$($r.since)"
+        if ((Get-DirtyCloneParkKeyKind -Key "$k") -ne 'repo') {
+            $slotCount++
+            $where = if ($r.repo_dir) { "$($r.repo_dir)" } else { '-' }
+            $line = "  [slot] $k   reason=$($r.reason) since=$($r.since) slot=$where"
+        } else {
+            $line = "  $($r.repo_dir)   reason=$($r.reason) head=$head since=$($r.since)"
+        }
         if ($line.Length -gt 200) { $line = $line.Substring(0, 199) + '…' }
         [PSCustomObject]@{ Line = $line; Since = "$($r.since)" }
     }
-    $lines = @("駐機中 repo（共有 clone が汚れて起動拒否中・operator 作業）: $($Parked.Count) 件")
+    $header = "駐機中 repo（共有 clone が汚れて起動拒否中・operator 作業）: $($Parked.Count) 件"
+    if ($slotCount -gt 0) {
+        $header = "駐機中: 共有 clone $($Parked.Count - $slotCount) 件 / slot $slotCount 件（slot は自動では外れない・人が確かめて ``Clear-Quarantine.ps1 -SlotParkKey <key>``）"
+    }
+    $lines = @($header)
     $lines += @($rows | Sort-Object -Property Since, Line | ForEach-Object { $_.Line })
     $lines += ""
     return , $lines

@@ -34,7 +34,7 @@ $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Langu
 foreach ($name in 'ConvertTo-DirtyCloneRepoKey', 'Get-DirtyCloneParkKey', 'Get-DirtyCloneParkKeyKind',
                   'ConvertTo-DirtyCloneParking', 'Set-DirtyCloneParked', 'Update-DirtyCloneParking',
                   'ConvertFrom-AlertIso', 'Read-LatestRetreatRecordsByRepo', 'Get-SlotKillUnconfirmedPark',
-                  'Complete-SlotThreadPark') {
+                  'Complete-SlotThreadPark', 'Get-DirtyCloneDigestLines') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -112,6 +112,20 @@ $null = Complete-SlotThreadPark -Parked $p2 -ParkKey $kD -Verdict $crash -NowIso
 $reloaded = ConvertTo-DirtyCloneParking -State (($p2 | ConvertTo-Json -Depth 5) | ConvertFrom-Json -AsHashtable)
 Check 'crash park (no slot_dir) survives save/load' $true $reloaded.ContainsKey($kD)
 Check 'crash park keeps its code after load' 'clone_slot_prep_crashed' $reloaded[$kD].reason
+
+# --- digest: slot parks are tagged and counted apart (msg-9326 §6) ------------------------------------
+$onlyRepo = @{}; $onlyRepo[$repoKey] = @{ repo_dir = $sharedClone; reason = 'modified'; head = 'h'; detail = ''; since = 's0'; signature = 'g0' }
+$dl = Get-DirtyCloneDigestLines -Parked $onlyRepo
+Check 'digest (INV-0): repo-only header unchanged' "駐機中 repo（共有 clone が汚れて起動拒否中・operator 作業）: 1 件" $dl[0]
+Check 'digest (INV-0): repo row unchanged' "  $sharedClone   reason=modified head=h since=s0" $dl[1]
+$mixed = @{}; $mixed[$repoKey] = $onlyRepo[$repoKey]
+$mixed[$kA] = @{ repo_dir = $slotDirA; reason = 'clone_slot_session_unknown'; head = ''; detail = ''; since = 's1'; signature = 'g1' }
+$mixed['slot|spirrow-mindwire|T-d'] = @{ repo_dir = ''; reason = 'clone_slot_prep_crashed'; head = ''; detail = ''; since = 's2'; signature = 'g2' }
+$dm = Get-DirtyCloneDigestLines -Parked $mixed
+Check 'digest: header counts shared clones and slots apart' $true ($dm[0] -like '駐機中: 共有 clone 1 件 / slot 2 件*Clear-Quarantine.ps1 -SlotParkKey*')
+Check 'digest: slot row is tagged and names its key' 1 @($dm | Where-Object { $_ -eq "  [slot] $kA   reason=clone_slot_session_unknown since=s1 slot=$slotDirA" }).Count
+Check 'digest: a slot park without slot_dir still has a row' 1 @($dm | Where-Object { $_ -like '  `[slot`] slot|spirrow-mindwire|T-d *slot=-' }).Count
+Check 'digest: the repo row is still there' 1 @($dm | Where-Object { $_ -eq "  $sharedClone   reason=modified head=h since=s0" }).Count
 
 # --- (e) the single-key unpark ----------------------------------------------------------------------------
 $data = Join-Path $tmp ("slot-unpark-test-" + [guid]::NewGuid().ToString('N'))
