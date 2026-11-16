@@ -3177,6 +3177,20 @@ function Get-DirtyCloneNotice {
 # carries no repo_dir to launch in, only a park. Pure: reads its arguments, touches nothing.
 # Not yet called by the sweep loop: the wiring lands with the slot-scoped park key (msg-8229 cond. 2).
 $SlotPrepCrashedParkCode = 'clone_slot_prep_crashed'
+# The slot park codes (step 2c of msg-8499; msg-8231: "wrapper の park 理由の一覧には登録します"). Every
+# code a slot park can carry: the ones `mindwire slot-prep` returns with exit 4 and the two the
+# wrapper decides itself (clone_slot_prep_crashed; clone_slot_session_unknown also on exit 7). Kept
+# equal to the PARK_* constants of src/spirrow_mindwire/clone_slot.py by
+# tests/test_clone_slot_kill_unconfirmed.py. Slot mode only: OFF never produces any of them. An
+# exit 4 whose code is not here means the two sides disagree, so Get-SlotPrepVerdict treats it like
+# an exit 4 without a code: a crash park that names the unknown code, never a silent pass.
+# Whether a park is a SLOT park is decided by its key (step 2d), not by these codes (Obj-24-1).
+$SlotParkCodes = @(
+    'clone_slot_owner_unknown', 'clone_slot_unpublished', 'clone_slot_preserve_failed',
+    'clone_slot_provision_failed', 'clone_slot_unrecoverable', 'clone_slot_quarantine_unconfirmed',
+    'clone_slot_index_lock_stale', 'clone_slot_session_unknown', 'clone_slot_prep_crashed',
+    'git.diverged', 'git.push_failed'
+)
 function Get-SlotPrepVerdict {
     param([int]$ExitCode, $Output, $Stderr)
     $payload = $null
@@ -3202,6 +3216,10 @@ function Get-SlotPrepVerdict {
     }
     if ($ExitCode -eq 4 -and -not $payload.park_code) {
         $crash.detail = "slot-prep exit=4 without a park_code: $errLine"
+        return $crash
+    }
+    if ($ExitCode -eq 4 -and $SlotParkCodes -notcontains "$($payload.park_code)") {
+        $crash.detail = "slot-prep exit=4 with an unregistered park_code '$($payload.park_code)': $errLine"
         return $crash
     }
     return @{ action = $want[$ExitCode]; crashed = $false

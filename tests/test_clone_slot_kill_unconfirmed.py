@@ -52,6 +52,22 @@ def test_wrapper_constants_match_python() -> None:
     assert KILL_UNCONFIRMED_DETAIL == "kill-unconfirmed (exit=7)"
 
 
+def test_wrapper_slot_park_codes_equal_clone_slot_park_constants() -> None:
+    # Step 2c (msg-8499 / msg-8231): the wrapper's slot park-code registry is exactly the set of
+    # clone_slot.PARK_* values, so a code added on one side reds the gate until the other follows.
+    from spirrow_mindwire import clone_slot
+
+    text = WRAPPER.read_text(encoding="utf-8")
+    m = re.search(r"^\$SlotParkCodes = @\((.*?)^\)", text, re.M | re.S)
+    assert m, "$SlotParkCodes not assigned in the wrapper"
+    wrapper_codes = re.findall(r"'([^']+)'", m.group(1))
+    assert len(wrapper_codes) == len(set(wrapper_codes))
+    python_codes = {
+        v for k, v in vars(clone_slot).items() if k.startswith("PARK_") and isinstance(v, str)
+    }
+    assert set(wrapper_codes) == python_codes
+
+
 def test_wrapper_row_reason_is_a_known_d7_reason() -> None:
     assert "provision_failed" in QUARANTINE_REASONS
 

@@ -20,6 +20,11 @@ $assign = $ast.FindAll({ param($n)
         $n.Left.Extent.Text -eq '$SlotPrepCrashedParkCode' }, $true) | Select-Object -First 1
 if (-not $assign) { throw 'SlotPrepCrashedParkCode not assigned in sweep script' }
 Invoke-Expression $assign.Extent.Text
+$assign = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$SlotParkCodes' }, $true) | Select-Object -First 1
+if (-not $assign) { throw 'SlotParkCodes not assigned in sweep script' }
+Invoke-Expression $assign.Extent.Text
 $fn = $ast.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $n.Name -eq 'Get-SlotPrepVerdict' }, $true) | Select-Object -First 1
@@ -78,6 +83,18 @@ Check 'exit/action mismatch -> crash park' 'clone_slot_prep_crashed' $v.park_cod
 
 $v = Get-SlotPrepVerdict -ExitCode 4 -Output @((Row @{ action = 'park'; slot_dir = $slot })) -Stderr @()
 Check 'exit 4 without park_code -> crash park' 'clone_slot_prep_crashed' $v.park_code
+
+# --- step 2c: an exit 4 whose code is not registered is a crash park naming it ------------------------
+foreach ($code in $SlotParkCodes) {
+    $v = Get-SlotPrepVerdict -ExitCode 4 -Output @((Row @{ action = 'park'; slot_dir = $slot; park_code = $code })) -Stderr @()
+    Check "registered code $code -> park with that code" $code $v.park_code
+    Check "registered code $code is not a crash" $false $v.crashed
+}
+$v = Get-SlotPrepVerdict -ExitCode 4 -Output @((Row @{ action = 'park'; slot_dir = $slot; park_code = 'clone_slot_brand_new' })) -Stderr @('e')
+Check 'exit 4 with an unregistered code -> crash park' 'clone_slot_prep_crashed' $v.park_code
+Check 'unregistered code is a crash' $true $v.crashed
+Check 'unregistered code is named in the detail' "slot-prep exit=4 with an unregistered park_code 'clone_slot_brand_new': e" $v.detail
+Check 'unregistered code yields no slot_dir' $null $v.slot_dir
 
 $v = Get-SlotPrepVerdict -ExitCode 1 -Output @() -Stderr @()
 Check 'exit 1 with empty stderr still has a detail' 'slot-prep exit=1: -' $v.detail
