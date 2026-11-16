@@ -88,6 +88,7 @@ from ..exceptions import (
     AdapterSpawnError,
     AdapterSpawnTimeoutError,
 )
+from ..gh_write_guard import P1_PROMPT_BLOCK, gh_write_guard_hooks
 from ..magickit.client import McpToolCaller
 from ..magickit.ledger_notes import (
     PROCESS_TASK_LOCKS,
@@ -307,8 +308,11 @@ response is posted verbatim.
 
 # The conductor reads the trailing NEXT: line to chain the loop (PR-2b-1); the implementer hands
 # back to the proposer for a spec-review, or to the human for a Tier-C decision (it never merges).
+# P-1 (T-real-infra-values-egress-from-agent-context msg-9299 §1): how to issue gh writes so the
+# L-p guard attached in ``_make_options`` lets them through.
 _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
-    f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.IMPLEMENTER)}"
+    f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{P1_PROMPT_BLOCK}\n"
+    f"{build_handoff_protocol_block(Role.IMPLEMENTER)}"
 )
 
 # The built-in Claude Code tools the implementer's SDK session exposes (T37 #1).
@@ -669,9 +673,16 @@ class ImplementerSdkAdapter:
             # (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         }
+        # L-p (T-real-infra-values-egress-from-agent-context msg-9299 §5): every Bash call goes
+        # through the gh-write guard before it runs. Attached on every path, not only the primary
+        # one — it is a check on the shape of a command, so a session without it is a session
+        # where the shape is unchecked. It changes nothing in ``tools=`` / ``mcp_servers`` /
+        # isolation (msg-9301 §3).
+        hooks = gh_write_guard_hooks()
         if telemetry is not None:
             # D-1' Point-4: observe auto-compaction of this reused session (primary path only).
-            kwargs["hooks"] = precompact_hooks(telemetry)
+            hooks.update(precompact_hooks(telemetry))
+        kwargs["hooks"] = hooks
         return ClaudeAgentOptions(**kwargs)
 
     async def spawn(
