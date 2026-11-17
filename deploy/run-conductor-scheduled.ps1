@@ -296,6 +296,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
 # Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
 . (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
+# ledger_drift (T-ledger-writeback-on-merge-and-thread-close-on-task-done): read-only ledger drift
+# report per project. Off unless sweep.json sets ledger_drift.enabled; off, nothing is spawned.
+. (Join-Path $PSScriptRoot 'lib/LedgerDrift.ps1')
 # In-flight launch ledger + the sweep's own hold acknowledgement when nothing launches (T-role-exit-
 # leaves-clone-off-default-branch PR-B, generalised by T-hold-observed-freshness-and-unlaunched-tick-
 # ack F1): Read-/Update-InflightLedger, Add-/Remove-InflightMark, Invoke-HoldAckViaPark. Calls
@@ -6588,6 +6591,13 @@ try {
         -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
         -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'settledclose' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+
+    # ledger_drift (design v0.3): the same projects, read only. Off by default, and off it spawns nothing.
+    $phaseStartUtc = Get-SweepNowUtc
+    $null = Invoke-LedgerDriftTick -Projects $passedHoldProjects -SweepConfigPath $sweepConfigPath `
+        -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+        -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }
+    Add-PreLoopPhase -Phases $preLoopPhases -Name 'ledgerdrift' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
 
     # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
     # are classified too. See Invoke-DeclaredProjectsParkWake.

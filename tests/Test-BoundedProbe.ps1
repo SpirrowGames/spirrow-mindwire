@@ -429,7 +429,9 @@ exit 3
     # literal call in the same function; no -UvOptions, like the plain clone-recover call.
     # +1 for the hold acknowledgement via park (same thread, PR-B): the -Report scriptblock handed to
     # Invoke-HoldAckViaPark, like the operator pass; no -UvOptions.
-    Check 'twenty-three helper call sites in the sweep script' 23 $helperCalls.Count
+    # +1 for the ledger_drift tick (T-ledger-writeback-on-merge-and-thread-close-on-task-done): the
+    # -Invoke scriptblock handed to Invoke-LedgerDriftTick, like settled_close; no -UvOptions.
+    Check 'twenty-four helper call sites in the sweep script' 24 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count
