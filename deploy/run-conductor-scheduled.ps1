@@ -176,6 +176,14 @@ $PreflightDeferredExitCode = 11
 # two). A fault of one thread's state file, not of the clone: the launch is reverted, nobody is
 # quarantined, the repo is NOT parked, and the candidate is retried next tick.
 $RefSnapshotUnrecordedExitCode = 12
+# Exit code of mindwire-loop when the turn-isolation layer refused the launch (ADR-2026-10-09-23
+# unit 2a wiring, Bohr msg-9439 W1-W3 / msg-9441): [turn.isolation] user is set and this launch's
+# check did not pass (failure, timeout, any exception), the user is a UPN, or the launcher route
+# refused. Mirrors SECRETS_STOP_EXIT_CODE in src/spirrow_mindwire/turn_isolation/errors.py (a
+# pytest pins the two). A fact about the HOST, not the thread: no quarantine, retry-pending
+# untouched, launch reverted, and the rest of the tick is not launched (every candidate on this
+# host would hit the same stop). Never reached while [turn.isolation] user is unset (INV-0).
+$TurnIsolationStopExitCode = 10
 # A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
 # a permanent failure misclassified as transient must not stay silent.
 $PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
@@ -3283,6 +3291,25 @@ function Get-RefSnapshotNotice {
              "clone: $RepoDir`n$detailLine`n$remedy")
     return @{ key = (Get-RefSnapshotNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey)
               signature = $sig; message = $body; repo_key = $repoKey }
+}
+
+# --- turn-isolation stop (ADR-2026-10-09-23 unit 2a wiring, Bohr msg-9439 / msg-9441) ---
+# Reader of the notification: the operator of this host. The daemon printed exactly one
+# "turn-isolation: STOP <reason>" line; the reason names a step and an object, never a value. The
+# key is host-wide (one per sweep host) and the signature is the reason, so a persisting stop
+# notifies once and a different reason notifies again.
+function Get-TurnIsolationStopNotice {
+    param([string]$CandidateKey, $Output, [int]$ExitCode)
+    $reason = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^turn-isolation: STOP (.+)$') { $reason = $Matches[1].Trim(); break }
+    }
+    $sig = if ($reason) { "turn-isolation:$reason" } else { 'turn-isolation:stop-line-missing' }
+    $shown = if ($reason) { $reason } else { '(停止行が見つからない)' }
+    $body = ("MindWire: turn isolation の確認が通らなかったため、この tick の起動をすべて止めました — **$CandidateKey** exit=$ExitCode。" +
+             "スレッドの不具合ではないので quarantine しません。`n" +
+             "理由: $shown")
+    return @{ key = '__turn_isolation__'; signature = $sig; message = $body; reason = $reason }
 }
 
 # --- preflight deferral (T-preflight-transient-gh-failure-quarantines-threads, design v3.2) ---
@@ -7557,6 +7584,27 @@ try {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "ref-snapshot-unrecorded $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine, no park; sweep CONTINUES"
             continue
+}
+
+        # EXIT CODE $TurnIsolationStopExitCode — turn-isolation stop (ADR-2026-10-09-23 unit 2a
+        # wiring). The host's isolation refused the launch before any turn started. MUST stay above
+        # the generic non-zero branch below (which would retry and then quarantine). The launch is
+        # reverted, any retry-pending is left as is (not consumed), and the tick stops launching:
+        # the stop is host-wide, so every later candidate would hit it too. They end 'not-reached'.
+        if ($code -eq $TurnIsolationStopExitCode) {
+            $dispositions[$cand.key] = 'turn-isolation-stop'
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "turn-isolation-stop $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN turn-isolation-stop $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched--
+                Write-Log "retry-launch $($cand.key): turn-isolation stop (exit $code) — retry-pending kept, retry not consumed"
+            }
+            $tiNotice = Get-TurnIsolationStopNotice -CandidateKey $cand.key -Output $output -ExitCode $code
+            Send-NotificationIfChanged -State $notifyState -Key $tiNotice.key -Signature $tiNotice.signature -Message $tiNotice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "turn-isolation-stop $($cand.key): exit=$code sig=$($tiNotice.signature) — no quarantine; tick STOPS launching"
+            break
         }
 
         # EXIT CODE $PreflightDeferredExitCode — preflight deferral (T-preflight-transient-gh-failure-

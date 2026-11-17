@@ -58,6 +58,7 @@ from ..exceptions import (
     AdapterSpawnError,
     AdapterSpawnTimeoutError,
 )
+from ..gh_write_guard import P1_PROMPT_BLOCK
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
 from ..ulid_util import new_ulid
@@ -115,7 +116,11 @@ tool calls, no meta-commentary.
 # In the Stage 3 loop this adapter plays the proposer (the read-only Stage3ProposerAdapter), so it
 # carries the proposer handoff guidance. The conductor reads the trailing NEXT: line to chain the
 # design loop (PR-2b-1); the block is advisory — the conductor's routing guards are the enforcement.
-_DEFAULT_SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.PROPOSER)}"
+# P-1 (T-real-infra-values-egress-from-agent-context msg-9297 §2 / msg-9299 §1): the proposer has
+# no Bash, but it writes the specs that tell the implementer how to issue gh writes.
+_DEFAULT_SYSTEM_PROMPT = (
+    f"{_BASE_SYSTEM_PROMPT}\n{P1_PROMPT_BLOCK}\n{build_handoff_protocol_block(Role.PROPOSER)}"
+)
 
 
 class _SdkClient(Protocol):
