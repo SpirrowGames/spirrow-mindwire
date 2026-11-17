@@ -309,8 +309,10 @@ def test_the_implementer_adapter_registers_the_precompact_hook(tmp_path: Path) -
     )
     options = adapter._make_options(telemetry=TurnTelemetryState())
     assert options.hooks is not None
-    assert set(options.hooks) == {"PreCompact"}
-    assert adapter._make_options().hooks is None
+    # PreToolUse is the L-p gh-write guard (T-real-infra-values-egress-from-agent-context), which
+    # is attached on every path; PreCompact is the telemetry observer, primary path only.
+    assert set(options.hooks) == {"PreCompact", "PreToolUse"}
+    assert set(adapter._make_options().hooks or {}) == {"PreToolUse"}
 
 
 class _NoJobModule:
