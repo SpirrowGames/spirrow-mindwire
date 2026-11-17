@@ -265,6 +265,30 @@ def test_garbage_file_is_unreadable_not_fresh(tmp_path: Path) -> None:
     assert judge(path, now=NOW, stale_after=timedelta(minutes=30)).freshness is Freshness.UNREADABLE
 
 
+def test_invalid_utf8_is_unreadable_not_a_crash(tmp_path: Path) -> None:
+    """PR #585 gate objection 4: corrupt bytes are UNREADABLE, and the digest says so."""
+    path = result_path(tmp_path, P)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"schema": "' + bytes([0xFF, 0xFE]) + b" broken")
+    judged = judge(path, now=NOW, stale_after=timedelta(minutes=30))
+    assert judged.freshness is Freshness.UNREADABLE
+    assert "UnicodeDecodeError" in judged.error
+    assert digest_lines(judged)[0].startswith("台帳のずれ: 読めない結果 (")
+
+
+def test_report_project_scopes_close_candidates_and_blockers() -> None:
+    """PR #585 gate objection 3: another project's tasks, loaded for PR resolution, never
+    enter (c) / (d) of this project's report."""
+    other = TaskInfo(project="other", task_id="T9", status="x", blocked_by=("T8",))
+    tasks = _tasks(_task("T1", "completed"), _task("T2", "x", blocked_by=("T1",)))
+    tasks |= {("other", "T8"): TaskInfo(project="other", task_id="T8", status="completed")}
+    tasks |= {("other", "T9"): other}
+    foreign_thread = ThreadInfo(project="other", thread_id="T-o", status="active", tags=("T8",))
+    out = detect(prs=[], threads={}, open_threads=[foreign_thread], tasks=tasks, project=P)
+    assert [r["task_id"] for r in out[Section.STALE_BLOCKED_BY].rows] == ["T2"]
+    assert out[Section.CLOSE_CANDIDATES].rows == []
+
+
 def test_write_leaves_no_temp_file(tmp_path: Path) -> None:
     path = _write(tmp_path, NOW)
     assert [p.name for p in path.parent.iterdir()] == [f"{P}.json"]

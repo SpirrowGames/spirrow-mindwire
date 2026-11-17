@@ -47,11 +47,15 @@ class Section(StrEnum):
 #: The sections bounded by the PR window (msg-9526 Obj-2-1); the others read everything.
 WINDOWED_SECTIONS = frozenset({Section.NOT_STARTED, Section.PR_RECORD, Section.UNLINKED_PRS})
 
-#: Which inputs each section needs to have been read completely.
+#: Which inputs each section needs to have been read completely. ``tasks`` is the report
+#: project's own ledger; ``linked_tasks`` is another project's ledger, loaded only because a PR
+#: links a thread there. ``unlinked_prs`` needs both: its ``task-not-in-ledger`` reason reads the
+#: task map, so a failed task listing must not pass that conclusion off as complete (PR #585 gate
+#: objection 2).
 NEEDS: Mapping[Section, frozenset[str]] = {
-    Section.NOT_STARTED: frozenset({"prs", "linked_threads", "tasks"}),
-    Section.PR_RECORD: frozenset({"prs", "linked_threads", "tasks"}),
-    Section.UNLINKED_PRS: frozenset({"prs", "linked_threads"}),
+    Section.NOT_STARTED: frozenset({"prs", "linked_threads", "tasks", "linked_tasks"}),
+    Section.PR_RECORD: frozenset({"prs", "linked_threads", "tasks", "linked_tasks"}),
+    Section.UNLINKED_PRS: frozenset({"prs", "linked_threads", "tasks", "linked_tasks"}),
     Section.CLOSE_CANDIDATES: frozenset({"open_threads", "tasks"}),
     Section.STALE_BLOCKED_BY: frozenset({"tasks"}),
 }
@@ -202,11 +206,15 @@ def detect(
     open_threads: Iterable[ThreadInfo],
     tasks: Mapping[tuple[str, str], TaskInfo],
     incomplete: Mapping[str, str] | None = None,
+    project: str | None = None,
 ) -> dict[Section, SectionResult]:
     """Every section. ``incomplete`` maps an input name (see :data:`NEEDS`) to why it is partial.
 
     ``threads`` holds every PR-linked thread that was looked up (``None``: looked up, not found).
-    ``tasks`` is keyed ``(project, task_id)``.
+    ``tasks`` is keyed ``(project, task_id)`` and may hold another project's tasks, loaded to
+    resolve a cross-project PR link. ``project`` is the report's own project: (c) and (d) read
+    only its threads and tasks, so a foreign ledger loaded for PR resolution never changes them
+    (PR #585 gate objection 3). ``None`` keeps every project (the pure-core tests' shape).
     """
     out = {s: SectionResult() for s in Section}
 
@@ -259,7 +267,12 @@ def detect(
             out[Section.PR_RECORD].rows.append(base | {"prs_not_in_notes": missing})
 
     # (c) over every open thread, (d) over every task: neither is bounded by the window.
+    def own(p: str) -> bool:
+        return project is None or p == project
+
     for thread in sorted(open_threads, key=lambda t: (t.project, t.thread_id)):
+        if not own(thread.project):
+            continue
         ids = thread_task_ids(thread)
         if not ids:
             continue  # zero linked tasks is never a close candidate (msg-9524 advisory)
@@ -277,6 +290,8 @@ def detect(
                 }
             )
     for key in sorted(tasks):
+        if not own(key[0]):
+            continue
         task = tasks[key]
         stale = [
             b

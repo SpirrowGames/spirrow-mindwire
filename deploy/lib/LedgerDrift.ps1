@@ -58,3 +58,32 @@ function Invoke-LedgerDriftTick {
         return $null
     }
 }
+
+# Get-LedgerDriftDigestLines: the daily digest's 台帳のずれ section (PR #585 gate objection 1). It runs
+# the module's --show once, which judges each project's saved result file at digest time — 未生成 /
+# 読めない結果 / 古い結果 (counts as reference values) / 不完全 per section (msg-9526 Obj-2-2) — so
+# the freshness verdict is never cached from the tick that wrote the file. Shape: header line,
+# indented --show rows, trailing "" (the $N3UnresolvedLines shape). Off: @() and nothing is
+# spawned, so the digest is unchanged. A --show that could not run is NOT dropped: the section
+# then says so, because a missing section would read as "no drift" (T42).
+function Get-LedgerDriftDigestLines {
+    param(
+        [Parameter(Mandatory)][string]$SweepConfigPath,
+        [Parameter(Mandatory)][scriptblock]$Invoke,
+        [int]$TimeoutSeconds = 120
+    )
+    if (-not (Test-LedgerDriftEnabled -SweepConfigPath $SweepConfigPath)) { return , @() }
+    $rows = @()
+    try {
+        $arguments = @('-m', 'spirrow_mindwire.ledger_drift', '--show', '--sweep-config', $SweepConfigPath)
+        $r = & $Invoke $arguments $TimeoutSeconds 'ledger-drift-show'
+        if (-not $r.ok) { $rows = @("  表示に失敗: $($r.error)") }
+        elseif ($r.code -ne 0) { $rows = @("  表示に失敗: exit=$($r.code) $("$($r.stderr)".Trim())") }
+        else {
+            $rows = @("$($r.stdout)" -split "`r?`n" | Where-Object { $_.Trim() -ne '' } | ForEach-Object { "  $_" })
+            if ($rows.Count -eq 0) { $rows = @("  表示に失敗: --show printed nothing") }
+        }
+    }
+    catch { $rows = @("  表示に失敗: $($_.Exception.Message)") }
+    return , (@("台帳のずれ (ledger_drift, read only):") + $rows + @(""))
+}

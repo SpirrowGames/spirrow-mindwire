@@ -2194,6 +2194,11 @@ function New-DailyDigest {
         # the caller with Get-N3UnresolvedDigestLines. Emitted after the stop-reason lines. Empty
         # (the default) leaves the digest exactly as it was.
         [string[]]$N3UnresolvedLines = @(),
+        # T-ledger-writeback-on-merge-and-thread-close-on-task-done (PR #585 gate objection 1): the
+        # 台帳のずれ section, built by the caller with Get-LedgerDriftDigestLines (deploy/lib/
+        # LedgerDrift.ps1). Emitted after the N-3 lines. Empty (the default, and ledger_drift off)
+        # leaves the digest exactly as it was.
+        [string[]]$LedgerDriftLines = @(),
 
         # T-composer-entrypoint-missing-drops-decision-cards D-3: the 材料未送信の判断待ち section,
         # built by the caller with Get-MaterialMissingDigestLines (same shape as $ParkedCloneLines:
@@ -2759,6 +2764,7 @@ function New-DailyDigest {
     }
     if ($StopClassLines.Count -gt 0) { $lines += $StopClassLines }
     if ($N3UnresolvedLines.Count -gt 0) { $lines += $N3UnresolvedLines }
+    if ($LedgerDriftLines.Count -gt 0) { $lines += $LedgerDriftLines }
 
     $lines += $quarCountLine
     if ($totalQ -eq 0) {
@@ -7981,6 +7987,9 @@ try {
                 -StopClassLines (@(Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed | ForEach-Object { $_ }) + $autoGateDigestLines +
                     @(Get-PreLoopBudgetDigestLines -State $preLoopBudgetState -NowEpoch $preLoopNowEpoch)) `
                 -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (Get-JsonState -Path $n3UnresolvedStatePath)) `
+                -LedgerDriftLines (Get-LedgerDriftDigestLines -SweepConfigPath $sweepConfigPath `
+                    -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+                    -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }) `
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake `
                 -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `

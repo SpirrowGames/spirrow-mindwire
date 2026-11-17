@@ -5,7 +5,10 @@
 #     or section that does not parse reads as on (the probe then refuses loudly)
 #   * Invoke-LedgerDriftTick: off spawns nothing; on calls the module once with --tick, the
 #     projects and the sweep config; a non-zero exit is logged with stderr (a save failure)
-#   * wiring: the wrapper dot-sources the lib and calls the tick once per sweep
+#   * Get-LedgerDriftDigestLines: off returns nothing and spawns nothing; on runs --show once and
+#     frames its rows as the digest section; a --show that fails is shown, never dropped
+#   * wiring: the wrapper dot-sources the lib, calls the tick once per sweep, and hands the digest
+#     section to New-DailyDigest
 #
 # Repo convention: plain pwsh with a Check helper, not Pester.
 
@@ -65,9 +68,30 @@ try {
     $r = Invoke-LedgerDriftTick -Projects @('p1') -SweepConfigPath $on -Invoke $bad
     Check 'probe failure fails open' ($null -eq $r -and ($script:logs -join "`n") -like '*fail-open*')
 
+    # Digest section (PR #585 gate objection 1). Write-Sweep reuses one path, so the off / on
+    # configs get their own files here.
+    $offFile = Join-Path $tmp 'sweep-off.json'; Set-Content -LiteralPath $offFile -Value '{"ledger_drift": {"enabled": false}}' -Encoding UTF8
+    $on = Join-Path $tmp 'sweep-on.json'; Set-Content -LiteralPath $on -Value '{"ledger_drift": {"enabled": true}}' -Encoding UTF8
+    $script:invoked = @()
+    $lines = Get-LedgerDriftDigestLines -SweepConfigPath $offFile -Invoke $fake
+    Check 'digest off: no lines, nothing spawned' (@($lines).Count -eq 0 -and $script:invoked.Count -eq 0)
+    $showOut = { param($a, $t, $l) $script:invoked += , @($a); return [PSCustomObject]@{ ok = $true; code = 0; stdout = "[p1]`n台帳のずれ: 古い結果 (x 時点, 3 時間 前。件数は参考値)`n  (a) merge 済み PR があるのに not_started: 2`n"; stderr = '' } }
+    $lines = Get-LedgerDriftDigestLines -SweepConfigPath $on -Invoke $showOut
+    $a1 = if ($script:invoked.Count -ge 1) { $script:invoked[0] -join ' ' } else { '' }
+    Check 'digest on: one --show call with the sweep config' ($script:invoked.Count -eq 1 -and $a1 -like "-m spirrow_mindwire.ledger_drift --show --sweep-config $on")
+    Check 'digest on: header, rows, trailing blank' ($lines.Count -eq 5 -and $lines[0] -like '台帳のずれ*' -and $lines[-1] -eq '')
+    Check 'digest on: stale verdict passes through' (($lines -join "`n") -like '*古い結果*参考値*')
+    $lines = Get-LedgerDriftDigestLines -SweepConfigPath $on -Invoke $bad
+    Check 'digest: a --show that did not run is shown, not dropped' ($lines.Count -eq 3 -and $lines[1] -like '*表示に失敗*timeout*')
+    $exit1 = { param($a, $t, $l) return [PSCustomObject]@{ ok = $true; code = 1; stdout = ''; stderr = 'boom' } }
+    $lines = Get-LedgerDriftDigestLines -SweepConfigPath $on -Invoke $exit1
+    Check 'digest: a failing --show is shown' (($lines -join "`n") -like '*表示に失敗: exit=1 boom*')
+
     $wrapper = Get-Content -LiteralPath (Join-Path $repoRoot 'deploy/run-conductor-scheduled.ps1') -Raw
     Check 'wrapper dot-sources the lib' ($wrapper -match "\. \(Join-Path \`$PSScriptRoot 'lib/LedgerDrift\.ps1'\)")
     Check 'wrapper calls the tick once' (([regex]::Matches($wrapper, 'Invoke-LedgerDriftTick -Projects')).Count -eq 1)
+    Check 'digest renderer emits the section' ($wrapper -match '\$lines \+= \$LedgerDriftLines')
+    Check 'digest call passes the section once' (([regex]::Matches($wrapper, '-LedgerDriftLines \(Get-LedgerDriftDigestLines')).Count -eq 1)
 }
 finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -98,7 +98,8 @@ def judge(path: Path, *, now: datetime, stale_after: timedelta) -> Judged:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return Judged(Freshness.MISSING)
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # Invalid UTF-8 is an unreadable result, not a crash of --show (PR #585 gate objection 4).
         return Judged(Freshness.UNREADABLE, error=repr(exc))
     try:
         payload = json.loads(text)

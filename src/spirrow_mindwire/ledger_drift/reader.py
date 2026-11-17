@@ -58,6 +58,8 @@ class Inputs:
     open_threads: list[ThreadInfo] = field(default_factory=list)
     tasks: dict[tuple[str, str], TaskInfo] = field(default_factory=dict)
     incomplete: dict[str, str] = field(default_factory=dict)
+    #: The report's own project (scopes (c) / (d) in :func:`detect`).
+    project: str | None = None
 
     def gap(self, name: str, why: str) -> None:
         self.incomplete[name] = (
@@ -71,6 +73,7 @@ class Inputs:
             open_threads=self.open_threads,
             tasks=self.tasks,
             incomplete=self.incomplete,
+            project=self.project,
         )
 
 
@@ -216,7 +219,7 @@ async def read_inputs(
     until: datetime,
 ) -> Inputs:
     """Read everything one project's report needs. Never raises for a failed read."""
-    inputs = Inputs()
+    inputs = Inputs(project=project)
     task_projects: set[str] = set()
 
     # Tasks of the project itself: (c) and (d) read the whole ledger.
@@ -262,7 +265,7 @@ async def read_inputs(
             inputs.gap("linked_threads", f"{key[0]}/{key[1]}: {exc}")
             continue
         # A linked thread in another project resolves its tasks in that project.
-        await _load_tasks(mcp, inputs, key[0], task_projects)
+        await _load_tasks(mcp, inputs, key[0], task_projects, gap_name="linked_tasks")
 
     # Mark the (c) candidates settled_close already handles (one full read each, few rows).
     marked: list[ThreadInfo] = []
@@ -274,7 +277,11 @@ async def read_inputs(
     return inputs
 
 
-async def _load_tasks(mcp: ToolCaller, inputs: Inputs, project: str, done: set[str]) -> None:
+async def _load_tasks(
+    mcp: ToolCaller, inputs: Inputs, project: str, done: set[str], *, gap_name: str = "tasks"
+) -> None:
+    """Load ``project``'s ledger. A failure is a ``tasks`` gap for the report's own project and a
+    ``linked_tasks`` gap for a foreign one, so a foreign failure cannot blank (c) / (d)."""
     if project in done:
         return
     done.add(project)
@@ -282,7 +289,7 @@ async def _load_tasks(mcp: ToolCaller, inputs: Inputs, project: str, done: set[s
         for task in await list_tasks(mcp, project):
             inputs.tasks[(task.project, task.task_id)] = task
     except MagickitMcpError as exc:
-        inputs.gap("tasks", f"{project}: {exc}")
+        inputs.gap(gap_name, f"{project}: {exc}")
 
 
 def _all_completed(info: ThreadInfo, tasks: Mapping[tuple[str, str], TaskInfo]) -> bool:

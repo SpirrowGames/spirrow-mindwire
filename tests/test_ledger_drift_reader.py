@@ -173,7 +173,76 @@ def test_task_listing_failure_blanks_every_section_that_reads_tasks() -> None:
     out = _read(FakeMcp(_threads(), None), _http({}))
     assert out[Section.STALE_BLOCKED_BY]["complete"] is False
     assert out[Section.CLOSE_CANDIDATES]["complete"] is False
-    assert out[Section.UNLINKED_PRS]["complete"] is True
+    # unlinked_prs reads the task map for task-not-in-ledger (PR #585 gate objection 2).
+    assert out[Section.UNLINKED_PRS]["complete"] is False
+
+
+def test_task_listing_failure_never_reports_a_linked_pr_as_task_not_in_ledger() -> None:
+    """PR #585 gate objection 2: a PR whose thread names an existing task, read while
+    list_tasks is down, must not come out as a complete ``task-not-in-ledger`` row."""
+    http = _http({1: [_pr(517, NOW, NOW, "Thread: T-a")]})
+    out = _read(FakeMcp(_threads(), None), http)
+    for s in (Section.NOT_STARTED, Section.PR_RECORD, Section.UNLINKED_PRS):
+        assert out[s]["complete"] is False, s
+        assert "count" not in out[s] and "rows" not in out[s]
+        assert any(r.startswith("tasks: ") for r in out[s]["incomplete_reasons"])
+
+
+class TwoProjectMcp(FakeMcp):
+    """``list_tasks`` / ``chatroom_get_thread`` answer per project (PR #585 gate objection 3)."""
+
+    def __init__(
+        self,
+        threads: dict[str, dict[str, Any]],
+        tasks: dict[str, list[dict[str, Any]] | None],
+        foreign_threads: dict[str, dict[str, Any]],
+    ) -> None:
+        super().__init__(threads, [])
+        self.by_project = tasks
+        self.foreign_threads = foreign_threads
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "list_tasks":
+            self.calls.append(name)
+            rows = self.by_project.get(arguments["project"], [])
+            if rows is None:
+                raise MagickitMcpError("foreign down")
+            return {"success": True, "tasks": rows}
+        if name == "chatroom_get_thread" and arguments["project"] != P:
+            self.calls.append(name)
+            return {"thread": self.foreign_threads.get(arguments["thread_id"])}
+        return await super().call_tool(name, arguments)
+
+
+def test_foreign_ledger_does_not_leak_into_the_projects_blocker_report() -> None:
+    foreign: list[dict[str, Any]] = [
+        {"id": "T5", "status": "not_started"},
+        {"id": "T8", "status": "completed"},
+        {"id": "T9", "status": "not_started", "blocked_by": ["T8"]},
+    ]
+    mcp = TwoProjectMcp(
+        _threads(), {P: _tasks(), "other": foreign}, {"T-x": {"status": "active", "tags": ["T5"]}}
+    )
+    out = _read(mcp, _http({1: [_pr(517, NOW, NOW, "Thread: other/T-x")]}))
+    # The cross-project PR still resolves through the foreign ledger ...
+    assert [(r["project"], r["task_id"]) for r in out[Section.NOT_STARTED]["rows"]] == [
+        ("other", "T5")
+    ]
+    # ... but (d) reports the report project's ledger only: T191 here, never other/T9.
+    assert [(r["project"], r["task_id"]) for r in out[Section.STALE_BLOCKED_BY]["rows"]] == [
+        (P, "T191")
+    ]
+
+
+def test_foreign_ledger_failure_blanks_only_the_pr_sections() -> None:
+    mcp = TwoProjectMcp(
+        _threads(), {P: _tasks(), "other": None}, {"T-x": {"status": "active", "tags": ["T5"]}}
+    )
+    out = _read(mcp, _http({1: [_pr(517, NOW, NOW, "Thread: other/T-x")]}))
+    assert out[Section.UNLINKED_PRS]["complete"] is False
+    assert out[Section.UNLINKED_PRS]["incomplete_reasons"][0].startswith("linked_tasks: other")
+    assert out[Section.STALE_BLOCKED_BY]["complete"] is True
+    assert out[Section.CLOSE_CANDIDATES]["complete"] is True
 
 
 def test_thread_listing_failure_blanks_close_candidates_only() -> None:
