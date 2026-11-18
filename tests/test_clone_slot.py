@@ -30,6 +30,10 @@ def test_slot_names_are_two_digit_one_based() -> None:
         ("slot-007", None),
         ("abc123def456", None),
         ("slot-01.lock", None),
+        ("slot-01\n", None),
+        ("slot-01\r\n", None),
+        (" slot-01", None),
+        ("slot-\N{ARABIC-INDIC DIGIT ZERO}\N{ARABIC-INDIC DIGIT ONE}", None),  # \d matches these
     ],
 )
 def test_slot_index_round_trips_only_canonical_names(name: str, index: int | None) -> None:

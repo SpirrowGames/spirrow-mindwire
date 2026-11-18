@@ -22,7 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SLOT_PREFIX = "slot-"
-_SLOT_NAME = re.compile(r"^slot-(\d{2,})$")
+# Used with ``fullmatch``: a ``$`` anchor would also accept a trailing newline ("slot-01\n").
+_SLOT_NAME = re.compile(r"slot-([0-9]{2,})")
 
 # Park codes named by the spec. The owner-file codes of the per-thread layout are gone with it.
 PARK_PRESERVE_FAILED = "clone_slot_preserve_failed"
@@ -49,7 +50,7 @@ def slot_name(n: int) -> str:
 
 def slot_index(name: str) -> int | None:
     """The pool index of a ``slot-NN`` directory name, or ``None`` for anything else."""
-    m = _SLOT_NAME.match(name)
+    m = _SLOT_NAME.fullmatch(name)
     if m is None or int(m.group(1)) < 1 or m.group(1) != f"{int(m.group(1)):02d}":
         return None
     return int(m.group(1))
