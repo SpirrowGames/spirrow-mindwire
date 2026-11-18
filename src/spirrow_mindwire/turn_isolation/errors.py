@@ -6,10 +6,11 @@ makes it a tick-wide stop with its own exit code: no thread runs, nobody is park
 quarantined. The stop reason names only the step and the object that failed — never a
 credential value.
 
-Unit 2a defines the code and raises it from the launcher and from ``mindwire
-turn-isolation-check``. Teaching the sweep wrapper to treat it as a tick-wide stop is part of
-the wiring that waits for the spike (msg-7100 item 5); unit 2b reuses the same code for a failed
-Vaultwarden fetch.
+Unit 2a defines the code and raises it from the launcher, from ``mindwire
+turn-isolation-check``, from the per-launch gate (:mod:`.gate`) and from the implementer
+adapter's launcher route. ``loop_runner.main`` turns it into exit 10 with one stop line, and the
+sweep wrapper treats exit 10 as a tick-wide stop (no quarantine, launch reverted, the rest of
+the tick skipped). Unit 2b reuses the same code for a failed Vaultwarden fetch.
 """
 
 from __future__ import annotations
@@ -25,6 +26,19 @@ STOP_LINE_PREFIX = "turn-isolation: STOP "
 TURN_USER_CREDENTIAL_MISSING = "turn user credential missing"
 IMPLEMENTER_PAT_CREDENTIAL_MISSING = "implementer PAT credential missing"
 TURN_JOB_ASSIGNMENT_FAILED = "turn job assignment failed"
+# msg-9439 W4: a UPN (``user@domain``) is refused at parse time, before any credential read or
+# logon, so the stop names the real cause instead of LogonUserW's "bad credential".
+TURN_USER_UPN_NOT_SUPPORTED = "turn user must be DOMAIN\\user or user (UPN not supported)"
+# msg-9439 W3 / ADR-2026-10-09-23 §7.1(c): a check that timed out or raised is "not passed".
+TURN_ISOLATION_CHECK_TIMED_OUT = "turn-isolation-check timed out"
+TURN_ISOLATION_CHECK_FAILED = "turn-isolation-check failed"
+# msg-9439 W2 / msg-9441: the launcher route of the implementer adapter. The cli_path shim and
+# the SDK environment it needs are decided by the operator spike (msg-8340 items 3-4); until
+# then the route is wired but refuses, by name, to start a turn (fail closed).
+TURN_LAUNCH_ROUTE_PENDING_SPIKE = (
+    "turn launcher route not available: cli_path shim awaits the spike (msg-8340)"
+)
+TURN_LAUNCH_ROUTE_FAILED = "turn launcher route failed"
 
 
 class TurnIsolationStop(Exception):  # noqa: N818 - a stop, not an error (S4)

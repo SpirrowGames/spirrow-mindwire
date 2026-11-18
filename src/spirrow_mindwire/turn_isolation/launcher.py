@@ -40,8 +40,12 @@ Fail closed: a failure at any step starts nothing (or terminates what was starte
 :data:`~.errors.SECRETS_STOP_EXIT_CODE` with one ``turn-isolation: STOP <reason>`` line on
 stderr. There is no fallback to a ``NULL`` or partial environment block.
 
-Not wired yet (msg-7100 item 5): no adapter points ``cli_path`` here and ``claude_bg`` does not
-route through it. That waits for the operator spike.
+Wiring (msg-9439 / msg-9441): with ``[turn.isolation] user`` set, the implementer adapter takes
+its launcher route instead of the direct SDK spawn, and only after the per-launch gate
+(:mod:`.gate`) passed. How the SDK's ``cli_path`` reaches this launcher (the shim) and which SDK
+environment the child needs are decided by the operator spike (msg-8340 items 3-4); until then
+that route stops by name (``TURN_LAUNCH_ROUTE_PENDING_SPIKE``) and never falls back to the
+direct spawn.
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ from .errors import (
     IMPLEMENTER_PAT_CREDENTIAL_MISSING,
     TURN_JOB_ASSIGNMENT_FAILED,
     TURN_USER_CREDENTIAL_MISSING,
+    TURN_USER_UPN_NOT_SUPPORTED,
     TurnIsolationStop,
 )
 from .win32 import (
@@ -124,7 +129,14 @@ class TurnUser:
 
     @classmethod
     def parse(cls, configured: str) -> TurnUser:
-        """``DOMAIN\\user`` or a bare local ``user`` (domain ``.``)."""
+        """``DOMAIN\\user`` or a bare local ``user`` (domain ``.``).
+
+        A UPN (``user@domain``) is refused here, before anything reads a credential or calls
+        ``LogonUserW`` (msg-9439 W4): passing it through as a bare user made the logon fail as
+        "bad credential", which names the wrong cause. Widen this when a host needs UPN.
+        """
+        if "@" in configured:
+            raise TurnIsolationStop(TURN_USER_UPN_NOT_SUPPORTED)
         domain, sep, user = configured.partition("\\")
         if not sep:
             return cls(user=configured, domain=".")

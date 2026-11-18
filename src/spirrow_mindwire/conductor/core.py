@@ -134,6 +134,7 @@ from ..tier_c_decisions_log import (
     missing_decision_entries,
     scan_decision_lines,
 )
+from ..turn_ref_snapshot import ContinuationScope
 from ..value_objects import (
     ChatroomEvent,
     Event,
@@ -653,7 +654,7 @@ class Conductor:
         summon_owner_control: SummonOwnerSource | None = None,
         resume_notice: ResumeNotice | None = None,
         continue_cap: int = DEFAULT_CONTINUE_CAP,
-        continuation_clone_check: Callable[[], None] | None = None,
+        continuation_clone_check: Callable[[ContinuationScope], None] | None = None,
         continuation_ledger_path: Path | None = None,
         conditional_proceed_notice: str | None = None,
         clone_retreat_log_path: Path | None = None,
@@ -678,6 +679,9 @@ class Conductor:
         # T-implementer-self-continuation (Bohr msg-7881 / msg-7887): the per-chain CONTINUE cap and
         # the clone check of condition 4. The check raises DirtyCloneError (CloneGuard.check +
         # check_pushed). ``None`` = not wired: fail-closed, every continuation is refused.
+        # It receives the :class:`ContinuationScope` of the CONTINUE turn (the trigger message that
+        # launched it), so ``check_pushed`` can judge only what that turn changed
+        # (T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 2).
         if continue_cap < 0:
             raise ValueError("continue_cap must be >= 0")
         self._continue_cap = continue_cap
@@ -2205,6 +2209,39 @@ class Conductor:
     def _continuation_links(self, messages: list[dict[str, Any]]) -> list[Link]:
         return [self._continuation_link(m) for m in messages]
 
+    def _continuation_scope(
+        self, messages: list[dict[str, Any]], continue_idx: int
+    ) -> ContinuationScope:
+        """D-2' 2 (v2.2): the trigger of the turn that posted CONTINUE ``messages[continue_idx]``.
+
+        Walk back from the message before the report; the first message that handed the thread to
+        the implementer is the trigger: its last ``NEXT:`` resolves to the implementer role on the
+        roster, or it is a conductor continue relay. Messages that hand to no one in particular
+        (notices, other roles' posts) are skipped. ``between_msg_ids`` lets the snapshot lookup
+        detect a disagreement with what the dispatcher recorded. No trigger found =
+        ``trigger_msg_id=None``, which judges every branch.
+        """
+        project = self._thread_ref.project_id
+        thread_id = self._thread_ref.thread_id
+        for i in range(continue_idx - 1, -1, -1):
+            msg = messages[i]
+            content = _content(msg)
+            if _author(msg) == CONDUCTOR_RELAY_AUTHOR:
+                hit = is_continue_relay_body(content)
+            else:
+                token = parse_next_token(content)
+                hit = bool(token) and self._roster_role(token or "") is self._implementer_role
+            if hit:
+                return ContinuationScope(
+                    project=project,
+                    thread_id=thread_id,
+                    trigger_msg_id=_msg_id(msg) or None,
+                    between_msg_ids=tuple(
+                        _msg_id(m) for m in messages[i + 1 : continue_idx] if _msg_id(m)
+                    ),
+                )
+        return ContinuationScope(project=project, thread_id=thread_id, trigger_msg_id=None)
+
     def _continue_relay_admissible(self, author: str, messages: list[dict[str, Any]]) -> bool:
         """carve-out 4: is the head a continue relay inside a valid, in-cap chain?"""
         if author != CONDUCTOR_RELAY_AUTHOR or not is_continue_relay_body(_content(messages[-1])):
@@ -2224,7 +2261,8 @@ class Conductor:
             )
             return False
         try:
-            self._continuation_clone_check()
+            # The CONTINUE report is the message right below the relay (``report_msg_id``).
+            self._continuation_clone_check(self._continuation_scope(messages, len(messages) - 2))
         except DirtyCloneError as exc:
             logger.warning(
                 "conductor continue invalidated: reason=dirty n=%d clone=%s (relay head %s)",
@@ -2269,7 +2307,9 @@ class Conductor:
             if self._continuation_clone_check is None:
                 return False
             try:
-                self._continuation_clone_check()
+                self._continuation_clone_check(
+                    self._continuation_scope(messages, len(messages) - 1)
+                )
             except DirtyCloneError as exc:
                 refusals.append(exc)
                 return False

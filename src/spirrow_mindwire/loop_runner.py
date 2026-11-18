@@ -116,6 +116,7 @@ from .config import (
     resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
     resolve_tierc_rules_snapshot_dir,
+    resolve_turn_ref_snapshot_dir,
 )
 from .decider.annotation import ANNOTATING_TIERC_MODES
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
@@ -162,6 +163,15 @@ from .preflight import (
 )
 from .repo_projects import load_repo_project_map
 from .spec_pin import SpecPinWriter
+from .turn_isolation.errors import TurnIsolationStop
+from .turn_isolation.gate import TurnLaunchFactory, resolve_turn_launch
+from .turn_ref_snapshot import (
+    REF_SNAPSHOT_UNRECORDED_EXIT_CODE,
+    ContinuationScope,
+    RefSnapshotUnrecordedError,
+    TurnRefSnapshotStore,
+    emit_ref_snapshot_unrecorded_payload,
+)
 from .value_objects import Capability, Event, Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -426,6 +436,7 @@ def build_implementer(
     cli_path: Path | None = None,
     ledger_mcp: McpToolCaller | None = None,
     ledger_journal_dir: Path | None = None,
+    turn_launch_factory: TurnLaunchFactory | None = None,
 ) -> ImplementerSdkAdapter:
     """The implementer adapter; inference base URL from env/defaults.
 
@@ -458,6 +469,10 @@ def build_implementer(
     ``ledger_journal_dir`` is where each append's recovery record is written before Magickit is
     (Bohr msg-5884 / msg-5886): ``<logs_dir>/ledger``. It is required whenever ``ledger_mcp`` is
     given; the adapter refuses a ledger without it.
+
+    ``turn_launch_factory`` is the turn-isolation launcher route (msg-9439 W2), passed only when
+    this launch's check passed (:func:`resolve_implementer_turn_launch`). ``None`` keeps the direct
+    SDK spawn (INV-0).
     """
     from .adapters import _sdk_job_hook
 
@@ -469,6 +484,7 @@ def build_implementer(
         cli_path=cli_path,
         ledger_mcp=ledger_mcp,
         ledger_journal=None if ledger_journal_dir is None else LedgerJournal(ledger_journal_dir),
+        turn_launch_factory=turn_launch_factory,
     )
 
 
@@ -725,6 +741,7 @@ def _build_dispatcher(
                 cli_path=role_cli_path,
                 ledger_mcp=mcp,
                 ledger_journal_dir=settings.paths.logs_dir / JOURNAL_DIR_NAME,
+                turn_launch_factory=resolve_implementer_turn_launch(settings, repo_dir),
             )
         if naysayer is None:
             # No model / cli_path here, by design: the naysayer's independence is
@@ -760,8 +777,12 @@ def _build_dispatcher(
     # any role onto ``loop.repo_dir`` while it is dirty, mid-operation, or off its default branch.
     # Same condition as the pin writer: no repo_dir = adapters were injected by a test.
     clone_guard: CloneGuard | None = None
+    ref_snapshot_store: TurnRefSnapshotStore | None = None
     if cfg.repo_dir is not None:
         clone_guard = CloneGuard(Path(cfg.repo_dir))
+        # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
+        # implementer launch records its starting ref state before the adapter runs.
+        ref_snapshot_store = TurnRefSnapshotStore(resolve_turn_ref_snapshot_dir(settings))
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,
@@ -769,21 +790,51 @@ def _build_dispatcher(
         spec_pin_writer=pin_writer,
         clone_guard=clone_guard,
         git_sync=build_git_sync_hook(settings),
+        ref_snapshot_store=ref_snapshot_store,
     )
     return mcp, registry, dispatcher
 
 
-def _continuation_clone_check(dispatcher: object) -> Callable[[], None] | None:
-    """``CloneGuard.check`` + ``check_pushed`` for the CONTINUE path, or ``None`` (fail-closed)."""
+def _continuation_clone_check(
+    dispatcher: object,
+) -> Callable[[ContinuationScope], None] | None:
+    """``CloneGuard.check`` + ``check_pushed`` for the CONTINUE path, or ``None`` (fail-closed).
+
+    ``check_pushed`` is given the launch snapshot of the CONTINUE turn as its baseline when the
+    dispatcher recorded one for exactly that trigger; otherwise ``None`` (every branch judged).
+    """
     guard = getattr(dispatcher, "clone_guard", None)
     if not isinstance(guard, CloneGuard):
         return None
+    store = getattr(dispatcher, "ref_snapshot_store", None)
 
-    def check() -> None:
+    def check(scope: ContinuationScope) -> None:
         guard.check()
-        guard.check_pushed()
+        baseline = (
+            store.baseline_for(scope, guard.repo_dir)
+            if isinstance(store, TurnRefSnapshotStore)
+            else None
+        )
+        guard.check_pushed(baseline=baseline)
 
     return check
+
+
+def resolve_implementer_turn_launch(
+    settings: MindwireSettings,
+    repo_dir: Path,
+    *,
+    resolve: Callable[..., TurnLaunchFactory | None] = resolve_turn_launch,
+) -> TurnLaunchFactory | None:
+    """The implementer's turn-isolation route for this launch (ADR-2026-10-09-23 2a wiring).
+
+    ``[turn.isolation] user`` unset → ``None``: no check, no launcher, the direct spawn (INV-0).
+    Set → the S8 check runs now, in-process, for ``repo_dir`` (msg-9439 W1); its result is this
+    return value and is never written anywhere (§7.1(c)). A check that does not pass raises
+    :class:`TurnIsolationStop` before any adapter exists, so neither the launcher nor the
+    direct spawn can run; ``main`` turns it into exit 10 and one stop line.
+    """
+    return resolve(settings.turn.isolation.user, [repo_dir])
 
 
 def build_git_sync_hook(settings: MindwireSettings) -> GitSyncHook | None:
@@ -1677,6 +1728,19 @@ def main() -> None:
             preflight_exc,
         )
         sys.exit(PREFLIGHT_DEFERRED_EXIT_CODE)
+    except RefSnapshotUnrecordedError as snap_exc:
+        # T-ref-snapshot-unreadable-file-blocks-thread-forever (design v2 D-2): the launch's ref
+        # snapshot could not be read, recovered or written. A state-directory fault of this one
+        # thread's file, not the clone's: a dedicated code so the wrapper skips only this candidate
+        # (no repo parking, no quarantine, launch reverted) instead of parking the whole repo as
+        # exit 8 does. The implementer was never started.
+        emit_ref_snapshot_unrecorded_payload(snap_exc)
+        logger.warning(
+            "ref-snapshot-unrecorded exit=%d: %s",
+            REF_SNAPSHOT_UNRECORDED_EXIT_CODE,
+            snap_exc,
+        )
+        sys.exit(REF_SNAPSHOT_UNRECORDED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
@@ -1693,6 +1757,15 @@ def main() -> None:
             dirty_exc.head,
         )
         sys.exit(DIRTY_CLONE_EXIT_CODE)
+    except TurnIsolationStop as stop:
+        # ADR-2026-10-09-23 unit 2a wiring (msg-9439 W1-W3): the turn-isolation layer refused this
+        # launch — the per-launch check did not pass (failure, timeout, any exception), the user is
+        # a UPN, or the launcher route refused. A fact about the host, not this thread: exit 10 and
+        # exactly one stop line, which carries a step and an object, never a value. The wrapper
+        # stops the tick without quarantining anyone.
+        print(stop.stop_line(), file=sys.stdout, flush=True)
+        logger.warning("turn-isolation stop exit=%d", stop.exit_code)
+        sys.exit(stop.exit_code)
     except BaseException as exc:
         # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
         # second copy). Sequenced carefully because Python's default

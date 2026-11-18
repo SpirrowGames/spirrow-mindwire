@@ -34,6 +34,12 @@ dependencies = [
   # (the POSIX code path raises ``NotImplementedError`` before ``psutil`` is
   # touched, but a stray ``import`` must still resolve at all times).
   "psutil>=5.9",
+  # T-real-infra-values-egress-from-agent-context (L-p, msg-9287 §1 / msg-9299 §5): the gh-write
+  # guard parses Bash commands with tree-sitter-bash. Pinned exactly: 0.25.1 silently drops a
+  # bare `-` before `<<`, the guard compensates for that one behaviour, and a version change has
+  # to go through the tree-level watch test in tests/test_gh_write_guard.py, not drift in.
+  "tree-sitter==0.26.1",
+  "tree-sitter-bash==0.25.1",
 ]
 
 [project.optional-dependencies]
@@ -75,7 +81,7 @@ warn_return_any = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["watchdog.*", "ulid.*", "mcp.*", "claude_agent_sdk.*"]
+module = ["watchdog.*", "ulid.*", "mcp.*", "claude_agent_sdk.*", "tree_sitter_bash.*"]
 ignore_missing_imports = true
 
 # T-auto-backgrounded-command-hangs-conductor-4h (v12): pywin32 ships no

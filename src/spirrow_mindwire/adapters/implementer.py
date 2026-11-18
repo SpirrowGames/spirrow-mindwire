@@ -88,6 +88,7 @@ from ..exceptions import (
     AdapterSpawnError,
     AdapterSpawnTimeoutError,
 )
+from ..gh_write_guard import P1_PROMPT_BLOCK, gh_write_guard_hooks
 from ..magickit.client import McpToolCaller
 from ..magickit.ledger_notes import (
     PROCESS_TASK_LOCKS,
@@ -100,6 +101,7 @@ from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
+from ..turn_isolation.errors import TURN_LAUNCH_ROUTE_FAILED, TurnIsolationStop
 from ..ulid_util import new_ulid
 from ..value_objects import (
     Capability,
@@ -307,8 +309,11 @@ response is posted verbatim.
 
 # The conductor reads the trailing NEXT: line to chain the loop (PR-2b-1); the implementer hands
 # back to the proposer for a spec-review, or to the human for a Tier-C decision (it never merges).
+# P-1 (T-real-infra-values-egress-from-agent-context msg-9299 §1): how to issue gh writes so the
+# L-p guard attached in ``_make_options`` lets them through.
 _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
-    f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.IMPLEMENTER)}"
+    f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{P1_PROMPT_BLOCK}\n"
+    f"{build_handoff_protocol_block(Role.IMPLEMENTER)}"
 )
 
 # The built-in Claude Code tools the implementer's SDK session exposes (T37 #1).
@@ -516,8 +521,16 @@ class ImplementerSdkAdapter:
         ledger_mcp: McpToolCaller | None = None,
         ledger_locks: TaskLocks | None = None,
         ledger_journal: LedgerJournal | None = None,
+        turn_launch_factory: Any = None,
     ) -> None:
         self._cwd = Path(cwd)
+        # Turn isolation (ADR-2026-10-09-23 unit 2a wiring, msg-9439 W2 / msg-9441). ``None``
+        # (``[turn.isolation] user`` unset) keeps the direct SDK spawn exactly as before (INV-0).
+        # When set, it is the launcher route the per-launch gate returned after the check passed
+        # (``turn_isolation.gate.resolve_turn_launch``), and it REPLACES ``client_factory``: a
+        # route that refuses or fails stops the tick by name and never falls back to the direct
+        # spawn.
+        self._turn_launch_factory = turn_launch_factory
         # Ledger notes (thread T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down, Bohr
         # msg-5296 / msg-5300): when a Magickit client is given, each session gets the in-process
         # ``mindwire-ledger`` server — two tools, pinned to the thread's project, append-only — and
@@ -669,9 +682,16 @@ class ImplementerSdkAdapter:
             # (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         }
+        # L-p (T-real-infra-values-egress-from-agent-context msg-9299 §5): every Bash call goes
+        # through the gh-write guard before it runs. Attached on every path, not only the primary
+        # one — it is a check on the shape of a command, so a session without it is a session
+        # where the shape is unchecked. It changes nothing in ``tools=`` / ``mcp_servers`` /
+        # isolation (msg-9301 §3).
+        hooks = gh_write_guard_hooks()
         if telemetry is not None:
             # D-1' Point-4: observe auto-compaction of this reused session (primary path only).
-            kwargs["hooks"] = precompact_hooks(telemetry)
+            hooks.update(precompact_hooks(telemetry))
+        kwargs["hooks"] = hooks
         return ClaudeAgentOptions(**kwargs)
 
     async def spawn(
@@ -752,7 +772,7 @@ class ImplementerSdkAdapter:
                 session.job_state = None
 
             # ── SDK client factory + connect, bounded by wait_for ────────
-            client = self._client_factory(options)
+            client = self._build_client(options)
             job_handle_for_ctx = session.job_state.handle if session.job_state is not None else None
             token = _JOB_HANDLE_CTX.set(job_handle_for_ctx)
             connect_started = time.monotonic()
@@ -817,6 +837,10 @@ class ImplementerSdkAdapter:
                 adapter_id=self.adapter_id,
                 timeout_s=self._spawn_timeout_seconds,
             ) from exc
+        except TurnIsolationStop:
+            # Tick-wide stop (exit 10 in ``loop_runner.main``), not a spawn fault of this thread:
+            # pass it through unwrapped so it never reaches retry / quarantine.
+            raise
         except ImplementerSdkSpawnError:
             # Already a spawn error — pass through so the caller sees our
             # error class; the finally still runs.
@@ -845,6 +869,21 @@ class ImplementerSdkAdapter:
                         session.job_state, self._sdk_executable_path
                     )
                 self._job_module.close_handle(session.job_state)
+
+    def _build_client(self, options: ClaudeAgentOptions) -> Any:
+        """The direct SDK client, or — with turn isolation on — the launcher route's client.
+
+        The two are exclusive: with a route set, ``client_factory`` is never called, and any
+        failure of the route becomes a named :class:`TurnIsolationStop` (no fallback).
+        """
+        if self._turn_launch_factory is None:
+            return self._client_factory(options)
+        try:
+            return self._turn_launch_factory(options)
+        except TurnIsolationStop:
+            raise
+        except Exception as exc:
+            raise TurnIsolationStop(f"{TURN_LAUNCH_ROUTE_FAILED} ({type(exc).__name__})") from None
 
     def source_marker_options(self, handle: SessionHandle) -> Any:
         """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.

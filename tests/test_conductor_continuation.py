@@ -28,6 +28,7 @@ from spirrow_mindwire.conductor.continuation import (
 from spirrow_mindwire.conductor.core import CONDUCTOR_RELAY_AUTHOR, Conductor, StopReason
 from spirrow_mindwire.conductor.handoff import parse_next_token
 from spirrow_mindwire.routing import ContinueVerdict, continuation_admissible
+from spirrow_mindwire.turn_ref_snapshot import ContinuationScope
 from spirrow_mindwire.value_objects import Role
 
 _ROSTER: Mapping[str, Role] = {
@@ -36,6 +37,8 @@ _ROSTER: Mapping[str, Role] = {
     "Einstein": Role.NAYSAYER,
 }
 
+_SCOPE = ContinuationScope(project="p", thread_id="t", trigger_msg_id=None)
+
 _ENTRY = "設計 OK\n\nTIER-C-CHECK: none\nNEXT: Heisenberg"
 
 
@@ -43,7 +46,7 @@ def _report(body: str = "step 2 of 3") -> str:
     return f"step 1 done, pushed\n\nCONTINUE: {body}\nNEXT: Heisenberg"
 
 
-def _ok() -> None:
+def _ok(scope: ContinuationScope) -> None:
     return None
 
 
@@ -51,7 +54,7 @@ def _conductor(
     mcp: _FakeChatroomMcp,
     disp: _ScriptedDispatcher,
     *,
-    clone_check: Callable[[], None] | None = _ok,
+    clone_check: Callable[[ContinuationScope], None] | None = _ok,
     cap: int = 3,
 ) -> Conductor:
     return Conductor(
@@ -295,10 +298,10 @@ def build_pushed_clone(tmp_path: Path) -> Path:
     return r
 
 
-def _check(repo: Path) -> Callable[[], None]:
+def _check(repo: Path) -> Callable[[ContinuationScope], None]:
     guard = CloneGuard(repo)
 
-    def check() -> None:
+    def check(scope: ContinuationScope) -> None:
         guard.check()
         guard.check_pushed()
 
@@ -306,13 +309,13 @@ def _check(repo: Path) -> Callable[[], None]:
 
 
 def test_5_clean_pushed_clone_passes(pushed_clone: Path) -> None:
-    _check(pushed_clone)()
+    _check(pushed_clone)(_SCOPE)
 
 
 def test_5_local_branch_without_upstream_but_fully_pushed_passes(pushed_clone: Path) -> None:
     """A branch with no upstream whose commits a remote already reaches is not unpushed."""
     _git(pushed_clone, "branch", "--no-track", "scratch-view", "origin/feature/x")
-    _check(pushed_clone)()
+    _check(pushed_clone)(_SCOPE)
 
 
 @pytest.mark.anyio
