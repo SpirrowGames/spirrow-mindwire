@@ -39,8 +39,8 @@ msg-9391 submodule、msg-9395 Obj-35-1 の 3）。
      session resume ではない）だけ。`~/.claude/projects/<path>` を読む箇所は無い。
    - **path を使うのは 1 か所:** `ClaudeBgAdapter.reap_orphans` が、孤児セッションの掃除対象を
      `cwd == repo_dir` で絞っている。これは前のターンの状態を次のターンへ引き継ぐものではなく、
-     掃除の範囲の絞り込み。slot 方式では範囲を「その repo の slot 全部」に広げる必要がある
-     （A2/A3 で対応）。
+     掃除の範囲の絞り込み。slot 方式では範囲を今回借りた slot の path に限る
+     （A3 で対応。repo の全 slot には広げない — msg-9402 Obj-36-3）。
 2. **trust のキーの書き方:** loop host の実ファイル `~/.claude.json` の `projects` のキーを読み取り
    専用で確認した。すべて「ドライブレター大文字 + `/` 区切り」（例 `C:/workspace/spirrow/spirrow-mindwire`）。
    祖先の `C:/workspace` が trusted でも、その下の git root（`C:/workspace/sandbox/mindwire-impl`、
@@ -67,6 +67,6 @@ msg-9391 submodule、msg-9395 Obj-35-1 の 3）。
    truncated でない）。全 gitlink を確かめる判定は、それでも A2 に入れる。
 
 ## このコミット時点で未測定（PR-A の中で追記する）
-- trust の登録先と親ディレクトリの trust が子に効くか。
+- 小文字ドライブレターの trust キーが Claude Code に受け付けられるか（確かめるには `.claude.json` への書き込みが要るので、上の 2 のとおり測らない）。
 - slot 内で `.mindwire-gate` / ローカル gate が動くか。
 - voxelworld の作り直し 1 回あたりのビルド時間。
