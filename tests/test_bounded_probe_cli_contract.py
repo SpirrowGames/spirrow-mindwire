@@ -87,8 +87,10 @@ def test_every_call_site_was_found() -> None:
     # T-decider-conductor-hook 2e-2b-2 adds Get-JevMaterial -> jev_material.py: eighteen.
     # T-role-exit-leaves-clone-off-default-branch PR-A adds Invoke-CloneRecover -Preserve: nineteen.
     # PR-B of the same thread adds the hold acknowledgement via park -> loop_control.py: twenty.
-    # T-digest-lacks-project-liveness-view adds Invoke-OpenPrsByProjectProbe: twenty-one.
-    assert len(_SITES) == 21, _SITES
+    # T-digest-lacks-project-liveness-view adds Invoke-OpenPrsByProjectProbe: twenty-one, and
+    # (PR #544 gate advisory 3) a second literal Invoke-UnregisteredThreadsProbe call that passes
+    # --liveness only on the digest tick: twenty-two.
+    assert len(_SITES) == 22, _SITES
 
 
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
@@ -110,8 +112,10 @@ def test_jev_material_call_site_resolves_to_the_2e_2b_2_script() -> None:
 
 def test_unregistered_threads_call_site_resolves_to_the_d2_script() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
-    # T-digest-lacks-project-liveness-view: the same walk also emits the liveness listing.
-    assert sites.get("'unregistered-threads'") == (
+    assert sites.get("'unregistered-threads'") == ("unregistered_threads.py", ["--sweep-config"])
+    # T-digest-lacks-project-liveness-view: on the digest tick the same walk also emits the
+    # liveness listing.
+    assert sites.get("'unregistered-threads-liveness'") == (
         "unregistered_threads.py",
         ["--sweep-config", "--liveness"],
     )

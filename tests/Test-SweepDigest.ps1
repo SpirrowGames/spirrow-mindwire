@@ -110,7 +110,7 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Format-DurationDigest', 'Get-ParkedRowTag', 'Get-StarvedKeys', 'New-DailyDigest',
                   'ConvertTo-UtcInstant',
                   'Test-DigestDelivered', 'Test-DigestFullSuccess',
-                  'Get-DigestPeriod', 'Test-DigestDeliveryDue',
+                  'Get-DigestPeriod', 'Test-DigestDeliveryDue', 'Test-DailyDigestDue',
                   'Get-DigestPeriodsMissed', 'Get-DigestHealthWarning',
                   'New-DegradedDigestMessage', 'Get-NotificationFailureClass',
                   # For the PR-gate regression block below (alert-path spam-loop pin,
@@ -201,6 +201,17 @@ Check "08:59 -> not due" $false (Test-DigestDeliveryDue -Now $local_08_59.ToUniv
 Check "09:00 exactly -> DUE" $true (Test-DigestDeliveryDue -Now $local_09_00.ToUniversalTime() -DeliveryTime $dt09)
 Check "09:05 (jitter of a 5-min tick) -> due (jitter tolerance is 0 by construction, all 09:00-23:59 is due)" $true `
     (Test-DigestDeliveryDue -Now $local_09_05.ToUniversalTime() -DeliveryTime $dt09)
+
+Write-Host "Test-DailyDigestDue - both halves, one definition (digest branch + liveness walk switch)"
+$p0829 = Get-DigestPeriod -Now $local_09_05.ToUniversalTime()
+Check "new period + delivery time reached -> due" $true `
+    (Test-DailyDigestDue -DigestState @{ last_sent_period = '2026-08-28' } -Now $local_09_05.ToUniversalTime() -DeliveryTime $dt09)
+Check "already sent this period -> not due" $false `
+    (Test-DailyDigestDue -DigestState @{ last_sent_period = $p0829 } -Now $local_09_05.ToUniversalTime() -DeliveryTime $dt09)
+Check "new period, before delivery time -> not due" $false `
+    (Test-DailyDigestDue -DigestState @{ last_sent_period = '2026-08-28' } -Now $local_08_59.ToUniversalTime() -DeliveryTime $dt09)
+Check "empty state (first run) after delivery time -> due" $true `
+    (Test-DailyDigestDue -DigestState @{} -Now $local_09_05.ToUniversalTime() -DeliveryTime $dt09)
 
 Write-Host "Get-DigestPeriodsMissed — period arithmetic, no stored counter (msg-2102 → msg-2103)"
 Check "no history (initial state) -> 0 (do not alarm on first ever run)" `
