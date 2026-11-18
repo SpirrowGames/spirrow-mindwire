@@ -424,6 +424,11 @@ async def test_r6_posts_one_note_that_moves_the_head_and_pollutes_no_gate_record
     assert body.rstrip().endswith("NEXT: human")
     assert parse_next_token(body) == "human"
     assert MERGE_WAIT_LINE not in body  # the verdict on this head was a COMMENT, not a merge wait
+    # T-fix-push-never-regates D3: the note names who may re-nominate (the configured human
+    # identity, default ``human``) and says an ``operator`` hand-off stops here again.
+    assert f"have human write `NEXT: pr-review {_REF}` by hand" in body
+    assert "including `operator`, is self-nomination" in body
+    assert "retry the merge" not in body
     # No verdict heading and no ci-route marker: R6 / R5 inputs are unchanged by the note.
     relay_after = [m["content"] for m in mcp._messages if m["author"] == "pr-gate-relay"]
     assert verdict_heads(relay_after) == verdict_heads(relay_before)
@@ -466,6 +471,8 @@ async def test_r6_on_a_merge_wait_head_keeps_the_merge_wait_lane() -> None:
     body = mcp.posts[-1]["content"]
     assert MERGE_WAIT_LINE in body
     assert classify_parked(body).lane is ParkedLane.MERGE_WAIT
+    # D3: an APPROVE whose merge failed (lexora#116) needs the merge retried, not a re-gate.
+    assert "The APPROVE on this head stands: if the merge failed, retry the merge" in body
 
 
 @pytest.mark.anyio

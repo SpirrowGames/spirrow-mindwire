@@ -652,6 +652,8 @@ class PrReviewOrchestrator:
         # 1b (pr_event_advance) can re-fire the gate once CI ends on that head, and so
         # verdict_heads does not count this hold as a review (R11). Only PENDING: UNKNOWN (a
         # token / permission fault) and FAILURE would reproduce the same answer if re-fired.
+        # An UNKNOWN hold is still read as a CI wait without the marker (gate_records.ci_wait,
+        # T-fix-push-never-regates D2'), and 1b re-fires it only once its own CI read is terminal.
         if outcome.ci_gated and outcome.ci_state is CiState.PENDING and outcome.head_sha:
             body = f"{body}\n\n{render_ci_hold_marker(head=outcome.head_sha)}"
         try:

@@ -3823,14 +3823,26 @@ class Conductor:
                 merge_wait = is_merge_wait_relay(body)
                 break
         tail = f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}" if merge_wait else f"NEXT: {HUMAN_TOKEN}"
+        # T-fix-push-never-regates D3 (Bohr msg-9571): name WHO may re-nominate. R0-OVERRIDE
+        # trusts the configured human identity only; "a person" read as anyone, and a hand-off
+        # by ``operator`` was then refused here again (lexora msg-1127 / msg-1128). The
+        # exception is not widened: the chatroom does not authenticate author strings.
+        who = self._human_identity or "the configured human identity"
+        merge_retry = (
+            "The APPROVE on this head stands: if the merge failed, retry the merge; "
+            "a re-gate is not needed.\n\n"
+            if merge_wait
+            else ""
+        )
         body = (
             f"{render_admission_heading(pr_ref)}\n\n"
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"{decision.reason}\n\n"
             f"The gate was NOT fired: head {head[:12]} already has a gate verdict in this "
             f"thread, and that verdict's hand-off stands. To review again, push a new commit, or "
-            f"have a person write the pr-review hand-off for {pr_ref} by hand.\n\n"
-            f"{tail}"
+            f"have {who} write `NEXT: pr-review {pr_ref}` by hand (a hand-off by any other "
+            f"author, including `operator`, is self-nomination and stops here again).\n\n"
+            f"{merge_retry}{tail}"
         )
         return await self._post_as_relay(body), merge_wait
 

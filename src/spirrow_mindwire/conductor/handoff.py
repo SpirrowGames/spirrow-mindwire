@@ -1992,7 +1992,11 @@ STOP_FORM_EXAMPLES: tuple[str, ...] = (STOP_DONE_EXAMPLE, BLOCKED_ON_EXAMPLE)
 #: without a sentence here fails the import instead of being accepted but never taught.
 _STOP_TRIGGER_MEANINGS: dict[str, str] = {
     "thread": "`thread <thread-id>` or `thread <project>/<thread-id>` (that thread is resolved)",
-    "pr": "`pr <owner/repo#n>` (that pull request is merged or closed)",
+    # T-fix-push-never-regates D4: the arm wakes on merge / close only, never on a new head.
+    "pr": (
+        "`pr <owner/repo#n>` (that pull request is merged or closed; a new push does not wake "
+        f"it, so after pushing a fix hand to `{PR_REVIEW_TOKEN} <owner/repo#n>` instead)"
+    ),
     "deploy": (
         "`deploy <request_id>` (that deploy request has succeeded, failed or been interrupted)"
     ),
@@ -2192,7 +2196,11 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     Role.IMPLEMENTER: (
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
-        "the independent naysayer review runs before any human merge. For other work, hand back "
+        "the independent naysayer review runs before any human merge. The same holds for a turn "
+        "that pushes a fix to an open PR (answering REQUEST_CHANGES, or any new commit): end it "
+        f"with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>`, not `BLOCKED-ON: pr`. Use "
+        "`BLOCKED-ON: pr` only once the gate has APPROVEd the current head, or to wait on another "
+        "thread's PR. For other work, hand back "
         "to the proposer for a spec-review (`NEXT: <proposer persona>`). You never merge to the "
         "main branch yourself, and you never ask the human to merge: the open PR already requests "
         "the merge and the merge-wait PR list carries it, so a merge is not a Tier-C decision. "

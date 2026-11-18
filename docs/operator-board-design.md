@@ -42,6 +42,10 @@
 | **merged** | (i) 作業スレッドに「PR #N が merge された（sha）」と 1 本書く | 本文に `Closes-thread: <thread_id>` があれば `none`。無ければ proposer |
 | **closed（merge されていない）** | 「PR #N が merge されずに close された（closed_at、最終 head sha）。本スレッドの作業はこの PR では landing していない」と 1 本書く | **`Closes-thread:` の有無に関係なく必ず proposer**。決着の形（`STOP: done`、旧 `NEXT: none`）は書かない |
 | **open**、かつ直前の gate 結果が CI pending による COMMENT で、同じ head の CI が終端 | (ii) gate を 1 回だけ撃ち直す | gate relay が決める |
+| **open**、末尾が役の `BLOCKED-ON: pr <この PR>` park、PR 本文の `Thread:` がこのスレッドを指し、現在の head にこのスレッドの gate verdict が無く、CI が終端（success / failure） | (iii) gate に渡す（T-fix-push-never-regates D1、行 1a〜1f） | `pr-review <PR>`（admission が R4 / R7 を決める） |
+
+- **(ii) の「CI pending による COMMENT」の範囲（T-fix-push-never-regates D2'）**: ci-hold marker のある relay に加えて、marker の無い L1 CI-gate の hold（`VERDICT: COMMENT (ci=pending|unknown)` の直後の行が L1 の hold 文で始まるもの）も含む。check が 0 件で `ci=unknown` になった COMMENT と、marker 導入前の古い hold を救うため。model を通った verdict（chatroom replay で非緑の `ci=` を名乗るものを含む）は含まない。同じ head に `ci=unknown` の hold が 2 本たまったら、その head は R6 で review 済みと数える（gate の token が Actions を読めず UNKNOWN を返し続けるときの無限再発火を 1 回で止める）。
+- **(iii) の手順側の規律（D4）**: 修正を push したターンは `NEXT: pr-review <PR>` で終える。`BLOCKED-ON: pr` は APPROVE の後か、他スレッドの PR を待つときに使う。(iii) は守られなかったときの安全網で、parse での拒否はしない。
 
 - **closed-unmerged で宣言を無視する理由**: `Closes-thread:` は「この PR が landing したらスレッドの目的は果たされる」という条件付きの宣言で、merge されずに close されたならその条件は満たされていない。放棄・差し替え・スレッドごと中止のどれかは判断が要るので、機械は決める主体（proposer）に渡すだけにする。スレッドごとやめるなら proposer 自身が書く。失敗の向き: 誤って閉じる経路は無く、最悪でも proposer が閉じる 1 手が余分にかかるだけ。
 - **優先順位と排他**: (ii) の再発火は **PR が `open` のときだけ**。gate COMMENT の後に PR が close されていたら (ii) は撃たず、closed の行が優先される。死んだ PR に gate を撃つ経路は無い。
