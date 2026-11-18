@@ -2203,6 +2203,16 @@ def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
 SCOPED_REVIEW_BODY_MARKER = "<!-- naysayer:scoped-driver -->"
 
 
+#: The opening words of the two L1 CI-gate ``COMMENT`` holds below (PENDING / UNKNOWN). One
+#: constant per opening, read by both this writer and the reader
+#: :func:`~spirrow_mindwire.conductor.gate_records.ci_wait_head`, which uses them to tell an L1
+#: short-circuit relay (no model ran) from a chatroom-replayed model verdict that happens to
+#: carry a non-green ``ci=`` (the replay pass runs BEFORE the L1 gate — T-fix-push-never-regates
+#: D2', the exception Einstein asked to be checked).
+CI_GATE_PENDING_OPENING = "CI is still running for "
+CI_GATE_UNKNOWN_OPENING = "CI status for "
+
+
 def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
     """Map a non-green CI state to a (verdict, body) — the L1 gate (ADR-16 §D-2).
 
@@ -2219,12 +2229,12 @@ def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
         )
     if ci.state is CiState.PENDING:
         return ReviewEvent.COMMENT, (
-            f"CI is still running for {pr_slug} (head {head}). Holding review until the "
+            f"{CI_GATE_PENDING_OPENING}{pr_slug} (head {head}). Holding review until the "
             f"checks complete — not approving while CI is pending (fail-closed)."
         )
     # UNKNOWN
     return ReviewEvent.COMMENT, (
-        f"CI status for {pr_slug} (head {head}) could not be determined (fail-closed) — "
+        f"{CI_GATE_UNKNOWN_OPENING}{pr_slug} (head {head}) could not be determined (fail-closed) — "
         f"not approving until CI is confirmed green. If this persists, check that "
         f"MINDWIRE_NAYSAYER_GITHUB_TOKEN has `Actions: Read-only`."
     )
@@ -4166,6 +4176,8 @@ class NaysayerPrReviewDriver:
 
 
 __all__ = [
+    "CI_GATE_PENDING_OPENING",
+    "CI_GATE_UNKNOWN_OPENING",
     "NaysayerPrReviewDriver",
     "NaysayerPrReviewError",
     "PrReviewOutcome",
