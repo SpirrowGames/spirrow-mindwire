@@ -622,6 +622,16 @@ function Get-ProjectLivenessContinuationChunks {
     $stamp = Format-LivenessStamp -GeneratedAt $GeneratedAt
     # The header's worst case is "(nnn/nnn)"; reserve it so the k/n numbering cannot push a chunk over.
     $headerReserve = ("続報 @$stamp (999/999)").Length + 1
+    # PR #544 gate objection 2: the split below only starts a new chunk once the current one has a
+    # row, so a row that does not fit even alone would be emitted over budget. Every row is checked
+    # against the budget with the header first; an impossible budget throws (the caller turns a
+    # throw into the one visible "?" line) instead of sending an over-budget message.
+    foreach ($r in $rows) {
+        $len = "$($r.minimal)".Length
+        if ($headerReserve + $len + 1 -gt $Budget) {
+            throw "liveness: follow-up budget $Budget cannot hold a $len-char row with its header ($headerReserve chars)"
+        }
+    }
     $groups = @()
     $cur = [System.Collections.Generic.List[string]]::new(); $curCost = $headerReserve
     foreach ($r in $rows) {
@@ -729,6 +739,13 @@ function ConvertFrom-LivenessProbeReports {
         else {
             $entry = $listing[$proj]
             if (& $isUnmeasured $entry 'threads') { $tReason = "listing: $(& $get $entry 'error')" }
+            else {
+                # PR #544 gate objection 1: a row with no readable thread identity means the
+                # population was not measured; dropping the row would let the rest read as EMPTY /
+                # DONE. The whole project's threads are unmeasured instead.
+                $noId = @(@(& $get $entry 'threads') | Where-Object { $null -eq $_ -or -not "$(& $get $_ 'thread_id')".Trim() }).Count
+                if ($noId -gt 0) { $tReason = "listing: $noId row(s) without a readable thread identity" }
+            }
         }
         $pReason = $null
         if ($prWhole) { $pReason = $prWhole }
