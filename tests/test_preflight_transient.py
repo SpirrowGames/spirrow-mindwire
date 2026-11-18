@@ -149,6 +149,9 @@ def _run(
     hooks = tmp_path / "hooks"
     hooks.mkdir(exist_ok=True)
     (hooks / "pre-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+    guard = hooks / "pre-push"
+    guard.write_text("#!/bin/sh\n# mindwire-guard: non-ff-expect v1\n", encoding="utf-8")
+    guard.chmod(0o755)
     result: list[str] | BaseException
     try:
         result = preflight_gate(
