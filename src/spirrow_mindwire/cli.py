@@ -142,6 +142,13 @@ def _build_parser() -> argparse.ArgumentParser:
     from .settled_close.__main__ import add_arguments as add_settled_close_arguments
 
     add_settled_close_arguments(settled)
+    drift = sub.add_parser(
+        "ledger-drift",
+        help="ledger_drift: where the task ledger lags merged PRs / open threads (read only)",
+    )
+    from .ledger_drift.__main__ import add_arguments as add_ledger_drift_arguments
+
+    add_ledger_drift_arguments(drift)
     iso = sub.add_parser(
         "turn-isolation-check",
         help="S8: check the turn user's credentials and clones; exit 0 ok/off, 10 stop",
@@ -206,6 +213,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         from .settled_close.__main__ import run as run_settled_close
 
         raise SystemExit(run_settled_close(args))
+    if args.command == "ledger-drift":
+        from .ledger_drift.__main__ import run as run_ledger_drift
+
+        raise SystemExit(run_ledger_drift(args))
     if args.command == "clone-recover":
         from .clone_recover import run as run_clone_recover
 
