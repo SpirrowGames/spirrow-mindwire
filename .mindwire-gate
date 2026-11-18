@@ -15,6 +15,7 @@ pwsh -NoProfile -File tests/Test-SweepHoldGate.ps1
 pwsh -NoProfile -File tests/Test-SweepQuarantine.ps1
 pwsh -NoProfile -File tests/Test-SweepRetry.ps1
 pwsh -NoProfile -File tests/Test-SweepDigest.ps1
+pwsh -NoProfile -File tests/Test-ProjectLiveness.ps1
 pwsh -NoProfile -File tests/Test-ClearQuarantine.ps1
 pwsh -NoProfile -File tests/Test-Lease.ps1
 pwsh -NoProfile -File tests/Test-SyncRepo.ps1

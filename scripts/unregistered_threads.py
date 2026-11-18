@@ -174,6 +174,7 @@ import sys
 from pathlib import Path
 from typing import Any, Protocol
 
+from spirrow_mindwire.chatroom.status import FINISHED_STATUSES
 from spirrow_mindwire.config import DEFAULT_DATA_DIR
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 from spirrow_mindwire.magickit.read_only import ReadOnlyMcp as _SharedReadOnlyMcp
@@ -233,8 +234,40 @@ def _as_dict(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[ListedThread], int, int]:
+#: The statuses the ``--liveness`` walk asks for (T-digest-lacks-project-liveness-view): the live
+#: set plus ``parked`` and the finished set. ``parked`` is the value
+#: :mod:`spirrow_mindwire.pr_event_advance.runner` already sends to production; the finished set is
+#: :data:`~spirrow_mindwire.chatroom.status.FINISHED_STATUSES`. The liveness view needs the parked
+#: and closed counts, and the closed set itself (a sweep entry for a closed thread is ``rot``).
+LIVENESS_STATUSES: tuple[str, ...] = tuple(
+    sorted(set(LIVE_STATUSES) | {"parked"} | set(FINISHED_STATUSES))
+)
+
+
+def _liveness_item(item: dict[str, Any]) -> dict[str, Any]:
+    """The three fields the liveness view reads, raw. The time is NOT parsed here: the intake's
+    single parse point (``classify_activity_at``) stays the only one in this script, and the
+    liveness lib normalises the raw string once, at its own intake (R-9)."""
+    raw_at = item.get(ACTIVITY_FIELD)
+    return {
+        "thread_id": str(item.get("thread_id") or "").strip(),
+        "status": str(item.get("status") or "").strip(),
+        "last_activity_at": raw_at if isinstance(raw_at, str) else None,
+    }
+
+
+async def _list_live_threads(
+    mcp: ToolCaller, project: str, liveness: list[dict[str, Any]] | None = None
+) -> tuple[list[ListedThread], int, int]:
     """Every live thread in a project, paged, filtered server-side to :data:`LIVE_STATUSES`.
+
+    ``liveness`` (T-digest-lacks-project-liveness-view): when a list is passed, the SAME walk asks
+    for :data:`LIVENESS_STATUSES` instead and appends every dict item, of any status, to it as
+    :func:`_liveness_item`. Items whose status is not live are then set aside BEFORE anything the
+    intake reads: they are not classified, not counted in ``field_absent`` and not returned, so the
+    intake sees exactly the population the narrow filter gives it. ``malformed`` still counts every
+    non-dict item, because a non-dict has no status to split on. With ``liveness=None`` (the
+    default) the request and the result are exactly what they were before.
 
     Passing ``status_filter`` at the tool boundary keeps the request
     scope narrow: a project with hundreds of resolved threads does not
@@ -263,7 +296,7 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
     was being dropped without ever being counted). The remedy is
     therefore to *observe* the drop count, not to change the arithmetic.
     """
-    statuses = sorted(LIVE_STATUSES)
+    statuses = list(LIVENESS_STATUSES) if liveness is not None else sorted(LIVE_STATUSES)
     out: list[ListedThread] = []
     malformed = 0
     field_absent = 0
@@ -287,6 +320,10 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
             break
         for item in items:
             if isinstance(item, dict):
+                if liveness is not None:
+                    liveness.append(_liveness_item(item))
+                    if str(item.get("status") or "").strip() not in LIVE_STATUSES:
+                        continue
                 if ACTIVITY_FIELD not in item:
                     field_absent += 1
                 out.append(ListedThread(item, classify_activity_at(item.get(ACTIVITY_FIELD))))
@@ -306,7 +343,10 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[Listed
 
 
 async def _enumerate_project_with_recovery(
-    mcp: ToolCaller, project: str, registered: RegisteredIndex
+    mcp: ToolCaller,
+    project: str,
+    registered: RegisteredIndex,
+    liveness: dict[str, Any] | None = None,
 ) -> ProjectReport:
     """Enumerate one project, converting any MCP failure into a :class:`ProjectReport` error.
 
@@ -328,15 +368,45 @@ async def _enumerate_project_with_recovery(
     ``malformed_count = None`` — a listing that raised does not have a
     knowable malformed count.
     """
+    rows: list[dict[str, Any]] | None = [] if liveness is not None else None
     try:
-        threads, malformed, field_absent = await _list_live_threads(mcp, project)
+        threads, malformed, field_absent = await _list_live_threads(mcp, project, rows)
     except MagickitMcpError as exc:
+        _record_liveness(liveness, project, None, f"chatroom_list_threads failed: {exc}")
         return project_error_report(project, f"chatroom_list_threads failed: {exc}")
     except Exception as exc:  # pragma: no cover - defence in depth
+        _record_liveness(liveness, project, None, f"unexpected {type(exc).__name__}: {exc}")
         return project_error_report(project, f"unexpected {type(exc).__name__}: {exc}")
+    # PR #544 gate objection 1: a listing with a row that has no readable thread identity (a
+    # non-dict item, or a dict with no thread_id) did not measure the project's thread population.
+    # Recording it as measured would let an unreadable listing read as EMPTY / DONE. The intake
+    # report below is unaffected: it keeps its own ``malformed_count``.
+    unreadable = malformed + sum(1 for r in rows or [] if not r.get("thread_id"))
+    if liveness is not None and unreadable:
+        _record_liveness(
+            liveness,
+            project,
+            None,
+            f"{unreadable} listing row(s) without a readable thread identity",
+        )
+    else:
+        _record_liveness(liveness, project, rows, None)
     return enumerate_project(
         project, threads, registered, malformed_count=malformed, field_absent_count=field_absent
     )
+
+
+def _record_liveness(
+    liveness: dict[str, Any] | None,
+    project: str,
+    rows: list[dict[str, Any]] | None,
+    error: str | None,
+) -> None:
+    """One project's liveness entry. A failed listing records ``threads: null`` and the error,
+    never an empty list, which would read as "measured, no threads" (EMPTY / DONE)."""
+    if liveness is None:
+        return
+    liveness[project] = {"threads": rows if error is None else None, "error": error}
 
 
 async def _lookup_tags(
@@ -363,15 +433,19 @@ async def _lookup_tags(
     return apply_tag_lookups(report, results, needed=len(targets))
 
 
-async def _enumerate_all(mcp: ToolCaller, registered: RegisteredIndex) -> EnumerateReport:
+async def _enumerate_all(
+    mcp: ToolCaller, registered: RegisteredIndex, liveness: dict[str, Any] | None = None
+) -> EnumerateReport:
     reports: list[ProjectReport] = []
     for project in registered.projects:
-        reports.append(await _enumerate_project_with_recovery(mcp, project, registered))
+        reports.append(await _enumerate_project_with_recovery(mcp, project, registered, liveness))
     return await _lookup_tags(mcp, EnumerateReport(projects=tuple(reports)), registered)
 
 
-async def _run(registered: RegisteredIndex, url: str | None) -> EnumerateReport:
-    return await _enumerate_all(ReadOnlyMcp(StreamableHttpChatroomMcp(url)), registered)
+async def _run(
+    registered: RegisteredIndex, url: str | None, liveness: dict[str, Any] | None = None
+) -> EnumerateReport:
+    return await _enumerate_all(ReadOnlyMcp(StreamableHttpChatroomMcp(url)), registered, liveness)
 
 
 def default_sweep_config_path() -> Path:
@@ -386,6 +460,14 @@ def main() -> int:
         help=f"sweep.json path (default: {default_sweep_config_path()})",
     )
     parser.add_argument("--url", default=None, help="magickit MCP URL (default: env/in-code)")
+    parser.add_argument(
+        "--liveness",
+        action="store_true",
+        help=(
+            "also emit `liveness`: every thread of every status per project, read from the same "
+            "listing walk (T-digest-lacks-project-liveness-view)"
+        ),
+    )
     args = parser.parse_args()
 
     path = Path(args.sweep_config) if args.sweep_config else default_sweep_config_path()
@@ -405,8 +487,9 @@ def main() -> int:
         print(json.dumps(EnumerateReport().as_json(), ensure_ascii=True, sort_keys=True))
         return 0
 
+    liveness: dict[str, Any] | None = {} if args.liveness else None
     try:
-        report = asyncio.run(_run(registered, args.url))
+        report = asyncio.run(_run(registered, args.url, liveness))
     except Phase0WriteAttemptedError as exc:
         print(f"unregistered_threads: {exc}", file=sys.stderr)
         return 1
@@ -418,7 +501,10 @@ def main() -> int:
     # which may contain non-ASCII; ``ensure_ascii=True`` emits ``\uXXXX``
     # escapes so the byte stream is invariant across code pages, matching
     # the wrapper's UTF-8 read side.
-    print(json.dumps(report.as_json(), ensure_ascii=True, sort_keys=True))
+    payload = report.as_json()
+    if liveness is not None:
+        payload["liveness"] = liveness
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
     return 0
 
 
