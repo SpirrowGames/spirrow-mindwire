@@ -39,14 +39,8 @@ $LivenessMaxMinimalRowLength = 200
 # closure rule requires (msg-2201 §3). $null for a tier means "unreachable by definition"; reaching
 # it is a contradiction and throws. A state or signal with no entry throws too: a new one cannot be
 # added without writing its triple here.
-#
-# pr_dependent (R-13, Bohr msg-9562, Einstein go): whether the state's predicate needs the open-PR
-# count. When that count is unknown this tick (PR listing failed / no `clones` entry / a shared repo),
-# only the pr_dependent = $false states are evaluated, in table order, and a project that matches
-# none of them lands in the explicit UNMEASURED sink. The column is part of the closed table: an
-# entry without it throws (same closure rule as the tier triple, R-8).
-# UNMEASURED (msg-9346 §2 / msg-9560 / msg-9562): a project whose threads were not measured, or the
-# R-13 sink. Never evaluated by a predicate, so its pr_dependent is $false; tier 2 flat.
+# pr_dependent (R-13, msg-9562): the predicate needs the open-PR count; a missing column throws.
+# UNMEASURED (msg-9346 §2 / R-13): threads not measured, or the R-13 sink; tier 2 flat.
 $LivenessStateTier = @{
     'UNTRACKED'  = @{ threshold = 'stall'; under = 2;     over = 3;     pr_dependent = $false }
     'STALLED'    = @{ threshold = 'stall'; under = $null; over = 3;     pr_dependent = $false }
@@ -58,7 +52,7 @@ $LivenessStateTier = @{
     'EMPTY'      = @{ threshold = $null;   under = 0;     over = 0;     pr_dependent = $true }
     'UNMEASURED' = @{ threshold = $null;   under = 2;     over = 2;     pr_dependent = $false }
 }
-# The floor tier of a row with any unmeasured fact (msg-9560 / R-13 step 5: max(2, state, signals)).
+# Floor tier of a row with any unmeasured fact (R-13 step 5).
 $LivenessUnmeasuredFloorTier = 2
 $LivenessSignalTier = @{
     'dark'  = @{ threshold = 'stall'; under = 2;     over = 3 }
@@ -67,9 +61,7 @@ $LivenessSignalTier = @{
 }
 # Attention order is by tier, so one name per tier for the omitted-row breakdown (msg-2199).
 $LivenessTierName = @{ 3 = 'critical'; 2 = 'watch'; 1 = 'hygiene'; 0 = 'quiet' }
-# L0 state tally abbreviations, in table order.
-# Table v3's evaluation order is $LivenessTableOrder; UNMEASURED is not in it (it is the sink /
-# the threads-unmeasured state, never matched by a predicate) but is tallied last on L0.
+# Table v3 evaluation order; UNMEASURED is never matched by a predicate but is tallied on L0.
 $LivenessTableOrder = @('UNTRACKED', 'HUMAN', 'STALLED', 'RUNNING', 'SHIP', 'PARKED', 'DONE', 'EMPTY')
 $LivenessStateOrder = @($LivenessTableOrder) + @('UNMEASURED')
 $LivenessStateAbbrev = @{
@@ -142,12 +134,8 @@ function Get-LivenessAgeAgg {
 #   -Nominations   hashtable "project/thread_id" -> nomination ('human' / 'none' / persona name)
 #   -OpenPrs       objects { project; created_at }
 #   -Projects      extra project names to enumerate (D-6 union: sweep / chatroom / list)
-#   -ThreadsUnmeasured  project names whose THREAD listing failed this tick. They still get a row
-#                  (INV-VIS: a failed listing must be visible by name, msg-9346 §2), but no thread
-#                  fact is computed from partial data: the row is UNMEASURED, tier 2.
-#   -PrsUnmeasured project names whose open-PR count is unknown this tick (PR listing failed, no
-#                  `clones` entry, a shared repo — msg-9560 Obj-12-1). Their thread facts are used in
-#                  full; R-13 decides the state without the PR count.
+#   -ThreadsUnmeasured  thread listing not measured: the row is UNMEASURED, tier 2 (msg-9346 §2)
+#   -PrsUnmeasured project open-PR count unknown: thread facts used, R-13 decides the state
 # Enumeration is the D-6 union and every row keeps its sources, so a name that exists only in
 # sweep.json renders '(sweep-only)' (msg-2197).
 function Get-ProjectLivenessFacts {
@@ -184,8 +172,7 @@ function Get-ProjectLivenessFacts {
         $threadsMeasured = -not $threadsUnmeasuredSet.ContainsKey($proj)
         $prsMeasured = -not $prsUnmeasuredSet.ContainsKey($proj)
         if (-not $threadsMeasured) {
-            # No thread fact from partial data: every thread-derived field is empty, so no signal
-            # (dark / stale / rot are all thread facts) and no predicate can fire on it.
+            # No thread fact from partial data, so no signal and no predicate can fire.
             $prsT = @()
             if ($prsMeasured) {
                 foreach ($pr in @($OpenPrs)) {
@@ -267,8 +254,7 @@ function Get-ProjectLivenessFacts {
     return , $out
 }
 
-# Whether a facts record's thread / PR facts were measured. A record built before these fields
-# existed reads as measured, so the default is the pre-R-13 behaviour.
+# A facts record without the *_measured fields reads as measured.
 function Test-LivenessMeasured {
     param($Facts, [string]$What)
     $name = "${What}_measured"
@@ -276,8 +262,7 @@ function Test-LivenessMeasured {
     return $true
 }
 
-# R-13's closed column: does the state's predicate need the open-PR count? A table entry without
-# the column throws (closure rule, R-8).
+# R-13 closed column; a missing entry or column throws (R-8 closure).
 function Test-LivenessStatePrDependent {
     param([string]$State)
     if (-not $LivenessStateTier.ContainsKey($State)) { throw "liveness: state '$State' has no table entry (closure rule, msg-2201 §3)" }
@@ -291,14 +276,9 @@ function Test-LivenessStatePrDependent {
 # 判定表 v3 (msg-2195), first match wins, with `tracked_open > 0` written INTO each tracked
 # predicate (R-5: not left to evaluation order). Returns @{ state; age } where age is the aggregate
 # the state's threshold is judged on (R-4: min for STALLED/RUNNING; oldest for the rest).
-#
-# R-13 (Bohr msg-9562, Einstein go): when the open-PR count is unknown, the pr_dependent states
-# (SHIP / DONE / EMPTY) are skipped, the others are evaluated in the same table order with the same
-# first-match rule, and a project that matches none of them goes to the explicit UNMEASURED sink —
-# it is classified there, not replaced afterwards, so every input ends in exactly one state. The PR
-# term of PARKED's predicate is only there because SHIP precedes it (open = 0 ∧ PR > 0 is SHIP);
-# with SHIP skipped it is dropped, which is what classifying PARKED as PR-independent means.
-# Thread facts unmeasured: no predicate can be evaluated at all, so the state is UNMEASURED.
+# R-13 (msg-9562): PR count unknown -> skip the pr_dependent states, first match over the rest,
+# else the explicit UNMEASURED sink. PARKED's PR=0 term exists only because SHIP precedes it, so
+# it is dropped. Threads unmeasured -> UNMEASURED.
 function Get-ProjectLivenessState {
     param($Facts)
     $f = $Facts
@@ -379,8 +359,7 @@ function Get-ProjectLivenessTier {
         $signals += @{ name = 'rot'; tier = $e.tier; ratio = $e.ratio }
     }
     foreach ($g in $signals) { if ($g.tier -gt $tier) { $tier = $g.tier }; if ($g.ratio -gt $ratio) { $ratio = $g.ratio } }
-    # msg-9560 / R-13 step 5: a row with any unmeasured fact is at least watch, never quiet; a known
-    # critical (state or signal) stays critical.
+    # R-13 step 5: any unmeasured fact -> at least tier 2; a known critical stays critical.
     if (-not (Test-LivenessMeasured $Facts 'threads') -or -not (Test-LivenessMeasured $Facts 'prs')) {
         if ($LivenessUnmeasuredFloorTier -gt $tier) { $tier = $LivenessUnmeasuredFloorTier }
     }
@@ -434,8 +413,7 @@ function Get-ProjectLivenessRow {
     }
     $threadsKnown = Test-LivenessMeasured $f 'threads'
     $prsKnown = Test-LivenessMeasured $f 'prs'
-    # msg-9346 §2 / msg-9562 step 4: the unmeasured marker sits right after the state token, in every
-    # rendering level including the minimal form, so the follow-ups carry it too.
+    # R-13 step 4: the marker follows the state token at every level, minimal form included.
     $unmeasuredMark = @()
     if (-not $threadsKnown) { $unmeasuredMark += 'threads unmeasured' }
     if (-not $prsKnown) { $unmeasuredMark += 'PRs unmeasured' }
@@ -560,8 +538,6 @@ function Get-ProjectLivenessDigestLines {
     $states = @($LivenessStateOrder | Where-Object { [int]$stateCount[$_] -gt 0 } | ForEach-Object { "$($LivenessStateAbbrev[$_])$($stateCount[$_])" }) -join '/'
     if (-not $states) { $states = '-' }
     $l0 = "$(@($rows).Count) projects — attention: $($tierCount[3]) critical / $($tierCount[2]) watch / $($tierCount[1]) hygiene · states $states · open $openTotal · PR $prTotal"
-    # The count summary of the rows carrying an unmeasured fact (msg-9346 §2: kept as a summary; the
-    # rows themselves name the projects).
     if ($unmeasuredN -gt 0) { $l0 += " · unmeasured $unmeasuredN" }
     if ($l0.Length -gt $LivenessL0Budget) {
         throw "liveness: L0 is $($l0.Length) chars (> $LivenessL0Budget, msg-2203 §7)"
@@ -622,10 +598,7 @@ function Get-ProjectLivenessContinuationChunks {
     $stamp = Format-LivenessStamp -GeneratedAt $GeneratedAt
     # The header's worst case is "(nnn/nnn)"; reserve it so the k/n numbering cannot push a chunk over.
     $headerReserve = ("続報 @$stamp (999/999)").Length + 1
-    # PR #544 gate objection 2: the split below only starts a new chunk once the current one has a
-    # row, so a row that does not fit even alone would be emitted over budget. Every row is checked
-    # against the budget with the header first; an impossible budget throws (the caller turns a
-    # throw into the one visible "?" line) instead of sending an over-budget message.
+    # PR #544 gate obj 2: a row that cannot fit with the header throws, never sent over budget.
     foreach ($r in $rows) {
         $len = "$($r.minimal)".Length
         if ($headerReserve + $len + 1 -gt $Budget) {
@@ -681,13 +654,9 @@ function ConvertTo-ProjectLivenessSnapshot {
 #   -HeadSkip                       state\head_skip.json as read: thread_id -> record. It is keyed by
 #                                   thread_id ALONE (no project), so the nomination is looked up by
 #                                   the listed thread's id and stored under "project/thread_id".
-# Fail direction (msg-9346 §2, msg-9560 Obj-12-1, msg-9562 R-13): nothing unmeasured is ever
-# written as an empty list. A project whose THREAD listing failed is ThreadsUnmeasured (its row is
-# UNMEASURED; no thread fact from partial data). A project whose open-PR count is unknown — PR listing
-# failed, a shared repo, or no `clones` entry at all (mindwire not opening PRs there does not mean
-# nobody does) — is PrsUnmeasured: its thread facts are used, R-13 decides its state. A whole-probe
-# failure makes every known project unmeasured on that side. Unmeasured is the union with reasons,
-# for the log line; NoPrSource still names the no-`clones` projects for the log line.
+# Fail direction: nothing unmeasured is written as an empty list. Thread listing failed ->
+# ThreadsUnmeasured; PR count unknown (failed, shared repo, no `clones` entry: Obj-12-1) ->
+# PrsUnmeasured. Unmeasured (union, with reasons) and NoPrSource feed the log lines.
 function ConvertFrom-LivenessProbeReports {
     param(
         $ListingReport = $null,
@@ -706,9 +675,7 @@ function ConvertFrom-LivenessProbeReports {
         return $m
     }
     $get = { param($o, [string]$k) if ($null -eq $o) { return $null }; if ($o -is [System.Collections.IDictionary]) { return $o[$k] }; return $o.$k }
-    # "Was this list measured?" must not go through $get: an empty list returned from a scriptblock
-    # unrolls to $null, which would read a measured `[]` (zero open PRs, zero threads) as `null`
-    # (not measured). The value is read and compared in the same scope instead.
+    # Not via $get: an empty list returned from a scriptblock unrolls to $null.
     $isUnmeasured = {
         param($o, [string]$k)
         if ($null -eq $o) { return $true }
@@ -740,9 +707,7 @@ function ConvertFrom-LivenessProbeReports {
             $entry = $listing[$proj]
             if (& $isUnmeasured $entry 'threads') { $tReason = "listing: $(& $get $entry 'error')" }
             else {
-                # PR #544 gate objection 1: a row with no readable thread identity means the
-                # population was not measured; dropping the row would let the rest read as EMPTY /
-                # DONE. The whole project's threads are unmeasured instead.
+                # PR #544 gate obj 1: a row without a thread id -> threads unmeasured.
                 $noId = @(@(& $get $entry 'threads') | Where-Object { $null -eq $_ -or -not "$(& $get $_ 'thread_id')".Trim() }).Count
                 if ($noId -gt 0) { $tReason = "listing: $noId row(s) without a readable thread identity" }
             }
@@ -775,8 +740,7 @@ function ConvertFrom-LivenessProbeReports {
     }
     return @{
         Threads           = $threads
-        # A threads-unmeasured project's sweep entries are dropped: rot cannot be judged without its
-        # thread listing, and its row is UNMEASURED regardless.
+        # rot cannot be judged without the thread listing.
         SweepEntries      = @(@($SweepEntries) | Where-Object { -not $threadsUnmeasured.Contains("$(& $get $_ 'project')") })
         Nominations       = $nominations
         OpenPrs           = $openPrs
