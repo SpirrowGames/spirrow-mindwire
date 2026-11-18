@@ -727,6 +727,28 @@ def test_a_failed_listing_records_null_threads_not_an_empty_list() -> None:
     assert "boom" in liveness["bad"]["error"]
 
 
+def test_unreadable_listing_rows_make_the_liveness_listing_unmeasured() -> None:
+    """PR #544 gate objection 1: a non-dict row, or a dict with no thread_id, means the thread
+    population was not measured. It must record ``threads: null`` (never a short list that could
+    read as EMPTY / DONE), while the intake keeps reading what it always read."""
+    no_id = _real_item("T-x", "resolved")
+    no_id.pop("thread_id")
+    cases: list[list[Any]] = [["garbage"], [_real_item("T-a", "active"), no_id]]
+    for items in cases:
+        inner = _RecordingMcp({"p": items})
+        liveness: dict[str, Any] = {}
+        registered = RegisteredIndex(projects=("p",), pairs=frozenset())
+        asyncio.run(_MODULE._enumerate_all(inner, registered, liveness))
+        assert liveness["p"]["threads"] is None
+        assert "without a readable thread identity" in liveness["p"]["error"]
+    clean = _RecordingMcp({"p": [_real_item("T-a", "active")]})
+    liveness = {}
+    asyncio.run(
+        _MODULE._enumerate_all(clean, RegisteredIndex(projects=("p",), pairs=frozenset()), liveness)
+    )
+    assert liveness["p"]["error"] is None
+
+
 def test_main_emits_liveness_only_with_the_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

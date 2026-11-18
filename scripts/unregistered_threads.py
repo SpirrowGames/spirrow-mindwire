@@ -377,7 +377,20 @@ async def _enumerate_project_with_recovery(
     except Exception as exc:  # pragma: no cover - defence in depth
         _record_liveness(liveness, project, None, f"unexpected {type(exc).__name__}: {exc}")
         return project_error_report(project, f"unexpected {type(exc).__name__}: {exc}")
-    _record_liveness(liveness, project, rows, None)
+    # PR #544 gate objection 1: a listing with a row that has no readable thread identity (a
+    # non-dict item, or a dict with no thread_id) did not measure the project's thread population.
+    # Recording it as measured would let an unreadable listing read as EMPTY / DONE. The intake
+    # report below is unaffected: it keeps its own ``malformed_count``.
+    unreadable = malformed + sum(1 for r in rows or [] if not r.get("thread_id"))
+    if liveness is not None and unreadable:
+        _record_liveness(
+            liveness,
+            project,
+            None,
+            f"{unreadable} listing row(s) without a readable thread identity",
+        )
+    else:
+        _record_liveness(liveness, project, rows, None)
     return enumerate_project(
         project, threads, registered, malformed_count=malformed, field_absent_count=field_absent
     )

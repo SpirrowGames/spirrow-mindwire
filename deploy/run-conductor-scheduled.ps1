@@ -2056,6 +2056,17 @@ function Test-DigestDeliveryDue {
     return $local.TimeOfDay -ge $DeliveryTime
 }
 
+# The whole "is the digest due this tick" predicate: a new period AND the delivery time reached.
+# One definition, read by the digest branch and by the intake probe's liveness switch.
+function Test-DailyDigestDue {
+    param([hashtable]$DigestState, [datetime]$Now, [TimeSpan]$DeliveryTime)
+    $last = $null
+    if ($DigestState -and $DigestState.ContainsKey('last_sent_period') -and $DigestState['last_sent_period']) {
+        $last = [string]$DigestState['last_sent_period']
+    }
+    return (($last -ne (Get-DigestPeriod -Now $Now)) -and (Test-DigestDeliveryDue -Now $Now -DeliveryTime $DeliveryTime))
+}
+
 # Compute the "periods missed since the operator was last told the queue" from health state.
 #
 # Uses date arithmetic on the parsed period ids so daylight-savings transitions do not skew the
@@ -5603,13 +5614,25 @@ function Invoke-HeadProbe {
 # `error`, which Resolve-UnregisteredIntake turns into "nothing auto-registered this tick" plus a "?"
 # row in the digest. Failing that way is safe in both directions: the listed candidates still run,
 # and the operator sees that the intake did not look.
+#
+# -Liveness (T-digest-lacks-project-liveness-view; PR #544 gate advisory 3): the walk also asks for
+# parked and closed threads for the liveness view. Only the digest tick reads that, so the caller
+# passes it only when the digest is due (Test-DailyDigestDue); an ordinary intake tick keeps the
+# narrow live-status walk and does not page through closed history. Two literal calls, so the CLI
+# contract test checks both argv shapes.
 function Invoke-UnregisteredThreadsProbe {
-    param([string]$SweepConfigPath)
+    param([string]$SweepConfigPath, [switch]$Liveness)
     $probe = Join-Path $repoRoot "scripts\unregistered_threads.py"
     if (-not (Test-Path -LiteralPath $probe)) { return @{ report = $null; error = "script not found: $probe" } }
     try {
-        $r = Invoke-BoundedUvProbe -Label 'unregistered-threads' -TimeoutSeconds $UnregisteredThreadsProbeTimeoutSeconds `
-            -Arguments @($probe, '--sweep-config', $SweepConfigPath, '--liveness')
+        if ($Liveness) {
+            $r = Invoke-BoundedUvProbe -Label 'unregistered-threads-liveness' -TimeoutSeconds $UnregisteredThreadsProbeTimeoutSeconds `
+                -Arguments @($probe, '--sweep-config', $SweepConfigPath, '--liveness')
+        }
+        else {
+            $r = Invoke-BoundedUvProbe -Label 'unregistered-threads' -TimeoutSeconds $UnregisteredThreadsProbeTimeoutSeconds `
+                -Arguments @($probe, '--sweep-config', $SweepConfigPath)
+        }
     }
     catch { return @{ report = $null; error = "invocation failed: $($_.Exception.Message)" } }
     if ($r.timedOut) { return @{ report = $null; error = "timed out after ${UnregisteredThreadsProbeTimeoutSeconds}s (process tree killed)" } }
@@ -6563,7 +6586,13 @@ try {
     $phaseStartUtc = Get-SweepNowUtc
     $sweepIntakeConfig = Get-SweepIntakeConfig -Path $sweepConfigPath
     foreach ($w in @(Get-CloneCandidateMismatches -Candidates $candidates -Clones $sweepIntakeConfig.clones)) { Write-Log $w }
-    $unregProbe = Invoke-UnregisteredThreadsProbe -SweepConfigPath $sweepConfigPath
+    # The liveness walk is wanted only when this tick will send the digest (PR #544 gate advisory 3).
+    # Same predicate as the digest branch below, read from the same state file; if the two ever
+    # disagree, the digest branch finds no `liveness` key and every project renders unmeasured,
+    # never quiet.
+    $livenessWalk = Test-DailyDigestDue -DigestState (Get-JsonState -Path $digestStatePath) -Now ([DateTime]::UtcNow) `
+        -DeliveryTime $DailyDigestDeliveryTime
+    $unregProbe = Invoke-UnregisteredThreadsProbe -SweepConfigPath $sweepConfigPath -Liveness:$livenessWalk
     $unregisteredIntake = Resolve-UnregisteredIntake -Candidates $candidates -Report $unregProbe.report -ProbeError $unregProbe.error `
         -IntakeConfig $sweepIntakeConfig -DaemonRoot $repoRoot
     $candidates = Join-UnregisteredCandidates -Candidates $candidates -Intake $unregisteredIntake
@@ -8123,8 +8152,7 @@ try {
     if ($digestState.ContainsKey('last_sent_period') -and $digestState['last_sent_period']) {
         $lastSentPeriod = [string]$digestState['last_sent_period']
     }
-    $deliveryDue = Test-DigestDeliveryDue -Now $nowUtc -DeliveryTime $DailyDigestDeliveryTime
-    $digestDue = ($lastSentPeriod -ne $currentPeriod) -and $deliveryDue
+    $digestDue = Test-DailyDigestDue -DigestState $digestState -Now $nowUtc -DeliveryTime $DailyDigestDeliveryTime
     if ($digestDue) {
         # Load notify-health for ⚠ derivation (D-6). Missing file = empty hashtable (state files
         # are corrupt-tolerant per Get-JsonState). Never fails the sweep on health-file trouble.
