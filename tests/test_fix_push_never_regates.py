@@ -7,8 +7,11 @@ D2' — an L1 CI-gate wait (``VERDICT: comment (ci=pending|unknown)`` + an L1 op
       old marker-less UNKNOWN COMMENTs are rescued too.
 D3  — the R6 note names who may re-nominate, and on a merge wait says to retry the merge.
 
-The relay bodies here are built from the real writers (``render_relay_heading`` and the L1
-``_ci_gate_response``), so a reworded hold breaks these tests rather than the reader.
+Most relay bodies here are built from the current writers (``render_relay_heading`` and the L1
+``_ci_gate_response``). Those share the opening constants with the reader, so on their own they
+cannot catch a reword that orphans holds already stored in chatroom history: the
+``_LEGACY_*`` literals below freeze the bodies exactly as the pre-change writer (main @ 061d822)
+laid them out, and a reword of an opening breaks those tests instead.
 """
 
 from __future__ import annotations
@@ -75,6 +78,37 @@ def _model_relay(event: str, ci: str, head: str = _HEAD) -> str:
 
 
 # --------------------------------------------------------------------------- D2' reader
+
+
+# Frozen literals: an L1 hold relay as stored in chatroom history before this change (writer text
+# from main @ 061d822). Do NOT build these from the writer — they pin backward compatibility.
+_LEGACY_PENDING_RELAY = (
+    "PR-gate (Tier B independent naysayer) — acme/widgets#7 @ "
+    "703b836737f29fe0f4139d86d2d02077c662ce5f\n\n"
+    "VERDICT: COMMENT (ci=pending)\n\n"
+    "CI is still running for acme/widgets#7 (head 703b836737f29fe0f4139d86d2d02077c662ce5f). "
+    "Holding review until the checks complete — not approving while CI is pending (fail-closed)."
+    "\n\nNEXT: human"
+)
+_LEGACY_UNKNOWN_RELAY = (
+    "PR-gate (Tier B independent naysayer) — acme/widgets#7 @ "
+    "703b836737f29fe0f4139d86d2d02077c662ce5f\n\n"
+    "VERDICT: COMMENT (ci=unknown)\n\n"
+    "CI status for acme/widgets#7 (head 703b836737f29fe0f4139d86d2d02077c662ce5f) could not be "
+    "determined (fail-closed) — not approving until CI is confirmed green. If this persists, "
+    "check that MINDWIRE_NAYSAYER_GITHUB_TOKEN has `Actions: Read-only`."
+    "\n\nNEXT: human"
+)
+
+
+@pytest.mark.parametrize(
+    ("body", "state"),
+    [(_LEGACY_PENDING_RELAY, CiState.PENDING), (_LEGACY_UNKNOWN_RELAY, CiState.UNKNOWN)],
+)
+def test_d2_frozen_historical_hold_literal_is_a_ci_wait(body: str, state: CiState) -> None:
+    assert ci_wait(body) == (_HEAD, state)
+    assert ci_wait_head(body) == _HEAD
+    assert verdict_heads([body]) == frozenset()
 
 
 @pytest.mark.parametrize("state", [CiState.PENDING, CiState.UNKNOWN])
