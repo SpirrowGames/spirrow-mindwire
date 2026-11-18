@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, assert_never
 
 from ..chatroom.status import FINISHED_STATUSES
+from ..conductor.gate_records import RELAY_AUTHOR, verdict_heads
 from ..github.client import CiState, CiStatus, PrRef, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ..repo_projects import RepoProjectMap
@@ -47,11 +48,15 @@ from ..tail_cache import CachedTail, TailCache
 from .decide import (
     PR_EVENT_RELAY_AUTHOR,
     Noop,
+    ParkTail,
     Post,
     decide,
+    decide_park,
     needs_ci,
+    park_needs_ci,
     pr_facts_of,
     precheck,
+    read_park_tail,
     read_relay_tail,
 )
 
@@ -222,7 +227,20 @@ async def advance_thread(
         return ThreadOutcome(thread_id, "skipped", f"thread-unreadable: {exc}")
     if tail_msg is None:
         return ThreadOutcome(thread_id, "skipped", "thread-unreadable: no messages")
-    tail = read_relay_tail(str(tail_msg.get("author", "")), str(tail_msg.get("content", "")))
+    author, content = str(tail_msg.get("author", "")), str(tail_msg.get("content", ""))
+    tail = read_relay_tail(author, content)
+    if tail is None:
+        park = read_park_tail(author, content)
+        if park is not None:
+            return await _advance_park(
+                mcp=mcp,
+                gh=gh,
+                project=project,
+                thread_id=thread_id,
+                park=park,
+                repo_map=repo_map,
+                cache=cache,
+            )
     early = precheck(tail)
     if early is not None:
         return ThreadOutcome(thread_id, "noop", early.reason.value)
@@ -270,6 +288,94 @@ async def advance_thread(
             if cache is not None:
                 cache.forget(thread_id)  # its tail is about to be our post
             return await _post(mcp, project, thread_id, tail.pr_ref, decision)
+        case _:
+            assert_never(decision)
+
+
+async def _relay_bodies(mcp: McpToolCaller, project: str, thread_id: str) -> list[str] | None:
+    """Every :data:`RELAY_AUTHOR` body of the thread, oldest first; ``None`` when unreadable."""
+    result = await mcp.call_tool(
+        "chatroom_get_thread", {"project": project, "thread_id": thread_id, "mode": "full"}
+    )
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not isinstance(messages, list):
+        return None
+    return [
+        str(m.get("content", ""))
+        for m in messages
+        if isinstance(m, dict) and m.get("author") == RELAY_AUTHOR
+    ]
+
+
+async def _advance_park(
+    *,
+    mcp: McpToolCaller,
+    gh: PrSource,
+    project: str,
+    thread_id: str,
+    park: ParkTail,
+    repo_map: RepoProjectMap,
+    cache: TailCache | None,
+) -> ThreadOutcome:
+    """Rows 1a-1f (T-fix-push-never-regates D1) for a ``BLOCKED-ON: pr <P>`` tail.
+
+    Reads in cost order and stops at the first row that answers: the PR (1a / 1b), then CI
+    (1d / 1e), and the thread's relay history (1c) only once CI is terminal. Fail-closed like
+    the relay rows: an unreadable fact is a ``skipped`` outcome and nothing is written.
+    """
+    pr = parse_pr_ref(park.pr_ref)
+    if pr is None:  # read_park_tail already validated the ref; defensive only
+        return ThreadOutcome(thread_id, "noop", "not-relay-tail")
+    try:
+        state = await gh.fetch_pr_state(pr)
+    except Exception as exc:  # isolation boundary; reported, not swallowed
+        logger.warning("pr-event: fetch_pr_state(%s) raised: %r", park.pr_ref, exc)
+        return ThreadOutcome(thread_id, "skipped", f"gh-error: {exc!r}", pr_ref=park.pr_ref)
+    facts = pr_facts_of(state)
+    if facts is None:
+        return ThreadOutcome(thread_id, "skipped", "gh-unresolvable", pr_ref=park.pr_ref)
+    pr_project = repo_map.resolve(pr.owner, pr.repo).project
+    ci: CiState | None = None
+    gated: frozenset[str] | None = None
+    if park_needs_ci(
+        park, facts, thread_project=project, thread_id=thread_id, pr_project=pr_project
+    ):
+        try:
+            status = await gh.fetch_ci_status(pr)
+        except Exception as exc:  # isolation boundary; reported, not swallowed
+            logger.warning("pr-event: fetch_ci_status(%s) raised: %r", park.pr_ref, exc)
+            return ThreadOutcome(thread_id, "skipped", f"gh-error: {exc!r}", pr_ref=park.pr_ref)
+        ci = status.state
+        if status.head_sha and facts.head_sha and status.head_sha.lower() != facts.head_sha.lower():
+            ci = CiState.PENDING  # the head moved between the two reads: wait a tick
+        if ci in (CiState.SUCCESS, CiState.FAILURE):
+            try:
+                bodies = await _relay_bodies(mcp, project, thread_id)
+            except MagickitMcpError as exc:
+                return ThreadOutcome(
+                    thread_id, "skipped", f"thread-unreadable: {exc}", pr_ref=park.pr_ref
+                )
+            if bodies is None:
+                return ThreadOutcome(
+                    thread_id, "skipped", "thread-unreadable: no messages", pr_ref=park.pr_ref
+                )
+            gated = verdict_heads(bodies)
+    decision = decide_park(
+        thread_project=project,
+        thread_id=thread_id,
+        pr_project=pr_project,
+        park=park,
+        pr=facts,
+        ci=ci,
+        gated_heads=gated,
+    )
+    match decision:
+        case Noop(reason=reason):
+            return ThreadOutcome(thread_id, "noop", reason.value, pr_ref=park.pr_ref)
+        case Post():
+            if cache is not None:
+                cache.forget(thread_id)  # its tail is about to be our post
+            return await _post(mcp, project, thread_id, park.pr_ref, decision)
         case _:
             assert_never(decision)
 

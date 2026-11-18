@@ -36,13 +36,17 @@ The table (v0.5 §2) is evaluated top to bottom and the first matching row wins:
 2b  relay with ``MERGE-SELF:``          merged, or closed (not merged)      Noop (note 2b)
 3   relay                               merged                              Post: done / proposer
 4   relay                               closed, not merged                  Post: proposer (always)
-5   relay, no ci-hold                   open                                Noop(OPEN_NO_HOLD)
-6   relay, ci-hold                      open, head moved                    Noop(HEAD_MOVED)
-7   relay, ci-hold                      open, same head, CI not terminal    Noop(CI_PENDING)
-8   relay, ci-hold                      open, same head, CI terminal        Post: pr-review <ref>
+5   relay, no ci-wait                   open                                Noop(OPEN_NO_HOLD)
+6   relay, ci-wait                      open, head moved                    Noop(HEAD_MOVED)
+7   relay, ci-wait                      open, same head, CI not terminal    Noop(CI_PENDING)
+8   relay, ci-wait                      open, same head, CI terminal        Post: pr-review <ref>
 9   anything else (unexpected state)    —                                   Noop(UNKNOWN_STATE)
 ==  ==================================  ==================================  =======================
 
+* "ci-wait" (T-fix-push-never-regates D2') is :func:`~..conductor.gate_records.ci_wait_head`:
+  the ci-hold marker, or a marker-less L1 CI-gate hold (``ci=pending|unknown``). Before D2'
+  only the marker counted, so a check-0 ``ci=unknown`` COMMENT was never re-fired. The park
+  rows 1a-1f (D1) are documented beside :func:`decide_park`.
 * Row 2b — ``Noop(MERGE_OWNED_BY_TURN)`` (T-gate-relay-routes-develop-approvals-to-human D5,
   Bohr msg-7576 / msg-7578): a MERGE-route relay woke the implementer to merge the PR itself,
   and that implementer's own post is the one terminal report, whether it merged the PR or found
@@ -89,7 +93,7 @@ from typing import assert_never
 
 from ..conductor.gate_records import (
     RELAY_AUTHOR,
-    ci_hold_head,
+    ci_wait_head,
     is_merge_self_relay,
     normalize_sha,
 )
@@ -101,8 +105,11 @@ from ..conductor.handoff import (
     STOP_DONE,
     TIER_C_CHECK_KEYWORD,
     TIER_C_CHECK_NONE,
+    StopLine,
+    StopStatus,
     parse_next_token,
     settles_by_terminal_form,
+    terminal_form_roster_free,
 )
 from ..github.client import CiState, PrResolution, PrState, parse_pr_ref
 from ..repo_projects import PrProject
@@ -229,6 +236,12 @@ class NoopReason(StrEnum):
     HEAD_MOVED = "head-moved"
     UNKNOWN_STATE = "unknown-state"
     MERGE_OWNED_BY_TURN = "merge-owned-by-turn"
+    # Park rows 1a-1f (T-fix-push-never-regates D1).
+    FOREIGN_PR = "park-foreign-pr"
+    PARK_PR_SETTLED = "park-pr-settled"
+    ALREADY_GATED = "park-already-gated"
+    PARK_CI_PENDING = "park-ci-pending"
+    PARK_NO_CI = "park-no-ci"
 
 
 @dataclass(frozen=True)
@@ -320,7 +333,7 @@ def read_relay_tail(author: str, body: str) -> RelayTail | None:
     return RelayTail(
         pr_ref=ref,
         token=token,
-        hold_head=ci_hold_head(body),
+        hold_head=ci_wait_head(body),
         merge_self=is_merge_self_relay(body),
     )
 
@@ -520,6 +533,123 @@ def decide(
     return Post(body=body, next_line=f"NEXT: {PR_REVIEW_TOKEN} {ref}")
 
 
+# ---- Park rows 1a-1f (T-fix-push-never-regates D1, Bohr msg-9571 / msg-9573, Einstein go) ------ #
+#
+# The rows above read only a RELAY tail. The four stalls that opened this thread (lexora#115 /
+# #117, mindwire#582, conclair#38) had a ROLE's park as their tail: a fix was pushed and the
+# thread was parked with ``BLOCKED-ON: pr <P>`` on the belief that someone re-fires the gate on
+# the new head. Nobody did: the ``pr`` arm wakes only on merge / close. These rows are that
+# someone. They hand to ``pr-review`` and leave every judgement to admission (R4 on red, R7 on
+# green); no new event kind is introduced.
+#
+# ==  ==========================================  ===========================================  ===
+# #   tail (not a relay)                          PR                                           res
+# ==  ==========================================  ===========================================  ===
+# 1a  ``BLOCKED-ON: pr <P>`` above the last NEXT  ``Thread:`` lines do not name this thread    Noop
+# 1b  same                                        merged / closed (the park-wake pr arm's)     Noop
+# 1c  same                                        open, this thread has a verdict on the head  Noop
+# 1d  same                                        open, no verdict on head, CI not terminal    Noop
+# 1e  same                                        open, no verdict on head, CI UNKNOWN         Noop
+# 1f  same                                        open, no verdict on head, CI terminal        Post
+# ==  ==========================================  ===========================================  ===
+#
+# 1a keeps a park that waits on ANOTHER thread's PR from gating that PR here. 1e is
+# ``fetch_ci_status``'s UNKNOWN, which covers both an empty rollup (a repo without CI, out of
+# scope: fail-closed, no APPROVE ever) and a read that did not answer; both wait. Idempotence is
+# the same as row 8: after the post the tail is :data:`PR_EVENT_RELAY_AUTHOR`, which is not a
+# park, so the next tick is a Noop with no counter.
+
+
+@dataclass(frozen=True)
+class ParkTail:
+    """A role's tail that parks on a PR: ``BLOCKED-ON: pr <pr_ref>`` above its final ``NEXT:``."""
+
+    pr_ref: str
+
+
+def read_park_tail(author: str, body: str) -> ParkTail | None:
+    """The tail as an accepted ``BLOCKED-ON: pr <P>`` park, or ``None``.
+
+    Roster-free, through the handoff module's one terminal-form parser. Only an ACCEPTED park
+    counts (:func:`settles_by_terminal_form`): a refused form is the conductor's to report, and
+    re-firing under it would bury that notice. Relay authors are excluded — their tails belong
+    to the rows above.
+    """
+    if author in (RELAY_AUTHOR, PR_EVENT_RELAY_AUTHOR):
+        return None
+    if not settles_by_terminal_form(body):
+        return None
+    stop = terminal_form_roster_free(body)
+    if not isinstance(stop, StopLine) or stop.status is not StopStatus.BLOCKED_ON:
+        return None
+    if stop.trigger_arm != "pr":
+        return None
+    ref = stop.trigger_operand
+    if ref is None or parse_pr_ref(ref) is None:
+        return None
+    return ParkTail(pr_ref=ref)
+
+
+def names_thread(pr_body: str, thread_project: str, thread_id: str, pr_project: str | None) -> bool:
+    """True iff a ``Thread:`` line of ``pr_body`` names this thread (row 1a), project included.
+
+    Same resolution as :func:`closes_thread`: unqualified means ``pr_project``, and an
+    unresolved ``pr_project`` lets only a qualified ref match.
+    """
+    want = (thread_project, thread_id)
+    return any(ref.resolved(pr_project) == want for ref in thread_refs(pr_body).thread_lines)
+
+
+def park_needs_ci(
+    park: ParkTail, pr: PrFacts, *, thread_project: str, thread_id: str, pr_project: str | None
+) -> bool:
+    """True iff :func:`decide_park` reaches rows 1c-1f — the rows that read CI and history."""
+    return (
+        lifecycle_of(pr) is PrLifecycle.OPEN
+        and pr.head_sha is not None
+        and names_thread(pr.body, thread_project, thread_id, pr_project)
+    )
+
+
+def decide_park(
+    *,
+    thread_project: str,
+    thread_id: str,
+    pr_project: str | None,
+    park: ParkTail,
+    pr: PrFacts,
+    ci: CiState | None,
+    gated_heads: frozenset[str] | None,
+) -> Decision:
+    """Rows 1a-1f. Total. ``gated_heads`` is :func:`~..conductor.gate_records.verdict_heads` over
+    this thread's relay posts, or ``None`` when it was not read (the runner reads it only once
+    CI is terminal); ``None`` there is a Noop, never a guess."""
+    if not names_thread(pr.body, thread_project, thread_id, pr_project):
+        return Noop(NoopReason.FOREIGN_PR)  # 1a
+    lifecycle = lifecycle_of(pr)
+    if lifecycle in (PrLifecycle.MERGED, PrLifecycle.CLOSED):
+        return Noop(NoopReason.PARK_PR_SETTLED)  # 1b
+    if lifecycle is not PrLifecycle.OPEN or pr.head_sha is None:
+        return Noop(NoopReason.UNKNOWN_STATE)
+    if ci is CiState.UNKNOWN:
+        return Noop(NoopReason.PARK_NO_CI)  # 1e
+    if ci is None or ci not in _CI_TERMINAL:
+        return Noop(NoopReason.PARK_CI_PENDING)  # 1d
+    if gated_heads is None:
+        return Noop(NoopReason.UNKNOWN_STATE)
+    head = normalize_sha(pr.head_sha)
+    if head in gated_heads:
+        return Noop(NoopReason.ALREADY_GATED)  # 1c
+    ref = park.pr_ref
+    body = (  # 1f
+        f"{_heading(ref)}\n\n"
+        f"このスレッドは PR {ref} を待って park しているが、現在の head {head} には"
+        f"このスレッドの gate verdict が無く、CI は終端している（{ci.value}）ので、"  # noqa: RUF001 (§F.1.1 wording)
+        "gate に渡す。"
+    )
+    return Post(body=body, next_line=f"NEXT: {PR_REVIEW_TOKEN} {ref}")
+
+
 __all__ = [
     "PR_EVENT_RELAY_AUTHOR",
     "THREAD_LINE_RE",
@@ -527,6 +657,7 @@ __all__ = [
     "Decision",
     "Noop",
     "NoopReason",
+    "ParkTail",
     "Post",
     "PrFacts",
     "PrLifecycle",
@@ -536,13 +667,17 @@ __all__ = [
     "body_lines",
     "closes_thread",
     "decide",
+    "decide_park",
     "heading_ref",
     "lifecycle_of",
     "lifecycle_post",
+    "names_thread",
     "needs_ci",
     "operator_handoff",
+    "park_needs_ci",
     "pr_facts_of",
     "precheck",
+    "read_park_tail",
     "read_relay_tail",
     "thread_refs",
 ]

@@ -2762,6 +2762,69 @@ async def test_r12_refire_after_a_ci_hold_routes_the_implementer_on_red() -> Non
     assert ci_route_heads([mcp.posts[-1]["content"]]) == frozenset({_HEAD})
 
 
+def _seed_unknown_wait_then_refire(mcp: _FakeChatroomMcp, waits: int = 1) -> None:
+    """T-fix-push-never-regates D2': the OLD shape — an L1 ``ci=unknown`` hold with NO ci-hold
+    marker (check 0 件 right after a push), laid out by the real L1 writer."""
+    from spirrow_mindwire.github.client import CiStatus
+    from spirrow_mindwire.naysayer.pr_review import _ci_gate_response
+
+    _, l1 = _ci_gate_response(
+        CiStatus(state=CiState.UNKNOWN, head_sha=_HEAD, failing=[]), "acme/widgets#7"
+    )
+    mcp.seed(author="Heisenberg", content="pushed\n\nNEXT: pr-review acme/widgets#7")
+    for _ in range(waits):
+        mcp.seed(
+            author="pr-gate-relay",
+            content=(
+                f"{render_relay_heading('acme/widgets#7', _HEAD)}\n\n"
+                f"VERDICT: COMMENT (ci=unknown)\n\n{l1}\n\nNEXT: human"
+            ),
+        )
+    mcp.seed(
+        author="pr-event-relay",
+        content=(
+            "PR event (1b, pr-event-relay) — acme/widgets#7\n\nCI ended\n\n"
+            "NEXT: pr-review acme/widgets#7"
+        ),
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_refire_after_an_old_unknown_hold_invokes_the_gate_on_green() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_wait_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == ["acme/widgets#7"]  # R7, not R6 ALREADY_REVIEWED
+
+
+@pytest.mark.anyio
+async def test_d2_refire_after_an_old_unknown_hold_routes_the_implementer_on_red() -> None:
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_wait_then_refire(mcp)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]  # R4
+
+
+@pytest.mark.anyio
+async def test_d2_a_second_unknown_hold_on_the_same_head_stops_at_r6() -> None:
+    """Bound: the gate's own CI read keeps answering UNKNOWN → no endless re-fire loop."""
+    mcp = _FakeChatroomMcp()
+    _seed_unknown_wait_then_refire(mcp, waits=2)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert "already has a gate verdict" in mcp.posts[-1]["content"]
+
+
 @pytest.mark.anyio
 async def test_r12_refire_after_a_ci_hold_defers_when_ci_is_pending_again() -> None:
     mcp = _FakeChatroomMcp()

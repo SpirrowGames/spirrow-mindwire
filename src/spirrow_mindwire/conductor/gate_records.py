@@ -64,6 +64,11 @@ head. Two consequences live here:
   "do not buy a second opinion on the same diff") must not treat it as a verdict. Counting it
   would make every 1b re-fire stop at R6 without waking the model.
 
+T-fix-push-never-regates D2' widens "hold" from the marker to :func:`ci_wait`, which also reads
+a marker-less L1 hold (every ``ci=unknown`` one, and ``ci=pending`` ones older than the marker)
+off the relay's own heading, ``VERDICT:`` line and L1 opening. 1b and :func:`verdict_heads` both
+read it, so they cannot disagree about what a wait is.
+
 This is the one place the trust model above loosens: a forged ci-hold marker under the relay
 author can make the loop do *more*, not less — at most ONE extra gate firing on that head,
 because the real verdict the re-fire produces carries no marker and is counted by R6 from then
@@ -82,7 +87,12 @@ from typing import Final, Literal
 
 from ..github.client import CiState, ReviewEvent
 from ..github.reviews import parse_verdict_footer
-from ..naysayer.pr_review import ObjectionParse, parse_objections
+from ..naysayer.pr_review import (
+    CI_GATE_PENDING_OPENING,
+    CI_GATE_UNKNOWN_OPENING,
+    ObjectionParse,
+    parse_objections,
+)
 
 #: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
 #: admission posts) are written. Both readers below are restricted to messages authored under
@@ -404,16 +414,99 @@ def render_relay_heading(pr_ref: str, head: str | None) -> str:
     return f"{heading} @ {normalize_sha(head)}" if head else heading
 
 
+#: The ``VERDICT:`` line :func:`~spirrow_mindwire.orchestrator` writes as a relay's second
+#: paragraph: ``VERDICT: <event> (ci=<state>)``. Column zero, whole line.
+_VERDICT_LINE_RE = re.compile(r"^VERDICT: (?P<event>[A-Z_]+) \(ci=(?P<ci>[a-z_]+)\)$")
+#: The CI states an L1 short-circuit ``COMMENT`` can carry (``_ci_gate_response``): a FAILURE is
+#: a ``REQUEST_CHANGES`` and is a real send-back (R4's business), never a wait.
+_CI_WAIT_STATES = frozenset({CiState.PENDING, CiState.UNKNOWN})
+
+
+def _paragraphs(body: str) -> list[str]:
+    """The non-blank lines of ``body``, stripped of the trailing ``\\r`` a CRLF body leaves."""
+    return [line.rstrip("\r") for line in body.strip().splitlines() if line.strip()]
+
+
+def ci_wait(body: str) -> tuple[str, CiState] | None:
+    """``(head, ci state)`` when ``body`` is a relay of an L1 CI-gate wait, else ``None``.
+
+    T-fix-push-never-regates D2' (Bohr msg-9573, Einstein go msg-9574). An L1 short-circuit
+    ``COMMENT`` is a record that CI was not green, not a review of the diff (INV-CI-1: the model
+    is never called). Two shapes say so:
+
+    1. the ci-hold marker (:func:`ci_hold_head`) — PENDING, written since R2;
+    2. the relay's own lines, for the holds written without a marker (every UNKNOWN, and every
+       PENDING before R2): the heading names a head (``... @ <sha>``), the next line is
+       ``VERDICT: COMMENT (ci=pending|unknown)``, and the line after it opens with one of the
+       two L1 hold openings
+       (:data:`~spirrow_mindwire.naysayer.pr_review.CI_GATE_PENDING_OPENING` /
+       ``CI_GATE_UNKNOWN_OPENING``).
+
+    The third condition is the narrowing the design pre-agreed for the case it asked to be
+    checked: the chatroom-replay pass runs BEFORE the L1 gate and re-posts an earlier model
+    verdict with the CURRENT ``ci=`` value, so ``VERDICT: … (ci=pending|unknown)`` alone does
+    not prove the model was skipped. A replayed verdict's body opens with the model's critique,
+    not an L1 opening, so it is still counted by :func:`verdict_heads`.
+
+    Only the first three non-blank lines are read: a critique that quotes a hold is not one
+    (the :func:`verdict_heads` discipline). Callers pass :data:`RELAY_AUTHOR` bodies only.
+    """
+    marked = ci_hold_head(body)
+    if marked is not None:
+        return marked, CiState.PENDING
+    lines = _paragraphs(body)
+    if len(lines) < 3 or not lines[0].strip().startswith(_RELAY_HEADING_PREFIX):
+        return None
+    head = _RELAY_HEAD_RE.search(lines[0].strip())
+    verdict = _VERDICT_LINE_RE.match(lines[1])
+    if head is None or verdict is None or verdict.group("event") != ReviewEvent.COMMENT.value:
+        return None
+    try:
+        state = CiState(verdict.group("ci"))
+    except ValueError:
+        return None
+    if state not in _CI_WAIT_STATES:
+        return None
+    opening = lines[2]
+    if not (
+        (state is CiState.PENDING and opening.startswith(CI_GATE_PENDING_OPENING))
+        or (state is CiState.UNKNOWN and opening.startswith(CI_GATE_UNKNOWN_OPENING))
+    ):
+        return None
+    return normalize_sha(head.group(1)), state
+
+
+def ci_wait_head(body: str) -> str | None:
+    """The head of :func:`ci_wait`, or ``None`` — the one reader 1b and :func:`verdict_heads`
+    share, so "is this a CI wait" cannot mean two different things in the two places."""
+    found = ci_wait(body)
+    return found[0] if found is not None else None
+
+
 def verdict_heads(bodies: Iterable[str]) -> frozenset[str]:
     """Every head named by a verdict relay heading in ``bodies`` — ``gate_admission``'s R6 input.
 
-    A relay carrying a ci-hold marker is skipped (T-pr-event-advances-thread R11): it is the L1
-    CI-gate's pending hold, not a review of the diff, so it must not make R6 refuse the one
-    re-fire 1b sends once CI ends. See the module docstring for the trust-model note.
+    A CI-wait relay (:func:`ci_wait`) is skipped (T-pr-event-advances-thread R11, widened by
+    T-fix-push-never-regates D2'): it is the L1 CI-gate's hold, not a review of the diff, so it
+    must not make R6 refuse the re-fire 1b sends once CI ends on that head.
+
+    One bound on that: the SECOND ``ci=unknown`` wait on the same head IS counted. 1b re-fires
+    when its own CI read is terminal; if the gate's read still answers UNKNOWN (the gate's token
+    lacks ``Actions: Read`` while 1b's has it — the case ``_ci_gate_response`` names), every tick
+    would re-fire and get the same answer. Counting the repeat makes the next re-fire stop at R6
+    and reach a person, after exactly one extra firing. A PENDING wait is not bounded here; it
+    behaves as R11 always did. See the module docstring for the trust-model note.
     """
     heads: set[str] = set()
+    unknown_waits: set[str] = set()
     for body in bodies:
-        if ci_hold_head(body) is not None:
+        wait = ci_wait(body)
+        if wait is not None:
+            head, state = wait
+            if state is CiState.UNKNOWN:
+                if head in unknown_waits:
+                    heads.add(head)
+                unknown_waits.add(head)
             continue
         first_line = body.strip().splitlines()[0] if body.strip() else ""
         match = _RELAY_HEAD_RE.search(first_line)
@@ -700,6 +793,8 @@ __all__ = [
     "ci_hold_head",
     "ci_route_entries",
     "ci_route_heads",
+    "ci_wait",
+    "ci_wait_head",
     "decide_relay_route",
     "is_merge_self_relay",
     "is_merge_wait_relay",
