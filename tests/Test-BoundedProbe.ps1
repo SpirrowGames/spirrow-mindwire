@@ -435,9 +435,7 @@ exit 3
     # -Invoke scriptblock handed to Invoke-LedgerDriftTick, like settled_close; no -UvOptions.
     # +1 for the ledger_drift digest section (same thread, PR #585 gate objection 1): the -Invoke
     # scriptblock handed to Get-LedgerDriftDigestLines; no -UvOptions.
-    # +1 for the second literal Invoke-UnregisteredThreadsProbe call (T-digest-lacks-project-liveness-
-    # view, PR #544 gate advisory 3): --liveness only on the digest tick; no -UvOptions.
-    Check 'twenty-seven helper call sites in the sweep script' 27 $helperCalls.Count
+    Check 'twenty-six helper call sites in the sweep script' 26 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

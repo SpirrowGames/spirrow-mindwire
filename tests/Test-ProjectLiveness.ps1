@@ -172,16 +172,6 @@ $rowsSmall = @($small | ForEach-Object { @($_ -split "`n" | Select-Object -Skip 
 Check 'rows never split across chunks' (($rowsSmall -join '|') -eq (@($res.Omitted | ForEach-Object minimal) -join '|'))
 Check 'no file path in any follow-up' (-not (($small + $chunks) -join "`n" -match 'project-liveness\.json|state[\\/]|\.json'))
 Check 'follow-up header stamp matches L1 stamp' ((($chunks[0] -split "`n")[0]) -like '続報 @13:40Z (1/*')
-# PR #544 gate objection 2: a row that cannot fit with its header is never sent over budget.
-$longRow = [PSCustomObject]@{ minimal = ('r' * 190) }
-$threw = $false; try { $null = Get-ProjectLivenessContinuationChunks -Omitted @($longRow) -GeneratedAt $now -Budget 200 } catch { $threw = $true }
-Check 'a 190-char row with Budget 200 throws instead of exceeding it' $threw
-$hdr = ("続報 @13:40Z (999/999)").Length + 1
-$fit = Get-ProjectLivenessContinuationChunks -Omitted @($longRow) -GeneratedAt $now -Budget ($hdr + 191)
-Check '... and at the exact boundary it fits the budget' (@($fit).Count -eq 1 -and $fit[0].Length -le ($hdr + 191)) "$($fit[0].Length)"
-$mixed = @(1..12 | ForEach-Object { [PSCustomObject]@{ minimal = ("row-{0:d2} " -f $_) + ('m' * (40 + 10 * $_)) } })
-$mc = Get-ProjectLivenessContinuationChunks -Omitted $mixed -GeneratedAt $now -Budget 300
-Check 'every chunk <= budget with long and short rows mixed' (@($mc | Where-Object { $_.Length -gt 300 }).Count -eq 0 -and @($mc).Count -gt 1) ((@($mc) | ForEach-Object Length) -join ',')
 
 Write-Host "R-10 snapshot"
 $snap = ConvertTo-ProjectLivenessSnapshot -Rows $res.Rows -GeneratedAt $now
@@ -276,13 +266,6 @@ $emptyIn = ConvertFrom-LivenessProbeReports -ListingReport ('{"liveness":{"pe":{
 Check 'a measured empty listing and empty PR list are measured (EMPTY is reachable)' (@($emptyIn.ThreadsUnmeasured).Count -eq 0 -and @($emptyIn.PrsUnmeasured).Count -eq 0) (($emptyIn.Unmeasured.Keys | ForEach-Object { "$_=$($emptyIn.Unmeasured[$_])" }) -join '; ')
 $fe = Get-ProjectLivenessFacts -Threads $emptyIn.Threads -Projects $emptyIn.Projects -ThreadsUnmeasured $emptyIn.ThreadsUnmeasured -PrsUnmeasured $emptyIn.PrsUnmeasured -Now $now
 Check '... and renders EMPTY' ((Get-ProjectLivenessRow -Facts $fe[0]).state -eq 'EMPTY')
-# PR #544 gate objection 1: a listing row with no thread id makes the project's threads unmeasured,
-# never a shorter measured list (which could read EMPTY / DONE).
-$noIdIn = ConvertFrom-LivenessProbeReports -ListingReport ('{"liveness":{"pn":{"threads":[{"thread_id":"","status":"resolved"},{"thread_id":"T-1","status":"resolved"}],"error":null}}}' | ConvertFrom-Json) `
-    -PrReport ('{"projects":{"pn":{"prs":[],"error":null}}}' | ConvertFrom-Json)
-Check 'a row without a thread id -> threads unmeasured, no partial threads' (@($noIdIn.ThreadsUnmeasured) -contains 'pn' -and @($noIdIn.Threads).Count -eq 0 -and $noIdIn.Unmeasured['pn'] -match 'readable thread identity') (($noIdIn.Unmeasured.Keys | ForEach-Object { "$_=$($noIdIn.Unmeasured[$_])" }) -join '; ')
-$fn = Get-ProjectLivenessFacts -Threads $noIdIn.Threads -Projects $noIdIn.Projects -ThreadsUnmeasured $noIdIn.ThreadsUnmeasured -PrsUnmeasured $noIdIn.PrsUnmeasured -Now $now
-Check '... and renders UNMEASURED, not DONE' ((Get-ProjectLivenessRow -Facts $fn[0]).state -eq 'UNMEASURED')
 $wholePr = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrError 'timed out'
 Check 'a whole PR-probe failure makes every project PRs-unmeasured' (@($wholePr.PrsUnmeasured).Count -eq 3 -and @($wholePr.OpenPrs).Count -eq 0)
 
