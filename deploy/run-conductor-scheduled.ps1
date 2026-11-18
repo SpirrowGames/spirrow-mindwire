@@ -8162,14 +8162,15 @@ try {
                     -PrReport $prProbe.report -PrError $prProbe.error -SweepEntries $livenessSweepEntries `
                     -HeadSkip (Get-JsonState -Path $headSkipStatePath)
                 $livFacts = Get-ProjectLivenessFacts -Threads $livIn.Threads -SweepEntries $livIn.SweepEntries `
-                    -Nominations $livIn.Nominations -OpenPrs $livIn.OpenPrs -Projects $livIn.Projects -Now $nowUtc
-                $liv = Get-ProjectLivenessDigestLines -Facts $livFacts -GeneratedAt $nowUtc -Unmeasured @($livIn.Unmeasured.Keys)
+                    -Nominations $livIn.Nominations -OpenPrs $livIn.OpenPrs -Projects $livIn.Projects `
+                    -ThreadsUnmeasured $livIn.ThreadsUnmeasured -PrsUnmeasured $livIn.PrsUnmeasured -Now $nowUtc
+                $liv = Get-ProjectLivenessDigestLines -Facts $livFacts -GeneratedAt $nowUtc
                 $livenessLines = @($liv.L0) + @($liv.L1)
                 $livenessChunks = @(Get-ProjectLivenessContinuationChunks -Omitted $liv.Omitted -GeneratedAt $nowUtc -Budget $DigestBudget)
                 Write-Log "project liveness: $($liv.L0) (omitted $(@($liv.Omitted).Count), follow-ups $($livenessChunks.Count))"
                 foreach ($u in $livIn.Unmeasured.Keys) { Write-Log "project liveness: unmeasured $u — $($livIn.Unmeasured[$u])" }
                 if (@($livIn.NoPrSource).Count -gt 0) {
-                    Write-Log "project liveness: no clones entry, open PRs not observed for $(@($livIn.NoPrSource) -join ', ')"
+                    Write-Log "project liveness: no clones entry, open PRs unmeasured for $(@($livIn.NoPrSource) -join ', ')"
                 }
                 try {
                     $snap = ConvertTo-ProjectLivenessSnapshot -Rows $liv.Rows -GeneratedAt $nowUtc

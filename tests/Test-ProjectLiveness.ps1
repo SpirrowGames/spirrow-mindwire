@@ -9,6 +9,9 @@
 #   * R-12 follow-ups: same row set and order as the omitted rows, <= budget each, rows never split,
 #     (k/n) consecutive, no file path anywhere
 #   * R-10 snapshot: generated_at matches the @stamp, every row present unfolded
+#   * UNMEASURED (msg-9346 §2, msg-9560, R-13 msg-9562): a failed thread listing is a named tier-2
+#     row; an unknown PR count never yields SHIP / DONE / EMPTY, ends in the explicit sink when no
+#     PR-independent state matches, and keeps a known critical critical
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -28,11 +31,12 @@ function S([string]$P, [string]$Id) { [PSCustomObject]@{ project = $P; thread_id
 function PR([string]$P, [double]$Days) { [PSCustomObject]@{ project = $P; created_at = (Ago $Days) } }
 
 function Rows {
-    param($Threads = @(), $Sweep = @(), $Nom = @{}, $Prs = @(), $Projects = @())
-    $facts = Get-ProjectLivenessFacts -Threads $Threads -SweepEntries $Sweep -Nominations $Nom -OpenPrs $Prs -Projects $Projects -Now $now
+    param($Threads = @(), $Sweep = @(), $Nom = @{}, $Prs = @(), $Projects = @(), $PrsU = @(), $ThreadsU = @())
+    $facts = Get-ProjectLivenessFacts -Threads $Threads -SweepEntries $Sweep -Nominations $Nom -OpenPrs $Prs -Projects $Projects `
+        -PrsUnmeasured $PrsU -ThreadsUnmeasured $ThreadsU -Now $now
     return , @($facts | ForEach-Object { Get-ProjectLivenessRow -Facts $_ })
 }
-function One { param($Threads = @(), $Sweep = @(), $Nom = @{}, $Prs = @(), $Projects = @()) (Rows $Threads $Sweep $Nom $Prs $Projects)[0] }
+function One { param($Threads = @(), $Sweep = @(), $Nom = @{}, $Prs = @(), $Projects = @(), $PrsU = @(), $ThreadsU = @()) (Rows $Threads $Sweep $Nom $Prs $Projects $PrsU $ThreadsU)[0] }
 
 Write-Host "status reading (single interpretation point)"
 Check 'active -> open' ((ConvertTo-LivenessThreadClass 'active') -eq 'open')
@@ -51,8 +55,9 @@ $r = One @(T p a parked (Ago 40)) ; Check '6 PARKED (tier 2, age does not promot
 $r = One @(T p a resolved (Ago 1)) ; Check '7 DONE(tracked) quiet' ($r.state -eq 'DONE' -and $r.tier -eq 0) $r.full
 $r = One @() @() @{} @() @('p') ; Check '8 EMPTY quiet' ($r.state -eq 'EMPTY' -and $r.tier -eq 0) $r.full
 
-Write-Host "totality / exclusivity sweep"
-$ok = $true; $n = 0
+Write-Host "totality / exclusivity sweep (with the R-13 PR-unknown axis)"
+$ok = $true; $n = 0; $nUnknown = 0; $prDepSeen = @(); $sinkSeen = 0
+foreach ($prKnown in $true, $false) {
 foreach ($openTracked in 0, 1) { foreach ($openDark in 0, 1) { foreach ($parkedN in 0, 1) { foreach ($closedN in 0, 1) {
 foreach ($prN in 0, 1) { foreach ($rotN in 0, 1) { foreach ($nom in 'human', 'Bohr', 'none') { foreach ($age in 1, 5, 10, $null) {
     $th = @(); $sw = @(); $nm = @{}
@@ -62,21 +67,43 @@ foreach ($prN in 0, 1) { foreach ($rotN in 0, 1) { foreach ($nom in 'human', 'Bo
     if ($closedN) { $th += T q c resolved (Ago 9) }
     if ($rotN) { $sw += S q ghost }
     $prs = @(); if ($prN) { $prs += PR q 3 }
+    $prsU = if ($prKnown) { @() } else { @('q') }
     try {
-        $row = One $th $sw $nm $prs @('q'); $n++
+        $all = Rows $th $sw $nm $prs @('q') $prsU; $n++
+        # exactly one row (one state) per project
+        if (@($all).Count -ne 1) { $ok = $false; Write-Host "    not one row: $(@($all).Count)" }
+        $row = $all[0]
         if (-not ($row.state -in $LivenessStateOrder) -or $row.tier -lt 0 -or $row.tier -gt 3) { $ok = $false }
+        if (-not $prKnown) {
+            $nUnknown++
+            if ($row.state -in @('SHIP', 'DONE', 'EMPTY')) { $prDepSeen += $row.full }
+            if ($row.state -eq 'UNMEASURED') { $sinkSeen++ }
+            if ($row.tier -lt 2) { $ok = $false; Write-Host "    PR-unknown row below tier 2: $($row.full)" }
+            if ($row.full -notlike '* · PRs unmeasured*' -or $row.minimal -notlike '* · PRs unmeasured*') { $ok = $false; Write-Host "    PR-unknown row without the marker: $($row.full)" }
+            if ($row.full -match '· PR \d') { $ok = $false; Write-Host "    PR-unknown row shows a PR count: $($row.full)" }
+        }
+        elseif ($row.state -eq 'UNMEASURED') { $ok = $false; Write-Host "    measured row in the sink: $($row.full)" }
         # INV-TIER: tier 3 <=> ratio > 1
         if (($row.tier -eq 3) -ne ($row.ratio -gt 1)) { $ok = $false; Write-Host "    INV-TIER broken: $($row.full) tier=$($row.tier) ratio=$($row.ratio)" }
         if ($rotN -and $row.tier -lt 1) { $ok = $false }
     } catch { $ok = $false; Write-Host "    threw: $_" }
-} } } } } } } }
-Check "every combination ($n) yields one state, a tier, and INV-TIER" $ok
+} } } } } } } } }
+Check "every combination ($n) yields one state, a tier, and INV-TIER" ($ok -and $n -eq 1536) "n=$n"
+Check "PR count unknown ($nUnknown inputs) -> never SHIP / DONE / EMPTY" ($prDepSeen.Count -eq 0 -and $nUnknown -eq 768) ($prDepSeen -join ' | ')
+Check "PR count unknown -> the sink is reached" ($sinkSeen -gt 0) "sink=$sinkSeen"
 
 Write-Host "closure rule"
 $threw = $false; try { $null = Get-LivenessElementTier -Table $LivenessStateTier -Key 'NOPE' -Agg $null -Use 'max' -Kind 'state' } catch { $threw = $true }
 Check 'unmapped state throws' $threw
 $threw = $false; try { $null = Get-LivenessElementTier -Table $LivenessSignalTier -Key 'nope' -Agg $null -Use 'max' -Kind 'signal' } catch { $threw = $true }
 Check 'unmapped signal throws' $threw
+$threw = $false; $saved = $LivenessStateTier['PARKED']
+try {
+    $LivenessStateTier['PARKED'] = @{ threshold = $null; under = 2; over = 2 }
+    try { $null = Test-LivenessStatePrDependent 'PARKED' } catch { $threw = $true }
+} finally { $LivenessStateTier['PARKED'] = $saved }
+Check 'a state without the pr_dependent column throws (R-13 closure)' $threw
+Check 'pr_dependent column: SHIP / DONE / EMPTY only' ((@($LivenessTableOrder | Where-Object { Test-LivenessStatePrDependent $_ }) -join ',') -eq 'SHIP,DONE,EMPTY')
 
 Write-Host "msg-8380 regression table"
 # vacuous truth: every open thread dark, nominations human — must be UNTRACKED, never HUMAN.
@@ -158,6 +185,41 @@ $res = Get-ProjectLivenessDigestLines -Facts (Get-ProjectLivenessFacts -Threads 
 Check 'quiet line counts tier-0 projects' (@($res.L1) -contains 'quiet: 3 projects — EMPTY/DONE, no defects') ($res.L1 -join ' | ')
 Check 'no omitted line when nothing cut' (-not (@($res.L1) | Where-Object { $_ -like '+*omitted*' }))
 
+Write-Host "UNMEASURED (msg-9346 §2 / msg-9560 / R-13 msg-9562)"
+# thread listing failed: named row, tier 2, no thread fact
+$r = One @() @() @{} @() @() @() @('p')
+Check 'threads unmeasured -> UNMEASURED tier 2, named' ($r.state -eq 'UNMEASURED' -and $r.tier -eq 2 -and $r.full -eq 'p ? · threads unmeasured') $r.full
+$r = One @() @() @{} @() @() @('p') @('p')
+Check 'threads and PRs unmeasured -> both named' ($r.full -eq 'p ? · threads unmeasured, PRs unmeasured') $r.full
+# DONE-equivalent: only closed threads, PR count unknown -> sink, never DONE
+$r = One @(T p a resolved (Ago 1)) @() @{} @() @() @('p')
+Check 'DONE-equivalent + PRs unknown -> UNMEASURED tier 2' ($r.state -eq 'UNMEASURED' -and $r.tier -eq 2 -and $r.full -eq 'p ? · PRs unmeasured') $r.full
+# EMPTY-equivalent (Einstein msg-9561's example): threads 0, sweep entry 0, PR count unknown
+$r = One @() @() @{} @() @('p') @('p')
+Check 'EMPTY-equivalent + PRs unknown -> UNMEASURED tier 2' ($r.state -eq 'UNMEASURED' -and $r.tier -eq 2 -and $r.full -eq 'p ? · PRs unmeasured') $r.full
+# a PR-independent state is kept, with the marker after it
+$r = One @(T p a parked (Ago 3)) @() @{} @() @() @('p')
+Check 'PARKED + PRs unknown -> PARKED · PRs unmeasured' ($r.state -eq 'PARKED' -and $r.full -like 'p PARKED · PRs unmeasured · *') $r.full
+# critical kept: a stalled project whose PR listing failed
+$r = One @(T p a active (Ago 10)) @(S p a) @{ 'p/a' = 'Bohr' } @() @() @('p')
+Check 'STALLED + PRs unknown -> STALLED · PRs unmeasured, tier 3' ($r.state -eq 'STALLED' -and $r.tier -eq 3 -and $r.full -like 'p STALLED · PRs unmeasured*' -and $r.full -notmatch '· PR \d') $r.full
+# ... and when it is cut, it is counted as critical in the omitted breakdown and carried in the follow-up
+$th = @(); $sw = @(); $nm = @{}
+for ($i = 0; $i -lt 30; $i++) {
+    $pn = "critical-project-{0:d2}" -f $i
+    $th += T $pn a active (Ago (20 + $i)); $sw += S $pn a; $nm["$pn/a"] = 'Bohr'
+}
+$th += T zz-pr-unknown a active (Ago 4); $sw += S zz-pr-unknown a; $nm['zz-pr-unknown/a'] = 'Bohr'
+$facts = Get-ProjectLivenessFacts -Threads $th -SweepEntries $sw -Nominations $nm -PrsUnmeasured @('zz-pr-unknown') -Now $now
+$res = Get-ProjectLivenessDigestLines -Facts $facts -GeneratedAt $now
+$cut = @($res.Omitted | Where-Object { $_.name -eq 'zz-pr-unknown' })
+Check 'the PR-unknown critical row is omitted from the tail' ($cut.Count -eq 1 -and $cut[0].tier -eq 3) (@($res.Omitted | ForEach-Object name) -join ',')
+$omitLine = @($res.L1) | Where-Object { $_ -like '+* rows omitted (*' }
+Check '... and counted as critical in the omitted breakdown' ($omitLine -match "^\+$(@($res.Omitted).Count) rows omitted \($(@($res.Omitted).Count) critical\)") "$omitLine"
+$chunks = Get-ProjectLivenessContinuationChunks -Omitted $res.Omitted -GeneratedAt $now
+Check '... and its follow-up row carries the marker' ((($chunks -join "`n") -split "`n") -contains 'zz-pr-unknown STALLED · PRs unmeasured · stale 1/1') ($chunks -join ' | ')
+Check 'L0 counts rows with an unmeasured fact' ($res.L0 -match '· unmeasured 1$') $res.L0
+
 Write-Host "ages from ConvertFrom-Json-typed timestamps"
 # ConvertFrom-Json turns an ISO string into a [datetime]; the age must not shift by the host offset.
 $typed = ('{"t":"' + (Ago 2) + '"}' | ConvertFrom-Json).t
@@ -177,21 +239,35 @@ $listingJson = @'
 $prJson = '{"projects":{"pa":{"prs":[{"number":5,"created_at":"2026-11-01T00:00:00+00:00"}],"error":null},"pc":{"prs":null,"error":"http_error: 502"}}}' | ConvertFrom-Json
 $hsJson = '{"T-1":{"last_observed_nomination":"human"},"T-9":{"last_observed_nomination":"bohr"}}' | ConvertFrom-Json
 $in = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrReport $prJson -SweepEntries @((S pa T-1), (S pb T-3)) -HeadSkip $hsJson
-Check 'a listed project with threads and PRs is measured' (@($in.Projects) -contains 'pa') (@($in.Projects) -join ',')
-Check 'a failed listing is unmeasured, never an empty project' ($in.Unmeasured.Contains('pb') -and @($in.Projects) -notcontains 'pb')
-Check 'a failed PR listing is unmeasured, never PR 0' ($in.Unmeasured.Contains('pc') -and $in.Unmeasured['pc'] -match 'http_error')
+Check 'a listed project with threads and PRs is measured' (@($in.Projects) -contains 'pa' -and @($in.ThreadsUnmeasured) -notcontains 'pa' -and @($in.PrsUnmeasured) -notcontains 'pa') (@($in.Projects) -join ',')
+Check 'a failed listing is threads-unmeasured and still enumerated (a named row)' (@($in.ThreadsUnmeasured) -contains 'pb' -and @($in.Projects) -contains 'pb' -and $in.Unmeasured['pb'] -match 'boom')
+Check 'a failed PR listing is PRs-unmeasured, never PR 0' (@($in.PrsUnmeasured) -contains 'pc' -and @($in.ThreadsUnmeasured) -notcontains 'pc' -and $in.Unmeasured['pc'] -match 'http_error')
 Check 'every status is carried (rot needs the closed set)' (@($in.Threads | Where-Object { $_.status -eq 'resolved' }).Count -eq 1)
 Check 'nominations are looked up by thread_id and keyed project/thread_id' ($in.Nominations['pa/T-1'] -eq 'human' -and $in.Nominations.Count -eq 1)
-Check 'sweep entries of an unmeasured project are dropped' (@($in.SweepEntries | Where-Object { $_.project -eq 'pb' }).Count -eq 0)
+Check 'sweep entries of a threads-unmeasured project are dropped' (@($in.SweepEntries | Where-Object { $_.project -eq 'pb' }).Count -eq 0)
 Check 'open PRs carry their project' (@($in.OpenPrs).Count -eq 1 -and $in.OpenPrs[0].project -eq 'pa')
-$f = Get-ProjectLivenessFacts -Threads $in.Threads -SweepEntries $in.SweepEntries -Nominations $in.Nominations -OpenPrs $in.OpenPrs -Projects $in.Projects -Now $now
-$res = Get-ProjectLivenessDigestLines -Facts $f -GeneratedAt $now -Unmeasured @($in.Unmeasured.Keys)
-Check 'the joined facts render: pa is HUMAN' ((@($res.Rows) | Where-Object { $_.name -eq 'pa' }).state -eq 'HUMAN') (($res.Rows | ForEach-Object { "$($_.name)=$($_.state)" }) -join ',')
+$f = Get-ProjectLivenessFacts -Threads $in.Threads -SweepEntries $in.SweepEntries -Nominations $in.Nominations -OpenPrs $in.OpenPrs -Projects $in.Projects `
+    -ThreadsUnmeasured $in.ThreadsUnmeasured -PrsUnmeasured $in.PrsUnmeasured -Now $now
+$res = Get-ProjectLivenessDigestLines -Facts $f -GeneratedAt $now
+$stateOf = { param($n) (@($res.Rows) | Where-Object { $_.name -eq $n }).state }
+$diag = (($res.Rows | ForEach-Object { "$($_.name)=$($_.state)" }) -join ',')
+Check 'the joined facts render: pa is HUMAN' ((& $stateOf 'pa') -eq 'HUMAN') $diag
+Check 'pb (listing failed) is an UNMEASURED row' ((& $stateOf 'pb') -eq 'UNMEASURED') $diag
+Check 'pc (no threads, PR listing failed) is UNMEASURED, not EMPTY' ((& $stateOf 'pc') -eq 'UNMEASURED') $diag
 Check 'L0 counts the unmeasured' ($res.L0 -match 'unmeasured 2') $res.L0
 $whole = ConvertFrom-LivenessProbeReports -ListingError 'timed out' -PrReport $prJson -SweepEntries @((S pa T-1))
-Check 'a whole listing failure leaves no row' (@($whole.Projects).Count -eq 0 -and $whole.Unmeasured['pa'] -match 'timed out')
+Check 'a whole listing failure makes every project threads-unmeasured' ((@($whole.ThreadsUnmeasured) -join ',') -eq 'pa,pc' -and $whole.Unmeasured['pa'] -match 'timed out' -and @($whole.Threads).Count -eq 0)
 $noPr = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrReport ('{"projects":{}}' | ConvertFrom-Json)
-Check 'a project with no clones entry is named NoPrSource, not unmeasured' (@($noPr.NoPrSource) -contains 'pa' -and -not $noPr.Unmeasured.Contains('pa'))
+Check 'a project with no clones entry is PRs-unmeasured, not PR 0 (msg-9560 Obj-12-1)' (@($noPr.NoPrSource) -contains 'pa' -and @($noPr.PrsUnmeasured) -contains 'pa' -and $noPr.Unmeasured['pa'] -match 'no clones entry')
+# A measured empty list is measured: `[]` threads / `[]` PRs must not read as `null` (a scriptblock
+# getter unrolls an empty array to $null — found while wiring R-13).
+$emptyIn = ConvertFrom-LivenessProbeReports -ListingReport ('{"liveness":{"pe":{"threads":[],"error":null}}}' | ConvertFrom-Json) `
+    -PrReport ('{"projects":{"pe":{"prs":[],"error":null}}}' | ConvertFrom-Json)
+Check 'a measured empty listing and empty PR list are measured (EMPTY is reachable)' (@($emptyIn.ThreadsUnmeasured).Count -eq 0 -and @($emptyIn.PrsUnmeasured).Count -eq 0) (($emptyIn.Unmeasured.Keys | ForEach-Object { "$_=$($emptyIn.Unmeasured[$_])" }) -join '; ')
+$fe = Get-ProjectLivenessFacts -Threads $emptyIn.Threads -Projects $emptyIn.Projects -ThreadsUnmeasured $emptyIn.ThreadsUnmeasured -PrsUnmeasured $emptyIn.PrsUnmeasured -Now $now
+Check '... and renders EMPTY' ((Get-ProjectLivenessRow -Facts $fe[0]).state -eq 'EMPTY')
+$wholePr = ConvertFrom-LivenessProbeReports -ListingReport $listingJson -PrError 'timed out'
+Check 'a whole PR-probe failure makes every project PRs-unmeasured' (@($wholePr.PrsUnmeasured).Count -eq 3 -and @($wholePr.OpenPrs).Count -eq 0)
 
 if ($script:failures -gt 0) { Write-Host "$script:failures failure(s)"; exit 1 }
 Write-Host "all passed"

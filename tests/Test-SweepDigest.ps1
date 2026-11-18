@@ -1280,6 +1280,36 @@ Check "L1 follows L0" $livLines[2] $wl[$sumIdx + 4]
 Check "a blank line closes the section" '' $wl[$sumIdx + 5]
 Check "without the parameter the digest is unchanged" $withoutLiv (($wl[0..($sumIdx + 1)] + $wl[($sumIdx + 6)..($wl.Count - 1)]) -join "`n")
 
+# msg-9346 §1 (Bohr) + msg-9347 / msg-9560 (Einstein): L1 is off the budget ladder, so the ladder
+# must see L0 and L1 as a fixed cost deducted first. Measured on the FINAL string New-DailyDigest
+# returns — the exact payload Send-Notification posts — with L0 at its 140-char cap, L1 at its
+# 400-char cap (newlines included, as the lib counts it) and every other section overflowing (the
+# saturated case-(ii) shape above).
+Write-Host 'liveness at its caps + saturated sections: the sent digest still fits the budget'
+$capL0 = ('L0 ' + ('x' * 137))
+$capL1 = @('プロジェクト liveness（日数は last_activity_at の投稿者申告値に依存）')
+$l1Cost = $capL1[0].Length + 1
+$k = 0
+while ($l1Cost -lt 400) {
+    $room = 400 - $l1Cost - 1
+    $line = ("p{0:d2} STALLED · stale " -f $k) + ('y' * [math]::Max(0, [math]::Min(80, $room - 18)))
+    if ($line.Length -gt $room) { $line = $line.Substring(0, $room) }
+    $capL1 += $line; $l1Cost += $line.Length + 1; $k++
+}
+CheckTrue 'fixture: L0 is exactly 140 chars' ($capL0.Length -eq 140) $capL0.Length
+CheckTrue 'fixture: L1 costs exactly 400 chars' ($l1Cost -eq 400) $l1Cost
+$capStarved = New-F1StarvedState -Count 5 -Now $f1Now
+$capDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 12 -Now $f1Now) `
+    -EvaluatedState $capStarved -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
+    -LiveKeys @($capStarved.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors @() -Budget $script:DigestBudget -ProjectLivenessLines (@($capL0) + $capL1)
+CheckTrue "the sent digest (L0 140 + L1 400 + saturated sections) is <= $($script:DigestBudget) chars" `
+    ($capDigest.Length -le $script:DigestBudget) $capDigest.Length
+$capLines = $capDigest -split "`n"
+CheckTrue 'every L0 / L1 line is in the sent digest, uncut' `
+    (@(@($capL0) + $capL1 | Where-Object { $capLines -notcontains $_ }).Count -eq 0)
+CheckTrue 'the other sections were actually squeezed (the case is saturated)' ($capDigest -match '\+\d+ 件（省略') $capDigest
+
 if ($script:failures -gt 0) {
     Write-Host ""
     Write-Host "sweep digest: $script:failures check(s) FAILED"
