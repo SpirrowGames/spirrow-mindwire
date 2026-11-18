@@ -444,11 +444,14 @@ Check "the wait clears after commit-launch and before the spawn" (($clearIdx -gt
 #   (a) $didWork is never READ inside the dispatch loop. It is only assigned there, and its single
 #       reader is the ALL-CANDIDATES-IDLE summary after the loop.
 #   (b) the loop's own `break` statements (nearest enclosing loop = the dispatch loop) are exactly
-#       the six exits the design names: time-budget, kill-unconfirmed (conductor exit 7, PR #407
-#       W-3), k-budget-hit, undeclared-verdict, the role-lane post-run break, and
+#       the seven exits the design names: time-budget, kill-unconfirmed (conductor exit 7, PR #407
+#       W-3), k-budget-hit, undeclared-verdict, the role-lane post-run break,
 #       inflight-mark-unwritable (T-role-exit-leaves-clone-off-default-branch PR-B, msg-8844: the
-#       in-flight ledger could not be written, so nothing may launch). Adding one forces this test
-#       to be revisited.
+#       in-flight ledger could not be written, so nothing may launch), and turn-isolation-stop
+#       (ADR-2026-10-09-23 unit 2a wiring, msg-9439: exit 10 is host-wide, so the tick stops
+#       launching). Adding one forces this test to be revisited.
+#   (b''') the turn-isolation-stop break sits under an `if` on `$TurnIsolationStopExitCode`, so it
+#       fires only on exit 10 and cannot widen into a general failure break.
 #   (b'') the inflight-mark-unwritable break sits under an `if` on the mark's `ok`, so it fires only
 #       when the ledger write failed.
 #   (b') the kill-unconfirmed break sits under an `if` on `$ConductorKillUnconfirmedExitCode`, so it
@@ -468,7 +471,7 @@ $didWorkReads = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Autom
 Check "(a) `$didWork is never read inside the dispatch loop" ($didWorkReads.Count -eq 0) "reads at line(s) $(($didWorkReads | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
 $ownBreaks = @($loop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.BreakStatementAst] }, $true) |
     Where-Object { (Get-NearestLoop $_) -eq $loop })
-Check "(b) the dispatch loop has exactly 6 own break exits" ($ownBreaks.Count -eq 6) "found $($ownBreaks.Count) at line(s) $(($ownBreaks | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
+Check "(b) the dispatch loop has exactly 7 own break exits" ($ownBreaks.Count -eq 7) "found $($ownBreaks.Count) at line(s) $(($ownBreaks | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')"
 $killBreak = @($ownBreaks | Where-Object {
     $p = $_.Parent; $found = $false
     while ($null -ne $p -and $p -ne $loop) {
@@ -496,6 +499,15 @@ $markBreak = @($ownBreaks | Where-Object {
     }
     $found })
 Check "(b'') the inflight-mark-unwritable break is governed by the mark's ok" ($markBreak.Count -eq 1)
+$isolationBreak = @($ownBreaks | Where-Object {
+    $p = $_.Parent; $found = $false
+    while ($null -ne $p -and $p -ne $loop) {
+        if ($p -is [System.Management.Automation.Language.IfStatementAst] -and
+            $p.Clauses[0].Item1.Extent.Text -eq '$code -eq $TurnIsolationStopExitCode') { $found = $true; break }
+        $p = $p.Parent
+    }
+    $found })
+Check "(b''') the turn-isolation-stop break is governed by `$TurnIsolationStopExitCode" ($isolationBreak.Count -eq 1)
 $orderAssign = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
     $n.Left.Extent.Text -eq '$candidates' -and $n.Right.Extent.Text -like 'Get-OrderedSweepCandidates*' }, $true))
 Check "the loop's `$candidates is the ordered list" ($orderAssign.Count -eq 1 -and $orderAssign[0].Extent.StartOffset -lt $loop.Extent.StartOffset)

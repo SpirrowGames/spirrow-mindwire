@@ -41,10 +41,11 @@ Refusal raises :class:`DirtyCloneError`; ``loop_runner.main`` turns it into exit
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -67,6 +68,9 @@ LOCK_POLL_S = 0.25
 FALLBACK_DEFAULT_BRANCH = "main"
 PIN_PATH = ".mindwire/pin"  # the file spec_pin.SpecPinWriter writes, relative to the clone root
 PORCELAIN_MAX_ENTRIES = 20
+LEFTOVER_LOG_MAX = 10  # unpushed leftovers named in the WARNING line before " ..."
+
+logger = logging.getLogger(__name__)
 
 # Files / directories under the git dir that mean an operation stopped half-way.
 OP_IN_PROGRESS_MARKERS: tuple[str, ...] = (
@@ -163,6 +167,9 @@ GitRunner = Callable[[Path, Sequence[str]], GitResult]
 def _subprocess_git(repo_dir: Path, args: Sequence[str]) -> GitResult:
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"  # belt to the --no-optional-locks braces below
+    # ``ls-remote`` (check_pushed) talks to origin: never stop on a credential prompt.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
     proc = subprocess.run(
         ["git", "--no-optional-locks", "-C", str(repo_dir), *args],
         capture_output=True,
@@ -172,6 +179,7 @@ def _subprocess_git(repo_dir: Path, args: Sequence[str]) -> GitResult:
         check=False,
         timeout=GIT_TIMEOUT_S,
         env=env,
+        stdin=subprocess.DEVNULL,
     )
     return GitResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
@@ -246,43 +254,111 @@ class CloneGuard:
                 detail=f"HEAD is on {head!r}, default branch is {default!r}",
             )
 
-    def check_pushed(self) -> None:
+    def ref_snapshot(self) -> dict[str, str]:
+        """``{refname: sha}`` for every local branch (``refs/heads``). Read-only.
+
+        Taken before an implementer dispatch and stored by
+        :class:`~spirrow_mindwire.turn_ref_snapshot.TurnRefSnapshotStore`; :meth:`check_pushed`
+        later diffs the current state against it. A git failure raises ``git_unavailable``.
+        """
+        res = self._run(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"], head=None
+        )
+        refs: dict[str, str] = {}
+        for line in res.stdout.splitlines():
+            ref, _, sha = line.strip().partition(" ")
+            if ref and sha:
+                refs[ref] = sha.strip()
+        return refs
+
+    def check_pushed(self, baseline: Mapping[str, str] | None = None) -> None:
         """Raise :class:`DirtyCloneError` (``unpushed``) if a local branch holds unpushed commits.
 
         The CONTINUE path's condition 4 (T-implementer-self-continuation msg-7881 / msg-7883 test
         5c): an implementer that committed but did not push leaves its work only in this shared
         clone. The implementer ends its turn back on the default branch, so HEAD alone cannot
-        show it; every local branch is read. Conservative on purpose: a stale unpushed branch of
-        another thread also refuses the continuation, and the refusal names it.
+        show it; local branches are read.
 
-        A branch whose track says ``ahead`` is unpushed. A branch with no upstream has no
-        tracking answer (PR #519 gate Obj-2); git prints the same empty track for it as for an
-        up-to-date branch, and ``[gone]`` for a deleted upstream. For those three, the branch is
-        unpushed when it carries any commit that no remote-tracking ref reaches
+        **Candidates.** A branch whose track says ``ahead`` is unpushed. A branch with no upstream
+        has no tracking answer (PR #519 gate Obj-2); git prints the same empty track for it as for
+        an up-to-date branch, and ``[gone]`` for a deleted upstream. For those three, the branch
+        is a candidate when it carries any commit that no remote-tracking ref reaches
         (``git rev-list --count <branch> --not --remotes``).
+
+        **Scope (T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2').**
+        ``baseline`` is the ``refs/heads`` state recorded when the turn that declared CONTINUE was
+        launched. When given, only branches that are new since it or whose sha changed are judged;
+        a candidate the baseline already held at the same sha is another turn's leftover, logged
+        at WARNING and not refused. ``None`` (no snapshot, or the launch could not be identified)
+        judges every local branch, as before.
+
+        **Remote tip (D-1').** A narrow ``remote.origin.fetch`` refspec creates no
+        remote-tracking ref for a pushed feature branch, so ``--not --remotes`` counts pushed work
+        as unpushed. When candidates remain, ``git ls-remote --heads origin`` runs once
+        (non-interactive, inside :data:`GIT_TIMEOUT_S`) and a candidate whose tip sha *equals* a
+        remote branch tip is dropped. Only exact tip equality is recognised: a local tip that is
+        an ancestor of a remote tip stays a candidate (the objects may not be local; fetching them
+        would write to the clone). A failed ``ls-remote`` drops nothing and is named in the detail.
         """
         res = self._run(
-            ["for-each-ref", "--format=%(refname) %(upstream:track)", "refs/heads"],
+            [
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(upstream:track)",
+                "refs/heads",
+            ],
             head=None,
         )
-        unpushed: list[str] = []
+        candidates: list[tuple[str, str, str]] = []  # (refname, sha, label)
         for line in res.stdout.splitlines():
-            ref, _, track = line.strip().partition(" ")
-            if not ref:
+            parts = line.strip().split(" ", 2)
+            if len(parts) < 2 or not parts[0]:
                 continue
+            ref, sha = parts[0], parts[1]
+            track = parts[2] if len(parts) > 2 else ""
             name = ref.removeprefix("refs/heads/")
             if "ahead" in track:
-                unpushed.append(name)
+                candidates.append((ref, sha, name))
             elif not track.strip() or "gone" in track:
                 count = self._run(["rev-list", "--count", ref, "--not", "--remotes"], head=None)
                 if count.stdout.strip() not in ("", "0"):
-                    unpushed.append(f"{name} (no upstream)")
+                    candidates.append((ref, sha, f"{name} (no upstream)"))
+        if baseline is not None:
+            leftovers = [c for c in candidates if baseline.get(c[0]) == c[1]]
+            candidates = [c for c in candidates if baseline.get(c[0]) != c[1]]
+            if leftovers:
+                names = sorted(c[2] for c in leftovers)
+                logger.warning(
+                    "clone guard: %d unpushed branch(es) predate this turn and are not judged in "
+                    "%s: %s%s",
+                    len(names),
+                    self._repo_dir,
+                    ", ".join(names[:LEFTOVER_LOG_MAX]),
+                    " ..." if len(names) > LEFTOVER_LOG_MAX else "",
+                )
+        if not candidates:
+            return
+        remote_tips, ls_error = self._remote_tips()
+        unpushed = sorted(label for _, sha, label in candidates if sha not in remote_tips)
         if unpushed:
-            raise self._error(
-                DirtyCloneReason.UNPUSHED,
-                head=self._head_or_none(),
-                detail="unpushed commits on: " + ", ".join(sorted(unpushed)),
-            )
+            detail = "unpushed commits on: " + ", ".join(unpushed)
+            if ls_error:
+                detail += f" (ls-remote failed: {ls_error})"
+            raise self._error(DirtyCloneReason.UNPUSHED, head=self._head_or_none(), detail=detail)
+
+    def _remote_tips(self) -> tuple[frozenset[str], str]:
+        """Branch-tip shas on origin, and an error string (empty on success). Never raises."""
+        args = ["ls-remote", "--heads", "origin"]
+        try:
+            res = self._git(self._repo_dir, args)
+        except subprocess.TimeoutExpired:
+            return frozenset(), f"timed out ({GIT_TIMEOUT_S:g}s)"
+        except OSError as exc:
+            return frozenset(), f"failed to run: {exc}"
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout).strip().splitlines()
+            return frozenset(), f"exit {res.returncode}: {err[0] if err else '-'}"
+        tips = {line.split()[0] for line in res.stdout.splitlines() if line.strip()}
+        return frozenset(tips), ""
 
     # -- helpers --------------------------------------------------------------------------------
 

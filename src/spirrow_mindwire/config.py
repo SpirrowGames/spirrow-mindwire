@@ -919,6 +919,15 @@ def resolve_continuation_ledger_path(settings: MindwireSettings) -> Path:
     return settings.paths.data_dir / "state" / CONTINUATION_LEDGER_FILENAME
 
 
+def resolve_turn_ref_snapshot_dir(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/turn_ref_snapshots`` — the ref state each implementer launch started
+    from (T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1); written by the
+    dispatcher, read by the CONTINUE clone check (:mod:`spirrow_mindwire.turn_ref_snapshot`)."""
+    from .turn_ref_snapshot import SNAPSHOT_DIRNAME
+
+    return settings.paths.data_dir / "state" / SNAPSHOT_DIRNAME
+
+
 CLONE_RETREAT_LOG_FILENAME = "clone-retreats.jsonl"
 """The clone-retreat record under ``<data_dir>/state/`` (T-dirty-clone-wip-retreat PR-1b)."""
 

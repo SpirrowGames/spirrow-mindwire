@@ -1107,11 +1107,17 @@ async def close_alert(
     `"already resolved" in str(exc).lower()`). The origin/main comment there
     declared a "discharge condition, one call: close an already-resolved
     thread once, record the envelope's ``error_type``". That measurement was
-    made (Bohr msg-2456 §2, incident report, 2026-09-03): the observed
-    envelope carries ``error_type='ChatroomStateError'`` and the ``error``
-    text ``"Cannot close thread '<id>' in status='resolved'"``. The measured
-    value is **recorded** here for the next reader, and **not used as a
-    predicate**:
+    made (Bohr msg-2456 §2, incident report, 2026-09-03, before the R2
+    deploy): the envelope observed on that date carried
+    ``error_type='ChatroomStateError'`` and the ``error`` text
+    ``"Cannot close thread '<id>' in status='resolved'"``. A second
+    measurement, made 2026-09-08 on production revision ``5523324`` (conclair
+    R2 + #24), recorded ``error_type='ChatroomThreadResolvedError'`` and the
+    ``error`` text ``"Thread '<id>' is resolved and cannot take new
+    messages. To continue, open a new thread and reference this one via
+    ``references_threads``."``. Both values are dated measurements, not a
+    claim about what production emits today. They are **recorded** here for
+    the next reader, and **neither is used as a predicate**:
 
         The comment's proposal was to convert both substring branches to
         ``exc.error_type == "<Name>"`` equality. Einstein msg-2457 blocked
@@ -1175,9 +1181,11 @@ async def close_alert(
         # blocking. The former substring branches
         # (``"already resolved"`` / ``"already closed"``) and the fallback
         # plan of ``error_type == "ChatroomStateError"`` are BOTH replaced
-        # by this one predicate, and the measured value of that error_type
-        # (2026-09-03: ``"ChatroomStateError"``) is recorded in the docstring
-        # above but deliberately NOT used as a filter (rationale there).
+        # by this one predicate, and the measured values of the error_type
+        # (2026-09-03: ``"ChatroomStateError"``; measured 2026-09-08 on
+        # production revision 5523324: ``"ChatroomThreadResolvedError"``) are
+        # recorded in the docstring above but deliberately NOT used as a
+        # filter (rationale there).
         recheck = await _read_thread_reading_or_none(mcp, project=project, thread_id=thread_id)
         if recheck is not None and recheck.state == _AlertThreadState.RESOLVED:
             return CloseResult(

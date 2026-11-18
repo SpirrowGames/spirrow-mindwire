@@ -481,8 +481,10 @@ def _elevation_message(payload: dict[object, Any]) -> str:
 # (false-negative is fail-safe, false-positive is not — see
 # :class:`ThreadResolvedError` docstring):
 #
-#   Form A — the currently-observed refusal, measured 2026-09-03 (Bohr
-#     msg-2456 §2 on T-gate-bootstrap-close-retried-on-resolved-thread):
+#   Form A — the pre-R2 refusal, measured 2026-09-03 (Bohr msg-2456 §2 on
+#     T-gate-bootstrap-close-retried-on-resolved-thread); emitted by
+#     revision b84640f, the rollback target recorded at the 2026-09-08
+#     deploy, which is why this form is kept:
 #     ``error_type == "ChatroomStateError"`` AND the ``error`` prose
 #     contains the pinning marker ``status='resolved'``. Matching on prose
 #     alone is what msg-2457 blocked at the CLOSE-swallow site; the
@@ -495,9 +497,10 @@ def _elevation_message(payload: dict[object, Any]) -> str:
 #
 #   Form B — the semantic name (forward-compatible for R2 and later): the
 #     envelope carries an ``error_type`` value that names the state
-#     directly. Currently anticipated names: ``ThreadResolvedError``,
-#     ``ChatroomThreadResolvedError``. When R2's actual wire form is
-#     measured, extend this tuple in ONE place.
+#     directly. ``ChatroomThreadResolvedError`` was measured 2026-09-08 on
+#     production revision 5523324 (R2's wire form; present in the tuple
+#     below). ``ThreadResolvedError`` is kept as an anticipated alias that
+#     has not been observed. A future rename extends this tuple in ONE place.
 #
 # Which producers currently touch this classifier:
 #   * :mod:`spirrow_mindwire.gate_bootstrap` — close_alert's post-refusal
@@ -522,8 +525,9 @@ _THREAD_RESOLVED_PROSE_MARKER = "status='resolved'"
 def _is_thread_resolved_envelope(payload: dict[object, Any]) -> bool:
     """``True`` iff ``payload`` is an envelope meaning "target thread is resolved".
 
-    Positive OR of Form A (currently-observed close refusal) and Form B
-    (forward-compatible semantic error_type names). See the block comment
+    Positive OR of Form A (pre-R2 close refusal, measured 2026-09-03) and
+    Form B (semantic error_type names; ``ChatroomThreadResolvedError``
+    measured 2026-09-08 on revision 5523324). See the block comment
     above for the design rationale and the pointer to msg-2457's invariant
     argument for why this site is allowed to inspect ``error`` prose in a
     way the close-swallow site is not.

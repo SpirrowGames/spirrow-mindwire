@@ -170,6 +170,20 @@ $GitSyncDeferredExitCode = 9
 # PREFLIGHT_DEFERRED_EXIT_CODE in src/spirrow_mindwire/preflight.py (a pytest pins the two). Not
 # 10: SECRETS_STOP_EXIT_CODE. No quarantine, retry-pending untouched, launch reverted.
 $PreflightDeferredExitCode = 11
+# Exit code of mindwire-loop when the implementer launch's ref snapshot could not be read, recovered
+# or written (T-ref-snapshot-unreadable-file-blocks-thread-forever, design v2 D-2). Mirrors
+# REF_SNAPSHOT_UNRECORDED_EXIT_CODE in src/spirrow_mindwire/turn_ref_snapshot.py (a pytest pins the
+# two). A fault of one thread's state file, not of the clone: the launch is reverted, nobody is
+# quarantined, the repo is NOT parked, and the candidate is retried next tick.
+$RefSnapshotUnrecordedExitCode = 12
+# Exit code of mindwire-loop when the turn-isolation layer refused the launch (ADR-2026-10-09-23
+# unit 2a wiring, Bohr msg-9439 W1-W3 / msg-9441): [turn.isolation] user is set and this launch's
+# check did not pass (failure, timeout, any exception), the user is a UPN, or the launcher route
+# refused. Mirrors SECRETS_STOP_EXIT_CODE in src/spirrow_mindwire/turn_isolation/errors.py (a
+# pytest pins the two). A fact about the HOST, not the thread: no quarantine, retry-pending
+# untouched, launch reverted, and the rest of the tick is not launched (every candidate on this
+# host would hit the same stop). Never reached while [turn.isolation] user is unset (INV-0).
+$TurnIsolationStopExitCode = 10
 # A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
 # a permanent failure misclassified as transient must not stay silent.
 $PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
@@ -288,6 +302,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # settled_close (T-done-disposition-auto-close boundary 6): Test-SettledCloseEnabled /
 # Invoke-SettledCloseTick. Off unless sweep.json sets settled_close.enabled; off, nothing is spawned.
 . (Join-Path $PSScriptRoot 'lib/SettledClose.ps1')
+# ledger_drift (T-ledger-writeback-on-merge-and-thread-close-on-task-done): read-only ledger drift
+# report per project. Off unless sweep.json sets ledger_drift.enabled; off, nothing is spawned.
+. (Join-Path $PSScriptRoot 'lib/LedgerDrift.ps1')
 # In-flight launch ledger + the sweep's own hold acknowledgement when nothing launches (T-role-exit-
 # leaves-clone-off-default-branch PR-B, generalised by T-hold-observed-freshness-and-unlaunched-tick-
 # ack F1): Read-/Update-InflightLedger, Add-/Remove-InflightMark, Invoke-HoldAckViaPark. Calls
@@ -2183,6 +2200,11 @@ function New-DailyDigest {
         # the caller with Get-N3UnresolvedDigestLines. Emitted after the stop-reason lines. Empty
         # (the default) leaves the digest exactly as it was.
         [string[]]$N3UnresolvedLines = @(),
+        # T-ledger-writeback-on-merge-and-thread-close-on-task-done (PR #585 gate objection 1): the
+        # 台帳のずれ section, built by the caller with Get-LedgerDriftDigestLines (deploy/lib/
+        # LedgerDrift.ps1). Emitted after the N-3 lines. Empty (the default, and ledger_drift off)
+        # leaves the digest exactly as it was.
+        [string[]]$LedgerDriftLines = @(),
 
         # T-composer-entrypoint-missing-drops-decision-cards D-3: the 材料未送信の判断待ち section,
         # built by the caller with Get-MaterialMissingDigestLines (same shape as $ParkedCloneLines:
@@ -2748,6 +2770,7 @@ function New-DailyDigest {
     }
     if ($StopClassLines.Count -gt 0) { $lines += $StopClassLines }
     if ($N3UnresolvedLines.Count -gt 0) { $lines += $N3UnresolvedLines }
+    if ($LedgerDriftLines.Count -gt 0) { $lines += $LedgerDriftLines }
 
     $lines += $quarCountLine
     if ($totalQ -eq 0) {
@@ -3219,6 +3242,85 @@ function Get-GitSyncDeferredNotice {
               signature = $sig; message = $body; repo_key = $repoKey }
 }
 
+# --- ref snapshot unrecorded (T-ref-snapshot-unreadable-file-blocks-thread-forever, design v2 D-2) ---
+# The daemon exits $RefSnapshotUnrecordedExitCode when the implementer launch's ref snapshot file
+# under <state>/turn_ref_snapshots could not be read (OSError), recovered (the exclusive copy of an
+# unreadable file, or the replace by the degraded file, failed) or written. The implementer was
+# never started. It is one thread's state file, not the clone: unlike exit $DirtyCloneExitCode the
+# repo is NOT parked, so the other candidates on the same repo_dir keep launching in this sweep
+# (Fermi msg-9398 #3 / Bohr msg-9431: exit 8 here used to park the whole repo every tick). Same
+# shape as the git-sync deferral: per-CANDIDATE notice key, launch reverted, no quarantine, no
+# STALLED count, retried next tick; the key is dropped once that candidate gets past the snapshot.
+function Get-RefSnapshotNoticeKey {
+    param([string]$RepoDir, [string]$CandidateKey)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    return "__ref_snapshot__/$repoKey/$CandidateKey"
+}
+
+# Drops a candidate's ref-snapshot notice key once its launch got past the snapshot. Returns $true
+# when a key was removed (the caller persists the state).
+function Clear-RefSnapshotNotice {
+    param([hashtable]$State, [string]$RepoDir, [string]$CandidateKey)
+    $key = Get-RefSnapshotNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey
+    if ($State.ContainsKey($key)) { $State.Remove($key); return $true }
+    return $false
+}
+
+# Whether a launch that ended with $ExitCode proves the candidate got past the ref snapshot. Exit
+# $DirtyCloneExitCode and $PreflightDeferredExitCode can stop before the snapshot is taken (clone
+# guard, preflight), and $RefSnapshotUnrecordedExitCode is the snapshot failing itself: none of the
+# three ends the episode. Every other code means the snapshot step was passed (or not needed).
+function Test-RefSnapshotEpisodeOver {
+    param([int]$ExitCode)
+    return ($ExitCode -ne $RefSnapshotUnrecordedExitCode -and $ExitCode -ne $DirtyCloneExitCode -and
+            $ExitCode -ne $PreflightDeferredExitCode)
+}
+
+function Get-RefSnapshotNotice {
+    param([string]$RepoDir, [string]$CandidateKey, $Output, [int]$ExitCode)
+    $repoKey = ConvertTo-DirtyCloneRepoKey -RepoDir $RepoDir
+    $payload = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_REF_SNAPSHOT_UNRECORDED_PAYLOAD\s+(.*)$') {
+            try { $payload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
+            break
+        }
+    }
+    $sig = 'ref-snapshot-unrecorded:parse-failed'
+    $detailLine = '(payload parse failed)'
+    $remedy = 'state ディレクトリの空き容量と権限を確認してください。ファイルを手で直す必要はありません。読めないファイルは自動で退避されます。'
+    if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'kind') {
+        $sig = "ref-snapshot-unrecorded:$($payload.kind)"
+        $detailLine = "reason=$($payload.reason) kind=$($payload.kind)`nfile: $($payload.path)"
+        if ($payload.error) { $detailLine += "`nerror: $($payload.error)" }
+        if ($payload.remedy) { $remedy = "$($payload.remedy)" }
+    }
+    $body = ("MindWire: ref snapshot を保存できなかったため implementer を起動しませんでした — **$CandidateKey** exit=$ExitCode。" +
+             "clone ではなく state ファイルの問題です。スレッドは無傷（quarantine も STALLED のカウントもしない）、repo は駐機せず、同じ clone の他の候補は起動を続けます。次の tick で再試行します。`n" +
+             "clone: $RepoDir`n$detailLine`n$remedy")
+    return @{ key = (Get-RefSnapshotNoticeKey -RepoDir $RepoDir -CandidateKey $CandidateKey)
+              signature = $sig; message = $body; repo_key = $repoKey }
+}
+
+# --- turn-isolation stop (ADR-2026-10-09-23 unit 2a wiring, Bohr msg-9439 / msg-9441) ---
+# Reader of the notification: the operator of this host. The daemon printed exactly one
+# "turn-isolation: STOP <reason>" line; the reason names a step and an object, never a value. The
+# key is host-wide (one per sweep host) and the signature is the reason, so a persisting stop
+# notifies once and a different reason notifies again.
+function Get-TurnIsolationStopNotice {
+    param([string]$CandidateKey, $Output, [int]$ExitCode)
+    $reason = $null
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^turn-isolation: STOP (.+)$') { $reason = $Matches[1].Trim(); break }
+    }
+    $sig = if ($reason) { "turn-isolation:$reason" } else { 'turn-isolation:stop-line-missing' }
+    $shown = if ($reason) { $reason } else { '(停止行が見つからない)' }
+    $body = ("MindWire: turn isolation の確認が通らなかったため、この tick の起動をすべて止めました — **$CandidateKey** exit=$ExitCode。" +
+             "スレッドの不具合ではないので quarantine しません。`n" +
+             "理由: $shown")
+    return @{ key = '__turn_isolation__'; signature = $sig; message = $body; reason = $reason }
+}
+
 # --- preflight deferral (T-preflight-transient-gh-failure-quarantines-threads, design v3.2) ---
 # The daemon exits $PreflightDeferredExitCode when preflight P1 could not confirm the target
 # repo's server-side protection because GitHub stayed transiently unreachable (TLS / EOF / 5xx /
@@ -3512,7 +3614,7 @@ function Invoke-LaunchEndRetreat {
           [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
           [scriptblock]$Recover = $null)
     if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode -or
-        $ExitCode -eq $PreflightDeferredExitCode) { return 'skipped' }
+        $ExitCode -eq $PreflightDeferredExitCode -or $ExitCode -eq $RefSnapshotUnrecordedExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
     $rrow = if ($null -ne $rr) { "$($rr.row)" } else { '' }
@@ -6562,6 +6664,13 @@ try {
         -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'settledclose' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
 
+    # ledger_drift (design v0.3): the same projects, read only. Off by default, and off it spawns nothing.
+    $phaseStartUtc = Get-SweepNowUtc
+    $null = Invoke-LedgerDriftTick -Projects $passedHoldProjects -SweepConfigPath $sweepConfigPath `
+        -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+        -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }
+    Add-PreLoopPhase -Phases $preLoopPhases -Name 'ledgerdrift' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+
     # S3b-1 (Bohr msg-6525): projects sweep.json declares under `projects` that no candidate names
     # are classified too. See Invoke-DeclaredProjectsParkWake.
     $phaseStartUtc = Get-SweepNowUtc
@@ -7258,11 +7367,19 @@ try {
         else { Write-Log "inflight $($cand.key): exit=$code — row $inflightLaunchId kept (exit not confirmed)" }
         # A launch that did not defer got past git-sync: end this candidate's deferral episode so
         # its next outage alerts again (see Get-GitSyncDeferredNotice). An exit-$PreflightDeferredExitCode
-        # run stopped before git-sync was reached, so it proves nothing about git-sync either way.
-        if ($code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
+        # run stopped before git-sync was reached, so it proves nothing about git-sync either way;
+        # neither does an exit-$RefSnapshotUnrecordedExitCode run (the snapshot precedes git-sync).
+        if ($code -ne $RefSnapshotUnrecordedExitCode -and
+            $code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
             (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "git-sync-deferred $($cand.key): episode over (exit=$code) — notice key cleared"
+        }
+        # Same for the ref-snapshot episode (see Test-RefSnapshotEpisodeOver).
+        if ((Test-RefSnapshotEpisodeOver -ExitCode $code) -and
+            (Clear-RefSnapshotNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "ref-snapshot-unrecorded $($cand.key): episode over (exit=$code) — notice key cleared"
         }
         # A run whose preflight passed (MINDWIRE_PREFLIGHT_OK, any exit code) ends that repo's
         # preflight-deferral episode, so its next outage alerts from 'open' again (D-5b).
@@ -7466,6 +7583,46 @@ try {
             continue
         }
 
+        # EXIT CODE $RefSnapshotUnrecordedExitCode — the implementer launch's ref snapshot could not
+        # be read, recovered or written (T-ref-snapshot-unreadable-file-blocks-thread-forever, design
+        # v2 D-2). The implementer never started. One thread's state file, not the clone: MUST stay
+        # above the generic non-zero branch below (which would retry and then quarantine), and MUST
+        # NOT park the repo (the other candidates on this repo_dir keep launching). Like exit 9: the
+        # launch is reverted (no backoff, no launches_same_head), per-candidate notice, retried next tick.
+        if ($code -eq $RefSnapshotUnrecordedExitCode) {
+            $dispositions[$cand.key] = 'ref-snapshot-unrecorded'
+            $notice = Get-RefSnapshotNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "ref-snapshot-unrecorded $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN ref-snapshot-unrecorded $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            Send-NotificationIfChanged -State $notifyState -Key $notice.key `
+                -Signature $notice.signature -Message $notice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "ref-snapshot-unrecorded $($cand.key): exit=$code key=$($notice.key) sig=$($notice.signature) — no quarantine, no park; sweep CONTINUES"
+            continue
+}
+
+        # EXIT CODE $TurnIsolationStopExitCode — turn-isolation stop (ADR-2026-10-09-23 unit 2a
+        # wiring). The host's isolation refused the launch before any turn started. MUST stay above
+        # the generic non-zero branch below (which would retry and then quarantine). The launch is
+        # reverted, any retry-pending is left as is (not consumed), and the tick stops launching:
+        # the stop is host-wide, so every later candidate would hit it too. They end 'not-reached'.
+        if ($code -eq $TurnIsolationStopExitCode) {
+            $dispositions[$cand.key] = 'turn-isolation-stop'
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "turn-isolation-stop $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN turn-isolation-stop $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched--
+                Write-Log "retry-launch $($cand.key): turn-isolation stop (exit $code) — retry-pending kept, retry not consumed"
+            }
+            $tiNotice = Get-TurnIsolationStopNotice -CandidateKey $cand.key -Output $output -ExitCode $code
+            Send-NotificationIfChanged -State $notifyState -Key $tiNotice.key -Signature $tiNotice.signature -Message $tiNotice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "turn-isolation-stop $($cand.key): exit=$code sig=$($tiNotice.signature) — no quarantine; tick STOPS launching"
+            break
+        }
+
         # EXIT CODE $PreflightDeferredExitCode — preflight deferral (T-preflight-transient-gh-failure-
         # quarantines-threads, design v3.2). P1 could not confirm protection because GitHub was
         # transiently unreachable; the role never started. MUST stay above the generic non-zero
@@ -7506,7 +7663,7 @@ try {
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
-        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode/$PreflightDeferredExitCode above) as a thread-scoped failure. Future
+        # handle (i.e. anything other than the 0/2/$DirtyCloneExitCode/$GitSyncDeferredExitCode/$RefSnapshotUnrecordedExitCode/$PreflightDeferredExitCode above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
         # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
@@ -7923,6 +8080,9 @@ try {
                 -StopClassLines (@(Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed | ForEach-Object { $_ }) + $autoGateDigestLines +
                     @(Get-PreLoopBudgetDigestLines -State $preLoopBudgetState -NowEpoch $preLoopNowEpoch)) `
                 -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (Get-JsonState -Path $n3UnresolvedStatePath)) `
+                -LedgerDriftLines (Get-LedgerDriftDigestLines -SweepConfigPath $sweepConfigPath `
+                    -TimeoutSeconds $PrEventAdvanceProbeTimeoutSeconds `
+                    -Invoke { param($a, $t, $l) Invoke-BoundedUvProbe -Arguments $a -TimeoutSeconds $t -Label $l }) `
                 -MaterialMissingLines (Get-MaterialMissingDigestLines -State $materialMissingState -Now $nowUtc) `
                 -UnregisteredIntake $unregisteredIntake `
                 -SummonLines (Get-SummonDigestLines -ControlByProject $controlByProject -SummonByKey $summonByKey `
