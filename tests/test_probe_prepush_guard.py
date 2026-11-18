@@ -11,6 +11,7 @@ behaviour is tested in spirrow-docs. Branch names never come from
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -105,7 +106,8 @@ def test_probe_passes_on_an_armed_clone(tmp_path: Path) -> None:
     res = mod.probe(clone, run_git=rec, tmp_parent=tmp_path)
     assert res.passed, res.steps
     assert res.summary() == "pass"
-    assert [n for n, _ok, _d in res.steps] == ["probe-remote", "canary", "commit", "ff", "non-ff"]
+    assert [n for n, _ok, _d in res.steps] == list(mod.STEPS)
+    assert res.steps[0][0] == "transport"
     assert len(rec.pushes()) == 2
     assert _refs(clone) == before  # the clone's refs are untouched
     assert not list(tmp_path.glob("mindwire-probe-*"))  # step 7 cleaned up
@@ -170,8 +172,8 @@ def test_probe_incomplete_when_update_ref_does_not_read_back(tmp_path: Path) -> 
 
     res = mod.probe(clone, run_git=tampered, tmp_parent=tmp_path)
     assert not res.passed
-    assert res.steps == [res.steps[0]]
-    assert res.steps[0][0] == "probe-remote"
+    assert [n for n, _ok, _d in res.steps] == ["transport", "probe-remote"]
+    assert res.steps[-1][:2] == ("probe-remote", False)
     assert rec.pushes() == []
 
 
@@ -187,7 +189,7 @@ def test_probe_incomplete_when_clone_has_no_head(tmp_path: Path) -> None:
     _git(clone, "init", "-q")
     res = mod.probe(clone, tmp_parent=tmp_path)
     assert not res.passed
-    assert res.steps[0][:2] == ("probe-remote", False)
+    assert res.steps[-1][:2] == ("probe-remote", False)
 
 
 def test_main_reports_p3_and_probe_and_exits_nonzero_on_failure(
@@ -213,3 +215,107 @@ def test_stub_wins_path_resolution_on_this_host(tmp_path: Path) -> None:
     res = mod.probe(_clone(tmp_path), tmp_parent=tmp_path)
     canary = [d for n, _ok, d in res.steps if n == "canary"]
     assert canary and mod.STUB_TOKEN in canary[0]
+
+
+# PR #587 gate round 1, Obj-1: no transport other than the local file one may start.
+def _ssh_recorder(tmp_path: Path, monkeypatch: Any) -> Path:
+    """Point GIT_SSH_COMMAND at a script that leaves a mark if git ever starts ssh."""
+    mark = tmp_path / "ssh-started"
+    script = tmp_path / "fake-ssh.sh"
+    script.write_text(
+        f"#!/bin/sh\ntouch {shlex.quote(mark.as_posix())}\nexit 1\n", encoding="utf-8", newline="\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("GIT_SSH_COMMAND", f"sh {shlex.quote(script.as_posix())}")
+    return mark
+
+
+@pytest.mark.parametrize("key", ["pushInsteadOf", "insteadOf"])
+def test_probe_refuses_when_an_inherited_url_rewrite_is_in_force(
+    tmp_path: Path, monkeypatch: Any, key: str
+) -> None:
+    """A global rule rewriting the temp path to ssh stops the probe before any transport."""
+    clone = _clone(tmp_path)
+    mark = _ssh_recorder(tmp_path, monkeypatch)
+    glob = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    for prefix in {tmp_path.as_posix(), str(tmp_path)}:
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(glob),
+                "--add",
+                f"url.ssh://probe.example.invalid/x.{key}",
+                prefix,
+            ],
+            check=True,
+        )
+    rec = Recorder()
+    res = mod.probe(clone, run_git=rec, tmp_parent=tmp_path)
+    assert not res.passed
+    assert [n for n, _ok, _d in res.steps] == ["transport"]
+    assert "probe.example.invalid" in res.steps[0][2]
+    assert rec.pushes() == []
+    assert not any("clone" in a for a in rec.calls)
+    assert not mark.exists()
+
+
+def test_probe_refuses_a_rewrite_injected_through_the_environment(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    clone = _clone(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.ssh://probe.example.invalid/x.pushInsteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", tmp_path.as_posix())
+    res = mod.probe(clone, tmp_parent=tmp_path)
+    assert [n for n, _ok, _d in res.steps] == ["transport"]
+    assert not res.passed
+
+
+def test_file_only_transport_backstops_a_rewrite_the_check_missed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """If a rewrite reached the clone / push anyway, GIT_ALLOW_PROTOCOL=file refuses ssh."""
+    clone = _clone(tmp_path)
+    mark = _ssh_recorder(tmp_path, monkeypatch)
+    rewrite: list[str] = []
+    for prefix in (tmp_path.as_posix(), str(tmp_path)):
+        rewrite += ["-c", f"url.ssh://probe.example.invalid/x.pushInsteadOf={prefix}"]
+        rewrite += ["-c", f"url.ssh://probe.example.invalid/x.insteadOf={prefix}"]
+    rec = Recorder()
+
+    def sneaky(args: Sequence[str], env: dict[str, str]) -> Any:
+        if "push" in args or "clone" in args:
+            assert env.get("GIT_ALLOW_PROTOCOL") == "file"
+            return rec([*rewrite, *args], env)
+        return rec(args, env)
+
+    res = mod.probe(clone, run_git=sneaky, tmp_parent=tmp_path)
+    assert not res.passed
+    assert res.steps[-1][:2] == ("probe-remote", False)
+    assert "not allowed" in res.steps[-1][2]
+    assert not mark.exists()
+
+
+# PR #587 gate round 1, Obj-2: the stub takes its recording path literally.
+@pytest.mark.parametrize("name", ["a$cache", "b`touch pwned`", "c$(touch pwned)", "d'q", "e space"])
+def test_probe_passes_under_a_temp_parent_with_shell_metacharacters(
+    tmp_path: Path, monkeypatch: Any, name: str
+) -> None:
+    monkeypatch.setenv("cache", "elsewhere")
+    parent = tmp_path / name
+    parent.mkdir()
+    clone = _clone(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    res = mod.probe(clone, tmp_parent=parent)
+    assert res.passed, res.steps
+    assert not (tmp_path / "pwned").exists()
+    assert not (tmp_path / "elsewhere").exists()
+    assert not list(parent.glob("mindwire-probe-*"))
+
+
+def test_stub_text_quotes_the_record_dir_once() -> None:
+    text = mod.stub_text(Path("/tmp/$x`y`/rec"))
+    assert "R='/tmp/$x`y`/rec'\n" in text
+    assert "/tmp/" not in text.split("\n", 2)[2]  # only the R= line names the path

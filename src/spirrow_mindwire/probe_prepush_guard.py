@@ -8,6 +8,16 @@ non-fast-forward push, both to a throwaway bare repository.
 
 Steps (all must hold; any deviation is ``incomplete`` — there is no fallback):
 
+0. **transport** — every probe git command runs with ``GIT_ALLOW_PROTOCOL=file``, so
+   git refuses any transport other than the local file one before it starts: a
+   ``url.*.insteadOf`` / ``pushInsteadOf`` rule that rewrites the temp path to
+   ``ssh://`` or ``https://`` fails closed instead of connecting. On top of that the
+   probe refuses to run at all when the clone's effective config (every scope, plus
+   config injected through the environment, read with the same env the pushes use)
+   carries any URL rewrite rule, because a rewrite to another *local* path would pass
+   the protocol check yet push somewhere other than the probe repo. The clone's config
+   is neither altered nor overridden, so the effective ``core.hooksPath`` is the one
+   probed (PR #587 gate round 1, Obj-1).
 1. **probe remote** — ``git clone --bare`` the clone into a temp dir (local path: no
    network, no checkout, no LFS smudge), then ``update-ref refs/heads/probe <HEAD>``
    and confirm it reads back. No push is used to create the ref, so a failing first
@@ -26,7 +36,8 @@ Steps (all must hold; any deviation is ``incomplete`` — there is no fallback):
    C, and not call the stub.
 6. verdict; 7. the temp dir is removed.
 
-Side effects: the push target is only the local bare repo, and LFS is the stub
+Side effects: the push target is only the local bare repo (step 0: file transport
+only, no URL rewrite rule in force), and LFS is the stub
 (confirmed by the canary before the first push), so nothing leaves the host whatever
 ``lfs.url`` / ``.lfsconfig`` say. Real LFS hand-off is covered by spirrow-docs
 ``scripts/test_pre_push_guard.py`` (j)-(m), not here.
@@ -40,6 +51,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -52,6 +64,9 @@ from pathlib import Path
 STUB_TOKEN = "mindwire-lfs-stub"
 GUARD_STDERR_TOKEN = "mindwire-guard"
 PROBE_REF = "refs/heads/probe"
+URL_REWRITE_KEY_RE = r"^url\..*\.(push)?insteadof$"
+"""``git config --get-regexp`` pattern matching every URL rewrite rule (keys lowercased)."""
+STEPS = ("transport", "probe-remote", "canary", "commit", "ff", "non-ff")
 
 GitRunner = Callable[[Sequence[str], dict[str, str]], "subprocess.CompletedProcess[bytes]"]
 """``(argv after "git", env) -> CompletedProcess``. Injectable for tests."""
@@ -67,14 +82,19 @@ def _run_git(args: Sequence[str], env: dict[str, str]) -> subprocess.CompletedPr
 def stub_text(record_dir: Path) -> str:
     """The recording ``git-lfs`` stub: answers ``version`` with :data:`STUB_TOKEN`;
     any other call is counted and its argv / stdin are saved, then it exits with
-    ``MINDWIRE_LFS_STUB_EXIT`` (default 0)."""
-    rec = record_dir.as_posix()
+    ``MINDWIRE_LFS_STUB_EXIT`` (default 0).
+
+    ``record_dir`` is shell-quoted once into ``R`` and only ever used as ``"$R"``, so a
+    temp parent containing ``$``, backticks or quotes is taken literally, never
+    expanded or executed (PR #587 gate round 1, Obj-2)."""
+    rec = shlex.quote(record_dir.as_posix())
     return (
         "#!/bin/sh\n"
+        f"R={rec}\n"
         f'if [ "$1" = version ]; then echo "{STUB_TOKEN}"; exit 0; fi\n'
-        f'n=$(cat "{rec}/count" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "{rec}/count"\n'
-        f'printf "%s\\n" "$@" > "{rec}/argv.$n"\n'
-        f'cat > "{rec}/stdin.$n"\n'
+        'n=$(cat "$R/count" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$R/count"\n'
+        'printf "%s\\n" "$@" > "$R/argv.$n"\n'
+        'cat > "$R/stdin.$n"\n'
         'exit "${MINDWIRE_LFS_STUB_EXIT:-0}"\n'
     )
 
@@ -86,11 +106,9 @@ class ProbeResult:
 
     @property
     def passed(self) -> bool:
-        # Exactly the five checked steps, all ok: stopping early is never a pass.
+        # Exactly the checked steps, all ok: stopping early is never a pass.
         names = [name for name, _ok, _detail in self.steps]
-        return names == ["probe-remote", "canary", "commit", "ff", "non-ff"] and all(
-            ok for _n, ok, _d in self.steps
-        )
+        return names == list(STEPS) and all(ok for _n, ok, _d in self.steps)
 
     def summary(self) -> str:
         if self.passed:
@@ -171,6 +189,8 @@ def _probe(
     env.pop("MINDWIRE_PUSH_EXPECT", None)  # the probe must see the guard's default verdict
     env.pop("MINDWIRE_LFS_STUB_EXIT", None)  # the stub passes unless make_stub says otherwise
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Step 0 backstop: only the local file transport may start, for every command.
+    env["GIT_ALLOW_PROTOCOL"] = "file"
     for k, v in (
         ("GIT_AUTHOR_NAME", "mindwire-probe"),
         ("GIT_AUTHOR_EMAIL", "probe@example.invalid"),
@@ -183,6 +203,19 @@ def _probe(
     pg = str(probe_git)
     # Pushes never recurse into submodules or carry tags: the probe repo only.
     push = ["-C", c, "-c", "push.recurseSubmodules=no", "-c", "push.followTags=false", "push"]
+
+    # 0. transport: no URL rewrite rule may be in force (GIT_ALLOW_PROTOCOL is the backstop)
+    rw = run_git(["-C", c, "config", "--get-regexp", URL_REWRITE_KEY_RE], env)
+    rules = _out(rw)
+    if rw.returncode not in (0, 1):
+        step("transport", False, f"config unreadable: {_err(rw) or 'rc=' + str(rw.returncode)}")
+    step(
+        "transport",
+        rw.returncode == 1 and not rules,
+        "no URL rewrite rule"
+        if not rules
+        else "URL rewrite rules in force: " + "; ".join(rules.splitlines()),
+    )
 
     # 1. probe remote, without a push
     head_p = run_git(["-C", c, "rev-parse", "--verify", "HEAD^{commit}"], env)
