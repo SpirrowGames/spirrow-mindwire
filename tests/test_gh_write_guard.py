@@ -559,3 +559,53 @@ def test_parser_exception_lets_commands_without_gh_through(
 def test_unparsable_or_wrapped_gh_writes_are_denied(cmd: str) -> None:
     assert g.is_gh_write(cmd)
     assert not g.decide(cmd)[0]
+
+
+# ------------------------------------------ PR-gate on #583: attached short body options
+#: gh accepts a short option's value attached to it (``-b"text"``) and short options bundled
+#: behind one dash (``-sb"text"``). Both carry a body, so both must be detected as writes.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'gh pr merge 1 --squash -b"$(cat private.txt)"',
+        "gh pr merge 1 --squash -b$(cat private.txt)",
+        'gh pr merge 1 -sb"$(cat private.txt)"',
+        'gh pr merge 1 -sdb"$(cat private.txt)"',
+        'gh pr merge 1 --squash -t"$(cat private.txt)"',
+        'gh pr close 1 -c"$(cat private.txt)"',
+        'gh issue close 1 -c"$(cat private.txt)"',
+        'gh pr merge 1 --squash -b="$(cat private.txt)"',
+    ],
+)
+def test_attached_short_body_options_are_detected_and_denied(cmd: str) -> None:
+    assert g.is_gh_write(cmd), cmd
+    allowed, reason = g.decide(cmd)
+    assert not allowed, cmd
+    assert reason is not None and "private.txt" not in reason
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr merge 1 -sbliteral",
+        "gh pr merge 1 --squash -bliteral",
+        "gh release edit v1 -nnotes",
+    ],
+)
+def test_attached_short_body_options_with_literal_values_are_writes(cmd: str) -> None:
+    assert g.is_gh_write(cmd), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr merge 1 -sd",  # bundled flags, no body letter
+        "gh pr merge 1 --squash -Robot/content",  # -R takes a value: its letters are not options
+        "gh pr merge 1 -sRobot/tub",
+        "gh pr close 1 -Robot/content",
+        "gh pr ready 1 -Rbot/cnt",
+    ],
+)
+def test_attached_values_of_other_options_are_not_body_options(cmd: str) -> None:
+    assert not g.is_gh_write(cmd), cmd
+    assert _run(_bash(cmd)) == {}, cmd

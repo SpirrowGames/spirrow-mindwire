@@ -383,7 +383,33 @@ def _gh_write_flat(argv: list[str], legacy: bool = False) -> bool:
     if not legacy and (g, sub) in POSFILE_CMDS:
         return True
     if g in ("pr", "issue", "release", "gist") and sub not in READONLY_SUBS:
-        return any(t in BODY_OPTS_WRITE or t.split("=", 1)[0] in BODY_OPTS_WRITE for t in rest)
+        vals = _val_set(g, sub)
+        return any(_is_body_opt(t, vals) for t in rest)
+    return False
+
+
+def _is_body_opt(t: str, vals: frozenset[str]) -> bool:
+    """Whether the word ``t`` carries a body option (PR-gate on #583: attached short options).
+
+    gh's flag parser accepts a short option's value attached to it (``-b"text"``) and short
+    options bundled behind one dash (``-sb"text"``: ``-s`` then ``-b`` with its value), so the
+    exact / ``--long=value`` test alone misses ``gh pr merge 1 --squash -b"$(cat f)"``. A
+    single-dash word is read letter by letter the way gh reads it: a body letter anywhere before
+    the first value-taking option makes it a body option; a value-taking option (``vals``, the
+    arity table of this group and sub) ends the options, the rest of the word being its value.
+    A letter in neither set is taken as a flag and the scan goes on, so an option missing from
+    the arity table can only widen detection, never narrow it.
+    """
+    if t in BODY_OPTS_WRITE or t.split("=", 1)[0] in BODY_OPTS_WRITE:
+        return True
+    if not t.startswith("-") or t.startswith("--") or len(t) <= 2:
+        return False
+    for ch in t[1:]:
+        opt = "-" + ch
+        if opt in BODY_OPTS_WRITE:
+            return True
+        if opt in vals:
+            return False
     return False
 
 

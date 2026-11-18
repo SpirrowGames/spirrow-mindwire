@@ -25,7 +25,11 @@ from ..pin_ignore import ensure_pin_ignored
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..source_marker import append_markers
 from ..spec_pin import SpecPinWriter
-from ..turn_ref_snapshot import SnapshotStoreError, TurnRefSnapshotStore
+from ..turn_ref_snapshot import (
+    RefSnapshotUnrecordedError,
+    SnapshotStoreError,
+    TurnRefSnapshotStore,
+)
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
 from .event_log import delivery_failed_event, reply_sent_event
@@ -254,10 +258,16 @@ class Dispatcher:
     def _record_ref_snapshot(
         guard: CloneGuard, store: TurnRefSnapshotStore, event: ChatroomEvent
     ) -> None:
-        """D-2' 1: save the launch's ref state, or refuse the dispatch (exit 8) before the adapter.
+        """D-2' 1: save the launch's ref state, or refuse the dispatch before the adapter.
 
         Runs after the clone guard and before git sync / the pin write, so a refusal leaves the
         clone as found. Keyed on the trigger message; an existing snapshot for the key is kept.
+
+        A state-file fault (:class:`RefSnapshotUnrecordedError`: the file could not be read,
+        recovered or written) propagates unchanged, so ``loop_runner.main`` exits
+        ``REF_SNAPSHOT_UNRECORDED_EXIT_CODE`` and the sweep skips only this candidate
+        (T-ref-snapshot-unreadable-file-blocks-thread-forever, design v2 D-2). A failing
+        ``ref_snapshot()`` git call is the clone's fault and stays exit 8 (``git_unavailable``).
         """
         msg_id = getattr(event.payload, "msg_id", None)
         try:
@@ -271,6 +281,8 @@ class Dispatcher:
                 repo_dir=guard.repo_dir,
                 refs=refs,
             )
+        except RefSnapshotUnrecordedError:
+            raise
         except (SnapshotStoreError, DirtyCloneError) as exc:
             raise DirtyCloneError(
                 repo_dir=guard.repo_dir,

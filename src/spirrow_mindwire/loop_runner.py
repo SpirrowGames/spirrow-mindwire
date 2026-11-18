@@ -165,7 +165,13 @@ from .repo_projects import load_repo_project_map
 from .spec_pin import SpecPinWriter
 from .turn_isolation.errors import TurnIsolationStop
 from .turn_isolation.gate import TurnLaunchFactory, resolve_turn_launch
-from .turn_ref_snapshot import ContinuationScope, TurnRefSnapshotStore
+from .turn_ref_snapshot import (
+    REF_SNAPSHOT_UNRECORDED_EXIT_CODE,
+    ContinuationScope,
+    RefSnapshotUnrecordedError,
+    TurnRefSnapshotStore,
+    emit_ref_snapshot_unrecorded_payload,
+)
 from .value_objects import Capability, Event, Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -1722,6 +1728,19 @@ def main() -> None:
             preflight_exc,
         )
         sys.exit(PREFLIGHT_DEFERRED_EXIT_CODE)
+    except RefSnapshotUnrecordedError as snap_exc:
+        # T-ref-snapshot-unreadable-file-blocks-thread-forever (design v2 D-2): the launch's ref
+        # snapshot could not be read, recovered or written. A state-directory fault of this one
+        # thread's file, not the clone's: a dedicated code so the wrapper skips only this candidate
+        # (no repo parking, no quarantine, launch reverted) instead of parking the whole repo as
+        # exit 8 does. The implementer was never started.
+        emit_ref_snapshot_unrecorded_payload(snap_exc)
+        logger.warning(
+            "ref-snapshot-unrecorded exit=%d: %s",
+            REF_SNAPSHOT_UNRECORDED_EXIT_CODE,
+            snap_exc,
+        )
+        sys.exit(REF_SNAPSHOT_UNRECORDED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
