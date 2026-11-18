@@ -101,6 +101,9 @@ def _armed_secret_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: A
     """
     hooks = tmp_path_factory.mktemp("armed-hooks")
     (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    guard = hooks / "pre-push"
+    guard.write_text("#!/bin/sh\n# mindwire-guard: non-ff-expect v1\nexit 0\n", encoding="utf-8")
+    guard.chmod(0o755)
     monkeypatch.setattr(preflight_mod, "_default_hooks_path_reader", lambda _r: str(hooks))
 
 

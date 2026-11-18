@@ -19,6 +19,7 @@ empty file, ``GIT_CONFIG_NOSYSTEM=1``): a developer machine with a global
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,27 @@ def _repo(tmp_path: Path) -> Path:
 
 def _p3(repo: Path) -> None:
     preflight_mod._p3_secret_guard_armed(repo, _real_reader, _real_toplevel)
+
+
+_MARKER = "# mindwire-guard: non-ff-expect v1"
+_GUARD_TEXT = f"#!/bin/sh\n{_MARKER}\nexit 0\n"
+
+
+def _write_guard(hooks: Path, text: str = _GUARD_TEXT, *, executable: bool = True) -> Path:
+    """Write ``hooks/pre-push`` (the force-push guard by default) with the given mode."""
+    hook = hooks / "pre-push"
+    hook.write_text(text, encoding="utf-8", newline="\n")
+    hook.chmod(0o755 if executable else 0o644)
+    return hook
+
+
+def _armed_hooks(tmp_path: Path) -> Path:
+    """A hooks dir holding both guards, as the spirrow-docs checkout at 8cb752a does."""
+    hooks = tmp_path / "githooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    _write_guard(hooks)
+    return hooks
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +161,7 @@ def test_p3_relative_hooks_path_resolves_against_toplevel(tmp_path: Path) -> Non
     repo = _repo(tmp_path)
     (repo / "githooks").mkdir()
     (repo / "githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    _write_guard(repo / "githooks")
     _git(repo, "config", "core.hooksPath", "githooks")
     _p3(repo)
     sub = repo / "nested" / "dir"
@@ -152,8 +175,9 @@ def test_p3_armed_clone_passes(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     hooks = tmp_path / "githooks"
     hooks.mkdir()
-    for name in ("pre-commit", "pre-push", "post-checkout", "post-commit", "post-merge"):
+    for name in ("pre-commit", "post-checkout", "post-commit", "post-merge"):
         (hooks / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    _write_guard(hooks)
     _git(repo, "config", "core.hooksPath", str(hooks))
     _p3(repo)
 
@@ -202,9 +226,7 @@ def test_preflight_gate_halts_on_unarmed_clone_before_p2_p1(tmp_path: Path) -> N
 
 def test_preflight_gate_proceeds_to_p2_once_armed(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
-    hooks = tmp_path / "githooks"
-    hooks.mkdir()
-    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hooks = _armed_hooks(tmp_path)
     _git(repo, "config", "core.hooksPath", str(hooks))
     daemon = tmp_path / "daemon"
     daemon.mkdir()
@@ -216,3 +238,113 @@ def test_preflight_gate_proceeds_to_p2_once_armed(tmp_path: Path) -> None:
             api_caller=_must_not_reach,
         )
     assert "P2" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# force-push guard (D-prime §4-prime) — pre-push must be the guard AND runnable by git
+# --------------------------------------------------------------------------- #
+
+_LFS_ONLY = (
+    "#!/bin/sh\n"
+    "command -v git-lfs >/dev/null 2>&1 || { echo >&2 'git-lfs missing'; exit 2; }\n"
+    'git lfs pre-push "$@"\n'
+)
+
+
+def _armed_repo_with_guard(tmp_path: Path, text: str, *, executable: bool = True) -> Path:
+    repo = _repo(tmp_path)
+    hooks = _armed_hooks(tmp_path)
+    _write_guard(hooks, text, executable=executable)
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    return repo
+
+
+def test_p3_pre_commit_only_hooks_dir_halts_on_missing_pre_push(tmp_path: Path) -> None:
+    """A hooks dir with pre-commit but no pre-push at all is not armed against force-push."""
+    repo = _repo(tmp_path)
+    hooks = _armed_hooks(tmp_path)
+    (hooks / "pre-push").unlink()
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    with pytest.raises(PreflightError) as exc:
+        _p3(repo)
+    msg = str(exc.value)
+    assert "P3" in msg
+    assert "pre-push" in msg
+    assert "force-push guard" in msg
+
+
+def test_p3_lfs_only_pre_push_halts_and_names_the_pull(tmp_path: Path) -> None:
+    """The live state before §4″ step 1: the hooks checkout still has the LFS-only pre-push."""
+    repo = _armed_repo_with_guard(tmp_path, _LFS_ONLY)
+    with pytest.raises(PreflightError) as exc:
+        _p3(repo)
+    msg = str(exc.value)
+    assert _MARKER in msg
+    assert "pull --ff-only" in msg  # the message names the repair
+    assert "Do not remove" in msg
+
+
+def test_p3_marker_as_substring_only_does_not_count(tmp_path: Path) -> None:
+    repo = _armed_repo_with_guard(tmp_path, f"#!/bin/sh\necho '{_MARKER}'\n")
+    with pytest.raises(PreflightError, match="no line"):
+        _p3(repo)
+
+
+def test_p3_pre_push_that_is_a_directory_halts(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    hooks = _armed_hooks(tmp_path)
+    (hooks / "pre-push").unlink()
+    (hooks / "pre-push").mkdir()
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    with pytest.raises(PreflightError, match="not a regular file"):
+        _p3(repo)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec bit; Windows has none to clear")
+def test_p3_marker_without_exec_bit_halts_on_posix(tmp_path: Path) -> None:
+    """Obj-1-2: the marker in a file git will not run is not an armed guard.
+
+    This is the gap PR-1 closed in the index (githooks/pre-push 100644 → 100755)."""
+    repo = _armed_repo_with_guard(tmp_path, _GUARD_TEXT, executable=False)
+    with pytest.raises(PreflightError, match="not executable"):
+        _p3(repo)
+
+
+def test_p3_posix_rule_uses_the_exec_bit(tmp_path: Path, monkeypatch: Any) -> None:
+    """The POSIX rule on every platform: X_OK is what decides, not the file's text."""
+    hooks = _armed_hooks(tmp_path)
+    monkeypatch.setattr(os, "access", lambda _p, _m: False)
+    with pytest.raises(PreflightError, match="not executable"):
+        preflight_mod._p3_force_push_guard_armed(tmp_path, str(hooks), hooks, windows=False)
+    monkeypatch.setattr(os, "access", lambda _p, _m: True)
+    preflight_mod._p3_force_push_guard_armed(tmp_path, str(hooks), hooks, windows=False)
+
+
+def test_p3_marker_without_shebang_halts_with_windows_rule(tmp_path: Path) -> None:
+    """Obj-1-2 on Windows: Git for Windows refuses to spawn a hook without ``#!``
+    (measured on 2.54.0.windows.1: "Exec format error"), so no shebang = not armed."""
+    hooks = _armed_hooks(tmp_path)
+    _write_guard(hooks, f"{_MARKER}\nexit 0\n")
+    with pytest.raises(PreflightError, match="shebang"):
+        preflight_mod._p3_force_push_guard_armed(tmp_path, str(hooks), hooks, windows=True)
+
+
+def test_p3_windows_rule_ignores_the_exec_bit(tmp_path: Path, monkeypatch: Any) -> None:
+    hooks = _armed_hooks(tmp_path)
+    monkeypatch.setattr(os, "access", lambda _p, _m: False)
+    preflight_mod._p3_force_push_guard_armed(tmp_path, str(hooks), hooks, windows=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the real platform switch, Windows side")
+def test_p3_marker_without_shebang_halts_through_platform_switch(tmp_path: Path) -> None:
+    repo = _armed_repo_with_guard(tmp_path, f"{_MARKER}\nexit 0\n")
+    with pytest.raises(PreflightError, match="shebang"):
+        _p3(repo)
+
+
+def test_p3_guard_with_crlf_line_endings_still_matches_marker(tmp_path: Path) -> None:
+    hooks = _armed_hooks(tmp_path)
+    hook = hooks / "pre-push"
+    hook.write_bytes(_GUARD_TEXT.replace("\n", "\r\n").encode("utf-8"))
+    hook.chmod(0o755)
+    preflight_mod._p3_force_push_guard_armed(tmp_path, str(hooks), hooks, windows=True)

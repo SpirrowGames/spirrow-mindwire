@@ -60,12 +60,33 @@ Four checks, in one order so the earliest failure is the loudest:
   silently joining the unarmed set. Remediation: run the guard's
   ``install_githooks.sh`` naming that clone.
 
+  The same directory must also hold the force-push guard
+  (T-force-push-silently-overwrites-with-no-fail-loud-boundary, D-prime §4-prime): a
+  ``pre-push`` that (1) is a regular file, (2) carries the marker line
+  ``# mindwire-guard: non-ff-expect v1`` and (3) git can actually run — on
+  POSIX the exec bit (``os.access(X_OK)``), on Windows a first line starting
+  with ``#!`` (Git for Windows ignores the exec bit and refuses to spawn a
+  hook without a shebang: measured on 2.54.0.windows.1, "cannot spawn …
+  Exec format error"). A marker in a file git cannot run is not an armed
+  guard. The guard refuses a non-fast-forward push or a ref deletion unless
+  ``MINDWIRE_PUSH_EXPECT`` names the remote head it expects to overwrite.
+  That variable grants nothing: force-push and ref deletion stay Tier C
+  under ADR-2026-05-23-07 and the loop does not perform them; the hook only
+  keeps even an approved force-push from overwriting a head it did not
+  expect. P3 asserts the hook is armed; it does not widen what the loop may
+  push.
+
   What P3 does NOT do (msg-5342 §4, kept out deliberately): it does not run
-  the hook (``git hook run``) and does not read any commit's rc, so the
-  production commit path gets no diagnostic side channel. It also checks the
-  hook by NAME only: any regular file called ``pre-commit`` passes whatever
-  it contains, and ``core.hooksPath`` is not compared against an expected
-  directory (that would need a new config item). Accepted residual weakness.
+  either hook (``git hook run``) and does not read any commit's or push's
+  rc, so the production path gets no diagnostic side channel. ``pre-commit``
+  is checked by NAME only: any regular file called ``pre-commit`` passes
+  whatever it contains, and ``core.hooksPath`` is not compared against an
+  expected directory (that would need a new config item). ``pre-push`` is
+  checked by marker, not by behaviour; that it actually refuses is what
+  ``spirrow_mindwire.probe_prepush_guard`` verifies per clone. Accepted
+  residual weakness: a worktree created by hand (not dispatched by the loop)
+  is never checked, and ``extensions.worktreeConfig`` can give a worktree its
+  own ``core.hooksPath``.
 
 * **P2** — every remote URL in ``repo_dir``'s ``.git/config`` at start is
   under ``https://github.com/SpirrowGames/``. Tier-C decide 2026-08-19
@@ -179,6 +200,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -549,6 +571,69 @@ _P3_REMEDY = (
     "(T-secret-guard-unarmed-in-every-implementer-clone msg-2864 §6 R-1)."
 )
 
+_P3_PRE_PUSH_HOOK = "pre-push"
+
+_P3_PRE_PUSH_MARKER = "# mindwire-guard: non-ff-expect v1"
+"""The marker line the spirrow-docs ``githooks/pre-push`` force-push guard carries.
+
+Matched as a whole line (``str.splitlines`` drops CR/LF), not as a substring."""
+
+_P3_PRE_PUSH_REMEDY = (
+    "The hooks directory is most likely a spirrow-docs checkout older than the "
+    "force-push guard (spirrow-docs#44): run `git pull --ff-only` in that hooks "
+    "checkout and check again "
+    "(T-force-push-silently-overwrites-with-no-fail-loud-boundary §4″). Do not remove "
+    "or bypass the hook to get past this check."
+)
+
+
+def _p3_hook_runnable(hook: Path, first_line: str, *, windows: bool) -> bool:
+    """Whether git would run ``hook``: POSIX → exec bit; Windows → ``#!`` first line.
+
+    Git for Windows does not consult an exec bit (there is none to read) and
+    refuses to spawn a hook whose first line is not a shebang — measured on
+    2.54.0.windows.1: ``cannot spawn …/pre-push: Exec format error``.
+    """
+    if windows:
+        return first_line.startswith("#!")
+    return os.access(hook, os.X_OK)
+
+
+def _p3_force_push_guard_armed(
+    repo_dir: Path, value: str, hooks_dir: Path, *, windows: bool | None = None
+) -> None:
+    """Assert ``hooks_dir/pre-push`` is the force-push guard and git can run it."""
+    if windows is None:
+        windows = os.name == "nt"
+    hook = hooks_dir / _P3_PRE_PUSH_HOOK
+    where = f"core.hooksPath for {repo_dir} is {value!r} but {hook}"
+    if not hook.is_file():
+        raise PreflightError(
+            f"preflight P3 failed: {where} is not a regular file, so the force-push "
+            f"guard is not armed. {_P3_PRE_PUSH_REMEDY}"
+        )
+    try:
+        lines = hook.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise PreflightError(
+            f"preflight P3 failed: {where} could not be read ({exc}); an unreadable "
+            f"guard is treated as unarmed (fail-closed). {_P3_PRE_PUSH_REMEDY}"
+        ) from exc
+    if _P3_PRE_PUSH_MARKER not in lines:
+        raise PreflightError(
+            f"preflight P3 failed: {where} has no line {_P3_PRE_PUSH_MARKER!r}, so it is "
+            f"not the force-push guard (an LFS-only pre-push lets a non-fast-forward "
+            f"push overwrite a remote head silently). {_P3_PRE_PUSH_REMEDY}"
+        )
+    first = lines[0] if lines else ""
+    if not _p3_hook_runnable(hook, first, windows=windows):
+        how = "its first line is not a #! shebang" if windows else "it is not executable"
+        raise PreflightError(
+            f"preflight P3 failed: {where} carries the guard marker but {how}, so git "
+            f"would not run it and the force-push guard is not armed. "
+            f"{_P3_PRE_PUSH_REMEDY}"
+        )
+
 
 def _p3_secret_guard_armed(
     repo_dir: Path, hooks_path_reader: HooksPathReader, git_toplevel: GitToplevel
@@ -589,6 +674,7 @@ def _p3_secret_guard_armed(
             f"(a hooks directory holding only other hooks, or a directory named "
             f"{_P3_REQUIRED_HOOK}, does not count). {_P3_REMEDY}"
         )
+    _p3_force_push_guard_armed(repo_dir, value, hooks_dir)
 
 
 # --------------------------------------------------------------------------- #
