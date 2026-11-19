@@ -500,6 +500,34 @@ async def test_reap_orphans_touches_only_managed_names_in_repo_dir() -> None:
 
 
 @pytest.mark.anyio
+async def test_reap_orphans_in_slot_mode_touches_only_the_borrowed_slot() -> None:
+    """Slot pool A3 (msg-9402 Obj-36-3, fix_cut): the wrapper points ``[loop].repo_dir`` at the
+    borrowed slot, so the sweep reaches only sessions whose cwd is that slot. A session left in
+    another slot of the same repo is cleaned up when that slot is next lent, never from here."""
+    cli = FakeCli()
+    cli.agents = [
+        _agent("aaaaaaa1", "T-x-r1-abcdef"),  # the borrowed slot (REPO) -> reaped
+        _agent("aaaaaaa2", "T-y-r1-abcdef", cwd=REPO + "-02"),  # another slot -> kept
+        _agent("aaaaaaa3", "T-z-r1-abcdef", cwd=REPO + "/sub"),  # below the slot -> kept
+    ]
+
+    async def planner(h: SessionHandle, e: ChatroomEvent, clean: bool | None) -> BgTurnPlan:
+        raise AssertionError("no turn is planned here")
+
+    clock = Clock()
+    adapter = ClaudeBgAdapter(
+        repo_dir=REPO,  # what the wrapper sets [loop].repo_dir to: the borrowed slot
+        planner=planner,
+        runner=cli,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    report = await adapter.reap_orphans(frozenset())
+    assert report.reaped == ("aaaaaaa1",)
+    assert [a["id"] for a in cli.agents] == ["aaaaaaa2", "aaaaaaa3"]
+
+
+@pytest.mark.anyio
 async def test_reap_reports_rm_failures() -> None:
     cli = FakeCli(rm_fails=True)
     cli.agents = [_agent("aaaaaaa1", "T-x-r1-abcdef")]

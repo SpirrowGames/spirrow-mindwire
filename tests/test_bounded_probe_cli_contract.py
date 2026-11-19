@@ -92,7 +92,18 @@ def test_every_call_site_was_found() -> None:
     # --liveness only on the digest tick: twenty-two.
     # T-thread-relations-unused-so-parallel-rule-cannot-be-checked adds
     # Invoke-ThreadReferencesProbe: twenty-three.
-    assert len(_SITES) == 23, _SITES
+    # T-ephemeral-impl-clone-slot-per-thread A3 adds Invoke-SlotPrep, Invoke-SlotFinish and
+    # Invoke-SlotLease -> -m spirrow_mindwire.cli slot-prep / slot-finish / slot-lease: twenty-six.
+    assert len(_SITES) == 26, _SITES
+
+
+def test_slot_pool_call_sites_pass_cli_flags() -> None:
+    sites = {label: (target, flags) for label, target, flags in _SITES}
+    assert sites["'slot-prep'"][0] == "-m spirrow_mindwire.cli slot-prep"
+    assert "--wrapper-pid" in sites["'slot-prep'"][1]
+    assert "--branch" not in sites["'slot-prep'"][1]  # slot-prep derives loop/<stem> itself
+    assert sites["'slot-finish'"][0] == "-m spirrow_mindwire.cli slot-finish"
+    assert sites["'slot-lease'"][0] == "-m spirrow_mindwire.cli slot-lease"
 
 
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:

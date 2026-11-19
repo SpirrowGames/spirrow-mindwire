@@ -340,6 +340,14 @@ class SlotPrep:
         res = _call(self._git, mirror.parent, "clone", "--mirror", self.origin_url, mirror.name)
         return None if res.returncode == 0 else f"mirror clone failed: {_first_line(res)}"
 
+    def _mirror_default(self) -> str | None:
+        """The default branch the bare mirror's ``HEAD`` names (``--base`` not given)."""
+        res = _call(
+            self._git, mirror_path(self.slots_root, self.repo), "symbolic-ref", "--short", "HEAD"
+        )
+        name = res.stdout.strip()
+        return name if res.returncode == 0 and name else None
+
     # -- borrow ----------------------------------------------------------------------------
 
     def borrow(
@@ -348,7 +356,7 @@ class SlotPrep:
         thread_id: str,
         turn_id: str,
         branch: str,
-        base: str,
+        base: str | None,
         wrapper_pid: int | None = None,
         session_name: str | None = None,
         job_name: str | None = None,
@@ -387,7 +395,7 @@ class SlotPrep:
         kept: list[tuple[Lease, UnreturnedVerdict]],
         *,
         branch: str,
-        base: str,
+        base: str | None,
     ) -> PrepResult:
         err = self._ensure_mirror()
         if err is not None:
@@ -423,6 +431,18 @@ class SlotPrep:
                     lease,
                     PARK_PROVISION_FAILED,
                     f"{slot}: {err}",
+                    acquire=acq,
+                    quarantine=quarantine,
+                    kept=kept,
+                )
+        if base is None:
+            base = self._mirror_default()
+            if base is None:
+                return self._park(
+                    ref,
+                    lease,
+                    PARK_PROVISION_FAILED,
+                    "the mirror's HEAD names no default branch; pass --base",
                     acquire=acq,
                     quarantine=quarantine,
                     kept=kept,
