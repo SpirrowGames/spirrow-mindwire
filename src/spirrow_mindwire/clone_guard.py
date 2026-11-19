@@ -150,9 +150,13 @@ def normalized_patch(diff: str) -> str | None:
     their line numbers. Every other byte is kept: whitespace inside a changed line can be the
     change itself (PR #590 gate Obj-1). A binary patch is ``None`` -- inconclusive, because
     without the ``index`` line two different binary changes print the same summary (Obj-2).
+
+    Lines are split on LF only, as git splits them. ``str.splitlines`` also breaks on VT, FF,
+    CR and other separators, so ``+a<VT>+b`` would read as the two lines ``+a`` / ``+b`` and
+    match a different change once hunk counts are dropped (PR #589 gate round 2, Obj-2-1).
     """
     out: list[str] = []
-    for line in diff.splitlines():
+    for line in diff.split("\n"):
         if line.startswith(("Binary files ", "GIT binary patch")):
             return None
         if line.startswith("index "):

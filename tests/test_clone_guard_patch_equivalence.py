@@ -122,6 +122,27 @@ def test_same_subject_different_binary_is_unpushed(clone: Path) -> None:
     assert "rescue" in _unpushed(clone).detail
 
 
+def test_same_subject_vertical_tab_versus_two_lines_is_unpushed(clone: Path) -> None:
+    """PR #589 gate round 2 Obj-2-1: "a\\nb\\n" and "a<VT>+b\\n" must not compare equal."""
+    _git(clone, "switch", "-q", "feature/x")
+    (clone / "v.txt").write_bytes(b"a\nb\n")
+    _git(clone, "add", "v.txt")
+    _git(clone, "commit", "-q", "-m", "add v")
+    _git(clone, "push", "-q", "origin", "feature/x")
+    _git(clone, "switch", "-q", "-c", "rescue", "main")
+    (clone / "v.txt").write_bytes(b"a\x0b+b\n")
+    _git(clone, "add", "v.txt")
+    _git(clone, "commit", "-q", "-m", "add v")
+    _git(clone, "switch", "-q", "main")
+    assert "rescue" in _unpushed(clone).detail
+
+
+def test_normalized_patch_splits_on_lf_only() -> None:
+    two = "diff --git a/v b/v\n@@ -0,0 +1,2 @@\n+a\n+b\n"
+    one = "diff --git a/v b/v\n@@ -0,0 +1 @@\n+a\x0b+b\n"
+    assert normalized_patch(two) != normalized_patch(one)
+
+
 def test_normalized_patch_ignores_index_and_hunk_positions() -> None:
     a = "diff --git a/f b/f\nindex 111..222 100644\n@@ -1,2 +1,3 @@ def x\n a\n+b\n"
     b = "diff --git a/f b/f\nindex 333..444 100644\n@@ -9,2 +9,3 @@\n a\n+b\n"
