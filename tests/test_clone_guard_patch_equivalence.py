@@ -96,6 +96,17 @@ def test_same_subject_whitespace_only_difference_is_unpushed(clone: Path) -> Non
     assert "rescue" in _unpushed(clone).detail
 
 
+def test_same_subject_trailing_space_on_last_line_is_unpushed(clone: Path) -> None:
+    """PR #590 gate round 2: "b" vs "b " as the patch's final line must not compare equal."""
+    _git(clone, "switch", "-q", "feature/x")
+    _commit(clone, "t.txt", "b\n", "add t")
+    _git(clone, "push", "-q", "origin", "feature/x")
+    _git(clone, "switch", "-q", "-c", "rescue", "main")
+    _commit(clone, "t.txt", "b \n", "add t")
+    _git(clone, "switch", "-q", "main")
+    assert "rescue" in _unpushed(clone).detail
+
+
 def test_same_subject_different_binary_is_unpushed(clone: Path) -> None:
     """PR #590 gate Obj-2: two binary changes print the same summary once index is dropped."""
     _git(clone, "switch", "-q", "feature/x")

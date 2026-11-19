@@ -447,17 +447,24 @@ class CloneGuard:
                 "--no-renames",
                 "-r",
                 sha,
-            ]
+            ],
+            raw=True,
         )
         return None if out is None else normalized_patch(out)
 
-    def _try(self, args: Sequence[str]) -> str | None:
-        """``git <args>`` stdout, or ``None`` on any failure. Never raises."""
+    def _try(self, args: Sequence[str], *, raw: bool = False) -> str | None:
+        """``git <args>`` stdout, or ``None`` on any failure. Never raises.
+
+        Stripped unless ``raw``: a patch is read raw, because stripping would drop trailing
+        whitespace on its last line, which can be the change itself (PR #590 gate round 2).
+        """
         try:
             res = self._git(self._repo_dir, args)
         except (subprocess.TimeoutExpired, OSError):
             return None
-        return res.stdout.strip() if res.returncode == 0 else None
+        if res.returncode != 0:
+            return None
+        return res.stdout if raw else res.stdout.strip()
 
     def _remote_tips(self) -> tuple[frozenset[str], str]:
         """Branch-tip shas on origin, and an error string (empty on success). Never raises."""
