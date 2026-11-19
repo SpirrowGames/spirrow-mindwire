@@ -170,10 +170,14 @@ def test_hold_bounces_everything_unadmittable_even_on_retry(body: str, retry: bo
         "TIER-C: scope\nNEXT: human\n",
     ],
 )
-def test_hold_admits_admittable_labels_as_recheck(body: str) -> None:
+def test_hold_bounces_admittable_labels_too_until_a_human_releases(body: str) -> None:
+    """PR #595 gate Obj-1 (fix_cut): without part 1b's per-hold Jev re-check a held head cannot
+    be told from an evasion, so even a well-formed admittable one is refused."""
     result = _decide("RETRY: u-0\n" + body, hold=True, retry=True)
-    assert result.verdict is AdmissionVerdict.ADMIT
-    assert result.rule == "RH-recheck"  # the caller must put it through Jev with the hold
+    assert result.verdict is AdmissionVerdict.BOUNCE
+    assert result.bounce_reason is BounceReason.SECURITY_HOLD
+    assert result.rule == "RH-security-hold"
+    assert "HOLD-RELEASE:" in (result.bounce_hint or "")
 
 
 def test_hold_does_not_hold_a_tighten() -> None:

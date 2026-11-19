@@ -131,12 +131,12 @@ class TierCGate:
         thread: str,
         msg_id: str,
         now: datetime,
-        released_holds: Iterable[str] = (),
     ) -> None:
         """Record that the head was delivered to the human (``ESCALATED``, msg-9650 §4).
 
-        Written only once nothing after the gate bounced it. ``released_holds`` are the holds this
-        delivery releases (msg-9661 §1.1⁵ 3.: after delivery, the supplemented ones only).
+        Written only once nothing after the gate bounced it. It releases no hold: in this part a
+        hold is released only by a human's ``HOLD-RELEASE:`` (PR #595 gate Obj-2, fix_cut); the
+        release of supplemented holds after delivery (msg-9661 §1.1⁵ 3.) comes with part 1b.
         """
         retry_uuid = None
         for logged in decision.log_entries:
@@ -150,7 +150,6 @@ class TierCGate:
                 "label": decision.normalized_label,
                 "rule": decision.rule,
                 "retry_uuid": retry_uuid,
-                "released_holds": sorted(released_holds),
             },
         )
         append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)

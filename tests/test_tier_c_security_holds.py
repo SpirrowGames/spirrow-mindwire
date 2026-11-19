@@ -1,9 +1,9 @@
 """T-tier-c-six-articles-security-boundary — security holds read back from the decisions log.
 
 msg-9665 §1.1⁷ (structural refusals each get their own hold; an identical body appends),
-msg-9661 §1.1⁵ (one hold per request; released only after delivery), msg-9655 §1.1'' (semantic
-hold on a Jev LIKELY_NOT of a security head; ``HOLD-RELEASE:`` by a human), msg-9650 §4
-(``ESCALATED``).
+msg-9655 §1.1'' (semantic hold on a Jev LIKELY_NOT of a security head; ``HOLD-RELEASE:`` by a
+human), msg-9650 §4 (``ESCALATED``). PR #595 gate: while held nothing passes (Obj-1) and only a
+human releases a hold (Obj-2) until part 1b; a released hold absorbs no later refusal (Obj-3).
 """
 
 from __future__ import annotations
@@ -11,6 +11,13 @@ from __future__ import annotations
 import itertools
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
+from test_conductor_core import _thread_ref
+from test_tierc_jev_bounce import LIKELY_NOT as LIKELY_NOT_RESULT
+from test_tierc_jev_bounce import _bounces, _rows, _run
+from test_tierc_jev_bounce import _Decider as _JevDecider
+from test_tierc_jev_bounce import _gate as _jev_gate
 
 from spirrow_mindwire.conductor.tierc_gate import TierCGate, render_bounce_body
 from spirrow_mindwire.tier_c_admission_gate import (
@@ -89,29 +96,47 @@ def test_holds_are_per_thread_and_author(tmp_path: Path) -> None:
     assert gate.holds(thread=T, author="Einstein") == []
 
 
-def test_escalated_releases_named_holds_and_is_logged(tmp_path: Path) -> None:
+def test_a_supplemented_head_is_still_held_until_a_human_releases(tmp_path: Path) -> None:
+    """PR #595 gate Obj-1 / Obj-2 (fix_cut): the supplement is refused while held, and once a
+    human releases both holds a RETRY of it gets through."""
     gate = _gate(tmp_path)
     _admit(gate, _sec("A"), "m1")
-    ok = _admit(gate, _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"), "m2")
-    assert ok.rule == "RH-recheck"
-    gate.escalated(author=A, decision=ok, thread=T, msg_id="m2", now=NOW, released_holds=["u1"])
-    assert gate.holds(thread=T, author=A) == []
-    row = next(r for r in iter_rows(gate.log_path) if r["kind"] == LogKind.ESCALATED.value)
-    assert (row["label"], row["rule"], row["msg_id"], row["released_holds"]) == (
-        "security",
-        "RH-recheck",
-        "m2",
-        ["u1"],
+    held = _admit(gate, _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"), "m2")
+    assert held.bounce_reason is BounceReason.SECURITY_HOLD
+    assert [h.held_basis for h in gate.holds(thread=T, author=A)] == [
+        None,
+        "SECURITY-BASIS: exposure src/a.py:3",
+    ]
+    ok = _admit(
+        gate,
+        "RETRY: u2\n" + _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"),
+        "m3",
+        released=("u1", "u2"),
     )
+    assert ok.verdict is AdmissionVerdict.ADMIT
 
 
-def test_escalated_without_release_keeps_the_hold(tmp_path: Path) -> None:
-    """msg-9665 / msg-9659: a different matter reaching the human releases nothing."""
+def test_escalated_releases_no_hold(tmp_path: Path) -> None:
+    """PR #595 gate Obj-2 (fix_cut): ``ESCALATED`` carries no release; only a human does."""
     gate = _gate(tmp_path)
     _admit(gate, _sec("A"), "m1")
-    ok = _admit(gate, "TIER-C: goal\nNEXT: human\n", "m2")
-    gate.escalated(author=A, decision=ok, thread=T, msg_id="m2", now=NOW)
-    assert len(gate.holds(thread=T, author=A)) == 1
+    other = TierCGate(log_path=gate.log_path, uuid_factory=lambda: "x")
+    ok = other.admit(
+        body="TIER-C: goal\nNEXT: human\n", author="Einstein", thread=T, msg_id="m2", now=NOW
+    )
+    other.escalated(author="Einstein", decision=ok, thread=T, msg_id="m2", now=NOW)
+    row = next(r for r in iter_rows(gate.log_path) if r["kind"] == LogKind.ESCALATED.value)
+    assert "released_holds" not in row
+    assert [h.hold_id for h in gate.holds(thread=T, author=A)] == ["u1"]
+
+
+def test_a_released_hold_does_not_absorb_a_later_identical_refusal(tmp_path: Path) -> None:
+    """PR #595 gate Obj-3: u1 released by a human, the same body refused again → its own hold."""
+    gate = _gate(tmp_path)
+    _admit(gate, _sec("A"), "m1")
+    _admit(gate, _sec("A"), "m2", released=("u1",))
+    (hold,) = gate.holds(thread=T, author=A, released_holds=["u1"])
+    assert (hold.hold_id, hold.held_msg_id, hold.history) == ("u2", "m2", [])
 
 
 def test_jev_likely_not_on_security_opens_a_semantic_hold(tmp_path: Path) -> None:
@@ -161,3 +186,21 @@ def test_bounce_notice_counts_the_admitted_labels(tmp_path: Path) -> None:
     body = render_bounce_body(author=A, decision=decision, bounced_msg_id="m1")
     assert f"Tier-C の{len(ADMIT_LABELS)}種類" in body
     assert "4種類" not in body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("decider", [None, _JevDecider(LIKELY_NOT_RESULT)])
+async def test_conductor_does_not_deliver_a_relabelled_head_while_held(
+    tmp_path: Path, decider: _JevDecider | None
+) -> None:
+    """PR #595 gate Obj-1: Bohr's security request was refused for lack of a basis; the same
+    request relabelled ``goal`` is bounced by the gate itself — with no decider at all, too —
+    and no ``ESCALATED`` row is written."""
+    gate = _jev_gate(tmp_path)
+    gate.admit(
+        body=_sec("A の漏洩"), author="Bohr", thread=_thread_ref().thread_id, msg_id="m0", now=NOW
+    )
+    _, _, mcp = await _run(gate, decider, head="A の件\n\nTIER-C: goal\nNEXT: human")
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD.value in notice["content"]
+    assert LogKind.ESCALATED.value not in [r["kind"] for r in _rows(gate)]

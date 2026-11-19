@@ -1734,11 +1734,7 @@ class Conductor:
         """
         if self._decider is None or self._decider.tierc_mode != "bounce":
             return None
-        # ``RH-recheck`` (a head admitted past an open security hold, msg-9653 §1.1') is put
-        # through Jev like an ordinary label admit: a RETRY never skips it while a hold is open.
-        if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith(
-            ("R1", "RH")
-        ):
+        if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith("R1"):
             return None
         if decision.normalized_label not in ADMIT_LABELS:
             return None

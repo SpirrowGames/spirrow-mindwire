@@ -265,9 +265,11 @@ SECURITY_TIGHTEN_HINT: str = (
 
 #: The hint for a bounce on an open security hold (msg-9653 §1.1').
 SECURITY_HOLD_HINT: str = (
-    "this thread holds a security request of yours that was refused for lack of a basis: "
-    "supply the basis (the location, or what is widened and how far), raise a different Tier-C "
-    "matter, or do not escalate and record `DECIDED:` / `DEFERRED:` instead"
+    "this thread holds a security request of yours that was refused for lack of a basis, and "
+    "while it is open no Tier-C handoff of yours in this thread reaches the human, whatever its "
+    "label and even on a re-send: only a human releases it, by writing `HOLD-RELEASE: <hold id>` "
+    "(the hold id is the RETRY uuid of the refusal that opened it) in this thread. Do not "
+    "escalate; record `DECIDED:` / `DEFERRED:` instead"
 )
 
 #: The former fourth label. Recognised so its bounce can say why (a merge is
@@ -665,9 +667,11 @@ def decide_admission(
     security_hold :
         ``True`` when the caller's decisions log shows an open security hold for this
         thread/author (msg-9655 §1.1'', msg-9665 §1.1⁷). Evaluated before the RETRY prologue:
-        while held, only a well-formed ``security`` handoff or another admitted Tier-C label
-        passes, as ``RH-recheck``, which the caller must put through Jev with the hold
-        context; everything else bounces ``security-hold`` and RETRY never force-admits.
+        while held, **nothing passes** — RETRY never force-admits and no label is admitted
+        (PR #595 gate Obj-1, fix_cut: until the per-hold Jev re-check of part 1b exists, a held
+        head cannot be judged a supplement rather than an evasion, so it waits for a human's
+        ``HOLD-RELEASE:``). Every refusal while held records its own structural hold, as before
+        (msg-9665 §1.1⁷); a tightening ``security`` head keeps its own no-hold bounce.
     """
 
     # Common-field stamper. The gate has enough context — ``now``,
@@ -731,25 +735,18 @@ def decide_admission(
     # RETRY nor a relabel to ``other:`` / ``unsure`` force-admits past it.
     if security_hold:
         held_label = LEGACY_LABEL_MAP.get(label, label) if label is not None else None
+        basis = None
         if held_label == SECURITY_LABEL:
             refused = _basis_bounce("RH-security-basis")
-            if refused is not None:
-                if refused.bounce_reason is BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL:
-                    return refused
-                return _security_bounce(
-                    BounceReason.SECURITY_HOLD,
-                    SECURITY_HOLD_HINT,
-                    "RH-security-hold",
-                    check_security_basis(body).basis,
-                )
-        if held_label is not None and held_label in ADMIT_LABELS:
-            return AdmissionDecision(
-                verdict=AdmissionVerdict.ADMIT,
-                rule="RH-recheck",
-                normalized_label=held_label,
-            )
+            if refused is not None and (
+                refused.bounce_reason is BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL
+            ):
+                return refused
+            basis = check_security_basis(body).basis
+        # Every other head waits for a human release (PR #595 gate Obj-1, fix_cut): no
+        # ``RH-recheck`` admission until part 1b asks Jev about each open hold.
         return _security_bounce(
-            BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT, "RH-security-hold", None
+            BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT, "RH-security-hold", basis
         )
 
     # -----------------------------------------------------------------

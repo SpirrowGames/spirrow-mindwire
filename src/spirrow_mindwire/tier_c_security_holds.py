@@ -18,12 +18,14 @@ matter:
   hold of the same pair, in which case it is appended to that hold's history (msg-9665 §1.1⁷);
 * a row carrying ``hold_history: [{hold_id, relation, outcome}, ...]`` appends to those holds
   (msg-9663 §1.1⁶ (a));
-* an ``ESCALATED`` row carrying ``released_holds: [hold_id, ...]`` releases them — written only
-  after the handoff was actually delivered (msg-9661 §1.1⁵ 3.).
+* nothing in the log releases a hold. Only a human's ``HOLD-RELEASE: <hold_id>`` line does
+  (msg-9655 §1.1''; PR #595 gate Obj-2, fix_cut — the release of supplemented holds after
+  delivery, msg-9661 §1.1⁵ 3., comes with part 1b). It lives in the thread, not in the log, so
+  the caller passes the released ids in. A released hold never absorbs a later refusal: an
+  identical body refused after the release opens a new hold (PR #595 gate Obj-3).
 
-A human's ``HOLD-RELEASE: <hold_id>`` line releases that one hold (msg-9655 §1.1''): it lives in
-the thread, not in the log, so the caller passes the released ids in. A resolved thread releases
-all its holds simply by never running again — holds are keyed by thread.
+A resolved thread releases all its holds simply by never running again — holds are keyed by
+thread.
 """
 
 from __future__ import annotations
@@ -78,25 +80,29 @@ def open_holds(
             continue
         kind = row.get("kind")
         if kind == LogKind.BOUNCED.value and row.get("security_hold") is True:
-            _open_or_append(holds, row, thread=thread, author=author)
+            _open_or_append(holds, row, thread=thread, author=author, released=released_ids)
         for item in row.get("hold_history") or ():
             if isinstance(item, dict):
                 hold = holds.get(str(item.get("hold_id")))
                 if hold is not None:
                     hold.history.append({**item, "msg_id": row.get("msg_id")})
-        if kind == LogKind.ESCALATED.value:
-            for hold_id in row.get("released_holds") or ():
-                holds.pop(str(hold_id), None)
     return [h for h in holds.values() if h.hold_id not in released_ids]
 
 
 def _open_or_append(
-    holds: dict[str, SecurityHold], row: dict[str, Any], *, thread: str, author: str
+    holds: dict[str, SecurityHold],
+    row: dict[str, Any],
+    *,
+    thread: str,
+    author: str,
+    released: set[str],
 ) -> None:
     hold_kind = str(row.get("hold_kind") or "structural")
     sha = row.get("body_sha256")
     if hold_kind == "structural" and isinstance(sha, str):
         for hold in holds.values():
+            if hold.hold_id in released:
+                continue  # a human released it: a later refusal is a hold of its own (Obj-3)
             if hold.hold_kind == "structural" and hold.body_sha256 == sha:
                 hold.history.append(
                     {
