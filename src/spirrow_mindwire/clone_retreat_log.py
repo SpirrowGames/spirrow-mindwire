@@ -257,6 +257,9 @@ def build_slot_quarantine_record(
     quarantine_candidates: list[Path] | None = None,
     detail: str = "",
     at: datetime | None = None,
+    recoverable: bool | None = None,
+    recoverable_reason: str | None = None,
+    rescue: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One ``slot_quarantine`` row (R-7', msg-8086; ``quarantine_candidates`` from msg-8088).
 
@@ -264,6 +267,10 @@ def build_slot_quarantine_record(
     *original* slot was renamed to, whatever the action, or ``None`` when it was not renamed. A
     saved artefact that does not exist is ``None`` — never the string ``none`` (msg-8084 R-7).
     ``clone_seconds`` / ``slot_bytes`` carry numbers only for ``rebuilt``.
+
+    Pool mode (A2) adds ``recoverable`` / ``recoverable_reason`` (msg-9388 Obj-32-3, msg-9391
+    Obj-33-2: D-6 removes only ``recoverable: true``) and ``rescue`` (outcome and the NN refs,
+    msg-9404 §4). They are written only when given, so older rows keep their shape.
     """
     if action not in (SLOT_ACTION_REBUILT, SLOT_ACTION_PARKED):
         raise ValueError(f"unknown slot action {action!r}")
@@ -297,6 +304,11 @@ def build_slot_quarantine_record(
     }
     if quarantine_candidates is not None:
         row["quarantine_candidates"] = [str(c) for c in quarantine_candidates]
+    if recoverable is not None:
+        row["recoverable"] = recoverable
+        row["recoverable_reason"] = recoverable_reason
+    if rescue is not None:
+        row["rescue"] = rescue
     return row
 
 

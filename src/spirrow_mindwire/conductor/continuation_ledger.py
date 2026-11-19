@@ -19,6 +19,14 @@ tried" are never the same count (Einstein msg-7972 advisory 2):
   relay left at the head was refused by the clone check). Keyed on (``msg_id``, ``outcome``),
   where ``msg_id`` is the report's or the relay's id.
 
+* ``slot_turn_result`` — slot mode only (T-ephemeral-impl-clone-slot-per-thread, Bohr msg-9400
+  §3, msg-9402, msg-9404): how a turn's clone slot was left before it was handed back.
+  ``outcome`` is one of :class:`SlotTurnOutcome`; ``rescued`` rows carry ``refs``, one entry per
+  rescue ref (``nn``, ``kind``, ``source``, ``sha``, ``ref``), so the next turn or a person can
+  find the rescued work. Keyed on (``turn_id``, ``outcome``): a turn whose rescue failed and whose
+  quarantine then failed too gets one ``rescue_failed`` and one ``quarantine_failed`` row
+  (msg-9402 Obj-36-4). The weekly view does not count these rows.
+
 The weekly view (:func:`summarize`, ``mindwire continue-report``) reads this file and nothing
 else: there is no second counter to drift from it (msg-7973 Obj-1-2).
 
@@ -43,10 +51,12 @@ __all__ = [
     "AttemptOutcome",
     "LedgerKind",
     "LedgerRead",
+    "SlotTurnOutcome",
     "ThreadSummary",
     "read_ledger",
     "record_admitted",
     "record_attempt",
+    "record_slot_turn",
     "render_summary",
     "report_text",
     "row_key",
@@ -57,6 +67,7 @@ __all__ = [
 class LedgerKind(StrEnum):
     ADMITTED = "continue_admitted"
     ATTEMPT = "continue_attempt"
+    SLOT_TURN = "slot_turn_result"
 
 
 class AttemptOutcome(StrEnum):
@@ -65,9 +76,20 @@ class AttemptOutcome(StrEnum):
     RELAY_RECOVERED_DIRTY = "relay_recovered_dirty"
 
 
+class SlotTurnOutcome(StrEnum):
+    """How a turn left its slot (msg-9400 §1, msg-9402 Obj-36-4). Only ``pushed`` and ``rescued``
+    let the thread continue; the conductor reads that in A4."""
+
+    PUSHED = "pushed"
+    RESCUED = "rescued"
+    RESCUE_FAILED = "rescue_failed"
+    QUARANTINE_FAILED = "quarantine_failed"
+
+
 RowKey = tuple[str, ...]
 
 _OUTCOME_VALUES = frozenset(o.value for o in AttemptOutcome)
+_SLOT_OUTCOME_VALUES = frozenset(o.value for o in SlotTurnOutcome)
 
 
 def row_key(row: dict[str, Any]) -> RowKey | None:
@@ -90,6 +112,14 @@ def row_key(row: dict[str, Any]) -> RowKey | None:
         if not isinstance(outcome, str) or outcome not in _OUTCOME_VALUES:
             return None
         return (kind, project, thread, msg_id, outcome)
+    if kind == LedgerKind.SLOT_TURN:
+        turn_id = row.get("turn_id")
+        outcome = row.get("outcome")
+        if not isinstance(turn_id, str) or not turn_id:
+            return None
+        if not isinstance(outcome, str) or outcome not in _SLOT_OUTCOME_VALUES:
+            return None
+        return (kind, project, thread, turn_id, outcome)
     return None
 
 
@@ -216,6 +246,39 @@ def record_attempt(
     return _append_once(path, row)
 
 
+def record_slot_turn(
+    path: Path,
+    *,
+    project: str,
+    thread: str,
+    turn_id: str,
+    outcome: SlotTurnOutcome,
+    slot: str,
+    refs: Iterable[dict[str, Any]] = (),
+    detail: str | None = None,
+    at: datetime | None = None,
+) -> bool:
+    """Record how a turn left its slot, once per (turn, outcome). ``True`` = a new row.
+
+    Unlike the two continuation kinds, a failure to write this row is NOT observation-only for
+    the caller: the slot must not be handed back as saved without it (Einstein msg-9405). The
+    caller lets an ``OSError`` from here turn the turn into ``rescue_failed``.
+    """
+    row: dict[str, Any] = {
+        "kind": LedgerKind.SLOT_TURN.value,
+        "at": _now_iso(at),
+        "project": project,
+        "thread": thread,
+        "turn_id": turn_id,
+        "outcome": outcome.value,
+        "slot": slot,
+        "refs": [dict(r) for r in refs],
+    }
+    if detail is not None:
+        row["detail"] = detail
+    return _append_once(path, row)
+
+
 @dataclass
 class ThreadSummary:
     """One thread's continuations in the window."""
@@ -249,6 +312,8 @@ def summarize(
     by_thread: dict[tuple[str, str], ThreadSummary] = {}
     undated = 0
     for row in rows:
+        if row["kind"] == LedgerKind.SLOT_TURN:  # a slot record, not a continuation
+            continue
         at = _parse_at(row.get("at"))
         if at is None:
             undated += 1
