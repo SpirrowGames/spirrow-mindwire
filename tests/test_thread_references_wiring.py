@@ -22,6 +22,7 @@ from spirrow_mindwire.pr_event_advance.decide import PR_EVENT_RELAY_AUTHOR
 from spirrow_mindwire.thread_context import build_turn_prompt
 from spirrow_mindwire.thread_references_tick import refresh_project
 from spirrow_mindwire.thread_relations import (
+    NO_REFERENCE_SEEN,
     STALE_MARK,
     ProjectView,
     ThreadSnapshot,
@@ -210,7 +211,9 @@ class _FakeMcp:
         *,
         fail_list: bool = False,
         fail_get: frozenset[str] = frozenset(),
+        omit_tags: bool = False,
     ) -> None:
+        self.omit_tags = omit_tags
         self.threads = threads
         self.fail_list = fail_list
         self.fail_get = fail_get
@@ -230,6 +233,9 @@ class _FakeMcp:
                 }
                 for t, v in self.threads.items()
             ]
+            if self.omit_tags:
+                for it in items:
+                    del it["tags"]
             return {"items": items[args["offset"] :], "total": len(items)}
         assert name == "chatroom_get_thread" and args["mode"] == "full"
         self.gets.append(args["thread_id"])
@@ -237,7 +243,11 @@ class _FakeMcp:
             raise MagickitMcpError("get down")
         v = self.threads[args["thread_id"]]
         return {
-            "thread": {"thread_id": args["thread_id"], "status": v["status"]},
+            "thread": {
+                "thread_id": args["thread_id"],
+                "status": v["status"],
+                "tags": v.get("tags", []),
+            },
             "messages": v["messages"],
         }
 
@@ -426,3 +436,47 @@ def test_proposer_prompt_carries_thread_open_step() -> None:
     assert THREAD_OPEN_REFERENCES_BLOCK in _DEFAULT_SYSTEM_PROMPT
     assert "Write `Related: none` only when you checked" in THREAD_OPEN_REFERENCES_BLOCK
     assert "references_threads" in THREAD_OPEN_REFERENCES_BLOCK
+
+
+# --- PR #593 gate round 2 ------------------------------------------------------------------------
+
+
+def test_round2_obj1_candidates_survive_listing_without_tags(tmp_path: Path) -> None:
+    cli = _load_script()
+    mcp = _FakeMcp(_threads(), omit_tags=True)
+    out = asyncio.run(cli.run_candidates(mcp, "p", "T-b", tmp_path, max_fetch=10))
+    assert out["open_threads"] == [{"thread_id": "T-b", "title": "T-b", "tags": ["T9"]}]
+
+
+def _a_unread_refs_b() -> dict[str, dict[str, Any]]:
+    # T-a (listed first) references T-b; T-b itself references nothing.
+    return {
+        "T-a": {"status": "active", "messages": [_msg("msg-1", refs=["T-b"])]},
+        "T-b": {"status": "active", "messages": [_msg("msg-2")]},
+    }
+
+
+def test_round2_obj2_warning_without_notice_when_referrer_unread(tmp_path: Path) -> None:
+    cli = _load_script()
+    threads = _a_unread_refs_b()
+    # Budget 1 with T-b listed first: only T-b is read, T-a (the referrer) is pending.
+    reordered = {"T-b": threads["T-b"], "T-a": threads["T-a"]}
+    _tick(cli, _FakeMcp(reordered), tmp_path, 2, max_fetch=1)
+    notice = notice_from_index(_index(tmp_path), "p", "T-b")
+    assert notice is not None
+    assert NO_REFERENCE_SEEN in notice and "未読 1 本" in notice
+    assert notice.endswith("(observed at 2026-11-19T02:00:00+00:00)")
+
+
+def test_round2_obj2_warning_without_notice_when_referrer_fetch_fails(tmp_path: Path) -> None:
+    cli = _load_script()
+    _tick(cli, _FakeMcp(_a_unread_refs_b(), fail_get=frozenset({"T-a"})), tmp_path, 2)
+    notice = notice_from_index(_index(tmp_path), "p", "T-b")
+    assert notice is not None and NO_REFERENCE_SEEN in notice and "読み取り失敗 1 本" in notice
+
+
+def test_round2_complete_project_without_reference_stays_silent(tmp_path: Path) -> None:
+    cli = _load_script()
+    threads = {"T-x": {"status": "active", "messages": [_msg("msg-1")]}}
+    _tick(cli, _FakeMcp(threads), tmp_path, 2)
+    assert notice_from_index(_index(tmp_path), "p", "T-x") is None

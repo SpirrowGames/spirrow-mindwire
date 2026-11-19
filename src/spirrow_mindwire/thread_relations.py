@@ -547,6 +547,12 @@ def _count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
+#: Shown when an incomplete project view found no reference for the thread (gate round 2).
+NO_REFERENCE_SEEN = (
+    "読めた範囲では、このスレッドを参照する／このスレッドが参照するスレッドは見つかっていない。"  # noqa: RUF001
+)
+
+
 def partial_view_warning(pending: int, fetch_errors: int) -> str | None:
     """The line that says a project's view is incomplete, or ``None`` when it is complete."""
     if pending <= 0 and fetch_errors <= 0:
@@ -560,7 +566,9 @@ def partial_view_warning(pending: int, fetch_errors: int) -> str | None:
 def notice_from_index(index: Any, project: str, thread_id: str) -> str | None:
     """The notice for one thread from a loaded index, stamped with when its project was observed.
 
-    A project whose view was incomplete gets :func:`partial_view_warning`. Anything unexpected
+    A project whose view was incomplete gets :func:`partial_view_warning`, and then even a thread
+    with no stored notice gets a block (:data:`NO_REFERENCE_SEEN` plus the warning), because a
+    reference to it may sit in a thread that was not read. Anything unexpected
     (wrong schema, missing project, non-string) is ``None``: this block is observation only, so a
     bad index costs the block, never the dispatch.
     """
@@ -576,10 +584,16 @@ def notice_from_index(index: Any, project: str, thread_id: str) -> str | None:
     if not isinstance(notices, Mapping):
         return None
     notice = notices.get(thread_id)
-    if not isinstance(notice, str) or not notice:
-        return None
-    lines = [notice]
     warning = partial_view_warning(_count(entry.get("pending")), _count(entry.get("fetch_errors")))
+    if isinstance(notice, str) and notice:
+        lines = [notice]
+    elif warning is not None:
+        # No reference was found for this thread in what was read, but the project view is
+        # incomplete, so one may sit in an unread or failed thread: say so instead of staying
+        # silent (PR #593 gate round 2, Obj-2).
+        lines = [_NOTICE_HEADER, NO_REFERENCE_SEEN]
+    else:
+        return None
     if warning is not None:
         lines.append(warning)
     lines.append(f"(observed at {_text(entry.get('observed_at')) or '?'})")
@@ -589,6 +603,7 @@ def notice_from_index(index: Any, project: str, thread_id: str) -> str | None:
 __all__ = [
     "INDEX_SCHEMA",
     "MERGED_DISPLAY_LIMIT",
+    "NO_REFERENCE_SEEN",
     "STALE_MARK",
     "Candidate",
     "Edge",

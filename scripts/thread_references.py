@@ -168,7 +168,13 @@ async def run_candidates(
         "fetch_errors": read.fetch_errors,
         "stale_threads": list(read.stale_threads),
         "open_threads": [
-            {"thread_id": i.thread_id, "title": i.title, "tags": list(i.tags)} for i in open_items
+            {
+                "thread_id": i.thread_id,
+                "title": i.title,
+                # The listing may omit tags; then the read snapshot's tags stand (gate round 2).
+                "tags": list(i.tags if i.tags is not None else by_id[i.thread_id].tags),
+            }
+            for i in open_items
         ],
         "candidates": [
             {
