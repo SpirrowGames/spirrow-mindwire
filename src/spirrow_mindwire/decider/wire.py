@@ -29,12 +29,10 @@ from typing import Any
 
 from spirrow_mindwire.decider.questions import (
     TIERC_ESCALATION_QUESTIONS_VERSION,
-    TIERC_HOLD_QUESTIONS_VERSION,
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
     TierCRules,
-    hold_questions,
     tierc_v2_questions,
 )
 from spirrow_mindwire.decider.state import AdmissionGateResult, DecisionState
@@ -134,16 +132,11 @@ def build_decide_request(
             "policy": policy,
             "questions_version": TIERC_QUESTIONS_VERSION,
         }
-    # T-tier-c-six-articles-security-boundary (msg-9661 §1.1⁵ / §8): the hold questions ride in
-    # the same call; with no open hold the request is byte-identical to ``tierc-v5``.
-    held = hold_questions(state.security_holds)
     return {
         "state": state_to_wire(state),
-        "questions": {**tierc_v2_questions(rules), **held},
+        "questions": tierc_v2_questions(rules),
         "policy": policy,
-        "questions_version": (
-            TIERC_HOLD_QUESTIONS_VERSION if held else TIERC_ESCALATION_QUESTIONS_VERSION
-        ),
+        "questions_version": TIERC_ESCALATION_QUESTIONS_VERSION,
     }
 
 

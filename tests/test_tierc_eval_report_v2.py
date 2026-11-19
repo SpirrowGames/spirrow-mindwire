@@ -471,9 +471,8 @@ def test_one_shared_v2_structure_set() -> None:
     """2d-16: the set is defined once, in the report; the exporter's registered version is in
     it."""
     assert (
-        frozenset({"tierc-v2", "tierc-v3", "tierc-v4", "tierc-v5", "tierc-v5-hold"})
-        == report.V2_STRUCTURE_VERSIONS
+        frozenset({"tierc-v2", "tierc-v3", "tierc-v4", "tierc-v5"}) == report.V2_STRUCTURE_VERSIONS
     )
     assert exporter.REGISTERED_QUESTIONS_VERSION in report.V2_STRUCTURE_VERSIONS
     src = (ROOT / "scripts" / "tierc_eval_report.py").read_text(encoding="utf-8")
-    assert src.count('"tierc-v2", "tierc-v3", "tierc-v4", "tierc-v5", "tierc-v5-hold"') == 1
+    assert src.count('"tierc-v2", "tierc-v3", "tierc-v4", "tierc-v5"') == 1

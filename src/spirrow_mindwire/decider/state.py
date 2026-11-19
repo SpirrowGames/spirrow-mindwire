@@ -31,7 +31,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from spirrow_mindwire.decider.questions import HoldRef
 from spirrow_mindwire.tier_c_admission_gate import (
     ADMIT_LABELS,
     AdmissionVerdict,
@@ -212,10 +211,6 @@ class DecisionState:
     diff_stat: DiffStat | None
     gate_result: AdmissionGateResult | None
     dispute_rounds: int | None = None
-    security_holds: tuple[HoldRef, ...] = ()
-    """The author's open security holds in this thread (T-tier-c-six-articles-security-boundary).
-    Never part of the ``state`` sent on the wire: they turn into the ``tierc-v5-hold`` questions
-    (``decider.questions.hold_questions``), so a state without holds sends the same bytes."""
 
 
 def state_builder(turn: Turn) -> DecisionState:
