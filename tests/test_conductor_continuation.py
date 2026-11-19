@@ -319,9 +319,10 @@ def test_5_local_branch_without_upstream_but_fully_pushed_passes(pushed_clone: P
 
 
 @pytest.mark.anyio
-async def test_5c_dirty_clone_wins_over_cap(pushed_clone: Path) -> None:
-    """PR #519 gate Obj-1: over the cap with unpushed work -> DIRTY, never a hand-off to the
-    proposer that cannot fetch the work."""
+async def test_5c_unpushed_over_cap_stops_at_human_not_proposer(pushed_clone: Path) -> None:
+    """PR #519 gate Obj-1 still holds: over the cap with unpushed work, never a hand-off to the
+    proposer that cannot fetch the work. T-dirty-clone-check-disagreement: and no exit 8 either
+    (clone-check cannot release an unpushed park) -- the thread stops at the human."""
     _make_dirty(pushed_clone, "unpushed")
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content=_ENTRY)
@@ -336,16 +337,20 @@ async def test_5c_dirty_clone_wins_over_cap(pushed_clone: Path) -> None:
     mcp.seed(author="Heisenberg", content=_report("part 5"))
     disp = _ScriptedDispatcher(mcp, {})
 
-    with pytest.raises(DirtyCloneError) as ei:
-        await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+    outcome = await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
 
-    assert ei.value.reason is DirtyCloneReason.UNPUSHED
-    assert _relays(mcp) == []  # no continue_cap notice posted
+    assert outcome.stop_reason is StopReason.HUMAN
+    relays = _relays(mcp)
+    assert len(relays) == 1
+    body = relays[0]["content"]
+    assert "continue_cap (4/3) with unpushed work" in body
+    assert "feature/x" in body
+    assert body.splitlines()[-1] == "NEXT: human"
     assert disp.dispatches == []
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("state", ["unpushed", "unpushed_no_upstream", "uncommitted"])
+@pytest.mark.parametrize("state", ["uncommitted"])
 async def test_5d_recovered_relay_head_rechecks_clone(pushed_clone: Path, state: str) -> None:
     """PR #519 gate round 3 Obj-1: a relay left at the head after a restart is re-admitted only
     on a clean, pushed clone -- condition 4 does not depend on which message the run resumes from.
@@ -366,6 +371,33 @@ async def test_5d_recovered_relay_head_rechecks_clone(pushed_clone: Path, state:
     assert ei.value.reason is expected
     assert disp.dispatches == []
     assert mcp.posts == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["unpushed", "unpushed_no_upstream"])
+async def test_5d2_recovered_relay_head_with_unpushed_work_dispatches(
+    pushed_clone: Path, state: str
+) -> None:
+    """T-dirty-clone-check-disagreement: unpushed work alone does not park the clone on the
+    recovery path either; the relay is re-admitted and the implementer runs."""
+    _make_dirty(pushed_clone, state)
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report())
+    mcp.seed(
+        author=CONDUCTOR_RELAY_AUTHOR,
+        content=render_relay(n=1, cap=3, continue_body="step 2 of 3", implementer="Heisenberg"),
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"]})
+
+    await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m3")
+    # PR #590 gate Obj-3: the relay posted earlier carries no notice, so the dispatch does.
+    notice = disp.events[0].clone_retreat_notice
+    assert notice is not None
+    assert "origin に無い commit" in notice
+    assert ("feature/y" if state == "unpushed_no_upstream" else "feature/x") in notice
 
 
 @pytest.mark.anyio
@@ -435,7 +467,59 @@ def _make_dirty(repo: Path, state: str) -> DirtyCloneReason:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("state", ["uncommitted", "untracked", "unpushed", "unpushed_no_upstream"])
+@pytest.mark.parametrize("state", ["unpushed", "unpushed_no_upstream"])
+async def test_5_unpushed_work_is_handed_back_to_the_implementer(
+    pushed_clone: Path, state: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T-dirty-clone-check-disagreement stage 2: the relay names the unpushed branch and the
+    implementer runs; nothing is raised, so the shared clone is never parked for it."""
+    _make_dirty(pushed_clone, state)
+    branch = "feature/y" if state == "unpushed_no_upstream" else "feature/x"
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report("write tests"))
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["x\n\nNEXT: Bohr"]})
+
+    with caplog.at_level(logging.INFO):
+        await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
+
+    relays = _relays(mcp)
+    assert len(relays) == 1
+    body = relays[0]["content"]
+    assert body.splitlines()[0] == "[continue 1/3] write tests"
+    assert branch in body
+    assert "origin に無い commit" in body
+    assert parse_next_token(body) == "Heisenberg"
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m3")
+    assert "continue with unpushed work" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_5_local_cherry_pick_of_pushed_commit_is_not_unpushed(pushed_clone: Path) -> None:
+    """2026-11-18/19 incident shape: a local no-upstream branch holding only a cherry-pick of a
+    commit already on origin. Its content is on the remote, so the continuation is plain."""
+    r = pushed_clone
+    _git(r, "switch", "-q", "feature/x")
+    (r / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(r, "add", "b.txt")
+    _git(r, "commit", "-q", "-m", "slot mode A2")
+    _git(r, "push", "-q", "origin", "feature/x")
+    _git(r, "switch", "-q", "-c", "rescue", "main")
+    _git(r, "cherry-pick", "feature/x")
+    _git(r, "switch", "-q", "main")
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report("write tests"))
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["x\n\nNEXT: Bohr"]})
+
+    await _conductor(mcp, disp, clone_check=_check(r)).run()
+
+    body = _relays(mcp)[0]["content"]
+    assert body == "[continue 1/3] write tests\nNEXT: Heisenberg"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["uncommitted", "untracked"])
 async def test_5_dirty_clone_refuses_continuation(
     pushed_clone: Path, state: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -449,9 +533,6 @@ async def test_5_dirty_clone_refuses_continuation(
         await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
 
     assert ei.value.reason is expected
-    if state == "unpushed_no_upstream":
-        # Proves the no-upstream rev-list fallback fired, not the tracked `ahead` branch.
-        assert "feature/y (no upstream)" in ei.value.detail
     assert _relays(mcp) == []
     assert disp.dispatches == []
     assert "continue invalidated: reason=dirty" in caplog.text

@@ -55,6 +55,7 @@ __all__ = [
     "is_continue_relay_body",
     "relay_chain_count",
     "render_relay",
+    "render_unpushed_notice",
 ]
 
 #: Default number of continuations per chain (msg-7879 §2-2: 4 turns x 1800 s = 2 h).
@@ -162,10 +163,32 @@ def is_continue_relay_body(body: str) -> bool:
     return _RELAY_RE.match(body.lstrip()) is not None
 
 
-def render_relay(*, n: int, cap: int, continue_body: str, implementer: str) -> str:
-    """The relay the conductor posts; its last line routes the turn to the implementer (Obj-1-1)."""
+def render_relay(
+    *, n: int, cap: int, continue_body: str, implementer: str, clone_notice: str = ""
+) -> str:
+    """The relay the conductor posts; its last line routes the turn to the implementer (Obj-1-1).
+
+    ``clone_notice`` (:func:`render_unpushed_notice`) sits between the tag line and ``NEXT:``.
+    """
     text = continue_body.strip() or EMPTY_BODY_PLACEHOLDER
-    return f"[continue {n}/{cap}] {text}\nNEXT: {implementer}"
+    notice = f"\n\n{clone_notice.strip()}\n\n" if clone_notice.strip() else "\n"
+    return f"[continue {n}/{cap}] {text}{notice}NEXT: {implementer}"
+
+
+def render_unpushed_notice(detail: str) -> str:
+    """What the implementer is told when its CONTINUE found unpushed work in the shared clone.
+
+    T-dirty-clone-check-disagreement (stage 2): the turn that left the work is the one that knows
+    whether it is wanted, so it is handed back rather than the whole clone being parked.
+    """
+    return (
+        "⚠ clone check: 共有 clone に origin に無い commit があります"
+        f"（{detail.strip() or 'unpushed'}）。\n"  # noqa: RUF001
+        "このターンの最初に片付けてください: 要る作業なら feature 枝へ push する。"
+        "要らない（例: origin に同じ内容がある退避枝）なら `git branch -D` で消す。"  # noqa: RUF001
+        "どちらとも言えなければ `wip/<枝名>-<UTC>` に改名して残す。"
+        "片付けずに CONTINUE を重ねると、上限で human に止まります。"
+    )
 
 
 class Link(StrEnum):
@@ -227,8 +250,14 @@ class ContinuePlan:
     cap: int
     continue_body: str
     implementer: str
+    #: :func:`render_unpushed_notice` text, or empty (T-dirty-clone-check-disagreement).
+    clone_notice: str = ""
 
     def relay(self) -> str:
         return render_relay(
-            n=self.n, cap=self.cap, continue_body=self.continue_body, implementer=self.implementer
+            n=self.n,
+            cap=self.cap,
+            continue_body=self.continue_body,
+            implementer=self.implementer,
+            clone_notice=self.clone_notice,
         )

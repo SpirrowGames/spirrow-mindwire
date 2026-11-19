@@ -80,7 +80,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..clone_guard import DirtyCloneError
+from ..clone_guard import DirtyCloneError, DirtyCloneReason
 from ..clone_retreat_log import PendingNotice, load_pending_notice, mark_delivered
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS, NaysayerGatingConfig
 from ..decider.annotation import (
@@ -155,6 +155,7 @@ from .continuation import (
     find_continue_declaration,
     is_continue_relay_body,
     relay_chain_count,
+    render_unpushed_notice,
 )
 from .continuation_ledger import AttemptOutcome, record_admitted, record_attempt
 from .control import BASELINE_CONTROL_STATE, FAILSAFE_CONTROL_STATE, ControlState, LoopControl
@@ -694,6 +695,9 @@ class Conductor:
         # routing never reads it. ``None`` = not wired: no notice, the prompt is unchanged.
         self._clone_retreat_log_path = clone_retreat_log_path
         self._clone_retreat_checked = False
+        # T-dirty-clone-check-disagreement (PR #590 gate Obj-3): the unpushed notice for a
+        # re-admitted relay, attached to the next implementer dispatch and cleared once sent.
+        self._unpushed_dispatch_notice: str | None = None
         # Set by ``_route`` on an admitted / capped CONTINUE; consumed by ``run`` right after.
         self._continuation: tuple[ContinueVerdict, ContinuePlan] | None = None
         self._thread_ref = thread_ref
@@ -2264,6 +2268,22 @@ class Conductor:
             # The CONTINUE report is the message right below the relay (``report_msg_id``).
             self._continuation_clone_check(self._continuation_scope(messages, len(messages) - 2))
         except DirtyCloneError as exc:
+            if exc.reason is DirtyCloneReason.UNPUSHED:
+                # T-dirty-clone-check-disagreement: as on the report path, unpushed work is not a
+                # reason to park the shared clone (clone-check cannot release it). The relay is
+                # re-admitted, and the relay posted earlier may carry no notice, so the notice
+                # rides on this implementer dispatch's input instead (PR #590 gate Obj-3).
+                self._unpushed_dispatch_notice = render_unpushed_notice(exc.detail)
+                logger.warning(
+                    "conductor continue relay re-admitted with unpushed work: n=%d (%s) head=%s",
+                    n,
+                    exc.detail,
+                    _msg_id(messages[-1]),
+                )
+                self._ledger_admitted(
+                    relay_msg_id=_msg_id(messages[-1]), report_msg_id=_msg_id(messages[-2]), n=n
+                )
+                return True
             logger.warning(
                 "conductor continue invalidated: reason=dirty n=%d clone=%s (relay head %s)",
                 n,
@@ -2291,9 +2311,11 @@ class Conductor:
         """The CONTINUE exception to the self-handoff stop; ``None`` = the ordinary SELF_HANDOFF.
 
         An admitted or capped continuation is stashed on ``self._continuation`` for ``run`` to
-        act on (post the relay, or the cap notice). A dirty / unpushed clone re-raises the
-        clone check's :class:`DirtyCloneError`, so the run ends on the ordinary dirty-clone path
-        (``loop_runner`` exit 8) with no relay posted (msg-7883 test 5).
+        act on (post the relay, or the cap notice). A dirty clone re-raises the clone check's
+        :class:`DirtyCloneError`, so the run ends on the ordinary dirty-clone path
+        (``loop_runner`` exit 8) with no relay posted (msg-7883 test 5). Unpushed commits alone
+        do not (T-dirty-clone-check-disagreement): the relay carries a notice naming them, and
+        over the cap the thread stops at the human.
         """
         if author_role is not self._implementer_role:
             return None
@@ -2302,6 +2324,7 @@ class Conductor:
             return None
         n = chain_count(self._continuation_links(messages))
         refusals: list[DirtyCloneError] = []
+        unpushed: list[DirtyCloneError] = []
 
         def clone_is_clean() -> bool:
             if self._continuation_clone_check is None:
@@ -2311,6 +2334,15 @@ class Conductor:
                     self._continuation_scope(messages, len(messages) - 1)
                 )
             except DirtyCloneError as exc:
+                if exc.reason is DirtyCloneReason.UNPUSHED:
+                    # T-dirty-clone-check-disagreement: unpushed branches are this thread's work,
+                    # not a fault of the shared clone. Raising here parked the whole repo, but the
+                    # wrapper's ``clone-check`` never judges pushed-ness, so it released the repo
+                    # on the next tick and the same CONTINUE was refused again — every ~3 min for
+                    # ~18 h on 2026-11-18/19. The implementer is told instead (relay notice), and
+                    # over the cap the thread goes to the human, never to the proposer.
+                    unpushed.append(exc)
+                    return True
                 refusals.append(exc)
                 return False
             return True
@@ -2347,11 +2379,33 @@ class Conductor:
                 )
                 raise refusals[0]
             return None
+        clone_notice = render_unpushed_notice(unpushed[0].detail) if unpushed else ""
+        if unpushed:
+            logger.warning(
+                "conductor continue with unpushed work: n=%d verdict=%s (%s) — %s",
+                n,
+                verdict.value,
+                unpushed[0].detail,
+                "handed back to the implementer"
+                if verdict is ContinueVerdict.ADMIT
+                else "cap: to the human",
+            )
         if verdict is ContinueVerdict.CAP:
-            self._ledger_attempt(_msg_id(messages[-1]), AttemptOutcome.CAP, n=n)
+            self._ledger_attempt(
+                _msg_id(messages[-1]),
+                AttemptOutcome.CAP,
+                n=n,
+                clone=DirtyCloneReason.UNPUSHED.value if unpushed else None,
+            )
         self._continuation = (
             verdict,
-            ContinuePlan(n=n, cap=self._continue_cap, continue_body=body, implementer=author),
+            ContinuePlan(
+                n=n,
+                cap=self._continue_cap,
+                continue_body=body,
+                implementer=author,
+                clone_notice=clone_notice,
+            ),
         )
         # Placeholder: ``run`` acts on ``self._continuation`` before reading this decision.
         return RouteDecision(
@@ -2437,6 +2491,28 @@ class Conductor:
         ``None`` = acted; ``run`` goes on to the next round.
         """
         verdict, plan = continuation
+        if verdict is ContinueVerdict.CAP and plan.clone_notice:
+            # Over the cap with work that exists only in this clone: the proposer cannot fetch
+            # it (PR #519 gate Obj-1), and parking the repo cannot be released by clone-check
+            # (T-dirty-clone-check-disagreement). A person decides.
+            body = (
+                f"Conductor stop — continue_cap ({plan.n}/{plan.cap}) with unpushed work\n\n"
+                f"`{plan.implementer}` の自己継続が上限 {plan.cap} 回を超えましたが、"
+                f"作業がまだ共有 clone にしかありません。\n\n"
+                f"{plan.clone_notice}\n\n"
+                f"最後の CONTINUE: {plan.continue_body or EMPTY_BODY_PLACEHOLDER}\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+            logger.warning(
+                "conductor continue stop: reason=continue_cap_unpushed n=%d cap=%d -> %s",
+                plan.n,
+                plan.cap,
+                HUMAN_TOKEN,
+            )
+            posted = await self._post_as_conductor_relay(body)
+            stop_at = _msg_id(posted) or latest_msg_id
+            reason = StopReason.HUMAN if _msg_id(posted) else StopReason.SELF_HANDOFF
+            return self._stop(round_index, reason, stop_at, forced, forced_saveable)
         if verdict is ContinueVerdict.CAP:
             proposer = self._proposer_identity() or HUMAN_TOKEN
             body = (
@@ -4110,6 +4186,11 @@ class Conductor:
                 role.value,
                 "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
             )
+        unpushed = self._unpushed_dispatch_notice if role is Role.IMPLEMENTER else None
+        clone_notice = (
+            "\n\n".join(t for t in (retreat.text if retreat is not None else None, unpushed) if t)
+            or None
+        )
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
                 review_round, review_round_notice = self._review_round(role, messages)
@@ -4120,7 +4201,7 @@ class Conductor:
                         messages,
                         retry_notice=notice,
                         resume_notice=resume_text,
-                        clone_retreat_notice=retreat.text if retreat is not None else None,
+                        clone_retreat_notice=clone_notice,
                         review_round=review_round,
                         review_round_notice=review_round_notice,
                         conditional_proceed_notice=(
@@ -4153,6 +4234,8 @@ class Conductor:
             self._resume_notice_delivered = True
         if retreat is not None:
             self._clone_retreat_delivered(retreat, role)
+        if unpushed is not None:
+            self._unpushed_dispatch_notice = None
         return None
 
     def _pending_clone_retreat(self, role: Role) -> PendingNotice | None:
