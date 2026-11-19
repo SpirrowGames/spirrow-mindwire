@@ -509,12 +509,14 @@ async def test_stale_branch_no_longer_blocks_a_clean_continuation(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("recovery", [False, True])
-async def test_13_unpushed_work_stays_refused_on_report_and_recovery(
-    narrow: Path, tmp_path: Path, recovery: bool
+async def test_13_unpushed_work_stays_detected_on_report_and_recovery(
+    narrow: Path, tmp_path: Path, recovery: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Einstein msg-9349 Obj-2: launch 10:00, commit 10:01, CONTINUE 10:10, relay left at head.
 
     The relay-launched turn's snapshot (taken after the commit) must not become the boundary.
+    T-dirty-clone-check-disagreement: detected unpushed work is handed back to the implementer
+    (relay notice / re-admitted relay) instead of raising into a repo park.
     """
     store = TurnRefSnapshotStore(tmp_path / "s")
     mcp = _FakeChatroomMcp()
@@ -526,11 +528,15 @@ async def test_13_unpushed_work_stays_refused_on_report_and_recovery(
         mcp.seed(author=CONDUCTOR_RELAY_AUTHOR, content=_relay())  # m3, left at the head
         _record(store, narrow, "m3")  # a later launch on the relay saw the commit already
     disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"]})
-    with pytest.raises(DirtyCloneError) as ei:
+    with caplog.at_level(logging.WARNING):
         await _conductor(mcp, disp, _Wired(narrow, store)).run()
-    assert ei.value.reason is DirtyCloneReason.UNPUSHED
-    assert "feature/wip" in ei.value.detail
-    assert disp.dispatches == []
+    assert disp.dispatches[0][0] is Role.IMPLEMENTER
+    if recovery:
+        assert "re-admitted with unpushed work" in caplog.text
+        assert "feature/wip" in caplog.text
+    else:
+        relays = [p for p in mcp.posts if p.get("author") == CONDUCTOR_RELAY_AUTHOR]
+        assert "feature/wip" in relays[0]["content"]
 
 
 def _msgs(*pairs: tuple[str, str]) -> list[dict[str, Any]]:

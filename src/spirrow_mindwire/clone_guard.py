@@ -69,6 +69,11 @@ FALLBACK_DEFAULT_BRANCH = "main"
 PIN_PATH = ".mindwire/pin"  # the file spec_pin.SpecPinWriter writes, relative to the clone root
 PORCELAIN_MAX_ENTRIES = 20
 LEFTOVER_LOG_MAX = 10  # unpushed leftovers named in the WARNING line before " ..."
+# check_pushed's patch-equivalence pass (``CloneGuard._equivalent_on_remote``).
+EQUIV_SINCE_SLACK_S = 86_400
+EQUIV_REMOTE_MAX = 20_000
+
+_HUNK_HEADER_PREFIX = "@@ "
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +141,24 @@ class DirtyCloneError(Exception):
             "porcelain": list(self.porcelain),
             "detail": self.detail,
         }
+
+
+def normalized_patch(diff: str) -> str:
+    """A commit's patch with what a cherry-pick may change removed, for equality only.
+
+    Close to ``git patch-id --stable``: ``index`` lines (blob ids differ when the base differs)
+    are dropped, hunk headers lose their line numbers, and whitespace is removed from every line.
+    Two commits with the same result introduce the same change.
+    """
+    out: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("index "):
+            continue
+        if line.startswith(_HUNK_HEADER_PREFIX):
+            out.append("@@")
+            continue
+        out.append("".join(line.split()))
+    return "\n".join(out)
 
 
 def emit_dirty_clone_payload(exc: DirtyCloneError) -> None:
@@ -299,6 +322,11 @@ class CloneGuard:
         remote branch tip is dropped. Only exact tip equality is recognised: a local tip that is
         an ancestor of a remote tip stays a candidate (the objects may not be local; fetching them
         would write to the clone). A failed ``ls-remote`` drops nothing and is named in the detail.
+
+        **Patch equivalence (T-dirty-clone-check-disagreement).** A candidate left after that is
+        still dropped when every commit it holds outside the remotes is a patch-equal copy of a
+        remote-reachable commit (:meth:`_equivalent_on_remote`): its content is already on the
+        remote, typically a local cherry-pick of a pushed commit.
         """
         res = self._run(
             [
@@ -338,12 +366,94 @@ class CloneGuard:
         if not candidates:
             return
         remote_tips, ls_error = self._remote_tips()
-        unpushed = sorted(label for _, sha, label in candidates if sha not in remote_tips)
+        candidates = [c for c in candidates if c[1] not in remote_tips]
+        # T-dirty-clone-check-disagreement: a branch whose every commit is a cherry-pick of a
+        # commit a remote-tracking ref already reaches holds nothing that exists only here.
+        # 2026-11-18/19: a local ``…-rescue`` branch (one cherry-pick of a pushed commit) kept a
+        # CONTINUE refused for ~18 h.
+        unpushed = sorted(
+            label for ref, _, label in candidates if not self._equivalent_on_remote(ref)
+        )
         if unpushed:
             detail = "unpushed commits on: " + ", ".join(unpushed)
             if ls_error:
                 detail += f" (ls-remote failed: {ls_error})"
             raise self._error(DirtyCloneReason.UNPUSHED, head=self._head_or_none(), detail=detail)
+
+    def _equivalent_on_remote(self, ref: str) -> bool:
+        """Is every commit ``ref`` holds outside the remotes a patch-equal copy of a remote commit?
+
+        Conservative by construction; any doubt answers ``False`` (the branch stays unpushed):
+
+        * a merge commit outside the remotes → ``False`` (a merge has no single patch);
+        * a commit is matched only to a remote-reachable commit with the **same subject** whose
+          normalised patch (:func:`normalized_patch`) is identical. A cherry-pick keeps the
+          subject and the author date; the remote side is read from the oldest local author date
+          minus :data:`EQUIV_SINCE_SLACK_S` onward (a remote original's committer date is never
+          before its author date), at most :data:`EQUIV_REMOTE_MAX` commits;
+        * any git failure → ``False``. Never raises: this only ever *drops* a refusal reason.
+        """
+        if self._try(["rev-list", "--count", "--merges", ref, "--not", "--remotes"]) != "0":
+            return False
+        local = self._try(
+            ["log", "--no-merges", "--format=%H%x1f%at%x1f%s", ref, "--not", "--remotes"]
+        )
+        if local is None:
+            return False
+        rows = [line.split("\x1f", 2) for line in local.splitlines() if line.strip()]
+        if not rows:
+            return True  # nothing outside the remotes: every commit is already reachable there
+        if any(len(r) != 3 or not r[1].isdigit() for r in rows):
+            return False
+        since = min(int(r[1]) for r in rows) - EQUIV_SINCE_SLACK_S
+        remote = self._try(
+            [
+                "log",
+                "--remotes",
+                "--no-merges",
+                f"--since=@{since}",
+                f"--max-count={EQUIV_REMOTE_MAX}",
+                "--format=%H%x1f%s",
+            ]
+        )
+        if remote is None:
+            return False
+        by_subject: dict[str, list[str]] = {}
+        for line in remote.splitlines():
+            sha, sep, subject = line.partition("\x1f")
+            if sep:
+                by_subject.setdefault(subject, []).append(sha)
+        for sha, _, subject in rows:
+            mine = self._normalized_patch(sha)
+            if mine is None:
+                return False
+            if not any(self._normalized_patch(r) == mine for r in by_subject.get(subject, [])):
+                return False
+        return True
+
+    def _normalized_patch(self, sha: str) -> str | None:
+        out = self._try(
+            [
+                "diff-tree",
+                "-p",
+                "--root",
+                "--no-commit-id",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "-r",
+                sha,
+            ]
+        )
+        return None if out is None else normalized_patch(out)
+
+    def _try(self, args: Sequence[str]) -> str | None:
+        """``git <args>`` stdout, or ``None`` on any failure. Never raises."""
+        try:
+            res = self._git(self._repo_dir, args)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return res.stdout.strip() if res.returncode == 0 else None
 
     def _remote_tips(self) -> tuple[frozenset[str], str]:
         """Branch-tip shas on origin, and an error string (empty on success). Never raises."""
@@ -444,4 +554,5 @@ __all__ = [
     "DirtyCloneReason",
     "GitResult",
     "emit_dirty_clone_payload",
+    "normalized_patch",
 ]

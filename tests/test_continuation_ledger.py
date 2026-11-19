@@ -203,7 +203,7 @@ async def test_same_relay_recovered_twice_is_one_admitted(tmp_path: Path) -> Non
 
 @pytest.mark.anyio
 async def test_dirty_report_is_an_attempt_not_admitted(tmp_path: Path, pushed_clone: Path) -> None:
-    _make_dirty(pushed_clone, "unpushed")
+    _make_dirty(pushed_clone, "uncommitted")
     ledger = tmp_path / "l.jsonl"
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content=_ENTRY)
@@ -216,7 +216,22 @@ async def test_dirty_report_is_an_attempt_not_admitted(tmp_path: Path, pushed_cl
     rows = read_ledger(ledger).rows
     assert _kinds(ledger) == [(LedgerKind.ATTEMPT, AttemptOutcome.DIRTY)]
     assert rows[0]["msg_id"] == "m2"
-    assert rows[0]["clone"] == "unpushed"
+    assert rows[0]["clone"] == "dirty_tree"
+
+
+@pytest.mark.anyio
+async def test_unpushed_report_is_admitted_with_notice(tmp_path: Path, pushed_clone: Path) -> None:
+    """T-dirty-clone-check-disagreement: unpushed work is handed back, so the relay is admitted."""
+    _make_dirty(pushed_clone, "unpushed")
+    ledger = tmp_path / "l.jsonl"
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_ENTRY)
+    mcp.seed(author="Heisenberg", content=_report())
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"]})
+
+    await _ledgered(mcp, disp, ledger, clone_check=_check(pushed_clone)).run()
+
+    assert [k for k, _ in _kinds(ledger)] == [LedgerKind.ADMITTED]
 
 
 @pytest.mark.anyio
