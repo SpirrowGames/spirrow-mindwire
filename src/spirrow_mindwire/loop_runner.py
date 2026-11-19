@@ -112,6 +112,7 @@ from .config import (
     load_settings,
     resolve_clone_retreat_log_path,
     resolve_continuation_ledger_path,
+    resolve_thread_references_index_path,
     resolve_tier_c_decisions_log_path,
     resolve_tierc_annotations_path,
     resolve_tierc_rules_path,
@@ -1170,6 +1171,9 @@ def build_conductor(
             # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-1b: where the last retreat of
             # this thread's clone put the WIP, shown to the run's first implementer turn.
             clone_retreat_log_path=resolve_clone_retreat_log_path(settings),
+            # T-thread-relations-unused-so-parallel-rule-cannot-be-checked D-2: per-tick index of
+            # observed cross-thread references, shown to every dispatched turn of this thread.
+            references_index_path=resolve_thread_references_index_path(settings),
             # T-naysayer-conditional-proceed-on-small-fixmin (PR 2): the naysayer is offered the
             # conditional exit only while this project's setting is ``issuing``; every other state
             # (absent, ``verify_only``, unknown) offers nothing (msg-7960 Obj-5-1).

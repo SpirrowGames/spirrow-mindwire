@@ -259,6 +259,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
         blocks.append(event.review_round_notice)
     if event.conditional_proceed_notice:
         blocks.append(event.conditional_proceed_notice)
+    # T-thread-relations-unused-so-parallel-rule-cannot-be-checked D-2: observed references to and
+    # from other threads, before the history. Absent -> no block, so the prompt is unchanged.
+    if event.references_notice:
+        blocks.append(event.references_notice)
     if history:
         blocks.append(history)
     blocks.append(f"New message from {payload.author}:\n\n{payload.body}")

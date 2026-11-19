@@ -939,6 +939,13 @@ def resolve_clone_retreat_log_path(settings: MindwireSettings) -> Path:
     return settings.paths.data_dir / "state" / CLONE_RETREAT_LOG_FILENAME
 
 
+def resolve_thread_references_index_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/thread-references-index.json`` — written once per tick by
+    ``scripts/thread_references.py`` (the sweep passes ``--state-dir <data_dir>/state``), read by
+    the conductor for the D-2 references block (T-thread-relations-unused-so-parallel-rule-...)."""
+    return settings.paths.data_dir / "state" / "thread-references-index.json"
+
+
 TIERC_ANNOTATIONS_FILENAME = "tierc_annotations.jsonl"
 """The Jev annotation log under ``<data_dir>/state/`` (2e-2). The sweep reads the same path."""
 
