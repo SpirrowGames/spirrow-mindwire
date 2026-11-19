@@ -28,8 +28,10 @@ Sources read for this file:
 
 **Verdict: not reachable as it is.** Reaching it needs a change to the listen address
 or the network settings on `{{HOST_SERVICES}}`, which widens a trust boundary.
-Per msg-9783 item 7 this goes to a person before any implementation; **PR-1
-(`custom_route`) does not start.** Which of bind / firewall causes the timeout was
+Per msg-9783 item 7 this would go to a person before any implementation. (Design
+v3.9 §1 then moved the parse route to Lexora, which is already reachable, so no
+trust-boundary change arises; Einstein msg-9800 accepted that.) **A Cognilens
+`custom_route` does not start.** Which of bind / firewall causes the timeout was
 not determined (`start.sh` is unreadable to me, and `:22` on that host is closed).
 
 ## 2. Backstop: does any hop silently shorten an over-long input? (Obj-12-1)
@@ -103,9 +105,15 @@ can_enable = (backstop_confirmed AND calibration_available) OR byte_bound_confir
 The switch stays off. PR-2 may still be implemented and merged with the switch off
 (v3.7 E-1).
 
-## 6. Four-PR re-measurement (msg-9783 item 6, v3.5 §5 PR-0)
+## 6. Four-PR re-measurement — REFERENCE ONLY (old prototype)
 
-Method (scratch prototype, not committed; PR-2 builds the real generator):
+**These numbers come from a scratch prototype that keeps 3 lines of context (U=3)
+around every change, including changes between class members. D-A' (v3.9 §2) removes
+that context, so these are NOT D-A' measurements.** The D-A' sizes — the report
+msg-9783 item 6 asks for — are measured again with PR-2's real generator
+(Bohr v3.10 Obj-14-3).
+
+Method (scratch prototype, not committed):
 
 - Diff = three-dot `base...head` of each PR (same as the gate). This repository
   has no `.naysayer-ignore`, so nothing is excluded.
@@ -137,9 +145,10 @@ By unit kind (widened chars): #562 = `.py` 173,663 + `.md` 3,448; #557 = `.py`
 
 Observations:
 
-- **D-A matters.** With a class as the fallback for a line between methods, #525's
+- **The class fallback matters.** With a class as the fallback for a line between methods, #525's
   `conductor/core.py` alone widened to 197,323 chars (one change sat on the blank
-  line between two methods of the 3,514-line `Conductor`). With D-A it is 22,391.
+  line between two methods of the 3,514-line `Conductor`). With the class excluded (prototype: U=3 only between members) it is 22,391;
+  this is not a D-A' figure.
 - **Markdown by block works for #557:** `.md` widens 9,422 → 9,912 chars. The
   earlier 211k estimate came from sending `.md` files whole.
 - #562 stays large because many functions change at once (`core.py` 59,223,
