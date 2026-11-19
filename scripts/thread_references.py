@@ -17,12 +17,15 @@ Refreshes ``<state-dir>/thread-references-cache.json`` (see
 JSON line::
 
     {"projects": [{"project": ..., "listed": N, "known": N, "fetched": N, "pending": N,
-                   "fetch_errors": N, "error": null}],
+                   "fetch_errors": N, "stale_threads": [...], "complete": true, "error": null}],
      "digest_lines": ["T-a の PR o/r#7 merged → 参照のある open スレッド: T-b"],
      "any_error": false}
 
 ``digest_lines`` (D-3) covers merges reported in the last ``--digest-hours`` (default 24). A
-project whose listing failed keeps its previous index entry and reports ``error``.
+project with ``complete: false`` had threads it could not read this tick; the sweep shows that as
+a warning next to the merge lines, and the D-2 notice carries the same warning (PR #593 gate
+Obj-1). A project whose listing failed keeps its previous index entry WITH that entry's own
+``observed_at`` — it is never restamped as observed now — and reports ``error`` (Obj-2).
 
 Candidates mode (D-4, and the D-1 thread-opening step)
 ------------------------------------------------------
@@ -35,6 +38,13 @@ Prints the project's OPEN threads (id, title, tags) and, for ``--thread``, the r
 candidates (shared ``T###`` tag, ``関連:`` / ``Related:`` lines, existing references) and whether
 the thread already carries ``Related: none``. Without ``--thread`` it prints candidates for every
 open thread. Output only: the owner decides and writes the declaration by hand (msg-9729 D-4).
+
+``--thread`` is read first, ahead of the fetch budget, and the refreshed cache is saved, so a
+repeated run keeps making progress on a large project instead of re-reading the same prefix
+(PR #593 gate Obj-4). ``complete: false`` means some threads were not read yet, so candidates
+from them can be missing: run again until it is ``true`` before concluding ``Related: none``.
+The cache is shared with the tick; both write it atomically and a lost update only costs a
+re-read, because every entry is re-validated against the listing's (status, last_msg_id).
 """
 
 from __future__ import annotations
@@ -62,7 +72,10 @@ from spirrow_mindwire.thread_references_tick import (
     write_json_atomic,
 )
 from spirrow_mindwire.thread_relations import (
+    INDEX_SCHEMA,
+    ProjectView,
     build_notice_index,
+    build_project_entry,
     collect_edges,
     digest_merged_lines,
     reference_candidates,
@@ -94,14 +107,28 @@ async def run_tick(
     write_json_atomic(cache_path, cache)
 
     good = {r.project: r.snapshots for r in reads if r.error is None}
-    index = build_notice_index(good, generated_at=now)
     old_index = load_json(index_path)
-    old_projects = old_index.get("projects") if isinstance(old_index, dict) else None
-    if isinstance(old_projects, dict):
-        for r in reads:
-            if r.error is not None and isinstance(old_projects.get(r.project), dict):
-                index["projects"][r.project] = old_projects[r.project]
-    write_json_atomic(index_path, index)
+    old_projects = (
+        old_index.get("projects")
+        if isinstance(old_index, dict) and old_index.get("schema") == INDEX_SCHEMA
+        else None
+    )
+    entries: dict[str, Any] = {}
+    for r in reads:
+        if r.error is None:
+            entries[r.project] = build_project_entry(
+                ProjectView(
+                    snapshots=r.snapshots,
+                    observed_at=now,
+                    pending=r.pending,
+                    fetch_errors=r.fetch_errors,
+                    stale=frozenset(r.stale_threads),
+                )
+            )
+        elif isinstance(old_projects, dict) and isinstance(old_projects.get(r.project), dict):
+            # Carried over as-is: its own observed_at still says when it was actually seen.
+            entries[r.project] = old_projects[r.project]
+    write_json_atomic(index_path, build_notice_index(entries))
 
     since = now - timedelta(hours=digest_hours)
     lines: list[str] = []
@@ -120,26 +147,34 @@ async def run_tick(
 async def run_candidates(
     mcp: ToolCaller, project: str, thread: str | None, state_dir: Path, *, max_fetch: int
 ) -> dict[str, Any]:
-    raw_cache = load_json(state_dir / CACHE_FILENAME)
+    cache_path = state_dir / CACHE_FILENAME
+    raw_cache = load_json(cache_path)
     cache: dict[str, Any] = raw_cache if isinstance(raw_cache, dict) else {}
-    read = await refresh_project(mcp, project, cache, max_fetch=max_fetch)
+    read = await refresh_project(mcp, project, cache, max_fetch=max_fetch, priority=thread)
     if read.error is not None:
         return {"project": project, "error": read.error}
+    write_json_atomic(cache_path, cache)
     snaps = read.snapshots
     edges = collect_edges(snaps)
     by_id = {s.thread_id: s for s in snaps}
     open_items = [i for i in read.listed if i.thread_id in by_id and by_id[i.thread_id].is_open]
     targets = [thread] if thread else [i.thread_id for i in open_items]
+    stale = set(read.stale_threads)
     return {
         "project": project,
         "error": None,
+        "complete": read.complete,
         "pending": read.pending,
+        "fetch_errors": read.fetch_errors,
+        "stale_threads": list(read.stale_threads),
         "open_threads": [
             {"thread_id": i.thread_id, "title": i.title, "tags": list(i.tags)} for i in open_items
         ],
         "candidates": [
             {
                 "thread_id": t,
+                # False: this thread itself is unread or only known from an older snapshot.
+                "read": t in by_id and t not in stale,
                 "related_none_msg": related_none_msg(by_id[t]) if t in by_id else None,
                 "candidates": [
                     {"thread_id": c.other, "reasons": list(c.reasons), "referenced": c.referenced}

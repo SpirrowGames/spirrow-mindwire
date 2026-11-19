@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -263,8 +264,12 @@ def _ids(ref: Reference) -> str:
     return ", ".join(ref.msg_ids) if ref.msg_ids else "affects_threads"
 
 
+#: Appended to a counterpart whose facts come from an older snapshot (PR #593 gate Obj-2).
+STALE_MARK = "（stale: 今回の読み取りに失敗または未読。前回観測時点の値）"  # noqa: RUF001
+
+
 def _counterpart_facts(
-    other: str, snapshots: Mapping[str, ThreadSnapshot]
+    other: str, snapshots: Mapping[str, ThreadSnapshot], stale: AbstractSet[str] = frozenset()
 ) -> tuple[str, list[str]]:
     snap = snapshots.get(other)
     if snap is None:
@@ -273,6 +278,8 @@ def _counterpart_facts(
         f"status={snap.status or 'unknown'} last_msg={snap.last_msg_at or '?'} "
         f"by {snap.last_msg_by or '?'}"
     )
+    if other in stale:
+        facts += STALE_MARK
     merges = [
         f"  merged: {e.slug}（{e.msg_id}, {e.at or '時刻不明'}）"  # noqa: RUF001 (msg-9729 §1 wording)
         for e in merged_events(snap.messages)[:MERGED_DISPLAY_LIMIT]
@@ -281,24 +288,27 @@ def _counterpart_facts(
 
 
 def render_references_notice(
-    refs: ThreadReferences, snapshots: Mapping[str, ThreadSnapshot]
+    refs: ThreadReferences,
+    snapshots: Mapping[str, ThreadSnapshot],
+    *,
+    stale: AbstractSet[str] = frozenset(),
 ) -> str | None:
     """The D-2 prompt block, or ``None`` when the thread has no reference in either direction.
 
     Every counterpart is shown, open or closed, with its status: a closed thread's merge is the
     case Obj-2-1 kept visible. Per counterpart at most :data:`MERGED_DISPLAY_LIMIT` merges, newest
     first, with no time window — see the module docstring (msg-9731) for what that does and does
-    not guarantee.
+    not guarantee. A counterpart named in ``stale`` carries :data:`STALE_MARK`.
     """
     if not refs.outgoing and not refs.incoming:
         return None
     lines: list[str] = []
     for ref in refs.outgoing:
-        facts, merges = _counterpart_facts(ref.other, snapshots)
+        facts, merges = _counterpart_facts(ref.other, snapshots, stale)
         lines.append(f"参照: このスレッド → {ref.other}（{_ids(ref)}） {facts}")  # noqa: RUF001
         lines.extend(merges)
     for ref in refs.incoming:
-        facts, merges = _counterpart_facts(ref.other, snapshots)
+        facts, merges = _counterpart_facts(ref.other, snapshots, stale)
         lines.append(f"参照: {ref.other} → このスレッド（{_ids(ref)}） {facts}")  # noqa: RUF001
         lines.extend(merges)
     return "\n".join([_NOTICE_HEADER, _NOTICE_FRAMING, *lines])
@@ -481,66 +491,119 @@ def snapshot_from_json(raw: Any) -> ThreadSnapshot | None:
     )
 
 
-#: Version of the index file the sweep writes and the conductor reads.
-INDEX_SCHEMA = 1
+#: Version of the index file the sweep writes and the conductor reads. 2: per-project entries
+#: carry their own observation time and completeness (PR #593 gate Obj-1 / Obj-2).
+INDEX_SCHEMA = 2
 
 
-def build_notice_index(
-    projects: Mapping[str, Sequence[ThreadSnapshot]], *, generated_at: datetime
-) -> dict[str, Any]:
-    """The D-2 index: per project, per thread, its rendered notice (threads without one omitted).
+@dataclass(frozen=True)
+class ProjectView:
+    """One project's snapshots as observed at ``observed_at``, with what is missing from them.
+
+    ``pending`` / ``fetch_errors`` count listed threads whose current state is not in
+    ``snapshots``; ``stale`` names those still shown from an older snapshot.
+    """
+
+    snapshots: Sequence[ThreadSnapshot]
+    observed_at: datetime
+    pending: int = 0
+    fetch_errors: int = 0
+    stale: frozenset[str] = frozenset()
+
+
+def build_project_entry(view: ProjectView) -> dict[str, Any]:
+    """One project's index entry: rendered notices plus when and how completely they were seen.
 
     Built once per tick by ``scripts/thread_references.py`` from ONE edge set per project, so
     every dispatch of the tick reads the same facts (msg-9729: the read happens once per tick).
     """
-    out: dict[str, dict[str, str]] = {}
-    for project, snaps in projects.items():
-        edges = collect_edges(snaps)
-        by_id = {s.thread_id: s for s in snaps}
-        notices: dict[str, str] = {}
-        for snap in snaps:
-            notice = render_references_notice(thread_references(edges, snap.thread_id), by_id)
-            if notice is not None:
-                notices[snap.thread_id] = notice
-        out[project] = notices
-    return {"schema": INDEX_SCHEMA, "generated_at": generated_at.isoformat(), "projects": out}
+    snaps = list(view.snapshots)
+    edges = collect_edges(snaps)
+    by_id = {s.thread_id: s for s in snaps}
+    notices: dict[str, str] = {}
+    for snap in snaps:
+        notice = render_references_notice(
+            thread_references(edges, snap.thread_id), by_id, stale=view.stale
+        )
+        if notice is not None:
+            notices[snap.thread_id] = notice
+    return {
+        "observed_at": view.observed_at.isoformat(),
+        "pending": view.pending,
+        "fetch_errors": view.fetch_errors,
+        "stale_threads": sorted(view.stale),
+        "notices": notices,
+    }
+
+
+def build_notice_index(projects: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The D-2 index from per-project entries (:func:`build_project_entry`, or one carried over
+    unchanged from the previous index when this tick's listing failed — it keeps its own
+    ``observed_at``, so it is never presented as observed now)."""
+    return {"schema": INDEX_SCHEMA, "projects": dict(projects)}
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def partial_view_warning(pending: int, fetch_errors: int) -> str | None:
+    """The line that says a project's view is incomplete, or ``None`` when it is complete."""
+    if pending <= 0 and fetch_errors <= 0:
+        return None
+    return (
+        f"（部分的な観測: 未読 {pending} 本・読み取り失敗 {fetch_errors} 本。"  # noqa: RUF001
+        "それらのスレッドからの参照と merge は欠けているか古い可能性がある）"  # noqa: RUF001
+    )
 
 
 def notice_from_index(index: Any, project: str, thread_id: str) -> str | None:
-    """The notice for one thread from a loaded index, stamped with when it was observed.
+    """The notice for one thread from a loaded index, stamped with when its project was observed.
 
-    Anything unexpected (wrong schema, missing project, non-string) is ``None``: this block is
-    observation only, so a bad index costs the block, never the dispatch.
+    A project whose view was incomplete gets :func:`partial_view_warning`. Anything unexpected
+    (wrong schema, missing project, non-string) is ``None``: this block is observation only, so a
+    bad index costs the block, never the dispatch.
     """
     if not isinstance(index, Mapping) or index.get("schema") != INDEX_SCHEMA:
         return None
     projects = index.get("projects")
     if not isinstance(projects, Mapping):
         return None
-    notices = projects.get(project)
+    entry = projects.get(project)
+    if not isinstance(entry, Mapping):
+        return None
+    notices = entry.get("notices")
     if not isinstance(notices, Mapping):
         return None
     notice = notices.get(thread_id)
     if not isinstance(notice, str) or not notice:
         return None
-    generated_at = _text(index.get("generated_at")) or "?"
-    return f"{notice}\n(observed at {generated_at})"
+    lines = [notice]
+    warning = partial_view_warning(_count(entry.get("pending")), _count(entry.get("fetch_errors")))
+    if warning is not None:
+        lines.append(warning)
+    lines.append(f"(observed at {_text(entry.get('observed_at')) or '?'})")
+    return "\n".join(lines)
 
 
 __all__ = [
     "INDEX_SCHEMA",
     "MERGED_DISPLAY_LIMIT",
+    "STALE_MARK",
     "Candidate",
     "Edge",
     "MergedEvent",
+    "ProjectView",
     "Reference",
     "ThreadReferences",
     "ThreadSnapshot",
     "build_notice_index",
+    "build_project_entry",
     "collect_edges",
     "digest_merged_lines",
     "merged_events",
     "notice_from_index",
+    "partial_view_warning",
     "reference_candidates",
     "related_none_msg",
     "render_references_notice",

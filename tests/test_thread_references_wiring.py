@@ -22,8 +22,11 @@ from spirrow_mindwire.pr_event_advance.decide import PR_EVENT_RELAY_AUTHOR
 from spirrow_mindwire.thread_context import build_turn_prompt
 from spirrow_mindwire.thread_references_tick import refresh_project
 from spirrow_mindwire.thread_relations import (
+    STALE_MARK,
+    ProjectView,
     ThreadSnapshot,
     build_notice_index,
+    build_project_entry,
     collect_edges,
     notice_from_index,
     reference_candidates,
@@ -136,12 +139,15 @@ def test_snapshot_cache_roundtrip() -> None:
 def test_index_roundtrip_and_stamp() -> None:
     a = _snap("T-a", msgs=[_msg("msg-1", refs=["T-b"])])
     b = _snap("T-b")
-    index = build_notice_index({"p": [a, b]}, generated_at=datetime(2026, 11, 19, tzinfo=UTC))
+    index = build_notice_index(
+        {"p": build_project_entry(ProjectView([a, b], datetime(2026, 11, 19, tzinfo=UTC)))}
+    )
     loaded = json.loads(json.dumps(index))
     notice = notice_from_index(loaded, "p", "T-b")
     assert notice is not None
     assert "参照: T-a → このスレッド（msg-1）" in notice
     assert notice.endswith("(observed at 2026-11-19T00:00:00+00:00)")
+    assert "部分的な観測" not in notice
     assert notice_from_index(loaded, "p", "T-zzz") is None
     assert notice_from_index(loaded, "other", "T-b") is None
     assert notice_from_index({**loaded, "schema": 99}, "p", "T-b") is None
@@ -156,10 +162,11 @@ def test_conductor_reads_index_and_fails_open(tmp_path: Path) -> None:
     assert Conductor._references_notice(fake) is None  # type: ignore[arg-type]  # missing file
     path.write_text("{not json", encoding="utf-8")
     assert Conductor._references_notice(fake) is None  # type: ignore[arg-type]  # unreadable
-    index = build_notice_index(
-        {"p": [_snap("T-a", msgs=[_msg("msg-1", refs=["T-b"])]), _snap("T-b")]},
-        generated_at=datetime(2026, 11, 19, tzinfo=UTC),
+    view = ProjectView(
+        [_snap("T-a", msgs=[_msg("msg-1", refs=["T-b"])]), _snap("T-b")],
+        datetime(2026, 11, 19, tzinfo=UTC),
     )
+    index = build_notice_index({"p": build_project_entry(view)})
     path.write_text(json.dumps(index), encoding="utf-8")
     notice = Conductor._references_notice(fake)  # type: ignore[arg-type]
     assert notice is not None and "T-a → このスレッド" in notice
@@ -197,9 +204,16 @@ def test_prompt_places_block_before_history_and_omits_when_absent() -> None:
 
 
 class _FakeMcp:
-    def __init__(self, threads: dict[str, dict[str, Any]], *, fail_list: bool = False) -> None:
+    def __init__(
+        self,
+        threads: dict[str, dict[str, Any]],
+        *,
+        fail_list: bool = False,
+        fail_get: frozenset[str] = frozenset(),
+    ) -> None:
         self.threads = threads
         self.fail_list = fail_list
+        self.fail_get = fail_get
         self.gets: list[str] = []
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
@@ -219,6 +233,8 @@ class _FakeMcp:
             return {"items": items[args["offset"] :], "total": len(items)}
         assert name == "chatroom_get_thread" and args["mode"] == "full"
         self.gets.append(args["thread_id"])
+        if args["thread_id"] in self.fail_get:
+            raise MagickitMcpError("get down")
         v = self.threads[args["thread_id"]]
         return {
             "thread": {"thread_id": args["thread_id"], "status": v["status"]},
@@ -299,7 +315,102 @@ def test_run_candidates_lists_open_threads(tmp_path: Path) -> None:
     cli = _load_script()
     out = asyncio.run(cli.run_candidates(_FakeMcp(_threads()), "p", "T-b", tmp_path, max_fetch=10))
     assert [t["thread_id"] for t in out["open_threads"]] == ["T-b"]
-    assert out["candidates"] == [{"thread_id": "T-b", "related_none_msg": None, "candidates": []}]
+    assert out["complete"] is True
+    assert out["candidates"] == [
+        {"thread_id": "T-b", "read": True, "related_none_msg": None, "candidates": []}
+    ]
+
+
+# --- PR #593 gate round 1 ------------------------------------------------------------------------
+
+
+def _tick(cli: ModuleType, mcp: _FakeMcp, tmp_path: Path, hour: int, **kw: Any) -> dict[str, Any]:
+    return asyncio.run(
+        cli.run_tick(
+            mcp,
+            ["p"],
+            tmp_path,
+            max_fetch=kw.get("max_fetch", 10),
+            digest_hours=24,
+            now=datetime(2026, 11, 19, hour, tzinfo=UTC),
+        )
+    )
+
+
+def _index(tmp_path: Path) -> Any:
+    return json.loads((tmp_path / "thread-references-index.json").read_text(encoding="utf-8"))
+
+
+def test_obj1_pending_threads_mark_notice_and_report_partial(tmp_path: Path) -> None:
+    cli = _load_script()
+    out = _tick(cli, _FakeMcp(_threads()), tmp_path, 2, max_fetch=1)
+    (proj,) = out["projects"]
+    assert proj["pending"] == 1 and proj["complete"] is False
+    # Only T-a was read; T-a's own notice must say the view is partial.
+    notice = notice_from_index(_index(tmp_path), "p", "T-a")
+    assert notice is not None and "部分的な観測: 未読 1 本・読み取り失敗 0 本" in notice
+
+
+def test_obj1_fetch_error_marks_notice_and_report_partial(tmp_path: Path) -> None:
+    cli = _load_script()
+    out = _tick(cli, _FakeMcp(_threads(), fail_get=frozenset({"T-b"})), tmp_path, 2)
+    (proj,) = out["projects"]
+    assert proj["fetch_errors"] == 1 and proj["complete"] is False
+    notice = notice_from_index(_index(tmp_path), "p", "T-a")
+    assert notice is not None and "読み取り失敗 1 本" in notice
+
+
+def test_obj2_listing_failure_keeps_original_observed_at(tmp_path: Path) -> None:
+    cli = _load_script()
+    _tick(cli, _FakeMcp(_threads()), tmp_path, 2)
+    _tick(cli, _FakeMcp({}, fail_list=True), tmp_path, 3)
+    _tick(cli, _FakeMcp({}, fail_list=True), tmp_path, 4)
+    notice = notice_from_index(_index(tmp_path), "p", "T-b")
+    assert notice is not None and notice.endswith("(observed at 2026-11-19T02:00:00+00:00)")
+
+
+def test_obj2_failed_refetch_marks_counterpart_stale(tmp_path: Path) -> None:
+    cli = _load_script()
+    threads = _threads()
+    _tick(cli, _FakeMcp(threads), tmp_path, 2)
+    threads["T-a"]["messages"].append(_msg("msg-7"))  # T-a moved; its re-read fails
+    out = _tick(cli, _FakeMcp(threads, fail_get=frozenset({"T-a"})), tmp_path, 3)
+    assert out["projects"][0]["stale_threads"] == ["T-a"]
+    notice = notice_from_index(_index(tmp_path), "p", "T-b")
+    assert notice is not None
+    line = next(ln for ln in notice.splitlines() if ln.startswith("参照: T-a"))
+    assert line.endswith(STALE_MARK)
+    assert "読み取り失敗 1 本" in notice
+
+
+def test_obj3_listing_tags_refresh_cached_snapshot_including_empty() -> None:
+    threads = _threads()
+    threads["T-c"] = {"status": "active", "messages": [_msg("msg-8")], "tags": ["T9"]}
+    mcp = _FakeMcp(threads)
+    cache: dict[str, Any] = {}
+    asyncio.run(refresh_project(mcp, "p", cache))
+    gets = len(mcp.gets)
+    threads["T-b"]["tags"] = []  # tag removed, no new message, same status
+    threads["T-c"]["tags"] = ["T9", "T229"]
+    read = asyncio.run(refresh_project(mcp, "p", cache))
+    assert len(mcp.gets) == gets  # no re-read needed
+    tags = {sn.thread_id: sn.tags for sn in read.snapshots}
+    assert tags["T-b"] == () and tags["T-c"] == ("T9", "T229")
+    assert cache["p"]["T-b"]["snapshot"]["tags"] == []
+    assert reference_candidates(read.snapshots, collect_edges(read.snapshots), "T-c") == ()
+
+
+def test_obj4_candidates_reads_target_first_and_persists_progress(tmp_path: Path) -> None:
+    cli = _load_script()
+    threads = {f"T-{n:02d}": {"status": "active", "messages": [_msg(f"msg-{n}")]} for n in range(5)}
+    mcp = _FakeMcp(threads)
+    first = asyncio.run(cli.run_candidates(mcp, "p", "T-04", tmp_path, max_fetch=2))
+    assert mcp.gets[0] == "T-04"
+    assert first["complete"] is False and first["candidates"][0]["read"] is True
+    second = asyncio.run(cli.run_candidates(mcp, "p", "T-04", tmp_path, max_fetch=2))
+    third = asyncio.run(cli.run_candidates(mcp, "p", "T-04", tmp_path, max_fetch=2))
+    assert second["complete"] is False and third["complete"] is True
+    assert sorted(mcp.gets) == sorted(threads)  # each thread read exactly once
 
 
 def test_cli_allowlist_is_read_only() -> None:

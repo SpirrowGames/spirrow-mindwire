@@ -10,9 +10,11 @@ Cost is bounded two ways:
 * **Cache keyed on (status, last_msg_id).** The listing carries both, so a thread whose key is
   unchanged since the last tick is not fetched again. Only threads that moved are read.
 * **``max_fetch`` per tick.** The first run on a host with hundreds of threads would otherwise
-  read them all at once. A thread not yet fetched is left out of this tick's index and picked up
-  on a later tick; the report says how many are still pending, so a partial view is never shown
-  as complete.
+  read them all at once. A thread not yet fetched is left out of this tick's index (or, when an
+  older snapshot of it is cached, shown from that snapshot and listed in
+  :attr:`ProjectRead.stale_threads`) and picked up on a later tick. ``pending``, ``fetch_errors``
+  and ``stale_threads`` travel into the index and the digest report, so a partial view is never
+  shown as complete (PR #593 gate Obj-1).
 
 Read-only: :data:`READ_ONLY_TOOLS` is the whole allowlist, enforced by
 :class:`~spirrow_mindwire.magickit.read_only.ReadOnlyMcp` in the CLI. Nothing here writes to any
@@ -23,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -57,7 +59,9 @@ class ListedItem:
     status: str
     last_msg_id: str | None
     title: str
-    tags: tuple[str, ...]
+    #: ``None`` when the listing carried no ``tags`` field at all; otherwise the listing's tags,
+    #: possibly empty. The listing is the authority for tags (PR #593 gate Obj-3).
+    tags: tuple[str, ...] | None
 
     @property
     def key(self) -> str:
@@ -74,7 +78,15 @@ class ProjectRead:
     fetched: int = 0
     pending: int = 0
     fetch_errors: int = 0
+    #: Threads shown from an older cached snapshot because this tick's read of them failed or did
+    #: not fit the budget. Their facts are as of an earlier observation (PR #593 gate Obj-2).
+    stale_threads: list[str] = field(default_factory=list)
     error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """True only when every listed thread is in ``snapshots`` at its current key."""
+        return self.error is None and self.pending == 0 and self.fetch_errors == 0
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -84,12 +96,14 @@ class ProjectRead:
             "fetched": self.fetched,
             "pending": self.pending,
             "fetch_errors": self.fetch_errors,
+            "stale_threads": list(self.stale_threads),
+            "complete": self.complete,
             "error": self.error,
         }
 
 
-def _tags(value: Any) -> tuple[str, ...]:
-    return tuple(t for t in value if isinstance(t, str)) if isinstance(value, list) else ()
+def _tags(value: Any) -> tuple[str, ...] | None:
+    return tuple(t for t in value if isinstance(t, str)) if isinstance(value, list) else None
 
 
 async def list_threads(mcp: ToolCaller, project: str) -> list[ListedItem]:
@@ -122,7 +136,7 @@ async def list_threads(mcp: ToolCaller, project: str) -> list[ListedItem]:
                     status=str(item.get("status") or "").strip(),
                     last_msg_id=last if isinstance(last, str) and last else None,
                     title=str(item.get("title") or ""),
-                    tags=_tags(item.get("tags")),
+                    tags=_tags(item.get("tags")) if "tags" in item else None,
                 )
             )
         offset += len(items)
@@ -138,12 +152,17 @@ async def refresh_project(
     cache: dict[str, Any],
     *,
     max_fetch: int = DEFAULT_MAX_FETCH,
+    priority: str | None = None,
 ) -> ProjectRead:
     """Bring ``cache[project]`` up to date with at most ``max_fetch`` reads; return the view.
 
     ``cache[project]`` maps thread id → ``{"key": ..., "snapshot": ...}``. Threads that are no
-    longer listed are dropped. A failed per-thread read keeps the previous snapshot (if any) and is
-    counted; a failed listing leaves the cache untouched and sets ``error``.
+    longer listed are dropped. A failed per-thread read keeps the previous snapshot (if any), is
+    counted, and is named in ``stale_threads``; a failed listing leaves the cache untouched and
+    sets ``error``. A cached snapshot whose key is unchanged still takes its tags from this
+    listing, an empty list included (PR #593 gate Obj-3). ``priority`` names a thread to read
+    first, ahead of the listing order, so a caller asking about one thread gets it within the
+    budget (PR #593 gate Obj-4).
     """
     read = ProjectRead(project=project)
     try:
@@ -155,9 +174,18 @@ async def refresh_project(
     old_entries: dict[str, Any] = old if isinstance(old, dict) else {}
     new_entries: dict[str, Any] = {}
     budget = max_fetch
-    for item in read.listed:
+    order = sorted(read.listed, key=lambda i: i.thread_id != priority) if priority else read.listed
+    for item in order:
         entry = old_entries.get(item.thread_id)
         cached = snapshot_from_json(entry.get("snapshot")) if isinstance(entry, dict) else None
+        if (
+            isinstance(entry, dict)
+            and cached is not None
+            and item.tags is not None
+            and cached.tags != item.tags
+        ):
+            cached = replace(cached, tags=item.tags)
+            entry = {**entry, "snapshot": snapshot_to_json(cached)}
         fresh = isinstance(entry, dict) and entry.get("key") == item.key and cached is not None
         if not fresh and budget > 0:
             budget -= 1
@@ -176,7 +204,7 @@ async def refresh_project(
                     status=snap.status or item.status,
                     messages=snap.messages,
                     affects_threads=snap.affects_threads,
-                    tags=item.tags or snap.tags,
+                    tags=item.tags if item.tags is not None else snap.tags,
                     last_msg_id=item.last_msg_id,
                 )
                 read.fetched += 1
@@ -189,7 +217,13 @@ async def refresh_project(
         if cached is not None:
             new_entries[item.thread_id] = entry
             read.snapshots.append(cached)
-    cache[project] = new_entries
+            if not fresh:
+                read.stale_threads.append(item.thread_id)
+    # Keep the listing's order in the cache and the view, whatever order the reads ran in.
+    rank = {i.thread_id: n for n, i in enumerate(read.listed)}
+    read.snapshots.sort(key=lambda sn: rank.get(sn.thread_id, len(rank)))
+    read.stale_threads.sort(key=lambda t: rank.get(t, len(rank)))
+    cache[project] = {k: new_entries[k] for k in sorted(new_entries, key=lambda t: rank.get(t, 0))}
     return read
 
 

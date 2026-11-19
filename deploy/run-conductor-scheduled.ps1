@@ -5706,7 +5706,9 @@ function Invoke-ThreadReferencesProbe {
 
 # D-3 (msg-9729): the merge lines of the last 24h, capped at -MaxLines with the dropped count shown.
 # Nothing is posted into any thread (msg-9544 §3). A failed probe is one `?` line, never silence; an
-# empty report (no merge with an open referencing thread) is no line at all.
+# empty report (no merge with an open referencing thread) is no line at all. A project read only
+# partly this tick (`complete` false: unread or failed threads) gets a warning line, because its merge
+# lines can be missing (PR #593 gate Obj-1).
 function Get-ThreadReferencesDigestLines {
     param($Report, [string]$ProbeError, [int]$MaxLines = 5)
     if ($ProbeError) { return @("参照のある merge: ? — $ProbeError") }
@@ -5720,6 +5722,9 @@ function Get-ThreadReferencesDigestLines {
     }
     foreach ($p in @($Report.projects)) {
         if ($p.error) { $out += "参照のある merge [$($p.project)]: ? — $($p.error)" }
+        elseif ($p.complete -eq $false) {
+            $out += "参照のある merge [$($p.project)]: 部分的な観測 — 未読 $($p.pending) 本・読み取り失敗 $($p.fetch_errors) 本、merge 行が欠けている可能性"
+        }
     }
     return $out
 }
