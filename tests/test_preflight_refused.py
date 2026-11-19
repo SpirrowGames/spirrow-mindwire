@@ -14,6 +14,7 @@ go Einstein msg-9813). Pinned here (the PowerShell side is tests/Test-PreflightR
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -257,3 +258,55 @@ def test_exit_code_is_the_next_free_one_and_pinned_to_the_wrapper() -> None:
     m = re.search(r"^\$PreflightRefusedExitCode\s*=\s*(\d+)\s*$", sweep, re.MULTILINE)
     assert m is not None and int(m.group(1)) == PREFLIGHT_REFUSED_EXIT_CODE
     assert f"^{PREFLIGHT_REFUSED_PAYLOAD_PREFIX.strip()}" in sweep
+
+
+# --------------------------------------------------------------------------- #
+# D-2' inventory finding — daemon configuration errors end before spawn, too
+# --------------------------------------------------------------------------- #
+
+
+def test_config_systemexit_message_becomes_a_config_refusal() -> None:
+    with pytest.raises(PreflightError) as ei, loop_runner._config_refusal():
+        raise SystemExit("conductor.roster is empty: set [conductor].roster")
+    assert ei.value.check == "config"
+    assert ei.value.detail.startswith("conductor.roster is empty")
+
+
+def test_config_refusal_passes_int_exits_preflight_errors_and_other_exceptions() -> None:
+    with pytest.raises(SystemExit) as ei, loop_runner._config_refusal():
+        raise SystemExit(4)
+    assert not isinstance(ei.value, PreflightError) and ei.value.code == 4
+    with pytest.raises(PreflightError) as pe, loop_runner._config_refusal():
+        raise PreflightError("preflight P0 failed: x", check="P0")
+    assert pe.value.check == "P0"
+    with pytest.raises(RuntimeError), loop_runner._config_refusal():
+        raise RuntimeError("unknown stays generic (exit 1 -> retry/quarantine)")
+
+
+def test_invalid_budget_is_a_config_refusal_before_anything_runs() -> None:
+    settings = MindwireSettings()
+    settings.conductor.run_budget_s = 0
+    with pytest.raises(PreflightError) as ei:
+        asyncio.run(loop_runner.run_conductor(settings, mcp=object()))  # type: ignore[arg-type]
+    assert ei.value.check == "config"
+
+
+def test_unloadable_settings_exit_13_in_conductor_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _broken() -> MindwireSettings:
+        raise ValueError("bad toml")
+
+    monkeypatch.setattr(loop_runner, "load_settings", _broken)
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+    with pytest.raises(SystemExit) as ei:
+        loop_runner.main()
+    assert ei.value.code == PREFLIGHT_REFUSED_EXIT_CODE
+    rows = [
+        ln
+        for ln in capsys.readouterr().out.splitlines()
+        if ln.startswith(PREFLIGHT_REFUSED_PAYLOAD_PREFIX)
+    ]
+    assert len(rows) == 1
+    payload = json.loads(rows[0][len(PREFLIGHT_REFUSED_PAYLOAD_PREFIX) :])
+    assert payload["check"] == "config" and "bad toml" in payload["detail"]

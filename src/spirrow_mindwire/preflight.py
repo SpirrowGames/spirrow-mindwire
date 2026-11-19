@@ -388,8 +388,13 @@ def _classify_exception(exc: BaseException, timeout_s: float) -> tuple[FailureKi
     return "terminal", _cap(str(exc)), "other"
 
 
-PreflightCheck = Literal["P0", "P1", "P2", "P3", "unexpected"]
-"""Which preflight check refused the run (T-preflight-failure-counts-toward-stall D-1)."""
+PreflightCheck = Literal["P0", "P1", "P2", "P3", "unexpected", "config"]
+"""Which pre-spawn check refused the run (T-preflight-failure-counts-toward-stall D-1).
+
+``"config"`` is the D-2' inventory's finding: a daemon configuration error (``load_settings``,
+``validate_budgets``, ``build_conductor``'s ``SystemExit``) also ends the run before any role is
+spawned, and used to reach the sweep as exit 1 (counted toward ``launches_same_head`` and retry ->
+quarantine) exactly like a preflight refusal did. It now takes the same exit 13."""
 
 
 class PreflightError(SystemExit):

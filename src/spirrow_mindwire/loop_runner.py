@@ -69,8 +69,8 @@ import functools
 import logging
 import os
 import sys
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1330,9 +1330,10 @@ async def run_conductor(
     raised (exit 5). The budgets are checked first, before anything is read or spawned.
     """
     cond_cfg = settings.conductor
-    validate_budgets(
-        run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
-    )
+    with _config_refusal():
+        validate_budgets(
+            run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
+        )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
     run_phase = RunPhase()
@@ -1434,18 +1435,19 @@ async def _run_conductor_once(
         )
         return outcome
     _preflight(settings.loop)
-    cond = build_conductor(
-        settings,
-        mcp=mcp,
-        stop_slot=stop_slot,
-        launches_same_head=launches_same_head,
-        launch_head_msg_id=launch_head_msg_id,
-        retry_of=retry_of,
-        run_phase=run_phase,
-        gate_only=gate_only,
-        summon_owner_project=summon_owner_project,
-        resume_notice=resume_notice,
-    )
+    with _config_refusal():
+        cond = build_conductor(
+            settings,
+            mcp=mcp,
+            stop_slot=stop_slot,
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
+            retry_of=retry_of,
+            run_phase=run_phase,
+            gate_only=gate_only,
+            summon_owner_project=summon_owner_project,
+            resume_notice=resume_notice,
+        )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
@@ -1468,6 +1470,28 @@ async def _run_conductor_once(
     finally:
         with run_phase.enter("teardown"):
             await cond.aclose()
+
+
+@contextmanager
+def _config_refusal() -> Iterator[None]:
+    """Turn a daemon-configuration ``SystemExit(<message>)`` into a ``config`` refusal.
+
+    T-preflight-failure-counts-toward-stall D-2' inventory: ``validate_budgets`` and
+    ``build_conductor`` (with ``_build_dispatcher`` under it) fail closed with ``SystemExit`` and a
+    message, before any role is spawned. That used to end the run with exit 1, which the sweep
+    counts as a launch and as a thread failure. Only a ``SystemExit`` whose code is a message is
+    converted (an int code is a deliberate exit and passes through), and a :class:`PreflightError`
+    passes through untouched. Any other exception keeps the generic exit-1 path: an unknown failure
+    stays "unknown -> quarantine" (the sweep's front-compat rule).
+    """
+    try:
+        yield
+    except PreflightError:
+        raise
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            raise PreflightError(exc.code, check="config") from exc
+        raise
 
 
 def _preflight(cfg: Stage3LoopConfig) -> None:
@@ -1653,7 +1677,20 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        if args.mode != "conductor":
+            raise
+        # D-2' inventory: an unreadable mindwire.toml ends the run before any role is spawned, so
+        # the sweep must not count it as a launch (exit 13, check=config). Watcher mode keeps the
+        # plain failure: it is not driven by the sweep's launch accounting.
+        refused = PreflightError(
+            f"mindwire settings could not be loaded: {type(exc).__name__}: {exc}", check="config"
+        )
+        emit_preflight_refused_payload(refused)
+        logger.error("preflight refused exit=%d check=config: %s", PREFLIGHT_REFUSED_EXIT_CODE, exc)
+        sys.exit(PREFLIGHT_REFUSED_EXIT_CODE)
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
     # unwound (Bohr msg-4440 D-1''/D-2'). Only the conductor mode writes it.
     stop_slot = ConductorStopSlot()
