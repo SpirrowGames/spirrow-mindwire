@@ -1,6 +1,6 @@
 # PR-0 measurements — widened gate input (T-gate-diff-context-truncates-branch-bodies)
 
-Status: **partial** (2026-11-20, Heisenberg). Design: Bohr v3.8 (msg-9790), go by
+Status: **complete except (b)/(c)** (2026-11-20, Heisenberg). Design: Bohr v3.8 (msg-9790), go by
 Einstein with no conditions. This file records what PR-0 has confirmed and what it
 has not. Nothing here changes code or switches anything on.
 
@@ -103,8 +103,56 @@ can_enable = (backstop_confirmed AND calibration_available) OR byte_bound_confir
 The switch stays off. PR-2 may still be implemented and merged with the switch off
 (v3.7 E-1).
 
-## 6. Not done yet
+## 6. Four-PR re-measurement (msg-9783 item 6, v3.5 §5 PR-0)
 
-- Re-measuring #216 / #525 / #562 / #557 with D-A and Markdown block units
-  (raw characters, widened characters, UTF-8 bytes, per finished prompt).
-- (c) measured refusal, (b) codex CLI behaviour.
+Method (scratch prototype, not committed; PR-2 builds the real generator):
+
+- Diff = three-dot `base...head` of each PR (same as the gate). This repository
+  has no `.naysayer-ignore`, so nothing is excluded.
+- Alignment from `git diff -U<whole file>`; every changed line is widened to its unit
+  on the new side (a deletion uses the new-side line it sits after), plus U=3.
+- `.py`: innermost function incl. decorators; outside any function, the innermost
+  direct member of the class body (**D-A**); a class is never a unit, so a line
+  between members (blank line, comment) keeps only its U=3. Else the top-level
+  statement. Unparseable → whole file (did not occur).
+- `.md`: smallest paragraph / fenced code block / whole list / heading / other
+  top-level block containing the change.
+- Other files: whole file (did not occur in these four PRs).
+- Finished prompts: `_build_messages` / `_build_pass2_messages` from `main` with the
+  widened text, flattened exactly as Lexora's `request_to_prompt` does
+  (`[role]
+<text>` joined by blank lines). Coverage, round context, design
+  conditions and ignore report were left empty, so **the prompt sizes are lower
+  bounds** (round 1 of a PR without design conditions is the exact case).
+
+| PR | raw U=3 chars | widened chars | widened UTF-8 bytes | pass-1 chars / bytes | pass-2 chars / bytes | E-2 with k=1 (≤ 145,536 bytes, ≤ 400k chars) |
+|---|---|---|---|---|---|---|
+| #216 | 27,396 | 34,649 | 34,712 | 48,061 / 48,202 | 49,018 / 49,982 | pass |
+| #525 | 119,594 | 179,488 | 180,052 | 192,900 / 193,542 | 193,857 / 195,322 | **fail** (bytes) |
+| #562 | 86,790 | 177,111 | 181,646 | 190,523 / 195,136 | 191,480 / 196,916 | **fail** (bytes) |
+| #557 | 57,652 | 73,015 | 78,356 | 86,427 / 91,846 | 87,384 / 93,626 | pass |
+
+By unit kind (widened chars): #562 = `.py` 173,663 + `.md` 3,448; #557 = `.py`
+63,103 + `.md` 9,912; #216 and #525 are `.py` only.
+
+Observations:
+
+- **D-A matters.** With a class as the fallback for a line between methods, #525's
+  `conductor/core.py` alone widened to 197,323 chars (one change sat on the blank
+  line between two methods of the 3,514-line `Conductor`). With D-A it is 22,391.
+- **Markdown by block works for #557:** `.md` widens 9,422 → 9,912 chars. The
+  earlier 211k estimate came from sending `.md` files whole.
+- #562 stays large because many functions change at once (`core.py` 59,223,
+  `handoff.py` 53,896), as reported before.
+- G-1 check on #216: both counter-evidence lines of msg-2442 §3
+  (`pairs.append((ThreadFacts(...), pr))` and `for dropped in ...`) are in the
+  widened input.
+- **If EN were satisfied only through the byte-bound (k = 1), 2 of the 4 PRs
+  (#525, #562) would fail input generation.** Characters (≤ 400k) never decide
+  here; bytes do. v3.7 E-2(ii) said this result goes back to Takahito.
+
+## 7. Not done yet
+
+- (b) codex CLI behaviour on an over-window prompt; (c) a measured refusal (needs a
+  quiet window on the shared codex subscription).
+- Calibration samples (need PR-2's per-`trace_id` byte log).
