@@ -695,6 +695,9 @@ class Conductor:
         # routing never reads it. ``None`` = not wired: no notice, the prompt is unchanged.
         self._clone_retreat_log_path = clone_retreat_log_path
         self._clone_retreat_checked = False
+        # T-dirty-clone-check-disagreement (PR #590 gate Obj-3): the unpushed notice for a
+        # re-admitted relay, attached to the next implementer dispatch and cleared once sent.
+        self._unpushed_dispatch_notice: str | None = None
         # Set by ``_route`` on an admitted / capped CONTINUE; consumed by ``run`` right after.
         self._continuation: tuple[ContinueVerdict, ContinuePlan] | None = None
         self._thread_ref = thread_ref
@@ -2268,8 +2271,9 @@ class Conductor:
             if exc.reason is DirtyCloneReason.UNPUSHED:
                 # T-dirty-clone-check-disagreement: as on the report path, unpushed work is not a
                 # reason to park the shared clone (clone-check cannot release it). The relay is
-                # re-admitted; the implementer's next CONTINUE report is checked again and gets
-                # the unpushed notice, or goes to the human over the cap.
+                # re-admitted, and the relay posted earlier may carry no notice, so the notice
+                # rides on this implementer dispatch's input instead (PR #590 gate Obj-3).
+                self._unpushed_dispatch_notice = render_unpushed_notice(exc.detail)
                 logger.warning(
                     "conductor continue relay re-admitted with unpushed work: n=%d (%s) head=%s",
                     n,
@@ -4182,6 +4186,11 @@ class Conductor:
                 role.value,
                 "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
             )
+        unpushed = self._unpushed_dispatch_notice if role is Role.IMPLEMENTER else None
+        clone_notice = (
+            "\n\n".join(t for t in (retreat.text if retreat is not None else None, unpushed) if t)
+            or None
+        )
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
                 review_round, review_round_notice = self._review_round(role, messages)
@@ -4192,7 +4201,7 @@ class Conductor:
                         messages,
                         retry_notice=notice,
                         resume_notice=resume_text,
-                        clone_retreat_notice=retreat.text if retreat is not None else None,
+                        clone_retreat_notice=clone_notice,
                         review_round=review_round,
                         review_round_notice=review_round_notice,
                         conditional_proceed_notice=(
@@ -4225,6 +4234,8 @@ class Conductor:
             self._resume_notice_delivered = True
         if retreat is not None:
             self._clone_retreat_delivered(retreat, role)
+        if unpushed is not None:
+            self._unpushed_dispatch_notice = None
         return None
 
     def _pending_clone_retreat(self, role: Role) -> PendingNotice | None:

@@ -393,6 +393,11 @@ async def test_5d2_recovered_relay_head_with_unpushed_work_dispatches(
     await _conductor(mcp, disp, clone_check=_check(pushed_clone)).run()
 
     assert disp.dispatches[0] == (Role.IMPLEMENTER, "m3")
+    # PR #590 gate Obj-3: the relay posted earlier carries no notice, so the dispatch does.
+    notice = disp.events[0].clone_retreat_notice
+    assert notice is not None
+    assert "origin に無い commit" in notice
+    assert ("feature/y" if state == "unpushed_no_upstream" else "feature/x") in notice
 
 
 @pytest.mark.anyio

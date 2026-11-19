@@ -143,21 +143,24 @@ class DirtyCloneError(Exception):
         }
 
 
-def normalized_patch(diff: str) -> str:
-    """A commit's patch with what a cherry-pick may change removed, for equality only.
+def normalized_patch(diff: str) -> str | None:
+    """A commit's patch with only what a cherry-pick may change removed, for equality only.
 
-    Close to ``git patch-id --stable``: ``index`` lines (blob ids differ when the base differs)
-    are dropped, hunk headers lose their line numbers, and whitespace is removed from every line.
-    Two commits with the same result introduce the same change.
+    ``index`` lines are dropped (blob ids differ when the base differs) and hunk headers lose
+    their line numbers. Every other byte is kept: whitespace inside a changed line can be the
+    change itself (PR #590 gate Obj-1). A binary patch is ``None`` -- inconclusive, because
+    without the ``index`` line two different binary changes print the same summary (Obj-2).
     """
     out: list[str] = []
     for line in diff.splitlines():
+        if line.startswith(("Binary files ", "GIT binary patch")):
+            return None
         if line.startswith("index "):
             continue
         if line.startswith(_HUNK_HEADER_PREFIX):
             out.append("@@")
             continue
-        out.append("".join(line.split()))
+        out.append(line)
     return "\n".join(out)
 
 
@@ -427,6 +430,7 @@ class CloneGuard:
             mine = self._normalized_patch(sha)
             if mine is None:
                 return False
+            # ``None == None`` never matches: ``mine`` is a str here.
             if not any(self._normalized_patch(r) == mine for r in by_subject.get(subject, [])):
                 return False
         return True

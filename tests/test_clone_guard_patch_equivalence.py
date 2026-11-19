@@ -85,9 +85,36 @@ def test_merge_commit_outside_the_remotes_is_unpushed(clone: Path) -> None:
     assert "rescue" in _unpushed(clone).detail
 
 
+def test_same_subject_whitespace_only_difference_is_unpushed(clone: Path) -> None:
+    """PR #590 gate Obj-1: "a b" and "ab" are different changes."""
+    _git(clone, "switch", "-q", "feature/x")
+    _commit(clone, "w.txt", "a b\n", "add w")
+    _git(clone, "push", "-q", "origin", "feature/x")
+    _git(clone, "switch", "-q", "-c", "rescue", "main")
+    _commit(clone, "w.txt", "ab\n", "add w")
+    _git(clone, "switch", "-q", "main")
+    assert "rescue" in _unpushed(clone).detail
+
+
+def test_same_subject_different_binary_is_unpushed(clone: Path) -> None:
+    """PR #590 gate Obj-2: two binary changes print the same summary once index is dropped."""
+    _git(clone, "switch", "-q", "feature/x")
+    (clone / "blob.bin").write_bytes(bytes([0, 1, 2, 3]))
+    _git(clone, "add", "blob.bin")
+    _git(clone, "commit", "-q", "-m", "add blob")
+    _git(clone, "push", "-q", "origin", "feature/x")
+    _git(clone, "switch", "-q", "-c", "rescue", "main")
+    (clone / "blob.bin").write_bytes(bytes([0, 9, 9, 3]))
+    _git(clone, "add", "blob.bin")
+    _git(clone, "commit", "-q", "-m", "add blob")
+    _git(clone, "switch", "-q", "main")
+    assert "rescue" in _unpushed(clone).detail
+
+
 def test_normalized_patch_ignores_index_and_hunk_positions() -> None:
     a = "diff --git a/f b/f\nindex 111..222 100644\n@@ -1,2 +1,3 @@ def x\n a\n+b\n"
-    b = "diff --git a/f b/f\nindex 333..444 100644\n@@ -9,2 +9,3 @@\n a\n+b \n"
-    c = "diff --git a/f b/f\nindex 333..444 100644\n@@ -9,2 +9,3 @@\n a\n+c\n"
+    b = "diff --git a/f b/f\nindex 333..444 100644\n@@ -9,2 +9,3 @@\n a\n+b\n"
+    c = "diff --git a/f b/f\nindex 333..444 100644\n@@ -9,2 +9,3 @@\n a\n+b \n"
     assert normalized_patch(a) == normalized_patch(b)
-    assert normalized_patch(a) != normalized_patch(c)
+    assert normalized_patch(a) != normalized_patch(c)  # whitespace is kept
+    assert normalized_patch("Binary files a/x and b/x differ\n") is None
