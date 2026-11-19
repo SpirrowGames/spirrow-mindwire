@@ -39,21 +39,25 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from ..tier_c_admission_gate import (
     ADMIT_LABELS,
+    SECURITY_LABEL,
     AdmissionDecision,
     AdmissionVerdict,
     BounceReason,
     LogEntry,
     LogKind,
+    check_security_basis,
     decide_admission,
+    normalized_body_sha256,
 )
 from ..tier_c_decisions_log import append_log_entries, build_retry_lookup
+from ..tier_c_security_holds import SecurityHold, open_holds
 
 TIERC_BOUNCE_HEADER = "Conductor bounce — Tier-C admission gate"
 """First line of every bounce notice. :func:`is_bounce_notice` keys on it so the conductor can tell
@@ -88,8 +92,13 @@ class TierCGate:
         thread: str,
         msg_id: str,
         now: datetime,
+        released_holds: Iterable[str] = (),
     ) -> AdmissionDecision:
         """Decide one ``NEXT: human`` and append the decision's log entries (thread + msg_id).
+
+        The security holds of ``(thread, author)`` are read back from the same log
+        (:func:`~spirrow_mindwire.tier_c_security_holds.open_holds`); ``released_holds`` are the
+        hold ids a human released with ``HOLD-RELEASE:`` in this thread.
 
         The rows are written **before** the caller posts any bounce: a bounce whose ``BOUNCED`` row
         failed to land would hand the author a uuid the RETRY lookup has never heard of, and every
@@ -101,9 +110,50 @@ class TierCGate:
             retry_lookup=build_retry_lookup(self.log_path),
             now=now,
             bounce_uuid=self.uuid_factory(),
+            security_hold=bool(
+                self.holds(thread=thread, author=author, released_holds=released_holds)
+            ),
         )
         append_log_entries(self.log_path, decision.log_entries, thread=thread, msg_id=msg_id)
         return decision
+
+    def holds(
+        self, *, thread: str, author: str, released_holds: Iterable[str] = ()
+    ) -> list[SecurityHold]:
+        """The open security holds of ``(thread, author)``, read back from the log."""
+        return open_holds(self.log_path, thread=thread, author=author, released=released_holds)
+
+    def escalated(
+        self,
+        *,
+        author: str,
+        decision: AdmissionDecision,
+        thread: str,
+        msg_id: str,
+        now: datetime,
+        released_holds: Iterable[str] = (),
+    ) -> None:
+        """Record that the head was delivered to the human (``ESCALATED``, msg-9650 §4).
+
+        Written only once nothing after the gate bounced it. ``released_holds`` are the holds this
+        delivery releases (msg-9661 §1.1⁵ 3.: after delivery, the supplemented ones only).
+        """
+        retry_uuid = None
+        for logged in decision.log_entries:
+            if logged.kind is LogKind.RETRY_ADMIT:
+                retry_uuid = logged.payload.get("retry_uuid")
+        entry = LogEntry(
+            kind=LogKind.ESCALATED,
+            payload={
+                "ts": now.isoformat(),
+                "author": author,
+                "label": decision.normalized_label,
+                "rule": decision.rule,
+                "retry_uuid": retry_uuid,
+                "released_holds": sorted(released_holds),
+            },
+        )
+        append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
 
     def jev_bounce(
         self,
@@ -114,6 +164,7 @@ class TierCGate:
         thread: str,
         msg_id: str,
         now: datetime,
+        body: str | None = None,
     ) -> str:
         """Record a Jev bounce of a label-admitted ``NEXT: human`` and return its RETRY uuid.
 
@@ -121,19 +172,28 @@ class TierCGate:
         :func:`build_retry_lookup` redeems a ``RETRY: <uuid>`` for it exactly as for a label
         bounce: one retry always reaches the human. As in :meth:`admit`, the row is written before
         the caller posts the notice; exceptions propagate and the caller fails open.
+
+        A ``security`` head Jev judged ``LIKELY_NOT`` also opens a *semantic* security hold,
+        whatever its basis kind (msg-9655 §1.1''), so its RETRY is re-checked, not force-admitted.
+        ``body`` supplies the basis line and the dedupe hash.
         """
         retry_uuid = self.uuid_factory()
-        entry = LogEntry(
-            kind=LogKind.BOUNCED,
-            payload={
-                "ts": now.isoformat(),
-                "author": author,
-                "reason": BounceReason.JEV_LIKELY_NOT.value,
-                "label": label,
-                "retry_uuid": retry_uuid,
-                "ask_score": ask_score,
-            },
-        )
+        payload: dict[str, object] = {
+            "ts": now.isoformat(),
+            "author": author,
+            "reason": BounceReason.JEV_LIKELY_NOT.value,
+            "label": label,
+            "retry_uuid": retry_uuid,
+            "ask_score": ask_score,
+        }
+        if label == SECURITY_LABEL and body is not None:
+            payload |= {
+                "security_hold": True,
+                "hold_kind": "semantic",
+                "held_basis": check_security_basis(body).basis,
+                "body_sha256": normalized_body_sha256(body),
+            }
+        entry = LogEntry(kind=LogKind.BOUNCED, payload=payload)
         append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
         return retry_uuid
 
@@ -189,8 +249,9 @@ def render_bounce_body(*, author: str, decision: AdmissionDecision, bounced_msg_
         f"{author} の `NEXT: human` は人に届けず、書いた本人に差し戻しました"
         f" (理由: `{reason}`)。\n\n"
         f"{hint_line}"
-        f"人に上げてよいのは Tier-C の4種類 ({labels})だけです。次のどれかで続けてください。\n"
-        "- 4種類のどれかに当たるなら、`NEXT: human` のすぐ上の行に `TIER-C: <label>` を書いて"
+        f"人に上げてよいのは Tier-C の{len(ADMIT_LABELS)}種類 ({labels})だけです"
+        "(人にしかできない作業は `HUMAN-TASK:` の形で頼みます)。次のどれかで続けてください。\n"
+        "- どれかの種類に当たるなら、`NEXT: human` のすぐ上の行に `TIER-C: <label>` を書いて"
         "出し直してください。\n"
         "- どれにも当たらないなら、人に上げずに自分で決めて進めてください。\n"
         "- それでも人の判断が要ると考えるなら、返信に次の1行をそのまま単独で書いてください。"
