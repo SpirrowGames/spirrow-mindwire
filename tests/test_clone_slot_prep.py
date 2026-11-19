@@ -278,3 +278,74 @@ def test_dirty_status_is_not_recoverable(tmp_path: Path, origin: Path) -> None:
     slot = _borrow(_prep(tmp_path, origin), "T-a", "t1").slot.path  # type: ignore[union-attr]
     (slot / "x").write_text("x", encoding="utf-8")
     assert judge_recoverable(slot) == (False, "status_unverified")
+
+
+_SUB = ("-c", "protocol.file.allow=always")
+
+
+def _bare_with_file(tmp_path: Path, name: str) -> Path:
+    work = tmp_path / f"{name}-seed"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "main")
+    _cfg(work)
+    (work / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+    _git(work, "add", ".")
+    _git(work, "commit", "-q", "-m", name)
+    bare = tmp_path / f"{name}.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(work), str(bare)], check=True, capture_output=True
+    )
+    return bare
+
+
+def _bare_with_submodule(tmp_path: Path, name: str, child: Path, path: str) -> Path:
+    work = tmp_path / f"{name}-work"
+    subprocess.run(["git", "clone", "-q", str(_bare_with_file(tmp_path, name)), str(work)],
+                   check=True, capture_output=True)  # fmt: skip
+    _cfg(work)
+    _git(work, *_SUB, "submodule", "add", "-q", str(child), path)
+    _git(work, "commit", "-q", "-m", f"add {path}")
+    _git(work, "push", "-q", "origin", "main")
+    return tmp_path / f"{name}.git"
+
+
+def _nested_slot(tmp_path: Path) -> Path:
+    """parent -> sub -> nested, each with its own bare origin, cloned recursively."""
+    nested = _bare_with_file(tmp_path, "nested")
+    sub = _bare_with_submodule(tmp_path, "sub", nested, "nested")
+    parent = _bare_with_submodule(tmp_path, "parent", sub, "sub")
+    slot = tmp_path / "slot"
+    subprocess.run(
+        ["git", *_SUB, "clone", "-q", "--recurse-submodules", str(parent), str(slot)],
+        check=True,
+        capture_output=True,
+        env=git_env(),
+    )
+    for repo in (slot, slot / "sub", slot / "sub" / "nested"):
+        _cfg(repo)
+    return slot
+
+
+def test_published_nested_submodules_are_recoverable(tmp_path: Path) -> None:
+    slot = _nested_slot(tmp_path)
+    assert judge_recoverable(slot) == (True, None)
+
+
+def test_unpublished_nested_submodule_commit_is_not_recoverable(tmp_path: Path) -> None:
+    """PR #589 Obj-1-3: the parent is clean and the direct submodule's commit is on its origin,
+    but that commit records a nested commit that exists only in this slot."""
+    slot = _nested_slot(tmp_path)
+    inner = slot / "sub" / "nested"
+    _git(inner, "checkout", "-q", "-b", "local-only")
+    (inner / "only-here.txt").write_text("x\n", encoding="utf-8")
+    _git(inner, "add", ".")
+    _git(inner, "commit", "-q", "-m", "local only")
+    sub = slot / "sub"
+    _git(sub, "add", "nested")
+    _git(sub, "commit", "-q", "-m", "bump nested")
+    _git(sub, "push", "-q", "origin", "HEAD:main")
+    _git(slot, "add", "sub")
+    _git(slot, "commit", "-q", "-m", "bump sub")
+    _git(slot, "push", "-q", "origin", "HEAD:main")
+    assert _git(slot, "status", "--porcelain", "--ignore-submodules=none") == ""
+    assert judge_recoverable(slot) == (False, "submodule_unverified")

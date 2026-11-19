@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,9 @@ import pytest
 from spirrow_mindwire import clone_slot_cli
 from spirrow_mindwire.cli import main
 from spirrow_mindwire.clone_retreat import git_env
+from spirrow_mindwire.clone_slot import SlotRef
+from spirrow_mindwire.clone_slot_lease import LeaseState, LeaseStore
+from spirrow_mindwire.clone_slot_prep import PrepOutcome, PrepResult, QuarantineInfo, SlotPrep
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -129,3 +133,62 @@ def test_prep_failure_exits_1_with_reason(
     (state / "slot-leases.json").write_text("not json", encoding="utf-8")
     code, out, err = _run(_prep_argv(tmp_path, origin, "T-a", "t1"), capsys)
     assert code == 1 and "slot-prep failed" in err and not out.strip()
+
+
+def _fail_append(*_a: object, **_k: object) -> None:
+    raise OSError("clone-retreats.jsonl is not writable")
+
+
+def test_record_failure_after_ready_borrow_releases_the_lease(
+    tmp_path: Path,
+    origin: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #589 Obj-1-2: a quarantined-and-rebuilt READY borrow whose record append fails exits 1
+    (the wrapper does not launch) and must not strand the lease."""
+    monkeypatch.setattr(clone_slot_cli, "_trusted", lambda p: True)
+    assert _run(_prep_argv(tmp_path, origin, "T-a", "t1"), capsys)[0] == 0
+    slot = tmp_path / "slots" / "sample" / "slot-01"
+    (slot / "wip.txt").write_text("w\n", encoding="utf-8")
+    base = ["--state-dir", str(tmp_path / "state"), "--repo", "sample", "--slot", "slot-01"]
+    assert _run(["slot-lease", "release", *base, "--turn-id", "t1"], capsys)[0] == 0
+    monkeypatch.setattr(clone_slot_cli, "append_slot_quarantine", _fail_append)
+    code, out, err = _run(_prep_argv(tmp_path, origin, "T-b", "t2"), capsys)
+    assert code == 1 and "not writable" in err
+    assert not [ln for ln in out.splitlines() if ln.startswith(clone_slot_cli.PREP_PREFIX)]
+    assert LeaseStore(tmp_path / "state").leases("sample") == []
+    monkeypatch.undo()
+    monkeypatch.setattr(clone_slot_cli, "_trusted", lambda p: True)
+    code, out, _ = _run(_prep_argv(tmp_path, origin, "T-c", "t3"), capsys)
+    assert code == 0 and _row(out)["slot_name"] == "slot-01"
+
+
+def test_record_failure_keeps_a_quarantine_failed_lease(
+    tmp_path: Path,
+    origin: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Obj-1-2's other half: a quarantine_failed lease stays held when the record fails, so the
+    slot is never lent again (msg-9402 Obj-36-4)."""
+    store = LeaseStore(tmp_path / "state")
+
+    def fake_borrow(self: SlotPrep, *, thread_id: str, turn_id: str, **_kw: object) -> PrepResult:
+        lease = store.acquire(
+            "sample", 1, thread_id=thread_id, turn_id=turn_id, now=datetime.now(UTC)
+        ).lease
+        assert lease is not None
+        lease = store.mark_quarantine_failed("sample", lease.slot, turn_id)
+        q = QuarantineInfo("modified", "T-a", None, None, False, "rename_failed")
+        ref = SlotRef(tmp_path / "slots", "sample", lease.index)
+        return PrepResult(
+            PrepOutcome.PARKED, ref, lease, park_code="clone_slot_unrecoverable", quarantine=q
+        )
+
+    monkeypatch.setattr(SlotPrep, "borrow", fake_borrow)
+    monkeypatch.setattr(clone_slot_cli, "append_slot_quarantine", _fail_append)
+    code, _, err = _run(_prep_argv(tmp_path, origin, "T-b", "t2"), capsys)
+    assert code == 1 and "recording the quarantine" in err
+    [kept] = store.leases("sample")
+    assert kept.state is LeaseState.QUARANTINE_FAILED and kept.turn_id == "t2"

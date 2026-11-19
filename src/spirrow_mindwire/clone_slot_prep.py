@@ -181,20 +181,43 @@ def _call(git: GitRunner, cwd: Path, *args: str) -> GitResult:
         return GitResult(-1, "", f"{type(exc).__name__}: {exc}")
 
 
+#: How deep :func:`judge_recoverable` follows submodules inside submodules. Deeper is unverified.
+SUBMODULE_MAX_DEPTH = 8
+
+
 def judge_recoverable(slot: Path, git: GitRunner = _subprocess_git) -> tuple[bool, str | None]:
     """``recoverable`` of a slot whose work is saved (msg-9391 Obj-33-2, msg-9393 Obj-34-2).
 
     True only when the status (submodules included) is empty, every gitlink (mode 160000) in the
     HEAD tree and in the index is a ``.gitmodules`` submodule, and for each of those the
     submodule's HEAD and the commit the parent records are both on the submodule's ``origin``
-    after a fetch. Anything that cannot be confirmed is ``False`` with ``embedded_repo`` or
+    after a fetch. The same check is applied inside every submodule, recursively (PR #589 gate
+    round 1, Obj-1-3: ``ls-tree -r`` does not descend into gitlinks, so a published submodule
+    commit can still point at a nested commit that exists only in this slot). A nested submodule
+    without its own repository, or nesting deeper than :data:`SUBMODULE_MAX_DEPTH`, cannot be
+    confirmed. Anything that cannot be confirmed is ``False`` with ``embedded_repo`` or
     ``submodule_unverified`` (or ``status_unverified``).
     """
+    verdict = _judge_gitlinks(slot, git, depth=0)
+    if verdict is not None:
+        return False, verdict
+    status = _call(
+        git, slot, "status", "--porcelain", "--ignore-submodules=none", "--untracked-files=all"
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        return False, "status_unverified"
+    return True, None
+
+
+def _judge_gitlinks(repo: Path, git: GitRunner, *, depth: int) -> str | None:
+    """``None`` when every gitlink of ``repo`` (and, recursively, of each submodule) is a declared
+    submodule whose HEAD and recorded commits are on that submodule's ``origin``; otherwise the
+    ``recoverable_reason``."""
     links: dict[str, set[str]] = {}
-    tree = _call(git, slot, "ls-tree", "-r", "-z", "HEAD")
-    index = _call(git, slot, "ls-files", "-s", "-z")
+    tree = _call(git, repo, "ls-tree", "-r", "-z", "HEAD")
+    index = _call(git, repo, "ls-files", "-s", "-z")
     if tree.returncode != 0 or index.returncode != 0:
-        return False, "submodule_unverified"
+        return "submodule_unverified"
     for entry in tree.stdout.split("\0"):
         meta, _, path = entry.partition("\t")
         parts = meta.split()
@@ -205,24 +228,28 @@ def judge_recoverable(slot: Path, git: GitRunner = _subprocess_git) -> tuple[boo
         parts = meta.split()
         if len(parts) == 3 and parts[0] == "160000":
             links.setdefault(path, set()).add(parts[1])
+    if not links:
+        return None
+    if depth >= SUBMODULE_MAX_DEPTH:
+        return "submodule_unverified"
     declared: set[str] = set()
-    if (slot / ".gitmodules").is_file():
+    if (repo / ".gitmodules").is_file():
         cfg = _call(
-            git, slot, "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"
+            git, repo, "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"
         )
         if cfg.returncode not in (0, 1):
-            return False, "submodule_unverified"
+            return "submodule_unverified"
         for line in cfg.stdout.splitlines():
             _, _, p = line.partition(" ")
             if p.strip():
                 declared.add(p.strip())
     if any(path not in declared for path in links):
-        return False, "embedded_repo"
+        return "embedded_repo"
     for path, recorded in sorted(links.items()):
-        sub = slot / path
+        sub = repo / path
         if not (sub / ".git").exists():
             # Without its own repository, git -C would answer for the parent instead.
-            return False, "submodule_unverified"
+            return "submodule_unverified"
         fetch = _call(
             git,
             sub,
@@ -233,18 +260,16 @@ def judge_recoverable(slot: Path, git: GitRunner = _subprocess_git) -> tuple[boo
             "+refs/heads/*:refs/remotes/origin/*",
         )
         if fetch.returncode != 0:
-            return False, "submodule_unverified"
+            return "submodule_unverified"
         outside = _call(
             git, sub, "rev-list", "-n", "1", "HEAD", *sorted(recorded), "--not", "--remotes=origin"
         )
         if outside.returncode != 0 or outside.stdout.strip():
-            return False, "submodule_unverified"
-    status = _call(
-        git, slot, "status", "--porcelain", "--ignore-submodules=none", "--untracked-files=all"
-    )
-    if status.returncode != 0 or status.stdout.strip():
-        return False, "status_unverified"
-    return True, None
+            return "submodule_unverified"
+        nested = _judge_gitlinks(sub, git, depth=depth + 1)
+        if nested is not None:
+            return nested
+    return None
 
 
 class SlotPrep:

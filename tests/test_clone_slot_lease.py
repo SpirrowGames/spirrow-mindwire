@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,7 @@ from spirrow_mindwire.clone_slot_lease import (
     judge_unreturned,
     pid_alive,
 )
+from spirrow_mindwire.stall_ledger.lock import LedgerLock
 
 T0 = datetime(2026, 11, 19, 1, 0, tzinfo=UTC)
 
@@ -50,7 +53,6 @@ def test_acquire_lends_lowest_free_slot_in_launching_state(tmp_path: Path) -> No
     for key in ("slot", "thread_id", "turn_id", "acquired_at", "wrapper_pid", "state"):
         assert key in rec
     assert rec["acquired_at"] == "2026-11-19T01:00:00Z"
-    assert not store.lock_path.exists()
 
 
 def test_one_slot_one_turn_and_one_turn_one_slot(tmp_path: Path) -> None:
@@ -184,29 +186,98 @@ def test_repos_are_independent(tmp_path: Path) -> None:
     assert store.acquire("mindwire", 1, thread_id="T-b", turn_id="t2", now=T0).lease is not None
 
 
-def test_lock_held_by_live_process_times_out(tmp_path: Path) -> None:
-    store = _store(tmp_path, alive=lambda pid: True, lock_wait_s=0.1)
-    store.lock_path.parent.mkdir(parents=True)
-    store.lock_path.write_text("4242", encoding="ascii")
-    with pytest.raises(LeaseLockTimeoutError):
-        _acq(store, "T-a", "t1")
+_HOLDER = """
+import sys, time
+from pathlib import Path
+from spirrow_mindwire.stall_ledger.lock import LedgerLock
+lock = LedgerLock(Path(sys.argv[1]))
+assert lock.acquire({"pid": 0})
+print("held", flush=True)
+time.sleep(60)
+"""
+
+
+def _hold_lock_in_child(lock_path: Path) -> subprocess.Popen[str]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    child = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(lock_path)], stdout=subprocess.PIPE, text=True
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline().strip() == "held"
+    return child
+
+
+def test_lock_held_by_another_process_times_out(tmp_path: Path) -> None:
+    store = _store(tmp_path, lock_wait_s=0.2)
+    child = _hold_lock_in_child(store.lock_path)
+    try:
+        with pytest.raises(LeaseLockTimeoutError):
+            _acq(store, "T-a", "t1")
+        assert not store.path.exists()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_lock_of_killed_process_is_released_by_the_os(tmp_path: Path) -> None:
+    """A holder killed mid-lock leaves the lock file behind; the OS has released its lock, so the
+    next contender gets it with no pid check and no takeover."""
+    store = _store(tmp_path, lock_wait_s=5.0)
+    child = _hold_lock_in_child(store.lock_path)
+    child.kill()
+    child.wait()
     assert store.lock_path.exists()
+    assert _acq(store, "T-a", "t1").lease is not None
 
 
-def test_stale_lock_of_dead_process_is_taken(tmp_path: Path) -> None:
-    store = _store(tmp_path, alive=lambda pid: False, lock_wait_s=0.1)
+def test_stale_lock_text_is_never_deleted_or_trusted(tmp_path: Path) -> None:
+    """The old pid-in-file takeover is gone: a lock file holding a dead pid is just a file."""
+    store = _store(tmp_path, alive=lambda pid: False, lock_wait_s=0.2)
     store.lock_path.parent.mkdir(parents=True)
     store.lock_path.write_text("4242", encoding="ascii")
     assert _acq(store, "T-a", "t1").lease is not None
-    assert not store.lock_path.exists()
+    assert store.lock_path.exists()
 
 
-def test_lock_without_pid_is_not_stolen(tmp_path: Path) -> None:
-    store = _store(tmp_path, alive=lambda pid: False, lock_wait_s=0.1)
-    store.lock_path.parent.mkdir(parents=True)
-    store.lock_path.write_text("", encoding="ascii")
-    with pytest.raises(LeaseLockTimeoutError):
-        _acq(store, "T-a", "t1")
+_CONTENDER = """
+import json, sys
+from datetime import UTC, datetime
+from pathlib import Path
+from spirrow_mindwire.clone_slot_lease import LeaseStore
+state, thread, go = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+while not go.exists():
+    pass
+r = LeaseStore(state, lock_wait_s=30.0).acquire(
+    "mindwire", 8, thread_id=thread, turn_id="t-" + thread,
+    now=datetime(2026, 11, 19, 1, 0, tzinfo=UTC),
+)
+print(json.dumps(r.lease.slot if r.lease else None))
+"""
+
+
+def test_concurrent_contenders_after_a_killed_holder_get_distinct_slots(tmp_path: Path) -> None:
+    """Obj-1-1: contenders that all arrive while a dead holder's lock file is present must not
+    share a slot. Every contender is a separate process; the holder is killed, then all go."""
+    state = tmp_path / "state"
+    store = LeaseStore(state)
+    holder = _hold_lock_in_child(store.lock_path)
+    go = tmp_path / "go"
+    kids = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CONTENDER, str(state), f"T-{i}", str(go)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(6)
+    ]
+    holder.kill()
+    holder.wait()
+    go.write_text("go", encoding="ascii")
+    slots = [json.loads(k.communicate(timeout=60)[0]) for k in kids]
+    assert all(k.returncode == 0 for k in kids)
+    assert None not in slots and len(set(slots)) == 6
+    held = {lease.slot: lease.thread_id for lease in store.leases("mindwire")}
+    assert len(held) == 6 and set(held) == set(slots)
 
 
 @pytest.mark.parametrize(
@@ -220,7 +291,7 @@ def test_unreadable_file_fails_loud_and_is_not_overwritten(tmp_path: Path, conte
     with pytest.raises(LeaseError):
         _acq(store, "T-a", "t1")
     assert store.path.read_text(encoding="utf-8") == content
-    assert not store.lock_path.exists()
+    assert LedgerLock(store.lock_path).acquire({"pid": 0}), "the lock was released"
 
 
 def test_malformed_lease_record_fails_loud(tmp_path: Path) -> None:

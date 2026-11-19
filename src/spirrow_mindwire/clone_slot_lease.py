@@ -1,8 +1,8 @@
 """Slot lease records for the pooled clone slots (T-ephemeral-impl-clone-slot-per-thread, A2).
 
 A slot is lent to one turn at a time (Bohr msg-9386, D-1 改訂 2). Which turn holds which slot lives
-in ``state/slot-leases.json``, updated the way ``dirty-clones.json`` is: take ``<file>.lock``,
-change one key, save atomically (write a sibling temp file, then ``os.replace``).
+in ``state/slot-leases.json``: hold the OS lock on ``<file>.lock`` (a permanent file, never
+deleted), change one key, save atomically (write a sibling temp file, then ``os.replace``).
 
 Record of a held slot (msg-9386 改訂 2, msg-9388 Obj-32-2, msg-9391 Obj-33-1, msg-9393 Obj-34-1):
 ``slot``, ``thread_id``, ``turn_id``, ``acquired_at``, ``wrapper_pid``, ``child_pid``,
@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from .clone_slot import slot_index, slot_name
+from .stall_ledger.lock import LedgerLock
 
 __all__ = [
     "LEASES_FILE",
@@ -88,7 +89,7 @@ class LeaseError(Exception):
 
 
 class LeaseLockTimeoutError(LeaseError):
-    """``<file>.lock`` stayed held by a live process for :data:`LOCK_WAIT_S`."""
+    """``<file>.lock`` stayed held by another process for :data:`LOCK_WAIT_S`."""
 
 
 def pid_alive(pid: int) -> bool:
@@ -241,43 +242,30 @@ class LeaseStore:
 
     @contextmanager
     def _locked(self) -> Iterator[dict[str, Any]]:
+        """Hold the OS lock on ``<file>.lock`` while reading, changing and saving the file.
+
+        The lock is :class:`~spirrow_mindwire.stall_ledger.lock.LedgerLock`: a byte-range lock
+        (Windows ``msvcrt.locking``) / ``flock`` (POSIX) on a lock file that is never deleted.
+        Mutual exclusion is decided inside one kernel call and the OS releases the lock when the
+        holder exits, crash or kill included, so there is no stale lock and no takeover — the
+        pid-and-unlink takeover could let a second contender delete a live replacement lock
+        (PR #589 gate round 1, Obj-1-1)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = LedgerLock(self.lock_path)
         deadline = time.monotonic() + self._lock_wait_s
-        while True:
-            try:
-                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if self._steal_if_stale():
-                    continue
-                if time.monotonic() >= deadline:
-                    raise LeaseLockTimeoutError(
-                        f"{self.lock_path} held for more than {self._lock_wait_s:g}s"
-                    ) from None
-                time.sleep(LOCK_POLL_S)
-                continue
-            break
+        payload = {"pid": os.getpid()}
+        while not lock.acquire(payload):
+            if time.monotonic() >= deadline:
+                raise LeaseLockTimeoutError(
+                    f"{self.lock_path} held for more than {self._lock_wait_s:g}s"
+                )
+            time.sleep(LOCK_POLL_S)
         try:
-            os.write(fd, str(os.getpid()).encode("ascii"))
-            os.close(fd)
             data = self._read()
             yield data
             self._write(data)
         finally:
-            with suppress(FileNotFoundError):
-                self.lock_path.unlink()
-
-    def _steal_if_stale(self) -> bool:
-        """Remove a lock whose recorded holder is no longer alive. A lock without a readable pid
-        is left alone (it may be mid-write); the wait bound then decides."""
-        try:
-            text = self.lock_path.read_text(encoding="ascii").strip()
-        except (FileNotFoundError, UnicodeDecodeError, OSError):
-            return False
-        if not text.isdigit() or self._alive(int(text)):
-            return False
-        with suppress(FileNotFoundError):
-            self.lock_path.unlink()
-        return True
+            lock.release()
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():

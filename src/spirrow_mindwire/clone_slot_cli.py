@@ -119,9 +119,29 @@ def run_prep(args: argparse.Namespace) -> int:
             session_name=args.session_name,
             job_name=args.job_name,
         )
-        _record_quarantine(args.state_dir, args.thread_id, args.repo, res)
     except Exception as exc:  # the wrapper parks on exit 1; say why on stderr
         print(f"slot-prep failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        _record_quarantine(args.state_dir, args.thread_id, args.repo, res)
+    except Exception as exc:
+        # The borrow already succeeded, but exit 1 means the wrapper will not launch the turn, and
+        # an unreturned lease is never reclaimed automatically. So a READY lease goes back to the
+        # pool here (PR #589 gate round 1, Obj-1-2). A quarantine_failed lease stays held on
+        # purpose: that slot must not be lent again until a person clears it (msg-9402 Obj-36-4).
+        print(
+            f"slot-prep failed recording the quarantine: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        if res.outcome is PrepOutcome.READY and res.lease is not None:
+            try:
+                store.release(args.repo, res.lease.slot, res.lease.turn_id)
+            except Exception as rel_exc:
+                print(
+                    f"slot-prep could not release {res.lease.slot}: "
+                    f"{type(rel_exc).__name__}: {rel_exc}",
+                    file=sys.stderr,
+                )
         return EXIT_FAILED
     print(PREP_PREFIX + json.dumps(res.to_json(), ensure_ascii=False, sort_keys=True))
     return {
