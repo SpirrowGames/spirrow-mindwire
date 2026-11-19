@@ -90,6 +90,10 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     StopReason.STALLED: StopKind.STALLED,
     # Never returned by ``Conductor.run``: the run exits 1, and R-QUAR's log tail decides.
     StopReason.ADAPTER_ERROR: None,
+    # Not in §6.3 (T-preflight-failure-counts-toward-stall). Never returned by ``Conductor.run``:
+    # the run exits 13 before any role is spawned, the sweep reverts the launch and retries the
+    # same head next tick. Not a stall of the thread (counting it as one was the bug).
+    StopReason.PREFLIGHT_REFUSED: None,
     StopReason.EMPTY: StopKind.EMPTY_THREAD,
     # These three reach ``stalled`` only when J-STALL sends them there; when it sends them to
     # ``ready_for_human`` the value is unused.

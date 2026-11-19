@@ -156,10 +156,12 @@ from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .preflight import (
     PREFLIGHT_DEFERRED_EXIT_CODE,
+    PREFLIGHT_REFUSED_EXIT_CODE,
     PreflightDeferredError,
     PreflightError,
     emit_preflight_deferred_payload,
     emit_preflight_ok,
+    emit_preflight_refused_payload,
     preflight_gate,
 )
 from .repo_projects import load_repo_project_map
@@ -1505,7 +1507,8 @@ def _preflight(cfg: Stage3LoopConfig) -> None:
         # Any unexpected exception at this layer is itself a fail-closed event —
         # the preflight either passes cleanly or halts the daemon.
         raise PreflightError(
-            f"preflight raised an unexpected exception (fail-closed by design): {exc}"
+            f"preflight raised an unexpected exception (fail-closed by design): {exc}",
+            check="unexpected",
         ) from exc
     # Design v2 D-5b: the sweep ends a repo's preflight-deferral episode on this row, whatever
     # the run's exit code (a role failing AFTER a passing preflight still proves the API answered).
@@ -1732,6 +1735,22 @@ def main() -> None:
             preflight_exc,
         )
         sys.exit(PREFLIGHT_DEFERRED_EXIT_CODE)
+    except PreflightError as refused_exc:
+        # T-preflight-failure-counts-toward-stall (design v3 D-1'', Bohr msg-9812): the preflight
+        # REFUSED this run (P0/P1/P2/P3, or an unexpected exception it wrapped) before any role was
+        # spawned. It used to propagate as SystemExit(message) = exit 1, which the wrapper counts as
+        # a launch (launches_same_head -> STALLED "the role went silent") and as a thread failure
+        # (retry -> quarantine). A dedicated code instead: the wrapper reverts the LAUNCH, leaves
+        # retry-pending untouched, and notifies per candidate that the role was not started.
+        # Fail-closed is unchanged. The payload row only feeds the notification.
+        emit_preflight_refused_payload(refused_exc)
+        logger.error(
+            "preflight refused exit=%d check=%s: %s",
+            PREFLIGHT_REFUSED_EXIT_CODE,
+            refused_exc.check,
+            refused_exc.detail,
+        )
+        sys.exit(PREFLIGHT_REFUSED_EXIT_CODE)
     except RefSnapshotUnrecordedError as snap_exc:
         # T-ref-snapshot-unreadable-file-blocks-thread-forever (design v2 D-2): the launch's ref
         # snapshot could not be read, recovered or written. A state-directory fault of this one
