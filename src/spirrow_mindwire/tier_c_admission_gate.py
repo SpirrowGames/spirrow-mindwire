@@ -270,6 +270,13 @@ SECURITY_HOLD_HINT: str = (
     "matter, or do not escalate and record `DECIDED:` / `DEFERRED:` instead"
 )
 
+#: The hint when Jev gave no answer for an open hold (msg-9661 §1.1⁵ 1.). Re-sendable; nothing is
+#: delivered or released without the answer.
+SECURITY_HOLD_NO_VERDICT_HINT: str = (
+    "the Tier-C decider gave no verdict on how this handoff relates to your open security "
+    "hold(s), so it was not delivered and no hold was released; send it again later"
+)
+
 #: The former fourth label. Recognised so its bounce can say why (a merge is
 #: requested by the PR itself), instead of reading as an unknown label.
 MERGE_LABEL: str = "merge-protected"

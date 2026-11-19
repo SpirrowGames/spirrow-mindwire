@@ -70,10 +70,11 @@ import logging
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from spirrow_mindwire.decider.questions import HoldRef
 from spirrow_mindwire.decider.result import DecisionResult, decision_result_to_dict
 from spirrow_mindwire.decider.state import (
     AdmissionGateResult,
@@ -534,8 +535,13 @@ async def run_tierc_hook(
     author_requested_human: bool,
     now: datetime | None = None,
     retry_lookup: RetryLookup = never_retry,
+    security_holds: Sequence[HoldRef] = (),
 ) -> DecisionResult | None:
     """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
+
+    ``security_holds`` are the head author's open security holds in this thread; they add the
+    ``tierc-v5-hold`` questions to the same single call (T-tier-c-six-articles-security-boundary,
+    msg-9661 §1.1⁵ / §8). The compute-only gate is not told about them — it is an observer.
 
     ``retry_lookup`` is the gate's RETRY store. ``never_retry`` while the gate is compute-only;
     under ``[tierc_gate] mode = "enforce"`` the Conductor passes the live decisions-log lookup so
@@ -584,6 +590,8 @@ async def run_tierc_hook(
                 dispute_rounds=count_dispute_rounds(roster, messages),
             )
         )
+        if security_holds:
+            state = replace(state, security_holds=tuple(security_holds))
         # The Decider owns "is this turn a target" (mode / head); the hook asks rather than
         # restating the rule (PR-gate advisory 1 on #345). Not a target → nothing is written.
         if not decider.is_target(state):

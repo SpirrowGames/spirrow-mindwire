@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -366,21 +367,108 @@ def tierc_v2_questions(rules: TierCRules, *, proceed: bool = False) -> dict[str,
     }
 
 
+# ---------------------------------------------------------------------------
+# tierc-v5-hold — the open security holds' questions (T-tier-c-six-articles-security-boundary)
+# ---------------------------------------------------------------------------
+#
+# Bohr msg-9661 §1.1⁵ (one independent question per open hold, never one choice across holds —
+# Einstein msg-9660 Obj-6-1) and msg-9663 §1.1⁶ (``unheld_unbased``). Asked in the same single
+# ``/v1/decide`` call as the escalation set, only while the author has an open hold in the thread,
+# so a call without holds is byte-identical to ``tierc-v5`` (msg-9661 §8: no extra call).
+
+TIERC_HOLD_QUESTIONS_VERSION = "tierc-v5-hold"
+"""The record version of a ``tierc-v5`` request that also carries the hold questions."""
+
+HOLD_RELATION_PREFIX = "hold_relation__"
+"""``hold_relation__<hold_id>`` — one choice question per open hold."""
+
+HOLD_SUPPLEMENTED = "supplemented"
+HOLD_UNSUPPLEMENTED = "unsupplemented"
+HOLD_UNRELATED = "unrelated"
+
+UNHELD_UNBASED_KEY = "unheld_unbased"
+UNHELD_YES = "yes"
+UNHELD_NO = "no"
+
+
+@dataclass(frozen=True)
+class HoldRef:
+    """What a hold question needs to name the held request: its id, message and basis line."""
+
+    hold_id: str
+    held_msg_id: str | None
+    held_basis: str | None
+
+
+def hold_relation_key(hold_id: str) -> str:
+    return f"{HOLD_RELATION_PREFIX}{hold_id}"
+
+
+def hold_questions(holds: Sequence[HoldRef]) -> dict[str, dict[str, Any]]:
+    """The ``tierc-v5-hold`` questions for ``holds`` (empty for no holds)."""
+    if not holds:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for hold in holds:
+        basis = hold.held_basis or "(根拠の行なし)"
+        held = f"保留中の申請 {hold.held_msg_id or '(msg 不明)'}(根拠: {basis})"
+        out[hold_relation_key(hold.hold_id)] = {
+            "type": "choice",
+            "instructions": (
+                f"このハンドオフ(NEXT: human)と、根拠不足として退けられた{held}との関係を "
+                "1 つ選べ。値ではなく場所や範囲が補われているかで判断する。"
+            ),
+            "criteria": {
+                HOLD_SUPPLEMENTED: (
+                    f"{held}を含み、場所(または何をどこまで広げるか)が具体的に補われている"
+                ),
+                HOLD_UNSUPPLEMENTED: (
+                    f"{held}を、根拠を補わずに含んでいる(ラベルや形式を変えたもの、"
+                    "別件の申請に紛れ込ませたものも含む)"
+                ),
+                HOLD_UNRELATED: f"{held}を含まない",
+            },
+        }
+    out[UNHELD_UNBASED_KEY] = {
+        "type": "choice",
+        "instructions": (
+            "このハンドオフは、上の保留中のどの申請とも別の、具体的な根拠(場所、または何を"
+            "どこまで広げるか)を欠いた露出の疑い・セキュリティの申請を含むか。"
+        ),
+        "criteria": {
+            UNHELD_YES: "含む",
+            UNHELD_NO: "含まない",
+        },
+    }
+    return out
+
+
 __all__ = [
+    "HOLD_RELATION_PREFIX",
+    "HOLD_SUPPLEMENTED",
+    "HOLD_UNRELATED",
+    "HOLD_UNSUPPLEMENTED",
     "MATCHED_RULE_KEY",
     "MATCHED_RULE_NONE",
     "SHOULD_ASK_HUMAN_KEY",
     "TIERC_ESCALATION_QUESTIONS_VERSION",
+    "TIERC_HOLD_QUESTIONS_VERSION",
     "TIERC_QUESTIONS_V1",
     "TIERC_QUESTIONS_VERSION",
     "TIERC_RULES_TEMPLATE_NAME",
     "TIERC_V2_PROCEED_QUESTIONS_VERSION",
     "TIERC_V2_SHOULD_ASK_CRITERIA",
+    "UNHELD_NO",
+    "UNHELD_UNBASED_KEY",
+    "UNHELD_YES",
+    "HoldRef",
     "TierCQuestion",
     "TierCQuestionKind",
     "TierCRule",
     "TierCRules",
     "TierCRulesError",
+    "hold_questions",
+    "hold_relation_key",
     "load_tierc_rules",
     "parse_tierc_rules",
     "render_rules_bullets",
