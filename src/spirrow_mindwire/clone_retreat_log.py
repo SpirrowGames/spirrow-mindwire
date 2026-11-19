@@ -75,6 +75,8 @@ QUARANTINE_REASONS = frozenset(
         "owner_unknown",
         "preserve_failed",
         "quarantine_unconfirmed",
+        # Pool mode A3: the turn-end rescue failed, so the slot is quarantined (msg-9400 §2).
+        "rescue_failed",
     }
 )
 # clone_slot.PARK_INDEX_LOCK_STALE, repeated so this module does not import the slot module.

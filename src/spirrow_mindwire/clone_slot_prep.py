@@ -64,6 +64,7 @@ __all__ = [
     "QuarantineInfo",
     "SlotPrep",
     "judge_recoverable",
+    "rename_to_quarantine",
 ]
 
 MIRROR_REMOTE = "mirror"
@@ -270,6 +271,35 @@ def _judge_gitlinks(repo: Path, git: GitRunner, *, depth: int) -> str | None:
         if nested is not None:
             return nested
     return None
+
+
+def rename_to_quarantine(
+    ref: SlotRef,
+    who: str,
+    now: datetime,
+    rename: Callable[[Path, Path], None] = os.rename,
+) -> tuple[Path | None, list[str]]:
+    """Rename the slot to ``_quarantine/<repo>/<slot>-<who>-<stamp>``, then ``-retryN`` (D-3).
+
+    Returns the new path, or ``None`` with one error per attempt when every attempt failed. Shared
+    by the borrow-time check and the turn-end rescue failure (msg-9400 §2, msg-9402 Obj-36-4).
+    """
+    root = quarantine_root(ref.slots_root, ref.repo)
+    root.mkdir(parents=True, exist_ok=True)
+    base_name = f"{ref.name}-{who}-{now.strftime('%Y%m%d-%H%M%S')}"
+    errors: list[str] = []
+    for attempt in range(RENAME_RETRIES + 1):
+        target = root / (base_name if attempt == 0 else f"{base_name}-retry{attempt}")
+        if target.exists():
+            errors.append(f"{target.name} exists")
+            continue
+        try:
+            rename(ref.path, target)
+        except OSError as exc:
+            errors.append(f"{target.name}: {exc}")
+            continue
+        return target, errors
+    return None, errors
 
 
 class SlotPrep:
@@ -486,21 +516,8 @@ class SlotPrep:
                 recoverable, rec_reason = judge_recoverable(slot, self._git)
         else:
             rec_reason = "not_a_repository"
-        stamp = self._clock().strftime("%Y%m%d-%H%M%S")
-        root = quarantine_root(self.slots_root, self.repo)
-        root.mkdir(parents=True, exist_ok=True)
-        base_name = f"{ref.name}-{prev}-{stamp}"
-        errors: list[str] = []
-        for attempt in range(RENAME_RETRIES + 1):
-            target = root / (base_name if attempt == 0 else f"{base_name}-retry{attempt}")
-            if target.exists():
-                errors.append(f"{target.name} exists")
-                continue
-            try:
-                self._rename(slot, target)
-            except OSError as exc:
-                errors.append(f"{target.name}: {exc}")
-                continue
+        target, errors = rename_to_quarantine(ref, prev, self._clock(), self._rename)
+        if target is not None:
             return QuarantineInfo(reason, prev, target, rescue, recoverable, rec_reason)
         return QuarantineInfo(
             reason,
