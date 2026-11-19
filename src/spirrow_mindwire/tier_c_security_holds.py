@@ -29,11 +29,20 @@ all its holds simply by never running again — holds are keyed by thread.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .decider.questions import (
+    HOLD_SUPPLEMENTED,
+    HOLD_UNRELATED,
+    HOLD_UNSUPPLEMENTED,
+    UNHELD_NO,
+    UNHELD_UNBASED_KEY,
+    UNHELD_YES,
+    hold_relation_key,
+)
 from .tier_c_admission_gate import LogKind
 from .tier_c_decisions_log import iter_rows
 
@@ -118,9 +127,71 @@ def _open_or_append(
     )
 
 
+@dataclass(frozen=True)
+class HoldAnswers:
+    """Jev's answers to the ``tierc-v5-hold`` questions, read per hold (msg-9661 §1.1⁵).
+
+    ``relations`` maps each asked hold id to ``supplemented`` / ``unsupplemented`` /
+    ``unrelated``; a hold whose answer is missing or not one of those is absent, and then
+    ``complete`` is ``False`` (no verdict — nothing may be delivered or released).
+    """
+
+    relations: dict[str, str]
+    unheld_unbased: str | None
+    complete: bool
+
+    @property
+    def blocked(self) -> bool:
+        """One ``unsupplemented`` stops the whole handoff (msg-9661 §1.1⁵ 2.)."""
+        return HOLD_UNSUPPLEMENTED in self.relations.values()
+
+    @property
+    def supplemented_ids(self) -> list[str]:
+        return sorted(h for h, r in self.relations.items() if r == HOLD_SUPPLEMENTED)
+
+    def history(self, outcome: str) -> list[dict[str, Any]]:
+        """§1.1⁶ (a): an entry for every hold the handoff touched, delivered or not."""
+        return [
+            {"hold_id": hold_id, "relation": relation, "outcome": outcome}
+            for hold_id, relation in sorted(self.relations.items())
+            if relation in (HOLD_SUPPLEMENTED, HOLD_UNSUPPLEMENTED)
+        ]
+
+
+_RELATIONS = frozenset({HOLD_SUPPLEMENTED, HOLD_UNSUPPLEMENTED, HOLD_UNRELATED})
+
+
+def _choice(answers: Mapping[str, Any] | None, key: str, allowed: frozenset[str]) -> str | None:
+    if answers is None:
+        return None
+    answer = answers.get(key)
+    choice = answer.get("choice") if isinstance(answer, Mapping) else None
+    return choice if isinstance(choice, str) and choice in allowed else None
+
+
+def read_hold_answers(
+    holds: Iterable[SecurityHold], answers: Mapping[str, Any] | None
+) -> HoldAnswers:
+    """Each hold's relation from Jev's raw answers, independently (one question per hold)."""
+    relations: dict[str, str] = {}
+    complete = True
+    for hold in holds:
+        relation = _choice(answers, hold_relation_key(hold.hold_id), _RELATIONS)
+        if relation is None:
+            complete = False
+        else:
+            relations[hold.hold_id] = relation
+    unheld = _choice(answers, UNHELD_UNBASED_KEY, frozenset({UNHELD_YES, UNHELD_NO}))
+    return HoldAnswers(
+        relations=relations, unheld_unbased=unheld, complete=complete and unheld is not None
+    )
+
+
 __all__ = [
     "HOLD_RELEASE_KEYWORD",
+    "HoldAnswers",
     "SecurityHold",
     "hold_release_ids",
     "open_holds",
+    "read_hold_answers",
 ]
