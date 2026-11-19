@@ -46,6 +46,7 @@ from .clone_slot_lease import LeaseError, LeaseStore
 from .clone_slot_prep import PrepOutcome, PrepResult, SlotPrep
 from .clone_slot_trust import TrustReadError, is_trusted
 from .config import CONTINUATION_LEDGER_FILENAME
+from .git_sync.branch import generation_name, normalize_stem
 
 PREP_PREFIX = "MINDWIRE_SLOT_PREP "
 FINISH_PREFIX = "MINDWIRE_SLOT_FINISH "
@@ -67,8 +68,16 @@ def add_parsers(sub: Any) -> None:
     prep.add_argument("--slots-per-repo", required=True, type=int)
     prep.add_argument("--thread-id", required=True)
     prep.add_argument("--turn-id", required=True)
-    prep.add_argument("--branch", required=True, help="the thread's branch")
-    prep.add_argument("--base", required=True, help="where a new branch starts (mirror/<base>)")
+    prep.add_argument(
+        "--branch",
+        default=None,
+        help="the thread's branch (default: loop/<stem>, the git-sync name, generation 1)",
+    )
+    prep.add_argument(
+        "--base",
+        default=None,
+        help="where a new branch starts (mirror/<base>; default: the mirror's HEAD)",
+    )
     prep.add_argument("--wrapper-pid", type=int, default=None)
     prep.add_argument("--session-name", default=None)
     prep.add_argument("--job-name", default=None)
@@ -138,7 +147,7 @@ def run_prep(args: argparse.Namespace) -> int:
         res = prep.borrow(
             thread_id=args.thread_id,
             turn_id=args.turn_id,
-            branch=args.branch,
+            branch=args.branch or generation_name(normalize_stem(args.thread_id), 1),
             base=args.base,
             wrapper_pid=args.wrapper_pid,
             session_name=args.session_name,

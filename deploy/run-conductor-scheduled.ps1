@@ -193,6 +193,13 @@ $CloneCheckTimeoutSeconds = 60
 # PR-1a (T-dirty-clone-wip-retreat-and-silent-stall-alerts): the launch-end clone-retreat. Worst
 # case is five bounded aborts plus reset/clean/switch (20 s each) and one push (40 s).
 $CloneRetreatTimeoutSeconds = 240
+# T-ephemeral-impl-clone-slot-per-thread A3: `mindwire slot-prep` may clone the bare mirror and a
+# slot (clone_slot_prep.CLONE_TIMEOUT_S = 600 per git call), so it gets the longest bound;
+# `slot-finish` fetches, may push rescue refs and confirms them (clone_slot_save network calls are
+# bounded at 40 s each); `slot-lease` only edits state/slot-leases.json under its lock.
+$SlotPrepTimeoutSeconds = 900
+$SlotFinishTimeoutSeconds = 300
+$SlotLeaseTimeoutSeconds = 60
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -322,6 +329,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # above the Write-Log definition is safe. The wrapper's LEASE state-machine is still inert (the
 # candidate-loop gate lands in PR 4); what activates in PR 2 is the READER half of Lease.ps1.
 . (Join-Path $PSScriptRoot 'lib/Lease.ps1')
+# T-ephemeral-impl-clone-slot-per-thread A3: the slot pool's decisions and notices (pure). Inert
+# unless [loop].slots_root is set, which the Python config refuses until A4.
+. (Join-Path $PSScriptRoot 'lib/CloneSlot.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
@@ -3604,6 +3614,106 @@ function Invoke-CloneCheck {
     $out = @()
     if ($r.stdout) { $out = @($r.stdout -split "`r?`n" | Where-Object { $_ -ne '' }) }
     return @{ code = [int]$r.code; output = $out; stderr = "$($r.stderr)" }
+}
+
+# T-ephemeral-impl-clone-slot-per-thread A3 (Bohr msg-9386 D-1 改訂 2, msg-9754 §1): borrow a slot
+# for one launch. Returns @{ code; stdout; stderr }; a probe that could not run or timed out reports
+# code -1 (Get-SlotPrepDecision parks the thread with clone_slot_prep_crashed). --branch and --base
+# are left to slot-prep: loop/<stem> (the git-sync name) and the mirror's default branch.
+function Invoke-SlotPrep {
+    param([string]$SlotsRoot, [string]$Repo, [string]$OriginUrl, [string]$StateDir,
+          [int]$SlotsPerRepo, [string]$ThreadId, [string]$TurnId)
+    $perRepo = "$SlotsPerRepo"
+    $wrapperPid = "$PID"
+    $r = Invoke-BoundedUvProbe -Label 'slot-prep' -TimeoutSeconds $SlotPrepTimeoutSeconds `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-prep', '--slots-root', $SlotsRoot, '--repo', $Repo,
+                     '--origin-url', $OriginUrl, '--state-dir', $StateDir, '--slots-per-repo', $perRepo,
+                     '--thread-id', $ThreadId, '--turn-id', $TurnId, '--wrapper-pid', $wrapperPid)
+    if (-not $r.ok) { return @{ code = -1; stdout = ''; stderr = "$($r.error)" } }
+    return @{ code = [int]$r.code; stdout = "$($r.stdout)"; stderr = "$($r.stderr)" }
+}
+
+# A3 (msg-9400 §1-§2, msg-9402 Obj-36-4): the turn-end step for a borrowed slot — save check against
+# origin, the slot_turn_result row, then release / quarantine. Returns @{ code; stdout; stderr }.
+function Invoke-SlotFinish {
+    param([string]$SlotsRoot, [string]$Repo, [string]$Project, [string]$StateDir,
+          [string]$SlotName, [string]$ThreadId, [string]$TurnId)
+    $r = Invoke-BoundedUvProbe -Label 'slot-finish' -TimeoutSeconds $SlotFinishTimeoutSeconds `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-finish', '--slots-root', $SlotsRoot, '--repo', $Repo,
+                     '--project', $Project, '--state-dir', $StateDir, '--slot', $SlotName,
+                     '--thread-id', $ThreadId, '--turn-id', $TurnId)
+    if (-not $r.ok) { return @{ code = -1; stdout = ''; stderr = "$($r.error)" } }
+    return @{ code = [int]$r.code; stdout = "$($r.stdout)"; stderr = "$($r.stderr)" }
+}
+
+# A3: move one lease (spawning before the conductor starts; release when a borrowed slot is not
+# launched after all). Returns the exit code, -1 when the probe could not run.
+function Invoke-SlotLease {
+    param([string]$Action, [string]$StateDir, [string]$Repo, [string]$SlotName, [string]$TurnId)
+    $r = Invoke-BoundedUvProbe -Label 'slot-lease' -TimeoutSeconds $SlotLeaseTimeoutSeconds `
+        -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-lease', $Action, '--state-dir', $StateDir,
+                     '--repo', $Repo, '--slot', $SlotName, '--turn-id', $TurnId)
+    if (-not $r.ok) { return -1 }
+    return [int]$r.code
+}
+
+# The candidate's own clone's origin URL: what the slot pool's bare mirror follows. '' when unreadable
+# (slot-prep then fails to clone the mirror and parks the thread with a reason).
+function Get-SlotOriginUrl {
+    param([string]$RepoDir)
+    $url = git -C $RepoDir remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return "$url".Trim()
+}
+
+# A borrowed slot that is not launched after all goes back to the pool: it was checked and nothing
+# has run in it since. Called on every not-launched path after the borrow. $null lease: no-op.
+function Undo-SlotBorrow {
+    param($Lease, [string]$StateDir, [string]$CandidateKey)
+    if ($null -eq $Lease) { return }
+    $rc = Invoke-SlotLease -Action 'release' -StateDir $StateDir -Repo $Lease.repo `
+        -SlotName $Lease.slot_name -TurnId $Lease.turn_id
+    Write-Log "slot-released ${CandidateKey}: $($Lease.slot) (not launched, exit=$rc)"
+}
+
+# A3: the turn-end step for a borrowed slot — slot-finish, its notices, its log line. Returns the
+# Get-SlotFinishDecision result (park_code set when this thread must park).
+function Complete-SlotTurn {
+    param($Lease, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey)
+    $finRun = Invoke-SlotFinish -SlotsRoot $SlotsRoot -Repo $Lease.repo -Project $Project -StateDir $StateDir `
+        -SlotName $Lease.slot_name -ThreadId $ThreadId -TurnId $Lease.turn_id
+    $finRow = Get-SlotRow -Stdout $finRun.stdout -Prefix 'MINDWIRE_SLOT_FINISH '
+    $decision = Get-SlotFinishDecision -Code $finRun.code -Row $finRow -Repo $Lease.repo `
+        -SlotName $Lease.slot_name -CandidateKey $CandidateKey -Stderr $finRun.stderr
+    Send-SlotNotices -NotifyState $notifyState -Notices $decision.notices
+    Write-Log "slot-finish ${CandidateKey}: $($Lease.slot) outcome=$($decision.outcome) exit=$($finRun.code)"
+    return $decision
+}
+
+# A3: the top-level finally's backstop for a lease still open when the tick ends by a throw. A
+# spawned turn gets the full slot-finish (save check, record, release / quarantine; a park it asks
+# for is in its notice, the quarantine record is not written on this path); a borrow that never
+# spawned goes back to the pool. Never throws: it runs inside `finally`.
+function Close-OpenSlot {
+    param($Open)
+    if ($null -eq $Open) { return }
+    try {
+        if ($Open.spawned) {
+            $null = Complete-SlotTurn -Lease $Open.lease -SlotsRoot $Open.slots_root -Project $Open.project `
+                -StateDir $Open.state_dir -ThreadId $Open.thread -CandidateKey $Open.key
+        }
+        else { Undo-SlotBorrow -Lease $Open.lease -StateDir $Open.state_dir -CandidateKey $Open.key }
+    }
+    catch { Write-Log "WARN slot $($Open.key): closing the open lease failed: $($_.Exception.Message) — the lease stays held" }
+}
+
+# Send each notice of a slot decision through the sweep's dedup (key + signature).
+function Send-SlotNotices {
+    param([hashtable]$NotifyState, [object[]]$Notices)
+    foreach ($n in @($Notices)) {
+        if ($null -eq $n) { continue }
+        Send-NotificationIfChanged -State $NotifyState -Key $n.key -Signature $n.signature -Message $n.message
+    }
 }
 
 # T-dirty-clone-wip-retreat-and-silent-stall-alerts PR-0 (operator msg-7774, Takahito 2026-11-04
@@ -7234,6 +7344,15 @@ try {
     # SOT via New-NotificationHeader — see T-park-alert-says-judgement-when-it-is-a-fault msg-1465.
     $needsHuman = Get-StopReasonPhraseMap
 
+    # T-ephemeral-impl-clone-slot-per-thread A3: the slot pool is used only when [loop].slots_root
+    # is set (refused by the Python config until A4). $null keeps the shared-clone path unchanged.
+    $slotMode = Get-SlotModeConfig -ConfigPath $configPath
+    if ($null -ne $slotMode) {
+        Write-Log "slot mode: slots_root=$($slotMode.slots_root) slots_per_repo=$($slotMode.slots_per_repo)"
+    }
+    $slotStateDir = Join-Path $dataDir 'state'
+    $script:slotOpen = $null
+
     foreach ($cand in $candidates) {
         $attempt++
         $thread = $cand.thread_id
@@ -7424,6 +7543,46 @@ try {
 
         Confirm-LogWorthKeeping
         Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, lane=$lane, admission=$($admission.reason), reason=$($v.reason), token=$($v.token)) ---"
+        # A3 (msg-9386 D-1 改訂 2/4/7, msg-9754 §1-§4): in slot mode, borrow a slot before anything
+        # about this launch is recorded. A gate-lane launch stops before the implementer turn
+        # (Get-ConductorLaneArgs), so it borrows nothing. No free slot: not launched, not parked. A park
+        # stops this thread only, through the per-thread quarantine record.
+        $slotLease = $null
+        if ($null -ne $slotMode -and $lane -ne 'gate') {
+            $slotRepo = Get-SlotRepoName -RepoDir $cand.repo_dir
+            $slotTurnId = New-SlotTurnId -NowUtc ((Get-Date).ToUniversalTime())
+            $originUrl = Get-SlotOriginUrl -RepoDir $cand.repo_dir
+            $prepRun = Invoke-SlotPrep -SlotsRoot $slotMode.slots_root -Repo $slotRepo -OriginUrl $originUrl `
+                -StateDir $slotStateDir -SlotsPerRepo $slotMode.slots_per_repo -ThreadId $thread -TurnId $slotTurnId
+            $prepRow = Get-SlotRow -Stdout $prepRun.stdout -Prefix 'MINDWIRE_SLOT_PREP '
+            $slotDecision = Get-SlotPrepDecision -Code $prepRun.code -Row $prepRow -Repo $slotRepo `
+                -CandidateKey $cand.key -Stderr $prepRun.stderr
+            Send-SlotNotices -NotifyState $notifyState -Notices $slotDecision.notices
+            if ($slotDecision.action -eq 'wait') {
+                Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'slot-waiting'
+                $dispositions[$cand.key] = 'slot-waiting'
+                Write-Log "slot-waiting $($cand.key): $($slotDecision.detail) — not launched, not parked (launch_wait_since kept)"
+                continue
+            }
+            if ($slotDecision.action -eq 'park') {
+                Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'slot-parked'
+                $dispositions[$cand.key] = "slot-parked:$($slotDecision.park_code)"
+                $quarantineState[$cand.key] = New-QuarantineRecord `
+                    -FirstFailureAt ((Get-Date).ToUniversalTime().ToString('o')) -ExitCode $prepRun.code `
+                    -StopReason $slotDecision.park_code -FailureHead $probeHead -FailureControl $currentControl `
+                    -SessionLogPath $logPath -SessionLogTail @("$($slotDecision.detail)") -FailureClass 'clone_slot'
+                $newlyQuarantined++
+                Write-Log "slot-parked $($cand.key): $($slotDecision.park_code) — $($slotDecision.detail) (this thread only)"
+                continue
+            }
+            $slotLease = @{ repo = $slotRepo; slot = $slotDecision.slot; slot_name = $slotDecision.slot_name; turn_id = $slotDecision.turn_id }
+            Write-Log "slot-borrowed $($cand.key): $($slotLease.slot) turn=$($slotLease.turn_id)"
+            # Until slot-finish or a release has run, the lease is open. If anything throws out of
+            # this iteration (the not-launched catch rethrows; the conductor run can throw), the wrapper's
+            # top-level finally closes it (Close-OpenSlot): finish if spawned, release if not.
+            $script:slotOpen = @{ lease = $slotLease; spawned = $false; key = $cand.key; thread = $thread
+                                  project = $cand.project; slots_root = $slotMode.slots_root; state_dir = $slotStateDir }
+        }
         # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
         # forced kill (head_skip.py docstring, test #10). The record is written with
         # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
@@ -7442,6 +7601,8 @@ try {
         $inflightLaunchId = $mark.launch_id
         foreach ($ev in $mark.events) { Write-Log "inflight $($cand.key): $ev" }
         if (-not $mark.ok) {
+            Undo-SlotBorrow -Lease $slotLease -StateDir $slotStateDir -CandidateKey $cand.key
+            $script:slotOpen = $null
             Write-Log "inflight-mark-unwritable $($cand.key): $($mark.error) — not launching it or anything after it"
             $breakReason = 'inflight-mark-unwritable'
             break
@@ -7470,7 +7631,10 @@ try {
             # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
             # against the wrong repo.
             Set-TomlValue -Path $configPath -Section 'loop'      -Key 'project'        -Value $cand.project
-            Set-TomlValue -Path $configPath -Section 'loop'      -Key 'repo_dir'       -Value $cand.repo_dir
+            # A3: in slot mode the implementer's clone is the borrowed slot, so reap_orphans (whose
+            # targets are sessions with cwd == repo_dir) reaches the borrowed slot only (Obj-36-3).
+            $turnRepoDir = if ($null -ne $slotLease) { $slotLease.slot } else { $cand.repo_dir }
+            Set-TomlValue -Path $configPath -Section 'loop'      -Key 'repo_dir'       -Value $turnRepoDir
             Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
 
             $launched++
@@ -7523,8 +7687,37 @@ try {
             else { Write-Log "WARN inflight $($cand.key): not launched, row $inflightLaunchId not removed ($($undo.error)) — kept" }
             throw
         }
+        # A3 (msg-9391 Obj-33-1): the spawning marker goes up right before the child starts. The
+        # conductor runs in this process (the inner script), so there is no child pid to record as
+        # `running`; the lease keeps this wrapper's pid, and a wrapper that dies without its
+        # finally leaves the lease kept (job_containment_unverified, msg-9395 Obj-35-1 §2).
+        if ($null -ne $slotLease) {
+            $rc = Invoke-SlotLease -Action 'spawning' -StateDir $slotStateDir -Repo $slotLease.repo `
+                -SlotName $slotLease.slot_name -TurnId $slotLease.turn_id
+            if ($rc -ne 0) { Write-Log "WARN slot $($cand.key): spawning mark not written (exit=$rc) — launching anyway" }
+        }
+        $slotFinished = $false
+        if ($null -ne $script:slotOpen) { $script:slotOpen.spawned = $true }
         $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        # A3 (msg-8047 D-4, msg-9400 §1-§2, msg-9402 Obj-36-4): however the run ended — the hard
+        # budget's kill returns here as exit 6/7 — the slot is checked, recorded, and only then
+        # released or quarantined. A throw out of the run skips this and is closed by the
+        # top-level finally instead (Close-OpenSlot), so no path leaves the lease open silently.
+        if ($null -ne $slotLease) {
+            $script:slotOpen = $null
+            $slotFinish = Complete-SlotTurn -Lease $slotLease -SlotsRoot $slotMode.slots_root -Project $cand.project `
+                -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key
+            if ($slotFinish.park_code) {
+                $quarantineState[$cand.key] = New-QuarantineRecord `
+                    -FirstFailureAt ((Get-Date).ToUniversalTime().ToString('o')) -ExitCode $code `
+                    -StopReason $slotFinish.park_code -FailureHead $probeHead -FailureControl $currentControl `
+                    -SessionLogPath $logPath -SessionLogTail @("slot $($slotLease.slot) quarantine failed") -FailureClass 'clone_slot'
+                $newlyQuarantined++
+                Write-Log "slot-parked $($cand.key): $($slotFinish.park_code) (this thread only)"
+            }
+            $slotFinished = $true
+        }
         # PR-B: the run's exit is confirmed on every code but 7, so drop this launch's own row. On
         # exit 7 the row stays (an orphan may be alive); a failed removal leaves it too. Either way
         # the project is kept out of the sweep's hold acknowledgement until an operator clears it.
@@ -7607,11 +7800,16 @@ try {
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
         # PR-1a: the launch is over, so leave the shared clone clean for the next one (see
         # Invoke-LaunchEndRetreat). Before every exit-code branch, so every way a run ends is covered.
+        # A3: a slot-mode launch ran in its slot and slot-finish has already handled it; this turn
+        # did not use the shared clone, so the PR-1a retreat does not run against it.
+        if ($slotFinished) { $retreatOutcome = 'skipped' }
+        else {
         $retreatOutcome = Invoke-LaunchEndRetreat -RepoDir $cand.repo_dir -ThreadId $thread -CandidateKey $cand.key `
             -HeadMsg "$probeHead" -StopReason "$($verdict.reason)" -ExitCode $code `
             -StateDir (Join-Path $dataDir 'state') `
             -Retreat { param($d, $t, $h, $r, $s) Invoke-CloneRetreat -RepoDir $d -ThreadId $t -HeadMsg $h -StopReason $r -StateDir $s } `
             -Recover { param($d, $t, $s) Invoke-CloneRecover -RepoDir $d -Preserve -ThreadId $t -StateDir $s }
+        }
         # PR-3: a retreat that may have appended a record invalidates the per-tick table, so the
         # exit-8 alert below never shows a record older than the file. Only no-op outcomes keep it.
         if ("$retreatOutcome" -notin @('skipped', 'clean', 'not_eligible')) { $recordsByRepoTick = $null }
@@ -8443,6 +8641,12 @@ catch {
     Write-Log ($_.ScriptStackTrace | Out-String)
 }
 finally {
+    # A3: a slot lease the tick left open by a throw is finished or released here (Close-OpenSlot).
+    if ($null -ne $script:slotOpen) {
+        Close-OpenSlot -Open $script:slotOpen
+        $script:slotOpen = $null
+        if ($null -ne $notifyState -and $notifyStatePath) { Save-JsonState -Path $notifyStatePath -State $notifyState }
+    }
     if ($script:logCommitted) { Write-Log "=== scheduled conductor run finished (exit $exitCode) ===" }
     else { Write-QuietSummary "sweep finished with nothing to do (exit $exitCode)" }
 }
