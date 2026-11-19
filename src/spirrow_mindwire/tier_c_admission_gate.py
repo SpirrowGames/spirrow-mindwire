@@ -2,7 +2,8 @@
 
 This is the label-based entry gate the Fermi/Bohr/Einstein design in
 T-tier-c-admission-gate converged on: only handoffs that name one of three
-Tier-C intents (goal / cost / irreversible) may reach the human.
+Tier-C intents (goal / cost / irreversible; security and dispute were added by
+T-tier-c-six-articles-security-boundary) may reach the human.
 ``merge-protected`` was the fourth until 2026-10-03: a merge into a protected
 branch is requested by opening the PR and is carried by the merge-wait PR
 list, so it is not a Tier-C escalation (Takahito, msg-4361); the label now
@@ -64,6 +65,7 @@ approved as the settled design.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -120,6 +122,11 @@ class LogKind(StrEnum):
       handoff (source: infra; this module's :func:`decide_admission`).
     * ``RETRY_ADMIT`` — admission gate admitted via the RETRY prologue
       (source: infra; this module's :func:`decide_admission`).
+    * ``ESCALATED`` — the conductor actually stopped the thread on the human, after the gate
+      admitted and the Jev bounce passed (source: infra; the conductor). The seventh value,
+      added by T-tier-c-six-articles-security-boundary (Bohr msg-9650 §4) so arrivals can be
+      counted per label and ``msg_id``. It re-opens the enum msg-3708 closed at six (recorded
+      as a DECIDED there). Never emitted by :func:`decide_admission`.
     """
 
     DECIDED = "DECIDED"
@@ -128,6 +135,7 @@ class LogKind(StrEnum):
     LABEL_MIGRATION = "LABEL_MIGRATION"
     ADMIT_UNSURE = "ADMIT_UNSURE"
     RETRY_ADMIT = "RETRY_ADMIT"
+    ESCALATED = "ESCALATED"
 
 
 class RetryAdmitReason(StrEnum):
@@ -180,6 +188,15 @@ class BounceReason(StrEnum):
       :func:`decide_admission`; written by
       :meth:`~spirrow_mindwire.conductor.tierc_gate.TierCGate.jev_bounce` so
       the same RETRY store redeems it.
+    * ``SECURITY_BASIS_MISSING`` / ``SECURITY_BASIS_MALFORMED`` — a ``security`` handoff
+      without exactly one well-formed ``SECURITY-BASIS:`` line (msg-9650 §1.1). Puts a
+      structural security hold on the thread/author (msg-9665 §1.1⁷).
+    * ``SECURITY_TIGHTEN_IS_AGENT_CALL`` — the basis was ``tighten`` / ``harden`` /
+      ``narrow``: strengthening inside the boundary is the agent's call (article 6). No hold.
+    * ``SECURITY_HOLD`` — the thread/author has an open security hold and this handoff may not
+      pass it (msg-9655 §1.1''). A structural hold when the gate emits it (msg-9665 §1.1⁷).
+    * ``SECURITY_HOLD_NO_VERDICT`` / ``EXPOSURE_UNLOCATED`` — written by the conductor after a
+      Jev question (hold relations, ``exposure_claim``), never by :func:`decide_admission`.
     """
 
     NO_LABEL = "no-label"
@@ -188,6 +205,12 @@ class BounceReason(StrEnum):
     UNKNOWN_LABEL = "unknown-label"
     MERGE_IS_NOT_TIER_C = "merge-is-not-tier-c"
     JEV_LIKELY_NOT = "jev-likely-not"
+    SECURITY_BASIS_MISSING = "security-basis-missing"
+    SECURITY_BASIS_MALFORMED = "security-basis-malformed"
+    SECURITY_TIGHTEN_IS_AGENT_CALL = "security-tighten-is-agent-call"
+    SECURITY_HOLD = "security-hold"
+    SECURITY_HOLD_NO_VERDICT = "security-hold-no-verdict"
+    EXPOSURE_UNLOCATED = "exposure-unlocated"
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +218,57 @@ class BounceReason(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+#: Article 6, the security trust boundary (T-tier-c-six-articles-security-boundary msg-9638).
+SECURITY_LABEL: str = "security"
+
+#: Article 5, the ruling on an AI-to-AI dispute (msg-9650 §1.2).
+DISPUTE_LABEL: str = "dispute"
+
+#: The Tier-C types of an objection's *substance* (msg-9650 §1.2, Obj-1-6). The naysayer's
+#: check conditions and its "a Tier-C objection is handed back at most once" list derive from
+#: this set. ``dispute`` names a process state, not a substance, so it is not here.
+SUBSTANCE_LABELS: frozenset[str] = frozenset({"goal", "cost", "irreversible", SECURITY_LABEL})
+
 #: The Tier-C intents that constitute a valid admission label (msg-3630 §2.1;
-#: ``merge-protected`` removed 2026-10-03, msg-4361). No other label reaches
-#: the human without a RETRY force-admit.
-ADMIT_LABELS: frozenset[str] = frozenset({"goal", "cost", "irreversible"})
+#: ``merge-protected`` removed 2026-10-03, msg-4361; ``security`` / ``dispute`` added by
+#: msg-9650 §1.2). No other label reaches the human without a RETRY force-admit.
+#: Article 4 (work only a person can do) has no label: it is the ``HUMAN-TASK:`` form, which
+#: must carry no Tier-C label at all (msg-9647 §1).
+ADMIT_LABELS: frozenset[str] = SUBSTANCE_LABELS | {DISPUTE_LABEL}
+
+#: The admitted labels as the bounce hints spell them (sorted, derived — never re-spelled).
+_LABELS_SLASH: str = " / ".join(sorted(ADMIT_LABELS))
+_LABELS_COMMA: str = ", ".join(sorted(ADMIT_LABELS))
+
+#: The ``SECURITY-BASIS:`` kinds that admit (msg-9650 §1.1).
+SECURITY_BASIS_KINDS: frozenset[str] = frozenset({"widen", "exposure"})
+
+#: The ``SECURITY-BASIS:`` kinds that name a tightening — the agent's call, not article 6.
+SECURITY_TIGHTEN_KINDS: frozenset[str] = frozenset({"tighten", "harden", "narrow"})
+
+#: The hint for a missing / malformed basis. It asks for the place, never the value: writing
+#: a secret into the thread would itself be a new exposure (msg-9647 §1.1).
+SECURITY_BASIS_HINT: str = (
+    "a `TIER-C: security` handoff needs exactly one line `SECURITY-BASIS: widen <what> <how far>` "
+    "or `SECURITY-BASIS: exposure <where: path:line / commit sha / msg-id>`; give the location, "
+    "never the secret value itself"
+)
+
+#: Appended to the hint when the same bounce comes back on a RETRY (msg-9650 §1.1).
+SECURITY_RETRY_SUFFIX: str = "; a security handoff does not pass on a re-send alone"
+
+#: The hint for a tightening basis.
+SECURITY_TIGHTEN_HINT: str = (
+    "strengthening inside the existing boundary (a deny added, redaction adjusted, a permission "
+    "narrowed) is your call: decide it and record `DECIDED: [security-tighten] ...`"
+)
+
+#: The hint for a bounce on an open security hold (msg-9653 §1.1').
+SECURITY_HOLD_HINT: str = (
+    "this thread holds a security request of yours that was refused for lack of a basis: "
+    "supply the basis (the location, or what is widened and how far), raise a different Tier-C "
+    "matter, or do not escalate and record `DECIDED:` / `DEFERRED:` instead"
+)
 
 #: The former fourth label. Recognised so its bounce can say why (a merge is
 #: requested by the PR itself), instead of reading as an unknown label.
@@ -369,6 +439,71 @@ def extract_label(body: str) -> str | None:
     return lowered
 
 
+# Any line starting with the keyword counts toward the one-line rule, so a second, malformed
+# line is caught rather than ignored (msg-9650 §1.1). CRLF tolerated as in the parsers above.
+_SECURITY_BASIS_LINE_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*SECURITY-BASIS:(?P<rest>[^\r\n]*)\r?$", re.IGNORECASE | re.MULTILINE
+)
+# The well-formed rest of the line: a kind, then (for an admitting kind) a non-empty detail.
+_SECURITY_BASIS_REST_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*(?P<kind>[A-Za-z-]+)(?:[ \t]+(?P<detail>\S[^\r\n]*?))?[ \t]*$"
+)
+
+
+@dataclass(frozen=True)
+class SecurityBasisCheck:
+    """The result of checking a body's ``SECURITY-BASIS:`` lines (msg-9650 §1.1).
+
+    ``reason`` is ``None`` when the body carries exactly one admitting line. ``basis`` is the
+    line's text (stripped) whenever there was exactly one line, whatever its shape — it is what
+    a hold records as ``held_basis``. ``kind`` is the lower-cased kind when one parsed.
+    """
+
+    reason: BounceReason | None
+    basis: str | None = None
+    kind: str | None = None
+
+
+def check_security_basis(body: str) -> SecurityBasisCheck:
+    """Check the ``SECURITY-BASIS:`` grammar of a ``security`` handoff (msg-9650 §1.1 table).
+
+    The gate checks shape, line count and non-emptiness only. Whether the detail is concrete
+    enough is for Jev (rule_6's note) and the naysayer.
+    """
+    lines = list(_SECURITY_BASIS_LINE_RE.finditer(body))
+    if not lines:
+        return SecurityBasisCheck(BounceReason.SECURITY_BASIS_MISSING)
+    if len(lines) > 1:
+        return SecurityBasisCheck(BounceReason.SECURITY_BASIS_MALFORMED)
+    rest = lines[0].group("rest")
+    basis = ("SECURITY-BASIS:" + rest).strip()
+    shape = _SECURITY_BASIS_REST_RE.match(rest)
+    if shape is None:
+        return SecurityBasisCheck(BounceReason.SECURITY_BASIS_MALFORMED, basis)
+    kind = shape.group("kind").lower()
+    if kind in SECURITY_TIGHTEN_KINDS:
+        return SecurityBasisCheck(BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL, basis, kind)
+    if kind not in SECURITY_BASIS_KINDS or shape.group("detail") is None:
+        return SecurityBasisCheck(BounceReason.SECURITY_BASIS_MALFORMED, basis, kind)
+    return SecurityBasisCheck(None, basis, kind)
+
+
+def normalized_body_sha256(body: str) -> str:
+    """The sha256 the structural-hold dedupe compares (msg-9665 §1.1⁷).
+
+    Line endings are unified, each line's runs of whitespace collapse to one space, and blank
+    lines and ``RETRY:`` lines drop out — a RETRY re-send of the same body is the same body.
+    Deterministic and Jev-free.
+    """
+    kept: list[str] = []
+    for raw in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = " ".join(raw.split())
+        if not line or _RETRY_LINE_RE.fullmatch(line):
+            continue
+        kept.append(line)
+    return hashlib.sha256("\n".join(kept).encode("utf-8")).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
@@ -487,6 +622,7 @@ def decide_admission(
     retry_lookup: RetryLookup,
     now: datetime,
     bounce_uuid: str,
+    security_hold: bool = False,
 ) -> AdmissionDecision:
     """Answer whether a ``NEXT: human`` handoff may reach the human.
 
@@ -526,6 +662,12 @@ def decide_admission(
         keeps the gate as the sole constructor of a well-formed
         :class:`LogEntry` (fix for PR-gate objection #322-6). If the
         arm chosen is not a bounce, the UUID is discarded.
+    security_hold :
+        ``True`` when the caller's decisions log shows an open security hold for this
+        thread/author (msg-9655 §1.1'', msg-9665 §1.1⁷). Evaluated before the RETRY prologue:
+        while held, only a well-formed ``security`` handoff or another admitted Tier-C label
+        passes, as ``RH-recheck``, which the caller must put through Jev with the hold
+        context; everything else bounces ``security-hold`` and RETRY never force-admits.
     """
 
     # Common-field stamper. The gate has enough context — ``now``,
@@ -540,6 +682,75 @@ def decide_admission(
 
     label = extract_label(body)
     retry_uuid = extract_retry_uuid(body)
+
+    # A security bounce. Every arm but the tighten one puts a structural hold on the
+    # thread/author (msg-9653 §1.1', msg-9665 §1.1⁷): the payload carries what the caller's
+    # hold store needs — the basis line as written and the normalised body hash for dedupe.
+    # ``held_msg_id`` is the envelope ``msg_id`` the transport adds.
+    def _security_bounce(
+        reason: BounceReason, hint: str, rule: str, basis: str | None, *, retry: bool = False
+    ) -> AdmissionDecision:
+        hold = reason is not BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL
+        if retry and hold:
+            hint += SECURITY_RETRY_SUFFIX
+        extra: dict[str, Any] = {
+            "reason": reason.value,
+            "label": label,
+            "hint": hint,
+            "retry_uuid": bounce_uuid,
+        }
+        if hold:
+            extra |= {
+                "security_hold": True,
+                "hold_kind": "structural",
+                "held_basis": basis,
+                "body_sha256": normalized_body_sha256(body),
+            }
+        return AdmissionDecision(
+            verdict=AdmissionVerdict.BOUNCE,
+            rule=rule,
+            bounce_reason=reason,
+            bounce_hint=hint,
+            normalized_label=label,
+            log_entries=[_entry(LogKind.BOUNCED, extra)],
+        )
+
+    def _basis_bounce(rule: str, *, retry: bool = False) -> AdmissionDecision | None:
+        check = check_security_basis(body)
+        if check.reason is None:
+            return None
+        hint = (
+            SECURITY_TIGHTEN_HINT
+            if check.reason is BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL
+            else SECURITY_BASIS_HINT
+        )
+        return _security_bounce(check.reason, hint, rule, check.basis, retry=retry)
+
+    # -----------------------------------------------------------------
+    # Step H — an open security hold (msg-9655 §1.1''). Before the RETRY prologue, so neither a
+    # RETRY nor a relabel to ``other:`` / ``unsure`` force-admits past it.
+    if security_hold:
+        held_label = LEGACY_LABEL_MAP.get(label, label) if label is not None else None
+        if held_label == SECURITY_LABEL:
+            refused = _basis_bounce("RH-security-basis")
+            if refused is not None:
+                if refused.bounce_reason is BounceReason.SECURITY_TIGHTEN_IS_AGENT_CALL:
+                    return refused
+                return _security_bounce(
+                    BounceReason.SECURITY_HOLD,
+                    SECURITY_HOLD_HINT,
+                    "RH-security-hold",
+                    check_security_basis(body).basis,
+                )
+        if held_label is not None and held_label in ADMIT_LABELS:
+            return AdmissionDecision(
+                verdict=AdmissionVerdict.ADMIT,
+                rule="RH-recheck",
+                normalized_label=held_label,
+            )
+        return _security_bounce(
+            BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT, "RH-security-hold", None
+        )
 
     # -----------------------------------------------------------------
     # Step 0 — RETRY binding check (msg-3710 §1 step 0).
@@ -588,6 +799,13 @@ def decide_admission(
             )
         else:
             normalized = label
+
+        # 0a' — a security retry still needs its basis: a missing or malformed basis is never
+        # force-admitted (msg-9650 §1.1, Obj-1-3), it bounces again with a hold.
+        if normalized == SECURITY_LABEL:
+            refused = _basis_bounce("R0-RETRY:security-basis", retry=True)
+            if refused is not None:
+                return refused
 
         # 0b — decide the RETRY outcome on the post-normalisation label.
         reason: RetryAdmitReason
@@ -646,8 +864,7 @@ def decide_admission(
             rule="R1-no-label",
             bounce_reason=BounceReason.NO_LABEL,
             bounce_hint=(
-                "attach a `TIER-C: <label>` line above `NEXT: human` "
-                "with one of: goal, cost, irreversible"
+                f"attach a `TIER-C: <label>` line above `NEXT: human` with one of: {_LABELS_COMMA}"
             ),
             log_entries=[
                 _entry(
@@ -680,6 +897,10 @@ def decide_admission(
         )
 
     if label in ADMIT_LABELS:
+        if label == SECURITY_LABEL:
+            refused = _basis_bounce("R1-security-basis")
+            if refused is not None:
+                return refused
         return AdmissionDecision(
             verdict=AdmissionVerdict.ADMIT,
             rule="R1-admit",
@@ -706,7 +927,7 @@ def decide_admission(
             bounce_reason=BounceReason.OTHER_NOT_ADMITTED,
             bounce_hint=(
                 "`other:<reason>` is a calibration escape hatch, not an "
-                "admission ticket; pick one of goal / cost / irreversible, "
+                f"admission ticket; pick one of {_LABELS_SLASH}, "
                 "or decide it yourself"
             ),
             log_entries=[
@@ -763,7 +984,7 @@ def decide_admission(
         rule="R1-unknown-label",
         bounce_reason=BounceReason.UNKNOWN_LABEL,
         bounce_hint=(
-            "unknown Tier-C label; pick one of goal / cost / irreversible "
+            f"unknown Tier-C label; pick one of {_LABELS_SLASH} "
             "(or `unsure:goal?` if genuinely unsure)"
         ),
         log_entries=[

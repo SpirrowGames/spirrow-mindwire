@@ -23,6 +23,7 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.github.client import PrRef, parse_pr_ref
+from spirrow_mindwire.tier_c_admission_gate import SUBSTANCE_LABELS
 from spirrow_mindwire.value_objects import Role
 
 _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
@@ -441,13 +442,15 @@ def test_naysayer_block_drops_non_tier_c_human_conditions() -> None:
     assert f"`NEXT: {OPERATOR_TOKEN}`" in block
 
 
-def test_naysayer_tier_c_check_conditions_are_exactly_the_admitted_labels() -> None:
+def test_naysayer_tier_c_check_conditions_are_exactly_the_substance_labels() -> None:
     # D2'-b (msg-6656, msg-6658 §5): the TIER-C-CHECK conditions map one-to-one onto the
-    # admitted label set, so the checklist cannot disagree with what the gate counts as Tier-C.
+    # Tier-C substance set, so the checklist cannot disagree with what the gate counts as Tier-C.
+    # msg-9650 §1.2: the substance set, not the admitted set — `dispute` is no check condition.
     from spirrow_mindwire.conductor import handoff
-    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS, SUBSTANCE_LABELS
 
-    assert frozenset(handoff._NAYSAYER_CHECK_CONDITIONS) == ADMIT_LABELS
+    assert frozenset(handoff._NAYSAYER_CHECK_CONDITIONS) == SUBSTANCE_LABELS
+    assert "dispute" not in handoff._NAYSAYER_CHECK_CONDITIONS
     block = build_handoff_protocol_block(Role.NAYSAYER)
     for label, condition in handoff._NAYSAYER_CHECK_CONDITIONS.items():
         assert f"{condition} (`{label}`)" in block, label
@@ -473,8 +476,9 @@ def test_naysayer_unresolved_objection_bound_is_non_tier_c_only() -> None:
     # label (straight away when no redesign can remove it), never to the implementer; the
     # two-hand-back `Unresolved objection:` → implementer path is for non-Tier-C objections only.
     block = build_handoff_protocol_block(Role.NAYSAYER)
-    slash = " / ".join(TIER_C_LABELS)
+    slash = " / ".join(sorted(SUBSTANCE_LABELS))
     assert slash == handoff_mod._TIER_C_SLASH_LIST
+    assert "dispute" not in slash
     opening = block.index("hand back to the proposer if your objections need a disposition")
     tier_c_start = block.index("That hand-back for a disposition also covers")
     bound = block.index("handed it back to the proposer twice")

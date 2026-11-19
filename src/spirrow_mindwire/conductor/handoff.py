@@ -72,6 +72,7 @@ from ..tier_c_admission_gate import (
     ADMIT_LABELS,
     LEGACY_LABEL_MAP,
     RELEASE_CROSS_REPO_LABEL,
+    SUBSTANCE_LABELS,
     UNSURE_LABEL,
     require_admitted,
 )
@@ -1885,12 +1886,43 @@ def _same_target(a: Handoff, b: Handoff) -> bool:
 # ``ADMIT_LABELS``; the check runs at import, so the prompt can neither teach a label the gate
 # does not admit nor omit one it does. Order follows :data:`TIER_C_LABELS` (sorted), the same
 # order the "Allowed labels" line uses.
+#
+# T-tier-c-six-articles-security-boundary: the six articles (msg-9638). ``goal`` follows the
+# reworded article 2 (msg-9652, Bohr msg-9655 §2'); ``cost`` carries the 500-yen threshold
+# (human msg-9767); ``security`` (article 6) and ``dispute`` (article 5) are new (msg-9650).
+# Article 4 has no label — it is the ``HUMAN-TASK:`` form.
 _TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
-    "goal": "the product's goal, spec, scope or direction changes",
-    "cost": "money spent changes: a new external service, API billing up or down",
+    "goal": (
+        "a spec or policy a human decided — a human / Fermi ruling, an approved ADR, the "
+        "product's goal or acceptance criteria — is added, removed or changed. A design the "
+        "agents decided themselves (design-doc details, internal formats, check scripts, dev "
+        "tools) is not: decide it and record `DECIDED:`"
+    ),
+    "cost": (
+        "money spent changes: a new external service, a new contract or plan change, or a "
+        "usage increase you cannot estimate. More usage of a paid service already in use, "
+        "estimated under 500 yen a month, is not: decide it and record the estimate and its "
+        "basis in `DECIDED:`"
+    ),
     "irreversible": (
         "cannot be undone: data deletion, public release, destructive migration, history "
         "rewrite, an external side effect"
+    ),
+    "security": (
+        "the security trust boundary is widened or loosened: a permission or credential's "
+        "scope grows, a new secret is introduced, an allow-list or egress entry is added, a "
+        "guard goes from fail-closed to fail-open or is disabled; or a secret's exposure you "
+        "can point at by location. It needs exactly one line `SECURITY-BASIS: widen <what> "
+        "<how far>` or `SECURITY-BASIS: exposure <path:line / commit sha / msg-id>` — the "
+        "location, never the secret value. Tightening inside the boundary (a deny added, "
+        "redaction adjusted, a permission narrowed) is not: decide it and record "
+        "`DECIDED: [security-tighten] ...`"
+    ),
+    "dispute": (
+        "a ruling on an AI-to-AI conflict the participants cannot settle: a design-direction "
+        "split between proposer and naysayer that the PR gate cannot decide, or a conflict "
+        "outside that pair (implementer vs PR gate, across threads); state the two positions, "
+        "one line each"
     ),
 }
 
@@ -1933,20 +1965,46 @@ _TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
 # naysayer's ``TIER-C-CHECK`` conditions are exactly the Tier-C types, one condition per admitted
 # label and named by it — the same key-set check as above runs at import, so the checklist can
 # neither ask about something the gate does not admit as Tier-C nor miss a type it does.
+#
+# T-tier-c-six-articles-security-boundary (Bohr msg-9650 §1.2 / §3): the conditions are keyed by
+# the *substance* set (``SUBSTANCE_LABELS``), not the admitted set — ``dispute`` names a process
+# state, not what an objection is about, so it is neither a check condition nor in the "a
+# Tier-C objection is handed back at most once" list.
+_SUBSTANCE_LABELS_SORTED: tuple[str, ...] = tuple(sorted(SUBSTANCE_LABELS))
 _NAYSAYER_CHECK_CONDITIONS: dict[str, str] = {
-    "goal": "no addition / removal / change to a spec already decided for the project",
-    "cost": "no increase in money spent",
+    "goal": (
+        "no addition / removal / change to a spec or policy a human decided (ruling, approved "
+        "ADR, goal, acceptance criteria)"
+    ),
+    "cost": (
+        "no new external service, contract or plan change, and no usage increase that is not "
+        "estimated under 500 yen a month"
+    ),
     "irreversible": "nothing irreversible or externally published",
+    "security": "no change that widens or loosens a security trust boundary",
 }
 _check_label_definitions(
-    _NAYSAYER_CHECK_CONDITIONS, ADMIT_LABELS, name="_NAYSAYER_CHECK_CONDITIONS"
+    _NAYSAYER_CHECK_CONDITIONS, SUBSTANCE_LABELS, name="_NAYSAYER_CHECK_CONDITIONS"
 )
 # D6-a (Bohr msg-6684, endorsed by Einstein): the naysayer text names the Tier-C types inline to
 # scope the two-hand-back bound to non-Tier-C objections; derived from the gate's set,
 # never re-spelled.
-_TIER_C_SLASH_LIST = " / ".join(TIER_C_LABELS)
+_TIER_C_SLASH_LIST = " / ".join(_SUBSTANCE_LABELS_SORTED)
 _NAYSAYER_CHECK_PROSE = "; ".join(
-    f"{_NAYSAYER_CHECK_CONDITIONS[label]} (`{label}`)" for label in TIER_C_LABELS
+    f"{_NAYSAYER_CHECK_CONDITIONS[label]} (`{label}`)" for label in _SUBSTANCE_LABELS_SORTED
+)
+# Bohr msg-9650 §3 / §1.2: the evidence rule for a security Tier-C, and how ``dispute`` relates
+# to the two-hand-back bound. Rendered into the naysayer's protocol text below.
+_NAYSAYER_SECURITY_AND_DISPUTE_RULES = (
+    " A `security` Tier-C — your own or one you review — needs its `SECURITY-BASIS:` line: an "
+    "`exposure` names the location (path:line, commit sha, msg-id), never the value; a `widen` "
+    "says what is widened and how far. Do not declare an exposure you cannot locate: tighten "
+    "instead (redaction, a deny) and record `DECIDED: [security-tighten] ...`. An objection "
+    "whose substance is a Tier-C type keeps the hand-back-once rule and its own label, never "
+    "`dispute`. For a non-Tier-C objection the `Unresolved objection:` route below stays the "
+    "default; you or the proposer may hand it to the human as `TIER-C: dispute` instead only "
+    "when it is a design-direction split the PR gate cannot settle, stating the two positions "
+    "one line each."
 )
 
 # D4'-a: the one written example of the operator form. The protocol text quotes it, the stand-down
@@ -2250,7 +2308,9 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"exactly `{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your "
         "`NEXT:` line, and only after checking that what you approve to build needs no Tier-C "
         f"decision: {_NAYSAYER_CHECK_PROSE}. If any of those applies, hand to the human instead, "
-        "with that type as the label. Without the check line the conductor does not build "
+        "with that type as the label."
+        + _NAYSAYER_SECURITY_AND_DISPUTE_RULES
+        + " Without the check line the conductor does not build "
         "autonomously — it routes your go to the human. Work that only a person can do by hand is "
         f"not Tier-C: use the `{HUMAN_TASK_KEYWORD}:` form above for it. Hand to `{HUMAN_TOKEN}` "
         f"only when the matter is one of the {_TIER_C_COUNT_WORD} Tier-C types, and name the type "
