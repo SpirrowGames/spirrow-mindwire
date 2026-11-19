@@ -176,7 +176,7 @@ _FULLWIDTH_LPAREN = "\N{FULLWIDTH LEFT PARENTHESIS}"
 _ID_REFERENCE = re.compile("(?<![A-Z0-9-])[A-Z]{1,2}-\\d{1,3}" + _PRIME + "?(?![A-Z0-9-])")
 
 # Definition patterns (SPEC-2026-09-20 section 5-D 定義子抽出, as revised by
-# SPEC-2026-11-19-v14-definition-forms D-1..D-3).  Bold form: first
+# SPEC-2026-11-19-v14-definition-forms D-40..D-42).  Bold form: first
 # occurrence per line of ``**X-nn**`` or ``**X-nn(`` (either the
 # half-width U+0028 or the full-width U+FF08 that the spec's own
 # decision-list titles use).  Table form: row whose leading cell is
@@ -186,7 +186,7 @@ _ID_REFERENCE = re.compile("(?<![A-Z0-9-])[A-Z]{1,2}-\\d{1,3}" + _PRIME + "?(?![
 # is bounded out on one side is not extracted on the other (which would
 # create a "defined but not referenced" ghost).
 #
-# Suffixes (D-2 of the successor spec): the captured id is exactly what the
+# Suffixes (D-41 of the successor spec): the captured id is exactly what the
 # reference side captures — ``X-nn`` plus an optional U+2032 PRIME, so
 # ``D-3`` and ``D-3<PRIME>`` stay distinct ids.  Every other revision mark
 # the reference side already truncates (U+2033/2034/2057 primes, the
@@ -194,7 +194,10 @@ _ID_REFERENCE = re.compile("(?<![A-Z0-9-])[A-Z]{1,2}-\\d{1,3}" + _PRIME + "?(?![
 # is tolerated AFTER the capture and before the required delimiter, so a
 # definition ``AC-14<U+2034>`` yields ``AC-14`` exactly as a reference to it
 # does.  No delimiter is relaxed.  Table / heading forms tolerate up to 3
-# leading spaces (CommonMark: 4 spaces make an indented code block).
+# leading spaces (CommonMark: 4 spaces make an indented code block), and
+# ``_extract_definitions`` skips every indented-code line (``_INDENTED_CODE``)
+# before ANY form is tried, so the unanchored bold form cannot pick a
+# definition back up from a code example (D-42).
 _ID_DEF = r"([A-Z]{1,2}-\d{1,3}" + _PRIME + "?)"
 _DEF_SUFFIX = (
     "(?:["
@@ -208,6 +211,9 @@ _DEF_BOLD = re.compile(r"\*\*" + _ID_DEF + _DEF_SUFFIX + r"(?:\*\*|[" + _FULLWID
 _DEF_TABLE = re.compile(
     r"^ {0,3}\|\s*(?:\*\*" + _ID_DEF + _DEF_SUFFIX + r"\*\*|" + _ID_DEF + _DEF_SUFFIX + r")\s*\|"
 )
+# A line whose indentation reaches 4 columns (4 spaces, or a tab within the
+# first 4 columns) is an indented code block in CommonMark: never definitional.
+_INDENTED_CODE = re.compile(r"^(?: {0,3}\t| {4})")
 _DEF_HEADING = re.compile(
     r"^ {0,3}#{1,6}[ \t]+"
     + _ID_DEF
@@ -1133,7 +1139,9 @@ def _extract_definitions(body: str, items: list[Any]) -> set[str]:
     Bold form takes the FIRST match per line only (§5-D 定義子抽出).
     Table form matches any row whose leading cell is a bounded id, plain
     or wrapped in a paired ``**``.  Heading form matches an ATX heading
-    whose first token is a bounded id (successor spec D-1).
+    whose first token is a bounded id (successor spec D-40).  Lines that
+    are indented code (``_INDENTED_CODE``) are skipped before every form,
+    the bold form included (successor spec D-42).
     Front-matter ``items[].id`` values are trivially definitional (I-N).
     """
 
@@ -1144,6 +1152,8 @@ def _extract_definitions(body: str, items: list[Any]) -> set[str]:
             if isinstance(iid, str) and _ID_REFERENCE.fullmatch(iid):
                 defs.add(iid)
     for raw_line in body.splitlines():
+        if _INDENTED_CODE.match(raw_line):
+            continue
         m_bold = _DEF_BOLD.search(raw_line)
         if m_bold:
             defs.add(m_bold.group(1))

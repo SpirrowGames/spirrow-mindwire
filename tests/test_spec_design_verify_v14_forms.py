@@ -146,6 +146,12 @@ def test_inline_bold_tolerates_suffix(line: str, expected: str) -> None:
         "**D-15 は強調された地の文**",  # emphasis with no delimiter after the id
         "    ### D-15 four-space indent is a code block",
         "    | D-15 | four-space indent is a code block |",
+        "    | **D-15** | four-space bold table row is a code block |",
+        "    | **D-15\N{TRIPLE PRIME}** | four-space bold suffixed row is a code block |",
+        "    - **D-15** four-space bold line is a code block",
+        f"    **D-15{FWL}code{FWR}** indented bold paren form",
+        "\t| **D-15** | tab indent is a code block |",
+        "  \t**D-15** tab within the first 4 columns",
         "| **D-15 | opening bold only |",
         "| D-15** | closing bold only |",
         "###D-15 no space after hashes",
@@ -154,6 +160,13 @@ def test_inline_bold_tolerates_suffix(line: str, expected: str) -> None:
 )
 def test_non_definition_forms_are_rejected(line: str) -> None:
     assert "D-15" not in _defs(line + "\n")
+
+
+def test_indented_bold_table_row_does_not_resolve_bare_reference() -> None:
+    """PR #592 gate finding: the unanchored bold form must not bypass D-42."""
+    body = "    | **AC-14\N{TRIPLE PRIME}** | code example |\n\nSee AC-14 here.\n"
+    assert "AC-14" in VERIFY._extract_references(body)
+    assert "AC-14" not in _defs(body)
 
 
 # ---------------------------------------------------------------------------
