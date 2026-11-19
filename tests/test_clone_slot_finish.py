@@ -195,6 +195,32 @@ def test_rename_failure_keeps_lease_quarantine_failed_and_parks(
     assert "rename failed" in str(notice["detail"])
 
 
+def test_obstructed_quarantine_root_keeps_lease_quarantine_failed_and_parks(
+    tmp_path: Path, origin: Path
+) -> None:
+    """A file where ``_quarantine/<repo>`` should be makes mkdir fail; that is a failed
+    quarantine, not a crash (PR #594 gate Obj-1-2)."""
+    slot = _borrow(tmp_path, origin)
+    (slot / "wip.txt").write_text("wip\n", encoding="utf-8")
+    _break_origin(slot, tmp_path)
+    qroot = quarantine_root(tmp_path / "slots", REPO)
+    qroot.parent.mkdir(parents=True, exist_ok=True)
+    qroot.write_text("obstruction\n", encoding="utf-8")
+
+    res = _finish(tmp_path).finish(slot="slot-01", thread_id="T-a", turn_id="t1")
+    assert res.outcome is FinishOutcome.PARKED, res.detail
+    assert res.park_code == PARK_UNRECOVERABLE
+    assert slot.is_dir() and (slot / "wip.txt").is_file()
+    assert _lease_state(tmp_path) is LeaseState.QUARANTINE_FAILED
+    assert [r["outcome"] for r in _ledger(tmp_path)] == ["rescue_failed", "quarantine_failed"]
+    (row,) = _retreats(tmp_path)
+    assert row["action"] == "parked" and row["park_code"] == PARK_UNRECOVERABLE
+    notice = res.notice
+    assert notice is not None
+    assert notice["reason"] == PARK_UNRECOVERABLE and notice["path"] == str(slot)
+    assert "quarantine root" in str(notice["detail"])
+
+
 def test_ledger_write_failure_is_never_released_as_saved(tmp_path: Path, origin: Path) -> None:
     slot = _borrow(tmp_path, origin)
     ledger_dir = tmp_path / "state" / CONTINUATION_LEDGER_FILENAME

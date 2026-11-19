@@ -124,6 +124,23 @@ function Get-SlotKeptNotices {
     return $out
 }
 
+# PR #594 gate Obj-1-1: a turn whose end is not confirmed — exit 7 (the hard budget's kill could
+# not be confirmed) or a throw out of the run — may have left a session still writing in the slot.
+# slot-finish does not run then: a save check proves nothing about a directory still in use, a
+# release would lend it to the next borrower, and a rescue failure would rename it under the
+# session. The lease stays held (this wrapper's pid); once the wrapper is gone, slot-prep reports it
+# as kept with job_containment_unverified, and the operator removes it after checking that no
+# process is left. Same key and signature as that kept notice, so the operator is told once.
+function Get-SlotRetainedNotice {
+    param([string]$Repo, [string]$SlotName, [string]$Slot, [string]$TurnId, [string]$ThreadId,
+          [string]$CandidateKey, [string]$Cause)
+    $msg = ("MindWire: **$CandidateKey** のターンは終了を確認できませんでした ($Cause)。" +
+            "セッションが残っている可能性があるため、slot $Repo/$SlotName ($Slot) の保存確認・返却・隔離はしていません。" +
+            "lease は保持したままで、二度目以降の貸し出しもしません (reason=job_containment_unverified, thread=$ThreadId, turn=$TurnId)。" +
+            "プロセスが残っていないことを確認してから lease を手で外してください。同じ repo の他スレッドは残りの slot を使うか待ちます。")
+    return New-SlotNotice -Key "__slot_kept__/$Repo/$SlotName" -Signature "$($TurnId):job_containment_unverified" -Message $msg
+}
+
 # What the sweep does with one slot-prep run. Returns
 #   @{ action = 'launch' | 'wait' | 'park'; slot; slot_name; turn_id; park_code; detail; notices }
 # * exit 0 with a row naming the slot: launch, with the turn's repo_dir = the slot;

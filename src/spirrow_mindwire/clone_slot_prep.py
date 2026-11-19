@@ -285,7 +285,12 @@ def rename_to_quarantine(
     by the borrow-time check and the turn-end rescue failure (msg-9400 §2, msg-9402 Obj-36-4).
     """
     root = quarantine_root(ref.slots_root, ref.repo)
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # An obstructed or unwritable quarantine root is a failed quarantine like a failed
+        # rename: the caller's quarantine_failed handling must run (PR #594 gate Obj-1-2).
+        return None, [f"{root}: cannot create quarantine root: {exc}"]
     base_name = f"{ref.name}-{who}-{now.strftime('%Y%m%d-%H%M%S')}"
     errors: list[str] = []
     for attempt in range(RENAME_RETRIES + 1):

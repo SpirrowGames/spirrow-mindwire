@@ -3691,16 +3691,19 @@ function Complete-SlotTurn {
 }
 
 # A3: the top-level finally's backstop for a lease still open when the tick ends by a throw. A
-# spawned turn gets the full slot-finish (save check, record, release / quarantine; a park it asks
-# for is in its notice, the quarantine record is not written on this path); a borrow that never
-# spawned goes back to the pool. Never throws: it runs inside `finally`.
+# borrow that never spawned goes back to the pool: nothing has run in it. A spawned turn that threw
+# out of the run has no confirmed end, so it is NOT finished (PR #594 gate Obj-1-1): a session may
+# still be writing in the slot. The lease stays held and the operator is told
+# (Get-SlotRetainedNotice). Never throws: it runs inside `finally`.
 function Close-OpenSlot {
     param($Open)
     if ($null -eq $Open) { return }
     try {
         if ($Open.spawned) {
-            $null = Complete-SlotTurn -Lease $Open.lease -SlotsRoot $Open.slots_root -Project $Open.project `
-                -StateDir $Open.state_dir -ThreadId $Open.thread -CandidateKey $Open.key
+            $l = $Open.lease
+            Send-SlotNotices -NotifyState $notifyState -Notices @(Get-SlotRetainedNotice -Repo $l.repo -SlotName $l.slot_name `
+                -Slot $l.slot -TurnId $l.turn_id -ThreadId $Open.thread -CandidateKey $Open.key -Cause 'the run threw')
+            Write-Log "slot-retained $($Open.key): $($l.slot) turn=$($l.turn_id) — the run threw, end not confirmed; lease kept, no slot-finish"
         }
         else { Undo-SlotBorrow -Lease $Open.lease -StateDir $Open.state_dir -CandidateKey $Open.key }
     }
@@ -7579,7 +7582,7 @@ try {
             Write-Log "slot-borrowed $($cand.key): $($slotLease.slot) turn=$($slotLease.turn_id)"
             # Until slot-finish or a release has run, the lease is open. If anything throws out of
             # this iteration (the not-launched catch rethrows; the conductor run can throw), the wrapper's
-            # top-level finally closes it (Close-OpenSlot): finish if spawned, release if not.
+            # top-level finally closes it (Close-OpenSlot): kept if spawned, released if not.
             $script:slotOpen = @{ lease = $slotLease; spawned = $false; key = $cand.key; thread = $thread
                                   project = $cand.project; slots_root = $slotMode.slots_root; state_dir = $slotStateDir }
         }
@@ -7700,11 +7703,21 @@ try {
         if ($null -ne $script:slotOpen) { $script:slotOpen.spawned = $true }
         $output = (& $inner @stallArgs @laneArgs @summonArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
-        # A3 (msg-8047 D-4, msg-9400 §1-§2, msg-9402 Obj-36-4): however the run ended — the hard
-        # budget's kill returns here as exit 6/7 — the slot is checked, recorded, and only then
-        # released or quarantined. A throw out of the run skips this and is closed by the
-        # top-level finally instead (Close-OpenSlot), so no path leaves the lease open silently.
-        if ($null -ne $slotLease) {
+        # A3 (msg-8047 D-4, msg-9400 §1-§2, msg-9402 Obj-36-4): once the run's end is confirmed —
+        # including the hard budget's confirmed kill (exit 6) — the slot is checked, recorded, and
+        # only then released or quarantined. Exit 7 is a kill that could not be confirmed: a session
+        # may still be writing in the slot, so slot-finish does not run and the lease stays held
+        # (PR #594 gate Obj-1-1; the same rule as the inflight row below). A throw out of the run
+        # skips this and is handled by the top-level finally (Close-OpenSlot), the same way.
+        if ($null -ne $slotLease -and $code -eq $ConductorKillUnconfirmedExitCode) {
+            $script:slotOpen = $null
+            Send-SlotNotices -NotifyState $notifyState -Notices @(Get-SlotRetainedNotice -Repo $slotLease.repo `
+                -SlotName $slotLease.slot_name -Slot $slotLease.slot -TurnId $slotLease.turn_id -ThreadId $thread `
+                -CandidateKey $cand.key -Cause "exit=$code, kill not confirmed")
+            Write-Log "slot-retained $($cand.key): $($slotLease.slot) turn=$($slotLease.turn_id) — exit=$code, end not confirmed; lease kept, no slot-finish"
+            $slotFinished = $true
+        }
+        elseif ($null -ne $slotLease) {
             $script:slotOpen = $null
             $slotFinish = Complete-SlotTurn -Lease $slotLease -SlotsRoot $slotMode.slots_root -Project $cand.project `
                 -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key
@@ -8641,7 +8654,7 @@ catch {
     Write-Log ($_.ScriptStackTrace | Out-String)
 }
 finally {
-    # A3: a slot lease the tick left open by a throw is finished or released here (Close-OpenSlot).
+    # A3: a slot lease the tick left open by a throw is kept (spawned) or released here (Close-OpenSlot).
     if ($null -ne $script:slotOpen) {
         Close-OpenSlot -Open $script:slotOpen
         $script:slotOpen = $null

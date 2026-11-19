@@ -135,7 +135,21 @@ Check 'inflight-mark failure releases the borrow at once' (([regex]::Matches($sr
 Check 'slot parks use the per-thread quarantine record with the park code' (
     ([regex]::Matches($src, '-StopReason \$slot(Decision|Finish)\.park_code')).Count -eq 2)
 
-# Close-OpenSlot, lifted from the sweep and run with stubs: spawned -> finish; not spawned -> release.
+# PR #594 gate Obj-1-1: exit 7 (kill not confirmed) keeps the lease — no slot-finish on that path.
+$k7 = $src.IndexOf('if ($null -ne $slotLease -and $code -eq $ConductorKillUnconfirmedExitCode) {')
+$fin7 = $src.IndexOf('elseif ($null -ne $slotLease) {')
+Check 'exit 7 branch comes first and only the elseif runs slot-finish' ($k7 -gt $inner -and $fin7 -gt $k7 -and $fin -gt $fin7 -and
+    -not $src.Substring($k7, $fin7 - $k7).Contains('Complete-SlotTurn') -and
+    $src.Substring($k7, $fin7 - $k7).Contains('Get-SlotRetainedNotice')) "$k7 $fin7 $fin"
+Check 'slot-finish is called from one place in the run path (plus none in Close-OpenSlot)' (
+    ([regex]::Matches($src, 'Complete-SlotTurn -Lease')).Count -eq 1)
+$rn = Get-SlotRetainedNotice -Repo 'r' -SlotName 'slot-01' -Slot 'C:/s/r/slot-01' -TurnId 't1' -ThreadId 'T-a' -CandidateKey 'p/T-a' -Cause 'exit=7, kill not confirmed'
+Check 'retained notice: same key/signature as the later kept notice, names the slot and the cause' (
+    $rn.key -eq '__slot_kept__/r/slot-01' -and $rn.signature -eq 't1:job_containment_unverified' -and
+    $rn.message.Contains('C:/s/r/slot-01') -and $rn.message.Contains('exit=7') -and $rn.message.Contains('job_containment_unverified'))
+
+# Close-OpenSlot, lifted from the sweep and run with stubs: spawned -> lease kept + notice (no
+# slot-finish: the end of a run that threw is not confirmed); not spawned -> release.
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
 $fnClose = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Close-OpenSlot' }, $true) | Select-Object -First 1
 Invoke-Expression $fnClose.Extent.Text
@@ -143,11 +157,13 @@ $script:calls = @()
 function Complete-SlotTurn { param($Lease, $SlotsRoot, $Project, $StateDir, $ThreadId, $CandidateKey) $script:calls += "finish:$($Lease.slot_name)" }
 function Undo-SlotBorrow { param($Lease, $StateDir, $CandidateKey) $script:calls += "release:$($Lease.slot_name)" }
 function Write-Log { param($m) $script:calls += "log" }
+function Send-SlotNotices { param($NotifyState, $Notices) foreach ($n in @($Notices)) { $script:calls += "notice:$($n.signature)" } }
+$notifyState = @{}
 $lease = @{ repo = 'r'; slot = 'C:/s/r/slot-01'; slot_name = 'slot-01'; turn_id = 't1' }
 Close-OpenSlot -Open @{ lease = $lease; spawned = $true; key = 'k'; thread = 'T'; project = 'p'; slots_root = 'C:/s'; state_dir = 'C:/st' }
 Close-OpenSlot -Open @{ lease = $lease; spawned = $false; key = 'k'; thread = 'T'; project = 'p'; slots_root = 'C:/s'; state_dir = 'C:/st' }
 Close-OpenSlot -Open $null
-Check 'Close-OpenSlot: spawned -> slot-finish, not spawned -> release, $null -> nothing' (($script:calls -join ',') -eq 'finish:slot-01,release:slot-01') ($script:calls -join ',')
+Check 'Close-OpenSlot: spawned -> kept + notice (no finish), not spawned -> release, $null -> nothing' (($script:calls -join ',') -eq 'notice:t1:job_containment_unverified,log,release:slot-01') ($script:calls -join ',')
 function Undo-SlotBorrow { param($Lease, $StateDir, $CandidateKey) throw 'boom' }
 $script:calls = @()
 Close-OpenSlot -Open @{ lease = $lease; spawned = $false; key = 'k' }
