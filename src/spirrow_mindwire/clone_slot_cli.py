@@ -12,6 +12,18 @@ quarantined the slot, and prints one line ``MINDWIRE_SLOT_PREP <json>``. Exit co
 ``slot-lease`` moves one lease: ``spawning`` / ``running --child-pid N`` / ``release`` /
 ``quarantine-failed``. Exit 0 done, 1 refused (wrong turn, not leased, unreadable record).
 
+``slot-finish`` (A3) is the wrapper's turn-end step (:class:`~.clone_slot_finish.SlotFinish`):
+save check against ``origin``, the ``slot_turn_result`` row, then release / quarantine. It prints
+one line ``MINDWIRE_SLOT_FINISH <json>``. Exit codes:
+
+* 0 — released: the turn's work is ``pushed`` or ``rescued`` and the slot is back in the pool;
+* 5 — quarantined: ``rescue_failed``; the slot was renamed away and returned, the json carries a
+  ``notice`` for the operator;
+* 4 — parked: ``rescue_failed`` and every rename failed; the lease stays ``quarantine_failed``
+  and only this thread parks with ``clone_slot_unrecoverable`` (``notice`` in the json);
+* 2 — refused: the lease is not this turn's, nothing was touched;
+* 1 — the procedure failed (the lease is left as it was: never released as saved).
+
 Nothing here posts to a thread: the json is read by the wrapper, which sends notices (A3).
 """
 
@@ -29,16 +41,22 @@ from .clone_retreat_log import (
     append_slot_quarantine,
     build_slot_quarantine_record,
 )
+from .clone_slot_finish import FinishOutcome, SlotFinish
 from .clone_slot_lease import LeaseError, LeaseStore
 from .clone_slot_prep import PrepOutcome, PrepResult, SlotPrep
 from .clone_slot_trust import TrustReadError, is_trusted
+from .config import CONTINUATION_LEDGER_FILENAME
+from .git_sync.branch import generation_name, normalize_stem
 
 PREP_PREFIX = "MINDWIRE_SLOT_PREP "
+FINISH_PREFIX = "MINDWIRE_SLOT_FINISH "
 RETREATS_FILE = "clone-retreats.jsonl"
 EXIT_READY = 0
 EXIT_FAILED = 1
 EXIT_WAITING = 3
 EXIT_PARKED = 4
+EXIT_REFUSED = 2
+EXIT_QUARANTINED = 5
 
 
 def add_parsers(sub: Any) -> None:
@@ -50,8 +68,16 @@ def add_parsers(sub: Any) -> None:
     prep.add_argument("--slots-per-repo", required=True, type=int)
     prep.add_argument("--thread-id", required=True)
     prep.add_argument("--turn-id", required=True)
-    prep.add_argument("--branch", required=True, help="the thread's branch")
-    prep.add_argument("--base", required=True, help="where a new branch starts (mirror/<base>)")
+    prep.add_argument(
+        "--branch",
+        default=None,
+        help="the thread's branch (default: loop/<stem>, the git-sync name, generation 1)",
+    )
+    prep.add_argument(
+        "--base",
+        default=None,
+        help="where a new branch starts (mirror/<base>; default: the mirror's HEAD)",
+    )
     prep.add_argument("--wrapper-pid", type=int, default=None)
     prep.add_argument("--session-name", default=None)
     prep.add_argument("--job-name", default=None)
@@ -62,6 +88,14 @@ def add_parsers(sub: Any) -> None:
     lease.add_argument("--slot", required=True, help="slot-NN")
     lease.add_argument("--turn-id", required=True)
     lease.add_argument("--child-pid", type=int, default=None, help="(running) the child's pid")
+    fin = sub.add_parser("slot-finish", help="hand a clone slot back at turn end (slot pool mode)")
+    fin.add_argument("--slots-root", required=True, type=Path)
+    fin.add_argument("--repo", required=True)
+    fin.add_argument("--project", required=True)
+    fin.add_argument("--state-dir", required=True, type=Path)
+    fin.add_argument("--slot", required=True, help="slot-NN")
+    fin.add_argument("--thread-id", required=True)
+    fin.add_argument("--turn-id", required=True)
 
 
 def _trusted(slot: Path) -> bool:
@@ -113,7 +147,7 @@ def run_prep(args: argparse.Namespace) -> int:
         res = prep.borrow(
             thread_id=args.thread_id,
             turn_id=args.turn_id,
-            branch=args.branch,
+            branch=args.branch or generation_name(normalize_stem(args.thread_id), 1),
             base=args.base,
             wrapper_pid=args.wrapper_pid,
             session_name=args.session_name,
@@ -169,3 +203,26 @@ def run_lease(args: argparse.Namespace) -> int:
         print(f"slot-lease {args.action}: {exc}", file=sys.stderr)
         return EXIT_FAILED
     return 0
+
+
+def run_finish(args: argparse.Namespace) -> int:
+    try:
+        fin = SlotFinish(
+            slots_root=args.slots_root,
+            repo=args.repo,
+            project=args.project,
+            store=LeaseStore(args.state_dir),
+            ledger=args.state_dir / CONTINUATION_LEDGER_FILENAME,
+            retreats=args.state_dir / RETREATS_FILE,
+        )
+        res = fin.finish(slot=args.slot, thread_id=args.thread_id, turn_id=args.turn_id)
+    except Exception as exc:  # the wrapper treats exit 1 as not saved; say why on stderr
+        print(f"slot-finish failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    print(FINISH_PREFIX + json.dumps(res.to_json(), ensure_ascii=False, sort_keys=True))
+    return {
+        FinishOutcome.RELEASED: EXIT_READY,
+        FinishOutcome.QUARANTINED: EXIT_QUARANTINED,
+        FinishOutcome.PARKED: EXIT_PARKED,
+        FinishOutcome.REFUSED: EXIT_REFUSED,
+    }[res.outcome]
