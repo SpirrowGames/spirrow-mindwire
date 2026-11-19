@@ -72,6 +72,8 @@ class ThreadSnapshot:
     status: str
     messages: tuple[Mapping[str, Any], ...] = ()
     affects_threads: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    last_msg_id: str | None = None
 
     @property
     def is_open(self) -> bool:
@@ -119,6 +121,8 @@ def snapshot_of(result: Any) -> ThreadSnapshot | None:
         status=_text(thread.get("status")) or "",
         messages=tuple(m for m in messages if isinstance(m, Mapping)),
         affects_threads=_thread_ids(thread.get("affects_threads")),
+        tags=_thread_ids(thread.get("tags")),
+        last_msg_id=_text(thread.get("last_msg_id")),
     )
 
 
@@ -338,17 +342,211 @@ def digest_merged_lines(
     return lines
 
 
+# --- D-4 candidates (msg-9729 §2 D-4; reused by the D-1 skill step) ------------------------------
+
+#: ``関連: …`` / ``Related: …`` at a line start (after whitespace). A ``>`` quote does not match.
+_RELATED_LINE_RE = re.compile(r"^\s*(?:関連|Related)\s*[:：]\s*(?P<rest>.*)$", re.MULTILINE)  # noqa: RUF001
+_THREAD_ID_RE = re.compile(r"(?<![A-Za-z0-9_-])T-[A-Za-z0-9_-]*[A-Za-z0-9_]")
+#: A tag of the ``T229`` kind (the project's work-item number), compared case-insensitively.
+_ITEM_TAG_RE = re.compile(r"^T\d+$", re.IGNORECASE)
+#: What a ``Related:`` line says when the thread was checked and nothing was found.
+_NONE_VALUES = frozenset({"none", "なし", "無し"})
+
+
+def _related_lines(snap: ThreadSnapshot) -> list[tuple[str | None, str]]:
+    out: list[tuple[str | None, str]] = []
+    for msg in snap.messages:
+        body = msg.get("content")
+        if isinstance(body, str):
+            out.extend(
+                (_text(msg.get("msg_id")), m.group("rest").strip())
+                for m in _RELATED_LINE_RE.finditer(body)
+            )
+    return out
+
+
+def related_none_msg(snap: ThreadSnapshot) -> str | None:
+    """The newest message carrying ``Related: none`` (checked, nothing found), or ``None``."""
+    found = [mid or "?" for mid, rest in _related_lines(snap) if rest.lower() in _NONE_VALUES]
+    return found[-1] if found else None
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One possible counterpart of a thread, and why. ``referenced`` = already an edge."""
+
+    other: str
+    reasons: tuple[str, ...]
+    referenced: bool
+
+
+def reference_candidates(
+    snapshots: Sequence[ThreadSnapshot], edges: Iterable[Edge], thread_id: str
+) -> tuple[Candidate, ...]:
+    """Candidates for ``thread_id`` among the project's OPEN threads, sorted by id.
+
+    Sources (msg-9729 D-4): a shared ``T###`` tag, a ``関連:`` / ``Related:`` line in either thread
+    naming the other, and an existing reference in either direction. Output only: nothing is
+    written anywhere. Closed threads are not offered, because a declaration is made against open
+    work (msg-9521 P-1).
+    """
+    by_id = {s.thread_id: s for s in snapshots}
+    me = by_id.get(thread_id)
+    reasons: dict[str, list[str]] = {}
+
+    def add(other: str, reason: str) -> None:
+        if other != thread_id and other in by_id and by_id[other].is_open:
+            bucket = reasons.setdefault(other, [])
+            if reason not in bucket:
+                bucket.append(reason)
+
+    referenced = set(thread_references(edges, thread_id).counterparts())
+    for other in sorted(referenced):
+        add(other, "reference")
+    if me is not None:
+        my_tags = {t.upper() for t in me.tags if _ITEM_TAG_RE.match(t)}
+        for snap in snapshots:
+            their = {t.upper() for t in snap.tags if _ITEM_TAG_RE.match(t)}
+            for tag in sorted(my_tags & their):
+                add(snap.thread_id, f"tag:{tag}")
+        for _mid, rest in _related_lines(me):
+            for tid in _THREAD_ID_RE.findall(rest):
+                add(tid, "related-line:this")
+    for snap in snapshots:
+        if snap.thread_id == thread_id:
+            continue
+        for _mid, rest in _related_lines(snap):
+            if thread_id in _THREAD_ID_RE.findall(rest):
+                add(snap.thread_id, "related-line:other")
+    return tuple(Candidate(o, tuple(reasons[o]), o in referenced) for o in sorted(reasons))
+
+
+# --- the per-tick cache and the D-2 index ------------------------------------------------------
+
+
+def slim_message(msg: Mapping[str, Any]) -> dict[str, Any]:
+    """The part of a message this module reads, so the per-tick cache stays small.
+
+    ``content`` keeps only the lines read here: the relay's merged line and ``関連:`` /
+    ``Related:`` lines. The rest of the body is dropped.
+    """
+    body = msg.get("content")
+    kept: list[str] = []
+    if isinstance(body, str):
+        relay = msg.get("author") == PR_EVENT_RELAY_AUTHOR
+        kept = [
+            line
+            for line in body.splitlines()
+            if _RELATED_LINE_RE.match(line) or (relay and _MERGED_LINE_RE.match(line))
+        ]
+    out: dict[str, Any] = {
+        "msg_id": _text(msg.get("msg_id")),
+        "author": _text(msg.get("author")),
+        "timestamp": _text(msg.get("timestamp")),
+        "content": "\n".join(kept),
+    }
+    refs = _thread_ids(msg.get("references_threads"))
+    if refs:
+        out["references_threads"] = list(refs)
+    return out
+
+
+def snapshot_to_json(snap: ThreadSnapshot) -> dict[str, Any]:
+    """The cache form of a snapshot (messages slimmed by :func:`slim_message`)."""
+    return {
+        "thread_id": snap.thread_id,
+        "status": snap.status,
+        "last_msg_id": snap.last_msg_id,
+        "tags": list(snap.tags),
+        "affects_threads": list(snap.affects_threads),
+        "messages": [slim_message(m) for m in snap.messages],
+    }
+
+
+def snapshot_from_json(raw: Any) -> ThreadSnapshot | None:
+    """Inverse of :func:`snapshot_to_json`; ``None`` for anything that is not that shape."""
+    if not isinstance(raw, Mapping):
+        return None
+    thread_id = _text(raw.get("thread_id"))
+    messages = raw.get("messages")
+    if thread_id is None or not isinstance(messages, list):
+        return None
+    return ThreadSnapshot(
+        thread_id=thread_id,
+        status=_text(raw.get("status")) or "",
+        messages=tuple(m for m in messages if isinstance(m, Mapping)),
+        affects_threads=_thread_ids(raw.get("affects_threads")),
+        tags=_thread_ids(raw.get("tags")),
+        last_msg_id=_text(raw.get("last_msg_id")),
+    )
+
+
+#: Version of the index file the sweep writes and the conductor reads.
+INDEX_SCHEMA = 1
+
+
+def build_notice_index(
+    projects: Mapping[str, Sequence[ThreadSnapshot]], *, generated_at: datetime
+) -> dict[str, Any]:
+    """The D-2 index: per project, per thread, its rendered notice (threads without one omitted).
+
+    Built once per tick by ``scripts/thread_references.py`` from ONE edge set per project, so
+    every dispatch of the tick reads the same facts (msg-9729: the read happens once per tick).
+    """
+    out: dict[str, dict[str, str]] = {}
+    for project, snaps in projects.items():
+        edges = collect_edges(snaps)
+        by_id = {s.thread_id: s for s in snaps}
+        notices: dict[str, str] = {}
+        for snap in snaps:
+            notice = render_references_notice(thread_references(edges, snap.thread_id), by_id)
+            if notice is not None:
+                notices[snap.thread_id] = notice
+        out[project] = notices
+    return {"schema": INDEX_SCHEMA, "generated_at": generated_at.isoformat(), "projects": out}
+
+
+def notice_from_index(index: Any, project: str, thread_id: str) -> str | None:
+    """The notice for one thread from a loaded index, stamped with when it was observed.
+
+    Anything unexpected (wrong schema, missing project, non-string) is ``None``: this block is
+    observation only, so a bad index costs the block, never the dispatch.
+    """
+    if not isinstance(index, Mapping) or index.get("schema") != INDEX_SCHEMA:
+        return None
+    projects = index.get("projects")
+    if not isinstance(projects, Mapping):
+        return None
+    notices = projects.get(project)
+    if not isinstance(notices, Mapping):
+        return None
+    notice = notices.get(thread_id)
+    if not isinstance(notice, str) or not notice:
+        return None
+    generated_at = _text(index.get("generated_at")) or "?"
+    return f"{notice}\n(observed at {generated_at})"
+
+
 __all__ = [
+    "INDEX_SCHEMA",
     "MERGED_DISPLAY_LIMIT",
+    "Candidate",
     "Edge",
     "MergedEvent",
     "Reference",
     "ThreadReferences",
     "ThreadSnapshot",
+    "build_notice_index",
     "collect_edges",
     "digest_merged_lines",
     "merged_events",
+    "notice_from_index",
+    "reference_candidates",
+    "related_none_msg",
     "render_references_notice",
+    "slim_message",
+    "snapshot_from_json",
     "snapshot_of",
+    "snapshot_to_json",
     "thread_references",
 ]

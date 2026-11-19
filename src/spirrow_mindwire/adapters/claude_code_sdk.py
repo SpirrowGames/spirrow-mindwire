@@ -118,8 +118,23 @@ tool calls, no meta-commentary.
 # design loop (PR-2b-1); the block is advisory — the conductor's routing guards are the enforcement.
 # P-1 (T-real-infra-values-egress-from-agent-context msg-9297 §2 / msg-9299 §1): the proposer has
 # no Bash, but it writes the specs that tell the implementer how to issue gh writes.
+# T-thread-relations-unused-so-parallel-rule-cannot-be-checked D-1 (Bohr msg-9729, approved by the
+# human in msg-9691): the proposer's thread-opening step. The proposer cannot write to the chatroom,
+# so the step binds what it writes when it proposes a new thread. Candidates come from what the turn
+# can see (the cross-thread references block and the thread itself), never from asking a person to
+# search; ``Related: none`` only after those candidates were checked.
+THREAD_OPEN_REFERENCES_BLOCK = """\
+Thread-opening references: when you propose opening a new thread (including a follow-up thread), \
+declare its references to open threads of the same project for `references_threads`. Draw the \
+candidates yourself from the cross-thread references block of this turn and from the threads named \
+in this thread, and list the ones that apply. Write `Related: none` only when you checked those \
+candidates and none applies; if you could not check, say so and do not write `Related: none`. A \
+reference can also be added later, in any message of either thread.
+"""
+
 _DEFAULT_SYSTEM_PROMPT = (
-    f"{_BASE_SYSTEM_PROMPT}\n{P1_PROMPT_BLOCK}\n{build_handoff_protocol_block(Role.PROPOSER)}"
+    f"{_BASE_SYSTEM_PROMPT}\n{P1_PROMPT_BLOCK}\n{THREAD_OPEN_REFERENCES_BLOCK}\n"
+    f"{build_handoff_protocol_block(Role.PROPOSER)}"
 )
 
 

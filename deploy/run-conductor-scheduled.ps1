@@ -841,6 +841,11 @@ $UnregisteredThreadsProbeTimeoutSeconds = 120
 # scripts/open_prs_by_project.py (T-digest-lacks-project-liveness-view): one GitHub listing per
 # clones repo, on the digest tick only.
 $OpenPrsByProjectProbeTimeoutSeconds = 120
+# scripts/thread_references.py (T-thread-relations-unused-so-parallel-rule-cannot-be-checked): one
+# listing per project plus a bounded number of thread reads (--max-fetch), every tick.
+$ThreadReferencesProbeTimeoutSeconds = 120
+# At most this many D-3 merge lines in the digest; the rest are counted as `+N 件`.
+$ThreadReferencesDigestMaxLines = 5
 # The liveness view's same-tick snapshot (R-10): the future L2's content. Never linked from Discord.
 $projectLivenessSnapshotPath = Join-Path $dataDir "state\project-liveness.json"
 $ControlProbeTimeoutSeconds = 120
@@ -5673,6 +5678,52 @@ function Invoke-OpenPrsByProjectProbe {
     catch { return @{ report = $null; error = "JSON unparseable: $($_.Exception.Message)" } }
 }
 
+# --- thread-references probe (T-thread-relations-unused-so-parallel-rule-cannot-be-checked) ------
+# Runs scripts/thread_references.py once per tick, before any thread is launched: it refreshes the
+# per-tick index the conductor reads for the D-2 references block of every dispatched turn, and
+# returns the D-3 digest lines. Returns @{ report; error }, exactly one set. Never throws. Observation
+# only: a failure costs the references block and the digest lines, never a launch.
+function Invoke-ThreadReferencesProbe {
+    param([string]$SweepConfigPath)
+    $probe = Join-Path $repoRoot "scripts\thread_references.py"
+    if (-not (Test-Path -LiteralPath $probe)) { return @{ report = $null; error = "script not found: $probe" } }
+    try {
+        $r = Invoke-BoundedUvProbe -Label 'thread-references' -TimeoutSeconds $ThreadReferencesProbeTimeoutSeconds `
+            -Arguments @($probe, '--sweep-config', $SweepConfigPath, '--state-dir', (Join-Path $dataDir 'state'))
+    }
+    catch { return @{ report = $null; error = "invocation failed: $($_.Exception.Message)" } }
+    if ($r.timedOut) { return @{ report = $null; error = "timed out after ${ThreadReferencesProbeTimeoutSeconds}s (process tree killed)" } }
+    if (-not $r.ok) { return @{ report = $null; error = "invocation failed: $($r.error)" } }
+    if ($r.code -ne 0) {
+        $tail = ((Get-ProbeOutputLines -Result $r) | ForEach-Object { "$_" }) -join ' / '
+        return @{ report = $null; error = "exit=$($r.code): $tail" }
+    }
+    $json = Get-ProbeJsonLine -Result $r
+    if (-not $json) { return @{ report = $null; error = 'no JSON on stdout' } }
+    try { return @{ report = ($json | ConvertFrom-Json); error = $null } }
+    catch { return @{ report = $null; error = "JSON unparseable: $($_.Exception.Message)" } }
+}
+
+# D-3 (msg-9729): the merge lines of the last 24h, capped at -MaxLines with the dropped count shown.
+# Nothing is posted into any thread (msg-9544 §3). A failed probe is one `?` line, never silence; an
+# empty report (no merge with an open referencing thread) is no line at all.
+function Get-ThreadReferencesDigestLines {
+    param($Report, [string]$ProbeError, [int]$MaxLines = 5)
+    if ($ProbeError) { return @("参照のある merge: ? — $ProbeError") }
+    if ($null -eq $Report) { return @() }
+    $out = @()
+    $all = @($Report.digest_lines | Where-Object { $_ })
+    if ($all.Count -gt 0) {
+        $out += "参照のある merge (24h): $($all.Count) 件"
+        $out += @($all | Select-Object -First $MaxLines | ForEach-Object { "  $_" })
+        if ($all.Count -gt $MaxLines) { $out += "  +$($all.Count - $MaxLines) 件" }
+    }
+    foreach ($p in @($Report.projects)) {
+        if ($p.error) { $out += "参照のある merge [$($p.project)]: ? — $($p.error)" }
+    }
+    return $out
+}
+
 # --- parked-humans probe (T-decision-request-composer S4 / D-32) --------------------------------
 # Poll the sweep candidates and return the subset currently parked on a human decision. Delegates
 # to ``scripts/parked_humans.py``, which re-uses the ``spirrow_mindwire.conductor.handoff``
@@ -6761,6 +6812,15 @@ try {
     $autoGate = Invoke-AutoGateTick -Projects $passedHoldProjects
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'autogate' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
+
+    # T-thread-relations-unused-so-parallel-rule-cannot-be-checked: once per tick, before any launch,
+    # so every turn of this tick reads the same references index (D-2); the digest reads the lines (D-3).
+    $phaseStartUtc = Get-SweepNowUtc
+    $threadRefsProbe = Invoke-ThreadReferencesProbe -SweepConfigPath $sweepConfigPath
+    if ($threadRefsProbe.error) { Write-Log "thread references: ? — $($threadRefsProbe.error) (no references block this tick)" }
+    $threadRefsDigestLines = @(Get-ThreadReferencesDigestLines -Report $threadRefsProbe.report -ProbeError $threadRefsProbe.error `
+        -MaxLines $ThreadReferencesDigestMaxLines)
+    Add-PreLoopPhase -Phases $preLoopPhases -Name 'threadrefs' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
 
     # settled_close (boundary 6): the same projects as 1c. Off by default, and off it spawns nothing.
     $phaseStartUtc = Get-SweepNowUtc
@@ -8223,7 +8283,7 @@ try {
                 -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold `
                 -StaleHumanThreshold $StaleHumanThreshold `
                 -ParkedCloneLines (Get-DirtyCloneDigestLines -Parked $dirtyClonesParked) `
-                -StopClassLines (@(Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed | ForEach-Object { $_ }) + $autoGateDigestLines +
+                -StopClassLines (@(Get-StopClassDigestLines -ByProject $stopClassByProject -Failed $stopClassFailed | ForEach-Object { $_ }) + $autoGateDigestLines + $threadRefsDigestLines +
                     @(Get-PreLoopBudgetDigestLines -State $preLoopBudgetState -NowEpoch $preLoopNowEpoch)) `
                 -N3UnresolvedLines (Get-N3UnresolvedDigestLines -Counts (Get-JsonState -Path $n3UnresolvedStatePath)) `
                 -LedgerDriftLines (Get-LedgerDriftDigestLines -SweepConfigPath $sweepConfigPath `

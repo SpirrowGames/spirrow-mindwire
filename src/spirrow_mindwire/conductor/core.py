@@ -71,6 +71,7 @@ structurally out of the loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping
@@ -659,6 +660,7 @@ class Conductor:
         continuation_ledger_path: Path | None = None,
         conditional_proceed_notice: str | None = None,
         clone_retreat_log_path: Path | None = None,
+        references_index_path: Path | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -694,6 +696,9 @@ class Conductor:
         # Read only by ``_dispatch_recording``, for the first implementer dispatch of the run; the
         # routing never reads it. ``None`` = not wired: no notice, the prompt is unchanged.
         self._clone_retreat_log_path = clone_retreat_log_path
+        # T-thread-relations-unused-so-parallel-rule-cannot-be-checked D-2: the per-tick index of
+        # cross-thread references. Prompt content only; nothing routes on it. ``None`` = not wired.
+        self._references_index_path = references_index_path
         self._clone_retreat_checked = False
         # T-dirty-clone-check-disagreement (PR #590 gate Obj-3): the unpushed notice for a
         # re-admitted relay, attached to the next implementer dispatch and cleared once sent.
@@ -4057,7 +4062,31 @@ class Conductor:
             # T-naysayer-invents-next-participant D-1: every role, every dispatch; the text is
             # built in handoff.py from the same roster resolve_handoff reads.
             roster_notice=build_roster_notice(self._roster),
+            references_notice=self._references_notice(),
         )
+
+    def _references_notice(self) -> str | None:
+        """D-2 (msg-9729): this thread's observed cross-thread references from the per-tick index.
+
+        Observation only, never gating (msg-9542 §0): an absent, unreadable or stale-schema index is
+        ``None`` and the dispatch goes ahead with the prompt it had before. Read on every event so
+        each round sees the latest tick's index.
+        """
+        path = self._references_index_path
+        if path is None:
+            return None
+        # Lazy, like the pr_event_advance import above: thread_relations reaches the conductor
+        # package through pr_event_advance.decide.
+        from ..thread_relations import notice_from_index
+
+        try:
+            index = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            logger.warning("thread-references index unreadable at %s", path, exc_info=True)
+            return None
+        return notice_from_index(index, self._thread_ref.project_id, self._thread_ref.thread_id)
 
     def _review_round(
         self, role: Role, messages: list[dict[str, Any]]
