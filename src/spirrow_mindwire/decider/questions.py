@@ -148,7 +148,12 @@ TIERC_QUESTIONS_V1: tuple[TierCQuestion, ...] = (
 # 経路が既にある)。key / criteria / 五ヶ条 / 閾値は不変。v3 の記録は v3 のまま読む。
 # ``scripts/tierc_casebook.py`` の ``tierc-v4-candidate`` は記録専用の別の候補 set で、
 # この値とは無関係。
-TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v4"
+#
+# ``tierc-v5`` (T-tier-c-six-articles-security-boundary, Bohr msg-9647 §2 / msg-9655 §2'): 六ヶ条に
+# なったので、枠の文・criteria・none の説明から「五ヶ条」(件数) を外して「次の各条」にし、
+# ``_V2_FIX_NOW_EXCLUSION`` の「仕様の追加・削除・変更」を msg-9652 の第 2 条に合わせて「人間が
+# 決めた仕様・方針の追加・削除・変更」にした。key と閾値は不変。v4 の記録は v4 のまま読む。
+TIERC_ESCALATION_QUESTIONS_VERSION = "tierc-v5"
 """v2 構造 (``should_ask_human`` + ``matched_rule``) の問いセットを ``NEXT: human`` の escalation に
 問うときの、set 単位の記録用 version。ルール文言の編集では動かない (``rules_sha256`` が区別する)。
 
@@ -164,16 +169,17 @@ MATCHED_RULE_NONE = "none"
 """``matched_rule`` の「どのルールにも当たらない」選択肢。"""
 
 TIERC_V2_SHOULD_ASK_CRITERIA: dict[str, str] = {
-    "true": "五ヶ条のいずれかに当たる",
-    "false": "五ヶ条のどれにも当たらない",
+    "true": "次の各条のいずれかに当たる",
+    "false": "次の各条のどれにも当たらない",
 }
-"""msg-4361 の criteria (逐語)。"""
+"""msg-4361 の criteria から件数 (「五ヶ条」) を外したもの (``tierc-v5``、msg-9647 §2)。"""
 
-_V2_RULES_HEADER = "次の五ヶ条は、AI エージェントが人間(Takahito)に問うべきものを定めている。"
+_V2_RULES_HEADER = "次の各条は、AI エージェントが人間(Takahito)に問うべきものを定めている。"
 _V2_FIX_NOW_EXCLUSION = (
     "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
     "順序・タイミングだけを問うハンドオフは、"
-    "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
+    "どの条にも当たらない(修正自体が人間が決めた仕様・方針の追加・削除・変更を伴う場合は、"
+    "その中身で判断する)。"
 )
 """DECIDED msg-5233 規則 5 の除外 (逐語は Bohr msg-5234 §3)。
 
@@ -187,28 +193,31 @@ _V2_MERGE_REQUEST_EXCLUSION = (
 (T-jev-tierc-audit-2026-10-12 F3、逐語は Bohr msg-6860)。``_V2_FIX_NOW_EXCLUSION`` と同じく、
 五ヶ条本文ではなく枠の文に置く。``tierc-v4``。"""
 _V2_SHOULD_ASK_QUESTION = (
-    "このハンドオフ(NEXT: human)は、五ヶ条のいずれかに当たり、人間に問うべきものか。"
+    "このハンドオフ(NEXT: human)は、次の各条のいずれかに当たり、人間に問うべきものか。"
     + _V2_FIX_NOW_EXCLUSION
     + _V2_MERGE_REQUEST_EXCLUSION
 )
 _V2_MATCHED_RULE_INSTRUCTIONS = (
-    "このハンドオフ(NEXT: human)が当たる五ヶ条のルールを 1 つ選べ。"
+    "このハンドオフ(NEXT: human)が当たるルールを 1 つ選べ。"
     "複数に当たるなら最もよく当たるもの、どれにも当たらなければ none。"
 )
-_V2_NONE_DESCRIPTION = "五ヶ条のどれにも当たらない"
+_V2_NONE_DESCRIPTION = "どのルールにも当たらない"
 
 # D-4' G3 (T-pr-2b-3-human-identity-delegate, Bohr msg-4856 §3 G3, Takahito "B" decide): the
 # same two keys, asked of a naysayer's proceed handoff (``NEXT: <implementer>``) instead of a
 # ``NEXT: human`` escalation. The frame sentences differ, so this is its own set version
 # (the rule above: 枠の文を変えたら version を上げる). The rules file and its sha256 are shared.
-TIERC_V2_PROCEED_QUESTIONS_VERSION = "tierc-v2-proceed"
-"""G3 proceed-clearance set version (the ``tierc-v2`` keys with proceed-turn frame sentences)."""
+TIERC_V2_PROCEED_QUESTIONS_VERSION = "tierc-v3-proceed"
+"""G3 proceed-clearance set version (the ``tierc-v2`` keys with proceed-turn frame sentences).
+
+``tierc-v3-proceed``: the frame sentences dropped 「五ヶ条」 for the six-article rules
+(msg-9647 §2)."""
 _V2_PROCEED_SHOULD_ASK_QUESTION = (
     "このハンドオフ(naysayer が承認し NEXT: implementer で実装着手を指示するもの)は、"
-    "五ヶ条のいずれかに当たり、実装前に人間に問うべきものか。"
+    "次の各条のいずれかに当たり、実装前に人間に問うべきものか。"
 )
 _V2_PROCEED_MATCHED_RULE_INSTRUCTIONS = (
-    "この実装着手のハンドオフが当たる五ヶ条のルールを 1 つ選べ。"
+    "この実装着手のハンドオフが当たるルールを 1 つ選べ。"
     "複数に当たるなら最もよく当たるもの、どれにも当たらなければ none。"
 )
 
