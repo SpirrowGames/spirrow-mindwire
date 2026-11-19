@@ -119,6 +119,9 @@ class Lease:
     session_name: str | None = None
     job_name: str | None = None
     spawning: bool = False
+    # The thread that held the slot before this lease (the free slot's ``last_thread_id``):
+    # whose work a failed borrow-time check rescues (msg-9386 改訂 5).
+    previous_thread_id: str | None = None
 
     @property
     def index(self) -> int:
@@ -139,6 +142,7 @@ class Lease:
             "session_name": self.session_name,
             "job_name": self.job_name,
             "spawning": self.spawning,
+            "previous_thread_id": self.previous_thread_id,
         }
 
     @classmethod
@@ -156,6 +160,7 @@ class Lease:
                 session_name=_opt_str(raw.get("session_name")),
                 job_name=_opt_str(raw.get("job_name")),
                 spawning=bool(raw.get("spawning", False)),
+                previous_thread_id=_opt_str(raw.get("previous_thread_id")),
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise LeaseError(f"malformed lease record in {repo}: {raw!r} ({exc})") from exc
@@ -362,6 +367,7 @@ class LeaseStore:
                 wrapper_pid=wrapper_pid,
                 session_name=session_name,
                 job_name=job_name,
+                previous_thread_id=_opt_str((slots.get(chosen) or {}).get("last_thread_id")),
             )
             slots[chosen] = lease.to_json()
             r["waiting"].pop(thread_id, None)

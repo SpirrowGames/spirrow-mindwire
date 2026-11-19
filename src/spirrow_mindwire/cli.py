@@ -40,6 +40,11 @@ thread's next implementer turn.
 patch to ``--state-dir`` and discard; see :mod:`spirrow_mindwire.clone_retreat`. Exit 0 clean /
 retreated / discarded, 4 discard incomplete (still parked), 1 failed.
 
+``mindwire slot-prep ...`` / ``mindwire slot-lease <action> ...`` (T-ephemeral-impl-clone-slot-per-
+thread A2) borrow a pooled clone slot for one turn and move its lease; see
+:mod:`spirrow_mindwire.clone_slot_cli`. Not called by the loop until ``[loop].slots_root`` is
+accepted (A4).
+
 ``mindwire continue-report [--days 7] [--config PATH]`` (T-implementer-self-continuation PR-2,
 D-3) prints the weekly view of implementer self-continuations, read from the continuation ledger
 (``<data_dir>/state/continuation_ledger.jsonl``) and nothing else: per thread, the admitted
@@ -129,6 +134,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="[loop].slots_root is set: never discard; leave the WIP for the turn-pre procedure",
     )
+    from .clone_slot_cli import add_parsers as add_slot_parsers
+
+    add_slot_parsers(sub)
     cont = sub.add_parser(
         "continue-report",
         help="weekly view of implementer self-continuations, from the continuation ledger",
@@ -249,6 +257,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 slot_mode=args.slot_mode,
             )
         )
+    if args.command in ("slot-prep", "slot-lease"):
+        from .clone_slot_cli import run_lease, run_prep
+
+        raise SystemExit(run_prep(args) if args.command == "slot-prep" else run_lease(args))
     if args.command == "continue-report":
         from .conductor.continuation_ledger import report_text
         from .config import resolve_continuation_ledger_path
