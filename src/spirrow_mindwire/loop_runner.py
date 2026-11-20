@@ -69,8 +69,8 @@ import functools
 import logging
 import os
 import sys
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -156,10 +156,12 @@ from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .preflight import (
     PREFLIGHT_DEFERRED_EXIT_CODE,
+    PREFLIGHT_REFUSED_EXIT_CODE,
     PreflightDeferredError,
     PreflightError,
     emit_preflight_deferred_payload,
     emit_preflight_ok,
+    emit_preflight_refused_payload,
     preflight_gate,
 )
 from .repo_projects import load_repo_project_map
@@ -1328,9 +1330,10 @@ async def run_conductor(
     raised (exit 5). The budgets are checked first, before anything is read or spawned.
     """
     cond_cfg = settings.conductor
-    validate_budgets(
-        run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
-    )
+    with _config_refusal():
+        validate_budgets(
+            run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
+        )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
     run_phase = RunPhase()
@@ -1432,18 +1435,19 @@ async def _run_conductor_once(
         )
         return outcome
     _preflight(settings.loop)
-    cond = build_conductor(
-        settings,
-        mcp=mcp,
-        stop_slot=stop_slot,
-        launches_same_head=launches_same_head,
-        launch_head_msg_id=launch_head_msg_id,
-        retry_of=retry_of,
-        run_phase=run_phase,
-        gate_only=gate_only,
-        summon_owner_project=summon_owner_project,
-        resume_notice=resume_notice,
-    )
+    with _config_refusal():
+        cond = build_conductor(
+            settings,
+            mcp=mcp,
+            stop_slot=stop_slot,
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
+            retry_of=retry_of,
+            run_phase=run_phase,
+            gate_only=gate_only,
+            summon_owner_project=summon_owner_project,
+            resume_notice=resume_notice,
+        )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
@@ -1466,6 +1470,28 @@ async def _run_conductor_once(
     finally:
         with run_phase.enter("teardown"):
             await cond.aclose()
+
+
+@contextmanager
+def _config_refusal() -> Iterator[None]:
+    """Turn a daemon-configuration ``SystemExit(<message>)`` into a ``config`` refusal.
+
+    T-preflight-failure-counts-toward-stall D-2' inventory: ``validate_budgets`` and
+    ``build_conductor`` (with ``_build_dispatcher`` under it) fail closed with ``SystemExit`` and a
+    message, before any role is spawned. That used to end the run with exit 1, which the sweep
+    counts as a launch and as a thread failure. Only a ``SystemExit`` whose code is a message is
+    converted (an int code is a deliberate exit and passes through), and a :class:`PreflightError`
+    passes through untouched. Any other exception keeps the generic exit-1 path: an unknown failure
+    stays "unknown -> quarantine" (the sweep's front-compat rule).
+    """
+    try:
+        yield
+    except PreflightError:
+        raise
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            raise PreflightError(exc.code, check="config") from exc
+        raise
 
 
 def _preflight(cfg: Stage3LoopConfig) -> None:
@@ -1505,7 +1531,8 @@ def _preflight(cfg: Stage3LoopConfig) -> None:
         # Any unexpected exception at this layer is itself a fail-closed event —
         # the preflight either passes cleanly or halts the daemon.
         raise PreflightError(
-            f"preflight raised an unexpected exception (fail-closed by design): {exc}"
+            f"preflight raised an unexpected exception (fail-closed by design): {exc}",
+            check="unexpected",
         ) from exc
     # Design v2 D-5b: the sweep ends a repo's preflight-deferral episode on this row, whatever
     # the run's exit code (a role failing AFTER a passing preflight still proves the API answered).
@@ -1650,7 +1677,20 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        if args.mode != "conductor":
+            raise
+        # D-2' inventory: an unreadable mindwire.toml ends the run before any role is spawned, so
+        # the sweep must not count it as a launch (exit 13, check=config). Watcher mode keeps the
+        # plain failure: it is not driven by the sweep's launch accounting.
+        refused = PreflightError(
+            f"mindwire settings could not be loaded: {type(exc).__name__}: {exc}", check="config"
+        )
+        emit_preflight_refused_payload(refused)
+        logger.error("preflight refused exit=%d check=config: %s", PREFLIGHT_REFUSED_EXIT_CODE, exc)
+        sys.exit(PREFLIGHT_REFUSED_EXIT_CODE)
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
     # unwound (Bohr msg-4440 D-1''/D-2'). Only the conductor mode writes it.
     stop_slot = ConductorStopSlot()
@@ -1732,6 +1772,22 @@ def main() -> None:
             preflight_exc,
         )
         sys.exit(PREFLIGHT_DEFERRED_EXIT_CODE)
+    except PreflightError as refused_exc:
+        # T-preflight-failure-counts-toward-stall (design v3 D-1'', Bohr msg-9812): the preflight
+        # REFUSED this run (P0/P1/P2/P3, or an unexpected exception it wrapped) before any role was
+        # spawned. It used to propagate as SystemExit(message) = exit 1, which the wrapper counts as
+        # a launch (launches_same_head -> STALLED "the role went silent") and as a thread failure
+        # (retry -> quarantine). A dedicated code instead: the wrapper reverts the LAUNCH, leaves
+        # retry-pending untouched, and notifies per candidate that the role was not started.
+        # Fail-closed is unchanged. The payload row only feeds the notification.
+        emit_preflight_refused_payload(refused_exc)
+        logger.error(
+            "preflight refused exit=%d check=%s: %s",
+            PREFLIGHT_REFUSED_EXIT_CODE,
+            refused_exc.check,
+            refused_exc.detail,
+        )
+        sys.exit(PREFLIGHT_REFUSED_EXIT_CODE)
     except RefSnapshotUnrecordedError as snap_exc:
         # T-ref-snapshot-unreadable-file-blocks-thread-forever (design v2 D-2): the launch's ref
         # snapshot could not be read, recovered or written. A state-directory fault of this one

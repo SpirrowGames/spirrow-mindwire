@@ -184,6 +184,13 @@ $RefSnapshotUnrecordedExitCode = 12
 # untouched, launch reverted, and the rest of the tick is not launched (every candidate on this
 # host would hit the same stop). Never reached while [turn.isolation] user is unset (INV-0).
 $TurnIsolationStopExitCode = 10
+# Exit code of mindwire-loop when the preflight REFUSED the run — a terminal P0/P1/P2/P3 failure or
+# an unexpected exception it wrapped (T-preflight-failure-counts-toward-stall, design v3: Bohr
+# msg-9812, go Einstein). Mirrors PREFLIGHT_REFUSED_EXIT_CODE in src/spirrow_mindwire/preflight.py
+# (a pytest pins the two). The role was never spawned: the launch is reverted (no backoff, no
+# launches_same_head, so no STALLED "the role went silent"), retry-pending is untouched, nobody is
+# quarantined, the repo is not skipped, and the notice is per candidate.
+$PreflightRefusedExitCode = 13
 # A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
 # a permanent failure misclassified as transient must not stay silent.
 $PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
@@ -3329,13 +3336,14 @@ function Clear-RefSnapshotNotice {
 }
 
 # Whether a launch that ended with $ExitCode proves the candidate got past the ref snapshot. Exit
-# $DirtyCloneExitCode and $PreflightDeferredExitCode can stop before the snapshot is taken (clone
-# guard, preflight), and $RefSnapshotUnrecordedExitCode is the snapshot failing itself: none of the
-# three ends the episode. Every other code means the snapshot step was passed (or not needed).
+# $DirtyCloneExitCode, $PreflightDeferredExitCode and $PreflightRefusedExitCode can stop before the
+# snapshot is taken (clone guard, preflight), and $RefSnapshotUnrecordedExitCode is the snapshot
+# failing itself: none of them ends the episode. Every other code means the snapshot step was passed
+# (or not needed).
 function Test-RefSnapshotEpisodeOver {
     param([int]$ExitCode)
     return ($ExitCode -ne $RefSnapshotUnrecordedExitCode -and $ExitCode -ne $DirtyCloneExitCode -and
-            $ExitCode -ne $PreflightDeferredExitCode)
+            $ExitCode -ne $PreflightDeferredExitCode -and $ExitCode -ne $PreflightRefusedExitCode)
 }
 
 function Get-RefSnapshotNotice {
@@ -3536,6 +3544,72 @@ function Get-PreflightDeferredNotice {
     return @{ key = (Get-PreflightDeferredNoticeKey -RepoKey $RepoKey); signature = $Transition.signature; message = $body }
 }
 
+# --- preflight refusal (T-preflight-failure-counts-toward-stall, design v3: Bohr msg-9812) ---
+# The daemon exits $PreflightRefusedExitCode when the preflight refused the run (a terminal
+# P0/P1/P2/P3 failure, or an unexpected exception it wrapped). The role was never spawned.
+#
+# Reader of the notification: the operator. The key is PER CANDIDATE
+# ('preflight-refused:<candidate key>', Obj-2-1): a refusal shared by every candidate of a repo
+# notifies once per candidate, and only that candidate's own MINDWIRE_PREFLIGHT_OK clears it, so a
+# passing run in another clone of the same repo never hides a refusal that still stands. The
+# signature is the check plus the normalised detail: one alert per distinct refusal, a changed
+# refusal alerts again, and after the candidate's OK the same refusal alerts again from scratch.
+# The body names the stop reason 'preflight_refused' through the shared phrase map
+# (StopReason.ps1), so it never reads as "the role posted nothing".
+function Get-PreflightRefusedPayload {
+    param($Output)
+    foreach ($line in @($Output)) {
+        if ("$line" -match '^MINDWIRE_PREFLIGHT_REFUSED_PAYLOAD\s+(.*)$') {
+            try { return ($Matches[1] | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+        }
+    }
+    return $null
+}
+
+function Get-PreflightRefusedNoticeKey {
+    param([string]$CandidateKey)
+    return "preflight-refused:$CandidateKey"
+}
+
+# Whitespace runs collapse to one space, so the same refusal printed with a different line layout
+# keeps one signature. The signature is the SHA-256 of the COMPLETE normalised detail (PR #596 gate
+# round 1, objection 2): a truncated prefix would give two refusals that differ only after it one
+# signature and swallow the "changed refusal alerts again" notice. The payload detail is already
+# bounded by the daemon; the body shows it in full and no display cap feeds the signature.
+function ConvertTo-PreflightRefusedSignatureDetail {
+    param([string]$Detail)
+    $d = ("$Detail" -replace '\s+', ' ').Trim()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($d)) } finally { $sha.Dispose() }
+    return (-join ($hash | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-PreflightRefusedNotice {
+    param([string]$CandidateKey, [string]$RepoDir, $Output, [int]$ExitCode)
+    $payload = Get-PreflightRefusedPayload -Output $Output
+    $check = 'unknown'
+    $detail = '(payload parse failed)'
+    if ($null -ne $payload -and $payload.PSObject.Properties.Name -contains 'check') {
+        $check = "$($payload.check)"
+        if ($payload.PSObject.Properties.Name -contains 'detail' -and "$($payload.detail)") { $detail = "$($payload.detail)" }
+    }
+    $sig = "preflight-refused:${check}:$(ConvertTo-PreflightRefusedSignatureDetail -Detail $detail)"
+    $phrase = Get-StopReasonPhrase -StopReason 'preflight_refused'
+    $body = ("MindWire: **$CandidateKey** — $phrase (reason=preflight_refused, exit=$ExitCode)`n" +
+             "role は起動していません。preflight の $check が次の理由で拒否しました（clone: $RepoDir）。" +
+             "スレッドの不具合ではないので quarantine せず、STALLED のカウントにも入れません。retry-pending もそのままです。" +
+             "拒否の原因を解消すれば次の tick で起動します。`n$detail")
+    return @{ key = (Get-PreflightRefusedNoticeKey -CandidateKey $CandidateKey); signature = $sig; message = $body; check = $check }
+}
+
+# End this candidate's refusal episode (its OK row was seen). Returns $true when a key was removed.
+function Clear-PreflightRefusedNotice {
+    param([hashtable]$State, [string]$CandidateKey)
+    $key = Get-PreflightRefusedNoticeKey -CandidateKey $CandidateKey
+    if ($null -ne $State -and $State.ContainsKey($key)) { [void]$State.Remove($key); return $true }
+    return $false
+}
+
 # --- repo-level parking of a dirty clone (T-clone-guard-pin-ignored-only-in-mindwire, v2.1 D-3) ---
 # An exit $DirtyCloneExitCode used to be counted like any launch: the LAUNCH commit stayed in
 # head_skip.json, so three refused runs on one head reached T42's threshold and the conductor
@@ -3675,7 +3749,8 @@ function Invoke-LaunchEndRetreat {
     param([string]$RepoDir, [string]$ThreadId, [string]$CandidateKey, [string]$HeadMsg,
           [string]$StopReason, [int]$ExitCode, [string]$StateDir, [scriptblock]$Retreat,
           [scriptblock]$Recover = $null)
-    if ($ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode -or
+    if ($ExitCode -eq $PreflightRefusedExitCode -or
+        $ExitCode -eq $DirtyCloneExitCode -or $ExitCode -eq $GitSyncDeferredExitCode -or
         $ExitCode -eq $PreflightDeferredExitCode -or $ExitCode -eq $RefSnapshotUnrecordedExitCode) { return 'skipped' }
     $rr = & $Retreat $RepoDir $ThreadId $HeadMsg $StopReason $StateDir
     $rcode = if ($null -ne $rr -and $null -ne $rr.code) { [int]$rr.code } else { -1 }
@@ -7539,7 +7614,7 @@ try {
         # its next outage alerts again (see Get-GitSyncDeferredNotice). An exit-$PreflightDeferredExitCode
         # run stopped before git-sync was reached, so it proves nothing about git-sync either way;
         # neither does an exit-$RefSnapshotUnrecordedExitCode run (the snapshot precedes git-sync).
-        if ($code -ne $RefSnapshotUnrecordedExitCode -and
+        if ($code -ne $PreflightRefusedExitCode -and $code -ne $RefSnapshotUnrecordedExitCode -and
             $code -ne $PreflightDeferredExitCode -and $code -ne $GitSyncDeferredExitCode -and
             (Clear-GitSyncDeferredNotice -State $notifyState -RepoDir $cand.repo_dir -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
@@ -7554,6 +7629,16 @@ try {
         # A run whose preflight passed (MINDWIRE_PREFLIGHT_OK, any exit code) ends that repo's
         # preflight-deferral episode, so its next outage alerts from 'open' again (D-5b).
         $preflightOk = Get-PreflightOkRepos -Output $output
+        # T-preflight-failure-counts-toward-stall D-1'': the same OK row ends THIS candidate's
+        # refusal notice (and only this candidate's — another clone of the same repo proves nothing
+        # about this one), so the next refusal is heard again. A run that printed OK and still exited
+        # $PreflightRefusedExitCode (a check=config refusal raised after the preflight) is NOT a
+        # recovery: clearing there would re-alert the same standing refusal every tick (PR #596 gate
+        # round 1, objection 1).
+        if ($preflightOk.seen -and $code -ne $PreflightRefusedExitCode -and (Clear-PreflightRefusedNotice -State $notifyState -CandidateKey $cand.key)) {
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "preflight-refused $($cand.key): episode over (preflight passed, exit=$code) — notice key cleared"
+        }
         if ($preflightOk.seen -and $preflightDeferredEpisodes.Count -gt 0) {
             $endedEpisodes = Clear-PreflightDeferredEpisodes -Episodes $preflightDeferredEpisodes -NotifyState $notifyState `
                 -Repos $preflightOk.repos -RepoDir $cand.repo_dir
@@ -7822,6 +7907,28 @@ try {
                 Save-JsonState -Path $notifyStatePath -State $notifyState
             }
             Write-Log "preflight-deferred $($cand.key): exit=$code repo=$pfRepoKey episode=$($pfTransition.action) count=$($pfTransition.record.count) — no quarantine, retry-pending untouched; other candidates on this repo_dir skipped this tick, other repos CONTINUE"
+            continue
+        }
+
+        # EXIT CODE $PreflightRefusedExitCode — the preflight refused the run (T-preflight-failure-
+        # counts-toward-stall, design v3 D-1''). The role was never spawned. MUST stay above the
+        # generic non-zero branch below: there it counted toward launches_same_head (three refusals
+        # became a STALLED "the role posted nothing", msg-9782) and toward retry -> quarantine.
+        # Like exit 11 for the launch and retry-pending (reverted / untouched), but NOT repo-scoped:
+        # no other candidate is skipped (Obj-1-2), and the notice is this candidate's own (Obj-2-1).
+        if ($code -eq $PreflightRefusedExitCode) {
+            $dispositions[$cand.key] = 'preflight-refused'
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if ($revert.ok) { Write-Log "preflight-refused $($cand.key): LAUNCH commit reverted (not counted toward backoff / launches_same_head)" }
+            else { Write-Log "WARN preflight-refused $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            if ($retryState.pending.ContainsKey($cand.key)) {
+                $retryLaunched--
+                Write-Log "retry-launch $($cand.key): preflight refused (exit $code) — retry-pending kept, retry not consumed"
+            }
+            $prNotice = Get-PreflightRefusedNotice -CandidateKey $cand.key -RepoDir $cand.repo_dir -Output $output -ExitCode $code
+            Send-NotificationIfChanged -State $notifyState -Key $prNotice.key -Signature $prNotice.signature -Message $prNotice.message
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "preflight-refused $($cand.key): exit=$code check=$($prNotice.check) sig=$($prNotice.signature) — role NOT started; no quarantine, retry-pending untouched, no repo skip; sweep CONTINUES"
             continue
         }
 
