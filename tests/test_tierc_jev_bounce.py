@@ -154,7 +154,11 @@ async def test_retry_of_a_jev_bounce_always_reaches_the_human(tmp_path: Path) ->
     outcome, _, mcp = await _run(gate, decider, proposer_replies=[retry])
     assert outcome.stop_reason is StopReason.HUMAN
     assert len(_bounces(mcp)) == 1
-    assert [r["kind"] for r in _rows(gate)] == [LogKind.BOUNCED.value, LogKind.RETRY_ADMIT.value]
+    assert [r["kind"] for r in _rows(gate)] == [
+        LogKind.BOUNCED.value,
+        LogKind.RETRY_ADMIT.value,
+        LogKind.ESCALATED.value,
+    ]
     assert decider.calls == 2  # Jev still judged the retry; it just may not bounce it
 
 
@@ -182,7 +186,7 @@ async def test_anything_but_likely_not_reaches_the_human(
     outcome, _, mcp = await _run(gate, _Decider(result))
     assert outcome.stop_reason is StopReason.HUMAN
     assert _bounces(mcp) == []
-    assert _rows(gate) == []
+    assert [r["kind"] for r in _rows(gate)] == [LogKind.ESCALATED.value]  # delivered (msg-9650 §4)
 
 
 @pytest.mark.anyio
@@ -191,7 +195,7 @@ async def test_shadow_mode_never_acts(tmp_path: Path) -> None:
     outcome, _, mcp = await _run(gate, _Decider(LIKELY_NOT, mode="shadow"))
     assert outcome.stop_reason is StopReason.HUMAN
     assert _bounces(mcp) == []
-    assert _rows(gate) == []
+    assert [r["kind"] for r in _rows(gate)] == [LogKind.ESCALATED.value]  # delivered (msg-9650 §4)
 
 
 @pytest.mark.anyio
@@ -207,7 +211,7 @@ async def test_unsure_label_is_not_bounced_by_jev(tmp_path: Path) -> None:
     outcome, _, mcp = await _run(gate, _Decider(LIKELY_NOT), head=UNSURE)
     assert outcome.stop_reason is StopReason.HUMAN
     assert _bounces(mcp) == []
-    assert [r["kind"] for r in _rows(gate)] == [LogKind.ADMIT_UNSURE.value]
+    assert [r["kind"] for r in _rows(gate)] == [LogKind.ADMIT_UNSURE.value, LogKind.ESCALATED.value]
 
 
 @pytest.mark.anyio

@@ -63,6 +63,14 @@ FIX_NOW_EXCLUSION = (
     "順序・タイミングだけを問うハンドオフは、"
     "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
 )
+"""The v3 / v4 wording, which the casebook's pinned v3 frame still asks."""
+FIX_NOW_EXCLUSION_V5 = (
+    "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
+    "順序・タイミングだけを問うハンドオフは、"
+    "どの条にも当たらない(修正自体が人間が決めた仕様・方針の追加・削除・変更を伴う場合は、"
+    "その中身で判断する)。"
+)
+"""tierc-v5 (msg-9655 §2'): the fix-now exclusion follows the reworded rule_2 (msg-9652)."""
 
 
 # --- F2'': the ASK: line ------------------------------------------------------------------------
@@ -165,13 +173,16 @@ def test_a_reply_written_as_instructed_keeps_its_label_and_passes_the_gate() -> 
 
 def test_v4_frame_is_v3_plus_the_merge_exclusion_only() -> None:
     instructions = tierc_v2_questions(RULES)[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert instructions.endswith(FIX_NOW_EXCLUSION + MERGE_EXCLUSION)
-    assert "権限" not in instructions and "guard" not in instructions  # dropped (msg-6871 §3)
+    assert instructions.endswith(FIX_NOW_EXCLUSION_V5 + MERGE_EXCLUSION)
+    # the permission / tool exclusion was dropped from the frame (msg-6871 §3); rule_6 (the rules
+    # file, above the blank line) legitimately names 権限, so check the frame sentence only
+    frame = instructions.rsplit("\n\n", 1)[1]
+    assert "権限" not in frame and "guard" not in frame
     assert MERGE_EXCLUSION not in TEMPLATE.read_text(encoding="utf-8")
     proceed = tierc_v2_questions(RULES, proceed=True)[SHOULD_ASK_HUMAN_KEY]["instructions"]
     assert "merge" not in proceed
-    assert TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v4"
-    assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v2-proceed"
+    assert TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v5"
+    assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v3-proceed"
 
 
 def _casebook() -> Any:
@@ -194,4 +205,11 @@ def test_casebook_keeps_asking_the_pinned_v3_frame() -> None:
     assert v3.endswith(FIX_NOW_EXCLUSION)
     assert MERGE_EXCLUSION not in v3
     live = tierc_v2_questions(RULES)[SHOULD_ASK_HUMAN_KEY]["instructions"]
-    assert live == v3 + MERGE_EXCLUSION  # v4 differs from v3 by that sentence only
+    # v4 differed from v3 by the merge sentence only; v5 also drops the article count from the
+    # frame (msg-9647 §2) and rewords the fix-now exclusion after rule_2 (msg-9655 §2').
+    v3_as_v5 = (
+        v3.replace("次の五ヶ条は", "次の各条は")
+        .replace("五ヶ条のいずれかに当たり", "次の各条のいずれかに当たり")
+        .replace(FIX_NOW_EXCLUSION, FIX_NOW_EXCLUSION_V5)
+    )
+    assert live == v3_as_v5 + MERGE_EXCLUSION

@@ -54,6 +54,7 @@ from spirrow_mindwire.tier_c_admission_gate import (
     LEGACY_LABEL_MAP,
     RELEASE_CROSS_REPO_HINT,
     RELEASE_CROSS_REPO_LABEL,
+    SUBSTANCE_LABELS,
     UNSURE_LABEL,
     AdmissionVerdict,
     BounceReason,
@@ -230,7 +231,8 @@ class TestMainLabelEvaluation:
 
     @pytest.mark.parametrize("label", sorted(ADMIT_LABELS))
     def test_admit_label_admits(self, label: str) -> None:
-        body = f"TIER-C: {label}\nNEXT: human\n"
+        basis = "SECURITY-BASIS: exposure src/x.py:12\n" if label == "security" else ""
+        body = f"{basis}TIER-C: {label}\nNEXT: human\n"
         result = decide_admission(
             body=body,
             author="alice",
@@ -543,8 +545,11 @@ class TestStructuralInvariants:
     """Invariants pinned in the function shape, not its body."""
 
     def test_admit_labels_are_the_tier_c_intents(self) -> None:
-        """msg-3630 §2.1, minus ``merge-protected`` (msg-4361, 2026-10-03)."""
-        assert frozenset({"goal", "cost", "irreversible"}) == ADMIT_LABELS
+        """msg-3630 §2.1, minus ``merge-protected`` (msg-4361, 2026-10-03), plus ``security``
+        and ``dispute`` (T-tier-c-six-articles-security-boundary msg-9650 §1.2)."""
+        assert frozenset({"goal", "cost", "irreversible", "security", "dispute"}) == ADMIT_LABELS
+        assert frozenset({"goal", "cost", "irreversible", "security"}) == SUBSTANCE_LABELS
+        assert SUBSTANCE_LABELS < ADMIT_LABELS
 
     def test_merge_protected_bounces_as_not_tier_c(self) -> None:
         """msg-4361: a merge is requested by the PR; the label bounces and says why."""
