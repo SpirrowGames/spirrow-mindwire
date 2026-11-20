@@ -100,7 +100,8 @@ class TierCGate:
         (:func:`~spirrow_mindwire.tier_c_security_holds.open_holds`); ``released_holds`` are the
         hold ids a human released with ``HOLD-RELEASE:`` in this thread. A release not yet stamped
         in the log is stamped on the rows this call writes (``holds_released``), so replay knows
-        which refusals came before it.
+        which refusals came before it; when the decision writes no row (a plain admit), a
+        ``HOLD_RELEASED`` row carries the stamp, so the release survives without the thread line.
 
         The rows are written **before** the caller posts any bounce: a bounce whose ``BOUNCED`` row
         failed to land would hand the author a uuid the RETRY lookup has never heard of, and every
@@ -120,6 +121,16 @@ class TierCGate:
         entries: Sequence[LogEntry] = decision.log_entries
         stamped = stamped_releases(self.log_path, thread=thread, author=author)
         unstamped = [hold_id for hold_id in released_ids if hold_id not in stamped]
+        if unstamped and not entries:
+            # A plain admit writes no row, so the release gets one of its own (PR #595 gate
+            # round 3): without it the release would live only in the thread line, and replay
+            # without that line would see the hold open again.
+            entries = (
+                LogEntry(
+                    kind=LogKind.HOLD_RELEASED,
+                    payload={"ts": now.isoformat(), "author": author},
+                ),
+            )
         if unstamped:
             # Stamp the release's position in the log (PR #595 gate round 2): refusals logged
             # before this row stay in the released hold's history; later ones open new holds.

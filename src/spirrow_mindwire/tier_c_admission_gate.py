@@ -127,6 +127,11 @@ class LogKind(StrEnum):
       added by T-tier-c-six-articles-security-boundary (Bohr msg-9650 §4) so arrivals can be
       counted per label and ``msg_id``. It re-opens the enum msg-3708 closed at six (recorded
       as a DECIDED there). Never emitted by :func:`decide_admission`.
+    * ``HOLD_RELEASED`` — the conductor's admission saw a human's ``HOLD-RELEASE:`` that the log
+      did not carry yet, and the decision itself wrote no row to stamp it on (a plain admit).
+      Its ``holds_released`` field fixes the release's position in the log for hold replay
+      (T-tier-c-six-articles-security-boundary, PR #595 gate round 3). Never emitted by
+      :func:`decide_admission`.
     """
 
     DECIDED = "DECIDED"
@@ -136,6 +141,7 @@ class LogKind(StrEnum):
     ADMIT_UNSURE = "ADMIT_UNSURE"
     RETRY_ADMIT = "RETRY_ADMIT"
     ESCALATED = "ESCALATED"
+    HOLD_RELEASED = "HOLD_RELEASED"
 
 
 class RetryAdmitReason(StrEnum):

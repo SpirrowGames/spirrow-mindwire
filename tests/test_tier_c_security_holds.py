@@ -48,6 +48,9 @@ def _admit(
     )
 
 
+_PLAIN_GOAL = "plain\nTIER-C: goal\nNEXT: human\n"
+
+
 def _sec(text: str, basis: str = "") -> str:
     return f"{text}\n{basis}TIER-C: security\nNEXT: human\n"
 
@@ -166,6 +169,34 @@ def test_duplicates_before_and_after_a_release_split_at_the_release(tmp_path: Pa
         assert (hold.hold_id, hold.held_msg_id, hold.history) == ("u3", "m3", [])
     stamped = [r for r in iter_rows(tmp_path / "log.jsonl") if r.get("holds_released")]
     assert [(r["msg_id"], r["holds_released"]) for r in stamped] == [("m3", ["u1"])]
+
+
+def test_a_plain_admit_persists_the_release_for_replay_without_the_thread_line(
+    tmp_path: Path,
+) -> None:
+    """PR #595 gate round 3: a plain admit writes no decision row, so the release gets a
+    ``HOLD_RELEASED`` row of its own; replay without resupplying the release keeps u1 released,
+    and an identical refusal after it opens a hold of its own."""
+    gate = _gate(tmp_path)
+    _admit(gate, _sec("A"), "m1")
+    _admit(gate, _sec("A"), "m2")
+    plain = _admit(gate, _PLAIN_GOAL, "m3", released=("u1",))
+    assert plain.verdict is AdmissionVerdict.ADMIT
+    assert not plain.log_entries
+    (row,) = [r for r in iter_rows(gate.log_path) if r.get("holds_released")]
+    assert (row["kind"], row["msg_id"], row["author"], row["holds_released"]) == (
+        LogKind.HOLD_RELEASED.value,
+        "m3",
+        A,
+        ["u1"],
+    )
+    assert gate.holds(thread=T, author=A) == []
+    # A second admit with the same thread line stamps nothing again.
+    _admit(gate, _PLAIN_GOAL, "m4", released=("u1",))
+    assert len([r for r in iter_rows(gate.log_path) if r.get("holds_released")]) == 1
+    _admit(gate, _sec("A"), "m5")
+    (hold,) = gate.holds(thread=T, author=A)
+    assert (hold.hold_id, hold.held_msg_id, hold.history) == ("u5", "m5", [])
 
 
 def test_jev_likely_not_on_security_opens_a_semantic_hold(tmp_path: Path) -> None:
