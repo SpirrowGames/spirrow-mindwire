@@ -78,7 +78,7 @@ from .adapters._sdk_result import emit_sdk_error_marker, find_sdk_error_signal
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.decider_lexora import build_decider
 from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
-from .adapters.implementer import ImplementerSdkAdapter
+from .adapters.implementer import ImplementerSdkAdapter, implementer_turn_timeout_s
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .clone_guard import (
     DIRTY_CLONE_EXIT_CODE,
@@ -97,6 +97,9 @@ from .conductor.core import (
 from .conductor.handoff import conditional_proceed_notice
 from .conductor.retry_notice import RetryOf, parse_retry_of
 from .conductor.run_budget import (
+    NON_IMPLEMENTER_RESERVE_S,
+    YIELD_MARGIN_S,
+    PostPhaseMcp,
     RunPhase,
     post_run_timeout_notice,
     run_with_budget,
@@ -1275,6 +1278,16 @@ def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
     )
 
 
+def _implementer_reserve_s() -> float:
+    """What an implementer turn needs left to start: its turn timeout + ``YIELD_MARGIN_S``."""
+    return implementer_turn_timeout_s() + YIELD_MARGIN_S
+
+
+def _other_reserve_s() -> float:
+    """What a proposer / naysayer / PR-gate turn needs left to start (msg-9833 D1)."""
+    return NON_IMPLEMENTER_RESERVE_S
+
+
 async def run_conductor(
     settings: MindwireSettings,
     *,
@@ -1326,17 +1339,33 @@ async def run_conductor(
     is cancelled, and a stop notice is posted (exit 0) or, if it cannot be posted within
     ``RELAY_POST_BUDGET_S``, :class:`~spirrow_mindwire.conductor.run_budget.RunTimeoutError` is
     raised (exit 5). The budgets are checked first, before anything is read or spawned.
+
+    T-run-budget-exhausted-by-chain-dispatches-new-turn (Bohr msg-9833 / msg-9835 / msg-9837,
+    endorsed by Einstein msg-9838): the implementer's reserve (its turn timeout +
+    ``YIELD_MARGIN_S``) is checked against the budget at startup and handed to the Conductor,
+    which refuses to start a turn the budget cannot hold (``budget_yield``). Every chatroom post
+    of the run goes through :class:`~spirrow_mindwire.conductor.run_budget.PostPhaseMcp`, so the
+    phase at the deadline says whether a post was in flight. A deadline that hits an
+    ``AUTO_RESUME_PHASES`` phase posts nothing and stops on ``budget_cut`` (exit 0): the head has
+    not moved and the next tick re-runs it, bounded by the T42 stall watchdog.
     """
     cond_cfg = settings.conductor
+    implementer_reserve_s = _implementer_reserve_s()
+    other_reserve_s = _other_reserve_s()
     validate_budgets(
-        run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
+        run_budget_s=cond_cfg.run_budget_s,
+        run_hard_budget_s=cond_cfg.run_hard_budget_s,
+        implementer_reserve_s=implementer_reserve_s,
+        other_reserve_s=other_reserve_s,
     )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
     run_phase = RunPhase()
+    run_phase.implementer_reserve_s = implementer_reserve_s
+    run_phase.other_reserve_s = other_reserve_s
     project = settings.loop.project
     thread_id = cond_cfg.task_thread_id
-    chatroom = mcp
+    chatroom = PostPhaseMcp(mcp, run_phase)
 
     async def _body() -> ConductorOutcome:
         return await _run_conductor_once(
@@ -1362,11 +1391,33 @@ async def run_conductor(
     if timed_out is None:
         assert outcome is not None
         return outcome
+    if timed_out.fields.get("auto_resume"):
+        # D3'' (msg-9837): cut off where nothing outside was written and no post was in flight.
+        # Post nothing: the head is unchanged and the next tick re-runs it. Not terminal and not
+        # notified (StopReason.ps1); the bound is the T42 stall watchdog on the unchanged head.
+        cut = ConductorOutcome(
+            rounds=run_phase.rounds_started,
+            stop_reason=StopReason.BUDGET_CUT,
+            last_msg_id=None,
+            forced_naysayer_turns=0,
+        )
+        logger.info(
+            "conductor stopped: reason=%s rounds=%d forced_naysayer=0 "
+            "forced_naysayer_saveable=0 last_msg=None",
+            cut.stop_reason.value,
+            cut.rounds,
+        )
+        return cut
     # The ``conductor.run_timeout`` line is already in the log (run_with_budget wrote it at the
     # deadline). Producer declaration: see ``post_run_timeout_notice`` — reader = the thread's
     # human; fallback = disposition (3), exit 5 via RunTimeoutError.
     posted = await post_run_timeout_notice(
-        mcp, project=project, thread_id=thread_id, event=timed_out, author=CONDUCTOR_RELAY_AUTHOR
+        mcp,
+        project=project,
+        thread_id=thread_id,
+        event=timed_out,
+        author=CONDUCTOR_RELAY_AUTHOR,
+        turns=tuple(run_phase.turns),
     )
     # Same ``conductor stopped:`` line shape as ``Conductor._stop``; HUMAN for the same reason the
     # spawn-timeout give-up uses it (a person has to act; Stage 1 SKIPs the ``NEXT: human`` head).

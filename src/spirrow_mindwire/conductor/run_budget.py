@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
@@ -80,7 +81,66 @@ RELAY_POST_BUDGET_S = 30.0
 
 PHASE_IDLE = "conductor"
 
+# T-run-budget-exhausted-by-chain-dispatches-new-turn (Bohr msg-9833 D1 / msg-9835 D1' / msg-9837
+# D3'', endorsed by Einstein msg-9838). A turn is dispatched only while the run has at least its
+# reserve left; otherwise the run stops on ``budget_yield`` and the next tick picks the same head
+# up with a full budget.
+#: Margin on top of the implementer's own turn timeout: the stop-notice post
+#: (:data:`RELAY_POST_BUDGET_S`) plus teardown. A margin, not a guarantee (Einstein msg-9834 #2):
+#: what holds is that the check runs immediately before the implementer's ``query``.
+YIELD_MARGIN_S = 120.0
+#: Reserve for every other turn (proposer / naysayer / the PR gate), which has no turn timeout of
+#: its own. A policy constant: re-read it against the per-run turn table this change records.
+NON_IMPLEMENTER_RESERVE_S = 600.0
+
+#: Phase of a chatroom post made outside a role's dispatch (the conductor's or the gate's own
+#: relay). A role's reply is ``<role>.post``. Both are set by :class:`PostPhaseMcp`, the one place
+#: every chatroom write of a conductor run passes through (msg-9837 D3''-2).
+PHASE_RELAY_POST = "relay.post"
+PHASE_PR_GATE = "pr_gate.review"
+
+#: The phases in which a run cut off by the budget is re-run on the next tick without a notice
+#: (msg-9837 D3''-4). None of them writes outside before its reply is posted, and a post in
+#: progress is ``<role>.post`` / ``relay.post``, which is not here. ``conductor`` (between two
+#: calls) is deliberately absent: the gap after the PR gate returned and before its relay was
+#: posted is ``conductor``, and re-running it would fire the gate again. ``implementer.dispatch``,
+#: ``pr_gate.review`` and ``teardown`` are absent because they may have written outside.
+AUTO_RESUME_PHASES: frozenset[str] = frozenset(
+    {
+        "proposer.spawn",
+        "proposer.dispatch",
+        "naysayer.spawn",
+        "naysayer.dispatch",
+        "implementer.spawn",
+        "thread.read",
+        "launch.resolve",
+    }
+)
+
+#: Log line of a dispatch the budget refused (D1').
+EVENT_KIND_BUDGET_YIELD = "conductor.budget_yield"
+#: Log line of a run cut off in an :data:`AUTO_RESUME_PHASES` phase (D3'').
+EVENT_KIND_BUDGET_CUT = "conductor.budget_cut"
+
 _T = TypeVar("_T")
+
+
+@dataclass
+class TurnRecord:
+    """One turn (or PR-gate review) this run dispatched (msg-9835 D2'): the timeout report's rows.
+
+    ``started_s`` / ``duration_s`` are seconds from the start of the run; ``duration_s`` is
+    ``None`` for the turn still running at the deadline. ``msg_id`` is the last post that landed
+    during the turn, ``-`` when none did.
+    """
+
+    round: int
+    role: str
+    identity: str
+    phase: str
+    started_s: float
+    duration_s: float | None = None
+    msg_id: str = "-"
 
 
 class RunPhase:
@@ -99,9 +159,86 @@ class RunPhase:
         # have posted, so the sweep must treat the run as one that did work (it then ends the
         # sweep for the tick and keeps the raw output in the log) rather than as an idle no-op.
         self.rounds_started = 0
+        # Set by :func:`run_with_budget` (loop clock). ``None`` = no budget around this run
+        # (tests, library use): every budget check passes.
+        self.started_at: float | None = None
+        self.deadline: float | None = None
+        # When :attr:`current` was entered (loop clock); restored together with it.
+        self.phase_started_at: float | None = None
+        # The implementer's reserve (D1'): its configured turn timeout + YIELD_MARGIN_S. The
+        # composition root sets it; the default only covers the margin.
+        self.implementer_reserve_s = YIELD_MARGIN_S
+        self.other_reserve_s = NON_IMPLEMENTER_RESERVE_S
+        self.turns: list[TurnRecord] = []
 
     def enter(self, phase: str) -> _PhaseScope:
         return _PhaseScope(self, phase)
+
+    @staticmethod
+    def now() -> float | None:
+        """The running loop's clock, or ``None`` outside a loop."""
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return None
+
+    def remaining_s(self) -> float | None:
+        """Seconds left before the run's deadline, or ``None`` when no budget is running."""
+        now = self.now()
+        if self.deadline is None or now is None:
+            return None
+        return self.deadline - now
+
+    def reserve_s(self, role: str) -> float:
+        """What a ``role`` turn needs left to start (D1')."""
+        if role == "implementer":
+            return self.implementer_reserve_s
+        return self.other_reserve_s
+
+    def short_for(self, role: str) -> tuple[float, float] | None:
+        """``(remaining, reserve)`` when a ``role`` turn must not start now, else ``None``.
+
+        Boundary (msg-9835 D1'): ``remaining < reserve`` stops; equal goes on.
+        """
+        remaining = self.remaining_s()
+        if remaining is None:
+            return None
+        reserve = self.reserve_s(role)
+        if remaining < reserve:
+            return remaining, reserve
+        return None
+
+    def elapsed_s(self) -> float:
+        now = self.now()
+        if self.started_at is None or now is None:
+            return 0.0
+        return now - self.started_at
+
+    def begin_turn(self, *, round_index: int, role: str, identity: str, phase: str) -> TurnRecord:
+        record = TurnRecord(
+            round=round_index,
+            role=role,
+            identity=identity,
+            phase=phase,
+            started_s=round(self.elapsed_s(), 1),
+        )
+        self.turns.append(record)
+        return record
+
+    def end_turn(self, record: TurnRecord) -> None:
+        record.duration_s = round(self.elapsed_s() - record.started_s, 1)
+
+    def note_post(self, msg_id: str) -> None:
+        """A chatroom post landed: credit it to the turn still running, if any."""
+        if msg_id and self.turns and self.turns[-1].duration_s is None:
+            self.turns[-1].msg_id = msg_id
+
+    def in_flight_s(self) -> float:
+        """How long the current phase has been running."""
+        now = self.now()
+        if self.phase_started_at is None or now is None:
+            return 0.0
+        return now - self.phase_started_at
 
 
 class _PhaseScope:
@@ -113,26 +250,84 @@ class _PhaseScope:
     (``tests/test_adapter_error_stop_line.py``). ``__exit__`` never looks at the exception.
     """
 
-    __slots__ = ("_phase", "_previous", "_run_phase")
+    __slots__ = ("_phase", "_previous", "_previous_at", "_run_phase")
 
     def __init__(self, run_phase: RunPhase | None, phase: str) -> None:
         self._run_phase = run_phase
         self._phase = phase
         self._previous = PHASE_IDLE
+        self._previous_at: float | None = None
 
     def __enter__(self) -> None:
         if self._run_phase is not None:
             self._previous = self._run_phase.current
+            self._previous_at = self._run_phase.phase_started_at
             self._run_phase.current = self._phase
+            self._run_phase.phase_started_at = RunPhase.now()
 
     def __exit__(self, *_exc: object) -> None:
         if self._run_phase is not None:
             self._run_phase.current = self._previous
+            self._run_phase.phase_started_at = self._previous_at
 
 
 def enter_phase(run_phase: RunPhase | None, phase: str) -> _PhaseScope:
     """:meth:`RunPhase.enter`, or nothing when no phase object was wired (tests, library use)."""
     return _PhaseScope(run_phase, phase)
+
+
+def post_phase_for(current: str) -> str:
+    """The phase of a chatroom post made while the run is in ``current`` (msg-9837 D3''-2).
+
+    Inside a role's dispatch the post is that role's reply (``<role>.post``); anywhere else it is
+    the conductor's or the gate's own relay (:data:`PHASE_RELAY_POST`).
+    """
+    role, _, step = current.partition(".")
+    if step == "dispatch" and role in ("proposer", "naysayer", "implementer"):
+        return f"{role}.post"
+    return PHASE_RELAY_POST
+
+
+class PostPhaseMcp:
+    """Wraps the run's :class:`McpToolCaller` so every chatroom post runs in a ``*.post`` phase.
+
+    The one place a conductor run's chatroom writes pass through (msg-9837 D3''-2): the
+    composition root hands this object to the gateway (role replies), the PR-gate orchestrator
+    (verdict relay, ledger) and the Conductor (its own relay posts). A post cut off by the budget
+    is therefore never in an :data:`AUTO_RESUME_PHASES` phase, and its unknown outcome goes to a
+    person. A post that landed is credited to the running turn (:meth:`RunPhase.note_post`).
+    """
+
+    def __init__(self, inner: McpToolCaller, run_phase: RunPhase) -> None:
+        self._inner = inner
+        self._run_phase = run_phase
+
+    @property
+    def inner(self) -> McpToolCaller:
+        """The transport this wraps: resolution and the run still share one client."""
+        return self._inner
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name != "chatroom_post_message":
+            return await self._inner.call_tool(name, arguments)
+        with self._run_phase.enter(post_phase_for(self._run_phase.current)):
+            result = await self._inner.call_tool(name, arguments)
+        msg = result.get("msg") if isinstance(result, dict) else None
+        if isinstance(msg, dict) and msg.get("msg_id"):
+            self._run_phase.note_post(str(msg["msg_id"]))
+        return result
+
+
+def emit_budget_yield(*, remaining_s: float, reserve_s: float, role: str, rounds: int) -> None:
+    """The one log line of a dispatch the budget refused (D1)."""
+    logger.info(
+        "%s remaining_s=%.1f reserve_s=%.1f role=%s rounds=%d",
+        EVENT_KIND_BUDGET_YIELD,
+        remaining_s,
+        reserve_s,
+        role,
+        rounds,
+    )
 
 
 class RunTimeoutError(SystemExit):
@@ -147,8 +342,20 @@ class RunTimeoutError(SystemExit):
         self.event = event
 
 
-def validate_budgets(*, run_budget_s: float, run_hard_budget_s: float) -> None:
+def validate_budgets(
+    *,
+    run_budget_s: float,
+    run_hard_budget_s: float,
+    implementer_reserve_s: float | None = None,
+    other_reserve_s: float | None = None,
+) -> None:
     """Refuse to start when the soft path could not finish before the hard kill (msg-5498).
+
+    With ``implementer_reserve_s`` (msg-9833 D1), also refuse a budget no implementer turn could
+    ever start under: the reserve must be below ``run_budget_s``. With ``other_reserve_s``, the
+    same for proposer / naysayer / PR-gate turns (PR #597 gate, REQUEST_CHANGES @ 9bf1a1a): a
+    budget at or below their reserve would make every such turn yield on a fresh run, so the
+    thread could never advance and would stand down instead.
 
     Raises ``SystemExit`` with the reason, like the other ``[conductor]`` startup checks.
     """
@@ -160,12 +367,37 @@ def validate_budgets(*, run_budget_s: float, run_hard_budget_s: float) -> None:
             f"run_budget_s ({run_budget_s}) + {RELAY_POST_BUDGET_S:g} s (the stop-notice post "
             f"budget), so a soft timeout is reported before the hard kill"
         )
+    if implementer_reserve_s is not None and implementer_reserve_s >= run_budget_s:
+        raise SystemExit(
+            f"[conductor].run_budget_s ({run_budget_s}) must be greater than the implementer's "
+            f"reserve ({implementer_reserve_s:g} s = its turn timeout + {YIELD_MARGIN_S:g} s), "
+            f"or no implementer turn could ever be dispatched"
+        )
+    if other_reserve_s is not None and other_reserve_s >= run_budget_s:
+        raise SystemExit(
+            f"[conductor].run_budget_s ({run_budget_s}) must be greater than the "
+            f"proposer / naysayer / PR-gate reserve ({other_reserve_s:g} s), "
+            f"or none of those turns could ever be dispatched"
+        )
 
 
 def run_timeout_event(
-    *, budget_s: float, elapsed_s: float, phase: str, project: str, thread: str
+    *,
+    budget_s: float,
+    elapsed_s: float,
+    phase: str,
+    project: str,
+    thread: str,
+    in_flight_s: float = 0.0,
+    turns: int = 0,
 ) -> Event:
-    """Build the ``conductor.run_timeout`` event (no message body, per the I6 Event convention)."""
+    """Build the ``conductor.run_timeout`` event (no message body, per the I6 Event convention).
+
+    ``in_flight_phase`` / ``in_flight_s`` / ``in_flight_share`` describe the call running at the
+    deadline (msg-9835 D2'). The share is an observation only and decides nothing (Einstein
+    msg-9834 #1). ``auto_resume`` is decided by the phase alone (:data:`AUTO_RESUME_PHASES`).
+    """
+    share = round(in_flight_s / elapsed_s, 2) if elapsed_s > 0 else 0.0
     return Event(
         event_id=new_ulid(),
         occurred_at=datetime.now(UTC),
@@ -176,6 +408,11 @@ def run_timeout_event(
             "phase": phase,
             "project": project,
             "thread": thread,
+            "in_flight_phase": phase,
+            "in_flight_s": round(in_flight_s, 1),
+            "in_flight_share": share,
+            "turns": turns,
+            "auto_resume": phase in AUTO_RESUME_PHASES,
         },
     )
 
@@ -184,33 +421,82 @@ def emit_run_timeout(event: Event) -> None:
     """Write the event as one warning line (the line a quarantine record's log tail carries)."""
     f = event.fields
     logger.warning(
-        "%s budget_s=%s elapsed_s=%s phase=%s project=%s thread=%s",
+        "%s budget_s=%s elapsed_s=%s phase=%s project=%s thread=%s "
+        "in_flight_phase=%s in_flight_s=%s turns=%s",
         event.kind,
         f.get("budget_s"),
         f.get("elapsed_s"),
         f.get("phase"),
         f.get("project"),
         f.get("thread"),
+        f.get("in_flight_phase"),
+        f.get("in_flight_s"),
+        f.get("turns"),
     )
 
 
-def render_run_timeout_notice(event: Event) -> str:
+def emit_budget_cut(event: Event) -> None:
+    """The run was cut off in an :data:`AUTO_RESUME_PHASES` phase: no notice, rerun next tick."""
+    f = event.fields
+    logger.info(
+        "%s phase=%s in_flight_s=%s turns=%s project=%s thread=%s",
+        EVENT_KIND_BUDGET_CUT,
+        f.get("in_flight_phase"),
+        f.get("in_flight_s"),
+        f.get("turns"),
+        f.get("project"),
+        f.get("thread"),
+    )
+
+
+def render_turn_table(turns: tuple[TurnRecord, ...]) -> str:
+    """The turns of this run as a Markdown table (D2')."""
+    if not turns:
+        return "(この起動で dispatch したターンはありません)"
+    lines = [
+        "| round | role | identity | phase | 開始 (秒) | 所要 (秒) | msg |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for t in turns:
+        duration = "実行中" if t.duration_s is None else f"{t.duration_s}"
+        lines.append(
+            f"| {t.round} | {t.role} | {t.identity} | `{t.phase}` | {t.started_s} | "
+            f"{duration} | {t.msg_id} |"
+        )
+    return "\n".join(lines)
+
+
+def render_run_timeout_notice(event: Event, turns: tuple[TurnRecord, ...] = ()) -> str:
     """The notice posted into the thread after the soft budget expired.
 
     Ends on ``NEXT: human`` like the conductor's other stop notices, with the stop marker above
     it (design §18.4), so the next sweep tick SKIPs instead of launching into the same hang.
+
+    Facts only (msg-9835 D2'): the phase running at the deadline, how long it had run and its
+    share of the run (an observation, not a diagnosis), and the turns of this run. A cut-off
+    implementer turn adds where the wrapper may have put its unpushed commits.
     """
     f = event.fields
+    phase = str(f.get("phase"))
+    wip = (
+        "\n\n実装ターンの途中で取り消しました。ラッパーが未 push のコミットをローカル ref "
+        "`wip/*` に退避していることがあります。"
+        "`git for-each-ref refs/heads/wip --sort=-creatordate` で確かめてください。"
+        if phase.startswith("implementer.")
+        else ""
+    )
     return (
         f"Conductor run timeout — 1 回の起動の時間上限を超えたので止めました\n\n"
         f"- 上限: {f.get('budget_s')} 秒 (`[conductor].run_budget_s`)\n"
         f"- 経過: {f.get('elapsed_s')} 秒\n"
-        f"- 止まっていた箇所: `{f.get('phase')}`\n\n"
+        f"- 上限の時点で動いていたのは `{phase}` で、経過は {f.get('in_flight_s')} 秒"
+        f" (起動全体の {f.get('in_flight_share')})\n\n"
         f"この起動は上限までに終わらなかったので、実行中の呼び出しを取り消しました "
-        f"(`{EVENT_KIND_RUN_TIMEOUT}`)。途中のターンの返信は投稿されていない可能性があります。"
-        f"原因は特定していません。上の箇所が、上限の時点で待っていた呼び出しです。\n\n"
-        f"次にやること: ループ host のログで、この箇所の呼び出しが返らなかった理由を"
-        f"確認してください。直したら、進め先の `NEXT:` を書いてください。"
+        f"(`{EVENT_KIND_RUN_TIMEOUT}`)。上の処理は外部に書いた可能性があるため、"
+        f"自動では再実行しません。\n\n"
+        f"この起動で進めたターン:\n\n{render_turn_table(turns)}"
+        f"{wip}\n\n"
+        f"次にやること: 上の処理が外部に何を残したかを確かめ、進め先の `NEXT:` を書いてください。"
         f"head が動くまでループは再開しません。\n\n"
         f"{render_stop_marker(event)}\n\n"
         f"NEXT: {HUMAN_TOKEN}"
@@ -218,7 +504,13 @@ def render_run_timeout_notice(event: Event) -> str:
 
 
 async def post_run_timeout_notice(
-    mcp: McpToolCaller, *, project: str, thread_id: str, event: Event, author: str
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    thread_id: str,
+    event: Event,
+    author: str,
+    turns: tuple[TurnRecord, ...] = (),
 ) -> str:
     """Post the run-timeout notice, bounded by :data:`RELAY_POST_BUDGET_S`. Returns the ``msg_id``.
 
@@ -241,7 +533,7 @@ async def post_run_timeout_notice(
                     "thread_id": thread_id,
                     "msg_type": "report",
                     "author": author,
-                    "content": render_run_timeout_notice(event),
+                    "content": render_run_timeout_notice(event, turns),
                 },
             )
     except ThreadResolvedError as exc:
@@ -316,6 +608,8 @@ async def run_with_budget(
     """
     loop = asyncio.get_running_loop()
     started = loop.time()
+    run_phase.started_at = started
+    run_phase.deadline = started + budget_s
     fired: list[Event] = []
     scope = asyncio.timeout(None)
 
@@ -326,8 +620,15 @@ async def run_with_budget(
             phase=run_phase.current,
             project=project,
             thread=thread,
+            in_flight_s=run_phase.in_flight_s(),
+            turns=len(run_phase.turns),
         )
+        # The ``conductor.run_timeout`` line is written for every phase (it is what a quarantine
+        # record's log tail looks for). D3'': a cut-off in an auto-resume phase adds the
+        # ``conductor.budget_cut`` line; nobody is told about it and the next tick re-runs it.
         emit_run_timeout(event)
+        if event.fields["auto_resume"]:
+            emit_budget_cut(event)
         fired.append(event)
         scope.reschedule(loop.time())
 
@@ -347,19 +648,32 @@ async def run_with_budget(
 
 
 __all__ = [
+    "AUTO_RESUME_PHASES",
+    "EVENT_KIND_BUDGET_CUT",
+    "EVENT_KIND_BUDGET_YIELD",
     "EVENT_KIND_RUN_KILLED",
     "EVENT_KIND_RUN_TIMEOUT",
+    "NON_IMPLEMENTER_RESERVE_S",
     "PHASE_IDLE",
+    "PHASE_PR_GATE",
+    "PHASE_RELAY_POST",
     "RELAY_POST_BUDGET_S",
     "RUN_KILLED_EXIT_CODE",
     "RUN_KILL_UNCONFIRMED_EXIT_CODE",
     "RUN_TIMEOUT_EXIT_CODE",
+    "YIELD_MARGIN_S",
+    "PostPhaseMcp",
     "RunPhase",
     "RunTimeoutError",
+    "TurnRecord",
+    "emit_budget_cut",
+    "emit_budget_yield",
     "emit_run_timeout",
     "enter_phase",
+    "post_phase_for",
     "post_run_timeout_notice",
     "render_run_timeout_notice",
+    "render_turn_table",
     "run_timeout_event",
     "run_with_budget",
     "validate_budgets",

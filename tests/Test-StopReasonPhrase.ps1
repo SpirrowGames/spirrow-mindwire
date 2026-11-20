@@ -293,6 +293,8 @@ $unnotified = @(
     'pr_settled'     # pr-review on an already merged/closed PR: the fact is posted, its NEXT hands on (msg-7560)
     'resume_retry'   # gate resume could not read GitHub / head moved: silent retry, bounded by the stall watchdog
     'slice_end'      # gate-lane run handed its relay / ci-route head to the role lane (msg-6313 §1′)
+    'budget_yield'   # the run's budget could not hold the next turn: not started, head unchanged, next tick (msg-9835 D1')
+    'budget_cut'     # budget ran out where nothing outside was written: no notice, head unchanged, next tick (msg-9837 D3'')
     'summon_yield'   # yielded to a Summon (T-human-call-priority-interrupt): heard via the digest's Summon line
     'adapter_error'  # adapter raised; exit!=0 -> quarantine, where the K alert sounds
 )

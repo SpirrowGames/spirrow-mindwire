@@ -170,6 +170,19 @@ def _read_float_env(name: str, default: float) -> float:
         return default
 
 
+def implementer_turn_timeout_s() -> float:
+    """The implementer's turn timeout as the adapter resolves it when none is passed in.
+
+    ``MINDWIRE_IMPLEMENTER_TURN_TIMEOUT_SECONDS`` or :data:`_DEFAULT_TURN_TIMEOUT_SECONDS`. The
+    conductor's run budget reads it to size the implementer's reserve
+    (T-run-budget-exhausted-by-chain-dispatches-new-turn, msg-9833 D1), so the reserve follows an
+    operator's override instead of a copy of the default.
+    """
+    return _read_float_env(
+        "MINDWIRE_IMPLEMENTER_TURN_TIMEOUT_SECONDS", _DEFAULT_TURN_TIMEOUT_SECONDS
+    )
+
+
 def _extract_sdk_pid(client: Any) -> int | None:
     """Best-effort extraction of the SDK subprocess pid for verify (v12).
 
@@ -587,10 +600,7 @@ class ImplementerSdkAdapter:
         self._turn_timeout_seconds = (
             turn_timeout_seconds
             if turn_timeout_seconds is not None
-            else _read_float_env(
-                "MINDWIRE_IMPLEMENTER_TURN_TIMEOUT_SECONDS",
-                _DEFAULT_TURN_TIMEOUT_SECONDS,
-            )
+            else implementer_turn_timeout_s()
         )
         # v12 — the SDK executable's absolute path. Used by the fallback
         # ``lookup_and_assign_leftover`` to distinguish OUR ``claude.exe``
