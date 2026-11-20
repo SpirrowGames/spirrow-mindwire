@@ -3571,13 +3571,17 @@ function Get-PreflightRefusedNoticeKey {
     return "preflight-refused:$CandidateKey"
 }
 
-# Whitespace runs collapse to one space and the text is capped, so the same refusal printed with a
-# different line layout keeps one signature.
+# Whitespace runs collapse to one space, so the same refusal printed with a different line layout
+# keeps one signature. The signature is the SHA-256 of the COMPLETE normalised detail (PR #596 gate
+# round 1, objection 2): a truncated prefix would give two refusals that differ only after it one
+# signature and swallow the "changed refusal alerts again" notice. The payload detail is already
+# bounded by the daemon; the body shows it in full and no display cap feeds the signature.
 function ConvertTo-PreflightRefusedSignatureDetail {
     param([string]$Detail)
     $d = ("$Detail" -replace '\s+', ' ').Trim()
-    if ($d.Length -gt 300) { $d = $d.Substring(0, 300) }
-    return $d
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($d)) } finally { $sha.Dispose() }
+    return (-join ($hash | ForEach-Object { $_.ToString('x2') }))
 }
 
 function Get-PreflightRefusedNotice {
@@ -7627,8 +7631,11 @@ try {
         $preflightOk = Get-PreflightOkRepos -Output $output
         # T-preflight-failure-counts-toward-stall D-1'': the same OK row ends THIS candidate's
         # refusal notice (and only this candidate's — another clone of the same repo proves nothing
-        # about this one), so the next refusal is heard again.
-        if ($preflightOk.seen -and (Clear-PreflightRefusedNotice -State $notifyState -CandidateKey $cand.key)) {
+        # about this one), so the next refusal is heard again. A run that printed OK and still exited
+        # $PreflightRefusedExitCode (a check=config refusal raised after the preflight) is NOT a
+        # recovery: clearing there would re-alert the same standing refusal every tick (PR #596 gate
+        # round 1, objection 1).
+        if ($preflightOk.seen -and $code -ne $PreflightRefusedExitCode -and (Clear-PreflightRefusedNotice -State $notifyState -CandidateKey $cand.key)) {
             Save-JsonState -Path $notifyStatePath -State $notifyState
             Write-Log "preflight-refused $($cand.key): episode over (preflight passed, exit=$code) — notice key cleared"
         }

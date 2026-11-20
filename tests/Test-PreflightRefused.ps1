@@ -87,7 +87,7 @@ Check 'notice key is per candidate' "preflight-refused:$keyA" (Get-PreflightRefu
 $n = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -Output $out13 -ExitCode 13
 Check 'notice key' "preflight-refused:$keyA" $n.key
 Check 'notice check' 'P1' $n.check
-Check 'signature = check + normalised detail' $true ($n.signature -like 'preflight-refused:P1:preflight P1 failed: could not fetch rules*')
+Check 'signature = check + sha256 of the normalised detail' $true ($n.signature -match '^preflight-refused:P1:[0-9a-f]{64}$')
 Check 'body says the role was not started' $true ($n.message -like '*role は起動していません*')
 Check 'body names the check' $true ($n.message -like '*preflight の P1 が*')
 Check 'body carries the detail' $true ($n.message -like '*HTTP 404*')
@@ -99,6 +99,13 @@ $nLayout = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -Exit
 Check 'whitespace-only change keeps the signature' $n.signature $nLayout.signature
 $nOther = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -ExitCode 13 -Output (New-RefusedOutput -Check 'P3' -Detail 'preflight P3 failed: no core.hooksPath')
 Check 'a different refusal changes the signature' $true ($nOther.signature -ne $n.signature)
+# PR #596 gate round 1, objection 2: a long common prefix (> 300 chars) followed by a different
+# diagnostic must still change the signature — the whole detail feeds the hash, not a prefix.
+$longPrefix = 'preflight P1 failed: could not fetch rules for SpirrowGames/spirrow-mindwire@main: ' + ('x' * 400)
+$nLong502 = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -ExitCode 13 -Output (New-RefusedOutput -Detail "$longPrefix gh: Bad Gateway (HTTP 502)")
+$nLong404 = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -ExitCode 13 -Output (New-RefusedOutput -Detail "$longPrefix gh: Not Found (HTTP 404)")
+Check 'details differing only after 300+ common chars get distinct signatures' $true ($nLong502.signature -ne $nLong404.signature)
+Check 'the body carries the full detail (tail diagnostic visible)' $true ($nLong404.message -like '*HTTP 404*')
 $nBad = Get-PreflightRefusedNotice -CandidateKey $keyA -RepoDir $cloneA -ExitCode 13 -Output @('MINDWIRE_PREFLIGHT_REFUSED_PAYLOAD {bad')
 Check 'unreadable payload still notifies (check unknown)' 'unknown' $nBad.check
 Check 'unreadable payload body still says the role was not started' $true ($nBad.message -like '*role は起動していません*')
@@ -111,7 +118,7 @@ $script:sent = @()
 function Invoke-Run {
     param([hashtable]$Notify, [hashtable]$Episodes, [string]$CandKey, [string]$RepoDir, [int]$Code, $Output, [datetime]$Now)
     $okRow = Get-PreflightOkRepos -Output $Output
-    if ($okRow.seen) { $null = Clear-PreflightRefusedNotice -State $Notify -CandidateKey $CandKey }
+    if ($okRow.seen -and $Code -ne $PreflightRefusedExitCode) { $null = Clear-PreflightRefusedNotice -State $Notify -CandidateKey $CandKey }
     if ($okRow.seen -and $Episodes.Count -gt 0) {
         $null = Clear-PreflightDeferredEpisodes -Episodes $Episodes -NotifyState $Notify -Repos $okRow.repos -RepoDir $RepoDir
     }
@@ -158,6 +165,21 @@ Check '3. OK row on exit 1 also clears' $false $notify.ContainsKey("preflight-re
 $null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 13 -Output $out13 -Now $t0.AddMinutes(96)
 $null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 1 -Output @('boom') -Now $t0.AddMinutes(112)
 Check '3. exit 1 without OK row keeps the notice' $true $notify.ContainsKey("preflight-refused:$keyA")
+
+# PR #596 gate round 1, objection 1: a config refusal is raised AFTER the preflight printed its OK
+# row, so the run carries both OK and exit 13. That OK is not a recovery: the standing refusal must
+# stay suppressed tick after tick, not re-alert every tick.
+Write-Host '3b. config refusal after OK (OK row + exit 13) does not re-alert every tick'
+$notify = @{}; $eps = @{}; $script:sent = @()
+$cfgOut = @($okOut[0]) + (New-RefusedOutput -Check 'config' -Detail 'conductor configuration refused: roster is empty')
+$null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 13 -Output $cfgOut -Now $t0
+Check '3b. first config refusal alerts' 1 $script:sent.Count
+$null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 13 -Output $cfgOut -Now $t0.AddMinutes(16)
+$null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 13 -Output $cfgOut -Now $t0.AddMinutes(32)
+Check '3b. the same config refusal on later ticks stays suppressed' 1 $script:sent.Count
+Check '3b. the notice key survives the OK row of an exit-13 run' $true $notify.ContainsKey("preflight-refused:$keyA")
+$null = Invoke-Run -Notify $notify -Episodes $eps -CandKey $keyA -RepoDir $cloneA -Code 0 -Output $okOut -Now $t0.AddMinutes(48)
+Check '3b. a run that gets past the config (exit 0 + OK) ends it' $false $notify.ContainsKey("preflight-refused:$keyA")
 
 # --- 6. two clones of the same owner/repo: B's OK never clears A's refusal ------------------------------
 Write-Host '6. A refused, B (other clone, same repo) OK, A refused again, A OK'
@@ -286,7 +308,7 @@ $posClear = $body.IndexOf('Clear-PreflightRefusedNotice -State $notifyState -Can
 $posBranch = $body.IndexOf('if ($code -eq $PreflightRefusedExitCode)')
 $posNonZero = $body.IndexOf('if ($code -ne 0) {')
 Check 'refusal clear is keyed by THIS candidate and follows the OK row' $true ($posClear -gt $posOk -and $posOk -gt $posInner)
-Check 'refusal clear needs the OK row' $true ($body -match 'if \(\$preflightOk\.seen -and \(Clear-PreflightRefusedNotice')
+Check 'refusal clear needs the OK row and a non-13 exit' $true ($body -match 'if \(\$preflightOk\.seen -and \$code -ne \$PreflightRefusedExitCode -and \(Clear-PreflightRefusedNotice')
 Check 'refusal clear precedes the exit-13 branch' $true ($posClear -lt $posBranch)
 Check 'exit-13 branch precedes the generic non-zero (quarantine) branch' $true ($posBranch -gt $posInner -and $posBranch -lt $posNonZero)
 Check '5. no per-repo skip exists for refusals (other candidates of the repo still launch)' $false ($body -match 'preflightRefusedRepoDirs|preflight-refused-skipped')
