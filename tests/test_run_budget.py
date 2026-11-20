@@ -288,6 +288,13 @@ async def test_post_that_does_not_land_exits_5(mode: str, monkeypatch: pytest.Mo
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture(autouse=True)
+def _no_implementer_reserve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests use sub-second budgets; the implementer-reserve startup check (msg-9833 D1)
+    would refuse every one of them. It is tested in test_run_budget_yield.py."""
+    monkeypatch.setattr(loop_runner, "_implementer_reserve_s", lambda: 0.0)
+
+
 def _settings(tmp_path: Path, *, run_budget_s: float = 0.1) -> MindwireSettings:
     return MindwireSettings(
         loop=Stage3LoopConfig(project="spirrow-mindwire", repo_dir=tmp_path),
@@ -443,6 +450,9 @@ async def test_cancelled_dispatch_records_no_adapter_error_snapshot() -> None:
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
     phase = RunPhase()
+    # This test is about a dispatch cut off by the deadline, so the turn must be allowed to start
+    # under a 0.1 s budget (the reserve check is tested in test_run_budget_yield.py).
+    phase.other_reserve_s = 0.0
     slot = ConductorStopSlot()
     conductor = _phase_conductor(mcp, _PhaseDispatcher(mcp, phase, hang=True), phase, slot)
     _result, event = await run_with_budget(
