@@ -452,6 +452,13 @@ async def test_cut_right_after_the_reply_landed_is_auto_resumed_and_not_redone()
 
 
 def test_auto_resume_phases_are_exactly_the_endorsed_set() -> None:
+    """msg-9837 D3''-4 safe-side rule: a role's ``*.dispatch`` may be in the set only if its posts
+    are shown to switch to ``<role>.post``. That is verified by msg-9837 tests 2, 3 and 5 (not
+    test 1, which is the implementer's query start — Einstein msg-9838):
+    ``test_cut_mid_reply_post_is_not_auto_resumed``,
+    ``test_cut_mid_relay_post_is_not_auto_resumed``,
+    ``test_cut_right_after_the_reply_landed_is_auto_resumed_and_not_redone`` and
+    ``test_conductor_run_post_sites_are_the_pinned_set``."""
     assert {
         "proposer.spawn",
         "proposer.dispatch",
