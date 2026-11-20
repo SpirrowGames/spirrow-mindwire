@@ -97,6 +97,7 @@ from .conductor.core import (
 from .conductor.handoff import conditional_proceed_notice
 from .conductor.retry_notice import RetryOf, parse_retry_of
 from .conductor.run_budget import (
+    NON_IMPLEMENTER_RESERVE_S,
     YIELD_MARGIN_S,
     PostPhaseMcp,
     RunPhase,
@@ -1282,6 +1283,11 @@ def _implementer_reserve_s() -> float:
     return implementer_turn_timeout_s() + YIELD_MARGIN_S
 
 
+def _other_reserve_s() -> float:
+    """What a proposer / naysayer / PR-gate turn needs left to start (msg-9833 D1)."""
+    return NON_IMPLEMENTER_RESERVE_S
+
+
 async def run_conductor(
     settings: MindwireSettings,
     *,
@@ -1345,15 +1351,18 @@ async def run_conductor(
     """
     cond_cfg = settings.conductor
     implementer_reserve_s = _implementer_reserve_s()
+    other_reserve_s = _other_reserve_s()
     validate_budgets(
         run_budget_s=cond_cfg.run_budget_s,
         run_hard_budget_s=cond_cfg.run_hard_budget_s,
         implementer_reserve_s=implementer_reserve_s,
+        other_reserve_s=other_reserve_s,
     )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
     run_phase = RunPhase()
     run_phase.implementer_reserve_s = implementer_reserve_s
+    run_phase.other_reserve_s = other_reserve_s
     project = settings.loop.project
     thread_id = cond_cfg.task_thread_id
     chatroom = PostPhaseMcp(mcp, run_phase)

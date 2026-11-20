@@ -293,6 +293,7 @@ def _no_implementer_reserve(monkeypatch: pytest.MonkeyPatch) -> None:
     """These tests use sub-second budgets; the implementer-reserve startup check (msg-9833 D1)
     would refuse every one of them. It is tested in test_run_budget_yield.py."""
     monkeypatch.setattr(loop_runner, "_implementer_reserve_s", lambda: 0.0)
+    monkeypatch.setattr(loop_runner, "_other_reserve_s", lambda: 0.0)
 
 
 def _settings(tmp_path: Path, *, run_budget_s: float = 0.1) -> MindwireSettings:

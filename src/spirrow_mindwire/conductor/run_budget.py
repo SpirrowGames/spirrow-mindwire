@@ -347,11 +347,15 @@ def validate_budgets(
     run_budget_s: float,
     run_hard_budget_s: float,
     implementer_reserve_s: float | None = None,
+    other_reserve_s: float | None = None,
 ) -> None:
     """Refuse to start when the soft path could not finish before the hard kill (msg-5498).
 
     With ``implementer_reserve_s`` (msg-9833 D1), also refuse a budget no implementer turn could
-    ever start under: the reserve must be below ``run_budget_s``.
+    ever start under: the reserve must be below ``run_budget_s``. With ``other_reserve_s``, the
+    same for proposer / naysayer / PR-gate turns (PR #597 gate, REQUEST_CHANGES @ 9bf1a1a): a
+    budget at or below their reserve would make every such turn yield on a fresh run, so the
+    thread could never advance and would stand down instead.
 
     Raises ``SystemExit`` with the reason, like the other ``[conductor]`` startup checks.
     """
@@ -368,6 +372,12 @@ def validate_budgets(
             f"[conductor].run_budget_s ({run_budget_s}) must be greater than the implementer's "
             f"reserve ({implementer_reserve_s:g} s = its turn timeout + {YIELD_MARGIN_S:g} s), "
             f"or no implementer turn could ever be dispatched"
+        )
+    if other_reserve_s is not None and other_reserve_s >= run_budget_s:
+        raise SystemExit(
+            f"[conductor].run_budget_s ({run_budget_s}) must be greater than the "
+            f"proposer / naysayer / PR-gate reserve ({other_reserve_s:g} s), "
+            f"or none of those turns could ever be dispatched"
         )
 
 

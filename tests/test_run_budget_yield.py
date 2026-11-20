@@ -262,6 +262,50 @@ def test_reserve_follows_the_implementer_turn_timeout_override(
     assert loop_runner._implementer_reserve_s() == 1800 + YIELD_MARGIN_S
 
 
+def test_validate_budgets_refuses_a_budget_below_the_other_role_reserve() -> None:
+    validate_budgets(
+        run_budget_s=NON_IMPLEMENTER_RESERVE_S + 1,
+        run_hard_budget_s=4840,
+        implementer_reserve_s=220,
+        other_reserve_s=NON_IMPLEMENTER_RESERVE_S,
+    )
+    with pytest.raises(SystemExit, match="PR-gate reserve"):
+        validate_budgets(
+            run_budget_s=NON_IMPLEMENTER_RESERVE_S,
+            run_hard_budget_s=4840,
+            implementer_reserve_s=220,
+            other_reserve_s=NON_IMPLEMENTER_RESERVE_S,
+        )
+
+
+@pytest.mark.anyio
+async def test_startup_refuses_a_budget_only_the_implementer_reserve_fits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """PR #597 gate (REQUEST_CHANGES @ 9bf1a1a): implementer timeout 100 s and run_budget_s=500
+    passed startup (implementer reserve 220 s) although every proposer / naysayer / PR-gate turn
+    (reserve 600 s) would yield on every launch. Startup must refuse it before anything runs."""
+    monkeypatch.setenv("MINDWIRE_IMPLEMENTER_TURN_TIMEOUT_SECONDS", "100")
+    called: list[Any] = []
+
+    async def _once(*_a: Any, **_kw: Any) -> Any:
+        called.append(1)
+        raise AssertionError("must not run")
+
+    monkeypatch.setattr(loop_runner, "_run_conductor_once", _once)
+    settings = MindwireSettings(
+        loop=Stage3LoopConfig(project="spirrow-mindwire", repo_dir=tmp_path),
+        conductor=ConductorConfig(
+            task_thread_id="T-cond", run_budget_s=500, run_hard_budget_s=10_000
+        ),
+    )
+    chat = _FakeChatroomMcp()
+    with pytest.raises(SystemExit, match="PR-gate reserve"):
+        await loop_runner.run_conductor(settings, mcp=chat)
+    assert called == []
+    assert chat.posts == []
+
+
 # --------------------------------------------------------------------------- #
 # 3. time used after the check: the spawn
 # --------------------------------------------------------------------------- #
@@ -517,6 +561,7 @@ async def test_budget_cut_posts_nothing_and_exits_zero(
 ) -> None:
     chat = _FakeChatroomMcp()
     monkeypatch.setattr(loop_runner, "_implementer_reserve_s", lambda: 0.0)
+    monkeypatch.setattr(loop_runner, "_other_reserve_s", lambda: 0.0)
     monkeypatch.setattr(loop_runner, "_run_conductor_once", _hang_in(phase_name))
     outcome = await loop_runner.run_conductor(_settings(tmp_path), mcp=chat)
     assert outcome.stop_reason is StopReason.BUDGET_CUT
@@ -534,6 +579,7 @@ async def test_cut_that_may_have_written_outside_goes_to_a_person(
 ) -> None:
     chat = _FakeChatroomMcp()
     monkeypatch.setattr(loop_runner, "_implementer_reserve_s", lambda: 0.0)
+    monkeypatch.setattr(loop_runner, "_other_reserve_s", lambda: 0.0)
     monkeypatch.setattr(loop_runner, "_run_conductor_once", _hang_in(phase_name))
     outcome = await loop_runner.run_conductor(_settings(tmp_path), mcp=chat)
     assert outcome.stop_reason is StopReason.HUMAN
@@ -562,6 +608,7 @@ async def test_run_conductor_hands_the_wrapped_mcp_to_the_run(
         )
 
     monkeypatch.setattr(loop_runner, "_implementer_reserve_s", lambda: 0.0)
+    monkeypatch.setattr(loop_runner, "_other_reserve_s", lambda: 0.0)
     monkeypatch.setattr(loop_runner, "_run_conductor_once", _once)
     await loop_runner.run_conductor(_settings(tmp_path), mcp=_FakeChatroomMcp())
     assert isinstance(seen[0], PostPhaseMcp)
