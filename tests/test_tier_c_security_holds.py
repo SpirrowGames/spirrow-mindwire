@@ -139,6 +139,35 @@ def test_a_released_hold_does_not_absorb_a_later_identical_refusal(tmp_path: Pat
     assert (hold.hold_id, hold.held_msg_id, hold.history) == ("u2", "m2", [])
 
 
+def test_releasing_a_hold_does_not_resurrect_its_earlier_duplicates(tmp_path: Path) -> None:
+    """PR #595 gate round 2: u1 and its identical re-send u2 (before release) are one hold, and
+    releasing u1 releases that one hold; the historical u2 does not come back as its own."""
+    gate = _gate(tmp_path)
+    _admit(gate, _sec("A"), "m1")
+    _admit(gate, _sec("A"), "m2")
+    (hold,) = gate.holds(thread=T, author=A)
+    assert (hold.hold_id, [h["msg_id"] for h in hold.history]) == ("u1", ["m2"])
+    assert gate.holds(thread=T, author=A, released_holds=["u1"]) == []
+    # The next head after the release stamps it in the log and is not held.
+    third = _admit(gate, "plain\nTIER-C: goal\nNEXT: human\n", "m3", released=("u1",))
+    assert third.verdict is AdmissionVerdict.ADMIT
+    assert gate.holds(thread=T, author=A, released_holds=["u1"]) == []
+
+
+def test_duplicates_before_and_after_a_release_split_at_the_release(tmp_path: Path) -> None:
+    """Refusals before the release stay in u1's history; one after it opens its own hold, and
+    that stays true on every later replay."""
+    gate = _gate(tmp_path)
+    _admit(gate, _sec("A"), "m1")
+    _admit(gate, _sec("A"), "m2")
+    _admit(gate, _sec("A"), "m3", released=("u1",))
+    for _ in range(2):
+        (hold,) = gate.holds(thread=T, author=A, released_holds=["u1"])
+        assert (hold.hold_id, hold.held_msg_id, hold.history) == ("u3", "m3", [])
+    stamped = [r for r in iter_rows(tmp_path / "log.jsonl") if r.get("holds_released")]
+    assert [(r["msg_id"], r["holds_released"]) for r in stamped] == [("m3", ["u1"])]
+
+
 def test_jev_likely_not_on_security_opens_a_semantic_hold(tmp_path: Path) -> None:
     gate = _gate(tmp_path)
     body = _sec("x", "SECURITY-BASIS: widen 不明\n")

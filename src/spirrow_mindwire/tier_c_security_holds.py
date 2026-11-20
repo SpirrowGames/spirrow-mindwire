@@ -24,6 +24,13 @@ matter:
   the caller passes the released ids in. A released hold never absorbs a later refusal: an
   identical body refused after the release opens a new hold (PR #595 gate Obj-3).
 
+Release ordering (PR #595 gate round 2): the thread line carries no position in the log, so the
+gate stamps it there. The first rows it writes after it sees a release carry
+``holds_released: [<hold_id>, ...]``, and replay applies that release at that row, before the row
+itself. Refusals logged before the stamp stay in the released hold's history; only refusals at or
+after it open holds of their own. A release the caller passes in that has no stamp yet is applied
+after every row, which is the right place for it: every row in the log predates it.
+
 A resolved thread releases all its holds simply by never running again — holds are keyed by
 thread.
 """
@@ -31,7 +38,7 @@ thread.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,21 +79,45 @@ def open_holds(
     """The open holds of ``(thread, author)``, oldest first.
 
     ``released`` is the set of hold ids a human released with ``HOLD-RELEASE:`` in this thread.
+    A release counts from its ``holds_released`` stamp in the log, or after every row if it has
+    none yet (module docstring, release ordering).
     """
     released_ids = set(released)
+    released_so_far: set[str] = set()
     holds: dict[str, SecurityHold] = {}
-    for row in iter_rows(log_path):
-        if row.get("thread") != thread or row.get("author") != author:
-            continue
+    for row in _rows_of(log_path, thread=thread, author=author):
+        released_so_far.update(_stamped_releases(row))
         kind = row.get("kind")
         if kind == LogKind.BOUNCED.value and row.get("security_hold") is True:
-            _open_or_append(holds, row, thread=thread, author=author, released=released_ids)
+            _open_or_append(holds, row, thread=thread, author=author, released=released_so_far)
         for item in row.get("hold_history") or ():
             if isinstance(item, dict):
                 hold = holds.get(str(item.get("hold_id")))
                 if hold is not None:
                     hold.history.append({**item, "msg_id": row.get("msg_id")})
-    return [h for h in holds.values() if h.hold_id not in released_ids]
+    gone = released_ids | released_so_far
+    return [h for h in holds.values() if h.hold_id not in gone]
+
+
+def stamped_releases(log_path: Path, *, thread: str, author: str) -> set[str]:
+    """The hold ids whose release the log already carries as a ``holds_released`` stamp."""
+    stamped: set[str] = set()
+    for row in _rows_of(log_path, thread=thread, author=author):
+        stamped.update(_stamped_releases(row))
+    return stamped
+
+
+def _rows_of(log_path: Path, *, thread: str, author: str) -> Iterator[dict[str, Any]]:
+    for row in iter_rows(log_path):
+        if row.get("thread") == thread and row.get("author") == author:
+            yield row
+
+
+def _stamped_releases(row: dict[str, Any]) -> list[str]:
+    value = row.get("holds_released")
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value]
 
 
 def _open_or_append(
@@ -102,7 +133,7 @@ def _open_or_append(
     if hold_kind == "structural" and isinstance(sha, str):
         for hold in holds.values():
             if hold.hold_id in released:
-                continue  # a human released it: a later refusal is a hold of its own (Obj-3)
+                continue  # released before this row: a later refusal is a hold of its own (Obj-3)
             if hold.hold_kind == "structural" and hold.body_sha256 == sha:
                 hold.history.append(
                     {
@@ -129,4 +160,5 @@ __all__ = [
     "SecurityHold",
     "hold_release_ids",
     "open_holds",
+    "stamped_releases",
 ]
