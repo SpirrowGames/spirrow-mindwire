@@ -160,7 +160,11 @@ async def test_t1_retry_with_the_bounce_uuid_reaches_the_human(tmp_path: Path) -
     assert outcome.stop_reason is StopReason.HUMAN
     assert len(_bounce_posts(mcp)) == 1
     kinds = [r["kind"] for r in _rows(gate)]
-    assert kinds == [LogKind.BOUNCED.value, LogKind.RETRY_ADMIT.value]
+    assert kinds == [
+        LogKind.BOUNCED.value,
+        LogKind.RETRY_ADMIT.value,
+        LogKind.ESCALATED.value,
+    ]
     assert _rows(gate)[1]["reason"] == "second_time_force_admit"
 
 
@@ -269,7 +273,9 @@ async def test_correct_label_is_unchanged(tmp_path: Path) -> None:
     assert enforced[0].stop_reason is StopReason.HUMAN
     assert enforced[1].dispatches == baseline[1].dispatches
     assert enforced[2].posts == baseline[2].posts
-    assert _rows(gate) == []  # a plain admit writes nothing
+    assert [r["kind"] for r in _rows(gate)] == [
+        LogKind.ESCALATED.value
+    ]  # a plain admit writes nothing  # delivered (msg-9650 §4)
 
 
 @pytest.mark.anyio
@@ -281,7 +287,7 @@ async def test_relay_operator_and_human_are_unchanged(tmp_path: Path, author: st
     assert enforced[0] == baseline[0]
     assert enforced[1].dispatches == baseline[1].dispatches
     assert enforced[2].posts == baseline[2].posts
-    assert _rows(gate) == []
+    assert _rows(gate) == []  # never gated, so no ESCALATED either
 
 
 @pytest.mark.anyio

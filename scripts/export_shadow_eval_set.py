@@ -108,9 +108,10 @@ from spirrow_mindwire.config import load_settings
 
 LOG_PREFIX = "decider_decision "
 ROUTED_STOP = "stop"
-REGISTERED_QUESTIONS_VERSION = "tierc-v4"
+REGISTERED_QUESTIONS_VERSION = "tierc-v5"
 """msg-5753 DECIDED 2d-15 (re-registered as tierc-v4 by T-jev-tierc-audit-2026-10-12 F3,
-Bohr msg-6860): the one questions version ``eval/tierc/shadow-prereg.md`` registers.
+Bohr msg-6860, and as tierc-v5 by T-tier-c-six-articles-security-boundary): the one
+questions version ``eval/tierc/shadow-prereg.md`` registers.
 Equal to ``decider.questions.TIERC_ESCALATION_QUESTIONS_VERSION`` and to the pre-registration's
 §1 condition 3 — ``tests/test_tierc_registered_version.py`` fails the gate when they drift."""
 EVAL_SET_SHADOW = "shadow"

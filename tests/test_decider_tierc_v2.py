@@ -82,6 +82,18 @@ FIVE_ARTICLES = (
     "での操作、Takahito の手元にしかない情報の提供）",  # noqa: RUF001
     "AI 同士で決着がつかない対立の裁定（proposer と naysayer が合意に至らないとき）",  # noqa: RUF001
 )
+# T-tier-c-six-articles-security-boundary: rule_2 reworded by msg-9652, rule_6 added by msg-9638
+# (both verbatim). rule_1 / 3 / 4 / 5 keep the 9/28 text.
+SIX_ARTICLES = (
+    FIVE_ARTICLES[0],
+    "人間が決めた仕様・方針の追加・削除・変更の承認：human / Fermi 名義の裁定、承認済み ADR、"  # noqa: RUF001
+    "プロダクトのゴールや受け入れ条件。",
+    *FIVE_ARTICLES[2:],
+    "セキュリティ上の信頼境界を広げる・緩める変更の承認：権限や資格情報のスコープ拡大、"  # noqa: RUF001
+    "新しい秘密情報の導入、許可リストや egress の追加、ガードを fail-closed から fail-open に"
+    "変えること・無効化すること。秘密情報の露出が疑われる場合は、具体的な該当箇所"
+    "（文字列・ファイル・コミット）を示せるときに限って上げる。",  # noqa: RUF001
+)
 
 GREY = AdmissionGateResult(
     verdict=AdmissionVerdict.ADMIT, kind=LogKind.ADMIT_UNSURE, label="unsure:goal?"
@@ -144,10 +156,18 @@ class FakeClient:
 # --------------------------------------------------------------------------- rules file
 
 
-def test_template_carries_the_five_articles_verbatim() -> None:
-    assert [r.id for r in RULES.rules] == [f"rule_{i}" for i in range(1, 6)]
-    assert tuple(r.text for r in RULES.rules) == FIVE_ARTICLES
-    assert RULES.matched_rule_options == ("rule_1", "rule_2", "rule_3", "rule_4", "rule_5", "none")
+def test_template_carries_the_six_articles_verbatim() -> None:
+    assert [r.id for r in RULES.rules] == [f"rule_{i}" for i in range(1, 7)]
+    assert tuple(r.text for r in RULES.rules) == SIX_ARTICLES
+    assert RULES.matched_rule_options == (
+        "rule_1",
+        "rule_2",
+        "rule_3",
+        "rule_4",
+        "rule_5",
+        "rule_6",
+        "none",
+    )
     assert RULES.sha256 == hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
 
 
@@ -155,7 +175,31 @@ def test_rule_5_carries_the_three_round_guideline() -> None:
     """msg-4380 Δ5: the round guideline is in the rules file (Takahito can edit it)."""
     note = RULES.rules[4].note
     assert note is not None and "3 回以上" in note and "VERDICT: APPROVE" in note
-    assert all(r.note is None for r in RULES.rules[:4])
+    assert RULES.rules[2].note is None and RULES.rules[3].note is None
+
+
+def test_rule_1_carries_the_cost_threshold() -> None:
+    """msg-9767: the 500-yen/month threshold is judgement material for rule_1."""
+    note = RULES.rules[0].note
+    assert note is not None
+    assert "月 500 円未満" in note and "DECIDED:" in note
+    assert "新しい外部サービス" in note and "見積もれない" in note
+
+
+def test_rule_2_note_carries_the_agent_design_exclusion() -> None:
+    """msg-9652 / msg-9655 §2': agent-decided design is not rule_2 unless it changes a
+    human ruling."""
+    note = RULES.rules[1].note
+    assert note is not None
+    assert "エージェントが自分たちで決めた設計" in note and "承認済み ADR" in note
+
+
+def test_rule_6_note_carries_both_judgement_materials() -> None:
+    """msg-9638 依頼 2: tightening alone is out of scope; exposure needs a concrete location."""
+    note = RULES.rules[5].note
+    assert note is not None
+    assert "境界の内側の強化" in note and "だけを理由として" in note
+    assert "具体的な該当箇所" in note
 
 
 @pytest.mark.parametrize(
@@ -192,8 +236,8 @@ def test_should_ask_human_question_shape() -> None:
     assert sa["type"] == "noul"
     # msg-4361 criteria, verbatim
     assert sa["criteria"] == {
-        "true": "五ヶ条のいずれかに当たる",
-        "false": "五ヶ条のどれにも当たらない",
+        "true": "次の各条のいずれかに当たる",
+        "false": "次の各条のどれにも当たらない",
     }
     for r in RULES.rules:
         assert f"- {r.id}: {r.text}" in sa["instructions"]
@@ -206,9 +250,9 @@ def test_matched_rule_is_a_choice_over_rule_ids_and_none() -> None:
     # TypeSafe's choice criteria is a {option: description} map; Jev answers an array with a 422
     assert isinstance(mr["criteria"], dict)
     assert list(mr["criteria"]) == list(RULES.matched_rule_options)
-    assert list(mr["criteria"].values())[:5] == list(FIVE_ARTICLES)
+    assert list(mr["criteria"].values())[:6] == list(SIX_ARTICLES)
     # the rule texts ride on the options, not repeated in the instructions
-    assert not any(text in mr["instructions"] for text in FIVE_ARTICLES)
+    assert not any(text in mr["instructions"] for text in SIX_ARTICLES)
 
 
 def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
@@ -220,13 +264,13 @@ def test_questions_follow_the_rules_file(tmp_path: Path) -> None:
     assert "- rule_1: ほげ" in q[SHOULD_ASK_HUMAN_KEY]["instructions"]
     assert q[MATCHED_RULE_KEY]["criteria"] == {
         "rule_1": "ほげ",
-        "none": "五ヶ条のどれにも当たらない",
+        "none": "どのルールにも当たらない",
     }
 
 
 def test_v2_request_body() -> None:
     body = build_decide_request(_state(), policy=POLICY_LIVE_TIERC, rules=RULES)
-    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v4"
+    assert body["questions_version"] == TIERC_ESCALATION_QUESTIONS_VERSION == "tierc-v5"
     assert body["questions"] == tierc_v2_questions(RULES)
     v1 = build_decide_request(_state(), policy=POLICY_LIVE_TIERC)
     assert v1["questions_version"] == "tierc-v1"
@@ -239,7 +283,8 @@ def test_fix_now_vs_follow_up_exclusion_is_in_the_should_ask_frame_only() -> Non
     exclusion = (
         "ただし、指摘を今の PR で直すか follow-up PR で直すかの"
         "順序・タイミングだけを問うハンドオフは、"
-        "どの条にも当たらない(修正自体が仕様の追加・削除・変更を伴う場合は、その中身で判断する)。"
+        "どの条にも当たらない(修正自体が人間が決めた仕様・方針の追加・削除・変更を伴う場合は、"
+        "その中身で判断する)。"
     )
     q = tierc_v2_questions(RULES)
     instructions = q[SHOULD_ASK_HUMAN_KEY]["instructions"]
@@ -249,10 +294,10 @@ def test_fix_now_vs_follow_up_exclusion_is_in_the_should_ask_frame_only() -> Non
     assert "follow-up" not in proceed[SHOULD_ASK_HUMAN_KEY]["instructions"]
     assert set(q) == {SHOULD_ASK_HUMAN_KEY, MATCHED_RULE_KEY}
     assert q[SHOULD_ASK_HUMAN_KEY]["criteria"] == {
-        "true": "五ヶ条のいずれかに当たる",
-        "false": "五ヶ条のどれにも当たらない",
+        "true": "次の各条のいずれかに当たる",
+        "false": "次の各条のどれにも当たらない",
     }
-    assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v2-proceed"
+    assert TIERC_V2_PROCEED_QUESTIONS_VERSION == "tierc-v3-proceed"
 
 
 def test_dispute_rounds_on_wire_only_when_computed() -> None:
@@ -284,7 +329,7 @@ def test_evaluate_tierc_v2_boundaries(p: float, kind: TierCVerdictKind) -> None:
     v = evaluate_tierc_v2(p)
     assert v.kind is kind and v.ask_score == p
     assert v.scope is TierCScope.IN_GATE and v.fired_reason is None
-    assert v.questions_version == "tierc-v4"
+    assert v.questions_version == "tierc-v5"
 
 
 def test_v2_threshold_defaults_are_the_preregistered_values() -> None:
@@ -330,7 +375,7 @@ async def test_v2_every_gate_result_is_sent_and_in_gate(gate: AdmissionGateResul
     assert dr.matched_rule_source == MATCHED_RULE_SOURCE_CHOICE == "choice"
     assert dr.matched_rule_error is None
     assert dr.rules_sha256 == RULES.sha256
-    assert dr.questions_version == "tierc-v4"
+    assert dr.questions_version == "tierc-v5"
 
 
 @pytest.mark.anyio
@@ -347,7 +392,7 @@ async def test_v2_bad_should_ask_human_is_malformed(payload: dict[str, Any]) -> 
     dr = await decide_once(_state(), client=FakeClient(payload), policy="p", rules=RULES)
     assert dr.outcome is DecisionOutcome.NO_VERDICT_MALFORMED
     assert dr.verdict is None and dr.error is not None
-    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v4"
+    assert dr.rules_sha256 == RULES.sha256 and dr.questions_version == "tierc-v5"
 
 
 @pytest.mark.anyio
@@ -390,7 +435,7 @@ async def test_v2_null_provider_and_transport_error_keep_version_fields() -> Non
         _state(), client=FakeClient(exc=LexoraTimeoutError("t")), policy="p", rules=RULES
     )
     assert te.outcome is DecisionOutcome.TRANSPORT_ERROR
-    assert te.questions_version == "tierc-v4" and te.rules_sha256 == RULES.sha256
+    assert te.questions_version == "tierc-v5" and te.rules_sha256 == RULES.sha256
     assert te.matched_rule is None and te.matched_rule_source is None
 
 
@@ -689,7 +734,7 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
     (line,) = _decider_lines(caplog)
     assert line["matched_rule"] == "rule_2" and line["matched_rule_source"] == "choice"
     assert line["rules_sha256"] == RULES.sha256
-    assert line["questions_version"] == "tierc-v4"
+    assert line["questions_version"] == "tierc-v5"
     assert line["ask_line"] is False  # T-jev-tierc-audit-2026-10-12 F2'': no ASK: line
     assert line["verdict"]["scope"] == "in_gate"
     assert line["gate_kind"] is None and line["gate_is_grey_zone"] is False  # labelled ADMIT
@@ -844,7 +889,7 @@ def test_replay_v2_dry_run_keeps_gateless_rows_in_gate(tmp_path: Path) -> None:
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(recs) == 2  # the gate_result-less row is not skipped under v2
     assert {r["scope"] for r in recs} == {"in_gate"}
-    assert {r["questions_version"] for r in recs} == {"tierc-v4"}
+    assert {r["questions_version"] for r in recs} == {"tierc-v5"}
     assert {r["rules_sha256"] for r in recs} == {RULES.sha256}
     assert recs[0]["state"]["dispute_rounds"] == 2
     assert "dispute_rounds" not in recs[1]["state"]
@@ -890,7 +935,7 @@ def test_replay_v2_endpoint_snapshots_rules_and_records_sha(
         ]
     )  # fmt: skip
     assert rc == 0
-    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v4"}
+    assert len(seen) == 2 and {b["questions_version"] for b in seen} == {"tierc-v5"}
     assert (snap / f"{RULES.sha256}.toml").read_bytes() == TEMPLATE.read_bytes()
     recs = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     for r in recs:
