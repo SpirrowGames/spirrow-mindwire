@@ -192,3 +192,23 @@ def test_record_failure_keeps_a_quarantine_failed_lease(
     assert code == 1 and "recording the quarantine" in err
     [kept] = store.leases("sample")
     assert kept.state is LeaseState.QUARANTINE_FAILED and kept.turn_id == "t2"
+
+
+def test_prep_defaults_branch_to_git_sync_name_and_base_to_mirror_head(
+    tmp_path: Path,
+    origin: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A3: the wrapper passes neither; the branch is ``loop/<stem>`` (git_sync D8, generation 1)
+    and a new branch starts from the default branch the mirror's HEAD names."""
+    monkeypatch.setattr(clone_slot_cli, "_trusted", lambda p: True)
+    argv = _prep_argv(tmp_path, origin, "T-Some_Thread", "t1")
+    for flag in ("--branch", "--base"):
+        i = argv.index(flag)
+        del argv[i : i + 2]
+    code, out, _ = _run(argv, capsys)
+    assert code == 0, out
+    slot = tmp_path / "slots" / "sample" / "slot-01"
+    assert _git(slot, "branch", "--show-current").strip() == "loop/t-some_thread"
+    assert _git(slot, "rev-parse", "HEAD") == _git(origin, "rev-parse", "main")
