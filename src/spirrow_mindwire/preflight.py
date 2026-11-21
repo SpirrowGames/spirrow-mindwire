@@ -248,6 +248,20 @@ PREFLIGHT_DEFERRED_EXIT_CODE = 11
 # rides on the exit code alone.
 PREFLIGHT_DEFERRED_PAYLOAD_PREFIX = "MINDWIRE_PREFLIGHT_DEFERRED_PAYLOAD "
 
+# T-preflight-failure-counts-toward-stall (design v3, Bohr msg-9812, go Einstein): a preflight
+# that REFUSED the run (a terminal PreflightError from P0/P1/P2/P3, or an unexpected exception
+# wrapped by loop_runner._preflight) used to end with exit 1, which the sweep counts as a launch
+# (launches_same_head) and as a thread failure (retry -> quarantine) although the role was never
+# spawned. It now ends with this dedicated code; the sweep mirrors it as
+# $PreflightRefusedExitCode (a pytest pins the two), reverts the LAUNCH, leaves retry-pending
+# alone, and notifies per candidate. Fail-closed is unchanged: the role is still never started.
+PREFLIGHT_REFUSED_EXIT_CODE = 13
+
+# stdout sentinel of the one JSON row ``loop_runner.main`` prints before exiting 13:
+# ``{"check": "P0"|"P1"|"P2"|"P3"|"unexpected", "detail": <capped message>}``. The wrapper reads
+# it only for the notification; the do-not-count decision rides on the exit code alone.
+PREFLIGHT_REFUSED_PAYLOAD_PREFIX = "MINDWIRE_PREFLIGHT_REFUSED_PAYLOAD "
+
 # stdout sentinel printed right after the preflight passed (design v2 D-5b). The wrapper ends
 # a repo's deferral episode when it sees this line, whatever the run's exit code: a role that
 # fails AFTER a passing preflight still proves the API answered.
@@ -283,6 +297,35 @@ _TRANSIENT_NETWORK_MARKERS = (
 FailureKind = Literal["transient", "terminal"]
 
 
+_JSON_STATUS_RE = re.compile(r'"status"\s*:\s*"?(\d{3})"?')
+
+
+def classify_gh_output(stderr: str, stdout: str) -> tuple[FailureKind, str]:
+    """Classify a failed ``gh api`` call from both of its streams (design v3 D-3').
+
+    Returns ``(kind, basis)``; ``basis`` names what decided it. The order is fixed, so a status
+    string on one stream can never overturn a known diagnosis on the other (no concatenation):
+
+    1. stderr is non-empty → stderr ALONE decides (:func:`classify_gh_failure`, unchanged: an
+       HTTP status or transport marker is classified, anything else unknown stays terminal).
+    2. stderr is empty → read stdout, where gh prints the HTTP error body: a JSON ``"status"``
+       of 5xx / 429 is transient, any other status is terminal.
+    3. stderr is empty and stdout has no status → transient, basis ``"unclassified"``: retried
+       within P1's deadline, then deferred (exit 11). The role is never started either way, so
+       this never leans toward "start while unconfirmed" (msg-1267 §4).
+    """
+    err = stderr or ""
+    if err.strip():
+        return classify_gh_failure(err), "stderr"
+    m = _JSON_STATUS_RE.search(stdout or "")
+    if m is not None:
+        status = int(m.group(1))
+        if status >= 500 or status == 429:
+            return "transient", "stdout"
+        return "terminal", "stdout"
+    return "transient", "unclassified"
+
+
 def classify_gh_failure(stderr: str) -> FailureKind:
     """Classify one failed ``gh api`` call by its stderr (design v1 D-1).
 
@@ -313,17 +356,45 @@ def _cap(text: str) -> str:
     return text[:PREFLIGHT_STDERR_CAP] + "…"
 
 
-def _classify_exception(exc: BaseException, timeout_s: float) -> tuple[FailureKind, str]:
-    """Map whatever the api caller raised to ``(kind, capped detail)``."""
+_STREAM_HEAD_CAP = 200
+
+
+def _cap_head(text: str) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= _STREAM_HEAD_CAP else text[:_STREAM_HEAD_CAP] + "…"
+
+
+def _classify_exception(exc: BaseException, timeout_s: float) -> tuple[FailureKind, str, str]:
+    """Map whatever the api caller raised to ``(kind, capped detail, basis)``.
+
+    ``basis`` is ``"unclassified"`` only for a gh failure with an empty stderr and no status on
+    stdout (D-3' rule 3); the fetcher reports such an endpoint as deferred with that reason."""
     if isinstance(exc, subprocess.TimeoutExpired):
-        return "transient", f"gh api timed out after {timeout_s:.1f}s"
+        return "transient", f"gh api timed out after {timeout_s:.1f}s", "timeout"
     if isinstance(exc, subprocess.CalledProcessError):
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return classify_gh_failure(stderr), _cap(stderr or str(exc))
+        stdout = exc.output if isinstance(exc.output, str) else ""
+        kind, basis = classify_gh_output(stderr, stdout)
+        if stderr.strip():
+            return kind, _cap(stderr), basis
+        # D-3': "returned non-zero exit status 1" alone does not say why (msg-9782 §1), so the
+        # detail names the exit code, what decided the verdict and the head of stdout.
+        head = _cap_head(stdout) or "<empty>"
+        detail = f"gh exit={exc.returncode} ({basis}); stderr=<empty>; stdout={head}"
+        return kind, _cap(detail), basis
     if isinstance(exc, ValueError):
         # json.JSONDecodeError: gh exited 0 but the body is not JSON — terminal (D-1).
-        return "terminal", _cap(f"response was not JSON: {exc}")
-    return "terminal", _cap(str(exc))
+        return "terminal", _cap(f"response was not JSON: {exc}"), "json"
+    return "terminal", _cap(str(exc)), "other"
+
+
+PreflightCheck = Literal["P0", "P1", "P2", "P3", "unexpected", "config"]
+"""Which pre-spawn check refused the run (T-preflight-failure-counts-toward-stall D-1).
+
+``"config"`` is the D-2' inventory's finding: a daemon configuration error (``load_settings``,
+``validate_budgets``, ``build_conductor``'s ``SystemExit``) also ends the run before any role is
+spawned, and used to reach the sweep as exit 1 (counted toward ``launches_same_head`` and retry ->
+quarantine) exactly like a preflight refusal did. It now takes the same exit 13."""
 
 
 class PreflightError(SystemExit):
@@ -333,7 +404,39 @@ class PreflightError(SystemExit):
     process boundary and is reported by the launcher (Task Scheduler / systemd
     log). The message text is the *reason* — that string is the only thing
     the operator sees before the daemon exits.
+
+    ``check`` names the check that refused: every raise site in this module fills it, and
+    ``"unexpected"`` is ``loop_runner._preflight``'s wrap of anything else. ``loop_runner.main``
+    maps this error to :data:`PREFLIGHT_REFUSED_EXIT_CODE` with one
+    ``MINDWIRE_PREFLIGHT_REFUSED_PAYLOAD`` row, so the sweep can tell "the role never started"
+    from a role that ran and failed (T-preflight-failure-counts-toward-stall D-1'').
     """
+
+    def __init__(self, message: str, *, check: PreflightCheck = "unexpected") -> None:
+        super().__init__(message)
+        self.check: PreflightCheck = check
+        self.detail = message
+
+    def payload(self) -> dict[str, object]:
+        return {"check": self.check, "detail": _cap_detail(self.detail)}
+
+
+# The refusal detail carried in the payload row: long enough to name the cause, short enough for
+# one notification (P1 bullets can run to several hundred characters per repo).
+PREFLIGHT_REFUSED_DETAIL_CAP = 1500
+
+
+def _cap_detail(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= PREFLIGHT_REFUSED_DETAIL_CAP:
+        return text
+    return text[:PREFLIGHT_REFUSED_DETAIL_CAP] + "…"
+
+
+def emit_preflight_refused_payload(exc: PreflightError) -> None:
+    """Print the one ``MINDWIRE_PREFLIGHT_REFUSED_PAYLOAD <json>`` row the sweep parses."""
+    sys.stdout.write(f"{PREFLIGHT_REFUSED_PAYLOAD_PREFIX}{json.dumps(exc.payload())}\n")
+    sys.stdout.flush()
 
 
 class PreflightDeferredError(Exception):
@@ -525,7 +628,8 @@ def _p0_daemon_checkout_separated(
             f"burns a throwaway clone (reflog restores), but the same in the daemon's "
             f"own checkout is a self-inflicted wound the loop cannot recover from. "
             f"Point [loop].repo_dir at a dedicated clone (the current production shape: "
-            f"C:/workspace/sandbox/<project>-impl)."
+            f"C:/workspace/sandbox/<project>-impl).",
+            check="P0",
         )
     # msg-1296 naysayer follow-up: literal path inequality is not enough. If
     # repo_dir is nested inside daemon_root's git tree without its own .git,
@@ -554,7 +658,8 @@ def _p0_daemon_checkout_separated(
             f"inequality is not a sufficient boundary; the shared git tree is. "
             f"Point [loop].repo_dir at a directory that has its own `.git` "
             f"(the current production shape: C:/workspace/sandbox/<project>-impl "
-            f"is a distinct git clone, not a subdirectory of the daemon's tree)."
+            f"is a distinct git clone, not a subdirectory of the daemon's tree).",
+            check="P0",
         )
 
 
@@ -610,20 +715,23 @@ def _p3_force_push_guard_armed(
     if not hook.is_file():
         raise PreflightError(
             f"preflight P3 failed: {where} is not a regular file, so the force-push "
-            f"guard is not armed. {_P3_PRE_PUSH_REMEDY}"
+            f"guard is not armed. {_P3_PRE_PUSH_REMEDY}",
+            check="P3",
         )
     try:
         lines = hook.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         raise PreflightError(
             f"preflight P3 failed: {where} could not be read ({exc}); an unreadable "
-            f"guard is treated as unarmed (fail-closed). {_P3_PRE_PUSH_REMEDY}"
+            f"guard is treated as unarmed (fail-closed). {_P3_PRE_PUSH_REMEDY}",
+            check="P3",
         ) from exc
     if _P3_PRE_PUSH_MARKER not in lines:
         raise PreflightError(
             f"preflight P3 failed: {where} has no line {_P3_PRE_PUSH_MARKER!r}, so it is "
             f"not the force-push guard (an LFS-only pre-push lets a non-fast-forward "
-            f"push overwrite a remote head silently). {_P3_PRE_PUSH_REMEDY}"
+            f"push overwrite a remote head silently). {_P3_PRE_PUSH_REMEDY}",
+            check="P3",
         )
     first = lines[0] if lines else ""
     if not _p3_hook_runnable(hook, first, windows=windows):
@@ -631,7 +739,8 @@ def _p3_force_push_guard_armed(
         raise PreflightError(
             f"preflight P3 failed: {where} carries the guard marker but {how}, so git "
             f"would not run it and the force-push guard is not armed. "
-            f"{_P3_PRE_PUSH_REMEDY}"
+            f"{_P3_PRE_PUSH_REMEDY}",
+            check="P3",
         )
 
 
@@ -643,14 +752,16 @@ def _p3_secret_guard_armed(
     except Exception as exc:
         raise PreflightError(
             f"preflight P3 failed: could not read core.hooksPath for {repo_dir}: {exc}. "
-            f"An unreadable arming state is treated as unarmed (fail-closed). {_P3_REMEDY}"
+            f"An unreadable arming state is treated as unarmed (fail-closed). {_P3_REMEDY}",
+            check="P3",
         ) from exc
     value = (raw or "").strip()
     if not value:
         raise PreflightError(
             f"preflight P3 failed: {repo_dir} has no core.hooksPath set, so the "
             f"{_P3_REQUIRED_HOOK} secret guard is not armed and a commit of a real infra "
-            f"value in this clone would go through unchecked. {_P3_REMEDY}"
+            f"value in this clone would go through unchecked. {_P3_REMEDY}",
+            check="P3",
         )
     hooks_dir = Path(value)
     if not hooks_dir.is_absolute():
@@ -661,7 +772,8 @@ def _p3_secret_guard_armed(
             raise PreflightError(
                 f"preflight P3 failed: core.hooksPath for {repo_dir} is relative "
                 f"({value!r}) and the repo's toplevel could not be resolved to anchor it. "
-                f"Fail-closed. {_P3_REMEDY}"
+                f"Fail-closed. {_P3_REMEDY}",
+                check="P3",
             )
         hooks_dir = top / hooks_dir
     hook = hooks_dir / _P3_REQUIRED_HOOK
@@ -672,7 +784,8 @@ def _p3_secret_guard_armed(
             f"preflight P3 failed: core.hooksPath for {repo_dir} is {value!r} but {hook} "
             f"is not a regular file, so the {_P3_REQUIRED_HOOK} secret guard is not armed "
             f"(a hooks directory holding only other hooks, or a directory named "
-            f"{_P3_REQUIRED_HOOK}, does not count). {_P3_REMEDY}"
+            f"{_P3_REQUIRED_HOOK}, does not count). {_P3_REMEDY}",
+            check="P3",
         )
     _p3_force_push_guard_armed(repo_dir, value, hooks_dir)
 
@@ -690,14 +803,16 @@ def _p2_remote_urls_under_spirrowgames(
     except Exception as exc:
         raise PreflightError(
             f"preflight P2 failed: could not read remotes for {repo_dir}: {exc}. "
-            f"P2-2 (msg-1270): unresolved destination → deny."
+            f"P2-2 (msg-1270): unresolved destination → deny.",
+            check="P2",
         ) from exc
     if not remotes:
         raise PreflightError(
             f"preflight P2 failed: {repo_dir} has no remotes configured. The GitHub org "
             f"ruleset can only protect a repo whose remote URL is under "
             f"{_SPIRROWGAMES_URL_PREFIX} — an empty remote list means nothing to check, "
-            f"and P2-2 (msg-1270) forbids assuming."
+            f"and P2-2 (msg-1270) forbids assuming.",
+            check="P2",
         )
     offenders = [(n, u) for n, u in remotes if not u.startswith(_SPIRROWGAMES_URL_PREFIX)]
     if offenders:
@@ -705,7 +820,8 @@ def _p2_remote_urls_under_spirrowgames(
             f"preflight P2 failed: {repo_dir} has remotes NOT under "
             f"{_SPIRROWGAMES_URL_PREFIX}: {offenders}. "
             f"(Tier-C decide 2026-08-19 msg-1270 option β: push-boundary check by URL, "
-            f"not by credential scope; positive assertion (P2-1), not a deny-list.)"
+            f"not by credential scope; positive assertion (P2-1), not a deny-list.)",
+            check="P2",
         )
     return remotes
 
@@ -762,6 +878,9 @@ class _P1Fetcher:
     def fetch(self, endpoint: str) -> _Fetched:
         attempt = 0
         last = ""
+        # D-3': true while every failure of this endpoint was an unclassified empty-stderr one, so
+        # the deferral says so (reason "unclassified") instead of claiming a known transient cause.
+        only_unclassified = True
         while True:
             remaining = self._deadline - self._clock()
             if remaining <= 0:
@@ -772,13 +891,15 @@ class _P1Fetcher:
             try:
                 value = self._api(endpoint, timeout_s)
             except Exception as exc:
-                kind, detail = _classify_exception(exc, timeout_s)
+                kind, detail, basis = _classify_exception(exc, timeout_s)
                 self.last_detail = detail
                 if kind == "terminal":
                     return _Fetched("terminal", endpoint, detail=detail)
                 last = detail
+                only_unclassified = only_unclassified and basis == "unclassified"
                 if attempt >= PREFLIGHT_MAX_ATTEMPTS:
-                    return self._undetermined(endpoint, "transient", detail)
+                    why = "unclassified" if only_unclassified else "transient"
+                    return self._undetermined(endpoint, why, detail)
                 delay = PREFLIGHT_RETRY_DELAYS_S[attempt - 1]
                 if self._clock() + delay >= self._deadline:
                     return self._undetermined(endpoint, "deadline", detail)
@@ -827,7 +948,8 @@ def _p1_default_branch_protected(remotes: list[tuple[str, str]], fetcher: _P1Fet
             raise PreflightError(
                 f"preflight P1 failed: remote {name!r} URL {url!r} passed the "
                 f"SpirrowGames prefix check but did not parse into an owner/repo. "
-                f"Cannot query server-side protection without an addressable repo."
+                f"Cannot query server-side protection without an addressable repo.",
+                check="P1",
             )
         unique_repos[(m["owner"], m["repo"])] = name
 
@@ -835,11 +957,16 @@ def _p1_default_branch_protected(remotes: list[tuple[str, str]], fetcher: _P1Fet
     for (owner, repo), name in unique_repos.items():
         verdict = _p1_check_repo(owner, repo, name, fetcher)
         if verdict.problems:
-            raise PreflightError("\n".join(verdict.problems))
+            raise PreflightError("\n".join(verdict.problems), check="P1")
         undetermined.extend(verdict.undetermined)
     if undetermined:
         first = undetermined[0]
-        reason = "deadline" if any(u.reason == "deadline" for u in undetermined) else "transient"
+        if any(u.reason == "deadline" for u in undetermined):
+            reason = "deadline"
+        elif all(u.reason == "unclassified" for u in undetermined):
+            reason = "unclassified"
+        else:
+            reason = "transient"
         raise PreflightDeferredError(
             owner=first.owner,
             repo=first.repo,
@@ -1263,17 +1390,22 @@ __all__ = [
     "PREFLIGHT_DEFERRED_PAYLOAD_PREFIX",
     "PREFLIGHT_MAX_ATTEMPTS",
     "PREFLIGHT_OK_PREFIX",
+    "PREFLIGHT_REFUSED_EXIT_CODE",
+    "PREFLIGHT_REFUSED_PAYLOAD_PREFIX",
     "PREFLIGHT_RETRY_DELAYS_S",
     "ApiCaller",
     "Clock",
     "GitToplevel",
     "HooksPathReader",
+    "PreflightCheck",
     "PreflightDeferredError",
     "PreflightError",
     "RemoteReader",
     "Sleep",
     "classify_gh_failure",
+    "classify_gh_output",
     "emit_preflight_deferred_payload",
     "emit_preflight_ok",
+    "emit_preflight_refused_payload",
     "preflight_gate",
 ]

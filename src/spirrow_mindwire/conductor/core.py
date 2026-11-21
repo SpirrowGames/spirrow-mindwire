@@ -429,6 +429,13 @@ class StopReason(StrEnum):
     # TERMINAL_STOP_REASONS (this head goes nowhere if re-run; that set is the only list of such
     # reasons).
     STALLED = "stalled_to_human"
+    # T-preflight-failure-counts-toward-stall (design v3 D-1'', Bohr msg-9812): the preflight
+    # refused the run before any role was spawned. The conductor never stops with this value —
+    # the daemon exits PREFLIGHT_REFUSED_EXIT_CODE (13) — but the sweep names the stop with it, so
+    # the operator's notice reads "the role was not started" instead of STALLED's "launched and
+    # posted nothing" (msg-9782 §1). Listed here so StopReason.ps1's phrase map stays a subset of
+    # this enum. Not terminal: the refused launch is reverted, the head is retried next tick.
+    PREFLIGHT_REFUSED = "preflight_refused"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
