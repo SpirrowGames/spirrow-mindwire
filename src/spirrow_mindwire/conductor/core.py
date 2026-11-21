@@ -3198,8 +3198,9 @@ class Conductor:
         * no hold read, no decider, a mode other than ``bounce``, no / malformed result, or an
           answer missing for any hold → ``security-hold-no-verdict`` (re-sendable, nothing
           delivered or released);
-        * any hold answered other than ``supplemented`` (``unsupplemented`` or ``unrelated``), or
-          an actionable ``LIKELY_NOT`` → ``security-hold`` for the whole handoff.
+        * any hold answered other than ``supplemented`` (``unsupplemented`` or ``unrelated``),
+          ``unheld_unbased`` answered ``yes`` (even with every hold supplemented), or an
+          actionable ``LIKELY_NOT`` → ``security-hold`` for the whole handoff.
 
         On delivery the supplemented holds are released by the ``ESCALATED`` row itself, through
         its ``holds_released`` stamp — the same replay path as a human's release (msg-9886 §3). If
@@ -3214,7 +3215,10 @@ class Conductor:
         likely_not = isinstance(av, TierCV2Verdict) and av.kind is TierCVerdictKind.LIKELY_NOT
         if not holds or not answers.complete:
             reason, hint = BounceReason.SECURITY_HOLD_NO_VERDICT, SECURITY_HOLD_NO_VERDICT_HINT
-        elif not answers.all_supplemented or likely_not:
+        elif not answers.all_supplemented or likely_not or answers.unheld_unbased == UNHELD_YES:
+            # A head that supplements every hold but also carries another unbased security
+            # request is not delivered: it bounces whole and opens a hold on the new request
+            # (PR #599 gate round 1).
             reason, hint = BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT
         else:
             self._write_escalated(gate, author, latest, decision, answers.supplemented_ids)

@@ -231,6 +231,27 @@ async def test_unheld_unbased_opens_a_new_hold_beside_the_appended_one(tmp_path:
 
 
 @pytest.mark.anyio
+async def test_all_supplemented_plus_a_new_unbased_request_is_not_delivered(
+    tmp_path: Path,
+) -> None:
+    """PR #599 gate round 1: every open hold answered ``supplemented`` but ``unheld_unbased =
+    yes`` (the head also carries another unbased security request) → the whole head bounces
+    ``security-hold``, nothing is delivered or released, and a hold opens on the new request."""
+    gate = _gate(tmp_path)
+    a, b = _hold(gate, "A", "m0a"), _hold(gate, "B", "m0b")
+    result = _result({a: "supplemented", b: "supplemented"}, unheld="yes")
+    _, _, mcp = await _run(gate, _Decider(result), head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD.value in notice["content"]
+    assert _escalated(gate) == []
+    assert _stamped(gate) == []
+    holds = gate.holds(thread=THREAD, author="Bohr")
+    assert [h.held_msg_id for h in holds] == ["m0a", "m0b", "m3"]
+    assert [h.hold_id for h in holds][:2] == [a, b]
+    assert [h.history[-1]["relation"] for h in holds[:2]] == ["supplemented", "supplemented"]
+
+
+@pytest.mark.anyio
 async def test_no_answer_for_a_hold_delivers_and_releases_nothing(tmp_path: Path) -> None:
     gate = _gate(tmp_path)
     a, b = _hold(gate, "A", "m0a"), _hold(gate, "B", "m0b")
