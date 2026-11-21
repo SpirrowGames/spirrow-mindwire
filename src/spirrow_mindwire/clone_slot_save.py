@@ -374,6 +374,7 @@ def record_turn_result(
     thread: str,
     turn_id: str,
     slot: str,
+    recovered_by: str | None = None,
 ) -> SaveResult:
     """Write the turn's row (msg-9400 §3, msg-9404 §4). A write that fails turns a saved result
     into ``rescue_failed``: the slot must not go back as saved without its record (msg-9405)."""
@@ -387,6 +388,7 @@ def record_turn_result(
             slot=slot,
             refs=result.refs,
             detail=result.detail,
+            recovered_by=recovered_by,
         )
     except (OSError, ValueError) as exc:
         return SaveResult(

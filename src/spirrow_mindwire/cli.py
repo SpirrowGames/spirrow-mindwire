@@ -42,9 +42,9 @@ retreated / discarded, 4 discard incomplete (still parked), 1 failed.
 
 ``mindwire slot-prep ...`` / ``mindwire slot-lease <action> ...`` (T-ephemeral-impl-clone-slot-per-
 thread A2) borrow a pooled clone slot for one turn and move its lease; ``mindwire slot-finish ...``
-(A3) hands it back at turn end after the save check; see
-:mod:`spirrow_mindwire.clone_slot_cli`. Not called by the loop until ``[loop].slots_root`` is
-accepted (A4).
+(A3) hands it back at turn end after the save check; ``mindwire slot-recover ...`` (A4) runs that
+turn end for a lease left held, by an operator; see :mod:`spirrow_mindwire.clone_slot_cli`. Called
+by the sweep only when ``[loop].slots_root`` is set.
 
 ``mindwire continue-report [--days 7] [--config PATH]`` (T-implementer-self-continuation PR-2,
 D-3) prints the weekly view of implementer self-continuations, read from the continuation ledger
@@ -258,10 +258,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 slot_mode=args.slot_mode,
             )
         )
-    if args.command in ("slot-prep", "slot-lease", "slot-finish"):
-        from .clone_slot_cli import run_finish, run_lease, run_prep
+    if args.command in ("slot-prep", "slot-lease", "slot-finish", "slot-recover"):
+        from .clone_slot_cli import run_finish, run_lease, run_prep, run_recover
 
-        runner = {"slot-prep": run_prep, "slot-lease": run_lease, "slot-finish": run_finish}
+        runner = {
+            "slot-prep": run_prep,
+            "slot-lease": run_lease,
+            "slot-finish": run_finish,
+            "slot-recover": run_recover,
+        }
         raise SystemExit(runner[args.command](args))
     if args.command == "continue-report":
         from .conductor.continuation_ledger import report_text

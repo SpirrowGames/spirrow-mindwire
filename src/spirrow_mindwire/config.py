@@ -366,10 +366,12 @@ class Stage3LoopConfig(_StrictModel):
     msg-9385 option A, design msg-9386 D-1 改訂; :mod:`spirrow_mindwire.clone_slot`). Each slot
     path is marked trusted by a person at deploy time; MindWire never writes Claude Code's config.
 
-    **Not accepted yet.** The pre-turn prep exists, but the loop / wrapper wiring and the
-    slot-scoped park key (D-5) do not, so a configured value would be silently ignored while every
-    thread kept sharing ``repo_dir``. Per msg-8055 R-7 / msg-8061 the value is refused at load
-    until the PR that wires provisioning and the slot park key together accepts it.
+    Accepted since A4 (msg-9875 item 2). The sweep wrapper borrows the slot before the launch
+    (``mindwire slot-prep``), points ``repo_dir`` at it, and hands it back at turn end
+    (``mindwire slot-finish``); the conductor then decides a later CONTINUE from the turn end's
+    ``slot_turn_result`` row instead of judging the clone
+    (:mod:`spirrow_mindwire.slot_continuation`).
+    Enabling it is a separate deploy step (steps in the A4 PR body), never a default.
     """
 
     slots_per_repo: int | None = Field(default=None, ge=1)
@@ -385,18 +387,6 @@ class Stage3LoopConfig(_StrictModel):
         return self.slots_per_repo if self.slots_per_repo is not None else 1
 
     watches: tuple[LoopWatchConfig, ...] = ()
-
-    @field_validator("slots_root", mode="after")
-    @classmethod
-    def _slots_root_not_wired_yet(cls, v: Path | None) -> Path | None:
-        """Refuse ``slots_root`` until slot provisioning is wired into the loop (msg-8061 R-7)."""
-        if v is not None:
-            raise ValueError(
-                "[loop].slots_root is not accepted yet: per-thread clone slots are not wired into "
-                "the loop (T-ephemeral-impl-clone-slot-per-thread PR-A in progress). Leave it "
-                "unset to keep the single shared repo_dir clone."
-            )
-        return v
 
     @field_validator("role_model", "role_cli_path", "repo_dir", "slots_root", mode="before")
     @classmethod

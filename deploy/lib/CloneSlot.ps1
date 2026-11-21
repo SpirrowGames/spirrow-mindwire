@@ -7,9 +7,9 @@
 # the side effects (the bounded probe, the per-thread quarantine record, Send-NotificationIfChanged)
 # so tests/Test-CloneSlot.ps1 can exercise every branch without git, uv or Discord.
 #
-# Slot mode is on only when [loop].slots_root is set in mindwire.toml. Until A4 accepts that key
-# the Python config refuses it, so none of this runs in production yet: with no slots_root the
-# sweep keeps the shared-clone path byte-for-byte (Get-SlotModeConfig returns $null).
+# Slot mode is on only when [loop].slots_root is set in mindwire.toml (accepted since A4, off by
+# default): with no slots_root the sweep keeps the shared-clone path byte-for-byte
+# (Get-SlotModeConfig returns $null).
 #
 # Notice reader and fallback surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): nothing here posts to
 # a chatroom thread. The reader of every notice is the operator who has to look at a slot; the
@@ -28,6 +28,8 @@ $SlotFinishQuarantinedExitCode = 5
 # read: this thread only, on this tick (clone_slot.PARK_PREP_CRASHED).
 $SlotPrepCrashedParkCode = 'clone_slot_prep_crashed'
 $SlotUnrecoverableParkCode = 'clone_slot_unrecoverable'
+# A4: the conductor refused a CONTINUE in slot mode (slot_continuation.PARK_CODE).
+$SlotContinueRefusedParkCode = 'clone_slot_continue_refused'
 
 # [loop].slots_root and [loop].slots_per_repo from mindwire.toml, line-oriented like
 # Get-ConductorHardBudgetSeconds. $null when the file or the key is missing or slots_root is empty:
@@ -237,4 +239,23 @@ function Get-SlotFinishDecision {
         -Message ("MindWire: **$CandidateKey** のターン終了処理 (slot-finish) が完了しませんでした (exit=$Code)。" +
                   "slot $Repo/$SlotName の lease は保存確認前のまま残しています。$Stderr")
     return $res
+}
+
+# A4 (msg-9400 §3): the conductor's exit-14 run. Its MINDWIRE_SLOT_CONTINUE_REFUSED row says why the
+# thread's CONTINUE was refused (reason = not_saved / no_record / lease_held) and where the work is
+# (path = the quarantine target, the slot still leased, or the slot whose quarantine failed).
+# Returns @{ park_code; path; detail; notice }. An unreadable row still parks (same code): the
+# refusal is the exit code, the row only says where to look.
+function Get-SlotContinueRefusedDecision {
+    param([string]$Output, [string]$CandidateKey)
+    $row = Get-SlotRow -Stdout $Output -Prefix 'MINDWIRE_SLOT_CONTINUE_REFUSED '
+    $path = if ($null -ne $row -and $row.path) { "$($row.path)" } else { '(unknown: no readable row)' }
+    $reason = if ($null -ne $row -and $row.reason) { "$($row.reason)" } else { 'unknown' }
+    $detail = if ($null -ne $row) { "$($row.detail)" } else { 'the conductor exited 14 without a readable row' }
+    $turn = if ($null -ne $row -and $row.turn_id) { "$($row.turn_id)" } else { '-' }
+    $msg = ("MindWire: **$CandidateKey** の CONTINUE を続行しませんでした (reason=$SlotContinueRefusedParkCode/$reason, turn=$turn)。" +
+            "前のターンの終了処理が作業を remote に保存したと記録していないためです。作業の場所: $path。詳細: $detail " +
+            "このスレッドだけを park しました。同じ repo の他スレッドは止めていません。")
+    return @{ park_code = $SlotContinueRefusedParkCode; path = $path; detail = $detail
+              notice = (New-SlotNotice -Key "__slot_continue__/$CandidateKey" -Signature "$($reason):$($turn):$path" -Message $msg) }
 }

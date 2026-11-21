@@ -24,7 +24,17 @@ one line ``MINDWIRE_SLOT_FINISH <json>``. Exit codes:
 * 2 — refused: the lease is not this turn's, nothing was touched;
 * 1 — the procedure failed (the lease is left as it was: never released as saved).
 
-Nothing here posts to a thread: the json is read by the wrapper, which sends notices (A3).
+``slot-recover`` (A4, msg-9877 (a)) is the operator's way back for a lease left held because its
+turn end never ran (exit 7, a throw after spawn, a wrapper gone without its finally): after
+checking that no session is left, ``mindwire slot-recover --slots-root R --repo r --slot slot-NN
+--project p --state-dir S --confirm-no-process``. It reads the turn and the thread from the lease
+file and runs the same turn end as ``slot-finish`` (:meth:`~.clone_slot_finish.SlotFinish.recover`),
+with ``recovered_by=operator`` on the rows. It prints ``MINDWIRE_SLOT_RECOVER <json>``; exit codes
+as ``slot-finish``. Refused (exit 2, nothing touched): no ``--confirm-no-process``, the slot not
+leased, or the lease ``quarantine_failed``.
+
+Nothing here posts to a thread: the json is read by the wrapper, which sends notices (A3). The
+``slot-recover`` json is read by the operator who ran it, on that terminal.
 """
 
 from __future__ import annotations
@@ -50,6 +60,8 @@ from .git_sync.branch import generation_name, normalize_stem
 
 PREP_PREFIX = "MINDWIRE_SLOT_PREP "
 FINISH_PREFIX = "MINDWIRE_SLOT_FINISH "
+RECOVER_PREFIX = "MINDWIRE_SLOT_RECOVER "
+RECOVERED_BY_OPERATOR = "operator"
 RETREATS_FILE = "clone-retreats.jsonl"
 EXIT_READY = 0
 EXIT_FAILED = 1
@@ -96,6 +108,20 @@ def add_parsers(sub: Any) -> None:
     fin.add_argument("--slot", required=True, help="slot-NN")
     fin.add_argument("--thread-id", required=True)
     fin.add_argument("--turn-id", required=True)
+    rec = sub.add_parser(
+        "slot-recover",
+        help="run the turn end of a lease left held (operator; after checking no process is left)",
+    )
+    rec.add_argument("--slots-root", required=True, type=Path)
+    rec.add_argument("--repo", required=True)
+    rec.add_argument("--project", required=True, help="the thread's project (for the ledger row)")
+    rec.add_argument("--state-dir", required=True, type=Path)
+    rec.add_argument("--slot", required=True, help="slot-NN")
+    rec.add_argument(
+        "--confirm-no-process",
+        action="store_true",
+        help="you checked that no session or child process is still using the slot",
+    )
 
 
 def _trusted(slot: Path) -> bool:
@@ -220,9 +246,32 @@ def run_finish(args: argparse.Namespace) -> int:
         print(f"slot-finish failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_FAILED
     print(FINISH_PREFIX + json.dumps(res.to_json(), ensure_ascii=False, sort_keys=True))
+    return _finish_code(res)
+
+
+def _finish_code(res: Any) -> int:
     return {
         FinishOutcome.RELEASED: EXIT_READY,
         FinishOutcome.QUARANTINED: EXIT_QUARANTINED,
         FinishOutcome.PARKED: EXIT_PARKED,
         FinishOutcome.REFUSED: EXIT_REFUSED,
     }[res.outcome]
+
+
+def run_recover(args: argparse.Namespace) -> int:
+    try:
+        fin = SlotFinish(
+            slots_root=args.slots_root,
+            repo=args.repo,
+            project=args.project,
+            store=LeaseStore(args.state_dir),
+            ledger=args.state_dir / CONTINUATION_LEDGER_FILENAME,
+            retreats=args.state_dir / RETREATS_FILE,
+            recovered_by=RECOVERED_BY_OPERATOR,
+        )
+        res = fin.recover(slot=args.slot, confirm_no_process=args.confirm_no_process)
+    except Exception as exc:  # the lease is left as it was: never released as saved
+        print(f"slot-recover failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    print(RECOVER_PREFIX + json.dumps(res.to_json(), ensure_ascii=False, sort_keys=True))
+    return _finish_code(res)
