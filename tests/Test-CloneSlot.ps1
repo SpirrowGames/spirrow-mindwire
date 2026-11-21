@@ -213,6 +213,20 @@ foreach ($c in @(0, 1, 6)) {
     Check "exit ${c}: slot-finish runs once, no retained notice" ((($script:calls -join ',') -eq 'finish') -and -not $rc.retained -and @($script:notices).Count -eq 0) ($script:calls -join ',')
 }
 
+# PR #598 gate Obj-1-1: exit 14 refused the CONTINUE before any turn ran in this borrow. The
+# borrow goes back unused by a plain release; slot-finish (which would record this clean slot as
+# `pushed` and make the refused CONTINUE look saved on the next retry) never runs.
+$SlotContinueRefusedExitCode = 14
+Reset-SlotStubs
+$script:slotOpen = $open7
+$r14 = Complete-SlotAfterRun -Lease $lease -Code 14 -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a'
+Close-OpenSlot -Open $script:slotOpen   # the top-level finally after exit 14: nothing left open
+Check 'exit 14: the unused borrow is released once, no slot-finish (no slot_turn_result row), no rename' (
+    ($script:calls -join ',') -eq 'release') ($script:calls -join ',')
+Check 'exit 14: lease returned, unused, not retained, nothing parked here, no notice, nothing left open' (
+    -not $script:leaseStore.ContainsKey('slot-01') -and $r14.unused -and -not $r14.retained -and
+    $null -eq $r14.park_code -and @($script:notices).Count -eq 0 -and $null -eq $script:slotOpen)
+
 # --- 4. A4 (msg-9400 §3): the exit-14 park -----------------------------------------------------
 $out14 = "conductor stopped`nMINDWIRE_SLOT_CONTINUE_REFUSED {`"project`":`"p`",`"thread`":`"T-a`",`"park_code`":`"clone_slot_continue_refused`",`"reason`":`"not_saved`",`"turn_id`":`"t2`",`"outcomes`":[`"rescue_failed`"],`"path`":`"C:/s/_quarantine/r/slot-01-x`",`"detail`":`"turn t2 ended rescue_failed`"}`n"
 $d14 = Get-SlotContinueRefusedDecision -Output $out14 -CandidateKey 'p/T-a'
@@ -225,7 +239,7 @@ Check 'exit 14 without a readable row still parks (same code)' ($d14b.park_code 
 $b14 = $src.IndexOf('if ($code -eq $SlotContinueRefusedExitCode) {')
 $b8 = $src.LastIndexOf('if ($code -eq $DirtyCloneExitCode) {')
 $generic = $src.IndexOf('# handle (i.e. anything other than the 0/2/')
-Check 'exit 14 branch: after the slot is finished, above exit 8 and the generic branch; per-thread record; continue' (
+Check 'exit 14 branch: after the slot step (unused borrow returned), above exit 8 and the generic branch; per-thread record; continue' (
     $b14 -gt $fin -and $b14 -lt $b8 -and $b14 -lt $generic -and
     $src.Substring($b14, $b8 - $b14).Contains('-StopReason $refused.park_code') -and
     $src.Substring($b14, $b8 - $b14).Contains("-FailureClass 'clone_slot'") -and

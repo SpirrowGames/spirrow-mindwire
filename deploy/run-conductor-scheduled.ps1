@@ -3772,20 +3772,32 @@ function Complete-SlotTurn {
 # confirmed: a session may still be writing in the slot, so slot-finish does not run and the lease
 # stays held (PR #594 gate Obj-1-1; the same rule as the inflight row), with one notice. Every other
 # code, including the hard budget's confirmed kill (exit 6), runs slot-finish. Either way the
-# lease is no longer open for the top-level finally. Returns @{ retained; park_code }.
+# lease is no longer open for the top-level finally. Returns @{ retained; park_code; unused }.
+# Exit 14 (slot mode refused a CONTINUE, A4) is raised before any implementer turn ran in this
+# borrow, so the borrow is UNUSED: it goes back to the pool by a plain release, with NO
+# slot_turn_result row (PR #598 gate Obj-1-1). A slot-finish here would record this unused clean
+# slot as `pushed`, and judge_slot_continuation, which reads the thread's LAST recorded turn,
+# would then admit the refused CONTINUE on its next retry or unpark although the earlier turn's
+# work is still unsaved (rescue_failed) or unrecorded (no_record). Releasing without a row keeps
+# the earlier turn the last one, so the refusal stands until that turn's work is dealt with.
 function Complete-SlotAfterRun {
     param($Lease, [int]$Code, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey)
     $script:slotOpen = $null
+    if ($Code -eq $SlotContinueRefusedExitCode) {
+        Undo-SlotBorrow -Lease $Lease -StateDir $StateDir -CandidateKey $CandidateKey
+        Write-Log "slot-returned-unused ${CandidateKey}: $($Lease.slot) turn=$($Lease.turn_id) — exit=$Code (CONTINUE refused before any turn ran); no slot_turn_result row"
+        return @{ retained = $false; park_code = $null; unused = $true }
+    }
     if ($Code -eq $ConductorKillUnconfirmedExitCode) {
         Send-SlotNotices -NotifyState $notifyState -Notices @(Get-SlotRetainedNotice -Repo $Lease.repo `
             -SlotName $Lease.slot_name -Slot $Lease.slot -TurnId $Lease.turn_id -ThreadId $ThreadId `
             -CandidateKey $CandidateKey -Cause "exit=$Code, kill not confirmed")
         Write-Log "slot-retained ${CandidateKey}: $($Lease.slot) turn=$($Lease.turn_id) — exit=$Code, end not confirmed; lease kept, no slot-finish"
-        return @{ retained = $true; park_code = $null }
+        return @{ retained = $true; park_code = $null; unused = $false }
     }
     $finish = Complete-SlotTurn -Lease $Lease -SlotsRoot $SlotsRoot -Project $Project `
         -StateDir $StateDir -ThreadId $ThreadId -CandidateKey $CandidateKey
-    return @{ retained = $false; park_code = $finish.park_code }
+    return @{ retained = $false; park_code = $finish.park_code; unused = $false }
 }
 
 # A3: the top-level finally's backstop for a lease still open when the tick ends by a throw. A
@@ -8013,7 +8025,9 @@ try {
 
         # EXIT CODE $SlotContinueRefusedExitCode — slot mode refused a CONTINUE (A4, msg-9400 §3): the
         # thread's last turn end recorded rescue_failed / quarantine_failed, recorded nothing, or its
-        # lease is still held. No role ran. This thread only is parked, naming where the work is;
+        # lease is still held. No role ran, so Complete-SlotAfterRun already returned the borrow
+        # unused, with no slot_turn_result row (PR #598 gate Obj-1-1): the refusing turn stays the
+        # thread's last recorded one. This thread only is parked, naming where the work is;
         # the other threads of the repo keep launching. MUST stay above the generic non-zero branch
         # (which would retry and then quarantine as an error).
         if ($code -eq $SlotContinueRefusedExitCode) {
