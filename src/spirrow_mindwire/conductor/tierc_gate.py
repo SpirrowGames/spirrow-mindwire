@@ -39,8 +39,8 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -57,7 +57,7 @@ from ..tier_c_admission_gate import (
     normalized_body_sha256,
 )
 from ..tier_c_decisions_log import append_log_entries, build_retry_lookup
-from ..tier_c_security_holds import SecurityHold, open_holds
+from ..tier_c_security_holds import SecurityHold, open_holds, stamped_releases
 
 TIERC_BOUNCE_HEADER = "Conductor bounce — Tier-C admission gate"
 """First line of every bounce notice. :func:`is_bounce_notice` keys on it so the conductor can tell
@@ -98,12 +98,16 @@ class TierCGate:
 
         The security holds of ``(thread, author)`` are read back from the same log
         (:func:`~spirrow_mindwire.tier_c_security_holds.open_holds`); ``released_holds`` are the
-        hold ids a human released with ``HOLD-RELEASE:`` in this thread.
+        hold ids a human released with ``HOLD-RELEASE:`` in this thread. A release not yet stamped
+        in the log is stamped on the rows this call writes (``holds_released``), so replay knows
+        which refusals came before it; when the decision writes no row (a plain admit), a
+        ``HOLD_RELEASED`` row carries the stamp, so the release survives without the thread line.
 
         The rows are written **before** the caller posts any bounce: a bounce whose ``BOUNCED`` row
         failed to land would hand the author a uuid the RETRY lookup has never heard of, and every
         retry would bounce again. Exceptions propagate; the caller fails open (condition 2).
         """
+        released_ids = list(dict.fromkeys(released_holds))
         decision = decide_admission(
             body=body,
             author=author,
@@ -111,10 +115,29 @@ class TierCGate:
             now=now,
             bounce_uuid=self.uuid_factory(),
             security_hold=bool(
-                self.holds(thread=thread, author=author, released_holds=released_holds)
+                self.holds(thread=thread, author=author, released_holds=released_ids)
             ),
         )
-        append_log_entries(self.log_path, decision.log_entries, thread=thread, msg_id=msg_id)
+        entries: Sequence[LogEntry] = decision.log_entries
+        stamped = stamped_releases(self.log_path, thread=thread, author=author)
+        unstamped = [hold_id for hold_id in released_ids if hold_id not in stamped]
+        if unstamped and not entries:
+            # A plain admit writes no row, so the release gets one of its own (PR #595 gate
+            # round 3): without it the release would live only in the thread line, and replay
+            # without that line would see the hold open again.
+            entries = (
+                LogEntry(
+                    kind=LogKind.HOLD_RELEASED,
+                    payload={"ts": now.isoformat(), "author": author},
+                ),
+            )
+        if unstamped:
+            # Stamp the release's position in the log (PR #595 gate round 2): refusals logged
+            # before this row stay in the released hold's history; later ones open new holds.
+            entries = tuple(
+                replace(e, payload={**e.payload, "holds_released": unstamped}) for e in entries
+            )
+        append_log_entries(self.log_path, entries, thread=thread, msg_id=msg_id)
         return decision
 
     def holds(
@@ -131,12 +154,16 @@ class TierCGate:
         thread: str,
         msg_id: str,
         now: datetime,
-        released_holds: Iterable[str] = (),
+        holds_released: Iterable[str] = (),
     ) -> None:
         """Record that the head was delivered to the human (``ESCALATED``, msg-9650 §4).
 
-        Written only once nothing after the gate bounced it. ``released_holds`` are the holds this
-        delivery releases (msg-9661 §1.1⁵ 3.: after delivery, the supplemented ones only).
+        Written only once nothing after the gate bounced it. ``holds_released`` are the holds an
+        ``RH-recheck`` head was confirmed to supplement (Bohr msg-9886 §3): the row carries them
+        in the same ``holds_released`` stamp a human's ``HOLD-RELEASE:`` gets, so replay releases
+        them at this row — refusals before it stay in the hold's history, later ones open new
+        holds. The release exists only once this row is written: if the write fails, the holds
+        stay open (msg-9779). An empty ``holds_released`` adds no field.
         """
         retry_uuid = None
         for logged in decision.log_entries:
@@ -150,9 +177,11 @@ class TierCGate:
                 "label": decision.normalized_label,
                 "rule": decision.rule,
                 "retry_uuid": retry_uuid,
-                "released_holds": sorted(released_holds),
             },
         )
+        released = list(dict.fromkeys(holds_released))
+        if released:
+            entry = replace(entry, payload={**entry.payload, "holds_released": released})
         append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
 
     def hold_bounce(

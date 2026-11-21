@@ -98,11 +98,13 @@ $map = Get-StopReasonPhraseMap
 # a refused STOP: done / BLOCKED-ON: form stops with a notice and must be heard, never silent.
 # 2026-11-10 (T-next-names-unspawnable-identity D2): grew to ten with 'unspawnable_target_to_human' —
 # NEXT: named an identity no adapter can run, so the request was never delivered and must be heard.
-$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'operator_work_to_human', 'malformed_handoff', 'unspawnable_target_to_human', 'round_cap', 'empty_thread')
+# 2026-11-20 (T-preflight-failure-counts-toward-stall D-1''): grew to eleven with 'preflight_refused' —
+# the preflight refused the run and no role was spawned; the operator must hear that, not STALLED.
+$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'stalled_to_human', 'preflight_refused', 'operator_work_to_human', 'malformed_handoff', 'unspawnable_target_to_human', 'round_cap', 'empty_thread')
 foreach ($k in $expectedKeys) {
     CheckTrue "map has key '$k'" ($map.ContainsKey($k))
 }
-Check 'map has exactly 10 keys (narrowing = notification loss, §4 §W-4)' 10 $map.Count
+Check 'map has exactly 11 keys (narrowing = notification loss, §4 §W-4)' 11 $map.Count
 
 Write-Host 'Get-StopReasonPhraseMap — returns a fresh hashtable each call (no shared state)'
 $m1 = Get-StopReasonPhraseMap

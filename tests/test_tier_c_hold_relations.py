@@ -1,10 +1,13 @@
 """T-tier-c-six-articles-security-boundary, part 1b — Jev's per-hold answers acted on.
 
-Bohr msg-9661 §1.1⁵ (one question per hold; one ``unsupplemented`` stops the whole handoff;
-release only after delivery, supplemented holds only), msg-9663 §1.1⁶ (history appended to every
+Bohr msg-9661 §1.1⁵ (one question per hold), msg-9663 §1.1⁶ (history appended to every
 touched hold; ``unheld_unbased = yes`` opens a new hold), msg-9665 §1.1⁷ (structural holds are
 asked about too), msg-9779 (release order: delivered → ``ESCALATED`` written → released; a failed
-write keeps the holds). Harness: ``test_tierc_jev_bounce``.
+write keeps the holds), msg-9886 §2 (delivered only when **every** open hold is answered
+``supplemented`` and the Decider runs in ``bounce`` mode; anything else is fail-closed) and §3 (the
+release rides in the ``ESCALATED`` row's ``holds_released`` stamp, the one replay path a human's
+release also uses). Every scenario runs through the conductor, not ``gate.escalated()`` directly
+(PR #595 gate Obj-1-2). Harness: ``test_tierc_jev_bounce``.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import pytest
 from test_conductor_core import _thread_ref
 from test_tierc_jev_bounce import _bounces, _Decider, _gate, _rows, _run
 
-from spirrow_mindwire.conductor.tierc_gate import TierCGate
+from spirrow_mindwire.conductor.tierc_gate import TierCGate, bounced_msg_id
 from spirrow_mindwire.decider.questions import (
     TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_HOLD_QUESTIONS_VERSION,
@@ -31,6 +34,7 @@ from spirrow_mindwire.decider.state import DecisionState
 from spirrow_mindwire.decider.verdict import TierCV2Verdict, TierCVerdictKind
 from spirrow_mindwire.tier_c_admission_gate import BounceReason, LogKind
 from spirrow_mindwire.tier_c_security_holds import read_hold_answers
+from spirrow_mindwire.value_objects import Role
 
 NOW = datetime(2026, 11, 20, tzinfo=UTC)
 THREAD = _thread_ref().thread_id
@@ -99,6 +103,11 @@ async def test_the_decider_is_asked_about_every_open_hold(tmp_path: Path) -> Non
     assert [h.held_msg_id for h in state.security_holds] == ["m0a", "m0b"]
 
 
+def _stamped(gate: TierCGate) -> list[str]:
+    """Every hold id any log row releases through ``holds_released``."""
+    return [h for r in _rows(gate) for h in r.get("holds_released") or ()]
+
+
 @pytest.mark.anyio
 async def test_both_supplemented_delivers_and_releases_both(tmp_path: Path) -> None:
     gate = _gate(tmp_path)
@@ -108,17 +117,43 @@ async def test_both_supplemented_delivers_and_releases_both(tmp_path: Path) -> N
     )
     assert _bounces(mcp) == []
     (row,) = _escalated(gate)
-    assert row["released_holds"] == sorted([a, b])
+    assert row["holds_released"] == sorted([a, b])
+    assert "released_holds" not in row  # msg-9886 §3: the old field is gone
     assert _open(gate) == []
 
 
 @pytest.mark.anyio
-async def test_only_the_supplemented_hold_is_released(tmp_path: Path) -> None:
+async def test_a_supplemented_hold_is_released_by_replay_without_the_thread_line(
+    tmp_path: Path,
+) -> None:
+    """msg-9886 §4: supplement A → delivered → A released; ``gate.holds()`` with no release passed
+    in returns nothing, and the same body refused after the release opens a hold of its own
+    (the round 2 ordering applied to the ``ESCALATED`` stamp)."""
+    gate = _gate(tmp_path)
+    a = _hold(gate, "A", "m0a")
+    _hold(gate, "A", "m0a2")  # identical re-send before the release: history of ``a``
+    assert _open(gate) == [a]
+    _, _, mcp = await _run(gate, _Decider(_result({a: "supplemented"})), head=HEAD)
+    assert _bounces(mcp) == []
+    assert _escalated(gate)[0]["holds_released"] == [a]
+    assert gate.holds(thread=THREAD, author="Bohr") == []
+    later = _hold(gate, "A", "m9")
+    assert _open(gate) == [later]
+    assert later != a
+
+
+@pytest.mark.anyio
+async def test_only_one_of_two_supplemented_bounces_and_releases_neither(tmp_path: Path) -> None:
+    """msg-9886 §2 / §4: A supplemented, B ``unrelated`` → the whole head bounces and nothing is
+    released (every open hold must be answered ``supplemented``)."""
     gate = _gate(tmp_path)
     a, b = _hold(gate, "A", "m0a"), _hold(gate, "B", "m0b")
-    await _run(gate, _Decider(_result({a: "supplemented", b: "unrelated"})), head=HEAD)
-    assert _escalated(gate)[0]["released_holds"] == [a]
-    assert _open(gate) == [b]
+    _, _, mcp = await _run(gate, _Decider(_result({a: "supplemented", b: "unrelated"})), head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD.value in notice["content"]
+    assert _escalated(gate) == []
+    assert _stamped(gate) == []
+    assert _open(gate) == [a, b]
 
 
 @pytest.mark.anyio
@@ -142,37 +177,57 @@ async def test_one_unsupplemented_stops_the_whole_handoff(tmp_path: Path) -> Non
 
 
 @pytest.mark.anyio
-async def test_supplemented_but_likely_not_keeps_the_hold_even_in_shadow(tmp_path: Path) -> None:
-    """msg-9663 §1.1⁶ (a) and msg-9655 §1.1'' (the hold path acts whatever the mode)."""
+async def test_supplemented_but_likely_not_keeps_the_hold(tmp_path: Path) -> None:
+    """msg-9886 §2: ``LIKELY_NOT`` bounces ``security-hold``; history is appended (§1.1⁶ (a))."""
     gate = _gate(tmp_path)
     a = _hold(gate, "A", "m0a")
     result = _result({a: "supplemented"}, kind=TierCVerdictKind.LIKELY_NOT)
-    _, _, mcp = await _run(gate, _Decider(result, mode="shadow"), head=HEAD)
+    _, _, mcp = await _run(gate, _Decider(result), head=HEAD)
     (notice,) = _bounces(mcp)
-    assert BounceReason.JEV_LIKELY_NOT.value in notice["content"]
+    assert BounceReason.SECURITY_HOLD.value in notice["content"]
+    assert "人へは通りません" in notice["content"]
     (hold,) = gate.holds(thread=THREAD, author="Bohr")
     assert hold.history[-1] == {
         "hold_id": a,
         "relation": "supplemented",
-        "outcome": "jev-likely-not",
+        "outcome": "security-hold",
         "msg_id": "m3",
     }
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["shadow", "annotate"])
+async def test_bounce_mode_off_is_not_delivered_even_when_supplemented(
+    tmp_path: Path, mode: str
+) -> None:
+    """msg-9886 §2: outside ``bounce`` mode the Decider's answers are not acted on, so a held head
+    is never delivered on them — fail-closed, not the ordinary pass-through."""
+    gate = _gate(tmp_path)
+    a = _hold(gate, "A", "m0a")
+    _, _, mcp = await _run(gate, _Decider(_result({a: "supplemented"}), mode=mode), head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD_NO_VERDICT.value in notice["content"]
+    assert _escalated(gate) == []
+    assert _stamped(gate) == []
+    assert _open(gate) == [a]
+
+
+@pytest.mark.anyio
 async def test_unheld_unbased_opens_a_new_hold_beside_the_appended_one(tmp_path: Path) -> None:
     """msg-9663 §6⁵: A carried unsupplemented plus an unbased B in one body → A appended, B's
-    hold opened; a later delivery that supplements only A releases A and keeps B."""
+    hold opened. A later head that supplements only A still bounces (B is open and not
+    supplemented, msg-9886 §2); one that supplements both releases both."""
     gate = _gate(tmp_path)
     a = _hold(gate, "A", "m0a")
     await _run(gate, _Decider(_result({a: "unsupplemented"}, unheld="yes")), head=HEAD)
     holds = gate.holds(thread=THREAD, author="Bohr")
     assert [h.held_msg_id for h in holds] == ["m0a", "m3"]
     new = holds[1].hold_id
-    # the next head supplements A only: A released, B stays
     gate2 = TierCGate(log_path=gate.log_path, uuid_factory=gate.uuid_factory)
     await _run(gate2, _Decider(_result({a: "supplemented", new: "unrelated"})), head=HEAD)
-    assert _open(gate2) == [new]
+    assert _open(gate2) == [a, new]
+    await _run(gate2, _Decider(_result({a: "supplemented", new: "supplemented"})), head=HEAD)
+    assert _open(gate2) == []
 
 
 @pytest.mark.anyio
@@ -187,12 +242,70 @@ async def test_no_answer_for_a_hold_delivers_and_releases_nothing(tmp_path: Path
 
 
 @pytest.mark.anyio
-async def test_no_decider_result_while_held_is_not_delivered(tmp_path: Path) -> None:
+@pytest.mark.parametrize("decider", ["none", "no-result"])
+async def test_no_decider_result_while_held_is_not_delivered(tmp_path: Path, decider: str) -> None:
+    """msg-9886 §2: no decider, or a decider that returned nothing (unavailable) → bounce."""
     gate = _gate(tmp_path)
     a = _hold(gate, "A", "m0a")
-    _, _, mcp = await _run(gate, None, head=HEAD)
-    assert len(_bounces(mcp)) == 1
+    _, _, mcp = await _run(gate, None if decider == "none" else _Decider(None), head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD_NO_VERDICT.value in notice["content"]
+    assert _escalated(gate) == []
+    assert _stamped(gate) == []
     assert _open(gate) == [a]
+
+
+@pytest.mark.anyio
+async def test_a_held_head_never_takes_the_ordinary_path_when_its_holds_read_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """msg-9886 §2: ``admit`` saw the hold (``RH-recheck``) but the conductor's own read came back
+    empty (a read failure) → the head is bounced, never delivered on the ordinary path."""
+    from spirrow_mindwire.conductor.core import Conductor
+
+    gate = _gate(tmp_path)
+    a = _hold(gate, "A", "m0a")
+    monkeypatch.setattr(Conductor, "_open_security_holds", lambda self, messages: [])
+    _, _, mcp = await _run(gate, _Decider(_result({a: "supplemented"})), head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert BounceReason.SECURITY_HOLD_NO_VERDICT.value in notice["content"]
+    assert _escalated(gate) == []
+    assert _open(gate) == [a]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("likely_not", id="jev-vetoes-delivery"),
+        pytest.param("no_unheld_answer", id="malformed-answer-set"),
+        pytest.param("shadow", id="bounce-mode-off"),
+    ],
+)
+async def test_delivery_failure_releases_nothing(tmp_path: Path, case: str) -> None:
+    """msg-9886 §4 / Einstein: the open hold is answered ``supplemented``, yet the head is not
+    delivered — it does not stop at the human: the conductor posts a bounce and dispatches the
+    author on it. Then no row carries a ``holds_released`` stamp and the hold stays open.
+
+    In this conductor "delivery" is the gate letting the head stop at the human; nothing is sent
+    after the ``ESCALATED`` row that could fail (that row's own failure is
+    ``test_escalated_write_failure_keeps_the_holds``). So the delivery that fails here is the one
+    refused after supplementation was answered."""
+    gate = _gate(tmp_path)
+    a = _hold(gate, "A", "m0a")
+    if case == "likely_not":
+        decider = _Decider(_result({a: "supplemented"}, kind=TierCVerdictKind.LIKELY_NOT))
+    elif case == "no_unheld_answer":
+        decider = _Decider(_result({a: "supplemented"}, unheld=None))
+    else:
+        decider = _Decider(_result({a: "supplemented"}), mode="shadow")
+    _, disp, mcp = await _run(gate, decider, head=HEAD)
+    (notice,) = _bounces(mcp)
+    assert bounced_msg_id(notice["content"]) == "m3"
+    assert disp.dispatches[-1][0] is Role.PROPOSER  # sent back, not stopped at the human
+    assert _escalated(gate) == []
+    assert _stamped(gate) == []
+    assert [h.hold_id for h in gate.holds(thread=THREAD, author="Bohr")] == [a]
 
 
 @dataclass(frozen=True)
@@ -210,6 +323,7 @@ async def test_escalated_write_failure_keeps_the_holds(tmp_path: Path) -> None:
     _, _, mcp = await _run(gate, _Decider(_result({a: "supplemented"})), head=HEAD)
     assert _bounces(mcp) == []  # still delivered
     assert _open(gate) == [a]
+    assert _stamped(gate) == []
 
 
 # --------------------------------------------------------------------------- wire / reading

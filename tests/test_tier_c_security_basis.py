@@ -170,10 +170,15 @@ def test_hold_bounces_everything_unadmittable_even_on_retry(body: str, retry: bo
         "TIER-C: scope\nNEXT: human\n",
     ],
 )
-def test_hold_admits_admittable_labels_as_recheck(body: str) -> None:
+def test_hold_admits_admittable_labels_only_as_recheck(body: str) -> None:
+    """Part 1b (Bohr msg-9886 §2): a well-formed admittable head passes the label gate only as
+    ``RH-recheck`` — never as an ordinary ``R1`` / RETRY admit — and writes no row; the conductor
+    delivers it only when Jev answers every open hold ``supplemented``
+    (``test_tier_c_hold_relations``). The RETRY line buys nothing while held."""
     result = _decide("RETRY: u-0\n" + body, hold=True, retry=True)
     assert result.verdict is AdmissionVerdict.ADMIT
-    assert result.rule == "RH-recheck"  # the caller must put it through Jev with the hold
+    assert result.rule == "RH-recheck"
+    assert result.log_entries == []
 
 
 def test_hold_does_not_hold_a_tighten() -> None:

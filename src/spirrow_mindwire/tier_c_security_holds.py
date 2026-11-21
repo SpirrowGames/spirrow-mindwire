@@ -18,18 +18,30 @@ matter:
   hold of the same pair, in which case it is appended to that hold's history (msg-9665 §1.1⁷);
 * a row carrying ``hold_history: [{hold_id, relation, outcome}, ...]`` appends to those holds
   (msg-9663 §1.1⁶ (a));
-* an ``ESCALATED`` row carrying ``released_holds: [hold_id, ...]`` releases them — written only
-  after the handoff was actually delivered (msg-9661 §1.1⁵ 3.).
+* a row carrying ``holds_released: [<hold_id>, ...]`` releases those holds at that row. There
+  are two writers and one replay path (Bohr msg-9886 §3): the gate stamps a human's
+  ``HOLD-RELEASE: <hold_id>`` line (msg-9655 §1.1'') on the rows it next writes, and the
+  ``ESCALATED`` row of a delivered ``RH-recheck`` head carries the holds Jev confirmed it
+  supplements (part 1b; written only after delivery, so a failed write releases nothing,
+  msg-9779). A human's line lives in the thread, so the caller also passes those ids in. A
+  released hold never absorbs a later refusal: an identical body refused after the release
+  opens a new hold (PR #595 gate Obj-3).
 
-A human's ``HOLD-RELEASE: <hold_id>`` line releases that one hold (msg-9655 §1.1''): it lives in
-the thread, not in the log, so the caller passes the released ids in. A resolved thread releases
-all its holds simply by never running again — holds are keyed by thread.
+Release ordering (PR #595 gate round 2): the thread line carries no position in the log, so the
+gate stamps it there. The first rows it writes after it sees a release carry
+``holds_released: [<hold_id>, ...]``, and replay applies that release at that row, before the row
+itself. Refusals logged before the stamp stay in the released hold's history; only refusals at or
+after it open holds of their own. A release the caller passes in that has no stamp yet is applied
+after every row, which is the right place for it: every row in the log predates it.
+
+A resolved thread releases all its holds simply by never running again — holds are keyed by
+thread.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,33 +91,61 @@ def open_holds(
     """The open holds of ``(thread, author)``, oldest first.
 
     ``released`` is the set of hold ids a human released with ``HOLD-RELEASE:`` in this thread.
+    A release counts from its ``holds_released`` stamp in the log, or after every row if it has
+    none yet (module docstring, release ordering).
     """
     released_ids = set(released)
+    released_so_far: set[str] = set()
     holds: dict[str, SecurityHold] = {}
-    for row in iter_rows(log_path):
-        if row.get("thread") != thread or row.get("author") != author:
-            continue
+    for row in _rows_of(log_path, thread=thread, author=author):
+        released_so_far.update(_stamped_releases(row))
         kind = row.get("kind")
         if kind == LogKind.BOUNCED.value and row.get("security_hold") is True:
-            _open_or_append(holds, row, thread=thread, author=author)
+            _open_or_append(holds, row, thread=thread, author=author, released=released_so_far)
         for item in row.get("hold_history") or ():
             if isinstance(item, dict):
                 hold = holds.get(str(item.get("hold_id")))
                 if hold is not None:
                     hold.history.append({**item, "msg_id": row.get("msg_id")})
-        if kind == LogKind.ESCALATED.value:
-            for hold_id in row.get("released_holds") or ():
-                holds.pop(str(hold_id), None)
-    return [h for h in holds.values() if h.hold_id not in released_ids]
+    gone = released_ids | released_so_far
+    return [h for h in holds.values() if h.hold_id not in gone]
+
+
+def stamped_releases(log_path: Path, *, thread: str, author: str) -> set[str]:
+    """The hold ids whose release the log already carries as a ``holds_released`` stamp."""
+    stamped: set[str] = set()
+    for row in _rows_of(log_path, thread=thread, author=author):
+        stamped.update(_stamped_releases(row))
+    return stamped
+
+
+def _rows_of(log_path: Path, *, thread: str, author: str) -> Iterator[dict[str, Any]]:
+    for row in iter_rows(log_path):
+        if row.get("thread") == thread and row.get("author") == author:
+            yield row
+
+
+def _stamped_releases(row: dict[str, Any]) -> list[str]:
+    value = row.get("holds_released")
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value]
 
 
 def _open_or_append(
-    holds: dict[str, SecurityHold], row: dict[str, Any], *, thread: str, author: str
+    holds: dict[str, SecurityHold],
+    row: dict[str, Any],
+    *,
+    thread: str,
+    author: str,
+    released: set[str],
 ) -> None:
     hold_kind = str(row.get("hold_kind") or "structural")
     sha = row.get("body_sha256")
     if hold_kind == "structural" and isinstance(sha, str):
         for hold in holds.values():
+            if hold.hold_id in released:
+                continue  # released before this row: a later refusal is a hold of its own (Obj-3)
             if hold.hold_kind == "structural" and hold.body_sha256 == sha:
                 hold.history.append(
                     {
@@ -141,9 +181,10 @@ class HoldAnswers:
     complete: bool
 
     @property
-    def blocked(self) -> bool:
-        """One ``unsupplemented`` stops the whole handoff (msg-9661 §1.1⁵ 2.)."""
-        return HOLD_UNSUPPLEMENTED in self.relations.values()
+    def all_supplemented(self) -> bool:
+        """Every asked hold answered ``supplemented`` — the only answer that admits (Bohr
+        msg-9886 §2). ``False`` for no holds: there is nothing to have supplemented."""
+        return bool(self.relations) and all(r == HOLD_SUPPLEMENTED for r in self.relations.values())
 
     @property
     def supplemented_ids(self) -> list[str]:
@@ -194,4 +235,5 @@ __all__ = [
     "hold_release_ids",
     "open_holds",
     "read_hold_answers",
+    "stamped_releases",
 ]

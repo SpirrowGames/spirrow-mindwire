@@ -90,6 +90,11 @@
 # field and filled in by Get-StopReasonPhrase (never by the caller), with 不明 when the field is
 # missing, so the sentence still reads (msg-8707 v0.4 item 3). It does not say 判断待ち.
 #
+# 2026-11-20 (T-preflight-failure-counts-toward-stall, Bohr msg-9812 D-1''): 'preflight_refused'
+# joined the MAP. The sweep names an exit-13 run (the preflight refused it; no role was spawned)
+# with it, so the operator hears "the role was not started" — not STALLED's "launched and posted
+# nothing", which is what three refusals used to become (msg-9782 §1). It does not say 判断待ち.
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
@@ -115,6 +120,7 @@ function Get-StopReasonPhraseMap {
         'no_progress_to_human'  = "dispatch した role が何も投稿せず停止しました"
         'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
         'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
+        'preflight_refused'     = "preflight が起動を拒否したため、role は起動していません"
         'operator_work_to_human' = "operator の手作業待ちで停止しました"
         'malformed_handoff'     = "決着・待ちの書き方（STOP: done / BLOCKED-ON:）が受け付けられず停止しました"
         'unspawnable_target_to_human' = "指名先（{0}）は spawn できない identity のため、依頼は届いていません。本人に直接渡してください"

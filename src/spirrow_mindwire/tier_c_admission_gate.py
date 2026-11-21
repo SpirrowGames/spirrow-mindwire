@@ -127,6 +127,11 @@ class LogKind(StrEnum):
       added by T-tier-c-six-articles-security-boundary (Bohr msg-9650 §4) so arrivals can be
       counted per label and ``msg_id``. It re-opens the enum msg-3708 closed at six (recorded
       as a DECIDED there). Never emitted by :func:`decide_admission`.
+    * ``HOLD_RELEASED`` — the conductor's admission saw a human's ``HOLD-RELEASE:`` that the log
+      did not carry yet, and the decision itself wrote no row to stamp it on (a plain admit).
+      Its ``holds_released`` field fixes the release's position in the log for hold replay
+      (T-tier-c-six-articles-security-boundary, PR #595 gate round 3). Never emitted by
+      :func:`decide_admission`.
     """
 
     DECIDED = "DECIDED"
@@ -136,6 +141,7 @@ class LogKind(StrEnum):
     ADMIT_UNSURE = "ADMIT_UNSURE"
     RETRY_ADMIT = "RETRY_ADMIT"
     ESCALATED = "ESCALATED"
+    HOLD_RELEASED = "HOLD_RELEASED"
 
 
 class RetryAdmitReason(StrEnum):
@@ -265,9 +271,13 @@ SECURITY_TIGHTEN_HINT: str = (
 
 #: The hint for a bounce on an open security hold (msg-9653 §1.1').
 SECURITY_HOLD_HINT: str = (
-    "this thread holds a security request of yours that was refused for lack of a basis: "
-    "supply the basis (the location, or what is widened and how far), raise a different Tier-C "
-    "matter, or do not escalate and record `DECIDED:` / `DEFERRED:` instead"
+    "this thread holds a security request of yours that was refused for lack of a basis, and "
+    "while it is open a Tier-C handoff of yours in this thread reaches the human only when the "
+    "Tier-C decider confirms it supplies that basis (the location, or what is widened and how "
+    "far) for every open hold; a re-send does not force it through. A human can also release a "
+    "hold by writing `HOLD-RELEASE: <hold id>` (the hold id is the RETRY uuid of the refusal that "
+    "opened it) in this thread. Otherwise do not escalate; record `DECIDED:` / `DEFERRED:` "
+    "instead"
 )
 
 #: The hint when Jev gave no answer for an open hold (msg-9661 §1.1⁵ 1.). Re-sendable; nothing is
@@ -672,9 +682,12 @@ def decide_admission(
     security_hold :
         ``True`` when the caller's decisions log shows an open security hold for this
         thread/author (msg-9655 §1.1'', msg-9665 §1.1⁷). Evaluated before the RETRY prologue:
-        while held, only a well-formed ``security`` handoff or another admitted Tier-C label
-        passes, as ``RH-recheck``, which the caller must put through Jev with the hold
-        context; everything else bounces ``security-hold`` and RETRY never force-admits.
+        while held, RETRY never force-admits; a well-formed ``security`` handoff or another
+        admitted Tier-C label passes **only** as ``RH-recheck``, which the conductor must put
+        through Jev with every open hold and deliver only when each hold is answered
+        ``supplemented`` (part 1b, Bohr msg-9886 §2; fail-closed on anything else). Everything
+        else bounces ``security-hold``, and every refusal while held records its own structural
+        hold (msg-9665 §1.1⁷); a tightening ``security`` head keeps its own no-hold bounce.
     """
 
     # Common-field stamper. The gate has enough context — ``now``,
@@ -749,6 +762,10 @@ def decide_admission(
                     "RH-security-hold",
                     check_security_basis(body).basis,
                 )
+        # Part 1b (Bohr msg-9886 §2): a well-formed ``security`` head or another admitted label
+        # passes the label gate as ``RH-recheck`` only. The conductor then puts it through Jev with
+        # every open hold and delivers it only when each hold is answered ``supplemented``;
+        # anything else bounces (fail-closed). RETRY and ``other:`` / ``unsure`` never pass here.
         if held_label is not None and held_label in ADMIT_LABELS:
             return AdmissionDecision(
                 verdict=AdmissionVerdict.ADMIT,

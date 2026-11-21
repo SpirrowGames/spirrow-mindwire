@@ -439,7 +439,10 @@ exit 3
     # view, PR #544 gate advisory 3): --liveness only on the digest tick; no -UvOptions.
     # +1 for Invoke-ThreadReferencesProbe (T-thread-relations-unused-so-parallel-rule-cannot-be-checked):
     # the once-per-tick references index and digest lines; no -UvOptions, like the probes above.
-    Check 'twenty-eight helper call sites in the sweep script' 28 $helperCalls.Count
+    # +3 for the clone slot pool (T-ephemeral-impl-clone-slot-per-thread A3): Invoke-SlotPrep,
+    # Invoke-SlotFinish and Invoke-SlotLease, each a literal `-m spirrow_mindwire.cli <sub>` argv
+    # checked by tests/test_bounded_probe_cli_contract.py; no -UvOptions.
+    Check 'thirty-one helper call sites in the sweep script' 31 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

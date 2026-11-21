@@ -438,6 +438,13 @@ class StopReason(StrEnum):
     # TERMINAL_STOP_REASONS (this head goes nowhere if re-run; that set is the only list of such
     # reasons).
     STALLED = "stalled_to_human"
+    # T-preflight-failure-counts-toward-stall (design v3 D-1'', Bohr msg-9812): the preflight
+    # refused the run before any role was spawned. The conductor never stops with this value —
+    # the daemon exits PREFLIGHT_REFUSED_EXIT_CODE (13) — but the sweep names the stop with it, so
+    # the operator's notice reads "the role was not started" instead of STALLED's "launched and
+    # posted nothing" (msg-9782 §1). Listed here so StopReason.ps1's phrase map stays a subset of
+    # this enum. Not terminal: the refused launch is reverted, the head is retried next tick.
+    PREFLIGHT_REFUSED = "preflight_refused"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -1628,7 +1635,10 @@ class Conductor:
                 body = render_bounce_body(
                     author=author, decision=decision, bounced_msg_id=_msg_id(latest)
                 )
-            elif decision.rule == "RH-recheck" and holds_before:
+            elif decision.rule == "RH-recheck":
+                # Always through the per-hold re-check, even if the holds read above came back
+                # empty (a read failure): ``admit`` saw a hold, so this head is never let through
+                # on the ordinary path (msg-9886 §2, fail-closed).
                 held = self._hold_recheck(
                     gate, author, latest, decision, decider_result, holds_before
                 )
@@ -1746,11 +1756,7 @@ class Conductor:
         """
         if self._decider is None or self._decider.tierc_mode != "bounce":
             return None
-        # ``RH-recheck`` (a head admitted past an open security hold, msg-9653 §1.1') is put
-        # through Jev like an ordinary label admit: a RETRY never skips it while a hold is open.
-        if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith(
-            ("R1", "RH")
-        ):
+        if decision.verdict is not AdmissionVerdict.ADMIT or not decision.rule.startswith("R1"):
             return None
         if decision.normalized_label not in ADMIT_LABELS:
             return None
@@ -3182,33 +3188,38 @@ class Conductor:
         decider_result: DecisionResult | None,
         holds: list[SecurityHold],
     ) -> AdmissionDecision | None:
-        """Decide an ``RH-recheck`` head against each open hold (msg-9661 §1.1⁵, msg-9663 §1.1⁶).
+        """Decide an ``RH-recheck`` head against each open hold (Bohr msg-9886 §2 / §3).
 
-        Returns the recorded bounce, or ``None`` when the head is delivered. In order: an answer
-        missing for any hold (or no result) → ``security-hold-no-verdict``; one
-        ``unsupplemented`` → ``security-hold`` for the whole handoff; a ``LIKELY_NOT`` →
-        ``jev-likely-not`` (acted on whatever the Decider mode: a hold is only real through
-        Jev's answer, msg-9655 §1.1''); otherwise delivered. Holds are released only after
-        delivery, and only through the ``ESCALATED`` row naming them: if that write fails they
-        stay (msg-9779). A bounce appends history to every hold it touched and, when Jev says
-        it carries another unbased request, opens a hold on it (§1.1⁶ (b)).
+        Returns the recorded bounce, or ``None`` when the head is delivered. **Fail-closed**: the
+        head is delivered only when the Decider runs in ``bounce`` mode, its result answers every
+        open hold (and ``unheld_unbased``) per hold id, every hold is answered ``supplemented``,
+        and the overall verdict is not ``LIKELY_NOT``. Otherwise it bounces:
 
-        Interim until the pending state of part 2 (§8⁗): no verdict is a re-sendable bounce,
-        never a delivery.
+        * no hold read, no decider, a mode other than ``bounce``, no / malformed result, or an
+          answer missing for any hold → ``security-hold-no-verdict`` (re-sendable, nothing
+          delivered or released);
+        * any hold answered other than ``supplemented`` (``unsupplemented`` or ``unrelated``), or
+          an actionable ``LIKELY_NOT`` → ``security-hold`` for the whole handoff.
+
+        On delivery the supplemented holds are released by the ``ESCALATED`` row itself, through
+        its ``holds_released`` stamp — the same replay path as a human's release (msg-9886 §3). If
+        that write fails the holds stay (msg-9779). A bounce releases nothing; it appends history
+        to every hold it touched and, when Jev says the head carries another unbased request,
+        opens a hold on it (msg-9663 §1.1⁶ (b)).
         """
+        bounce_mode = self._decider is not None and self._decider.tierc_mode == "bounce"
         raw = decider_result.raw_answers if decider_result is not None else None
-        answers = read_hold_answers(holds, raw)
+        answers = read_hold_answers(holds, raw if bounce_mode else None)
         av = decider_result.actionable_verdict if decider_result is not None else None
         likely_not = isinstance(av, TierCV2Verdict) and av.kind is TierCVerdictKind.LIKELY_NOT
-        if not answers.complete:
+        if not holds or not answers.complete:
             reason, hint = BounceReason.SECURITY_HOLD_NO_VERDICT, SECURITY_HOLD_NO_VERDICT_HINT
-        elif answers.blocked:
+        elif not answers.all_supplemented or likely_not:
             reason, hint = BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT
-        elif likely_not:
-            reason, hint = BounceReason.JEV_LIKELY_NOT, SECURITY_HOLD_HINT
         else:
             self._write_escalated(gate, author, latest, decision, answers.supplemented_ids)
             return None
+        complete = bool(holds) and answers.complete
         return gate.hold_bounce(
             author=author,
             label=decision.normalized_label,
@@ -3218,8 +3229,8 @@ class Conductor:
             msg_id=_msg_id(latest),
             now=datetime.now(UTC),
             body=_content(latest),
-            history=answers.history(reason.value) if answers.complete else [],
-            open_new=answers.complete and answers.unheld_unbased == UNHELD_YES,
+            history=answers.history(reason.value) if complete else [],
+            open_new=complete and answers.unheld_unbased == UNHELD_YES,
         )
 
     def _write_escalated(
@@ -3239,7 +3250,7 @@ class Conductor:
                 thread=self._thread_ref.thread_id,
                 msg_id=_msg_id(latest),
                 now=datetime.now(UTC),
-                released_holds=released,
+                holds_released=released,
             )
         except Exception:
             logger.warning(
