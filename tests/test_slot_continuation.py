@@ -133,3 +133,45 @@ def test_payload_line(capsys: pytest.CaptureFixture[str]) -> None:
     payload = json.loads(out[len(SLOT_CONTINUE_REFUSED_PREFIX) :])
     assert payload["park_code"] == PARK_CODE and payload["thread"] == T
     assert payload["reason"] == REASON_NOT_SAVED and payload["path"]
+
+
+def test_built_check_reads_the_ledger_and_lease_files(tmp_path: Path) -> None:
+    from spirrow_mindwire.conductor.continuation_ledger import SlotTurnOutcome, record_slot_turn
+    from spirrow_mindwire.slot_continuation import build_slot_continuation_check
+
+    state = tmp_path / "state"
+    ledger = state / "continuation_ledger.jsonl"
+    check = build_slot_continuation_check(
+        slots_root=tmp_path / "slots",
+        current_slot=tmp_path / "slots" / REPO / "slot-02",
+        state_dir=state,
+        ledger_path=ledger,
+        retreats_path=state / "clone-retreats.jsonl",
+        project=P,
+        thread=T,
+    )
+    with pytest.raises(SlotContinuationRefused) as no_row:
+        check()
+    assert no_row.value.verdict.reason == REASON_NO_RECORD
+    record_slot_turn(
+        ledger, project=P, thread=T, turn_id="t1", outcome=SlotTurnOutcome.PUSHED, slot="slot-01"
+    )
+    check()  # admitted
+    record_slot_turn(
+        ledger,
+        project=P,
+        thread=T,
+        turn_id="t2",
+        outcome=SlotTurnOutcome.RESCUE_FAILED,
+        slot="slot-01",
+    )
+    with pytest.raises(SlotContinuationRefused) as failed:
+        check()
+    assert failed.value.verdict.reason == REASON_NOT_SAVED
+
+
+def test_loop_runner_builds_no_slot_check_without_slots_root() -> None:
+    from spirrow_mindwire.config import MindwireSettings
+    from spirrow_mindwire.loop_runner import _slot_continuation_check, _thread_ref
+
+    assert _slot_continuation_check(MindwireSettings(), _thread_ref("p", "t")) is None

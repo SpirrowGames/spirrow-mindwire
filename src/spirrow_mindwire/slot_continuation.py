@@ -29,20 +29,21 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .clone_slot import quarantine_root
-from .clone_slot_lease import Lease, LeaseState
-from .conductor.continuation_ledger import LedgerKind, SlotTurnOutcome
+from .clone_slot_lease import Lease, LeaseState, LeaseStore
+from .conductor.continuation_ledger import LedgerKind, SlotTurnOutcome, read_ledger
 
 __all__ = [
     "SLOT_CONTINUE_REFUSED_EXIT_CODE",
     "SLOT_CONTINUE_REFUSED_PREFIX",
     "SlotContinuationRefused",
     "SlotContinuationVerdict",
+    "build_slot_continuation_check",
     "emit_slot_continue_refused_payload",
     "judge_slot_continuation",
 ]
@@ -192,3 +193,57 @@ def emit_slot_continue_refused_payload(exc: SlotContinuationRefused) -> None:
     """One ``MINDWIRE_SLOT_CONTINUE_REFUSED <json>`` line on stdout for the wrapper."""
     payload = exc.verdict.to_json(project=exc.project, thread=exc.thread)
     print(SLOT_CONTINUE_REFUSED_PREFIX + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Every JSON-object line of ``path``; a missing file or an unreadable line reads as nothing
+    (only the quarantine *path* in the park reason comes from here, never the verdict)."""
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows
+
+
+def build_slot_continuation_check(
+    *,
+    slots_root: Path,
+    current_slot: Path,
+    state_dir: Path,
+    ledger_path: Path,
+    retreats_path: Path,
+    project: str,
+    thread: str,
+) -> Callable[[], None]:
+    """The conductor's slot-mode continuation check for this run (``[loop].slots_root`` set).
+
+    ``current_slot`` is this run's ``[loop].repo_dir`` — the slot the wrapper borrowed,
+    ``<slots_root>/<repo>/slot-NN`` — so the repo is its parent's name. The ledger and the lease
+    file are read at call time, after the earlier run's turn end wrote them. A read failure of
+    either propagates (fail-closed: the run stops, nothing is continued on a guess).
+    """
+    repo = current_slot.parent.name
+
+    def check() -> None:
+        verdict = judge_slot_continuation(
+            project=project,
+            thread=thread,
+            ledger_rows=read_ledger(ledger_path).rows,
+            leases=LeaseStore(state_dir).leases(repo),
+            current_slot=current_slot,
+            slots_root=slots_root,
+            repo=repo,
+            retreat_rows=_read_jsonl(retreats_path),
+        )
+        if not verdict.admit:
+            raise SlotContinuationRefused(verdict, project=project, thread=thread)
+
+    return check

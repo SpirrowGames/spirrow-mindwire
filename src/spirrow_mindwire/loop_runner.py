@@ -165,6 +165,12 @@ from .preflight import (
     preflight_gate,
 )
 from .repo_projects import load_repo_project_map
+from .slot_continuation import (
+    SLOT_CONTINUE_REFUSED_EXIT_CODE,
+    SlotContinuationRefused,
+    build_slot_continuation_check,
+    emit_slot_continue_refused_payload,
+)
 from .spec_pin import SpecPinWriter
 from .turn_isolation.errors import TurnIsolationStop
 from .turn_isolation.gate import TurnLaunchFactory, resolve_turn_launch
@@ -785,7 +791,10 @@ def _build_dispatcher(
         clone_guard = CloneGuard(Path(cfg.repo_dir))
         # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
         # implementer launch records its starting ref state before the adapter runs.
-        ref_snapshot_store = TurnRefSnapshotStore(resolve_turn_ref_snapshot_dir(settings))
+        # A4 (msg-9400 §4): slot mode does not use the launch ref snapshot; the turn end's
+        # ledger row decides continuation instead (:mod:`spirrow_mindwire.slot_continuation`).
+        if settings.loop.slots_root is None:
+            ref_snapshot_store = TurnRefSnapshotStore(resolve_turn_ref_snapshot_dir(settings))
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,
@@ -821,6 +830,25 @@ def _continuation_clone_check(
         guard.check_pushed(baseline=baseline)
 
     return check
+
+
+def _slot_continuation_check(
+    settings: MindwireSettings, thread_ref: ThreadRef
+) -> Callable[[], None] | None:
+    """The slot-mode continuation check, or ``None`` when ``[loop].slots_root`` is unset (INV-0:
+    the shared clone keeps :func:`_continuation_clone_check`)."""
+    loop_cfg = settings.loop
+    if loop_cfg.slots_root is None or loop_cfg.repo_dir is None:
+        return None
+    return build_slot_continuation_check(
+        slots_root=Path(loop_cfg.slots_root),
+        current_slot=Path(loop_cfg.repo_dir),
+        state_dir=settings.paths.data_dir / "state",
+        ledger_path=resolve_continuation_ledger_path(settings),
+        retreats_path=resolve_clone_retreat_log_path(settings),
+        project=thread_ref.project_id,
+        thread=thread_ref.thread_id,
+    )
 
 
 def resolve_implementer_turn_launch(
@@ -1165,7 +1193,11 @@ def build_conductor(
             dispatcher=dispatcher,
             # T-implementer-self-continuation condition 4: clean tree AND nothing unpushed, judged
             # by the same guard the dispatcher runs before every dispatch.
-            continuation_clone_check=_continuation_clone_check(dispatcher),
+            continuation_clone_check=(
+                _continuation_clone_check(dispatcher) if loop_cfg.slots_root is None else None
+            ),
+            # A4 (msg-9400 §3): slot mode decides from the ledger and the lease file.
+            slot_continuation_check=_slot_continuation_check(settings, thread_ref),
             # PR-2 (Bohr msg-7971 §1 / msg-7973): the per-project cap ([conductor].continue_cap,
             # default 3 when this project has no key) and the D-3 continuation ledger.
             continue_cap=_resolve_continue_cap(cond_cfg.continue_cap_for(loop_cfg.project)),
@@ -1801,6 +1833,19 @@ def main() -> None:
             snap_exc,
         )
         sys.exit(REF_SNAPSHOT_UNRECORDED_EXIT_CODE)
+    except SlotContinuationRefused as slot_exc:
+        # A4 (msg-9400 §3): slot mode refused a CONTINUE whose turn end did not record its work
+        # as saved. This thread only is parked by the wrapper (exit 14), on the payload line
+        # naming the quarantine path or the slot still leased; never the repo, never a retry.
+        emit_slot_continue_refused_payload(slot_exc)
+        logger.warning(
+            "slot-continue-refused exit=%d: reason=%s path=%s %s",
+            SLOT_CONTINUE_REFUSED_EXIT_CODE,
+            slot_exc.verdict.reason,
+            slot_exc.verdict.path,
+            slot_exc.verdict.detail,
+        )
+        sys.exit(SLOT_CONTINUE_REFUSED_EXIT_CODE)
     except DirtyCloneError as dirty_exc:
         # T-timed-out-implementer-turn-leaves-dirty-shared-clone (design v4 D-2): the dispatch was
         # refused because ``[loop].repo_dir`` is not clean. Not this thread's fault, so it must not
