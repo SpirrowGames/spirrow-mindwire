@@ -20,6 +20,7 @@ always built). Pinned here:
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib.util
 import json
 import sys
@@ -324,7 +325,14 @@ def test_parity_fixture_report_is_the_enumerators_output() -> None:
     assert EnumerateReport(projects=tuple(reports)).as_json() == _PARITY["report"]
 
 
-def test_parity_get_thread_keys_equal_the_tag_step_keys() -> None:
+def test_parity_get_thread_keys_equal_the_tag_step_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The CLI takes no ``now``, so pin its clock to the fixture's own ``now``. Without this the
+    # fixture's dated threads age past ``max_idle_days`` on the wall clock and drop out of the tag
+    # step (red on main 8a90ecb from 2026-11-21, when ``T-fresh2`` turned 14 days idle).
+    now = datetime.fromisoformat(_PARITY["now"])
+    monkeypatch.setattr(
+        _CLI, "enumerate_project", functools.partial(_CLI.enumerate_project, now=now)
+    )
     reg = parse_registered(_PARITY["sweep"])
     names = {p for i in _PARITY["listings"].values() for p in (i[0]["thread_id"],)}
     assert names  # the fixture is not empty
