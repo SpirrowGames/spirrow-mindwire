@@ -64,6 +64,7 @@ __all__ = [
     "QuarantineInfo",
     "SlotPrep",
     "judge_recoverable",
+    "rename_to_quarantine",
 ]
 
 MIRROR_REMOTE = "mirror"
@@ -272,6 +273,40 @@ def _judge_gitlinks(repo: Path, git: GitRunner, *, depth: int) -> str | None:
     return None
 
 
+def rename_to_quarantine(
+    ref: SlotRef,
+    who: str,
+    now: datetime,
+    rename: Callable[[Path, Path], None] = os.rename,
+) -> tuple[Path | None, list[str]]:
+    """Rename the slot to ``_quarantine/<repo>/<slot>-<who>-<stamp>``, then ``-retryN`` (D-3).
+
+    Returns the new path, or ``None`` with one error per attempt when every attempt failed. Shared
+    by the borrow-time check and the turn-end rescue failure (msg-9400 §2, msg-9402 Obj-36-4).
+    """
+    root = quarantine_root(ref.slots_root, ref.repo)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # An obstructed or unwritable quarantine root is a failed quarantine like a failed
+        # rename: the caller's quarantine_failed handling must run (PR #594 gate Obj-1-2).
+        return None, [f"{root}: cannot create quarantine root: {exc}"]
+    base_name = f"{ref.name}-{who}-{now.strftime('%Y%m%d-%H%M%S')}"
+    errors: list[str] = []
+    for attempt in range(RENAME_RETRIES + 1):
+        target = root / (base_name if attempt == 0 else f"{base_name}-retry{attempt}")
+        if target.exists():
+            errors.append(f"{target.name} exists")
+            continue
+        try:
+            rename(ref.path, target)
+        except OSError as exc:
+            errors.append(f"{target.name}: {exc}")
+            continue
+        return target, errors
+    return None, errors
+
+
 class SlotPrep:
     """Borrow-time procedure of one repo's slot pool. Every git call goes through ``git``."""
 
@@ -310,6 +345,14 @@ class SlotPrep:
         res = _call(self._git, mirror.parent, "clone", "--mirror", self.origin_url, mirror.name)
         return None if res.returncode == 0 else f"mirror clone failed: {_first_line(res)}"
 
+    def _mirror_default(self) -> str | None:
+        """The default branch the bare mirror's ``HEAD`` names (``--base`` not given)."""
+        res = _call(
+            self._git, mirror_path(self.slots_root, self.repo), "symbolic-ref", "--short", "HEAD"
+        )
+        name = res.stdout.strip()
+        return name if res.returncode == 0 and name else None
+
     # -- borrow ----------------------------------------------------------------------------
 
     def borrow(
@@ -318,7 +361,7 @@ class SlotPrep:
         thread_id: str,
         turn_id: str,
         branch: str,
-        base: str,
+        base: str | None,
         wrapper_pid: int | None = None,
         session_name: str | None = None,
         job_name: str | None = None,
@@ -357,7 +400,7 @@ class SlotPrep:
         kept: list[tuple[Lease, UnreturnedVerdict]],
         *,
         branch: str,
-        base: str,
+        base: str | None,
     ) -> PrepResult:
         err = self._ensure_mirror()
         if err is not None:
@@ -393,6 +436,18 @@ class SlotPrep:
                     lease,
                     PARK_PROVISION_FAILED,
                     f"{slot}: {err}",
+                    acquire=acq,
+                    quarantine=quarantine,
+                    kept=kept,
+                )
+        if base is None:
+            base = self._mirror_default()
+            if base is None:
+                return self._park(
+                    ref,
+                    lease,
+                    PARK_PROVISION_FAILED,
+                    "the mirror's HEAD names no default branch; pass --base",
                     acquire=acq,
                     quarantine=quarantine,
                     kept=kept,
@@ -486,21 +541,8 @@ class SlotPrep:
                 recoverable, rec_reason = judge_recoverable(slot, self._git)
         else:
             rec_reason = "not_a_repository"
-        stamp = self._clock().strftime("%Y%m%d-%H%M%S")
-        root = quarantine_root(self.slots_root, self.repo)
-        root.mkdir(parents=True, exist_ok=True)
-        base_name = f"{ref.name}-{prev}-{stamp}"
-        errors: list[str] = []
-        for attempt in range(RENAME_RETRIES + 1):
-            target = root / (base_name if attempt == 0 else f"{base_name}-retry{attempt}")
-            if target.exists():
-                errors.append(f"{target.name} exists")
-                continue
-            try:
-                self._rename(slot, target)
-            except OSError as exc:
-                errors.append(f"{target.name}: {exc}")
-                continue
+        target, errors = rename_to_quarantine(ref, prev, self._clock(), self._rename)
+        if target is not None:
             return QuarantineInfo(reason, prev, target, rescue, recoverable, rec_reason)
         return QuarantineInfo(
             reason,

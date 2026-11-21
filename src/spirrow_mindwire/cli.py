@@ -41,7 +41,8 @@ patch to ``--state-dir`` and discard; see :mod:`spirrow_mindwire.clone_retreat`.
 retreated / discarded, 4 discard incomplete (still parked), 1 failed.
 
 ``mindwire slot-prep ...`` / ``mindwire slot-lease <action> ...`` (T-ephemeral-impl-clone-slot-per-
-thread A2) borrow a pooled clone slot for one turn and move its lease; see
+thread A2) borrow a pooled clone slot for one turn and move its lease; ``mindwire slot-finish ...``
+(A3) hands it back at turn end after the save check; see
 :mod:`spirrow_mindwire.clone_slot_cli`. Not called by the loop until ``[loop].slots_root`` is
 accepted (A4).
 
@@ -257,10 +258,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 slot_mode=args.slot_mode,
             )
         )
-    if args.command in ("slot-prep", "slot-lease"):
-        from .clone_slot_cli import run_lease, run_prep
+    if args.command in ("slot-prep", "slot-lease", "slot-finish"):
+        from .clone_slot_cli import run_finish, run_lease, run_prep
 
-        raise SystemExit(run_prep(args) if args.command == "slot-prep" else run_lease(args))
+        runner = {"slot-prep": run_prep, "slot-lease": run_lease, "slot-finish": run_finish}
+        raise SystemExit(runner[args.command](args))
     if args.command == "continue-report":
         from .conductor.continuation_ledger import report_text
         from .config import resolve_continuation_ledger_path

@@ -135,6 +135,7 @@ from ..tier_c_decisions_log import (
     missing_decision_entries,
     scan_decision_lines,
 )
+from ..tier_c_security_holds import hold_release_ids
 from ..turn_ref_snapshot import ContinuationScope
 from ..value_objects import (
     ChatroomEvent,
@@ -429,6 +430,13 @@ class StopReason(StrEnum):
     # TERMINAL_STOP_REASONS (this head goes nowhere if re-run; that set is the only list of such
     # reasons).
     STALLED = "stalled_to_human"
+    # T-preflight-failure-counts-toward-stall (design v3 D-1'', Bohr msg-9812): the preflight
+    # refused the run before any role was spawned. The conductor never stops with this value —
+    # the daemon exits PREFLIGHT_REFUSED_EXIT_CODE (13) — but the sweep names the stop with it, so
+    # the operator's notice reads "the role was not started" instead of STALLED's "launched and
+    # posted nothing" (msg-9782 §1). Listed here so StopReason.ps1's phrase map stays a subset of
+    # this enum. Not terminal: the refused launch is reverted, the head is retried next tick.
+    PREFLIGHT_REFUSED = "preflight_refused"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -1349,7 +1357,9 @@ class Conductor:
                 and not spawn_blocked
                 and self._tierc_gate is not None
             ):
-                bounce_msg = await self._enforce_tierc_gate(handoff, latest, decider_result)
+                bounce_msg = await self._enforce_tierc_gate(
+                    handoff, latest, decider_result, messages
+                )
                 if bounce_msg is not None:
                     author_identity, author_role = self._roster_entry(_author(latest))
                     handle = sessions.get(author_identity)
@@ -1593,6 +1603,7 @@ class Conductor:
         handoff: Handoff,
         latest: dict[str, Any],
         decider_result: DecisionResult | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """Run the enforced admission gate on a head ``_route`` stopped at the human (2e-1b).
 
@@ -1631,6 +1642,7 @@ class Conductor:
                 thread=self._thread_ref.thread_id,
                 msg_id=_msg_id(latest),
                 now=datetime.now(UTC),
+                released_holds=self._hold_release_ids(messages or []),
             )
             logger.info(
                 "tierc_gate decision: msg=%s author=%s verdict=%s rule=%s",
@@ -1646,6 +1658,22 @@ class Conductor:
             else:
                 ask_score = self._jev_bounce_score(decision, decider_result)
                 if ask_score is None:
+                    # Delivered: nothing after the gate bounced it (msg-9650 §4). A failed write
+                    # is logged and the head still reaches the human — measurement, not a gate.
+                    try:
+                        gate.escalated(
+                            author=author,
+                            decision=decision,
+                            thread=self._thread_ref.thread_id,
+                            msg_id=_msg_id(latest),
+                            now=datetime.now(UTC),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "tierc_gate ESCALATED row for msg=%s not written",
+                            _msg_id(latest),
+                            exc_info=True,
+                        )
                     return None
                 retry_uuid = gate.jev_bounce(
                     author=author,
@@ -1654,6 +1682,7 @@ class Conductor:
                     thread=self._thread_ref.thread_id,
                     msg_id=_msg_id(latest),
                     now=datetime.now(UTC),
+                    body=_content(latest),
                 )
                 logger.info(
                     "tierc_gate jev bounce: msg=%s author=%s label=%s ask_score=%.3f",
@@ -3171,6 +3200,15 @@ class Conductor:
             logger.warning("G3 prefetch has no head msg id; carve-out ③ will close")
             return
         self._proceed_veto = (head_id, vetoed, ask_score)
+
+    def _hold_release_ids(self, messages: list[dict[str, Any]]) -> list[str]:
+        """The hold ids a human released in this thread with ``HOLD-RELEASE: <id>`` (msg-9655
+        §1.1''). Only a human identity's line counts; an agent cannot release its own hold."""
+        released: list[str] = []
+        for msg in messages:
+            if self._is_human(_author(msg)):
+                released.extend(hold_release_ids(_content(msg)))
+        return released
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a

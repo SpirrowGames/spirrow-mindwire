@@ -75,8 +75,10 @@ def test_a_admitted_share_is_split_by_label_and_adds_up() -> None:
     out = _classify([("p", "T-a", msgs)], modes={"p": "off"})
     assert out["iii_admitted_by_label"] == {
         "cost": 1,
+        "dispute": 0,
         "goal": 2,
         "irreversible": 0,
+        "security": 0,
         "unsure:goal?": 1,
     }
     assert sum(out["iii_admitted_by_label"].values()) == out["counts"]["iii_admitted"] == 4
