@@ -20,6 +20,15 @@ msg-9402 and msg-9404):
    written next to the ``rescue_failed`` one, and the thread alone parks with
    ``clone_slot_unrecoverable``. The notice names the slot's own (unrenamed) path.
 
+7. A5 D-5 (Bohr msg-9899 §1): when the conductor exited 8 because the clone guard refused the
+   borrowed slot (``guard_reason`` given), the slot is never handed back as it is. Steps 2-3 run
+   as above, then the slot is quarantined whatever the save outcome (the D-7 reason comes from
+   :func:`refusal_reason`), and a failed rename parks this thread only, as in step 6. The repo is
+   never parked. A ``pushed`` outcome writes no ``slot_turn_result`` row: the guard may have
+   refused before any role ran, and a ``pushed`` row for an unused borrow would let a refused
+   CONTINUE through (the PR #598 gate Obj-1-1 hazard). Leaving the earlier turn the last recorded
+   one fails closed. Only an unsaved outcome carries an operator notice.
+
 Nothing here deletes a directory or runs ``reset --hard``. Nothing here posts to a thread either:
 :class:`FinishResult` carries the notice fields and the wrapper sends them.
 
@@ -34,6 +43,7 @@ written before the notice is attempted.
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -50,7 +60,7 @@ from .clone_retreat_log import (
 )
 from .clone_slot import PARK_UNRECOVERABLE, SlotRef
 from .clone_slot_lease import Lease, LeaseState, LeaseStore
-from .clone_slot_prep import PUSH_REMOTE, rename_to_quarantine
+from .clone_slot_prep import PUSH_REMOTE, judge_recoverable, rename_to_quarantine
 from .clone_slot_save import SaveResult, SlotSaver, _subprocess_git, record_turn_result
 from .conductor.continuation_ledger import SlotTurnOutcome, record_slot_turn
 
@@ -58,10 +68,39 @@ __all__ = [
     "FinishOutcome",
     "FinishResult",
     "SlotFinish",
+    "refusal_reason",
 ]
 
 RETREATS_FILE = "clone-retreats.jsonl"
 QUARANTINE_REASON = "rescue_failed"
+
+# A5 D-5: the clone guard's refusal reason (clone_guard.DirtyCloneReason) -> the D-7 reason.
+# ``dirty_tree`` is split by the slot's own status (untracked_only / modified).
+_GUARD_TO_D7 = {
+    "op_in_progress": "merge_in_progress",
+    "clone_busy": "index_lock",
+    "wrong_head": "wrong_head",
+    "pin_not_ignored": "modified",
+    "git_unavailable": "provision_failed",
+}
+
+
+def refusal_reason(slot: Path, guard_reason: str, git: GitRunner = _subprocess_git) -> str:
+    """The D-7 quarantine reason of a slot the clone guard refused with ``guard_reason``.
+
+    An unknown guard reason, or a ``dirty_tree`` whose status cannot be read, is ``modified``:
+    the slot is quarantined either way, the reason only feeds the D-7 counts.
+    """
+    if guard_reason != "dirty_tree":
+        return _GUARD_TO_D7.get(guard_reason, "modified")
+    try:
+        res = git(slot, ("status", "--porcelain", "--untracked-files=all"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return "modified"
+    lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+    if res.returncode == 0 and lines and all(ln.startswith("??") for ln in lines):
+        return "untracked_only"
+    return "modified"
 
 
 class FinishOutcome(StrEnum):
@@ -81,6 +120,7 @@ class FinishResult:
     detail: str = ""
     record_error: str | None = None
     recovered_by: str | None = None
+    quarantine_reason: str = QUARANTINE_REASON
 
     @property
     def notice(self) -> dict[str, Any] | None:
@@ -89,6 +129,9 @@ class FinishResult:
         the thread is added by the wrapper, and the reason. ``None`` when nothing needs a person."""
         notice: dict[str, Any]
         if self.outcome is FinishOutcome.QUARANTINED:
+            if self.save is not None and self.save.saved:
+                # A5 D-5: a guard-refused slot quarantined with its work saved needs nobody.
+                return None
             notice = {
                 "reason": QUARANTINE_REASON,
                 "path": str(self.quarantine_path),
@@ -121,6 +164,7 @@ class FinishResult:
             "detail": self.detail,
             "record_error": self.record_error,
             "recovered_by": self.recovered_by,
+            "quarantine_reason": self.quarantine_reason,
             "notice": self.notice,
         }
 
@@ -161,7 +205,9 @@ class SlotFinish:
                 return lease
         return None
 
-    def finish(self, *, slot: str, thread_id: str, turn_id: str) -> FinishResult:
+    def finish(
+        self, *, slot: str, thread_id: str, turn_id: str, guard_reason: str | None = None
+    ) -> FinishResult:
         lease = self._held(slot, turn_id)
         if lease is None:
             return FinishResult(
@@ -177,27 +223,57 @@ class SlotFinish:
                 FinishOutcome.REFUSED, detail=f"{self.repo}/{slot} is already quarantine_failed"
             )
         ref = SlotRef(self.slots_root, self.repo, lease.index)
+        # Classified before the rescue, which may stage the slot's files.
+        reason = None if guard_reason is None else refusal_reason(ref.path, guard_reason, self._git)
         if ref.path.is_dir():
             saver = SlotSaver(ref.path, git=self._git, push_remote=PUSH_REMOTE)
             save = saver.check_and_rescue(thread_id, turn_id, remote=PUSH_REMOTE)
         else:
             save = SaveResult(SlotTurnOutcome.RESCUE_FAILED, detail=f"{ref.path} is missing")
-        save = record_turn_result(
-            self.ledger,
-            save,
-            project=self.project,
-            thread=thread_id,
-            turn_id=turn_id,
-            slot=ref.name,
-            recovered_by=self.recovered_by,
-        )
+        if guard_reason is None or save.outcome is not SlotTurnOutcome.PUSHED:
+            save = record_turn_result(
+                self.ledger,
+                save,
+                project=self.project,
+                thread=thread_id,
+                turn_id=turn_id,
+                slot=ref.name,
+                recovered_by=self.recovered_by,
+            )
+        if guard_reason is not None and reason is not None:
+            recoverable, rec_reason = (
+                judge_recoverable(ref.path, self._git)
+                if save.saved and ref.path.is_dir()
+                else (False, QUARANTINE_REASON)
+            )
+            return self._quarantine(
+                ref,
+                lease,
+                save,
+                reason=reason,
+                recoverable=recoverable,
+                recoverable_reason=rec_reason,
+                why=f"clone guard refused ({guard_reason})",
+            )
         if save.saved:
             self.store.release(self.repo, ref.name, turn_id)
             return FinishResult(FinishOutcome.RELEASED, ref, save, recovered_by=self.recovered_by)
         return self._quarantine(ref, lease, save)
 
-    def _quarantine(self, ref: SlotRef, lease: Lease, save: SaveResult) -> FinishResult:
-        detail = save.detail or ", ".join(save.reasons) or "not saved"
+    def _quarantine(
+        self,
+        ref: SlotRef,
+        lease: Lease,
+        save: SaveResult,
+        *,
+        reason: str = QUARANTINE_REASON,
+        recoverable: bool = False,
+        recoverable_reason: str | None = QUARANTINE_REASON,
+        why: str | None = None,
+    ) -> FinishResult:
+        detail = save.detail or ", ".join(save.reasons) or ("saved" if save.saved else "not saved")
+        if why is not None:
+            detail = f"{why}; {detail}"
         target: Path | None = None
         errors: list[str] = []
         if ref.path.exists():
@@ -211,11 +287,11 @@ class SlotFinish:
                 repo=self.repo,
                 slot_path=ref.path,
                 action=SLOT_ACTION_REBUILT,
-                quarantine_reason=QUARANTINE_REASON,
+                quarantine_reason=reason,
                 quarantine_path=target,
                 detail=f"turn end {lease.turn_id}: {detail}",
-                recoverable=False,
-                recoverable_reason=QUARANTINE_REASON,
+                recoverable=recoverable,
+                recoverable_reason=recoverable_reason,
                 rescue=rescue,
             )
             record_error = self._append(row)
@@ -230,6 +306,7 @@ class SlotFinish:
                 detail=detail,
                 record_error=record_error,
                 recovered_by=self.recovered_by,
+                quarantine_reason=reason,
             )
         # Every rename failed (msg-9402 Obj-36-4): keep the lease so the slot is never lent again.
         self.store.mark_quarantine_failed(self.repo, ref.name, lease.turn_id)
@@ -254,11 +331,11 @@ class SlotFinish:
             repo=self.repo,
             slot_path=ref.path,
             action=SLOT_ACTION_PARKED,
-            quarantine_reason=QUARANTINE_REASON,
+            quarantine_reason=reason,
             park_code=PARK_UNRECOVERABLE,
             detail=f"turn end {lease.turn_id}: {detail}; {why}",
             recoverable=False,
-            recoverable_reason=QUARANTINE_REASON,
+            recoverable_reason=recoverable_reason or QUARANTINE_REASON,
             rescue=rescue,
         )
         err = self._append(row)
@@ -272,6 +349,7 @@ class SlotFinish:
             detail=f"{detail}; {why}",
             record_error="; ".join(record_errors) or None,
             recovered_by=self.recovered_by,
+            quarantine_reason=reason,
         )
 
     def recover(self, *, slot: str, confirm_no_process: bool) -> FinishResult:

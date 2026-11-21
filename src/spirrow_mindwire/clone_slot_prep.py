@@ -64,6 +64,7 @@ __all__ = [
     "QuarantineInfo",
     "SlotPrep",
     "judge_recoverable",
+    "measure_bytes",
     "rename_to_quarantine",
 ]
 
@@ -110,6 +111,7 @@ class PrepResult:
     quarantine: QuarantineInfo | None = None
     provisioned: bool = False
     clone_seconds: float | None = None
+    slot_bytes: int | None = None
     deleted_branches: tuple[str, ...] = ()
     kept: list[tuple[Lease, UnreturnedVerdict]] = field(default_factory=list)
 
@@ -127,6 +129,7 @@ class PrepResult:
             "wait_notice": bool(self.acquire is not None and self.acquire.notice),
             "provisioned": self.provisioned,
             "clone_seconds": self.clone_seconds,
+            "slot_bytes": self.slot_bytes,
             "deleted_branches": list(self.deleted_branches),
             "quarantine": None
             if q is None
@@ -273,6 +276,26 @@ def _judge_gitlinks(repo: Path, git: GitRunner, *, depth: int) -> str | None:
     return None
 
 
+def measure_bytes(path: Path) -> int | None:
+    """Total size of the files under ``path`` (D-7, Bohr msg-9899 §2): the provisioned slot's size.
+
+    Symlinks are not followed. Any failure is ``None``: the measurement never stops a turn.
+    """
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path, onerror=_raise):
+            for name in files:
+                st = os.lstat(os.path.join(root, name))
+                total += st.st_size
+    except OSError:
+        return None
+    return total
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
+
+
 def rename_to_quarantine(
     ref: SlotRef,
     who: str,
@@ -409,6 +432,7 @@ class SlotPrep:
         quarantine: QuarantineInfo | None = None
         provisioned = False
         clone_seconds: float | None = None
+        slot_bytes: int | None = None
         if slot.exists():
             reason = self._check(slot)
             if reason is not None:
@@ -430,6 +454,8 @@ class SlotPrep:
             err = self._provision(slot)
             clone_seconds = round(time.monotonic() - t0, 3)
             provisioned = True
+            if err is None:
+                slot_bytes = measure_bytes(slot)
             if err is not None:
                 return self._park(
                     ref,
@@ -482,6 +508,7 @@ class SlotPrep:
             quarantine=quarantine,
             provisioned=provisioned,
             clone_seconds=clone_seconds,
+            slot_bytes=slot_bytes,
             deleted_branches=deleted,
             kept=kept,
         )

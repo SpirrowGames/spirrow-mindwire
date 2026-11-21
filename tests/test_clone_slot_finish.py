@@ -16,7 +16,7 @@ import pytest
 from spirrow_mindwire.cli import main
 from spirrow_mindwire.clone_retreat import git_env
 from spirrow_mindwire.clone_slot import PARK_UNRECOVERABLE, quarantine_root
-from spirrow_mindwire.clone_slot_finish import FinishOutcome, SlotFinish
+from spirrow_mindwire.clone_slot_finish import FinishOutcome, SlotFinish, refusal_reason
 from spirrow_mindwire.clone_slot_lease import LeaseState, LeaseStore
 from spirrow_mindwire.clone_slot_prep import PrepOutcome, SlotPrep
 from spirrow_mindwire.config import CONTINUATION_LEDGER_FILENAME
@@ -305,3 +305,119 @@ def test_cli_refused_exit_2(
     capsys.readouterr()
     code, payload = _run(_finish_argv(tmp_path, turn="nope"), capsys)
     assert code == 2 and payload["outcome"] == "refused"
+
+
+# --- A5 D-5 (Bohr msg-9899 §1): the clone guard refused the borrowed slot (conductor exit 8) ---
+
+
+def _ledger_or_empty(tmp_path: Path) -> list[dict[str, object]]:
+    p = tmp_path / "state" / CONTINUATION_LEDGER_FILENAME
+    return _ledger(tmp_path) if p.exists() else []
+
+
+def test_guard_refused_saved_slot_is_quarantined_without_notice(
+    tmp_path: Path, origin: Path
+) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.txt").write_text("new\n", encoding="utf-8")
+    res = _finish(tmp_path).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1", guard_reason="dirty_tree"
+    )
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    assert res.save is not None and res.save.saved
+    assert res.notice is None  # saved: nobody needs to act
+    assert not slot.exists() and res.quarantine_path is not None
+    assert (res.quarantine_path / "new.txt").is_file()  # renamed, never deleted
+    assert [r["outcome"] for r in _ledger(tmp_path)] == ["rescued"]
+    (row,) = _retreats(tmp_path)
+    assert row["action"] == "rebuilt" and row["quarantine_reason"] == "untracked_only"
+    assert "clone guard refused (dirty_tree)" in str(row["detail"])
+    assert _lease_state(tmp_path) is None  # returned: the next borrow provisions anew
+
+
+def test_guard_refused_pushed_slot_writes_no_turn_row(tmp_path: Path, origin: Path) -> None:
+    # The guard may have refused before any role ran: a `pushed` row for that unused borrow would
+    # let a refused CONTINUE through (PR #598 gate Obj-1-1), so none is written (fail closed).
+    slot = _borrow(tmp_path, origin)
+    res = _finish(tmp_path).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1", guard_reason="clone_busy"
+    )
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    assert res.notice is None
+    assert _ledger_or_empty(tmp_path) == []
+    (row,) = _retreats(tmp_path)
+    assert row["quarantine_reason"] == "index_lock"
+    assert not slot.exists()
+
+
+def test_guard_refused_unsaved_slot_is_quarantined_with_notice(
+    tmp_path: Path, origin: Path
+) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "a.txt").write_text("changed\n", encoding="utf-8")
+    _break_origin(slot, tmp_path)
+    res = _finish(tmp_path).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1", guard_reason="dirty_tree"
+    )
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    assert [r["outcome"] for r in _ledger(tmp_path)] == ["rescue_failed"]
+    (row,) = _retreats(tmp_path)
+    assert row["quarantine_reason"] == "modified" and row["recoverable"] is False
+    notice = res.notice
+    assert notice is not None and notice["path"] == str(res.quarantine_path)
+
+
+def test_guard_refused_rename_failure_parks_this_thread_only(tmp_path: Path, origin: Path) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.txt").write_text("new\n", encoding="utf-8")
+
+    def refuse(src: Path, dst: Path) -> None:
+        raise PermissionError("in use")
+
+    res = _finish(tmp_path, rename=refuse).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1", guard_reason="dirty_tree"
+    )
+    assert res.outcome is FinishOutcome.PARKED and res.park_code == PARK_UNRECOVERABLE
+    assert _lease_state(tmp_path) is LeaseState.QUARANTINE_FAILED
+    assert slot.is_dir()
+    notice = res.notice
+    assert notice is not None and notice["path"] == str(slot)
+
+
+def test_after_guard_refusal_another_thread_borrows_a_fresh_slot(
+    tmp_path: Path, origin: Path
+) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.txt").write_text("new\n", encoding="utf-8")
+    _finish(tmp_path).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1", guard_reason="dirty_tree"
+    )
+    again = _borrow(tmp_path, origin, thread="T-b", turn="t2")  # asserts READY
+    assert again == slot and not (again / "new.txt").exists()
+
+
+def test_cli_guard_reason_quarantines_with_null_notice(
+    tmp_path: Path, origin: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.txt").write_text("new\n", encoding="utf-8")
+    capsys.readouterr()
+    code, payload = _run([*_finish_argv(tmp_path), "--guard-reason", "dirty_tree"], capsys)
+    assert code == 5
+    assert payload["outcome"] == "quarantined" and payload["turn_outcome"] == "rescued"
+    assert payload["notice"] is None and payload["quarantine_reason"] == "untracked_only"
+
+
+@pytest.mark.parametrize(
+    ("guard", "expected"),
+    [
+        ("op_in_progress", "merge_in_progress"),
+        ("clone_busy", "index_lock"),
+        ("wrong_head", "wrong_head"),
+        ("pin_not_ignored", "modified"),
+        ("git_unavailable", "provision_failed"),
+        ("unknown", "modified"),
+    ],
+)
+def test_refusal_reason_maps_guard_reasons(tmp_path: Path, guard: str, expected: str) -> None:
+    assert refusal_reason(tmp_path, guard) == expected

@@ -349,3 +349,28 @@ def test_unpublished_nested_submodule_commit_is_not_recoverable(tmp_path: Path) 
     _git(slot, "push", "-q", "origin", "HEAD:main")
     assert _git(slot, "status", "--porcelain", "--ignore-submodules=none") == ""
     assert judge_recoverable(slot) == (False, "submodule_unverified")
+
+
+# --- A5 D-7 (Bohr msg-9899 §2): the provisioned slot's size ---
+
+
+def test_provisioned_slot_records_its_size(tmp_path: Path, origin: Path) -> None:
+    res = _borrow(_prep(tmp_path, origin), "T-a", "t1")
+    assert res.provisioned and isinstance(res.slot_bytes, int) and res.slot_bytes > 0
+    assert res.to_json()["slot_bytes"] == res.slot_bytes
+
+
+def test_reused_slot_has_no_size(tmp_path: Path, origin: Path) -> None:
+    prep = _prep(tmp_path, origin)
+    first = _borrow(prep, "T-a", "t1")
+    prep.store.release(REPO, first.lease.slot, "t1")  # type: ignore[union-attr]
+    again = _borrow(prep, "T-b", "t2", branch="feature/T-b")
+    assert not again.provisioned and again.slot_bytes is None
+
+
+def test_measure_failure_is_none_and_never_raises(tmp_path: Path) -> None:
+    from spirrow_mindwire.clone_slot_prep import measure_bytes
+
+    assert measure_bytes(tmp_path / "missing") in (0, None)
+    (tmp_path / "f").write_bytes(b"abc")
+    assert measure_bytes(tmp_path) == 3

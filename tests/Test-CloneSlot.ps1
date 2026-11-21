@@ -172,12 +172,14 @@ Check 'Close-OpenSlot never throws (it runs inside finally)' (($script:calls -jo
 $fnAfter = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Complete-SlotAfterRun' }, $true) | Select-Object -First 1
 Invoke-Expression $fnAfter.Extent.Text
 $ConductorKillUnconfirmedExitCode = 7
+$DirtyCloneExitCode = 8
 function Reset-SlotStubs {
-    $script:calls = @(); $script:notices = @()
+    $script:calls = @(); $script:notices = @(); $script:finishPark = $null
     $script:leaseStore = @{ 'slot-01' = @{ state = 'running'; spawning = $true; turn_id = 't1' } }
 }
-function Complete-SlotTurn { param($Lease, $SlotsRoot, $Project, $StateDir, $ThreadId, $CandidateKey)
-    $script:calls += 'finish'; $script:leaseStore.Remove($Lease.slot_name); return @{ park_code = $null } }
+function Complete-SlotTurn { param($Lease, $SlotsRoot, $Project, $StateDir, $ThreadId, $CandidateKey, $GuardReason = '')
+    $script:calls += $(if ($GuardReason) { "finish:guard=$GuardReason" } else { 'finish' })
+    $script:leaseStore.Remove($Lease.slot_name); return @{ park_code = $script:finishPark } }
 function Invoke-SlotFinish { $script:calls += 'slot-finish'; $script:leaseStore.Clear(); return @{ code = 0; stdout = ''; stderr = '' } }
 function Invoke-SlotLease { param($Action) $script:calls += "lease:$Action"; if ($Action -eq 'release') { $script:leaseStore.Clear() }; return 0 }
 function Undo-SlotBorrow { param($Lease, $StateDir, $CandidateKey) $script:calls += 'release'; $script:leaseStore.Remove($Lease.slot_name) }
@@ -226,6 +228,35 @@ Check 'exit 14: the unused borrow is released once, no slot-finish (no slot_turn
 Check 'exit 14: lease returned, unused, not retained, nothing parked here, no notice, nothing left open' (
     -not $script:leaseStore.ContainsKey('slot-01') -and $r14.unused -and -not $r14.retained -and
     $null -eq $r14.park_code -and @($script:notices).Count -eq 0 -and $null -eq $script:slotOpen)
+
+# A5 D-5 (Bohr msg-9899 §1): exit 8 in slot mode = the guard refused the borrowed slot. slot-finish
+# runs with the payload's reason (it quarantines the slot); a failed rename's park code comes back
+# for this thread only.
+$out8 = "x`nMINDWIRE_DIRTY_CLONE_PAYLOAD {`"reason`":`"dirty_tree`",`"repo_dir`":`"C:/s/r/slot-01`"}`n"
+Reset-SlotStubs
+$script:slotOpen = $open7
+$r8 = Complete-SlotAfterRun -Lease $lease -Code 8 -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a' -Output $out8
+Check 'exit 8 (slot mode): slot-finish runs once with the guard reason' ((($script:calls -join ',') -eq 'finish:guard=dirty_tree') -and
+    -not $r8.retained -and $null -eq $r8.park_code -and $null -eq $script:slotOpen) ($script:calls -join ',')
+Reset-SlotStubs
+$script:finishPark = 'clone_slot_unrecoverable'
+$r8b = Complete-SlotAfterRun -Lease $lease -Code 8 -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a' -Output 'no payload'
+Check 'exit 8 without a payload: reason unknown; a failed rename parks this thread (park_code back)' (
+    (($script:calls -join ',') -eq 'finish:guard=unknown') -and $r8b.park_code -eq 'clone_slot_unrecoverable') ($script:calls -join ',')
+Check 'Get-DirtyClonePayloadReason rejects a reason that is not a plain word' (
+    (Get-DirtyClonePayloadReason -Output "MINDWIRE_DIRTY_CLONE_PAYLOAD {`"reason`":`"a b;c`"}") -eq 'unknown')
+$q8 = Get-SlotFinishDecision -Code 5 -Row (Row '{"outcome":"quarantined","turn_outcome":"rescued","notice":null}') -Repo 'r' -SlotName 'slot-01' -CandidateKey 'k'
+Check 'slot-finish exit 5 with saved work and no notice: quarantined, no notice' ($q8.outcome -eq 'quarantined' -and @($q8.notices).Count -eq 0 -and $null -eq $q8.park_code)
+$q8b = Get-SlotFinishDecision -Code 5 -Row (Row '{"outcome":"quarantined","turn_outcome":"rescue_failed","notice":null}') -Repo 'r' -SlotName 'slot-01' -CandidateKey 'k'
+Check 'slot-finish exit 5, unsaved and no notice: still the failed notice (fail loud)' ($q8b.outcome -eq 'failed' -and @($q8b.notices).Count -eq 1)
+$s8 = $src.IndexOf('if ($code -eq $DirtyCloneExitCode -and $null -ne $slotLease) {')
+$s8end = $src.IndexOf('if ($code -eq $DirtyCloneExitCode) {', $s8)
+Check 'exit 8 slot branch: after the slot step, before the shared-clone branch; no dirty-clones.json park; continue' (
+    $s8 -gt $fin -and $s8end -gt $s8 -and $s8end -eq $src.LastIndexOf('if ($code -eq $DirtyCloneExitCode) {') -and
+    -not $src.Substring($s8, $s8end - $s8).Contains('Set-DirtyCloneParked') -and
+    -not $src.Substring($s8, $s8end - $s8).Contains('dirtyRepoDirs') -and
+    $src.Substring($s8, $s8end - $s8).Contains('Invoke-HeadSkipRevertLaunch') -and
+    $src.Substring($s8, $s8end - $s8).Contains('continue')) "$fin $s8 $s8end"
 
 # --- 4. A4 (msg-9400 §3): the exit-14 park -----------------------------------------------------
 $out14 = "conductor stopped`nMINDWIRE_SLOT_CONTINUE_REFUSED {`"project`":`"p`",`"thread`":`"T-a`",`"park_code`":`"clone_slot_continue_refused`",`"reason`":`"not_saved`",`"turn_id`":`"t2`",`"outcomes`":[`"rescue_failed`"],`"path`":`"C:/s/_quarantine/r/slot-01-x`",`"detail`":`"turn t2 ended rescue_failed`"}`n"
