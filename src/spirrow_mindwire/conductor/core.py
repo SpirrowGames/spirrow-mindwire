@@ -665,6 +665,7 @@ class Conductor:
         resume_notice: ResumeNotice | None = None,
         continue_cap: int = DEFAULT_CONTINUE_CAP,
         continuation_clone_check: Callable[[ContinuationScope], None] | None = None,
+        slot_continuation_check: Callable[[], None] | None = None,
         continuation_ledger_path: Path | None = None,
         conditional_proceed_notice: str | None = None,
         clone_retreat_log_path: Path | None = None,
@@ -697,6 +698,15 @@ class Conductor:
             raise ValueError("continue_cap must be >= 0")
         self._continue_cap = continue_cap
         self._continuation_clone_check = continuation_clone_check
+        # T-ephemeral-impl-clone-slot-per-thread A4 (msg-9400 §3-§4): in slot mode the clone check
+        # above is not wired (the next tick's slot is not the CONTINUE turn's clone) and this
+        # check judges instead, from the ledger and the lease file; it raises
+        # :class:`~spirrow_mindwire.slot_continuation.SlotContinuationRefused`. It is skipped for
+        # a CONTINUE posted in this run (``_implementer_dispatched_in_run``): this run still
+        # holds that turn's slot, so the next turn works in the same clone and the turn end that
+        # follows saves both.
+        self._slot_continuation_check = slot_continuation_check
+        self._implementer_dispatched_in_run = False
         # D-3 (PR-2, msg-7973 Obj-1-2): the continuation ledger. ``None`` = not recorded; the
         # routing is identical either way (see :mod:`.continuation_ledger`).
         self._continuation_ledger_path = continuation_ledger_path
@@ -2244,6 +2254,29 @@ class Conductor:
             return Link.ENTRY
         return Link.OTHER
 
+    def _continuation_check_wired(self) -> bool:
+        return (
+            self._continuation_clone_check is not None or self._slot_continuation_check is not None
+        )
+
+    def _judge_continuation(self, messages: list[dict[str, Any]], continue_idx: int) -> None:
+        """Condition 4 for the CONTINUE ``messages[continue_idx]``; raises to refuse.
+
+        Slot mode (A4, msg-9400 §3-§4): the ledger check, which raises
+        :class:`~spirrow_mindwire.slot_continuation.SlotContinuationRefused`; never the clone
+        check or :meth:`_continuation_scope` (#581's machinery is for the shared clone only).
+        A CONTINUE posted in this run needs neither: its slot is still this run's.
+        Shared clone: the clone check, which raises :class:`DirtyCloneError`.
+        """
+        if self._slot_continuation_check is not None:
+            if self._implementer_dispatched_in_run:
+                logger.info("conductor continue (slot mode): posted in this run, slot still held")
+                return
+            self._slot_continuation_check()
+            return
+        assert self._continuation_clone_check is not None
+        self._continuation_clone_check(self._continuation_scope(messages, continue_idx))
+
     def _continuation_links(self, messages: list[dict[str, Any]]) -> list[Link]:
         return [self._continuation_link(m) for m in messages]
 
@@ -2292,7 +2325,7 @@ class Conductor:
         # clean and pushed; a DirtyCloneError propagates to the ordinary dirty-clone path
         # (loop_runner exit 8), exactly as on the report path. Unwired = fail-closed: the relay
         # is not carve-out 4 and falls through to guard (i).
-        if self._continuation_clone_check is None:
+        if not self._continuation_check_wired():
             logger.warning(
                 "conductor continue relay not admitted: reason=clone_check_unwired head=%s",
                 _msg_id(messages[-1]),
@@ -2300,7 +2333,7 @@ class Conductor:
             return False
         try:
             # The CONTINUE report is the message right below the relay (``report_msg_id``).
-            self._continuation_clone_check(self._continuation_scope(messages, len(messages) - 2))
+            self._judge_continuation(messages, len(messages) - 2)
         except DirtyCloneError as exc:
             if exc.reason is DirtyCloneReason.UNPUSHED:
                 # T-dirty-clone-check-disagreement: as on the report path, unpushed work is not a
@@ -2361,12 +2394,10 @@ class Conductor:
         unpushed: list[DirtyCloneError] = []
 
         def clone_is_clean() -> bool:
-            if self._continuation_clone_check is None:
+            if not self._continuation_check_wired():
                 return False
             try:
-                self._continuation_clone_check(
-                    self._continuation_scope(messages, len(messages) - 1)
-                )
+                self._judge_continuation(messages, len(messages) - 1)
             except DirtyCloneError as exc:
                 if exc.reason is DirtyCloneReason.UNPUSHED:
                     # T-dirty-clone-check-disagreement: unpushed branches are this thread's work,
@@ -4231,6 +4262,9 @@ class Conductor:
         """
         notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
         retreat = self._pending_clone_retreat(role)
+        if role is Role.IMPLEMENTER:
+            # A4: from here on a CONTINUE at the head was posted by this run's own slot.
+            self._implementer_dispatched_in_run = True
         # Resume notice (v1.4): only on the first role turn this run sends, and only once.
         resume_text: str | None = None
         first_resume_dispatch = False

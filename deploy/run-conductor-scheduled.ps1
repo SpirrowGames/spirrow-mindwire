@@ -191,6 +191,10 @@ $TurnIsolationStopExitCode = 10
 # launches_same_head, so no STALLED "the role went silent"), retry-pending is untouched, nobody is
 # quarantined, the repo is not skipped, and the notice is per candidate.
 $PreflightRefusedExitCode = 13
+# T-ephemeral-impl-clone-slot-per-thread A4 (msg-9400 §3): slot mode refused a CONTINUE whose turn
+# end did not record the work as saved (slot_continuation.SLOT_CONTINUE_REFUSED_EXIT_CODE). This
+# thread only is parked, on the MINDWIRE_SLOT_CONTINUE_REFUSED row; never the repo, never a retry.
+$SlotContinueRefusedExitCode = 14
 # A preflight-deferral episode alerts again, once, when it has lasted this long (design v2 D-5b):
 # a permanent failure misclassified as transient must not stay silent.
 $PreflightDeferredEscalateAfter = [TimeSpan]::FromHours(2)
@@ -336,8 +340,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # above the Write-Log definition is safe. The wrapper's LEASE state-machine is still inert (the
 # candidate-loop gate lands in PR 4); what activates in PR 2 is the READER half of Lease.ps1.
 . (Join-Path $PSScriptRoot 'lib/Lease.ps1')
-# T-ephemeral-impl-clone-slot-per-thread A3: the slot pool's decisions and notices (pure). Inert
-# unless [loop].slots_root is set, which the Python config refuses until A4.
+# T-ephemeral-impl-clone-slot-per-thread A3/A4: the slot pool's decisions and notices (pure). Inert
+# unless [loop].slots_root is set (accepted since A4; off by default).
 . (Join-Path $PSScriptRoot 'lib/CloneSlot.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -3762,6 +3766,38 @@ function Complete-SlotTurn {
     Send-SlotNotices -NotifyState $notifyState -Notices $decision.notices
     Write-Log "slot-finish ${CandidateKey}: $($Lease.slot) outcome=$($decision.outcome) exit=$($finRun.code)"
     return $decision
+}
+
+# A3/A4: what happens to a borrowed slot once the run returned. Exit 7 is a kill that could not be
+# confirmed: a session may still be writing in the slot, so slot-finish does not run and the lease
+# stays held (PR #594 gate Obj-1-1; the same rule as the inflight row), with one notice. Every other
+# code, including the hard budget's confirmed kill (exit 6), runs slot-finish. Either way the
+# lease is no longer open for the top-level finally. Returns @{ retained; park_code; unused }.
+# Exit 14 (slot mode refused a CONTINUE, A4) is raised before any implementer turn ran in this
+# borrow, so the borrow is UNUSED: it goes back to the pool by a plain release, with NO
+# slot_turn_result row (PR #598 gate Obj-1-1). A slot-finish here would record this unused clean
+# slot as `pushed`, and judge_slot_continuation, which reads the thread's LAST recorded turn,
+# would then admit the refused CONTINUE on its next retry or unpark although the earlier turn's
+# work is still unsaved (rescue_failed) or unrecorded (no_record). Releasing without a row keeps
+# the earlier turn the last one, so the refusal stands until that turn's work is dealt with.
+function Complete-SlotAfterRun {
+    param($Lease, [int]$Code, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey)
+    $script:slotOpen = $null
+    if ($Code -eq $SlotContinueRefusedExitCode) {
+        Undo-SlotBorrow -Lease $Lease -StateDir $StateDir -CandidateKey $CandidateKey
+        Write-Log "slot-returned-unused ${CandidateKey}: $($Lease.slot) turn=$($Lease.turn_id) — exit=$Code (CONTINUE refused before any turn ran); no slot_turn_result row"
+        return @{ retained = $false; park_code = $null; unused = $true }
+    }
+    if ($Code -eq $ConductorKillUnconfirmedExitCode) {
+        Send-SlotNotices -NotifyState $notifyState -Notices @(Get-SlotRetainedNotice -Repo $Lease.repo `
+            -SlotName $Lease.slot_name -Slot $Lease.slot -TurnId $Lease.turn_id -ThreadId $ThreadId `
+            -CandidateKey $CandidateKey -Cause "exit=$Code, kill not confirmed")
+        Write-Log "slot-retained ${CandidateKey}: $($Lease.slot) turn=$($Lease.turn_id) — exit=$Code, end not confirmed; lease kept, no slot-finish"
+        return @{ retained = $true; park_code = $null; unused = $false }
+    }
+    $finish = Complete-SlotTurn -Lease $Lease -SlotsRoot $SlotsRoot -Project $Project `
+        -StateDir $StateDir -ThreadId $ThreadId -CandidateKey $CandidateKey
+    return @{ retained = $false; park_code = $finish.park_code; unused = $false }
 }
 
 # A3: the top-level finally's backstop for a lease still open when the tick ends by a throw. A
@@ -7784,25 +7820,16 @@ try {
         # may still be writing in the slot, so slot-finish does not run and the lease stays held
         # (PR #594 gate Obj-1-1; the same rule as the inflight row below). A throw out of the run
         # skips this and is handled by the top-level finally (Close-OpenSlot), the same way.
-        if ($null -ne $slotLease -and $code -eq $ConductorKillUnconfirmedExitCode) {
-            $script:slotOpen = $null
-            Send-SlotNotices -NotifyState $notifyState -Notices @(Get-SlotRetainedNotice -Repo $slotLease.repo `
-                -SlotName $slotLease.slot_name -Slot $slotLease.slot -TurnId $slotLease.turn_id -ThreadId $thread `
-                -CandidateKey $cand.key -Cause "exit=$code, kill not confirmed")
-            Write-Log "slot-retained $($cand.key): $($slotLease.slot) turn=$($slotLease.turn_id) — exit=$code, end not confirmed; lease kept, no slot-finish"
-            $slotFinished = $true
-        }
-        elseif ($null -ne $slotLease) {
-            $script:slotOpen = $null
-            $slotFinish = Complete-SlotTurn -Lease $slotLease -SlotsRoot $slotMode.slots_root -Project $cand.project `
-                -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key
-            if ($slotFinish.park_code) {
+        if ($null -ne $slotLease) {
+            $slotAfter = Complete-SlotAfterRun -Lease $slotLease -Code $code -SlotsRoot $slotMode.slots_root `
+                -Project $cand.project -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key
+            if ($slotAfter.park_code) {
                 $quarantineState[$cand.key] = New-QuarantineRecord `
                     -FirstFailureAt ((Get-Date).ToUniversalTime().ToString('o')) -ExitCode $code `
-                    -StopReason $slotFinish.park_code -FailureHead $probeHead -FailureControl $currentControl `
+                    -StopReason $slotAfter.park_code -FailureHead $probeHead -FailureControl $currentControl `
                     -SessionLogPath $logPath -SessionLogTail @("slot $($slotLease.slot) quarantine failed") -FailureClass 'clone_slot'
                 $newlyQuarantined++
-                Write-Log "slot-parked $($cand.key): $($slotFinish.park_code) (this thread only)"
+                Write-Log "slot-parked $($cand.key): $($slotAfter.park_code) (this thread only)"
             }
             $slotFinished = $true
         }
@@ -7993,6 +8020,29 @@ try {
                 -Signature $envSig `
                 -Message $envBody
             Write-Log "env-terminal $($cand.key): exit=2 key=$envKey — sweep CONTINUES, no quarantine"
+            continue
+        }
+
+        # EXIT CODE $SlotContinueRefusedExitCode — slot mode refused a CONTINUE (A4, msg-9400 §3): the
+        # thread's last turn end recorded rescue_failed / quarantine_failed, recorded nothing, or its
+        # lease is still held. No role ran, so Complete-SlotAfterRun already returned the borrow
+        # unused, with no slot_turn_result row (PR #598 gate Obj-1-1): the refusing turn stays the
+        # thread's last recorded one. This thread only is parked, naming where the work is;
+        # the other threads of the repo keep launching. MUST stay above the generic non-zero branch
+        # (which would retry and then quarantine as an error).
+        if ($code -eq $SlotContinueRefusedExitCode) {
+            $dispositions[$cand.key] = 'slot-continue-refused'
+            $refused = Get-SlotContinueRefusedDecision -Output ($output -join "`n") -CandidateKey $cand.key
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if (-not $revert.ok) { Write-Log "WARN slot-continue-refused $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            $quarantineState[$cand.key] = New-QuarantineRecord `
+                -FirstFailureAt ((Get-Date).ToUniversalTime().ToString('o')) -ExitCode $code `
+                -StopReason $refused.park_code -FailureHead $probeHead -FailureControl $currentControl `
+                -SessionLogPath $logPath -SessionLogTail @("$($refused.detail)") -FailureClass 'clone_slot'
+            $newlyQuarantined++
+            Send-SlotNotices -NotifyState $notifyState -Notices @($refused.notice)
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "slot-continue-refused $($cand.key): $($refused.park_code) path=$($refused.path) — $($refused.detail) (this thread only)"
             continue
         }
 

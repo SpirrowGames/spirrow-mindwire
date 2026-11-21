@@ -80,25 +80,32 @@ class FinishResult:
     park_code: str | None = None
     detail: str = ""
     record_error: str | None = None
+    recovered_by: str | None = None
 
     @property
     def notice(self) -> dict[str, Any] | None:
         """The operator notice for a turn whose work is not confirmed saved (msg-9400 §2,
         msg-9402 Obj-36-4): the path (the quarantine, or the slot itself when the rename failed),
         the thread is added by the wrapper, and the reason. ``None`` when nothing needs a person."""
+        notice: dict[str, Any]
         if self.outcome is FinishOutcome.QUARANTINED:
-            return {
+            notice = {
                 "reason": QUARANTINE_REASON,
                 "path": str(self.quarantine_path),
                 "detail": self.detail,
             }
-        if self.outcome is FinishOutcome.PARKED:
-            return {
+        elif self.outcome is FinishOutcome.PARKED:
+            notice = {
                 "reason": self.park_code,
                 "path": None if self.slot is None else str(self.slot.path),
                 "detail": self.detail,
             }
-        return None
+        else:
+            return None
+        if self.recovered_by is not None:
+            # A4 (msg-9877 (a)): the same notice, marked as an operator's recovery.
+            notice["recovered_by"] = self.recovered_by
+        return notice
 
     def to_json(self) -> dict[str, Any]:
         save = self.save
@@ -113,6 +120,7 @@ class FinishResult:
             "park_code": self.park_code,
             "detail": self.detail,
             "record_error": self.record_error,
+            "recovered_by": self.recovered_by,
             "notice": self.notice,
         }
 
@@ -132,6 +140,7 @@ class SlotFinish:
         git: GitRunner = _subprocess_git,
         rename: Callable[[Path, Path], None] = os.rename,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        recovered_by: str | None = None,
     ) -> None:
         self.slots_root = slots_root
         self.repo = repo
@@ -142,6 +151,9 @@ class SlotFinish:
         self._git = git
         self._rename = rename
         self._clock = clock
+        # A4 (msg-9877 (a)): "operator" when ``mindwire slot-recover`` runs this turn end for a
+        # lease whose own turn end never ran; written on every row this finish writes.
+        self.recovered_by = recovered_by
 
     def _held(self, slot: str, turn_id: str) -> Lease | None:
         for lease in self.store.leases(self.repo):
@@ -177,10 +189,11 @@ class SlotFinish:
             thread=thread_id,
             turn_id=turn_id,
             slot=ref.name,
+            recovered_by=self.recovered_by,
         )
         if save.saved:
             self.store.release(self.repo, ref.name, turn_id)
-            return FinishResult(FinishOutcome.RELEASED, ref, save)
+            return FinishResult(FinishOutcome.RELEASED, ref, save, recovered_by=self.recovered_by)
         return self._quarantine(ref, lease, save)
 
     def _quarantine(self, ref: SlotRef, lease: Lease, save: SaveResult) -> FinishResult:
@@ -216,6 +229,7 @@ class SlotFinish:
                 quarantine_path=target,
                 detail=detail,
                 record_error=record_error,
+                recovered_by=self.recovered_by,
             )
         # Every rename failed (msg-9402 Obj-36-4): keep the lease so the slot is never lent again.
         self.store.mark_quarantine_failed(self.repo, ref.name, lease.turn_id)
@@ -231,6 +245,7 @@ class SlotFinish:
                 slot=ref.name,
                 refs=save.refs,
                 detail=why,
+                recovered_by=self.recovered_by,
             )
         except (OSError, ValueError) as exc:
             record_errors.append(f"ledger: {type(exc).__name__}: {exc}")
@@ -256,7 +271,35 @@ class SlotFinish:
             park_code=PARK_UNRECOVERABLE,
             detail=f"{detail}; {why}",
             record_error="; ".join(record_errors) or None,
+            recovered_by=self.recovered_by,
         )
+
+    def recover(self, *, slot: str, confirm_no_process: bool) -> FinishResult:
+        """``mindwire slot-recover`` (A4, msg-9877 (a)): run the turn end of a lease whose own turn
+        end never ran (exit 7, a throw after spawn, a wrapper that died without its finally).
+
+        A thin entry to :meth:`finish`, never a second way to return a slot: the turn and the
+        thread come from the lease file, not from the operator, and the lease must still be
+        ``launching`` (spawning marker or not) or ``running``. ``quarantine_failed`` is refused here
+        and in :meth:`finish` alike; clearing it is not A4. Every refusal touches nothing.
+        """
+        if not confirm_no_process:
+            return FinishResult(
+                FinishOutcome.REFUSED,
+                detail="--confirm-no-process is required: check no session is left in the slot",
+            )
+        held = [lease for lease in self.store.leases(self.repo) if lease.slot == slot]
+        if not held:
+            return FinishResult(
+                FinishOutcome.REFUSED, detail=f"{self.repo}/{slot} is not leased (already returned)"
+            )
+        lease = held[0]
+        if lease.state not in (LeaseState.LAUNCHING, LeaseState.RUNNING):
+            return FinishResult(
+                FinishOutcome.REFUSED,
+                detail=f"{self.repo}/{slot} is {lease.state.value}: slot-recover does not clear it",
+            )
+        return self.finish(slot=slot, thread_id=lease.thread_id, turn_id=lease.turn_id)
 
     def _append(self, row: dict[str, Any]) -> str | None:
         try:

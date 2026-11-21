@@ -256,9 +256,13 @@ def record_slot_turn(
     slot: str,
     refs: Iterable[dict[str, Any]] = (),
     detail: str | None = None,
+    recovered_by: str | None = None,
     at: datetime | None = None,
 ) -> bool:
     """Record how a turn left its slot, once per (turn, outcome). ``True`` = a new row.
+
+    ``recovered_by`` (A4, msg-9877 (a)): ``"operator"`` when the turn end was run by
+    ``mindwire slot-recover`` for a lease whose turn end never ran, absent otherwise.
 
     Unlike the two continuation kinds, a failure to write this row is NOT observation-only for
     the caller: the slot must not be handed back as saved without it (Einstein msg-9405). The
@@ -276,6 +280,8 @@ def record_slot_turn(
     }
     if detail is not None:
         row["detail"] = detail
+    if recovered_by is not None:
+        row["recovered_by"] = recovered_by
     return _append_once(path, row)
 
 

@@ -324,7 +324,12 @@ def test_parity_fixture_report_is_the_enumerators_output() -> None:
     assert EnumerateReport(projects=tuple(reports)).as_json() == _PARITY["report"]
 
 
-def test_parity_get_thread_keys_equal_the_tag_step_keys() -> None:
+def test_parity_get_thread_keys_equal_the_tag_step_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Judge idleness at the fixture's own ``now``, as the report test above does: on the wall
+    # clock T-fresh2 (last activity 2026-11-07) aged out of the tag step on 2026-11-21.
+    now = datetime.fromisoformat(_PARITY["now"])
+    real = _CLI.enumerate_project
+    monkeypatch.setattr(_CLI, "enumerate_project", lambda *a, **k: real(*a, **k, now=now))
     reg = parse_registered(_PARITY["sweep"])
     names = {p for i in _PARITY["listings"].values() for p in (i[0]["thread_id"],)}
     assert names  # the fixture is not empty

@@ -556,8 +556,9 @@ def test_slots_root_blank_reads_as_unset(tmp_path: Path) -> None:
     assert load_settings(cfg).loop.slots_root is None
 
 
-def test_slots_root_is_refused_until_the_loop_wiring_lands(tmp_path: Path) -> None:
-    """msg-8055 R-7: a set value is refused at load, never silently ignored."""
+def test_slots_root_is_accepted_since_the_loop_wiring_landed(tmp_path: Path) -> None:
+    """A4 (msg-9875 item 2): a set value loads; unset stays the shared clone (above)."""
+    root = tmp_path / "slots"
     cfg = tmp_path / "mindwire.toml"
     cfg.write_text(
         dedent(
@@ -565,18 +566,12 @@ def test_slots_root_is_refused_until_the_loop_wiring_lands(tmp_path: Path) -> No
             schema_version = 1
 
             [loop]
-            slots_root = {str(tmp_path / "slots").replace(chr(92), "/")!r}
+            slots_root = {str(root).replace(chr(92), "/")!r}
             """
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValidationError, match="slots_root is not accepted yet") as exc:
-        load_settings(cfg)
-    # msg-8229 condition 1: names the field, says it is not wired, says unset keeps repo_dir.
-    text = str(exc.value)
-    assert "[loop].slots_root" in text
-    assert "not wired into the loop" in text
-    assert "Leave it unset to keep the single shared repo_dir clone" in text
+    assert load_settings(cfg).loop.slots_root == root
 
 
 # --- [loop].slots_per_repo (msg-9386 D-1 改訂 1) ---------------------------------------------

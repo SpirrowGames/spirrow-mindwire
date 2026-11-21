@@ -121,7 +121,7 @@ Check 'repo_dir is the borrowed slot in slot mode' ($src.Contains('$turnRepoDir 
     $src.Contains("-Key 'repo_dir'       -Value `$turnRepoDir"))
 $spawn = $src.IndexOf("Invoke-SlotLease -Action 'spawning'")
 $inner = $src.IndexOf('$output = (& $inner @stallArgs @laneArgs @summonArgs *>&1)')
-$fin = $src.IndexOf('$slotFinish = Complete-SlotTurn -Lease $slotLease')
+$fin = $src.IndexOf('$slotAfter = Complete-SlotAfterRun -Lease $slotLease -Code $code')
 $retreat = $src.IndexOf('$retreatOutcome = Invoke-LaunchEndRetreat')
 Check 'spawning mark before the run; slot-finish right after it' ($spawn -gt 0 -and $inner -gt $spawn -and $fin -gt $inner) "$spawn $inner $fin"
 $open = $src.IndexOf('$script:slotOpen = @{ lease = $slotLease; spawned = $false')
@@ -133,16 +133,13 @@ Check 'the top-level finally closes a lease a throw left open' ($top -gt 0 -and 
 Check 'shared-clone retreat skipped for a slot launch' ($retreat -gt $fin -and $src.Contains("if (`$slotFinished) { `$retreatOutcome = 'skipped' }"))
 Check 'inflight-mark failure releases the borrow at once' (([regex]::Matches($src, 'Undo-SlotBorrow -Lease \$slotLease')).Count -eq 1)
 Check 'slot parks use the per-thread quarantine record with the park code' (
-    ([regex]::Matches($src, '-StopReason \$slot(Decision|Finish)\.park_code')).Count -eq 2)
+    ([regex]::Matches($src, '-StopReason \$slot(Decision|After)\.park_code')).Count -eq 2)
 
-# PR #594 gate Obj-1-1: exit 7 (kill not confirmed) keeps the lease — no slot-finish on that path.
-$k7 = $src.IndexOf('if ($null -ne $slotLease -and $code -eq $ConductorKillUnconfirmedExitCode) {')
-$fin7 = $src.IndexOf('elseif ($null -ne $slotLease) {')
-Check 'exit 7 branch comes first and only the elseif runs slot-finish' ($k7 -gt $inner -and $fin7 -gt $k7 -and $fin -gt $fin7 -and
-    -not $src.Substring($k7, $fin7 - $k7).Contains('Complete-SlotTurn') -and
-    $src.Substring($k7, $fin7 - $k7).Contains('Get-SlotRetainedNotice')) "$k7 $fin7 $fin"
-Check 'slot-finish is called from one place in the run path (plus none in Close-OpenSlot)' (
-    ([regex]::Matches($src, 'Complete-SlotTurn -Lease')).Count -eq 1)
+# PR #594 gate Obj-1-1: exit 7 (kill not confirmed) keeps the lease. The decision lives in one
+# function, Complete-SlotAfterRun; section 3 below runs it with stubs.
+Check 'slot-finish is called from one place (Complete-SlotAfterRun), none in Close-OpenSlot' (
+    ([regex]::Matches($src, 'Complete-SlotTurn -Lease')).Count -eq 1 -and
+    ([regex]::Matches($src, 'Complete-SlotAfterRun -Lease')).Count -eq 1)
 $rn = Get-SlotRetainedNotice -Repo 'r' -SlotName 'slot-01' -Slot 'C:/s/r/slot-01' -TurnId 't1' -ThreadId 'T-a' -CandidateKey 'p/T-a' -Cause 'exit=7, kill not confirmed'
 Check 'retained notice: same key/signature as the later kept notice, names the slot and the cause' (
     $rn.key -eq '__slot_kept__/r/slot-01' -and $rn.signature -eq 't1:job_containment_unverified' -and
@@ -168,6 +165,87 @@ function Undo-SlotBorrow { param($Lease, $StateDir, $CandidateKey) throw 'boom' 
 $script:calls = @()
 Close-OpenSlot -Open @{ lease = $lease; spawned = $false; key = 'k' }
 Check 'Close-OpenSlot never throws (it runs inside finally)' (($script:calls -join ',') -eq 'log')
+
+# --- 3. A4 (msg-9877 (b)): the exit-7 branch and Close-OpenSlot, executed with stubs ----------
+# A fake lease store stands in for state/slot-leases.json. slot-finish, release and rename are
+# stubs that would change it, so "never called" and "lease still spawning" are both observable.
+$fnAfter = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Complete-SlotAfterRun' }, $true) | Select-Object -First 1
+Invoke-Expression $fnAfter.Extent.Text
+$ConductorKillUnconfirmedExitCode = 7
+function Reset-SlotStubs {
+    $script:calls = @(); $script:notices = @()
+    $script:leaseStore = @{ 'slot-01' = @{ state = 'running'; spawning = $true; turn_id = 't1' } }
+}
+function Complete-SlotTurn { param($Lease, $SlotsRoot, $Project, $StateDir, $ThreadId, $CandidateKey)
+    $script:calls += 'finish'; $script:leaseStore.Remove($Lease.slot_name); return @{ park_code = $null } }
+function Invoke-SlotFinish { $script:calls += 'slot-finish'; $script:leaseStore.Clear(); return @{ code = 0; stdout = ''; stderr = '' } }
+function Invoke-SlotLease { param($Action) $script:calls += "lease:$Action"; if ($Action -eq 'release') { $script:leaseStore.Clear() }; return 0 }
+function Undo-SlotBorrow { param($Lease, $StateDir, $CandidateKey) $script:calls += 'release'; $script:leaseStore.Remove($Lease.slot_name) }
+function Rename-Item { $script:calls += 'rename' }
+function Move-Item { $script:calls += 'rename' }
+function Send-SlotNotices { param($NotifyState, $Notices) foreach ($n in @($Notices)) { if ($null -ne $n) { $script:notices += $n } } }
+function Write-Log { param($m) }
+$open7 = @{ lease = $lease; spawned = $true; key = 'p/T-a'; thread = 'T-a'; project = 'p'; slots_root = 'C:/s'; state_dir = 'C:/st' }
+
+Reset-SlotStubs
+$script:slotOpen = $open7
+$r7 = Complete-SlotAfterRun -Lease $lease -Code 7 -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a'
+Close-OpenSlot -Open $script:slotOpen   # the top-level finally, after the run returned exit 7
+Check 'exit 7: no slot-finish, no release, no rename' (@($script:calls).Count -eq 0) ($script:calls -join ',')
+Check 'exit 7: the lease is still held (spawning/running)' ($script:leaseStore.ContainsKey('slot-01') -and
+    $script:leaseStore['slot-01'].state -eq 'running' -and $script:leaseStore['slot-01'].spawning)
+Check 'exit 7: exactly one job_containment_unverified notice, even with the finally after it' (
+    @($script:notices).Count -eq 1 -and $script:notices[0].signature -eq 't1:job_containment_unverified' -and
+    $script:notices[0].message.Contains('exit=7'))
+Check 'exit 7: retained, nothing parked, the lease is no longer open' ($r7.retained -and $null -eq $r7.park_code -and $null -eq $script:slotOpen)
+
+Reset-SlotStubs
+$script:slotOpen = $open7
+Close-OpenSlot -Open $script:slotOpen   # a throw out of the run after spawn
+Check 'throw after spawn: no slot-finish, no release, no rename; lease held; one notice' (
+    @($script:calls).Count -eq 0 -and $script:leaseStore.ContainsKey('slot-01') -and
+    @($script:notices).Count -eq 1 -and $script:notices[0].signature -eq 't1:job_containment_unverified') ($script:calls -join ',')
+
+foreach ($c in @(0, 1, 6)) {
+    Reset-SlotStubs
+    $script:slotOpen = $open7
+    $rc = Complete-SlotAfterRun -Lease $lease -Code $c -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a'
+    Check "exit ${c}: slot-finish runs once, no retained notice" ((($script:calls -join ',') -eq 'finish') -and -not $rc.retained -and @($script:notices).Count -eq 0) ($script:calls -join ',')
+}
+
+# PR #598 gate Obj-1-1: exit 14 refused the CONTINUE before any turn ran in this borrow. The
+# borrow goes back unused by a plain release; slot-finish (which would record this clean slot as
+# `pushed` and make the refused CONTINUE look saved on the next retry) never runs.
+$SlotContinueRefusedExitCode = 14
+Reset-SlotStubs
+$script:slotOpen = $open7
+$r14 = Complete-SlotAfterRun -Lease $lease -Code 14 -SlotsRoot 'C:/s' -Project 'p' -StateDir 'C:/st' -ThreadId 'T-a' -CandidateKey 'p/T-a'
+Close-OpenSlot -Open $script:slotOpen   # the top-level finally after exit 14: nothing left open
+Check 'exit 14: the unused borrow is released once, no slot-finish (no slot_turn_result row), no rename' (
+    ($script:calls -join ',') -eq 'release') ($script:calls -join ',')
+Check 'exit 14: lease returned, unused, not retained, nothing parked here, no notice, nothing left open' (
+    -not $script:leaseStore.ContainsKey('slot-01') -and $r14.unused -and -not $r14.retained -and
+    $null -eq $r14.park_code -and @($script:notices).Count -eq 0 -and $null -eq $script:slotOpen)
+
+# --- 4. A4 (msg-9400 §3): the exit-14 park -----------------------------------------------------
+$out14 = "conductor stopped`nMINDWIRE_SLOT_CONTINUE_REFUSED {`"project`":`"p`",`"thread`":`"T-a`",`"park_code`":`"clone_slot_continue_refused`",`"reason`":`"not_saved`",`"turn_id`":`"t2`",`"outcomes`":[`"rescue_failed`"],`"path`":`"C:/s/_quarantine/r/slot-01-x`",`"detail`":`"turn t2 ended rescue_failed`"}`n"
+$d14 = Get-SlotContinueRefusedDecision -Output $out14 -CandidateKey 'p/T-a'
+Check 'exit 14: parks with clone_slot_continue_refused, notice names the path and the reason' (
+    $d14.park_code -eq 'clone_slot_continue_refused' -and $d14.path -eq 'C:/s/_quarantine/r/slot-01-x' -and
+    $d14.notice.message.Contains('C:/s/_quarantine/r/slot-01-x') -and $d14.notice.message.Contains('not_saved') -and
+    $d14.notice.key -eq '__slot_continue__/p/T-a')
+$d14b = Get-SlotContinueRefusedDecision -Output 'no row here' -CandidateKey 'p/T-a'
+Check 'exit 14 without a readable row still parks (same code)' ($d14b.park_code -eq 'clone_slot_continue_refused' -and $d14b.path.Contains('unknown'))
+$b14 = $src.IndexOf('if ($code -eq $SlotContinueRefusedExitCode) {')
+$b8 = $src.LastIndexOf('if ($code -eq $DirtyCloneExitCode) {')
+$generic = $src.IndexOf('# handle (i.e. anything other than the 0/2/')
+Check 'exit 14 branch: after the slot step (unused borrow returned), above exit 8 and the generic branch; per-thread record; continue' (
+    $b14 -gt $fin -and $b14 -lt $b8 -and $b14 -lt $generic -and
+    $src.Substring($b14, $b8 - $b14).Contains('-StopReason $refused.park_code') -and
+    $src.Substring($b14, $b8 - $b14).Contains("-FailureClass 'clone_slot'") -and
+    $src.Substring($b14, $b8 - $b14).Contains('continue') -and
+    -not $src.Substring($b14, $b8 - $b14).Contains('Set-DirtyCloneParked')) "$fin $b14 $b8 $generic"
+Check 'exit code 14 is declared' ($src.Contains('$SlotContinueRefusedExitCode = 14'))
 
 if ($script:failures -gt 0) { Write-Host "$($script:failures) failure(s)"; exit 1 }
 Write-Host "all passed"
