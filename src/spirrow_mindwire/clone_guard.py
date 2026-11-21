@@ -224,11 +224,17 @@ class CloneGuard:
         git: GitRunner = _subprocess_git,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        slot_mode: bool = False,
     ) -> None:
         self._repo_dir = repo_dir
         self._git = git
         self._sleep = sleep
         self._monotonic = monotonic
+        # A5 D-5 (Bohr msg-9899 §1): in slot mode ``repo_dir`` is the borrowed slot, which
+        # slot-prep left on the thread's own branch, not on the default branch (msg-9386 改訂 5:
+        # "HEAD being some other thread's branch is normal"). Only the default-branch comparison
+        # is skipped; a detached HEAD, dirt, a lock or an operation in progress still refuse.
+        self._slot_mode = slot_mode
 
     @property
     def repo_dir(self) -> Path:
@@ -276,6 +282,8 @@ class CloneGuard:
         if head_ref.returncode == 1:
             raise self._error(DirtyCloneReason.WRONG_HEAD, head=None, detail="HEAD is detached")
         head = head_ref.stdout.strip().removeprefix("refs/heads/")
+        if self._slot_mode:
+            return
         default = self._default_branch(head)
         if head != default:
             raise self._error(

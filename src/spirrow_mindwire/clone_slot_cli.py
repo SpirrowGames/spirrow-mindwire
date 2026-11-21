@@ -22,6 +22,8 @@ one line ``MINDWIRE_SLOT_FINISH <json>``. Exit codes:
 * 4 — parked: ``rescue_failed`` and every rename failed; the lease stays ``quarantine_failed``
   and only this thread parks with ``clone_slot_unrecoverable`` (``notice`` in the json);
 * 2 — refused: the lease is not this turn's, nothing was touched;
+* with ``--guard-reason`` (A5 D-5, conductor exit 8) the slot is quarantined even when the work is
+  saved: exit 5 then carries ``notice: null`` and ``turn_outcome`` ``pushed`` / ``rescued``;
 * 1 — the procedure failed (the lease is left as it was: never released as saved).
 
 ``slot-recover`` (A4, msg-9877 (a)) is the operator's way back for a lease left held because its
@@ -108,6 +110,12 @@ def add_parsers(sub: Any) -> None:
     fin.add_argument("--slot", required=True, help="slot-NN")
     fin.add_argument("--thread-id", required=True)
     fin.add_argument("--turn-id", required=True)
+    fin.add_argument(
+        "--guard-reason",
+        default=None,
+        help="(A5 D-5) the clone guard refused the slot with this reason (conductor exit 8): "
+        "quarantine it whatever the save outcome",
+    )
     rec = sub.add_parser(
         "slot-recover",
         help="run the turn end of a lease left held (operator; after checking no process is left)",
@@ -145,6 +153,7 @@ def _record_quarantine(state_dir: Path, thread_id: str, repo: str, res: PrepResu
         quarantine_path=q.quarantine_path,
         park_code=res.park_code if parked else None,
         clone_seconds=None if parked else res.clone_seconds,
+        slot_bytes=None if parked else res.slot_bytes,
         detail=(q.detail or res.detail or f"borrowed by {thread_id}").strip(),
         recoverable=q.recoverable,
         recoverable_reason=q.recoverable_reason,
@@ -241,7 +250,12 @@ def run_finish(args: argparse.Namespace) -> int:
             ledger=args.state_dir / CONTINUATION_LEDGER_FILENAME,
             retreats=args.state_dir / RETREATS_FILE,
         )
-        res = fin.finish(slot=args.slot, thread_id=args.thread_id, turn_id=args.turn_id)
+        res = fin.finish(
+            slot=args.slot,
+            thread_id=args.thread_id,
+            turn_id=args.turn_id,
+            guard_reason=args.guard_reason,
+        )
     except Exception as exc:  # the wrapper treats exit 1 as not saved; say why on stderr
         print(f"slot-finish failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_FAILED

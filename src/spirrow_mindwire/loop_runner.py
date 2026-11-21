@@ -788,7 +788,9 @@ def _build_dispatcher(
     clone_guard: CloneGuard | None = None
     ref_snapshot_store: TurnRefSnapshotStore | None = None
     if cfg.repo_dir is not None:
-        clone_guard = CloneGuard(Path(cfg.repo_dir))
+        # A5 D-5: in slot mode the guard judges the borrowed slot only, and the slot is on the
+        # thread's branch (see CloneGuard ``slot_mode``).
+        clone_guard = CloneGuard(Path(cfg.repo_dir), slot_mode=settings.loop.slots_root is not None)
         # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
         # implementer launch records its starting ref state before the adapter runs.
         # A4 (msg-9400 §4): slot mode does not use the launch ref snapshot; the turn end's

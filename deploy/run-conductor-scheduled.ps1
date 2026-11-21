@@ -3715,11 +3715,20 @@ function Invoke-SlotPrep {
 # origin, the slot_turn_result row, then release / quarantine. Returns @{ code; stdout; stderr }.
 function Invoke-SlotFinish {
     param([string]$SlotsRoot, [string]$Repo, [string]$Project, [string]$StateDir,
-          [string]$SlotName, [string]$ThreadId, [string]$TurnId)
-    $r = Invoke-BoundedUvProbe -Label 'slot-finish' -TimeoutSeconds $SlotFinishTimeoutSeconds `
-        -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-finish', '--slots-root', $SlotsRoot, '--repo', $Repo,
-                     '--project', $Project, '--state-dir', $StateDir, '--slot', $SlotName,
-                     '--thread-id', $ThreadId, '--turn-id', $TurnId)
+          [string]$SlotName, [string]$ThreadId, [string]$TurnId, [string]$GuardReason = '')
+    # A5 D-5: on exit 8 the guard's reason rides along, and slot-finish quarantines the slot. Two
+    # literal call sites, so tests/test_bounded_probe_cli_contract.py checks each argv.
+    if ($GuardReason) {
+        $r = Invoke-BoundedUvProbe -Label 'slot-finish-guard' -TimeoutSeconds $SlotFinishTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-finish', '--slots-root', $SlotsRoot, '--repo', $Repo,
+                         '--project', $Project, '--state-dir', $StateDir, '--slot', $SlotName,
+                         '--thread-id', $ThreadId, '--turn-id', $TurnId, '--guard-reason', $GuardReason)
+    } else {
+        $r = Invoke-BoundedUvProbe -Label 'slot-finish' -TimeoutSeconds $SlotFinishTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-finish', '--slots-root', $SlotsRoot, '--repo', $Repo,
+                         '--project', $Project, '--state-dir', $StateDir, '--slot', $SlotName,
+                         '--thread-id', $ThreadId, '--turn-id', $TurnId)
+    }
     if (-not $r.ok) { return @{ code = -1; stdout = ''; stderr = "$($r.error)" } }
     return @{ code = [int]$r.code; stdout = "$($r.stdout)"; stderr = "$($r.stderr)" }
 }
@@ -3757,9 +3766,10 @@ function Undo-SlotBorrow {
 # A3: the turn-end step for a borrowed slot — slot-finish, its notices, its log line. Returns the
 # Get-SlotFinishDecision result (park_code set when this thread must park).
 function Complete-SlotTurn {
-    param($Lease, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey)
+    param($Lease, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey,
+          [string]$GuardReason = '')
     $finRun = Invoke-SlotFinish -SlotsRoot $SlotsRoot -Repo $Lease.repo -Project $Project -StateDir $StateDir `
-        -SlotName $Lease.slot_name -ThreadId $ThreadId -TurnId $Lease.turn_id
+        -SlotName $Lease.slot_name -ThreadId $ThreadId -TurnId $Lease.turn_id -GuardReason $GuardReason
     $finRow = Get-SlotRow -Stdout $finRun.stdout -Prefix 'MINDWIRE_SLOT_FINISH '
     $decision = Get-SlotFinishDecision -Code $finRun.code -Row $finRow -Repo $Lease.repo `
         -SlotName $Lease.slot_name -CandidateKey $CandidateKey -Stderr $finRun.stderr
@@ -3780,8 +3790,13 @@ function Complete-SlotTurn {
 # would then admit the refused CONTINUE on its next retry or unpark although the earlier turn's
 # work is still unsaved (rescue_failed) or unrecorded (no_record). Releasing without a row keeps
 # the earlier turn the last one, so the refusal stands until that turn's work is dealt with.
+# Exit 8 (A5 D-5, Bohr msg-9899 §1): the clone guard refused the borrowed slot. slot-finish runs with
+# -GuardReason (the reason in the run's MINDWIRE_DIRTY_CLONE_PAYLOAD row, Get-DirtyClonePayloadReason),
+# so the slot is rescued, recorded and quarantined, never handed back as it is; a failed rename parks
+# this thread only (park_code). The repo is not parked.
 function Complete-SlotAfterRun {
-    param($Lease, [int]$Code, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey)
+    param($Lease, [int]$Code, [string]$SlotsRoot, [string]$Project, [string]$StateDir, [string]$ThreadId, [string]$CandidateKey,
+          [string]$Output = '')
     $script:slotOpen = $null
     if ($Code -eq $SlotContinueRefusedExitCode) {
         Undo-SlotBorrow -Lease $Lease -StateDir $StateDir -CandidateKey $CandidateKey
@@ -3795,8 +3810,9 @@ function Complete-SlotAfterRun {
         Write-Log "slot-retained ${CandidateKey}: $($Lease.slot) turn=$($Lease.turn_id) — exit=$Code, end not confirmed; lease kept, no slot-finish"
         return @{ retained = $true; park_code = $null; unused = $false }
     }
+    $guardReason = if ($Code -eq $DirtyCloneExitCode) { Get-DirtyClonePayloadReason -Output $Output } else { '' }
     $finish = Complete-SlotTurn -Lease $Lease -SlotsRoot $SlotsRoot -Project $Project `
-        -StateDir $StateDir -ThreadId $ThreadId -CandidateKey $CandidateKey
+        -StateDir $StateDir -ThreadId $ThreadId -CandidateKey $CandidateKey -GuardReason $guardReason
     return @{ retained = $false; park_code = $finish.park_code; unused = $false }
 }
 
@@ -7822,7 +7838,8 @@ try {
         # skips this and is handled by the top-level finally (Close-OpenSlot), the same way.
         if ($null -ne $slotLease) {
             $slotAfter = Complete-SlotAfterRun -Lease $slotLease -Code $code -SlotsRoot $slotMode.slots_root `
-                -Project $cand.project -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key
+                -Project $cand.project -StateDir $slotStateDir -ThreadId $thread -CandidateKey $cand.key `
+                -Output ($output -join "`n")
             if ($slotAfter.park_code) {
                 $quarantineState[$cand.key] = New-QuarantineRecord `
                     -FirstFailureAt ((Get-Date).ToUniversalTime().ToString('o')) -ExitCode $code `
@@ -8050,6 +8067,20 @@ try {
         # dirty-shared-clone, design v4 D-2). The daemon's pre-dispatch guard refused to start a
         # role on this repo_dir. MUST stay above the generic non-zero branch below: falling into it
         # would retry and then quarantine a thread that did nothing wrong.
+        # A5 D-5 (Bohr msg-9899 §1): in slot mode the guard judged the borrowed slot only, and
+        # Complete-SlotAfterRun has already quarantined it (or, when every rename failed, parked
+        # this thread with clone_slot_unrecoverable). Nothing is written to dirty-clones.json and
+        # the repo's other threads keep launching. Like the shared-clone branch, the launch is
+        # reverted (not counted toward backoff / launches_same_head). A gate-lane launch borrows no
+        # slot, so its exit 8 is about the shared clone and takes the branch below unchanged.
+        if ($code -eq $DirtyCloneExitCode -and $null -ne $slotLease) {
+            $dispositions[$cand.key] = 'slot-dirty'
+            $revert = Invoke-HeadSkipRevertLaunch -CommitOutput $commitResult.commit_output -StateFilePath $headSkipStatePath
+            if (-not $revert.ok) { Write-Log "WARN slot-dirty $($cand.key): LAUNCH commit NOT reverted — $($revert.error)" }
+            $parkNote = if ($slotAfter.park_code) { "thread parked $($slotAfter.park_code)" } else { 'slot quarantined, retried next tick' }
+            Write-Log "slot-dirty $($cand.key): exit=$code guard refused $($slotLease.slot) — $parkNote; repo NOT parked, other threads CONTINUE"
+            continue
+        }
         if ($code -eq $DirtyCloneExitCode) {
             $dispositions[$cand.key] = 'dirty-clone'
             $notice = Get-DirtyCloneNotice -RepoDir $cand.repo_dir -CandidateKey $cand.key -Output $output -ExitCode $code

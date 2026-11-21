@@ -546,3 +546,22 @@ def test_turn_end_obligation_is_filed_for_the_implementer() -> None:
     assert "do not commit, delete, or edit it" in entry.body
     # The loader already refuses a drifted body; pin that this entry carries a pin at all.
     assert entry.body_sha256 is not None
+
+
+# --------------------------------------------------------------- A5 D-5: slot mode
+
+
+def test_slot_mode_accepts_the_threads_own_branch(repo: Path) -> None:
+    # Bohr msg-9899 §1 / msg-9386 改訂 5: a borrowed slot is on the thread's branch, not main.
+    _git(repo, "switch", "-q", "-c", "loop/t-a")
+    assert _reason(repo, slot_mode=True) is None
+    assert _reason(repo) == DirtyCloneReason.WRONG_HEAD  # shared-clone mode unchanged
+
+
+def test_slot_mode_still_refuses_dirt_and_a_detached_head(repo: Path) -> None:
+    _git(repo, "switch", "-q", "-c", "loop/t-a")
+    (repo / "wip.txt").write_text("wip\n", encoding="utf-8")
+    assert _reason(repo, slot_mode=True) == DirtyCloneReason.DIRTY_TREE
+    (repo / "wip.txt").unlink()
+    _git(repo, "switch", "-q", "--detach")
+    assert _reason(repo, slot_mode=True) == DirtyCloneReason.WRONG_HEAD
