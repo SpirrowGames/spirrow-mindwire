@@ -444,7 +444,9 @@ exit 3
     # checked by tests/test_bounded_probe_cli_contract.py; no -UvOptions.
     # +1 for the exit-8 slot-finish with --guard-reason (same thread, A5 D-5): a second literal call
     # in Invoke-SlotFinish, like Invoke-CloneRecover -Preserve; no -UvOptions.
-    Check 'thirty-two helper call sites in the sweep script' 32 $helperCalls.Count
+    # +1 for Invoke-QuarantineGc (same thread, A5 D-6): -m spirrow_mindwire.cli quarantine-gc once per
+    # slot-mode tick; no -UvOptions.
+    Check 'thirty-three helper call sites in the sweep script' 33 $helperCalls.Count
     $withUvOptions = @($helperCalls | Where-Object { $_.CommandElements | Where-Object {
                 $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'UvOptions' } })
     Check 'exactly one call site passes -UvOptions' 1 $withUvOptions.Count

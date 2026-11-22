@@ -421,3 +421,22 @@ def test_cli_guard_reason_quarantines_with_null_notice(
 )
 def test_refusal_reason_maps_guard_reasons(tmp_path: Path, guard: str, expected: str) -> None:
     assert refusal_reason(tmp_path, guard) == expected
+
+
+# --- A5 D-6 (Bohr msg-9901 §1): the quarantine is exported before the rename ---
+
+
+def test_turn_end_quarantine_exports_and_writes_a_manifest(tmp_path: Path, origin: Path) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.bin").write_bytes(b"\x00\x01only here")
+    _break_origin(slot, tmp_path)
+    exports = tmp_path / "state" / "slot-exports"
+    res = _finish(tmp_path, exports_root=exports).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1"
+    )
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    (mp,) = list((exports / REPO).glob("*.manifest.json"))
+    m = json.loads(mp.read_text(encoding="utf-8"))
+    assert m["quarantine_path"] == str(res.quarantine_path) and m["complete"] is True
+    (row,) = _retreats(tmp_path)
+    assert row["patch"] and row["untracked"] and str(row["untracked"]).endswith(".untracked.tar")

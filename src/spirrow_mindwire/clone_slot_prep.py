@@ -53,6 +53,7 @@ from .clone_slot import (
     mirror_path,
     quarantine_root,
 )
+from .clone_slot_gc import ExportResult, export_slot, write_manifest
 from .clone_slot_lease import AcquireResult, Lease, LeaseStore, UnreturnedVerdict
 from .clone_slot_save import SaveResult, SlotSaver, rescue_ref
 from .conductor.continuation_ledger import SlotTurnOutcome
@@ -98,6 +99,7 @@ class QuarantineInfo:
     recoverable: bool
     recoverable_reason: str | None
     detail: str = ""
+    export: ExportResult | None = None  # A5 D-6: what was saved to state/ before the rename
 
 
 @dataclass(frozen=True)
@@ -345,6 +347,7 @@ class SlotPrep:
         rename: Callable[[Path, Path], None] = os.rename,
         trusted: Callable[[Path], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        exports_root: Path | None = None,
     ) -> None:
         self.slots_root = slots_root
         self.repo = repo
@@ -355,6 +358,8 @@ class SlotPrep:
         self._rename = rename
         self._trusted = trusted
         self._clock = clock
+        # A5 D-6: where the quarantine export goes (<state>/slot-exports); None = no export.
+        self.exports_root = exports_root
 
     # -- mirror ----------------------------------------------------------------------------
 
@@ -568,9 +573,21 @@ class SlotPrep:
                 recoverable, rec_reason = judge_recoverable(slot, self._git)
         else:
             rec_reason = "not_a_repository"
-        target, errors = rename_to_quarantine(ref, prev, self._clock(), self._rename)
+        now = self._clock()
+        export = (
+            None
+            if self.exports_root is None
+            else export_slot(
+                slot, self.exports_root, self.repo, f"{ref.name}-{prev}-{now:%Y%m%d-%H%M%S}"
+            )
+        )
+        target, errors = rename_to_quarantine(ref, prev, now, self._rename)
         if target is not None:
-            return QuarantineInfo(reason, prev, target, rescue, recoverable, rec_reason)
+            if export is not None:
+                write_manifest(export, target, now)
+            return QuarantineInfo(
+                reason, prev, target, rescue, recoverable, rec_reason, export=export
+            )
         return QuarantineInfo(
             reason,
             prev,
@@ -579,6 +596,7 @@ class SlotPrep:
             False,
             rec_reason or "quarantine_failed",
             detail="rename failed: " + "; ".join(errors),
+            export=export,
         )
 
     # -- provision / switch / cleanup ------------------------------------------------------

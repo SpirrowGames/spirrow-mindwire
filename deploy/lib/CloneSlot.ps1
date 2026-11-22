@@ -257,6 +257,21 @@ function Get-DirtyClonePayloadReason {
     return 'unknown'
 }
 
+# A5 D-6: one notice per quarantine the GC keeps (no manifest, incomplete export, changed since the
+# export, unverifiable, gc_stuck, gc_verify_timeout). Key and signature come from the GC row, so the
+# sweep's dedup sends each once for as long as the reason and the path stay the same.
+function Get-QuarantineGcNotices {
+    param($Row)
+    $out = @()
+    foreach ($n in @($Row.notices)) {
+        if ($null -eq $n) { continue }
+        $out += New-SlotNotice -Key "$($n.key)" -Signature "$($n.signature)" `
+            -Message ("MindWire: 隔離した slot を削除せずに残しています (reason=$($n.reason))。" +
+                      "中身がほかの場所に保存されたと確かめられないためです: $($n.path)。詳細: $($n.detail)")
+    }
+    return , $out
+}
+
 # A4 (msg-9400 §3): the conductor's exit-14 run. Its MINDWIRE_SLOT_CONTINUE_REFUSED row says why the
 # thread's CONTINUE was refused (reason = not_saved / no_record / lease_held) and where the work is
 # (path = the quarantine target, the slot still leased, or the slot whose quarantine failed).

@@ -278,5 +278,19 @@ Check 'exit 14 branch: after the slot step (unused borrow returned), above exit 
     -not $src.Substring($b14, $b8 - $b14).Contains('Set-DirtyCloneParked')) "$fin $b14 $b8 $generic"
 Check 'exit code 14 is declared' ($src.Contains('$SlotContinueRefusedExitCode = 14'))
 
+# --- 5. A5 D-6: quarantine GC notices and placement ---------------------------------------
+$gcRow = Row '{"deleted":[],"notices":[{"key":"__quarantine_gc__/c:/s/_quarantine/r/q1","signature":"no_manifest:C:/s/_quarantine/r/q1","reason":"no_manifest","path":"C:/s/_quarantine/r/q1","detail":"d"}]}'
+$gcN = Get-QuarantineGcNotices -Row $gcRow
+Check 'GC: one notice per kept quarantine, key and signature from the row, path and reason in the message' (
+    @($gcN).Count -eq 1 -and $gcN[0].key -eq '__quarantine_gc__/c:/s/_quarantine/r/q1' -and
+    $gcN[0].signature -eq 'no_manifest:C:/s/_quarantine/r/q1' -and $gcN[0].message.Contains('C:/s/_quarantine/r/q1') -and
+    $gcN[0].message.Contains('no_manifest'))
+$gcNone = Get-QuarantineGcNotices -Row (Row '{"deleted":[],"notices":[]}')
+Check 'GC: nothing kept, no notice' ($gcNone.Count -eq 0)
+$gcCall = $src.IndexOf('if ($null -ne $slotMode) { Invoke-QuarantineGc')
+$loop = $src.IndexOf('foreach ($cand in $candidates) {', [Math]::Max(0, $gcCall))
+Check 'GC runs once per tick, slot mode only, before the candidate loop' (
+    $gcCall -gt 0 -and $loop -gt $gcCall -and ([regex]::Matches($src, 'Invoke-QuarantineGc -SlotsRoot')).Count -eq 1)
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) failure(s)"; exit 1 }
 Write-Host "all passed"

@@ -50,10 +50,12 @@ from typing import Any
 from .clone_retreat_log import (
     SLOT_ACTION_PARKED,
     SLOT_ACTION_REBUILT,
+    append_quarantine_gc,
     append_slot_quarantine,
     build_slot_quarantine_record,
 )
 from .clone_slot_finish import FinishOutcome, SlotFinish
+from .clone_slot_gc import EXPORTS_DIR, QuarantineGc
 from .clone_slot_lease import LeaseError, LeaseStore
 from .clone_slot_prep import PrepOutcome, PrepResult, SlotPrep
 from .clone_slot_trust import TrustReadError, is_trusted
@@ -63,6 +65,7 @@ from .git_sync.branch import generation_name, normalize_stem
 PREP_PREFIX = "MINDWIRE_SLOT_PREP "
 FINISH_PREFIX = "MINDWIRE_SLOT_FINISH "
 RECOVER_PREFIX = "MINDWIRE_SLOT_RECOVER "
+GC_PREFIX = "MINDWIRE_QUARANTINE_GC "
 RECOVERED_BY_OPERATOR = "operator"
 RETREATS_FILE = "clone-retreats.jsonl"
 EXIT_READY = 0
@@ -74,6 +77,7 @@ EXIT_QUARANTINED = 5
 
 
 def add_parsers(sub: Any) -> None:
+    add_gc_parser(sub)
     prep = sub.add_parser("slot-prep", help="borrow a clone slot for one turn (slot pool mode)")
     prep.add_argument("--slots-root", required=True, type=Path)
     prep.add_argument("--repo", required=True)
@@ -132,6 +136,41 @@ def add_parsers(sub: Any) -> None:
     )
 
 
+def add_gc_parser(sub: Any) -> None:
+    gc = sub.add_parser(
+        "quarantine-gc", help="delete verified, exported quarantines (slot pool mode, A5 D-6)"
+    )
+    gc.add_argument("--slots-root", required=True, type=Path)
+    gc.add_argument("--state-dir", required=True, type=Path)
+
+
+def run_gc(args: argparse.Namespace) -> int:
+    """``mindwire quarantine-gc`` (A5 D-6): one bounded GC pass. Prints ``MINDWIRE_QUARANTINE_GC
+    <json>`` (notices for the wrapper to send) and appends a ``quarantine_gc`` row. Exit 0, or 1
+    when the pass itself failed (the wrapper logs it and the sweep goes on)."""
+    try:
+        store = LeaseStore(args.state_dir)
+        leased: list[Path] = []
+        qroot = args.slots_root / "_quarantine"
+        repos = [d.name for d in qroot.iterdir() if d.is_dir()] if qroot.is_dir() else []
+        for repo in repos:
+            leased += [args.slots_root / repo / lease.slot for lease in store.leases(repo)]
+        res = QuarantineGc(
+            slots_root=args.slots_root, state_dir=args.state_dir, leased_paths=leased
+        ).run()
+        summary = res.to_json()
+        append_quarantine_gc(
+            args.state_dir / RETREATS_FILE,
+            {k: v for k, v in summary.items() if k not in ("notices", "events")}
+            | {"kept_noticed": len(res.notices)},
+        )
+    except Exception as exc:
+        print(f"quarantine-gc failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    print(GC_PREFIX + json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _trusted(slot: Path) -> bool:
     try:
         return is_trusted(slot)
@@ -157,6 +196,9 @@ def _record_quarantine(state_dir: Path, thread_id: str, repo: str, res: PrepResu
         detail=(q.detail or res.detail or f"borrowed by {thread_id}").strip(),
         recoverable=q.recoverable,
         recoverable_reason=q.recoverable_reason,
+        patch=None if q.export is None else q.export.patch,
+        untracked=None if q.export is None else q.export.untracked_tar,
+        bundle=None if q.export is None else q.export.bundle,
         rescue=None
         if q.rescue is None
         else {
@@ -178,6 +220,7 @@ def run_prep(args: argparse.Namespace) -> int:
             store=store,
             slots_per_repo=args.slots_per_repo,
             trusted=_trusted,
+            exports_root=args.state_dir / EXPORTS_DIR,
         )
         res = prep.borrow(
             thread_id=args.thread_id,
@@ -249,6 +292,7 @@ def run_finish(args: argparse.Namespace) -> int:
             store=LeaseStore(args.state_dir),
             ledger=args.state_dir / CONTINUATION_LEDGER_FILENAME,
             retreats=args.state_dir / RETREATS_FILE,
+            exports_root=args.state_dir / EXPORTS_DIR,
         )
         res = fin.finish(
             slot=args.slot,
@@ -281,6 +325,7 @@ def run_recover(args: argparse.Namespace) -> int:
             store=LeaseStore(args.state_dir),
             ledger=args.state_dir / CONTINUATION_LEDGER_FILENAME,
             retreats=args.state_dir / RETREATS_FILE,
+            exports_root=args.state_dir / EXPORTS_DIR,
             recovered_by=RECOVERED_BY_OPERATOR,
         )
         res = fin.recover(slot=args.slot, confirm_no_process=args.confirm_no_process)
