@@ -1,4 +1,4 @@
-"""Blank the daemon's ``MINDWIRE_*_TOKEN`` secrets in every agent subprocess (I-4).
+"""Blank the daemon's ``MINDWIRE_*`` secrets in every agent subprocess (I-4, I-4b).
 
 T-gate-records-submitted-review-id, msg-9923 I-4 (go: msg-9931 → Einstein). Phase 0
 (msg-9922) observed that an implementer turn's shell held
@@ -18,6 +18,11 @@ child's env stops casual and accidental use; it is **not** grounds for enabling 
 gate's signed record (msg-9923 I-4 says so explicitly). That needs the turn-isolation
 launcher, which builds the child env from scratch and is unaffected by this module.
 
+I-4b (msg-9953, go: Einstein after msg-9953) widened the names from ``_TOKEN`` only to every
+``MINDWIRE_*`` name ending in one of :data:`SECRET_ENV_NAME_SUFFIXES` — a Discord webhook
+URL (``MINDWIRE_NOTIFY_DISCORD_WEBHOOK``) is a posting credential on its own. The suffix
+set is a single constant pinned by a test, so changing it needs a reviewed diff.
+
 ``keep`` lets an adapter pass through a token that is its own identity. The implementer
 keeps ``MINDWIRE_GITHUB_TOKEN``: it is the author identity its ``gh`` is already logged in
 as, and ``mindwire pr-diff-size`` (which the fix-now rule makes it run) authenticates with
@@ -30,16 +35,22 @@ import os
 import re
 from collections.abc import Iterable, Mapping
 
-__all__ = ["SECRET_ENV_NAME_RE", "scrubbed_secret_env"]
+__all__ = ["SECRET_ENV_NAME_RE", "SECRET_ENV_NAME_SUFFIXES", "scrubbed_secret_env"]
 
-# ``MINDWIRE_<anything>_TOKEN``. Windows env names are case-insensitive, so match that way.
-SECRET_ENV_NAME_RE = re.compile(r"^MINDWIRE_\w+_TOKEN$", re.IGNORECASE)
+# The name endings that mark a ``MINDWIRE_*`` variable as a secret (I-4b). Pinned by
+# ``tests/test_env_scrub.py``; widen it there and here together, under review.
+SECRET_ENV_NAME_SUFFIXES: tuple[str, ...] = ("TOKEN", "SECRET", "KEY", "WEBHOOK", "PASSWORD")
+
+# ``MINDWIRE_<anything>_<suffix>``. Windows env names are case-insensitive, so match that way.
+SECRET_ENV_NAME_RE = re.compile(
+    r"^MINDWIRE_\w+_(?:" + "|".join(SECRET_ENV_NAME_SUFFIXES) + r")$", re.IGNORECASE
+)
 
 
 def scrubbed_secret_env(
     environ: Mapping[str, str] | None = None, *, keep: Iterable[str] = ()
 ) -> dict[str, str]:
-    """``{name: ""}`` for every ``MINDWIRE_*_TOKEN`` in ``environ`` (default ``os.environ``).
+    """``{name: ""}`` for every ``MINDWIRE_*`` secret name in ``environ`` (default ``os.environ``).
 
     Put this FIRST in an adapter's ``options.env`` so an explicit value the composition root
     sets afterwards still wins. Names in ``keep`` (compared case-insensitively) are left out.
