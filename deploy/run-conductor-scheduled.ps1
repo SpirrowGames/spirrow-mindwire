@@ -210,6 +210,9 @@ $CloneRetreatTimeoutSeconds = 240
 # bounded at 40 s each); `slot-lease` only edits state/slot-leases.json under its lock.
 $SlotPrepTimeoutSeconds = 900
 $SlotFinishTimeoutSeconds = 300
+# A5 D-6: the GC pass stops starting work after 20 s (clone_slot_gc.TICK_BUDGET_S); this outer bound
+# also covers the uv start-up and the one file or 1 MiB a step can overrun by.
+$QuarantineGcTimeoutSeconds = 90
 $SlotLeaseTimeoutSeconds = 60
 
 # --- paths -------------------------------------------------------------------------------------
@@ -3735,6 +3738,26 @@ function Invoke-SlotFinish {
 
 # A3: move one lease (spawning before the conductor starts; release when a borrowed slot is not
 # launched after all). Returns the exit code, -1 when the probe could not run.
+# A5 D-6 (Bohr msg-9901 / msg-9903 / msg-9905): one bounded quarantine GC pass per tick, slot mode
+# only, before any candidate launches. It deletes only quarantines whose export it re-verified;
+# everything it keeps comes back as notices, sent once each (key + signature dedup). A failure is
+# logged and the sweep goes on: GC is housekeeping, it never stops a launch.
+function Invoke-QuarantineGc {
+    param([string]$SlotsRoot, [string]$StateDir)
+    try {
+        $r = Invoke-BoundedUvProbe -Label 'quarantine-gc' -TimeoutSeconds $QuarantineGcTimeoutSeconds `
+            -Arguments @('-m', 'spirrow_mindwire.cli', 'quarantine-gc', '--slots-root', $SlotsRoot, '--state-dir', $StateDir)
+        if (-not $r.ok) { Write-Log "WARN quarantine-gc: did not run ($($r.error)) — the sweep goes on"; return }
+        $row = Get-SlotRow -Stdout "$($r.stdout)" -Prefix 'MINDWIRE_QUARANTINE_GC '
+        if ($null -eq $row) { Write-Log "WARN quarantine-gc: exit=$($r.code), no row — $($r.stderr)"; return }
+        Send-SlotNotices -NotifyState $notifyState -Notices (Get-QuarantineGcNotices -Row $row)
+        Save-JsonState -Path $notifyStatePath -State $notifyState
+        Write-Log ("quarantine-gc: deleted=$(@($row.deleted).Count) verified=$($row.verified) remaining_due=$($row.remaining_due) " +
+                   "deleting_pending=$($row.deleting_pending) kept_noticed=$(@($row.notices).Count) seconds=$($row.seconds)")
+    }
+    catch { Write-Log "WARN quarantine-gc: $($_.Exception.Message) — the sweep goes on" }
+}
+
 function Invoke-SlotLease {
     param([string]$Action, [string]$StateDir, [string]$Repo, [string]$SlotName, [string]$TurnId)
     $r = Invoke-BoundedUvProbe -Label 'slot-lease' -TimeoutSeconds $SlotLeaseTimeoutSeconds `
@@ -7482,6 +7505,7 @@ try {
     }
     $slotStateDir = Join-Path $dataDir 'state'
     $script:slotOpen = $null
+    if ($null -ne $slotMode) { Invoke-QuarantineGc -SlotsRoot $slotMode.slots_root -StateDir $slotStateDir }
 
     foreach ($cand in $candidates) {
         $attempt++

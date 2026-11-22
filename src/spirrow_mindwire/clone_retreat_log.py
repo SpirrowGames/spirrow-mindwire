@@ -60,6 +60,9 @@ NOTICE_KINDS = frozenset({RETREAT_KIND, SLOT_QUARANTINE_KIND})
 # published, with the slot launched un-quarantined. Recorded, never noticed: it is not in
 # NOTICE_KINDS, so pending_record skips it, and it is not a quarantine for the D-7 counts.
 SLOT_PRESERVE_KIND = "slot_preserve"
+# A5 D-6 (msg-9901 §3): one row per quarantine GC pass (counts and seconds). Not in NOTICE_KINDS
+# and not a quarantine, so nothing that reads the thread notices or the D-7 counts picks it up.
+QUARANTINE_GC_KIND = "quarantine_gc"
 SLOT_ACTION_REBUILT = "rebuilt"
 SLOT_ACTION_PARKED = "parked"
 # D-7 reasons (msg-8061, plus quarantine_unconfirmed from msg-8088).
@@ -353,6 +356,12 @@ def append_slot_preserve(path: Path, row: dict[str, Any]) -> None:
     """Append a row built by :func:`build_slot_preserve_record`."""
     if row.get("kind") != SLOT_PRESERVE_KIND:
         raise ValueError("not a slot_preserve row")
+    _append(path, row)
+
+
+def append_quarantine_gc(path: Path, summary: dict[str, Any], at: datetime | None = None) -> None:
+    """Append one ``quarantine_gc`` row: what one GC pass deleted, kept and left for later."""
+    row = {"kind": QUARANTINE_GC_KIND, "at": _now_iso(at), **summary}
     _append(path, row)
 
 

@@ -258,14 +258,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 slot_mode=args.slot_mode,
             )
         )
-    if args.command in ("slot-prep", "slot-lease", "slot-finish", "slot-recover"):
-        from .clone_slot_cli import run_finish, run_lease, run_prep, run_recover
+    if args.command in ("slot-prep", "slot-lease", "slot-finish", "slot-recover", "quarantine-gc"):
+        from .clone_slot_cli import run_finish, run_gc, run_lease, run_prep, run_recover
 
         runner = {
             "slot-prep": run_prep,
             "slot-lease": run_lease,
             "slot-finish": run_finish,
             "slot-recover": run_recover,
+            "quarantine-gc": run_gc,
         }
         raise SystemExit(runner[args.command](args))
     if args.command == "continue-report":

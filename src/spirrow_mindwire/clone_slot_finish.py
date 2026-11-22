@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,6 +60,7 @@ from .clone_retreat_log import (
     build_slot_quarantine_record,
 )
 from .clone_slot import PARK_UNRECOVERABLE, SlotRef
+from .clone_slot_gc import FINISH_ALLOWANCE_S, export_deadline, export_slot, write_manifest
 from .clone_slot_lease import Lease, LeaseState, LeaseStore
 from .clone_slot_prep import PUSH_REMOTE, judge_recoverable, rename_to_quarantine
 from .clone_slot_save import SaveResult, SlotSaver, _subprocess_git, record_turn_result
@@ -185,7 +187,13 @@ class SlotFinish:
         rename: Callable[[Path, Path], None] = os.rename,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         recovered_by: str | None = None,
+        exports_root: Path | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        # #600 gate Obj-4: when this finish started, so the export can leave time for the rename
+        # and the lease bookkeeping inside the wrapper's $SlotFinishTimeoutSeconds.
+        self._mono = monotonic
+        self._started = monotonic()
         self.slots_root = slots_root
         self.repo = repo
         self.project = project
@@ -198,6 +206,8 @@ class SlotFinish:
         # A4 (msg-9877 (a)): "operator" when ``mindwire slot-recover`` runs this turn end for a
         # lease whose own turn end never ran; written on every row this finish writes.
         self.recovered_by = recovered_by
+        # A5 D-6: where the quarantine export goes (<state>/slot-exports); None = no export.
+        self.exports_root = exports_root
 
     def _held(self, slot: str, turn_id: str) -> Lease | None:
         for lease in self.store.leases(self.repo):
@@ -276,10 +286,32 @@ class SlotFinish:
             detail = f"{why}; {detail}"
         target: Path | None = None
         errors: list[str] = []
+        export = None
+        now = self._clock()
         if ref.path.exists():
-            target, errors = rename_to_quarantine(ref, lease.thread_id, self._clock(), self._rename)
+            if self.exports_root is not None:
+                export = export_slot(
+                    ref.path,
+                    self.exports_root,
+                    self.repo,
+                    f"{ref.name}-{lease.thread_id}-{now:%Y%m%d-%H%M%S}",
+                    deadline=export_deadline(self._started, FINISH_ALLOWANCE_S, self._mono()),
+                    monotonic=self._mono,
+                )
+            target, errors = rename_to_quarantine(ref, lease.thread_id, now, self._rename)
+            if target is not None and export is not None:
+                write_manifest(export, target, now)
         else:
             errors = [f"{ref.path} is missing"]
+        saved_files: dict[str, Any] = (
+            {}
+            if export is None
+            else {
+                "patch": export.patch,
+                "untracked": export.untracked_tar,
+                "bundle": export.bundle,
+            }
+        )
         rescue = {"outcome": save.outcome.value, "refs": save.refs, "detail": save.detail}
         if target is not None:
             row = build_slot_quarantine_record(
@@ -293,6 +325,7 @@ class SlotFinish:
                 recoverable=recoverable,
                 recoverable_reason=recoverable_reason,
                 rescue=rescue,
+                **saved_files,
             )
             record_error = self._append(row)
             # The slot is gone from its path, so it can go back to the pool: the next borrow
@@ -337,6 +370,7 @@ class SlotFinish:
             recoverable=False,
             recoverable_reason=recoverable_reason or QUARANTINE_REASON,
             rescue=rescue,
+            **saved_files,
         )
         err = self._append(row)
         if err is not None:

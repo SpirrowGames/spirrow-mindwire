@@ -421,3 +421,46 @@ def test_cli_guard_reason_quarantines_with_null_notice(
 )
 def test_refusal_reason_maps_guard_reasons(tmp_path: Path, guard: str, expected: str) -> None:
     assert refusal_reason(tmp_path, guard) == expected
+
+
+# --- A5 D-6 (Bohr msg-9901 §1): the quarantine is exported before the rename ---
+
+
+def test_turn_end_quarantine_exports_and_writes_a_manifest(tmp_path: Path, origin: Path) -> None:
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.bin").write_bytes(b"\x00\x01only here")
+    _break_origin(slot, tmp_path)
+    exports = tmp_path / "state" / "slot-exports"
+    res = _finish(tmp_path, exports_root=exports).finish(
+        slot="slot-01", thread_id="T-a", turn_id="t1"
+    )
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    (mp,) = list((exports / REPO).glob("*.manifest.json"))
+    m = json.loads(mp.read_text(encoding="utf-8"))
+    assert m["quarantine_path"] == str(res.quarantine_path) and m["complete"] is True
+    (row,) = _retreats(tmp_path)
+    assert row["patch"] and row["untracked"] and str(row["untracked"]).endswith(".untracked.tar")
+
+
+def test_turn_end_export_past_its_deadline_still_quarantines(tmp_path: Path, origin: Path) -> None:
+    # #600 gate Obj-4: the export has one deadline inside the wrapper's slot-finish bound; past
+    # it the export stops (complete false, kept by the GC) and the rename and lease release run.
+    slot = _borrow(tmp_path, origin)
+    (slot / "new.bin").write_bytes(b"\x00\x01only here")
+    _break_origin(slot, tmp_path)
+    exports = tmp_path / "state" / "slot-exports"
+    t = [0.0]
+
+    def mono() -> float:
+        return t[0]
+
+    fin = _finish(tmp_path, exports_root=exports, monotonic=mono)
+    t[0] = 1000.0  # the rescue used up the whole allowance before the export starts
+    res = fin.finish(slot="slot-01", thread_id="T-a", turn_id="t1")
+    assert res.outcome is FinishOutcome.QUARANTINED, res.detail
+    assert res.quarantine_path is not None and res.quarantine_path.is_dir()
+    (mp,) = list((exports / REPO).glob("*.manifest.json"))
+    m = json.loads(mp.read_text(encoding="utf-8"))
+    assert m["complete"] is False
+    assert any(r.startswith("export_timeout") for r in m["incomplete_reasons"])
+    assert _lease_state(tmp_path) is None  # released: the next borrow provisions anew
