@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,7 +60,7 @@ from .clone_retreat_log import (
     build_slot_quarantine_record,
 )
 from .clone_slot import PARK_UNRECOVERABLE, SlotRef
-from .clone_slot_gc import export_slot, write_manifest
+from .clone_slot_gc import FINISH_ALLOWANCE_S, export_deadline, export_slot, write_manifest
 from .clone_slot_lease import Lease, LeaseState, LeaseStore
 from .clone_slot_prep import PUSH_REMOTE, judge_recoverable, rename_to_quarantine
 from .clone_slot_save import SaveResult, SlotSaver, _subprocess_git, record_turn_result
@@ -187,7 +188,12 @@ class SlotFinish:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         recovered_by: str | None = None,
         exports_root: Path | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        # #600 gate Obj-4: when this finish started, so the export can leave time for the rename
+        # and the lease bookkeeping inside the wrapper's $SlotFinishTimeoutSeconds.
+        self._mono = monotonic
+        self._started = monotonic()
         self.slots_root = slots_root
         self.repo = repo
         self.project = project
@@ -289,6 +295,8 @@ class SlotFinish:
                     self.exports_root,
                     self.repo,
                     f"{ref.name}-{lease.thread_id}-{now:%Y%m%d-%H%M%S}",
+                    deadline=export_deadline(self._started, FINISH_ALLOWANCE_S, self._mono()),
+                    monotonic=self._mono,
                 )
             target, errors = rename_to_quarantine(ref, lease.thread_id, now, self._rename)
             if target is not None and export is not None:

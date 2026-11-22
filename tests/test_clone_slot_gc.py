@@ -7,6 +7,7 @@ import hashlib
 import json
 import subprocess
 import tarfile
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ REPO = "r"
 AT = datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC)
 LATER = AT + timedelta(days=8)
 BINARY = bytes(range(256)) * 50
+DIFF_CACHED = ("diff", "--cached", "--binary", "--no-color", "--no-ext-diff", "HEAD")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -139,7 +141,8 @@ def test_restore_from_bundle_patch_and_tar_matches_the_quarantine(
     bundle = base / m["bundle"]["file"]
     _git(restored, "fetch", "-q", str(bundle), f"{m['head']}")
     _git(restored, "checkout", "-q", "--detach", str(m["head"]))
-    _git(restored, "apply", "--index", "--binary", str(base / m["patch"]["file"]))
+    _apply(restored, base / m["index_patch"]["file"], "--cached")
+    _apply(restored, base / m["patch"]["file"])
     with tarfile.open(base / m["untracked_tar"]["file"]) as tar:
         tar.extractall(restored, filter="data")
     diff = ("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
@@ -148,6 +151,7 @@ def test_restore_from_bundle_patch_and_tar_matches_the_quarantine(
         target, "rev-list", "HEAD", "--not", "--remotes"
     )
     assert _gitb(restored, *diff) == _gitb(target, *diff)
+    assert _gitb(restored, *DIFF_CACHED) == _gitb(target, *DIFF_CACHED)
     assert (restored / "new.bin").read_bytes() == (target / "new.bin").read_bytes()
 
 
@@ -163,6 +167,165 @@ def test_export_of_a_non_repository_is_incomplete_and_never_raises(tmp_path: Pat
     d.mkdir(parents=True)
     res = export_slot(d, tmp_path / "state" / EXPORTS_DIR, REPO, "slot-01-x")
     assert res.complete is False
+
+
+def _apply(repo: Path, patch: Path, *flags: str) -> None:
+    if patch.stat().st_size:  # an empty patch has nothing to apply
+        _git(repo, "apply", *flags, "--binary", str(patch))
+
+
+def test_staged_version_unlike_the_worktree_is_exported_and_restored(
+    tmp_path: Path, origin: Path
+) -> None:
+    # #600 gate Obj-1: stage B, then put the work tree back to HEAD's A. `git diff HEAD` is empty
+    # for that file; the index patch is the only copy of B. A second file differs in all three.
+    slot = _slot(tmp_path, origin)
+    (slot / "a.txt").write_text("staged B\n", encoding="utf-8")
+    _git(slot, "add", "a.txt")
+    (slot / "a.txt").write_text("base\n", encoding="utf-8")
+    (slot / "d.txt").write_text("v1\n", encoding="utf-8")
+    _git(slot, "add", "d.txt")
+    (slot / "d.txt").write_text("v2\n", encoding="utf-8")
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    base = tmp_path / "state" / EXPORTS_DIR / REPO
+    assert b"staged B" in (base / m["index_patch"]["file"]).read_bytes()
+    restored = tmp_path / "restored"
+    subprocess.run(["git", "clone", "-q", str(origin), str(restored)], check=True)
+    _git(restored, "checkout", "-q", "--detach", str(m["head"]))
+    _apply(restored, base / m["index_patch"]["file"], "--cached")
+    _apply(restored, base / m["patch"]["file"])
+    assert _git(restored, "show", ":a.txt") == "staged B\n"
+    assert (restored / "a.txt").read_text(encoding="utf-8") == "base\n"
+    assert _git(restored, "show", ":d.txt") == "v1\n"
+    assert (restored / "d.txt").read_text(encoding="utf-8") == "v2\n"
+    diff = ("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+    assert _gitb(restored, *diff) == _gitb(target, *diff)
+    assert _gitb(restored, *DIFF_CACHED) == _gitb(target, *DIFF_CACHED)
+
+
+def test_index_change_after_quarantine_is_kept(tmp_path: Path, origin: Path) -> None:
+    # #600 gate Obj-1: the work tree is unchanged, only the index moved.
+    slot = _slot(tmp_path, origin)
+    _dirty(slot)
+    target, _ = _quarantine(tmp_path, slot)
+    _git(target, "add", "a.txt")
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and _reasons(res) == {str(target): STATUS_CHANGED}
+
+
+def test_assume_unchanged_entry_makes_the_export_incomplete(tmp_path: Path, origin: Path) -> None:
+    slot = _slot(tmp_path, origin)
+    _git(slot, "update-index", "--assume-unchanged", "a.txt")
+    (slot / "a.txt").write_text("hidden from git diff\n", encoding="utf-8")
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is False and "assume_unchanged" in m["incomplete_reasons"]
+    assert target.is_dir() and _reasons(_gc(tmp_path).run()) == {str(target): "export_incomplete"}
+
+
+def _symlink_or_skip(link: Path, to: str) -> None:
+    try:
+        link.symlink_to(to)
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+
+@pytest.mark.parametrize("direction", ["file_to_symlink", "symlink_to_file"])
+def test_untracked_type_change_after_quarantine_is_kept(
+    tmp_path: Path, origin: Path, direction: str
+) -> None:
+    # #600 gate Obj-3: a regular file holding "target" and a symlink to "target" hash the same.
+    slot = _slot(tmp_path, origin)
+    if direction == "file_to_symlink":
+        (slot / "lnk").write_text("target", encoding="utf-8")
+    else:
+        _symlink_or_skip(slot / "lnk", "target")
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    (entry,) = m["untracked"]
+    assert entry["type"] == ("file" if direction == "file_to_symlink" else "symlink")
+    (target / "lnk").unlink()
+    if direction == "file_to_symlink":
+        _symlink_or_skip(target / "lnk", "target")
+    else:
+        (target / "lnk").write_text("target", encoding="utf-8")
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and _reasons(res) == {str(target): STATUS_CHANGED}
+
+
+def test_untracked_entry_without_a_type_is_unverified(tmp_path: Path, origin: Path) -> None:
+    slot = _slot(tmp_path, origin)
+    _dirty(slot)
+    target, m = _quarantine(tmp_path, slot)
+    (mp,) = list((tmp_path / "state" / EXPORTS_DIR / REPO).glob("*.manifest.json"))
+    for e in m["untracked"]:
+        del e["type"]
+    mp.write_text(json.dumps(m), encoding="utf-8")
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and _reasons(res) == {str(target): STATUS_UNVERIFIED}
+
+
+def test_export_past_its_deadline_is_incomplete(tmp_path: Path, origin: Path) -> None:
+    # #600 gate Obj-4: one deadline for the whole export, not one per git call.
+    slot = _slot(tmp_path, origin)
+    _dirty(slot)
+    res = export_slot(
+        slot, tmp_path / "state" / EXPORTS_DIR, REPO, "x", deadline=time.monotonic() - 1
+    )
+    assert res.complete is False
+    assert any(r.startswith("export_timeout") for r in res.manifest["incomplete_reasons"])
+
+
+def test_export_stops_mid_content_at_the_deadline(tmp_path: Path, origin: Path) -> None:
+    slot = _slot(tmp_path, origin)
+    (slot / "big.bin").write_bytes(b"\x00" * (4 * 1024 * 1024))
+    calls = [0]
+
+    def mono() -> float:
+        calls[0] += 1
+        return 0.0 if calls[0] < 20 else 1000.0
+
+    res = export_slot(
+        slot, tmp_path / "state" / EXPORTS_DIR, REPO, "x", deadline=500.0, monotonic=mono
+    )
+    assert res.complete is False
+    assert any(r.startswith("export_timeout") for r in res.manifest["incomplete_reasons"])
+
+
+def test_size_cap_is_checked_before_any_content_is_read(
+    tmp_path: Path, origin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import spirrow_mindwire.clone_slot_gc as gc
+
+    class _NoRead:
+        def __init__(self, *a: object) -> None:
+            raise AssertionError("content read despite the cap")
+
+    monkeypatch.setattr(gc, "_DeadlineReader", _NoRead)
+    slot = _slot(tmp_path, origin)
+    _dirty(slot)
+    res = export_slot(slot, tmp_path / "state" / EXPORTS_DIR, REPO, "x", untracked_cap=10)
+    reasons = res.manifest["incomplete_reasons"]
+    assert "untracked_cap" in reasons and not any(r.startswith("export_error") for r in reasons)
+
+
+def test_export_deadline_leaves_the_reserve_inside_the_wrapper_bound() -> None:
+    import re
+
+    from spirrow_mindwire.clone_slot_gc import (
+        EXPORT_BUDGET_S,
+        EXPORT_RESERVE_S,
+        FINISH_ALLOWANCE_S,
+        export_deadline,
+    )
+
+    ps1 = Path(__file__).resolve().parents[1] / "deploy" / "run-conductor-scheduled.ps1"
+    found = re.search(r"^\$SlotFinishTimeoutSeconds = (\d+)", ps1.read_text(encoding="utf-8"), re.M)
+    assert found is not None and float(found.group(1)) == FINISH_ALLOWANCE_S
+    assert 0 < EXPORT_RESERVE_S < FINISH_ALLOWANCE_S
+    assert export_deadline(0.0, FINISH_ALLOWANCE_S, 0.0) == EXPORT_BUDGET_S
+    late = export_deadline(0.0, FINISH_ALLOWANCE_S, 200.0)
+    assert late == FINISH_ALLOWANCE_S - EXPORT_RESERVE_S
 
 
 # --- GC: deletes only what is verified ----------------------------------------------------
@@ -250,9 +413,9 @@ def test_incomplete_export_is_kept(tmp_path: Path, origin: Path) -> None:
 # --- GC: count, bounds, _deleting ----------------------------------------------------------
 
 
-def test_count_limit_and_item_bound_carry_over_to_the_next_tick(
-    tmp_path: Path, origin: Path
-) -> None:
+def test_count_limit_counts_only_verified_and_carries_over(tmp_path: Path, origin: Path) -> None:
+    # #600 gate Obj-2: a quarantine counts towards the 10 only once its verification completed;
+    # the 3-per-tick bound covers pre-verification and verify-then-delete together.
     targets = []
     for n in range(14):
         slot = _slot(tmp_path, origin, f"slot-{n + 1:02d}")
@@ -260,12 +423,36 @@ def test_count_limit_and_item_bound_carry_over_to_the_next_tick(
         targets.append(_quarantine(tmp_path, slot, at=AT + timedelta(minutes=n))[0])
     young = AT + timedelta(days=1)  # none is older than 7 days: only the count makes them due
     first = _gc(tmp_path, now=young).run()
-    assert len(first.deleted) == 3 and first.remaining_due == 1  # 4 over 10, 3 per tick
-    assert [t.exists() for t in targets[:3]] == [False] * 3 and targets[3].exists()
-    second = _gc(tmp_path, now=young).run()
-    assert len(second.deleted) == 1 and not targets[3].exists()
+    assert first.deleted == [] and first.verified == 3  # nothing is counted before it is verified
+    for _ in range(12):
+        res = _gc(tmp_path, now=young).run()
+        assert res.verified <= 3 and res.notices == []
+    assert [t.exists() for t in targets[:4]] == [False] * 4
     assert all(t.exists() for t in targets[4:])
     assert len(list((tmp_path / "slots" / "_quarantine" / REPO).iterdir())) == 10
+
+
+def test_unverifiable_newer_quarantines_do_not_make_a_valid_older_one_due(
+    tmp_path: Path, origin: Path
+) -> None:
+    # #600 gate Obj-2's case: eleven young quarantines, the oldest valid, the ten newer ones
+    # with their bundles gone. Only one is verifiably deletable, so nothing is over the 10.
+    targets = []
+    for n in range(11):
+        slot = _slot(tmp_path, origin, f"slot-{n + 1:02d}")
+        _dirty(slot)
+        target, m = _quarantine(tmp_path, slot, at=AT + timedelta(minutes=n))
+        if n > 0:
+            (tmp_path / "state" / EXPORTS_DIR / REPO / m["bundle"]["file"]).unlink()
+        targets.append(target)
+    young = AT + timedelta(days=1)
+    last = None
+    for _ in range(8):
+        last = _gc(tmp_path, now=young).run()
+        assert last.deleted == []
+    assert all(t.is_dir() for t in targets)
+    assert last is not None
+    assert _reasons(last) == {str(t): STATUS_UNVERIFIED for t in targets[1:]}
 
 
 class _Clock:

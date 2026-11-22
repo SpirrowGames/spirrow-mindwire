@@ -7,8 +7,12 @@ and msg-9905; Einstein's go is msg-9906. Two halves:
 by the borrow-time check (``clone_slot_prep``) or by the turn end (``clone_slot_finish``) —
 :func:`export_slot` writes, under ``<state>/slot-exports/<repo>/``, one stem per quarantine:
 
-* ``<stem>.patch`` — ``git diff --binary HEAD`` (index and work-tree changes against HEAD);
-* ``<stem>.untracked.tar`` — the CONTENT of every untracked, not ignored file (``tarfile``);
+* ``<stem>.patch`` — ``git diff --binary HEAD`` (the work tree against HEAD);
+* ``<stem>.index.patch`` — ``git diff --cached --binary HEAD`` (the index against HEAD), so a
+  staged version the work tree no longer has is kept too (#600 gate Obj-1). Restore: check out
+  HEAD, ``git apply --cached`` the index patch, ``git apply`` the patch, extract the tar;
+* ``<stem>.untracked.tar`` — the CONTENT of every untracked, not ignored file (``tarfile``); the
+  manifest records each entry's type (file / symlink) and execute bit next to its sha256;
 * ``<stem>.bundle`` — only when there are commits no remote ref has: ``git bundle create`` of
   HEAD, the local branches, the tags and the stash, ``--not --remotes``, then ``git bundle verify``;
 * ``<stem>.manifest.json`` — written by :func:`write_manifest` once the rename has succeeded, with
@@ -17,8 +21,11 @@ by the borrow-time check (``clone_slot_prep``) or by the turn end (``clone_slot_
 
 ``complete`` is false when a file could not be read, the untracked files exceed
 :data:`UNTRACKED_CAP` (256 MiB), the exports together exceed :data:`TOTAL_CAP` (1 GiB, msg-9903
-§3), the bundle could not be created or verified, HEAD could not be read, or the slot has
-something the export cannot carry (a gitlink / submodule, an embedded repository). Only checks
+§3), the bundle could not be created or verified, HEAD could not be read, the whole export ran
+past its deadline (``export_timeout``: one deadline for all of it, sizes checked from ``lstat``
+before any content is read, #600 gate Obj-4), or the slot has something the export cannot carry
+(a gitlink / submodule, an embedded repository, an untracked special file, unmerged index
+entries, assume-unchanged / skip-worktree entries). Only checks
 that actually ran are recorded: there is no ``restore_checked`` (msg-9905 Obj-3-1); the restore
 path is verified by the tests. A failing export never stops or parks anything: the quarantine
 goes on exactly as before (msg-9901 §1).
@@ -27,12 +34,16 @@ goes on exactly as before (msg-9901 §1).
 only when ALL of these hold (msg-9901 §2, msg-9903 §1): a manifest names exactly that path and
 says ``complete``; every file it lists exists with the recorded sha256; re-reading the quarantined
 slot right before deleting gives the same HEAD, the same ``git diff --binary HEAD`` sha256, the
-same local-only commits, and the same untracked files with the same sha256; no lease names the
+same ``git diff --cached --binary HEAD`` sha256, no index hazard, the same local-only commits,
+and the same untracked entries with the same type, execute bit and sha256; no lease names the
 path. This is inside Takahito's approval in msg-8047 D-6 ("patch export 済み"), and narrower:
 a rescue ref alone never makes anything deletable (msg-9901 Obj-1-2).
 
-What is due: among the deletable candidates of one repo (oldest first by ``quarantined_at``),
-those older than :data:`MAX_AGE` (7 days) or beyond the newest :data:`MAX_PER_REPO` (10). A
+What is due: a candidate older than :data:`MAX_AGE` (7 days), or, among the candidates of one
+repo whose verification COMPLETED within :data:`ELIGIBLE_TTL` (oldest first by
+``quarantined_at``), those beyond the newest :data:`MAX_PER_REPO` (10). A candidate not yet
+verified is verified first without deleting anything (#600 gate Obj-2), inside the same per-tick
+bound; a due one is verified again right before deletion. A
 quarantine that does not qualify (no manifest, as for every one made before A5; ``complete``
 false; changed since export; unverifiable) is kept, is not counted in the 10, and is named in one
 notice. Deleting: rename to ``_quarantine/_deleting/<repo>/<dir>`` first, then delete file by
@@ -78,6 +89,7 @@ __all__ = [
     "ExportResult",
     "GcResult",
     "QuarantineGc",
+    "export_deadline",
     "export_slot",
     "write_manifest",
 ]
@@ -95,6 +107,15 @@ TICK_BUDGET_S = 20.0
 MAX_ITEMS = 3
 STUCK_AFTER = 3
 EXPORT_GIT_TIMEOUT_S = 300.0
+# #600 gate Obj-4: one export's whole budget, and the time it leaves inside the wrapper's bound.
+EXPORT_BUDGET_S = 120.0
+EXPORT_RESERVE_S = 60.0
+# The wrapper's bound on `mindwire slot-finish` ($SlotFinishTimeoutSeconds in
+# deploy/run-conductor-scheduled.ps1; a test keeps the two equal).
+FINISH_ALLOWANCE_S = 300.0
+# #600 gate Obj-2: a completed verification makes a quarantine count towards MAX_PER_REPO
+# for this long; after that it is verified again before it counts.
+ELIGIBLE_TTL = timedelta(hours=24)
 
 STATUS_STUCK = "gc_stuck"
 STATUS_VERIFY_TIMEOUT = "gc_verify_timeout"
@@ -131,10 +152,16 @@ def _git_bytes(cwd: Path, args: Sequence[str], timeout: float) -> tuple[int, byt
 
 
 _DIFF = ("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+# #600 gate Obj-1: the index is exported on its own. ``_DIFF`` is HEAD -> work tree only, so a
+# staged version that the work tree no longer has (stage B, restore the file to A) is in neither.
+# Restore: ``git apply --cached <index patch>`` then ``git apply <patch>`` on a checkout of HEAD.
+_DIFF_INDEX = ("diff", "--cached", "--binary", "--no-color", "--no-ext-diff", "HEAD")
 _UNTRACKED = ("ls-files", "--others", "--exclude-standard", "-z")
 
+_Run = Callable[[Sequence[str]], tuple[int, bytes, bytes]]
 
-def _local_args(cwd: Path, run: Callable[[Sequence[str]], tuple[int, bytes, bytes]]) -> list[str]:
+
+def _local_args(cwd: Path, run: _Run) -> list[str]:
     """The positive refs whose commits must survive: HEAD, branches, tags, and the stash."""
     args = ["HEAD", "--branches", "--tags"]
     code, _out, _err = run(("rev-parse", "-q", "--verify", "refs/stash"))
@@ -146,6 +173,7 @@ def _local_args(cwd: Path, run: Callable[[Sequence[str]], tuple[int, bytes, byte
 def _sha256_file(
     path: Path, deadline: float | None = None, mono: Callable[[], float] = time.monotonic
 ) -> str:
+    """Content hash (a symlink: its target string). The entry TYPE is compared separately."""
     h = hashlib.sha256()
     if path.is_symlink():
         h.update(os.fsencode(os.readlink(path)))
@@ -161,7 +189,17 @@ def _sha256_file(
     return h.hexdigest()
 
 
-def _has_gitlink(slot: Path, run: Callable[[Sequence[str]], tuple[int, bytes, bytes]]) -> bool:
+def _entry_kind(st: os.stat_result) -> tuple[str, bool]:
+    """``(type, exec)`` of an untracked entry (#600 gate Obj-3). ``type`` is ``file``,
+    ``symlink`` or ``special``; ``exec`` is the owner execute bit of a regular file."""
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink", False
+    if stat.S_ISREG(st.st_mode):
+        return "file", bool(st.st_mode & stat.S_IXUSR)
+    return "special", False
+
+
+def _has_gitlink(slot: Path, run: _Run) -> bool:
     if (slot / ".gitmodules").exists():
         return True
     for args in (("ls-files", "-s", "-z"), ("ls-tree", "-r", "-z", "HEAD")):
@@ -174,12 +212,36 @@ def _has_gitlink(slot: Path, run: Callable[[Sequence[str]], tuple[int, bytes, by
     return False
 
 
+def _index_hazards(run: _Run) -> list[str]:
+    """Index states the two patches cannot carry (#600 gate Obj-1): unmerged stages, and
+    assume-unchanged / skip-worktree entries, whose work-tree changes ``git diff`` hides."""
+    found: list[str] = []
+    code, out, _ = run(("ls-files", "-u", "-z"))
+    if code != 0:
+        return ["index_unreadable"]
+    if out.strip(b"\0"):
+        found.append("unmerged_index")
+    code, out, _ = run(("ls-files", "-v", "-z"))
+    if code != 0:
+        return [*found, "index_unreadable"]
+    for entry in out.split(b"\0"):
+        tag = entry[:1]
+        if tag.islower():
+            found.append("assume_unchanged")
+            break
+        if tag == b"S":
+            found.append("skip_worktree")
+            break
+    return found
+
+
 @dataclass
 class ExportResult:
     """What :func:`export_slot` wrote. ``manifest`` is the body :func:`write_manifest` completes."""
 
     stem: Path
     patch: Path | None = None
+    index_patch: Path | None = None
     untracked_tar: Path | None = None
     bundle: Path | None = None
     manifest: dict[str, Any] = field(default_factory=dict)
@@ -187,6 +249,14 @@ class ExportResult:
     @property
     def complete(self) -> bool:
         return bool(self.manifest.get("complete"))
+
+
+def export_deadline(started: float, allowance_s: float, now: float) -> float:
+    """The absolute (monotonic) deadline of one export (#600 gate Obj-4): at most
+    :data:`EXPORT_BUDGET_S` from ``now``, and never later than ``allowance_s`` after the process
+    ``started`` minus :data:`EXPORT_RESERVE_S`, which is left for the rename, the manifest, the
+    ledger row and the lease bookkeeping that must still run inside the wrapper's bound."""
+    return min(now + EXPORT_BUDGET_S, started + allowance_s - EXPORT_RESERVE_S)
 
 
 def export_slot(
@@ -198,12 +268,22 @@ def export_slot(
     untracked_cap: int = UNTRACKED_CAP,
     total_cap: int = TOTAL_CAP,
     timeout: float = EXPORT_GIT_TIMEOUT_S,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> ExportResult:
     """Export a slot that is about to be quarantined. Never raises: a failure is ``complete`` false.
+
+    ``deadline`` (monotonic) bounds the WHOLE export, not one git call (#600 gate Obj-4): every
+    git call gets the time left as its timeout, file contents are read in tar-sized blocks with
+    the clock checked in between, and the size caps are checked from ``lstat`` before any content
+    is read. Past the deadline the export stops with ``export_timeout`` and the caller goes on to
+    the rename. ``None`` = :data:`EXPORT_BUDGET_S` from now.
 
     ``name`` makes the stem readable (``<slot>-<who>-<stamp>``); a random suffix keeps two
     quarantines of the same second apart.
     """
+    if deadline is None:
+        deadline = monotonic() + EXPORT_BUDGET_S
     out_dir = exports_root / repo
     stem = out_dir / f"{name}-{uuid.uuid4().hex[:8]}"
     res = ExportResult(stem=stem)
@@ -212,6 +292,7 @@ def export_slot(
         "repo": repo,
         "head": None,
         "patch": None,
+        "index_patch": None,
         "untracked_tar": None,
         "bundle": None,
         "local_commits": [],
@@ -222,11 +303,32 @@ def export_slot(
     res.manifest = m
     why: list[str] = m["incomplete_reasons"]
     try:
-        _export(slot, out_dir, stem, res, m, why, untracked_cap, total_cap, timeout)
+        _export(
+            slot, out_dir, stem, res, m, why, untracked_cap, total_cap, timeout, deadline, monotonic
+        )
+    except _TimeoutError as exc:
+        why.append(f"export_timeout: {exc}")
     except Exception as exc:  # never stop the quarantine (msg-9901 §1)
         why.append(f"export_error: {type(exc).__name__}: {exc}")
     m["complete"] = not why
     return res
+
+
+class _DeadlineReader:
+    """A file reader for ``tarfile.addfile`` that hashes what it reads and stops at the deadline."""
+
+    def __init__(self, fh: Any, deadline: float, mono: Callable[[], float]) -> None:
+        self._fh = fh
+        self._deadline = deadline
+        self._mono = mono
+        self.sha = hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        if self._mono() > self._deadline:
+            raise _TimeoutError("untracked contents")
+        data: bytes = self._fh.read(n)
+        self.sha.update(data)
+        return data
 
 
 def _export(
@@ -239,9 +341,17 @@ def _export(
     untracked_cap: int,
     total_cap: int,
     timeout: float,
+    deadline: float,
+    mono: Callable[[], float],
 ) -> None:
     def run(args: Sequence[str]) -> tuple[int, bytes, bytes]:
-        return _git_bytes(slot, args, timeout)
+        left = deadline - mono()
+        if left <= 0:
+            raise _TimeoutError("git " + args[0])
+        try:
+            return _git_bytes(slot, args, min(timeout, left))
+        except subprocess.TimeoutExpired as exc:
+            raise _TimeoutError("git " + args[0]) from exc
 
     out_dir.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -252,24 +362,9 @@ def _export(
         m["head"] = out.decode().strip()
     if _has_gitlink(slot, run):
         why.append("submodule")
+    why.extend(_index_hazards(run))
 
-    code, patch, err = run(_DIFF)
-    if code != 0:
-        why.append(f"diff_failed: {err.decode(errors='replace').strip()[:200]}")
-    else:
-        total += len(patch)
-        if total > total_cap:
-            why.append("total_cap")
-        else:
-            p = Path(f"{stem}.patch")
-            p.write_bytes(patch)
-            res.patch = p
-            m["patch"] = {
-                "file": p.name,
-                "sha256": hashlib.sha256(patch).hexdigest(),
-                "bytes": len(patch),
-            }
-
+    # Untracked entries: list, lstat and cap BEFORE reading any content (#600 gate Obj-4).
     code, listing, _ = run(_UNTRACKED)
     if code != 0:
         why.append("untracked_list_failed")
@@ -278,31 +373,71 @@ def _export(
         names = sorted(os.fsdecode(n) for n in listing.split(b"\0") if n)
     if any(n.endswith("/") for n in names):
         why.append("embedded_repo")
-    files = [n for n in names if not n.endswith("/")]
+    kinds: list[tuple[str, str, bool]] = []
     sizes = 0
-    entries: list[dict[str, str]] = []
-    for n in files:
-        fp = slot / n
+    for n in (n for n in names if not n.endswith("/")):
         try:
-            sizes += fp.lstat().st_size
-            entries.append({"path": n, "sha256": _sha256_file(fp)})
+            st = (slot / n).lstat()
         except OSError:
             why.append(f"unreadable: {n}")
-    m["untracked"] = entries
+            continue
+        kind, exe = _entry_kind(st)
+        if kind == "special":
+            why.append(f"special_file: {n}")
+            continue
+        sizes += st.st_size
+        kinds.append((n, kind, exe))
     if sizes > untracked_cap:
         why.append("untracked_cap")
-    elif not any(w.startswith("unreadable") for w in why):
+
+    for key, args, suffix in (
+        ("patch", _DIFF, ".patch"),
+        ("index_patch", _DIFF_INDEX, ".index.patch"),
+    ):
+        code, patch, err = run(args)
+        if code != 0:
+            why.append(f"{key}_failed: {err.decode(errors='replace').strip()[:200]}")
+            continue
+        total += len(patch)
+        if total > total_cap:
+            why.append("total_cap")
+            continue
+        p = Path(f"{stem}{suffix}")
+        p.write_bytes(patch)
+        setattr(res, key, p)
+        m[key] = {"file": p.name, "sha256": hashlib.sha256(patch).hexdigest(), "bytes": len(patch)}
+
+    blocked = "untracked_cap" in why or any(
+        w.startswith(("unreadable", "special_file")) for w in why
+    )
+    if not blocked:
         if total + sizes > total_cap:
             why.append("total_cap")
         else:
+            entries: list[dict[str, Any]] = []
             tp = Path(f"{stem}.untracked.tar")
             with tarfile.open(tp, "w") as tar:
-                for e in entries:
-                    tar.add(str(slot / e["path"]), arcname=e["path"], recursive=False)
+                for n, kind, exe in kinds:
+                    fp = slot / n
+                    info = tar.gettarinfo(str(fp), arcname=n)
+                    if kind == "symlink":
+                        tar.addfile(info)
+                        sha = _sha256_file(fp)
+                    else:
+                        with fp.open("rb") as fh:
+                            reader = _DeadlineReader(fh, deadline, mono)
+                            tar.addfile(info, reader)
+                            sha = reader.sha.hexdigest()
+                    entries.append({"path": n, "type": kind, "exec": exe, "sha256": sha})
+            m["untracked"] = entries
             res.untracked_tar = tp
             size = tp.stat().st_size
             total += size
-            m["untracked_tar"] = {"file": tp.name, "sha256": _sha256_file(tp), "bytes": size}
+            m["untracked_tar"] = {
+                "file": tp.name,
+                "sha256": _sha256_file(tp, deadline, mono),
+                "bytes": size,
+            }
 
     pos = _local_args(slot, run)
     code, revs, _ = run(("rev-list", *pos, "--not", "--remotes"))
@@ -323,7 +458,7 @@ def _export(
     vcode, _, _ = run(("bundle", "verify", str(bp)))
     m["bundle"] = {
         "file": bp.name,
-        "sha256": _sha256_file(bp),
+        "sha256": _sha256_file(bp, deadline, mono),
         "bytes": size,
         "verify": "ok" if vcode == 0 else "failed",
     }
@@ -573,28 +708,49 @@ class QuarantineGc:
             if _norm(it.path) in self.leased:
                 continue
             by_repo.setdefault(it.repo, []).append(it)
+        # #600 gate Obj-2: only a quarantine whose verification COMPLETED (within ELIGIBLE_TTL)
+        # counts towards MAX_PER_REPO. One that passed only the manifest metadata is verified
+        # first ("pre-verify", nothing deleted), so ten broken exports never make a valid older
+        # one due. Age makes a quarantine due by itself; it is verified right before deletion.
         due: list[_Item] = []
+        unknown: list[_Item] = []
         for items in by_repo.values():
             items.sort(key=lambda i: (i.at, str(i.path)))
-            over = len(items) - self.max_per_repo
-            for n, it in enumerate(items):
+            counted = [i for i in items if self._eligible(state, i, now)]
+            over = set(map(id, counted[: max(0, len(counted) - self.max_per_repo)]))
+            for it in items:
                 assert it.at is not None
-                if n < over or now - it.at >= self.max_age:
+                if id(it) in over or now - it.at >= self.max_age:
                     due.append(it)
+                elif not self._eligible(state, it, now):
+                    unknown.append(it)
         due.sort(key=lambda i: (i.at, str(i.path)))
+        unknown.sort(key=lambda i: (i.at, str(i.path)))
         started = 0
-        for it in due:
+        for it, delete in [(i, True) for i in due] + [(i, False) for i in unknown]:
             if started >= self.max_items or self._mono() > deadline:
-                res.remaining_due += 1
+                if delete:
+                    res.remaining_due += 1
                 continue
             started += 1
-            self._verify_and_delete(it, state, res, deadline)
+            self._verify_and_delete(it, state, res, deadline, delete=delete)
+
+    def _eligible(self, state: dict[str, dict[str, Any]], it: _Item, now: datetime) -> bool:
+        at = _parse_at(state.get(_norm(it.path), {}).get("eligible_at"))
+        return at is not None and now - at < ELIGIBLE_TTL
 
     def _verify_and_delete(
-        self, it: _Item, state: dict[str, dict[str, Any]], res: GcResult, deadline: float
+        self,
+        it: _Item,
+        state: dict[str, dict[str, Any]],
+        res: GcResult,
+        deadline: float,
+        *,
+        delete: bool = True,
     ) -> None:
         key = _norm(it.path)
         rec = state.setdefault(key, {})
+        rec.pop("eligible_at", None)  # set again only by a verification that completes now
         try:
             verify(it.path, it.manifest or {}, it.manifest_path, deadline, self._mono)
         except _TimeoutError as exc:
@@ -614,7 +770,8 @@ class QuarantineGc:
             return
         res.verified += 1
         rec["verify_timeouts"] = 0
-        if _norm(it.path) in self.leased:
+        rec["eligible_at"] = self._clock().astimezone(UTC).isoformat()
+        if not delete or _norm(it.path) in self.leased:
             return
         target = self.root / DELETING_DIR / it.repo / it.path.name
         try:
@@ -668,20 +825,23 @@ def verify(
             raise _TimeoutError("deadline")
         return r
 
-    def run(args: Sequence[str]) -> bytes:
+    def run_raw(args: Sequence[str]) -> tuple[int, bytes, bytes]:
         try:
-            code, out, err = _git_bytes(path, args, left())
+            return _git_bytes(path, args, left())
         except subprocess.TimeoutExpired as exc:
             raise _TimeoutError(" ".join(args)) from exc
         except OSError as exc:
             raise _MismatchError(f"unverified: git {args[0]}: {exc}") from exc
+
+    def run(args: Sequence[str]) -> bytes:
+        code, out, err = run_raw(args)
         if code != 0:
             raise _MismatchError(
                 f"unverified: git {' '.join(args)}: {err.decode(errors='replace')[:200]}"
             )
         return out
 
-    for key in ("patch", "untracked_tar", "bundle"):
+    for key in ("patch", "index_patch", "untracked_tar", "bundle"):
         entry = m.get(key)
         if key != "bundle" and entry is None:
             raise _MismatchError(f"unverified: no {key} export")
@@ -697,26 +857,37 @@ def verify(
         raise _MismatchError("unverified: local commits without a bundle")
     if run(("rev-parse", "HEAD")).decode().strip() != m.get("head"):
         raise _MismatchError("changed: HEAD")
-    patch = run(_DIFF)
-    if hashlib.sha256(patch).hexdigest() != (m.get("patch") or {}).get("sha256"):
-        raise _MismatchError("changed: tracked files (git diff --binary HEAD)")
+    hazards = _index_hazards(run_raw)
+    if hazards:
+        raise _MismatchError(f"changed: index ({', '.join(hazards)})")
+    for key, args, what in (
+        ("patch", _DIFF, "tracked files (git diff --binary HEAD)"),
+        ("index_patch", _DIFF_INDEX, "index (git diff --cached --binary HEAD)"),
+    ):
+        if hashlib.sha256(run(args)).hexdigest() != (m.get(key) or {}).get("sha256"):
+            raise _MismatchError(f"changed: {what}")
     pos = ["HEAD", "--branches", "--tags"]
-    try:
-        code, _, _ = _git_bytes(path, ("rev-parse", "-q", "--verify", "refs/stash"), left())
-    except subprocess.TimeoutExpired as exc:
-        raise _TimeoutError("stash") from exc
+    code, _, _ = run_raw(("rev-parse", "-q", "--verify", "refs/stash"))
     if code == 0:
         pos.append("refs/stash")
     commits = sorted(r for r in run(("rev-list", *pos, "--not", "--remotes")).decode().split() if r)
     if commits != sorted(m.get("local_commits") or []):
         raise _MismatchError("changed: local-only commits")
     names = sorted(os.fsdecode(n) for n in run(_UNTRACKED).split(b"\0") if n)
-    saved = {str(e["path"]): str(e["sha256"]) for e in m.get("untracked") or []}
+    saved: dict[str, dict[str, Any]] = {}
+    for e in m.get("untracked") or []:
+        if not isinstance(e, dict) or e.get("type") not in ("file", "symlink"):
+            raise _MismatchError("unverified: untracked entry without a type")
+        saved[str(e["path"])] = e
     if names != sorted(saved):
         raise _MismatchError("changed: untracked file list")
     for n in names:
+        e = saved[n]
         try:
-            if _sha256_file(path / n, deadline, mono) != saved[n]:
+            # #600 gate Obj-3: type and execute bit first, then the content.
+            if _entry_kind((path / n).lstat()) != (e["type"], bool(e.get("exec"))):
+                raise _MismatchError(f"changed: untracked {n} (type or mode)")
+            if _sha256_file(path / n, deadline, mono) != e["sha256"]:
                 raise _MismatchError(f"changed: untracked {n}")
         except OSError as exc:
             raise _MismatchError(f"unverified: untracked {n}: {exc}") from exc
