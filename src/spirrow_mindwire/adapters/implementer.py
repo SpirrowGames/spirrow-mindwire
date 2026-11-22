@@ -119,6 +119,7 @@ from . import _sdk_job_hook
 from ._cli_selection import cli_selection_kwargs
 from ._command_line import check_command_line, system_prompt_file
 from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
+from ._env_scrub import scrubbed_secret_env
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
     JobState,
@@ -326,6 +327,11 @@ _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
 # no ``SlashCommand``) to keep the surface minimal. Since the allow-list guard was
 # removed (2026-08-20) this list IS the tool surface: what is not exposed here
 # cannot be called at all, and what is exposed runs without a per-call check.
+# Tokens the implementer's subprocess keeps although they match ``MINDWIRE_*_TOKEN``: its own
+# author identity, which its ``gh`` already holds and ``mindwire pr-diff-size`` reads. Every
+# other daemon token (the ops review token above all) is blanked (``_env_scrub``, I-4).
+IMPLEMENTER_KEPT_TOKEN_ENV: tuple[str, ...] = ("MINDWIRE_GITHUB_TOKEN",)
+
 _IMPLEMENTER_BUILTIN_TOOLS: tuple[str, ...] = (
     "Read",
     "Write",
@@ -647,6 +653,10 @@ class ImplementerSdkAdapter:
             # docstring), so what limits it is that the server exposes only these two tools.
             allowed_tools.extend(LEDGER_ALLOWED_TOOLS)
         env = {
+            # I-4 (T-gate-records-submitted-review-id msg-9923): blank the daemon's
+            # MINDWIRE_*_TOKEN secrets first, so the explicit values below still win. The
+            # author token stays: it is this role's own identity (see ``_env_scrub``).
+            **scrubbed_secret_env(keep=IMPLEMENTER_KEPT_TOKEN_ENV),
             "ANTHROPIC_BASE_URL": self._inference_base_url,
             # Force UTF-8 in the CLI subprocess and any Python the agent spawns
             # (``uv run`` / pytest / its own scripts). On Japanese Windows the

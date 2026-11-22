@@ -148,6 +148,7 @@ from ..value_objects import (
 )
 from ._command_line import check_command_line, system_prompt_file
 from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS, connect_bounded
+from ._env_scrub import scrubbed_secret_env
 from ._sdk_result import (
     SdkIsErrorSignal,
     capture_is_error_detail,
@@ -707,7 +708,12 @@ class NaysayerSdkAdapter:
         return replace(options, env=env)
 
     def _make_options(self) -> ClaudeAgentOptions:
-        env = {"ANTHROPIC_BASE_URL": self._inference_base_url, **self._extra_env}
+        # I-4 (T-gate-records-submitted-review-id msg-9923): blank MINDWIRE_*_TOKEN first.
+        env = {
+            **scrubbed_secret_env(),
+            "ANTHROPIC_BASE_URL": self._inference_base_url,
+            **self._extra_env,
+        }
         kwargs: dict[str, Any] = {
             "cwd": self._cwd,
             # Through a file, not ``--system-prompt``: the ADR index and the obligations ride in

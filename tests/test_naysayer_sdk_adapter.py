@@ -1996,3 +1996,26 @@ async def test_a_design_time_turn_in_the_codex_limit_band_is_marked_for_the_ledg
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     await adapter.deliver_event(handle, _event())
     assert is_codex_limit_band_trace_id(asked[0]) is in_band
+
+
+@pytest.mark.anyio
+async def test_options_blank_every_daemon_token_including_the_ops_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-4 (T-gate-records-submitted-review-id msg-9923)."""
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    opts: list[Any] = []
+    client = _FakeClient([_assistant("…"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, opts),
+        preflight=_preflight_ok(),
+        turn_rows=_turn_rows_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    env = adapter.source_marker_options(handle).env
+    assert env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
+    assert env["MINDWIRE_GITHUB_TOKEN"] == ""
