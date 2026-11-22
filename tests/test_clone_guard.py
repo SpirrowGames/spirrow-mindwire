@@ -565,3 +565,88 @@ def test_slot_mode_still_refuses_dirt_and_a_detached_head(repo: Path) -> None:
     (repo / "wip.txt").unlink()
     _git(repo, "switch", "-q", "--detach")
     assert _reason(repo, slot_mode=True) == DirtyCloneReason.WRONG_HEAD
+
+
+# ------------------------------------------- A5 D-5: slot_mode from the launch, not the config
+
+
+def _pool_settings(tmp_path: Path, repo_dir: Path, *, thread: str = "T-a") -> MindwireSettings:
+    settings = MindwireSettings()
+    settings.loop.slots_root = tmp_path / "slots"
+    settings.loop.repo_dir = repo_dir
+    settings.paths.data_dir = tmp_path / "data"
+    settings.conductor.task_thread_id = thread
+    return settings
+
+
+def _borrow(tmp_path: Path, *, thread: str = "T-a") -> Path:
+    """Take a real lease on ``mindwire/slot-01`` the way ``slot-prep`` does; return the slot."""
+    from spirrow_mindwire.clone_slot import slot_dir
+    from spirrow_mindwire.clone_slot_lease import LeaseStore
+
+    state = tmp_path / "data" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    res = LeaseStore(state).acquire(
+        "mindwire", 2, thread_id=thread, turn_id="turn-1", now=datetime.now(UTC)
+    )
+    assert res.lease is not None and res.lease.slot == "slot-01"
+    slot = slot_dir(tmp_path / "slots", "mindwire", 1)
+    slot.mkdir(parents=True, exist_ok=True)
+    return slot
+
+
+def _guard_for(settings: MindwireSettings, monkeypatch: pytest.MonkeyPatch) -> CloneGuard:
+    monkeypatch.setattr(loop_runner, "build_registry", lambda **_kw: InMemoryAdapterRegistry())
+    _mcp, _reg, disp = loop_runner._build_dispatcher(
+        settings,
+        mcp=object(),  # type: ignore[arg-type]
+        proposer=_Adapter("p"),
+        implementer=_Adapter("i"),
+        naysayer=_Adapter("n"),
+    )
+    guard = disp._clone_guard
+    assert isinstance(guard, CloneGuard)
+    return guard
+
+
+def test_dispatcher_relaxes_the_guard_for_a_borrowed_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = _borrow(tmp_path)
+    guard = _guard_for(_pool_settings(tmp_path, slot), monkeypatch)
+    assert guard.repo_dir == slot
+    assert guard._slot_mode is True
+
+
+def test_gate_lane_on_the_shared_clone_keeps_the_strict_guard_with_a_pool_configured(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #603 gate Obj-1-1: a gate-lane launch borrows no slot; [loop].repo_dir is the shared clone.
+    # A clean shared clone left on another thread's branch must still be refused.
+    _borrow(tmp_path)  # another launch's lease exists in the same pool
+    _git(repo, "switch", "-q", "-c", "loop/t-other")
+    guard = _guard_for(_pool_settings(tmp_path, repo), monkeypatch)
+    assert guard._slot_mode is False
+    with pytest.raises(DirtyCloneError) as ei:
+        guard.check()
+    assert ei.value.reason == DirtyCloneReason.WRONG_HEAD
+
+
+@pytest.mark.parametrize("case", ["no_lease", "other_thread", "unreadable_leases"])
+def test_a_slot_path_without_this_launchs_lease_keeps_the_strict_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from spirrow_mindwire.clone_slot import slot_dir
+
+    if case == "no_lease":
+        slot = slot_dir(tmp_path / "slots", "mindwire", 1)
+        slot.mkdir(parents=True)
+    elif case == "other_thread":
+        slot = _borrow(tmp_path, thread="T-other")
+    else:
+        slot = _borrow(tmp_path)
+        from spirrow_mindwire.clone_slot_lease import LEASES_FILE
+
+        (tmp_path / "data" / "state" / LEASES_FILE).write_text("{not json", encoding="utf-8")
+    guard = _guard_for(_pool_settings(tmp_path, slot), monkeypatch)
+    assert guard._slot_mode is False

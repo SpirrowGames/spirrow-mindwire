@@ -86,6 +86,8 @@ from .clone_guard import (
     DirtyCloneError,
     emit_dirty_clone_payload,
 )
+from .clone_slot import slot_index
+from .clone_slot_lease import LeaseError, LeaseStore
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.continuation import DEFAULT_CONTINUE_CAP
 from .conductor.core import (
@@ -788,9 +790,11 @@ def _build_dispatcher(
     clone_guard: CloneGuard | None = None
     ref_snapshot_store: TurnRefSnapshotStore | None = None
     if cfg.repo_dir is not None:
-        # A5 D-5: in slot mode the guard judges the borrowed slot only, and the slot is on the
-        # thread's branch (see CloneGuard ``slot_mode``).
-        clone_guard = CloneGuard(Path(cfg.repo_dir), slot_mode=settings.loop.slots_root is not None)
+        # A5 D-5: the guard judges a borrowed slot by itself, and that slot is on the thread's
+        # branch (see CloneGuard ``slot_mode``). Relaxed only when this launch provably borrowed
+        # a slot, not merely because a pool is configured: a gate-lane launch borrows none and
+        # runs on the shared clone, which must still be on its default branch (#603 gate Obj-1-1).
+        clone_guard = CloneGuard(Path(cfg.repo_dir), slot_mode=_launch_borrowed_slot(settings))
         # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
         # implementer launch records its starting ref state before the adapter runs.
         # A4 (msg-9400 §4): slot mode does not use the launch ref snapshot; the turn end's
@@ -807,6 +811,37 @@ def _build_dispatcher(
         ref_snapshot_store=ref_snapshot_store,
     )
     return mcp, registry, dispatcher
+
+
+def _launch_borrowed_slot(settings: MindwireSettings) -> bool:
+    """Whether this launch's ``[loop].repo_dir`` is a slot this run borrowed (A5 D-5).
+
+    True only on positive evidence, all of it read now: ``[loop].slots_root`` is set,
+    ``repo_dir`` is ``<slots_root>/<repo>/slot-NN``, and the lease file holds a lease on that
+    slot (for ``[conductor].task_thread_id`` when that is set) — the lease the wrapper took with
+    ``slot-prep`` before writing the slot into ``repo_dir``. Anything else, including a lease file
+    that cannot be read, is ``False``: the strict shared-clone guard (fail-closed — a refused
+    launch, never one on the wrong branch). A gate-lane launch borrows no slot and points
+    ``repo_dir`` at the shared clone, so it always gets the strict guard.
+    """
+    loop_cfg = settings.loop
+    if loop_cfg.slots_root is None or loop_cfg.repo_dir is None:
+        return False
+    slot = Path(os.path.abspath(loop_cfg.repo_dir))
+    root = Path(os.path.abspath(loop_cfg.slots_root))
+    if slot_index(slot.name) is None:
+        return False
+    if os.path.normcase(str(slot.parent.parent)) != os.path.normcase(str(root)):
+        return False
+    repo = slot.parent.name
+    thread = settings.conductor.task_thread_id.strip()
+    try:
+        leases = LeaseStore(settings.paths.data_dir / "state").leases(repo)
+    except (LeaseError, OSError, ValueError):
+        return False
+    return any(
+        lease.slot == slot.name and (not thread or lease.thread_id == thread) for lease in leases
+    )
 
 
 def _continuation_clone_check(
