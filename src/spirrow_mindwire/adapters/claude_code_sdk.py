@@ -82,6 +82,7 @@ from ._connect_budget import (
     SdkConnectTimeoutError,
     connect_bounded,
 )
+from ._env_scrub import scrubbed_secret_env
 from ._sdk_result import (
     SdkIsErrorSignal,
     capture_is_error_detail,
@@ -527,6 +528,9 @@ class ClaudeCodeSdkAdapter:
             # Host settings / MCP config stay out; see ``_session_isolation`` for
             # what that prevents and what it cost to learn.
             **session_isolation_kwargs(),
+            # I-4 (T-gate-records-submitted-review-id msg-9923): this session holds
+            # built-in tools and so a shell; it gets none of the daemon's tokens.
+            env=scrubbed_secret_env(),
             # Model / CLI binary, omitted entirely when the composition root chose
             # neither (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),

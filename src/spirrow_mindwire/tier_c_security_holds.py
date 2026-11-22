@@ -139,7 +139,9 @@ def _open_or_append(
     thread: str,
     author: str,
     released: set[str],
-) -> None:
+) -> str | None:
+    """Open a hold on ``row`` or append it to an identical open structural one. Returns the id
+    of the hold it opened, or ``None`` when it was appended (msg-9665 §1.1⁷)."""
     hold_kind = str(row.get("hold_kind") or "structural")
     sha = row.get("body_sha256")
     if hold_kind == "structural" and isinstance(sha, str):
@@ -154,7 +156,7 @@ def _open_or_append(
                         "outcome": row.get("reason"),
                     }
                 )
-                return
+                return None
     hold_id = str(row.get("retry_uuid"))
     holds[hold_id] = SecurityHold(
         hold_id=hold_id,
@@ -165,6 +167,59 @@ def _open_or_append(
         hold_kind=hold_kind,
         body_sha256=sha if isinstance(sha, str) else None,
     )
+    return hold_id
+
+
+@dataclass(frozen=True)
+class HoldReplayStep:
+    """What one log row did to the holds of its ``(thread, author)`` pair, in log order.
+
+    ``opened`` is the id of a hold this row opened (``None`` when it opened none, including a
+    refusal appended to an identical open structural hold). ``released`` are the ids of known
+    holds of the pair this row's ``holds_released`` stamp releases for the first time;
+    ``released_unknown`` are stamped ids that name no hold of the pair or were already released.
+    """
+
+    row: dict[str, Any]
+    opened: str | None
+    released: tuple[str, ...]
+    released_unknown: tuple[str, ...]
+
+
+def replay_hold_rows(rows: Iterable[dict[str, Any]]) -> Iterator[HoldReplayStep]:
+    """Replay log rows of every ``(thread, author)`` pair with the rules :func:`open_holds` uses.
+
+    For counting (``scripts/tierc_gate_measure.py``, msg-9914 Obj-3): the same
+    ``_open_or_append`` decides whether a refusal opens a hold, and a stamp is applied at its row
+    before the row itself, as in :func:`open_holds`. A release only a thread line carries (no
+    stamp yet) is invisible here: replay has the log, not the thread.
+    """
+    holds: dict[tuple[Any, Any], dict[str, SecurityHold]] = {}
+    released: dict[tuple[Any, Any], set[str]] = {}
+    for row in rows:
+        pair = (row.get("thread"), row.get("author"))
+        pair_holds = holds.setdefault(pair, {})
+        pair_released = released.setdefault(pair, set())
+        fresh: list[str] = []
+        unknown: list[str] = []
+        for hold_id in dict.fromkeys(_stamped_releases(row)):
+            if hold_id in pair_holds and hold_id not in pair_released:
+                fresh.append(hold_id)
+                pair_released.add(hold_id)
+            else:
+                unknown.append(hold_id)
+        opened = None
+        if row.get("kind") == LogKind.BOUNCED.value and row.get("security_hold") is True:
+            opened = _open_or_append(
+                pair_holds,
+                row,
+                thread=str(pair[0]),
+                author=str(pair[1]),
+                released=pair_released,
+            )
+        yield HoldReplayStep(
+            row=row, opened=opened, released=tuple(fresh), released_unknown=tuple(unknown)
+        )
 
 
 @dataclass(frozen=True)
@@ -231,9 +286,11 @@ def read_hold_answers(
 __all__ = [
     "HOLD_RELEASE_KEYWORD",
     "HoldAnswers",
+    "HoldReplayStep",
     "SecurityHold",
     "hold_release_ids",
     "open_holds",
     "read_hold_answers",
+    "replay_hold_rows",
     "stamped_releases",
 ]

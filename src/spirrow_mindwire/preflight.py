@@ -1383,6 +1383,54 @@ def _default_git_toplevel(path: Path) -> Path | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Tier-C rules file drift — warning only (T-tier-c-six-articles-security-boundary msg-9912 A)
+# --------------------------------------------------------------------------- #
+
+
+def tierc_rules_drift(runtime: Path, template: Path | None = None) -> str | None:
+    """Compare the runtime Tier-C rules file with the packaged template; a warning or ``None``.
+
+    Design: Bohr msg-9912 A / msg-9914 Obj-1 / msg-9916 Obj-2-1 (Einstein msg-9913 / 9917: a
+    warning, never a refusal). Jev reads ``<data_dir>/config/tierc_rules.toml``, never the
+    template, and ``init-config`` never overwrites it, so a template update does not reach
+    production by itself. This names the gap at startup without stopping anything: the runtime
+    file may differ on purpose (``docs/deploy.md`` "Tier-C rules file (six articles)" records
+    why, and that record — not the absence of this warning — is what completes a deploy).
+
+    The comparison is on rule ids, ``text`` and ``note`` (as parsed), not on bytes, so comments
+    and formatting never warn. The message names both sha256 values and the ids missing from the
+    runtime file (``missing rule_6``), present only in it, or worded differently.
+
+    A runtime file that is missing or malformed raises the same
+    :class:`~spirrow_mindwire.decider.questions.TierCRulesError` the Decider's own load raises at
+    startup, so it is reported exactly as it is today; the caller decides what to do with it.
+    """
+    from .decider.questions import load_tierc_rules, tierc_rules_template_path
+
+    live = load_tierc_rules(runtime)
+    tpl = load_tierc_rules(template if template is not None else tierc_rules_template_path())
+    live_by_id = {r.id: (r.text, r.note) for r in live.rules}
+    tpl_by_id = {r.id: (r.text, r.note) for r in tpl.rules}
+    missing = [rid for rid in tpl_by_id if rid not in live_by_id]
+    extra = [rid for rid in live_by_id if rid not in tpl_by_id]
+    differ = [rid for rid in tpl_by_id if rid in live_by_id and live_by_id[rid] != tpl_by_id[rid]]
+    if not (missing or extra or differ):
+        return None
+    parts = [
+        f"tierc rules file {live.source} differs from the packaged template "
+        f"(runtime rules_sha256={live.sha256}, template rules_sha256={tpl.sha256})"
+    ]
+    if missing:
+        parts.append("missing " + ", ".join(missing))
+    if differ:
+        parts.append("worded differently " + ", ".join(differ))
+    if extra:
+        parts.append("not in the template " + ", ".join(extra))
+    parts.append('see docs/deploy.md "Tier-C rules file (six articles)"')
+    return "; ".join(parts)
+
+
 __all__ = [
     "PREFLIGHT_CALL_TIMEOUT_S",
     "PREFLIGHT_DEADLINE_S",
@@ -1408,4 +1456,5 @@ __all__ = [
     "emit_preflight_ok",
     "emit_preflight_refused_payload",
     "preflight_gate",
+    "tierc_rules_drift",
 ]

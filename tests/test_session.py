@@ -311,3 +311,16 @@ async def test_invoke_idle_propagates_unchanged_when_both_timeouts_set(
         )
     # The crucial assertion: kind stays "idle"; nothing re-wraps it as absolute.
     assert exc.value.kind == "idle"
+
+
+@pytest.mark.anyio
+async def test_invoke_blanks_every_daemon_token_in_the_subprocess_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-4 (T-gate-records-submitted-review-id msg-9923)."""
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
+    captured: dict[str, Any] = {}
+    await invoke_claude_code(
+        prompt="x", cwd=tmp_path, system_prompt="role", runner=_runner(captured, [_result()])
+    )
+    assert captured["options"].env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
