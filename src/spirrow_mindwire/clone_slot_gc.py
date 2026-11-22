@@ -14,7 +14,8 @@ by the borrow-time check (``clone_slot_prep``) or by the turn end (``clone_slot_
 * ``<stem>.untracked.tar`` — the CONTENT of every untracked, not ignored file (``tarfile``); the
   manifest records each entry's type (file / symlink) and execute bit next to its sha256;
 * ``<stem>.bundle`` — only when there are commits no remote ref has: ``git bundle create`` of
-  HEAD, the local branches, the tags and the stash, ``--not --remotes``, then ``git bundle verify``;
+  HEAD, the local branches, the tags and every stash entry (the whole reflog), ``--not
+  --remotes``, then ``git bundle verify``;
 * ``<stem>.manifest.json`` — written by :func:`write_manifest` once the rename has succeeded, with
   the quarantine path and time, the HEAD sha, each file's sha256 and size, the bundle verify
   result, the local-only commits, every untracked file with its sha256, and ``complete``.
@@ -151,23 +152,70 @@ def _git_bytes(cwd: Path, args: Sequence[str], timeout: float) -> tuple[int, byt
     return proc.returncode, proc.stdout or b"", proc.stderr or b""
 
 
-_DIFF = ("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+# #600 gate round 2 Obj-1: ``--no-textconv`` as well as ``--no-ext-diff``. A configured
+# ``diff.<driver>.textconv`` would otherwise put converted text in the patch, which export and
+# verification would agree on while it cannot restore the original bytes.
+_DIFF = ("diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD")
 # #600 gate Obj-1: the index is exported on its own. ``_DIFF`` is HEAD -> work tree only, so a
 # staged version that the work tree no longer has (stage B, restore the file to A) is in neither.
 # Restore: ``git apply --cached <index patch>`` then ``git apply <patch>`` on a checkout of HEAD.
-_DIFF_INDEX = ("diff", "--cached", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+_DIFF_INDEX = (
+    "diff",
+    "--cached",
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "HEAD",
+)
 _UNTRACKED = ("ls-files", "--others", "--exclude-standard", "-z")
 
 _Run = Callable[[Sequence[str]], tuple[int, bytes, bytes]]
 
 
-def _local_args(cwd: Path, run: _Run) -> list[str]:
-    """The positive refs whose commits must survive: HEAD, branches, tags, and the stash."""
-    args = ["HEAD", "--branches", "--tags"]
+def _stash_entries(run: _Run) -> list[str]:
+    """Every stash entry, newest first (#600 gate round 2 Obj-2). Older entries live only in the
+    ``refs/stash`` reflog and are generally not ancestors of the newest, so ``refs/stash`` alone
+    would drop them. Raises :class:`_MismatchError` when the reflog cannot be read."""
     code, _out, _err = run(("rev-parse", "-q", "--verify", "refs/stash"))
-    if code == 0:
-        args.append("refs/stash")
-    return args
+    if code != 0:
+        return []
+    code, out, err = run(("reflog", "show", "--format=%H", "refs/stash", "--"))
+    if code != 0:
+        raise _MismatchError(f"unverified: stash reflog: {err.decode(errors='replace')[:200]}")
+    return [r for r in out.decode().split() if r]
+
+
+def _local_args(cwd: Path, run: _Run) -> tuple[list[str], list[str]]:
+    """``(positive revisions, stash entries)``. The revisions whose commits must survive are
+    HEAD, branches, tags, and EVERY stash entry: ``refs/stash`` as a ref (so a bundle always
+    has one to name, even when nothing else is local) plus each older entry by sha. Restore the
+    stash with ``git stash store <sha>`` from the manifest's ``stash`` list, oldest first."""
+    stash = _stash_entries(run)
+    args = ["HEAD", "--branches", "--tags"]
+    if stash:
+        args += ["refs/stash", *stash[1:]]
+    return args, stash
+
+
+def _tar_estimate(kinds: Sequence[tuple[str, str, bool]], extra: dict[str, int]) -> int:
+    """An upper estimate of the tar's size BEFORE it is written (#600 gate round 2 Obj-4).
+
+    Per entry: a PAX extended header (tarfile writes one for every entry, at least for the
+    fractional mtime) of one header block plus the records padded to 512 -- the path when it
+    is long, a symlink's target, and room for mtime/uid/gid/names -- then the ustar header and
+    the contents padded to 512. Then the two end blocks and the record rounding. ``extra`` is
+    the content size of a file, the target length of a symlink. The written size is checked
+    again afterwards, so an estimate that is low only costs disk, never completeness.
+    """
+    total = 1024
+    for n, kind, _exe in kinds:
+        size = extra.get(n, 0)
+        link = size if kind == "symlink" else 0
+        body = 0 if kind == "symlink" else size
+        pax = len(os.fsencode(n)) + link + 256
+        total += 512 + -(-pax // 512) * 512 + 512 + -(-body // 512) * 512
+    return -(-total // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
 
 
 def _sha256_file(
@@ -375,6 +423,7 @@ def _export(
         why.append("embedded_repo")
     kinds: list[tuple[str, str, bool]] = []
     sizes = 0
+    each: dict[str, int] = {}
     for n in (n for n in names if not n.endswith("/")):
         try:
             st = (slot / n).lstat()
@@ -386,6 +435,10 @@ def _export(
             why.append(f"special_file: {n}")
             continue
         sizes += st.st_size
+        if kind == "symlink":
+            each[n] = len(os.fsencode(os.readlink(slot / n)))  # the link, not any content
+        else:
+            each[n] = st.st_size
         kinds.append((n, kind, exe))
     if sizes > untracked_cap:
         why.append("untracked_cap")
@@ -411,7 +464,7 @@ def _export(
         w.startswith(("unreadable", "special_file")) for w in why
     )
     if not blocked:
-        if total + sizes > total_cap:
+        if total + _tar_estimate(kinds, each) > total_cap:
             why.append("total_cap")
         else:
             entries: list[dict[str, Any]] = []
@@ -438,8 +491,10 @@ def _export(
                 "sha256": _sha256_file(tp, deadline, mono),
                 "bytes": size,
             }
+            if total > total_cap:  # the WRITTEN size, before any early return below
+                why.append("total_cap")
 
-    pos = _local_args(slot, run)
+    pos, m["stash"] = _local_args(slot, run)
     code, revs, _ = run(("rev-list", *pos, "--not", "--remotes"))
     if code != 0:
         why.append("rev_list_failed")
@@ -465,7 +520,7 @@ def _export(
     res.bundle = bp
     if vcode != 0:
         why.append("bundle_verify_failed")
-    if total > total_cap:
+    if total > total_cap and "total_cap" not in why:
         why.append("total_cap")
 
 
@@ -659,25 +714,45 @@ class QuarantineGc:
                     res.deleting_pending += 1
 
     def _delete_tree(self, d: Path, rec: dict[str, Any], res: GcResult, deadline: float) -> bool:
-        """Delete ``d`` file by file. False when the deadline stopped it or a removal failed."""
+        """Delete ``d`` entry by entry. False when the deadline stopped it or a removal failed.
+
+        #600 gate round 2 Obj-3: an incremental depth-first walk (``os.scandir``, one directory
+        open at a time) with the clock checked before every entry and before every ``rmdir``,
+        so neither discovering a large tree nor removing empty directories runs past the
+        deadline. What is left stays under ``_deleting/`` for the next tick.
+        """
         try:
-            for root, dirs, files in os.walk(d, topdown=False):
-                for name in files:
-                    if self._mono() > deadline:
-                        return False
-                    fp = Path(root) / name
-                    try:
-                        self._remove(fp)
-                    except PermissionError:
-                        os.chmod(fp, stat.S_IWRITE)  # git objects are read-only on Windows
-                        self._remove(fp)
-                for name in dirs:
-                    dp = Path(root) / name
-                    if dp.is_symlink():
-                        self._remove(dp)
-                    else:
-                        os.rmdir(dp)
-            os.rmdir(d)
+            stack = [d]
+            while stack:
+                if self._mono() > deadline:
+                    return False
+                cur = stack[-1]
+                descend: Path | None = None
+                with os.scandir(cur) as it:
+                    for e in it:
+                        if self._mono() > deadline:
+                            return False
+                        fp = Path(e.path)
+                        if e.is_symlink():
+                            self._remove(fp)  # never followed
+                        elif getattr(e, "is_junction", lambda: False)():  # 3.12+
+                            os.rmdir(fp)  # a Windows junction: removes the link only
+                        elif e.is_dir(follow_symlinks=False):
+                            descend = fp
+                            break
+                        else:
+                            try:
+                                self._remove(fp)
+                            except PermissionError:
+                                os.chmod(fp, stat.S_IWRITE)  # git objects: read-only on Windows
+                                self._remove(fp)
+                if descend is not None:
+                    stack.append(descend)
+                    continue
+                if self._mono() > deadline:
+                    return False
+                os.rmdir(cur)
+                stack.pop()
         except OSError as exc:
             rec["delete_failures"] = int(rec.get("delete_failures", 0)) + 1
             res.events.append(f"delete failed {d}: {exc}")
@@ -866,10 +941,9 @@ def verify(
     ):
         if hashlib.sha256(run(args)).hexdigest() != (m.get(key) or {}).get("sha256"):
             raise _MismatchError(f"changed: {what}")
-    pos = ["HEAD", "--branches", "--tags"]
-    code, _, _ = run_raw(("rev-parse", "-q", "--verify", "refs/stash"))
-    if code == 0:
-        pos.append("refs/stash")
+    pos, stash = _local_args(path, run_raw)  # the export's revision set (round 2 Obj-2)
+    if stash != list(m.get("stash") or []):
+        raise _MismatchError("changed: stash entries")
     commits = sorted(r for r in run(("rev-list", *pos, "--not", "--remotes")).decode().split() if r)
     if commits != sorted(m.get("local_commits") or []):
         raise _MismatchError("changed: local-only commits")

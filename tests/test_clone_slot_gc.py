@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire import clone_slot_gc
 from spirrow_mindwire.cli import main
 from spirrow_mindwire.clone_retreat import git_env
 from spirrow_mindwire.clone_slot_gc import (
@@ -24,6 +25,7 @@ from spirrow_mindwire.clone_slot_gc import (
     STATUS_STUCK,
     STATUS_UNVERIFIED,
     STATUS_VERIFY_TIMEOUT,
+    GcResult,
     QuarantineGc,
     export_slot,
     write_manifest,
@@ -564,3 +566,136 @@ def test_cli_prints_summary_and_appends_a_gc_row(
     rows = (tmp_path / "state" / "clone-retreats.jsonl").read_text(encoding="utf-8").splitlines()
     row = json.loads(rows[-1])
     assert row["kind"] == "quarantine_gc" and row["deleted"] == payload["deleted"]
+
+
+# --- #600 gate round 2 --------------------------------------------------------------------
+
+
+def test_textconv_driver_does_not_hide_changes_from_the_patch(tmp_path: Path, origin: Path) -> None:
+    # Obj-2-1: a textconv that maps every version to the same text would make `git diff` empty.
+    slot = _slot(tmp_path, origin)
+    (slot / "doc.doc").write_bytes(b"version one\n")
+    _git(slot, "add", "doc.doc")
+    _git(slot, "commit", "-q", "-m", "doc")
+    (slot / ".git" / "info" / "attributes").write_text("*.doc diff=conv\n", encoding="utf-8")
+    _git(slot, "config", "diff.conv.textconv", "echo SAME #")
+    (slot / "doc.doc").write_bytes(b"version two\n")
+    (slot / "a.txt").write_text("staged\n", encoding="utf-8")
+    _git(slot, "add", "a.txt")
+    _git(slot, "add", "doc.doc")
+    (slot / "doc.doc").write_bytes(b"version three\n")
+    # The driver is live: with textconv the change is invisible to a plain diff.
+    assert b"version" not in _gitb(slot, "diff", "--binary", "HEAD")
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    base = tmp_path / "state" / EXPORTS_DIR / REPO
+    restored = tmp_path / "restored"
+    subprocess.run(["git", "clone", "-q", str(origin), str(restored)], check=True)
+    _git(restored, "fetch", "-q", str(base / m["bundle"]["file"]), "HEAD")
+    _git(restored, "checkout", "-q", "--detach", str(m["head"]))
+    _apply(restored, base / m["index_patch"]["file"], "--cached")
+    _apply(restored, base / m["patch"]["file"])
+    assert _gitb(restored, "show", ":doc.doc") == b"version two\n"
+    assert (restored / "doc.doc").read_bytes() == (target / "doc.doc").read_bytes()
+    assert _git(restored, "show", ":a.txt") == "staged\n"
+    res = _gc(tmp_path).run()  # and the verification agrees, so it is deletable
+    assert res.notices == [] and not target.exists()
+
+
+def _two_stashes(slot: Path) -> list[str]:
+    (slot / "a.txt").write_text("stash one\n", encoding="utf-8")
+    _git(slot, "stash", "-q")
+    (slot / "a.txt").write_text("stash two\n", encoding="utf-8")
+    _git(slot, "stash", "-q")
+    return _git(slot, "reflog", "show", "--format=%H", "refs/stash").split()
+
+
+def test_every_stash_entry_is_exported_and_restored(tmp_path: Path, origin: Path) -> None:
+    # Obj-2-2: the older stash lives only in the reflog and is not an ancestor of the newest.
+    slot = _slot(tmp_path, origin)
+    stashes = _two_stashes(slot)
+    assert len(stashes) == 2
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    assert m["stash"] == stashes and set(stashes) <= set(m["local_commits"])
+    base = tmp_path / "state" / EXPORTS_DIR / REPO
+    restored = tmp_path / "restored"
+    subprocess.run(["git", "clone", "-q", str(origin), str(restored)], check=True)
+    _git(restored, "config", "user.email", "t@example.invalid")
+    _git(restored, "config", "user.name", "t")
+    _git(restored, "fetch", "-q", str(base / m["bundle"]["file"]), "refs/stash")
+    for sha in reversed(m["stash"]):  # oldest first, so stash@{0} ends up the newest
+        _git(restored, "stash", "store", "-m", "restored", sha)
+    assert _git(restored, "reflog", "show", "--format=%H", "refs/stash").split() == stashes
+    assert _git(restored, "show", "stash@{1}:a.txt") == "stash one\n"
+    assert _git(restored, "show", "stash@{0}:a.txt") == "stash two\n"
+    res = _gc(tmp_path).run()
+    assert res.notices == [] and not target.exists()
+
+
+def test_dropping_an_older_stash_after_quarantine_is_kept(tmp_path: Path, origin: Path) -> None:
+    slot = _slot(tmp_path, origin)
+    _two_stashes(slot)
+    target, _ = _quarantine(tmp_path, slot)
+    _git(target, "stash", "drop", "-q", "stash@{1}")
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and _reasons(res) == {str(target): STATUS_CHANGED}
+
+
+def test_directory_only_tree_deletion_stops_at_the_deadline_and_resumes(tmp_path: Path) -> None:
+    # Obj-2-3: empty directories only. The walk itself and every rmdir check the clock.
+    d = tmp_path / "big"
+    for i in range(20):
+        for j in range(5):
+            (d / f"d{i}" / f"e{j}").mkdir(parents=True)
+    total = sum(1 for _ in d.rglob("*"))
+    clock = _Clock(1.0)
+    gc = _gc(tmp_path, monotonic=clock)
+    rec: dict[str, Any] = {}
+    assert gc._delete_tree(d, rec, GcResult(), deadline=30.0) is False
+    left = sum(1 for _ in d.rglob("*"))
+    assert d.is_dir() and 0 < left < total and rec == {}
+    assert clock.t <= 31.0  # stopped at the first clock reading past the deadline
+    assert gc._delete_tree(d, rec, GcResult(), deadline=clock.t + 10_000) is True
+    assert not d.exists()
+
+
+def _empty_untracked(slot: Path, n: int) -> None:
+    for i in range(n):
+        (slot / f"e{i:03}.txt").write_bytes(b"")
+
+
+def test_tar_overhead_counts_towards_the_total_cap(tmp_path: Path, origin: Path) -> None:
+    # Obj-2-4: no local-only commits, so nothing after the tar would check the total.
+    slot = _slot(tmp_path, origin)
+    _empty_untracked(slot, 30)
+    target, m = _quarantine(tmp_path, slot, total_cap=4096)
+    assert m["local_commits"] == []
+    assert m["complete"] is False and "total_cap" in m["incomplete_reasons"]
+    assert m["untracked_tar"] is None  # refused before writing
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and str(target) in _reasons(res)
+
+
+def test_written_tar_over_the_total_cap_is_incomplete(
+    tmp_path: Path, origin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Obj-2-4: the written size is checked as well, whatever the estimate said.
+    monkeypatch.setattr(clone_slot_gc, "_tar_estimate", lambda *_a: 0)
+    slot = _slot(tmp_path, origin)
+    _empty_untracked(slot, 30)
+    _, m = _quarantine(tmp_path, slot, total_cap=4096)
+    assert m["local_commits"] == [] and m["untracked_tar"]["bytes"] > 4096
+    assert m["complete"] is False and m["incomplete_reasons"] == ["total_cap"]
+
+
+def test_tar_estimate_is_not_below_the_written_size(tmp_path: Path, origin: Path) -> None:
+    slot = _slot(tmp_path, origin)
+    _empty_untracked(slot, 30)
+    (slot / ("long" * 40 + ".bin")).write_bytes(BINARY)
+    _, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    kinds = [(str(e["path"]), str(e["type"]), bool(e["exec"])) for e in m["untracked"]]
+    sizes = {n: (len(BINARY) if n.endswith(".bin") else 0) for n, _k, _e in kinds}
+    assert len(kinds) == 31
+    assert clone_slot_gc._tar_estimate(kinds, sizes) >= m["untracked_tar"]["bytes"]
