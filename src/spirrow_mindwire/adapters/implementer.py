@@ -327,9 +327,9 @@ _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
 # no ``SlashCommand``) to keep the surface minimal. Since the allow-list guard was
 # removed (2026-08-20) this list IS the tool surface: what is not exposed here
 # cannot be called at all, and what is exposed runs without a per-call check.
-# Tokens the implementer's subprocess keeps although they match ``MINDWIRE_*_TOKEN``: its own
+# Tokens the implementer's subprocess keeps although they match the secret-name pattern: its own
 # author identity, which its ``gh`` already holds and ``mindwire pr-diff-size`` reads. Every
-# other daemon token (the ops review token above all) is blanked (``_env_scrub``, I-4).
+# other daemon secret (the ops review token above all) is blanked (``_env_scrub``, I-4/I-4b).
 IMPLEMENTER_KEPT_TOKEN_ENV: tuple[str, ...] = ("MINDWIRE_GITHUB_TOKEN",)
 
 _IMPLEMENTER_BUILTIN_TOOLS: tuple[str, ...] = (

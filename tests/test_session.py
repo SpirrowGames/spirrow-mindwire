@@ -319,8 +319,14 @@ async def test_invoke_blanks_every_daemon_token_in_the_subprocess_env(
 ) -> None:
     """I-4 (T-gate-records-submitted-review-id msg-9923)."""
     monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    monkeypatch.setenv("MINDWIRE_NOTIFY_DISCORD_WEBHOOK", "https://hook-secret")  # I-4b
     captured: dict[str, Any] = {}
     await invoke_claude_code(
         prompt="x", cwd=tmp_path, system_prompt="role", runner=_runner(captured, [_result()])
     )
-    assert captured["options"].env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
+    env = captured["options"].env
+    assert env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
+    assert env["MINDWIRE_GITHUB_TOKEN"] == ""
+    assert env["MINDWIRE_NOTIFY_DISCORD_WEBHOOK"] == ""
+    assert "PATH" not in env
