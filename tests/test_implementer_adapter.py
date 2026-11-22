@@ -295,3 +295,45 @@ async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
     await adapter.halt(handle)
     with pytest.raises(ImplementerSdkDeliveryError):
         await adapter.deliver_event(handle, _event())
+
+
+@pytest.mark.anyio
+async def test_spawn_blanks_daemon_tokens_but_keeps_the_author_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-4 (T-gate-records-submitted-review-id msg-9923): the ops review token and every other
+    MINDWIRE_*_TOKEN is blanked; MINDWIRE_GITHUB_TOKEN is the implementer's own identity and is
+    left to the SDK's os.environ merge (``pr-diff-size`` reads it)."""
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
+    monkeypatch.setenv("MINDWIRE_STALL_LEDGER_GITHUB_TOKEN", "ledger-secret")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    cap: list[_FakeSdkClient] = []
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url="http://lexora:8110",
+        client_factory=_factory(responses=[], capture=cap),
+    )
+    await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
+    env = cap[0].options.env
+    assert env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
+    assert env["MINDWIRE_STALL_LEDGER_GITHUB_TOKEN"] == ""
+    assert "MINDWIRE_GITHUB_TOKEN" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "http://lexora:8110"
+
+
+@pytest.mark.anyio
+async def test_explicit_extra_env_still_wins_over_the_scrub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINDWIRE_X_TOKEN", "inherited")
+    cap: list[_FakeSdkClient] = []
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url="http://lexora:8110",
+        extra_env={"MINDWIRE_X_TOKEN": "explicit"},
+        client_factory=_factory(responses=[], capture=cap),
+    )
+    await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
+    assert cap[0].options.env["MINDWIRE_X_TOKEN"] == "explicit"

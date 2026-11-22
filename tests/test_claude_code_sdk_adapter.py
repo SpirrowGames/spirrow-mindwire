@@ -960,3 +960,28 @@ async def test_drain_reply_does_not_wrap_inner_timeout_error_as_sdk_turn_timeout
 
     with pytest.raises(SdkTurnTimeoutError):
         await _drain_reply(_HangingClient(), turn_timeout_seconds=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# I-4 (T-gate-records-submitted-review-id msg-9923): no daemon tokens in the child
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_spawn_blanks_every_daemon_token_in_the_subprocess_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    seen: list[Any] = []
+    client = _FakeClient([])
+
+    def make(options: Any) -> _FakeClient:
+        seen.append(options)
+        return client
+
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=make)
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    # The SDK merges os.environ under options.env; an empty override is how a name is removed.
+    assert seen[0].env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
+    assert seen[0].env["MINDWIRE_GITHUB_TOKEN"] == ""

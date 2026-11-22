@@ -45,6 +45,10 @@ _NOT_SDK_BACKED: dict[str, str] = {
     "__init__.py": "package marker; defines no adapter",
     "_sdk_result.py": "parses an SDK result object; spawns nothing",
     "_session_isolation.py": "this module IS the policy",
+    "_env_scrub.py": (
+        "builds the env-override dict an adapter splats into its options.env; constructs no "
+        "ClaudeAgentOptions and spawns nothing — isolation is applied by that adapter"
+    ),
     "_turn_telemetry.py": (
         "builds the PreCompact hook value and log lines for options an adapter builds; "
         "constructs no ClaudeAgentOptions and spawns nothing — isolation is applied by the "

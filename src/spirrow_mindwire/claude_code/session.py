@@ -54,6 +54,8 @@ from claude_agent_sdk import (
     query,
 )
 
+from ..adapters._env_scrub import scrubbed_secret_env
+
 SdkMessage = (
     UserMessage | AssistantMessage | SystemMessage | ResultMessage | StreamEvent | RateLimitEvent
 )
@@ -150,6 +152,8 @@ async def invoke_claude_code(
         allowed_tools=allowed_tools or [],
         mcp_servers=mcp_servers or {},
         max_turns=max_turns,
+        # I-4 (T-gate-records-submitted-review-id msg-9923): no daemon tokens in the child.
+        env=scrubbed_secret_env(),
     )
 
     run = runner if runner is not None else query
