@@ -642,6 +642,47 @@ def test_dropping_an_older_stash_after_quarantine_is_kept(tmp_path: Path, origin
     assert target.is_dir() and _reasons(res) == {str(target): STATUS_CHANGED}
 
 
+def _stash_without_reflog(slot: Path) -> str:
+    (slot / "a.txt").write_text("stash no log\n", encoding="utf-8")
+    _git(slot, "stash", "-q")
+    tip = _git(slot, "rev-parse", "refs/stash").strip()
+    log = slot / ".git" / "logs" / "refs" / "stash"
+    log.unlink()  # the ref stays; the reflog is gone
+    assert _git(slot, "reflog", "show", "--format=%H", "refs/stash").split() == []
+    return tip
+
+
+def test_stash_ref_without_reflog_is_still_exported(tmp_path: Path, origin: Path) -> None:
+    # Round 3 Obj-1: `git reflog show` succeeds with empty output; the tip must not be lost.
+    slot = _slot(tmp_path, origin)
+    tip = _stash_without_reflog(slot)
+    target, m = _quarantine(tmp_path, slot)
+    assert m["complete"] is True, m["incomplete_reasons"]
+    assert m["stash"] == [tip] and tip in m["local_commits"]
+    base = tmp_path / "state" / EXPORTS_DIR / REPO
+    restored = tmp_path / "restored"
+    subprocess.run(["git", "clone", "-q", str(origin), str(restored)], check=True)
+    _git(restored, "config", "user.email", "t@example.invalid")
+    _git(restored, "config", "user.name", "t")
+    _git(restored, "fetch", "-q", str(base / m["bundle"]["file"]), "refs/stash")
+    _git(restored, "stash", "store", "-m", "restored", m["stash"][0])
+    assert _git(restored, "show", "stash@{0}:a.txt") == "stash no log\n"
+    res = _gc(tmp_path).run()
+    assert res.notices == [] and not target.exists()
+
+
+def test_stash_tip_moved_without_reflog_after_quarantine_is_kept(
+    tmp_path: Path, origin: Path
+) -> None:
+    slot = _slot(tmp_path, origin)
+    _stash_without_reflog(slot)
+    target, _ = _quarantine(tmp_path, slot)
+    head = _git(target, "rev-parse", "HEAD").strip()
+    _git(target, "update-ref", "--no-deref", "refs/stash", head)  # no reflog written
+    res = _gc(tmp_path).run()
+    assert target.is_dir() and _reasons(res) == {str(target): STATUS_CHANGED}
+
+
 def test_directory_only_tree_deletion_stops_at_the_deadline_and_resumes(tmp_path: Path) -> None:
     # Obj-2-3: empty directories only. The walk itself and every rmdir check the clock.
     d = tmp_path / "big"

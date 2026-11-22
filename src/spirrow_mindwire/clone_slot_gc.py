@@ -176,14 +176,23 @@ _Run = Callable[[Sequence[str]], tuple[int, bytes, bytes]]
 def _stash_entries(run: _Run) -> list[str]:
     """Every stash entry, newest first (#600 gate round 2 Obj-2). Older entries live only in the
     ``refs/stash`` reflog and are generally not ancestors of the newest, so ``refs/stash`` alone
-    would drop them. Raises :class:`_MismatchError` when the reflog cannot be read."""
-    code, _out, _err = run(("rev-parse", "-q", "--verify", "refs/stash"))
+    would drop them. Raises :class:`_MismatchError` when the reflog cannot be read.
+
+    The resolved ``refs/stash`` tip always comes first, whatever the reflog says (#600 gate
+    round 3 Obj-1): a stash ref can exist with no reflog (reflog expired or deleted, or the ref
+    written with logging off), and ``git reflog show`` then succeeds with empty output. The tip
+    is put first and not repeated, so an empty or stale reflog never drops it."""
+    code, out, _err = run(("rev-parse", "-q", "--verify", "refs/stash^{commit}"))
     if code != 0:
         return []
+    tip = out.decode().strip()
+    if not tip:
+        raise _MismatchError("unverified: refs/stash resolved to nothing")
     code, out, err = run(("reflog", "show", "--format=%H", "refs/stash", "--"))
     if code != 0:
         raise _MismatchError(f"unverified: stash reflog: {err.decode(errors='replace')[:200]}")
-    return [r for r in out.decode().split() if r]
+    logged = [r for r in out.decode().split() if r]
+    return [tip, *(r for r in logged if r != tip)]
 
 
 def _local_args(cwd: Path, run: _Run) -> tuple[list[str], list[str]]:
