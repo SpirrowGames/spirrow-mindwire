@@ -1000,3 +1000,78 @@ def test_writes_the_lp_allowlist_admits_are_still_denied_overall(cmd: str, want:
 )
 def test_lp_allowed_writes_without_the_overlay_shapes_still_pass(cmd: str) -> None:
     assert g.decide(cmd) == (True, None)
+
+
+# ================================================== P-1 prompt for L-p2 (msg-10010, msg-10012)
+#: msg-10012 Obj-28-1: the code spans (i)-(iii) already carried before the examples existed. A
+#: ``gh`` code span in the block must be one of these or a rendered example constant.
+_P1_WRITE_SPANS = frozenset(
+    {
+        "gh pr create|comment|edit|review|merge",
+        "gh issue create|comment|edit",
+        "gh pr create",
+        "gh api",
+        "gh gist create|edit",
+        "gh release create|upload",
+    }
+)
+
+
+def _gh_alias_row(argv: list[str]) -> tuple[str, str]:
+    group = g.GH_GROUP_ALIASES.get(argv[1], argv[1])
+    return group, g.GH_SUB_ALIASES.get((group, argv[2]), argv[2])
+
+
+def test_p1_lists_every_l2_row() -> None:
+    for group, sub in g.L2_ALLOW:
+        assert f"- `{group} {sub}`: " in g.P1_PROMPT_BLOCK, (group, sub)
+
+
+def test_p1_drops_the_old_get_guidance_and_covers_reads() -> None:
+    assert "checked against the CLI" not in g.P1_PROMPT_BLOCK
+    assert "every Bash call that runs `gh`" in g.P1_PROMPT_BLOCK
+    assert "Do not use `gh api` to read" in g.P1_PROMPT_BLOCK
+    assert "fixed per subcommand" in g.P1_PROMPT_BLOCK
+
+
+def test_p1_every_row_has_an_allowed_example() -> None:
+    rows = {r for r, _t in g.P1_EXAMPLES_ALLOW}
+    assert rows == set(g.L2_ALLOW)
+
+
+@pytest.mark.parametrize(("row", "template"), g.P1_EXAMPLES_ALLOW)
+def test_p1_allowed_example_is_allowed_and_names_its_row(
+    row: tuple[str, str], template: str
+) -> None:
+    cmd = g.p1_render(template, synthetic=True)
+    assert "{" not in cmd and "<" not in cmd, cmd
+    assert _gh_alias_row(cmd.split()) == row
+    assert g.judge_table(cmd.split()) is None, cmd
+    assert g.decide(cmd) == (True, None), cmd
+    assert f"`{g.p1_render(template)}`" in g.P1_PROMPT_BLOCK
+
+
+@pytest.mark.parametrize(("template", "key"), g.P1_EXAMPLES_DENY)
+def test_p1_denied_example_is_denied_with_its_class(template: str, key: str) -> None:
+    cmd = g.p1_render(template, synthetic=True)
+    assert "{" not in cmd and "<" not in cmd, cmd
+    assert _deny_key(cmd) == key
+    assert f"`{g.p1_render(template)}` [{key}]" in g.P1_PROMPT_BLOCK
+
+
+def test_p1_every_gh_code_span_comes_from_a_constant() -> None:
+    import re
+
+    rendered = {g.p1_render(t) for _r, t in g.P1_EXAMPLES_ALLOW} | {
+        g.p1_render(t) for t, _k in g.P1_EXAMPLES_DENY
+    }
+    spans = [s for s in re.findall(r"`([^`]*)`", g.P1_PROMPT_BLOCK) if s.startswith("gh ")]
+    assert spans
+    for s in spans:
+        assert s in rendered or s in _P1_WRITE_SPANS, s
+
+
+def test_p1_shows_placeholders_only() -> None:
+    for _shown, synth in g.P1_PLACEHOLDERS.values():
+        assert f" {synth} " not in g.P1_PROMPT_BLOCK.replace("-L 20", "")
+    assert "o/r" not in g.P1_PROMPT_BLOCK.replace("owner/repo", "")
