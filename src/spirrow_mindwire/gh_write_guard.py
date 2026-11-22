@@ -238,6 +238,29 @@ ALLOW_PI_OPTS = frozenset(
         "--repo",
     }
 )
+#: Thread ``T-lp-allowlist-lacks-base-head-so-develop-flow-repos-cannot-open-prs`` (D1, approved
+#: by Einstein after msg-9964): ``gh pr create`` — and only it — also takes the base and head
+#: branch, each at most once, as a literal branch name (:func:`_is_branch_name`). Kept apart from
+#: :data:`ALLOW_PI_OPTS` because ``-H`` means ``--header`` to ``gh api``, and because ``pr edit
+#: --base`` (moving a PR's base) and ``issue`` are deliberately not covered. With either option
+#: present the command may carry no positional argument (``gh pr create`` takes none).
+ALLOW_PR_CREATE_REF_OPTS: dict[str, str] = {
+    "-B": "base",
+    "--base": "base",
+    "-H": "head",
+    "--head": "head",
+}
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+def _is_branch_name(v: str | None) -> bool:
+    """A plain branch name: no expansion, no ``owner:branch`` fork form, no ``..``/``//``, no
+    trailing ``/`` or ``.lock``, and not starting with ``-``."""
+    if v is None or not _BRANCH_NAME.fullmatch(v):
+        return False
+    return ".." not in v and "//" not in v and not v.endswith(("/", ".lock"))
+
+
 ALLOW_API_OPTS = frozenset(
     {"-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header"}
 )
@@ -793,7 +816,19 @@ def classify_ex(cmd: str) -> tuple[str, bool, bool]:
     opts = [it for it in items if it[0] == "opt"]
     stdin_opts = FILE_OPTS.get(group, frozenset()) if heredoc_form else frozenset()
     if group in ("pr", "issue") and sub in ALLOW_PI_SUBS:
-        if all(o[1] in ALLOW_PI_OPTS | stdin_opts for o in opts) and len(pos_vals) <= 1:
+        ref_opts = [o for o in opts if o[1] in ALLOW_PR_CREATE_REF_OPTS]
+        if ref_opts:
+            if group != "pr" or sub != "create" or pos_vals:
+                return "other", True, rec
+            seen: set[str] = set()
+            for o in ref_opts:
+                kind = ALLOW_PR_CREATE_REF_OPTS[o[1]]
+                lit, v, has = _optval(o)
+                if kind in seen or not (has and lit and _is_branch_name(v)):
+                    return "other", True, rec
+                seen.add(kind)
+        rest_opts = [o for o in opts if o[1] not in ALLOW_PR_CREATE_REF_OPTS]
+        if all(o[1] in ALLOW_PI_OPTS | stdin_opts for o in rest_opts) and len(pos_vals) <= 1:
             return allowed_cls, True, rec
     elif (
         group == "api"
@@ -907,7 +942,8 @@ run that one command alone in its own Bash call — never chain it with `cd`, \
 `git`, `|`, `;`, `&&` or a newline. Pass the body with `--body-file -` and a \
 heredoc whose delimiter is quoted (`<<'EOF'`). Name the repository with \
 `-R owner/repo` instead of `cd`; do `git push` and any other preparation in an \
-earlier, separate Bash call.
+earlier, separate Bash call. `gh pr create` also accepts `--base`/`--head` \
+(a plain branch name only).
 (ii) `gh api`: alone in its own Bash call, every value a literal `-f`/`-F` (no \
 value starting with `@`), the owner/repo written into the endpoint. This is on \
 the allowlist but unproven in practice: a read-only GET with `-f` was checked \
