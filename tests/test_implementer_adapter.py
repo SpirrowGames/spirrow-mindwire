@@ -307,6 +307,7 @@ async def test_spawn_blanks_daemon_tokens_but_keeps_the_author_token(
     monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
     monkeypatch.setenv("MINDWIRE_STALL_LEDGER_GITHUB_TOKEN", "ledger-secret")
     monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    monkeypatch.setenv("MINDWIRE_NOTIFY_DISCORD_WEBHOOK", "https://hook-secret")  # I-4b
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
@@ -319,6 +320,8 @@ async def test_spawn_blanks_daemon_tokens_but_keeps_the_author_token(
     assert env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
     assert env["MINDWIRE_STALL_LEDGER_GITHUB_TOKEN"] == ""
     assert "MINDWIRE_GITHUB_TOKEN" not in env
+    assert env["MINDWIRE_NOTIFY_DISCORD_WEBHOOK"] == ""
+    assert "PATH" not in env  # non-secret names stay with the SDK's os.environ merge
     assert env["ANTHROPIC_BASE_URL"] == "http://lexora:8110"
 
 

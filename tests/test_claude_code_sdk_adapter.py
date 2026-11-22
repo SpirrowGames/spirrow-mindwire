@@ -973,6 +973,7 @@ async def test_spawn_blanks_every_daemon_token_in_the_subprocess_env(
 ) -> None:
     monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "ops-secret")
     monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-secret")
+    monkeypatch.setenv("MINDWIRE_NOTIFY_DISCORD_WEBHOOK", "https://hook-secret")  # I-4b
     seen: list[Any] = []
     client = _FakeClient([])
 
@@ -985,3 +986,5 @@ async def test_spawn_blanks_every_daemon_token_in_the_subprocess_env(
     # The SDK merges os.environ under options.env; an empty override is how a name is removed.
     assert seen[0].env["MINDWIRE_NAYSAYER_GITHUB_TOKEN"] == ""
     assert seen[0].env["MINDWIRE_GITHUB_TOKEN"] == ""
+    assert seen[0].env["MINDWIRE_NOTIFY_DISCORD_WEBHOOK"] == ""
+    assert "PATH" not in seen[0].env
