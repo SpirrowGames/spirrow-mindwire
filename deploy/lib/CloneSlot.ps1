@@ -213,6 +213,12 @@ function Get-SlotFinishDecision {
     $n = if ($null -ne $Row) { $Row.notice } else { $null }
     $res = @{ park_code = $null; outcome = 'failed'; notices = @() }
     if ($Code -eq 0 -and $null -ne $Row) { $res.outcome = "$($Row.outcome)"; return $res }
+    if ($Code -eq $SlotFinishQuarantinedExitCode -and $null -ne $Row -and $null -eq $n -and
+        "$($Row.outcome)" -eq 'quarantined' -and "$($Row.turn_outcome)" -in @('pushed', 'rescued')) {
+        # A5 D-5: a guard-refused slot (exit 8) quarantined with its work saved needs nobody.
+        $res.outcome = 'quarantined'
+        return $res
+    }
     if ($Code -eq $SlotFinishQuarantinedExitCode -and $null -ne $n) {
         $res.outcome = 'quarantined'
         $res.notices += New-SlotNotice -Key "__slot_finish__/$CandidateKey" -Signature "$($n.path)" `
@@ -239,6 +245,16 @@ function Get-SlotFinishDecision {
         -Message ("MindWire: **$CandidateKey** のターン終了処理 (slot-finish) が完了しませんでした (exit=$Code)。" +
                   "slot $Repo/$SlotName の lease は保存確認前のまま残しています。$Stderr")
     return $res
+}
+
+# A5 D-5: the clone guard's reason in an exit-8 run's MINDWIRE_DIRTY_CLONE_PAYLOAD row (the last such
+# row), or 'unknown' when there is none or it does not parse. slot-finish maps it to a D-7 reason
+# (an unknown one becomes `modified`); the slot is quarantined either way.
+function Get-DirtyClonePayloadReason {
+    param([string]$Output)
+    $row = Get-SlotRow -Stdout $Output -Prefix 'MINDWIRE_DIRTY_CLONE_PAYLOAD '
+    if ($null -ne $row -and $row.reason -and "$($row.reason)" -match '^[a-z_]+$') { return "$($row.reason)" }
+    return 'unknown'
 }
 
 # A4 (msg-9400 §3): the conductor's exit-14 run. Its MINDWIRE_SLOT_CONTINUE_REFUSED row says why the

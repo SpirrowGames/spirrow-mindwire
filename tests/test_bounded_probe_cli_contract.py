@@ -94,7 +94,8 @@ def test_every_call_site_was_found() -> None:
     # Invoke-ThreadReferencesProbe: twenty-three.
     # T-ephemeral-impl-clone-slot-per-thread A3 adds Invoke-SlotPrep, Invoke-SlotFinish and
     # Invoke-SlotLease -> -m spirrow_mindwire.cli slot-prep / slot-finish / slot-lease: twenty-six.
-    assert len(_SITES) == 26, _SITES
+    # A5 (D-5) adds the exit-8 slot-finish call with --guard-reason: twenty-seven.
+    assert len(_SITES) == 27, _SITES
 
 
 def test_slot_pool_call_sites_pass_cli_flags() -> None:
@@ -104,6 +105,9 @@ def test_slot_pool_call_sites_pass_cli_flags() -> None:
     assert "--branch" not in sites["'slot-prep'"][1]  # slot-prep derives loop/<stem> itself
     assert sites["'slot-finish'"][0] == "-m spirrow_mindwire.cli slot-finish"
     assert sites["'slot-lease'"][0] == "-m spirrow_mindwire.cli slot-lease"
+    assert "--guard-reason" not in sites["'slot-finish'"][1]
+    assert sites["'slot-finish-guard'"][0] == "-m spirrow_mindwire.cli slot-finish"
+    assert "--guard-reason" in sites["'slot-finish-guard'"][1]
 
 
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:

@@ -69,7 +69,7 @@ import functools
 import logging
 import os
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +86,8 @@ from .clone_guard import (
     DirtyCloneError,
     emit_dirty_clone_payload,
 )
+from .clone_slot import slot_index
+from .clone_slot_lease import Lease, LeaseStore
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.continuation import DEFAULT_CONTINUE_CAP
 from .conductor.core import (
@@ -789,7 +791,10 @@ def _build_dispatcher(
     clone_guard: CloneGuard | None = None
     ref_snapshot_store: TurnRefSnapshotStore | None = None
     if cfg.repo_dir is not None:
-        clone_guard = CloneGuard(Path(cfg.repo_dir))
+        # A5 D-5: when this run borrowed a slot the guard judges that slot only, and the slot is
+        # on the thread's branch (see CloneGuard ``slot_mode``). Decided from the lease, not from
+        # ``[loop].slots_root``: a gate-lane launch borrows no slot and keeps the strict guard.
+        clone_guard = CloneGuard(Path(cfg.repo_dir), slot_mode=_runs_in_borrowed_slot(settings))
         # T-check-pushed-misreads-narrow-fetch-refspec-and-stale-branches D-2' 1: every
         # implementer launch records its starting ref state before the adapter runs.
         # A4 (msg-9400 §4): slot mode does not use the launch ref snapshot; the turn end's
@@ -806,6 +811,39 @@ def _build_dispatcher(
         ref_snapshot_store=ref_snapshot_store,
     )
     return mcp, registry, dispatcher
+
+
+def _runs_in_borrowed_slot(
+    settings: MindwireSettings,
+    *,
+    read_leases: Callable[[Path, str], Sequence[Lease]] | None = None,
+) -> bool:
+    """Whether ``[loop].repo_dir`` is a slot this run borrowed (A5 D-5, #603 gate Obj-1-1).
+
+    True only on positive evidence: ``[loop].slots_root`` is set, ``repo_dir`` is
+    ``<slots_root>/<repo>/slot-NN``, and ``state/slot-leases.json`` holds a lease on that slot.
+    Anything else — a gate-lane launch on the shared clone with a pool configured, a path outside
+    the pool, a lease file that cannot be read — is False, which keeps the strict shared-clone
+    guard (fail-closed: the default-branch comparison is skipped only for a leased slot).
+    """
+    loop_cfg = settings.loop
+    if loop_cfg.slots_root is None or loop_cfg.repo_dir is None:
+        return False
+    repo_dir = Path(loop_cfg.repo_dir)
+    if slot_index(repo_dir.name) is None:
+        return False
+    repo = repo_dir.parent.name
+    try:
+        if os.path.normcase(os.path.abspath(repo_dir.parent.parent)) != os.path.normcase(
+            os.path.abspath(loop_cfg.slots_root)
+        ):
+            return False
+        reader = read_leases or (lambda state_dir, r: LeaseStore(state_dir).leases(r))
+        leases = reader(settings.paths.data_dir / "state", repo)
+    except Exception:
+        logger.warning("slot lease read failed; clone guard stays strict", exc_info=True)
+        return False
+    return any(lease.slot == repo_dir.name for lease in leases)
 
 
 def _continuation_clone_check(

@@ -546,3 +546,114 @@ def test_turn_end_obligation_is_filed_for_the_implementer() -> None:
     assert "do not commit, delete, or edit it" in entry.body
     # The loader already refuses a drifted body; pin that this entry carries a pin at all.
     assert entry.body_sha256 is not None
+
+
+# --------------------------------------------------------------- A5 D-5: slot mode
+
+
+def test_slot_mode_accepts_the_threads_own_branch(repo: Path) -> None:
+    # Bohr msg-9899 §1 / msg-9386 改訂 5: a borrowed slot is on the thread's branch, not main.
+    _git(repo, "switch", "-q", "-c", "loop/t-a")
+    assert _reason(repo, slot_mode=True) is None
+    assert _reason(repo) == DirtyCloneReason.WRONG_HEAD  # shared-clone mode unchanged
+
+
+def test_slot_mode_still_refuses_dirt_and_a_detached_head(repo: Path) -> None:
+    _git(repo, "switch", "-q", "-c", "loop/t-a")
+    (repo / "wip.txt").write_text("wip\n", encoding="utf-8")
+    assert _reason(repo, slot_mode=True) == DirtyCloneReason.DIRTY_TREE
+    (repo / "wip.txt").unlink()
+    _git(repo, "switch", "-q", "--detach")
+    assert _reason(repo, slot_mode=True) == DirtyCloneReason.WRONG_HEAD
+
+
+# ------------------------------------- A5 D-5: slot mode comes from the lease (#603 gate Obj-1-1)
+
+
+def _dispatcher_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo_dir: Path, slots: Path
+) -> CloneGuard:
+    monkeypatch.setattr(loop_runner, "build_registry", lambda **_kw: InMemoryAdapterRegistry())
+    settings = MindwireSettings()
+    settings.paths.data_dir = tmp_path / "data"
+    settings.loop.repo_dir = repo_dir
+    settings.loop.slots_root = slots
+    _mcp, _reg, disp = loop_runner._build_dispatcher(
+        settings,
+        mcp=object(),  # type: ignore[arg-type]
+        proposer=_Adapter("p"),
+        implementer=_Adapter("i"),
+        naysayer=_Adapter("n"),
+    )
+    guard = disp._clone_guard
+    assert isinstance(guard, CloneGuard)
+    assert guard.repo_dir == repo_dir
+    return guard
+
+
+def _guard_reason(guard: CloneGuard) -> DirtyCloneReason | None:
+    try:
+        guard.check()
+    except DirtyCloneError as exc:
+        return exc.reason
+    return None
+
+
+def _leased_slot(tmp_path: Path, repo: Path) -> tuple[Path, Path]:
+    """Move ``repo`` to ``<slots>/clone/slot-01`` and lease that slot, as slot-prep leaves it."""
+    from spirrow_mindwire.clone_slot_lease import LeaseStore
+
+    slots = tmp_path / "slots"
+    slot = slots / "clone" / "slot-01"
+    slot.parent.mkdir(parents=True)
+    repo.rename(slot)
+    state = tmp_path / "data" / "state"
+    state.mkdir(parents=True)
+    got = LeaseStore(state).acquire(
+        "clone", 2, thread_id="t-a", turn_id="turn-1", now=datetime.now(UTC)
+    )
+    assert got.lease is not None and got.lease.slot == "slot-01"
+    _git(slot, "switch", "-q", "-c", "loop/t-a")
+    return slots, slot
+
+
+def test_dispatcher_relaxes_the_guard_for_a_leased_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    slots, slot = _leased_slot(tmp_path, repo)
+    guard = _dispatcher_guard(tmp_path, monkeypatch, slot, slots)
+    assert _guard_reason(guard) is None
+    (slot / "wip.txt").write_text("wip\n", encoding="utf-8")
+    assert _guard_reason(guard) == DirtyCloneReason.DIRTY_TREE
+
+
+def test_dispatcher_keeps_the_strict_guard_for_a_shared_clone_with_slots_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    # A gate-lane launch borrows no slot: repo_dir is the shared clone, slots_root is still set.
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    _git(repo, "switch", "-q", "-c", "loop/other-thread")
+    guard = _dispatcher_guard(tmp_path, monkeypatch, repo, slots)
+    assert _guard_reason(guard) == DirtyCloneReason.WRONG_HEAD
+
+
+def test_dispatcher_keeps_the_strict_guard_for_a_slot_path_without_a_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    slots = tmp_path / "slots"
+    slot = slots / "clone" / "slot-01"
+    slot.parent.mkdir(parents=True)
+    repo.rename(slot)
+    _git(slot, "switch", "-q", "-c", "loop/t-a")
+    guard = _dispatcher_guard(tmp_path, monkeypatch, slot, slots)
+    assert _guard_reason(guard) == DirtyCloneReason.WRONG_HEAD
+
+
+def test_dispatcher_keeps_the_strict_guard_when_the_lease_file_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    slots, slot = _leased_slot(tmp_path, repo)
+    (tmp_path / "data" / "state" / "slot-leases.json").write_text("{not json", encoding="utf-8")
+    guard = _dispatcher_guard(tmp_path, monkeypatch, slot, slots)
+    assert _guard_reason(guard) == DirtyCloneReason.WRONG_HEAD
