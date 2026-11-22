@@ -57,6 +57,34 @@ the pipeline counts as a verdict. Bodies are read for the check and never writte
 ``retry_lookup`` is ``never_retry``: no past turn carries a ``RETRY:`` token issued by a live
 gate, so "no unresolved bounce exists" is the true answer for history.
 
+**Security** (T-tier-c-six-articles-security-boundary part 4; Bohr msg-9912 B → msg-9914 →
+msg-9916, Einstein msg-9913 / 9915 / 9917). What happened to ``security`` heads is read **only**
+from the gate's decisions log (``--decisions-log``, default the daemon's), never from a rerun
+(:func:`security_section`):
+
+* ``heads`` — one outcome per ``(thread, msg_id)`` carrying a ``label=security`` row inside the
+  window, read from every in-window row of that head whatever its label: ``delivered`` (an
+  ``ESCALATED`` row), else ``bounced`` (a ``BOUNCED`` row, split by reason), else ``no_outcome``.
+  Only rows inside ``[--since, --until)`` decide an outcome; within them ``ESCALATED`` wins.
+  Rows after the window are not read, so a later delivery never changes a closed window
+  (msg-9916 Obj-2-2).
+* ``hold_bounces`` — ``BOUNCED`` rows in the window with reason ``security-hold`` /
+  ``security-hold-no-verdict``, whatever the head's label.
+* ``holds_opened`` / ``holds_released`` — distinct hold ids (a refusal merged into an open
+  identical hold opens none), replayed by :func:`~spirrow_mindwire.tier_c_security_holds.
+  replay_hold_rows`. Rows from ``--replay-from`` (default: the start of the log; it may not be
+  later than ``--since``) up to
+  ``--since`` only set up which holds are open; bounces and releases inside the window count even
+  for a hold opened before it (msg-9914 Obj-4).
+* a release's origin: ``human`` when the thread holds a ``HOLD-RELEASE: <id>`` line by the
+  conductor's ``human_identity`` posted at or before the stamped row; else ``delivery`` when the
+  stamp is on an ``ESCALATED`` row and the thread was read; else ``unknown`` (the thread was not
+  harvested, the row has no time, or neither applies). Text alone never makes it ``human``.
+
+``formal_recheck`` is the rerun of :func:`decide_admission` over the same window, restricted to
+``security``: a formal check, not an outcome, never added to or compared with ``security``. A log
+that cannot be read gives ``security = "unmeasured: <reason>"``, never 0.
+
 **Output.** Counts and ``msg_id`` lists only (``--out`` JSON, LF). No message body, no label text
 and no Jev score is written — the pre-registration in T-decider-tierc-replay-eval forbids looking
 at the shadow scores before evaluation, and this script has none to look at. Nothing is posted to
@@ -83,16 +111,21 @@ from spirrow_mindwire.conductor.gate_records import (
     relay_heading_pr_ref,
 )
 from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
+from spirrow_mindwire.conductor.human_identity import is_human_identity
 from spirrow_mindwire.config import MindwireSettings
 from spirrow_mindwire.decider.hook import TIERC_ENTRY_ROLES, never_retry
 from spirrow_mindwire.github.reviews import parse_verdict_footer
 from spirrow_mindwire.tier_c_admission_gate import (
     ADMIT_LABELS,
+    SECURITY_LABEL,
     UNSURE_LABEL,
     AdmissionVerdict,
+    BounceReason,
     LogKind,
     decide_admission,
 )
+from spirrow_mindwire.tier_c_decisions_log import iter_rows
+from spirrow_mindwire.tier_c_security_holds import hold_release_ids, replay_hold_rows
 from spirrow_mindwire.value_objects import Role
 
 
@@ -181,6 +214,8 @@ def classify(
     projects_seen: set[str] = set()
     bounce_reasons: Counter[str] = Counter()
     by_author: Counter[str] = Counter()
+    formal_admitted: list[str] = []
+    formal_bounced: dict[str, list[str]] = {}
     for project, thread_id, messages in threads:
         projects_seen.add(project)
         for i, m in enumerate(messages):
@@ -209,6 +244,12 @@ def classify(
                 bounce_uuid="measure",
             )
             kinds = {e.kind for e in decision.log_entries}
+            if decision.normalized_label == SECURITY_LABEL:
+                if decision.verdict is AdmissionVerdict.BOUNCE:
+                    assert decision.bounce_reason is not None
+                    formal_bounced.setdefault(decision.bounce_reason.value, []).append(ref)
+                else:
+                    formal_admitted.append(ref)
             if decision.verdict is AdmissionVerdict.BOUNCE:
                 ids["i_bounce"].append(ref)
                 assert decision.bounce_reason is not None
@@ -248,7 +289,179 @@ def classify(
         "iv_by_kind_counts": {k: len(v) for k, v in by_kind.items()},
         "must_admit": must,
         "must_admit_dropped": [r for r, b in must.items() if b in ("i_bounce", NOT_FOUND)],
+        # msg-9914 Obj-2: the rerun, kept apart from what the log says happened (``security``).
+        "formal_recheck": {
+            "note": "decide_admission rerun on security heads; a formal check, not an outcome",
+            "admitted": len(formal_admitted),
+            "admitted_msg_ids": formal_admitted,
+            "bounced_by_reason": {r: len(v) for r, v in sorted(formal_bounced.items())},
+            "bounced_by_reason_msg_ids": dict(sorted(formal_bounced.items())),
+        },
     }
+
+
+#: The two bounce reasons of a held head (msg-9912 B), always reported, zero or not.
+HOLD_BOUNCE_REASONS: tuple[str, ...] = (
+    BounceReason.SECURITY_HOLD.value,
+    BounceReason.SECURITY_HOLD_NO_VERDICT.value,
+)
+#: Where a hold release came from (msg-9914 Obj-3, msg-9916), in the order they are checked.
+RELEASE_ORIGINS: tuple[str, ...] = ("human", "delivery", "unknown")
+
+
+def _row_time(row: Mapping[str, Any]) -> datetime | None:
+    raw = row.get("ts")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _release_origin(
+    hold_id: str,
+    row: Mapping[str, Any],
+    at: datetime,
+    thread_messages: Mapping[str, Sequence[Any] | None],
+    human_identity: str,
+) -> str:
+    """``human`` / ``delivery`` / ``unknown`` for one stamped release (msg-9916 note).
+
+    ``human`` needs both the author (the conductor's own :func:`is_human_identity` rule, the one
+    that decides whose ``HOLD-RELEASE:`` counts) and the order (posted at or before the stamped
+    row); if either cannot be confirmed it is not ``human``. ``delivery`` needs the thread to
+    have been read, so that "no human line" is known rather than assumed.
+    """
+    messages = thread_messages.get(str(row.get("thread")))
+    if messages is None:
+        return "unknown"
+    for m in messages:
+        if (
+            m.timestamp <= at
+            and is_human_identity(m.author, human_identity)
+            and hold_id in hold_release_ids(m.content)
+        ):
+            return "human"
+    if row.get("kind") == LogKind.ESCALATED.value:
+        return "delivery"
+    return "unknown"
+
+
+def security_section(
+    rows: Sequence[Mapping[str, Any]],
+    threads: Sequence[tuple[str, str, Sequence[Any]]],
+    *,
+    since: datetime,
+    until: datetime,
+    human_identity: str,
+    replay_from: datetime | None = None,
+) -> dict[str, Any]:
+    """What the decisions log says happened to security heads and holds in ``[since, until)``.
+
+    Pure; counts, hold ids and ``thread#msg_id`` refs only. ``rows`` in log (append) order. A row
+    without a readable timezone-aware ``ts`` is replayed but counted nowhere
+    (``rows_without_ts``).
+
+    ``replay_from`` only moves where the hold replay starts; it may not cut into the window, so
+    a ``replay_from`` later than ``since`` is a :class:`ValueError` (PR #601 round 1, Obj-2).
+    A head is selected when any in-window row of it carries ``label=security``, and its outcome
+    is read from **all** its in-window rows, whatever their label (PR #601 round 1, Obj-1).
+    """
+    if replay_from is not None and replay_from > since:
+        raise ValueError(
+            f"replay_from ({replay_from.isoformat()}) is later than since ({since.isoformat()}):"
+            " it would drop rows from the measured window"
+        )
+    # The log's ``thread`` is the bare thread id; one harvested in two projects is ambiguous.
+    by_thread: dict[str, Sequence[Any] | None] = {}
+    for _project, thread_id, messages in threads:
+        by_thread[thread_id] = None if thread_id in by_thread else messages
+    replayed: list[dict[str, Any]] = []
+    times: list[datetime | None] = []
+    without_ts = 0
+    for row in rows:
+        at = _row_time(row)
+        if at is None:
+            without_ts += 1
+        elif at >= until or (replay_from is not None and at < replay_from):
+            continue  # after the window: never read (Obj-2-2); before replay_from: not replayed
+        replayed.append(dict(row))
+        times.append(at)
+
+    by_head: dict[str, list[Mapping[str, Any]]] = {}
+    security_refs: set[str] = set()
+    hold_bounces: dict[str, list[str]] = {r: [] for r in HOLD_BOUNCE_REASONS}
+    opened: list[str] = []
+    released: dict[str, list[str]] = {o: [] for o in RELEASE_ORIGINS}
+    unmatched = 0
+    for step, at in zip(replay_hold_rows(replayed), times, strict=True):
+        if at is None or at < since:
+            continue  # sets up the holds open at the window's start; counted nowhere
+        row = step.row
+        ref = f"{row.get('thread')}#{row.get('msg_id')}"
+        by_head.setdefault(ref, []).append(row)
+        if row.get("label") == SECURITY_LABEL:
+            security_refs.add(ref)
+        if row.get("kind") == LogKind.BOUNCED.value and row.get("reason") in hold_bounces:
+            hold_bounces[str(row.get("reason"))].append(ref)
+        if step.opened is not None:
+            opened.append(step.opened)
+        unmatched += len(step.released_unknown)
+        for hold_id in step.released:
+            origin = _release_origin(hold_id, row, at, by_thread, human_identity)
+            released[origin].append(hold_id)
+
+    delivered: list[str] = []
+    bounced: dict[str, list[str]] = {}
+    no_outcome: list[str] = []
+    heads = {ref: head_rows for ref, head_rows in by_head.items() if ref in security_refs}
+    for ref, head_rows in heads.items():
+        kinds = [r.get("kind") for r in head_rows]
+        if LogKind.ESCALATED.value in kinds:
+            delivered.append(ref)  # within the window ESCALATED wins (msg-9914 Obj-2)
+        elif LogKind.BOUNCED.value in kinds:
+            last = [r for r in head_rows if r.get("kind") == LogKind.BOUNCED.value][-1]
+            bounced.setdefault(str(last.get("reason")), []).append(ref)
+        else:
+            no_outcome.append(ref)
+    return {
+        "window": {
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+            "replay_from": replay_from.isoformat() if replay_from is not None else None,
+        },
+        "heads": {
+            "delivered": len(delivered),
+            "bounced": sum(len(v) for v in bounced.values()),
+            "bounced_by_reason": {r: len(v) for r, v in sorted(bounced.items())},
+            "no_outcome": len(no_outcome),
+        },
+        "heads_msg_ids": {
+            "delivered": delivered,
+            "bounced_by_reason": dict(sorted(bounced.items())),
+            "no_outcome": no_outcome,
+        },
+        "hold_bounces": {r: len(v) for r, v in hold_bounces.items()},
+        "hold_bounces_msg_ids": hold_bounces,
+        "holds_opened": len(opened),
+        "holds_opened_ids": opened,
+        "holds_released": {o: len(v) for o, v in released.items()},
+        "holds_released_ids": released,
+        "release_stamps_unmatched": unmatched,
+        "rows_without_ts": without_ts,
+    }
+
+
+def load_decisions_log(path: Path) -> list[dict[str, Any]] | str:
+    """The log's rows, or ``unmeasured: <reason>`` — a missing log is not an empty one."""
+    if not path.is_file():
+        return f"unmeasured: decisions log not found at {path}"
+    try:
+        return list(iter_rows(path))
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"unmeasured: decisions log unreadable ({type(exc).__name__})"
 
 
 def load_config(config_path: Path | None) -> MindwireSettings | str:
@@ -299,7 +512,18 @@ def main(argv: list[str] | None = None) -> int:
         help="regression ref the gate must not bounce (repeatable; default: msg-829, msg-740)",
     )
     parser.add_argument("--config", type=Path, default=None, help="default: the daemon's toml")
+    parser.add_argument(
+        "--decisions-log", type=Path, default=None, help="default: the daemon's Tier-C log"
+    )
+    parser.add_argument(
+        "--replay-from",
+        type=_date,
+        default=None,
+        help="replay holds from this time (default: the start of the log; not after --since)",
+    )
     args = parser.parse_args(argv)
+    if args.replay_from is not None and args.replay_from > args.since:
+        parser.error("--replay-from must not be later than --since")
 
     projects = tuple(args.project or builder.PROJECTS)
     loaded = load_config(args.config)
@@ -328,6 +552,22 @@ def main(argv: list[str] | None = None) -> int:
         until=args.until,
         mode_by_project=modes_from(projects, loaded),
         must_admit=tuple(args.must_admit or DEFAULT_MUST_ADMIT),
+    )
+    from spirrow_mindwire.config import resolve_tier_c_decisions_log_path
+
+    log_path = args.decisions_log or resolve_tier_c_decisions_log_path(loaded)
+    rows = load_decisions_log(log_path)
+    result["security"] = (
+        rows
+        if isinstance(rows, str)
+        else security_section(
+            rows,
+            threads,
+            since=args.since,
+            until=args.until,
+            human_identity=loaded.conductor.human_identity,
+            replay_from=args.replay_from,
+        )
     )
     result["measured_at"] = datetime.now(UTC).isoformat()
     result["projects"] = list(projects)
