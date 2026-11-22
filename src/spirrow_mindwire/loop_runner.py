@@ -163,6 +163,7 @@ from .preflight import (
     emit_preflight_ok,
     emit_preflight_refused_payload,
     preflight_gate,
+    tierc_rules_drift,
 )
 from .repo_projects import load_repo_project_map
 from .slot_continuation import (
@@ -1152,6 +1153,15 @@ def build_conductor(
         )
     except ValueError as exc:
         raise SystemExit(f"decider misconfigured ([decider] in mindwire.toml): {exc}") from exc
+    if decider is not None and dec_cfg.tierc.questions == "tierc-v2":
+        # msg-9912 A: the runtime rules file Jev just loaded vs the packaged template. A warning,
+        # never a refusal (Einstein msg-9913): the runtime file may differ on purpose.
+        try:
+            drift = tierc_rules_drift(resolve_tierc_rules_path(settings))
+        except ValueError as exc:  # TierCRulesError; build_decider read it a moment ago
+            drift = f"tierc rules file could not be compared with the template: {exc}"
+        if drift is not None:
+            logger.warning("decider: %s", drift)
     # One INFO line each, on every start, whatever the value (DECIDED 2e-1b, the msg-4748
     # recurrence fix): the Decider sat at backend=off for days with nothing in the log to say so.
     # ``built`` is whether a Decider object exists — the only fact the hook acts on.

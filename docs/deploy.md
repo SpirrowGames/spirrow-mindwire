@@ -434,6 +434,48 @@ Three rules are load-bearing:
 > unread announcement that `spec/process/README.md` (the fail-open-placement rule) exists to prevent. Alerts are deduped on the reason, so a
 > week spent on a feature branch costs one message, not 2016.
 
+### Tier-C rules file (six articles)
+
+T-tier-c-six-articles-security-boundary (Bohr msg-9912 A → msg-9914 Obj-1 → msg-9916 Obj-2-1 /
+Obj-2-3, Einstein msg-9913 / 9915 / 9917). Jev judges escalations by the **runtime** rules file,
+`<data_dir>/config/tierc_rules.toml` (or `[decider.tierc].rules_path`), never by the packaged
+template `src/spirrow_mindwire/decider/tierc_rules.default.toml`. `mindwire init-config tierc-rules`
+never overwrites an existing file, so a sync that brings in the six-article template leaves the
+runtime file on the five articles of 2026-09-28. **A code deploy does not move it; this step does.**
+
+At startup the conductor compares the runtime file's rule ids, `text` and `note` with the template
+and, if they differ, logs one WARNING naming both `rules_sha256` values and the ids that are
+missing (`missing rule_6`), worded differently, or not in the template
+(`preflight.tierc_rules_drift`). It is a warning, never a refusal: the runtime file may differ on
+purpose. A missing or malformed runtime file still refuses startup exactly as before.
+
+Steps (they belong to the production deploy, which needs Takahito's instruction):
+
+1. Diff the runtime file against the template.
+2. Carry any deliberate edits of the runtime file into the new one; with none, copy the template
+   over it. `rule_6` is wording Takahito confirmed: it takes the template's `text` and `note`
+   unchanged.
+3. Restart the conductor. Its startup log has `decider tierc-v2 rules loaded from … (rules_sha256=…)`
+   and writes the snapshot `<data_dir>/decider/rules/<sha256>.toml`.
+4. Check the startup log for the rules WARNING.
+
+**The deploy is done when all four hold, recorded in the thread** — not when the warning is gone:
+
+1. **Content.** The runtime file has `rule_1` … `rule_6`, and `rule_6`'s `text` and `note` equal
+   the template's exactly. If `rule_6` differs, the deploy is not done.
+2. **Deliberate differences.** Every rule id that still differs from the template is listed, each
+   with one line saying why it was kept.
+3. **Hash.** The runtime file's `rules_sha256` equals the sha256 of the snapshot written at that
+   restart (`<data_dir>/decider/rules/<sha256>.toml`).
+4. **Warning.** If the WARNING is still logged, the record says why, and the ids it names are the
+   ones listed in 2.
+
+The record also gives the restart time, taken from that startup log line. The 14-day measurement
+window is `[restart time, restart time + 14 days)` — the restart, not the time the record is
+posted — and is run with `scripts/tierc_gate_measure.py --since <restart> --until <restart + 14d>`;
+its `security` section counts from the decisions log, its `formal_recheck` section is a rerun of
+the label gate and is not an outcome.
+
 ### Migration boundary — lease-state substrate change (T-exclusive-resource-lease-queue PR 4)
 
 This subsection is the runbook that MUST be followed when a `main` merge lands PR 4 of
