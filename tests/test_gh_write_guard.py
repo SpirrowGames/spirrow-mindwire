@@ -609,3 +609,69 @@ def test_attached_short_body_options_with_literal_values_are_writes(cmd: str) ->
 def test_attached_values_of_other_options_are_not_body_options(cmd: str) -> None:
     assert not g.is_gh_write(cmd), cmd
     assert _run(_bash(cmd)) == {}, cmd
+
+
+# ------------- T-lp-allowlist-lacks-base-head-so-develop-flow-repos-cannot-open-prs (D1)
+#: ``gh pr create`` takes ``-B/--base`` and ``-H/--head`` as a plain literal branch name, once each.
+_PRC = "gh pr create -R o/r "
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        _PRC + "--base develop --head feature/x --title t --body-file - " + H,
+        _PRC + "-B main -H fix/y --title t --body-file - " + H,
+        _PRC + "--head feature/x --title t --body-file - " + H,
+        _PRC + "--base=develop --title t --body-file - " + H,
+        _PRC + "--base develop --title t --body x",
+    ],
+)
+def test_pr_create_accepts_branch_name_base_and_head(cmd: str) -> None:
+    assert g.classify(cmd) in g.ALLOWED_CLASSES
+    assert g.decide(cmd) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        _PRC + '--base "$B" --title t --body-file - ' + H,
+        _PRC + "--head owner:feature/x --title t --body-file - " + H,
+        _PRC + "--base ../x --title t --body-file - " + H,
+        _PRC + "--base a..b --title t --body-file - " + H,
+        _PRC + "--base a//b --title t --body-file - " + H,
+        _PRC + "--base a/ --title t --body-file - " + H,
+        _PRC + "--base a.lock --title t --body-file - " + H,
+        _PRC + "--base -x --title t --body-file - " + H,
+        _PRC + "--head a b --title t --body-file - " + H,
+        _PRC + "--base develop --base main --title t --body-file - " + H,
+        _PRC + "-B develop --base main --title t --body-file - " + H,
+        _PRC + "--title t --body-file - --base " + H,
+        "gh pr edit 1 -R o/r --base develop",
+        "gh pr edit 1 -R o/r --base develop --body-file - " + H,
+        "gh issue create -R o/r --base x --title t --body-file - " + H,
+        "gh pr comment 1 -R o/r --head x --body-file - " + H,
+        _PRC + "--base develop --title t --body-file - --fill " + H,
+        _PRC + "--base develop --title t --body-file - --dry-run " + H,
+        # D2 / D4 were cut from this thread (msg-9964): still denied.
+        _PRC + "--draft --base develop --title t --body-file - " + H,
+        "gh api repos/o/r/pulls/1 -X PATCH -f title=t --jq .title",
+        "gh api repos/o/r/pulls/1 -X PATCH -f title=t --silent",
+        'gh api repos/o/r/pulls/1 -X PATCH -f title=t --jq "$Q"',
+    ],
+)
+def test_pr_create_ref_options_outside_the_shape_stay_denied(cmd: str) -> None:
+    assert g.classify(cmd) not in g.ALLOWED_CLASSES
+    allowed, reason = g.decide(cmd)
+    assert not allowed and reason is not None
+
+
+def test_api_header_is_not_the_pr_create_head_option() -> None:
+    # ``-H`` stays ``--header`` to ``gh api``; the branch-name rule does not apply there.
+    assert g.classify("gh api -X POST repos/o/r/issues -H Accept:x -f title=t") == (
+        "a_prime_inline"
+    )
+
+
+def test_p1_names_base_and_head_for_pr_create() -> None:
+    assert "`gh pr create` also accepts `--base`/`--head`" in g.P1_PROMPT_BLOCK
+    assert "--draft" not in g.P1_PROMPT_BLOCK
