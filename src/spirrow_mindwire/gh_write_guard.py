@@ -1388,12 +1388,112 @@ def decide(cmd: object) -> tuple[bool, str | None]:
 
 
 # --------------------------------------------------------------------------- P-1 prompt text
-#: P-1 (msg-9299 §1, with the msg-9301 §4 / Einstein's CLI-check wording): the guidance the
-#: implementer and proposer system prompts carry. Kept here so the prompt and the guard it
-#: describes cannot drift apart.
+#: msg-10012 Obj-28-1: the placeholders a P-1 example template may carry, with the text the prompt
+#: shows for each (C-42: placeholders only, never a real value) and the fixed synthetic value the
+#: tests substitute before running the example through :func:`decide`.
+P1_PLACEHOLDERS: dict[str, tuple[str, str]] = {
+    "{n}": ("<n>", "1"),
+    "{owner_repo}": ("owner/repo", "o/r"),
+    "{branch}": ("<branch>", "feature-x"),
+    "{text}": ("<text>", "foo"),
+}
+
+#: msg-10012 Obj-28-1 / Obj-28-2: one or more allowed examples per :data:`L2_ALLOW` row, as
+#: ``(row, template)``. The prompt's (iv) list is built from these, and the tests run every one
+#: of them through :func:`decide` and check that every row has at least one.
+P1_EXAMPLES_ALLOW: tuple[tuple[tuple[str, str], str], ...] = (
+    (("pr", "list"), "gh pr list -R {owner_repo} -s open"),
+    (("pr", "view"), "gh pr view {n} -R {owner_repo}"),
+    (("pr", "diff"), "gh pr diff {n} -R {owner_repo}"),
+    (("pr", "checks"), "gh pr checks {n} -R {owner_repo}"),
+    (("pr", "status"), "gh pr status -R {owner_repo}"),
+    (("pr", "checkout"), "gh pr checkout {n} -R {owner_repo}"),
+    (("pr", "ready"), "gh pr ready {n} -R {owner_repo}"),
+    (("pr", "update-branch"), "gh pr update-branch {n} -R {owner_repo}"),
+    (("pr", "close"), "gh pr close {n} -R {owner_repo}"),
+    (("pr", "reopen"), "gh pr reopen {n} -R {owner_repo}"),
+    (("pr", "merge"), "gh pr merge {n} -R {owner_repo} --squash"),
+    (("issue", "list"), "gh issue list -R {owner_repo} -s open"),
+    (("issue", "view"), "gh issue view {n} -R {owner_repo}"),
+    (("issue", "status"), "gh issue status -R {owner_repo}"),
+    (("issue", "close"), "gh issue close {n} -R {owner_repo}"),
+    (("issue", "reopen"), "gh issue reopen {n} -R {owner_repo}"),
+    (("run", "list"), "gh run list -R {owner_repo} -L 20"),
+    (("run", "view"), "gh run view {n} -R {owner_repo} --log-failed"),
+    (("run", "watch"), "gh run watch {n} -R {owner_repo} --exit-status"),
+    (("run", "download"), "gh run download {n} -R {owner_repo}"),
+    (("workflow", "list"), "gh workflow list -R {owner_repo}"),
+    (("workflow", "view"), "gh workflow view {n} -R {owner_repo}"),
+    (("repo", "view"), "gh repo view {owner_repo}"),
+    (("repo", "clone"), "gh repo clone {owner_repo}"),
+    (("release", "list"), "gh release list -R {owner_repo}"),
+    (("release", "view"), "gh release view -R {owner_repo}"),
+    (("release", "download"), "gh release download -R {owner_repo}"),
+    (("label", "list"), "gh label list -R {owner_repo}"),
+    (("secret", "list"), "gh secret list -R {owner_repo}"),
+    (("cache", "list"), "gh cache list -R {owner_repo}"),
+    (("ruleset", "list"), "gh ruleset list -R {owner_repo}"),
+    (("ruleset", "view"), "gh ruleset view {n} -R {owner_repo}"),
+    (("ruleset", "check"), "gh ruleset check {branch} -R {owner_repo}"),
+    (("auth", "setup-git"), "gh auth setup-git"),
+)
+
+#: msg-10012 Obj-28-1: denied examples, as ``(template, expected class)``. The prompt shows them
+#: as shapes not to use; the tests check that each is denied with that class.
+P1_EXAMPLES_DENY: tuple[tuple[str, str], ...] = (
+    ("gh pr list -R {owner_repo} --search {text}", "gh_search_text"),
+    ("gh pr list -R {owner_repo} -S {text}", "gh_search_text"),
+    ("gh search prs {text}", "gh_search_text"),
+    ('bash -c "gh pr view {n}"', "gh_not_in_table"),
+    ("env gh pr view {n}", "gh_not_in_table"),
+    ("gh -R {owner_repo} pr view {n}", "gh_not_in_table"),
+    ("gh --version", "gh_not_in_table"),
+    ("gh api repos/{owner_repo}/pulls/{n}", "gh_not_in_table"),
+    ("gh auth token", "gh_auth_token"),
+    ("gh variable list -R {owner_repo}", "gh_secret_value"),
+)
+
+
+def p1_render(template: str, synthetic: bool = False) -> str:
+    """``template`` with each placeholder replaced by its prompt text, or (``synthetic``) by the
+    fixed synthetic value the tests run through :func:`decide`."""
+    out = template
+    for ph, (shown, synth) in P1_PLACEHOLDERS.items():
+        out = out.replace(ph, synth if synthetic else shown)
+    return out
+
+
+def _p1_reads_block() -> str:
+    """P-1 (iv): one line per :data:`L2_ALLOW` row with its allowed examples, then the denied
+    examples — all built from constants (msg-10010 P-e, msg-10012 Obj-28-2)."""
+    rows = []
+    for row in sorted(L2_ALLOW):
+        shapes = "; ".join(f"`{p1_render(t)}`" for r, t in P1_EXAMPLES_ALLOW if r == row)
+        rows.append(f"- `{row[0]} {row[1]}`: {shapes}\n")
+    denied = "; ".join(f"`{p1_render(t)}` [{k}]" for t, k in P1_EXAMPLES_DENY)
+    return (
+        "(iv) Every other `gh` call, reads included: only the group and subcommand rows below are "
+        "allowed, and anything else is denied (a read through `gh api` included). The kind of "
+        "argument and the place it goes are fixed per subcommand: use the shape of that row's "
+        "example. `-S`/`--search` is never allowed. A `gh` run through a wrapper or launcher "
+        "(`bash -c`, `env`, `xargs`, `command`, `time` and the like) is denied, and so is any "
+        "option placed before the group or the subcommand. A row here is only what this guard "
+        "admits, not a permission: every other rule you are given still applies.\n"
+        + "".join(rows)
+        + f"Denied shapes (with the class the guard answers): {denied}.\n"
+        "If a call is denied, do what the deny text says; do not reshape the command to get it "
+        "through.\n"
+    )
+
+
+#: P-1 (msg-9299 §1, msg-9301 §4; updated for L-p2 by msg-10010 P-a..P-e and msg-10012): the
+#: guidance the implementer and proposer system prompts carry. Kept here, with the (iv) list built
+#: from :data:`L2_ALLOW` and the example constants above, so the prompt and the guard it describes
+#: cannot drift apart.
 P1_PROMPT_BLOCK = """\
-GH WRITES: every Bash call that writes through `gh` passes a guard (L-p) that \
-denies any other shape before the command runs.
+GH CALLS: every Bash call that runs `gh` passes a guard (L-p / L-p2) that judges \
+every `gh` in the command and denies, before the command runs, any shape it does \
+not list.
 (i) `gh pr create|comment|edit|review|merge` and `gh issue create|comment|edit`: \
 run that one command alone in its own Bash call — never chain it with `cd`, \
 `git`, `|`, `;`, `&&` or a newline. Pass the body with `--body-file -` and a \
@@ -1401,13 +1501,13 @@ heredoc whose delimiter is quoted (`<<'EOF'`). Name the repository with \
 `-R owner/repo` instead of `cd`; do `git push` and any other preparation in an \
 earlier, separate Bash call. `gh pr create` also accepts `--base`/`--head` \
 (a plain branch name only).
-(ii) `gh api`: alone in its own Bash call, every value a literal `-f`/`-F` (no \
-value starting with `@`), the owner/repo written into the endpoint. This is on \
-the allowlist but unproven in practice: a read-only GET with `-f` was checked \
-against the CLI; `-F` and writes have not been.
+(ii) `gh api`: for a write only (`-X`/`--method` other than GET). Alone in its \
+own Bash call, every value a literal `-f`/`-F` (no value starting with `@`), the \
+owner/repo written into the endpoint. This is on the allowlist but unproven in \
+practice. Do not use `gh api` to read: read with the subcommands in (iv).
 (iii) `gh gist create|edit` and `gh release create|upload` are always denied and \
 have no allowed form. If one is needed, stop and say why in the thread.
-"""
+""" + _p1_reads_block()
 
 
 # ------------------------------------------------------------------------------- SDK hook
@@ -1453,6 +1553,9 @@ __all__ = [
     "CLASSES",
     "L2_ALLOW",
     "L2_CLASSES",
+    "P1_EXAMPLES_ALLOW",
+    "P1_EXAMPLES_DENY",
+    "P1_PLACEHOLDERS",
     "P1_PROMPT_BLOCK",
     "Verdict",
     "classify",
@@ -1466,5 +1569,6 @@ __all__ = [
     "gh_write_pretooluse",
     "is_gh_write",
     "judge_table",
+    "p1_render",
     "parse",
 ]
