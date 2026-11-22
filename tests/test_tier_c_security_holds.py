@@ -99,24 +99,19 @@ def test_holds_are_per_thread_and_author(tmp_path: Path) -> None:
     assert gate.holds(thread=T, author="Einstein") == []
 
 
-def test_a_supplemented_head_is_still_held_until_a_human_releases(tmp_path: Path) -> None:
-    """PR #595 gate Obj-1 / Obj-2 (fix_cut): the supplement is refused while held, and once a
-    human releases both holds a RETRY of it gets through."""
+def test_a_supplemented_head_is_only_a_recheck_until_released(tmp_path: Path) -> None:
+    """Part 1b (Bohr msg-9886 §2): while held, the supplement passes the label gate only as
+    ``RH-recheck`` (the conductor's per-hold Jev check decides delivery) and the hold stays; once a
+    human releases it, the same head is an ordinary admit."""
     gate = _gate(tmp_path)
     _admit(gate, _sec("A"), "m1")
     held = _admit(gate, _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"), "m2")
-    assert held.bounce_reason is BounceReason.SECURITY_HOLD
-    assert [h.held_basis for h in gate.holds(thread=T, author=A)] == [
-        None,
-        "SECURITY-BASIS: exposure src/a.py:3",
-    ]
-    ok = _admit(
-        gate,
-        "RETRY: u2\n" + _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"),
-        "m3",
-        released=("u1", "u2"),
-    )
+    assert held.verdict is AdmissionVerdict.ADMIT
+    assert held.rule == "RH-recheck"
+    assert [h.hold_id for h in gate.holds(thread=T, author=A)] == ["u1"]
+    ok = _admit(gate, _sec("A", "SECURITY-BASIS: exposure src/a.py:3\n"), "m3", released=("u1",))
     assert ok.verdict is AdmissionVerdict.ADMIT
+    assert ok.rule != "RH-recheck"
 
 
 def test_escalated_releases_no_hold(tmp_path: Path) -> None:

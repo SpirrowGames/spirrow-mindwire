@@ -97,6 +97,7 @@ from ..decider.hook import (
     run_proceed_veto,
     run_tierc_hook,
 )
+from ..decider.questions import UNHELD_YES, HoldRef
 from ..decider.result import DecisionResult
 from ..decider.verdict import TierCV2Verdict, TierCVerdictKind
 from ..exceptions import AdapterSpawnTimeoutError
@@ -125,7 +126,14 @@ from ..routing import (
 )
 from ..source_marker import attestation_agrees, parse_attestation_marker
 from ..thread_context import build_thread_context, with_appended_trigger
-from ..tier_c_admission_gate import ADMIT_LABELS, AdmissionDecision, AdmissionVerdict
+from ..tier_c_admission_gate import (
+    ADMIT_LABELS,
+    SECURITY_HOLD_HINT,
+    SECURITY_HOLD_NO_VERDICT_HINT,
+    AdmissionDecision,
+    AdmissionVerdict,
+    BounceReason,
+)
 from ..tier_c_decisions_log import (
     DECISION_LOG_AUTHOR_ROLES,
     DecisionLineScan,
@@ -135,7 +143,7 @@ from ..tier_c_decisions_log import (
     missing_decision_entries,
     scan_decision_lines,
 )
-from ..tier_c_security_holds import hold_release_ids
+from ..tier_c_security_holds import SecurityHold, hold_release_ids, read_hold_answers
 from ..turn_ref_snapshot import ContinuationScope
 from ..value_objects import (
     ChatroomEvent,
@@ -1569,6 +1577,12 @@ class Conductor:
             retry_lookup=(
                 self._tierc_gate.retry_lookup if self._tierc_gate is not None else never_retry
             ),
+            # T-tier-c-six-articles-security-boundary: the author's open holds become the
+            # ``tierc-v5-hold`` questions in the same call (msg-9661 §1.1⁵).
+            security_holds=[
+                HoldRef(hold_id=h.hold_id, held_msg_id=h.held_msg_id, held_basis=h.held_basis)
+                for h in self._open_security_holds(messages)
+            ],
         )
 
     async def _enforce_tierc_gate(
@@ -1609,6 +1623,9 @@ class Conductor:
         if not is_tierc_entry(author_requested_human=True, author_role=self._roster_role(author)):
             return None
         try:
+            # Read before admit: a bounce below may open a new hold, which this head must not be
+            # asked about (it was not in the questions Jev answered).
+            holds_before = self._open_security_holds(messages or [])
             decision = gate.admit(
                 body=_content(latest),
                 author=author,
@@ -1628,25 +1645,23 @@ class Conductor:
                 body = render_bounce_body(
                     author=author, decision=decision, bounced_msg_id=_msg_id(latest)
                 )
+            elif decision.rule == "RH-recheck":
+                # Always through the per-hold re-check, even if the holds read above came back
+                # empty (a read failure): ``admit`` saw a hold, so this head is never let through
+                # on the ordinary path (msg-9886 §2, fail-closed).
+                held = self._hold_recheck(
+                    gate, author, latest, decision, decider_result, holds_before
+                )
+                if held is None:
+                    return None
+                body = render_bounce_body(
+                    author=author, decision=held, bounced_msg_id=_msg_id(latest)
+                )
             else:
                 ask_score = self._jev_bounce_score(decision, decider_result)
                 if ask_score is None:
-                    # Delivered: nothing after the gate bounced it (msg-9650 §4). A failed write
-                    # is logged and the head still reaches the human — measurement, not a gate.
-                    try:
-                        gate.escalated(
-                            author=author,
-                            decision=decision,
-                            thread=self._thread_ref.thread_id,
-                            msg_id=_msg_id(latest),
-                            now=datetime.now(UTC),
-                        )
-                    except Exception:
-                        logger.warning(
-                            "tierc_gate ESCALATED row for msg=%s not written",
-                            _msg_id(latest),
-                            exc_info=True,
-                        )
+                    # Delivered: nothing after the gate bounced it (msg-9650 §4).
+                    self._write_escalated(gate, author, latest, decision, [])
                     return None
                 retry_uuid = gate.jev_bounce(
                     author=author,
@@ -3194,6 +3209,107 @@ class Conductor:
             logger.warning("G3 prefetch has no head msg id; carve-out ③ will close")
             return
         self._proceed_veto = (head_id, vetoed, ask_score)
+
+    def _hold_recheck(
+        self,
+        gate: TierCGate,
+        author: str,
+        latest: dict[str, Any],
+        decision: AdmissionDecision,
+        decider_result: DecisionResult | None,
+        holds: list[SecurityHold],
+    ) -> AdmissionDecision | None:
+        """Decide an ``RH-recheck`` head against each open hold (Bohr msg-9886 §2 / §3).
+
+        Returns the recorded bounce, or ``None`` when the head is delivered. **Fail-closed**: the
+        head is delivered only when the Decider runs in ``bounce`` mode, its result answers every
+        open hold (and ``unheld_unbased``) per hold id, every hold is answered ``supplemented``,
+        and the overall verdict is not ``LIKELY_NOT``. Otherwise it bounces:
+
+        * no hold read, no decider, a mode other than ``bounce``, no / malformed result, or an
+          answer missing for any hold → ``security-hold-no-verdict`` (re-sendable, nothing
+          delivered or released);
+        * any hold answered other than ``supplemented`` (``unsupplemented`` or ``unrelated``),
+          ``unheld_unbased`` answered ``yes`` (even with every hold supplemented), or an
+          actionable ``LIKELY_NOT`` → ``security-hold`` for the whole handoff.
+
+        On delivery the supplemented holds are released by the ``ESCALATED`` row itself, through
+        its ``holds_released`` stamp — the same replay path as a human's release (msg-9886 §3). If
+        that write fails the holds stay (msg-9779). A bounce releases nothing; it appends history
+        to every hold it touched and, when Jev says the head carries another unbased request,
+        opens a hold on it (msg-9663 §1.1⁶ (b)).
+        """
+        bounce_mode = self._decider is not None and self._decider.tierc_mode == "bounce"
+        raw = decider_result.raw_answers if decider_result is not None else None
+        answers = read_hold_answers(holds, raw if bounce_mode else None)
+        av = decider_result.actionable_verdict if decider_result is not None else None
+        likely_not = isinstance(av, TierCV2Verdict) and av.kind is TierCVerdictKind.LIKELY_NOT
+        if not holds or not answers.complete:
+            reason, hint = BounceReason.SECURITY_HOLD_NO_VERDICT, SECURITY_HOLD_NO_VERDICT_HINT
+        elif not answers.all_supplemented or likely_not or answers.unheld_unbased == UNHELD_YES:
+            # A head that supplements every hold but also carries another unbased security
+            # request is not delivered: it bounces whole and opens a hold on the new request
+            # (PR #599 gate round 1).
+            reason, hint = BounceReason.SECURITY_HOLD, SECURITY_HOLD_HINT
+        else:
+            self._write_escalated(gate, author, latest, decision, answers.supplemented_ids)
+            return None
+        complete = bool(holds) and answers.complete
+        return gate.hold_bounce(
+            author=author,
+            label=decision.normalized_label,
+            reason=reason,
+            hint=hint,
+            thread=self._thread_ref.thread_id,
+            msg_id=_msg_id(latest),
+            now=datetime.now(UTC),
+            body=_content(latest),
+            history=answers.history(reason.value) if complete else [],
+            open_new=complete and answers.unheld_unbased == UNHELD_YES,
+        )
+
+    def _write_escalated(
+        self,
+        gate: TierCGate,
+        author: str,
+        latest: dict[str, Any],
+        decision: AdmissionDecision,
+        released: list[str],
+    ) -> None:
+        """Write ``ESCALATED`` for a delivered head. A failed write is logged and the head still
+        reaches the human; the holds it would have released stay open (msg-9779)."""
+        try:
+            gate.escalated(
+                author=author,
+                decision=decision,
+                thread=self._thread_ref.thread_id,
+                msg_id=_msg_id(latest),
+                now=datetime.now(UTC),
+                holds_released=released,
+            )
+        except Exception:
+            logger.warning(
+                "tierc_gate ESCALATED row for msg=%s not written; its holds stay open",
+                _msg_id(latest),
+                exc_info=True,
+            )
+
+    def _open_security_holds(self, messages: list[dict[str, Any]]) -> list[SecurityHold]:
+        """The head author's open security holds in this thread, or ``[]`` with the gate off.
+
+        A read failure is logged and reads as no holds here; :meth:`TierCGate.admit` reads the
+        same log and its own failure takes the gate's existing fail-open path (condition 2)."""
+        if self._tierc_gate is None or not messages:
+            return []
+        try:
+            return self._tierc_gate.holds(
+                thread=self._thread_ref.thread_id,
+                author=_author(messages[-1]),
+                released_holds=self._hold_release_ids(messages),
+            )
+        except Exception:
+            logger.warning("security holds not readable; asking without them", exc_info=True)
+            return []
 
     def _hold_release_ids(self, messages: list[dict[str, Any]]) -> list[str]:
         """The hold ids a human released in this thread with ``HOLD-RELEASE: <id>`` (msg-9655
