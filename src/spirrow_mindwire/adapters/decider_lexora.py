@@ -67,7 +67,6 @@ from ..decider.questions import (
     SHOULD_ASK_HUMAN_KEY,
     TIERC_ESCALATION_QUESTIONS_VERSION,
     TIERC_QUESTIONS_VERSION,
-    TIERC_V2_PROCEED_QUESTIONS_VERSION,
     TierCRules,
     load_tierc_rules,
 )
@@ -186,9 +185,7 @@ async def decide_once(
     if rules is None and state.gate_result is None:
         raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
     body = build_decide_request(state, policy=policy, rules=rules, proceed=proceed)
-    v2_version = (
-        TIERC_V2_PROCEED_QUESTIONS_VERSION if proceed else TIERC_ESCALATION_QUESTIONS_VERSION
-    )
+    v2_version = str(body["questions_version"])
     version_fields: dict[str, Any] = (
         {"questions_version": TIERC_QUESTIONS_VERSION}
         if rules is None

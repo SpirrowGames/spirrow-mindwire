@@ -154,12 +154,16 @@ class TierCGate:
         thread: str,
         msg_id: str,
         now: datetime,
+        holds_released: Iterable[str] = (),
     ) -> None:
         """Record that the head was delivered to the human (``ESCALATED``, msg-9650 §4).
 
-        Written only once nothing after the gate bounced it. It releases no hold: in this part a
-        hold is released only by a human's ``HOLD-RELEASE:`` (PR #595 gate Obj-2, fix_cut); the
-        release of supplemented holds after delivery (msg-9661 §1.1⁵ 3.) comes with part 1b.
+        Written only once nothing after the gate bounced it. ``holds_released`` are the holds an
+        ``RH-recheck`` head was confirmed to supplement (Bohr msg-9886 §3): the row carries them
+        in the same ``holds_released`` stamp a human's ``HOLD-RELEASE:`` gets, so replay releases
+        them at this row — refusals before it stay in the hold's history, later ones open new
+        holds. The release exists only once this row is written: if the write fails, the holds
+        stay open (msg-9779). An empty ``holds_released`` adds no field.
         """
         retry_uuid = None
         for logged in decision.log_entries:
@@ -175,7 +179,58 @@ class TierCGate:
                 "retry_uuid": retry_uuid,
             },
         )
+        released = list(dict.fromkeys(holds_released))
+        if released:
+            entry = replace(entry, payload={**entry.payload, "holds_released": released})
         append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
+
+    def hold_bounce(
+        self,
+        *,
+        author: str,
+        label: str | None,
+        reason: BounceReason,
+        hint: str,
+        thread: str,
+        msg_id: str,
+        now: datetime,
+        body: str,
+        history: list[dict[str, object]],
+        open_new: bool,
+    ) -> AdmissionDecision:
+        """Record the bounce of an ``RH-recheck`` head that may not pass its holds (msg-9661
+        §1.1⁵, msg-9663 §1.1⁶) and return it as a bounce decision for the notice.
+
+        ``history`` appends to the holds this head touched (§1.1⁶ (a)); ``open_new`` opens a new
+        semantic hold on this message (§1.1⁶ (b), ``unheld_unbased = yes``). Nothing is released.
+        """
+        retry_uuid = self.uuid_factory()
+        payload: dict[str, object] = {
+            "ts": now.isoformat(),
+            "author": author,
+            "reason": reason.value,
+            "label": label,
+            "hint": hint,
+            "retry_uuid": retry_uuid,
+            "hold_history": history,
+        }
+        if open_new:
+            payload |= {
+                "security_hold": True,
+                "hold_kind": "semantic",
+                "held_basis": check_security_basis(body).basis,
+                "body_sha256": normalized_body_sha256(body),
+            }
+        entry = LogEntry(kind=LogKind.BOUNCED, payload=payload)
+        append_log_entries(self.log_path, [entry], thread=thread, msg_id=msg_id)
+        return AdmissionDecision(
+            verdict=AdmissionVerdict.BOUNCE,
+            rule="RH-relation",
+            bounce_reason=reason,
+            bounce_hint=hint,
+            normalized_label=label,
+            log_entries=[entry],
+        )
 
     def jev_bounce(
         self,
@@ -276,12 +331,37 @@ def render_bounce_body(*, author: str, decision: AdmissionDecision, bounced_msg_
         "- どれかの種類に当たるなら、`NEXT: human` のすぐ上の行に `TIER-C: <label>` を書いて"
         "出し直してください。\n"
         "- どれにも当たらないなら、人に上げずに自分で決めて進めてください。\n"
-        "- それでも人の判断が要ると考えるなら、返信に次の1行をそのまま単独で書いてください。"
-        "この差し戻しに対して1回だけ、ラベルに関係なく人へ通します。\n\n"
+        f"{_retry_bullet(decision.bounce_reason)}\n\n"
         f"RETRY: {retry_uuid}\n\n"
         "この post は conductor の書き戻しです (author: `conductor-relay`、role: なし。"
         "T-decider-conductor-hook DECIDED 2e-1b)。\n\n"
         f"NEXT: {author}"
+    )
+
+
+#: Bounces a RETRY does not force through: a security request without its basis, or one that
+#: meets an open security hold (msg-9650 §1.1, msg-9653 §1.1'). The notice must not promise
+#: otherwise.
+_HOLDING_REASONS: frozenset[BounceReason] = frozenset(
+    {
+        BounceReason.SECURITY_BASIS_MISSING,
+        BounceReason.SECURITY_BASIS_MALFORMED,
+        BounceReason.SECURITY_HOLD,
+        BounceReason.SECURITY_HOLD_NO_VERDICT,
+    }
+)
+
+
+def _retry_bullet(reason: BounceReason | None) -> str:
+    if reason in _HOLDING_REASONS:
+        return (
+            "- セキュリティの申請は、根拠 (場所、または何をどこまで広げるか) を補わない限り、"
+            "下の `RETRY:` 行を付けても人へは通りません。根拠を補って出し直すか、"
+            "人に上げずに `DECIDED:` / `DEFERRED:` で残してください。"
+        )
+    return (
+        "- それでも人の判断が要ると考えるなら、返信に次の1行をそのまま単独で書いてください。"
+        "この差し戻しに対して1回だけ、ラベルに関係なく人へ通します。"
     )
 
 

@@ -18,11 +18,14 @@ matter:
   hold of the same pair, in which case it is appended to that hold's history (msg-9665 §1.1⁷);
 * a row carrying ``hold_history: [{hold_id, relation, outcome}, ...]`` appends to those holds
   (msg-9663 §1.1⁶ (a));
-* nothing in the log releases a hold. Only a human's ``HOLD-RELEASE: <hold_id>`` line does
-  (msg-9655 §1.1''; PR #595 gate Obj-2, fix_cut — the release of supplemented holds after
-  delivery, msg-9661 §1.1⁵ 3., comes with part 1b). It lives in the thread, not in the log, so
-  the caller passes the released ids in. A released hold never absorbs a later refusal: an
-  identical body refused after the release opens a new hold (PR #595 gate Obj-3).
+* a row carrying ``holds_released: [<hold_id>, ...]`` releases those holds at that row. There
+  are two writers and one replay path (Bohr msg-9886 §3): the gate stamps a human's
+  ``HOLD-RELEASE: <hold_id>`` line (msg-9655 §1.1'') on the rows it next writes, and the
+  ``ESCALATED`` row of a delivered ``RH-recheck`` head carries the holds Jev confirmed it
+  supplements (part 1b; written only after delivery, so a failed write releases nothing,
+  msg-9779). A human's line lives in the thread, so the caller also passes those ids in. A
+  released hold never absorbs a later refusal: an identical body refused after the release
+  opens a new hold (PR #595 gate Obj-3).
 
 Release ordering (PR #595 gate round 2): the thread line carries no position in the log, so the
 gate stamps it there. The first rows it writes after it sees a release carry
@@ -38,11 +41,20 @@ thread.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .decider.questions import (
+    HOLD_SUPPLEMENTED,
+    HOLD_UNRELATED,
+    HOLD_UNSUPPLEMENTED,
+    UNHELD_NO,
+    UNHELD_UNBASED_KEY,
+    UNHELD_YES,
+    hold_relation_key,
+)
 from .tier_c_admission_gate import LogKind
 from .tier_c_decisions_log import iter_rows
 
@@ -155,10 +167,73 @@ def _open_or_append(
     )
 
 
+@dataclass(frozen=True)
+class HoldAnswers:
+    """Jev's answers to the ``tierc-v5-hold`` questions, read per hold (msg-9661 §1.1⁵).
+
+    ``relations`` maps each asked hold id to ``supplemented`` / ``unsupplemented`` /
+    ``unrelated``; a hold whose answer is missing or not one of those is absent, and then
+    ``complete`` is ``False`` (no verdict — nothing may be delivered or released).
+    """
+
+    relations: dict[str, str]
+    unheld_unbased: str | None
+    complete: bool
+
+    @property
+    def all_supplemented(self) -> bool:
+        """Every asked hold answered ``supplemented`` — the only answer that admits (Bohr
+        msg-9886 §2). ``False`` for no holds: there is nothing to have supplemented."""
+        return bool(self.relations) and all(r == HOLD_SUPPLEMENTED for r in self.relations.values())
+
+    @property
+    def supplemented_ids(self) -> list[str]:
+        return sorted(h for h, r in self.relations.items() if r == HOLD_SUPPLEMENTED)
+
+    def history(self, outcome: str) -> list[dict[str, Any]]:
+        """§1.1⁶ (a): an entry for every hold the handoff touched, delivered or not."""
+        return [
+            {"hold_id": hold_id, "relation": relation, "outcome": outcome}
+            for hold_id, relation in sorted(self.relations.items())
+            if relation in (HOLD_SUPPLEMENTED, HOLD_UNSUPPLEMENTED)
+        ]
+
+
+_RELATIONS = frozenset({HOLD_SUPPLEMENTED, HOLD_UNSUPPLEMENTED, HOLD_UNRELATED})
+
+
+def _choice(answers: Mapping[str, Any] | None, key: str, allowed: frozenset[str]) -> str | None:
+    if answers is None:
+        return None
+    answer = answers.get(key)
+    choice = answer.get("choice") if isinstance(answer, Mapping) else None
+    return choice if isinstance(choice, str) and choice in allowed else None
+
+
+def read_hold_answers(
+    holds: Iterable[SecurityHold], answers: Mapping[str, Any] | None
+) -> HoldAnswers:
+    """Each hold's relation from Jev's raw answers, independently (one question per hold)."""
+    relations: dict[str, str] = {}
+    complete = True
+    for hold in holds:
+        relation = _choice(answers, hold_relation_key(hold.hold_id), _RELATIONS)
+        if relation is None:
+            complete = False
+        else:
+            relations[hold.hold_id] = relation
+    unheld = _choice(answers, UNHELD_UNBASED_KEY, frozenset({UNHELD_YES, UNHELD_NO}))
+    return HoldAnswers(
+        relations=relations, unheld_unbased=unheld, complete=complete and unheld is not None
+    )
+
+
 __all__ = [
     "HOLD_RELEASE_KEYWORD",
+    "HoldAnswers",
     "SecurityHold",
     "hold_release_ids",
     "open_holds",
+    "read_hold_answers",
     "stamped_releases",
 ]
