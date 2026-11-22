@@ -75,6 +75,7 @@ $needed = @(
     'New-MaterialUrl',
     'Get-ComposerReadHead',
     'Get-ParkedLaneFields',
+    'Get-RulesHashField',
     # 2e-2b-2: lifted so its output parsing is tested below; then replaced by a stub (the seam).
     'Get-JevMaterial',
     'Push-DecisionMaterial',
@@ -1428,7 +1429,7 @@ $r = Invoke-JevPush -Jev $null
 $b = $script:materialLastCall.BodyJson | ConvertFrom-Json
 Check 'jev absent: the PUT is still sent' 1 $script:materialCallCount
 CheckTrue 'jev absent: no jev key in the body' (-not ($b.PSObject.Properties.Name -contains 'jev')) $script:materialLastCall.BodyJson
-CheckTrue 'jev absent: log line says jev=absent' ((Get-Logged) -match 'material push: p/T-jev head=msg-777 replaced=False jev=absent \(42 ms\)') (Get-Logged)
+CheckTrue 'jev absent: log line says jev=absent' ((Get-Logged) -match 'material push: p/T-jev head=msg-777 replaced=False jev=absent rules_hash=absent \(42 ms\)') (Get-Logged)
 Check 'jev absent: outcome pushed' 'pushed' $r.outcome
 
 # A failed lookup is fail-open: PUT without jev, the reason on the push line, one PUT (no retry).
@@ -1443,7 +1444,7 @@ $script:materialReturn = @{ ok = $false; status = 400; body = '{"detail":"invali
 $r = Invoke-JevPush -Jev $jevObj
 Check 'PUT 400 with jev: one PUT, no retry without jev' 1 $script:materialCallCount
 Check 'PUT 400 with jev: outcome missing (existing fail-open path)' 'missing' $r.outcome
-CheckTrue 'PUT 400 with jev: failure line says jev=present' ((Get-Logged) -match 'material push FAILED \(non-fatal\): p/T-jev head=msg-777 jev=present — HTTP 400') (Get-Logged)
+CheckTrue 'PUT 400 with jev: failure line says jev=present' ((Get-Logged) -match 'material push FAILED \(non-fatal\): p/T-jev head=msg-777 jev=present rules_hash=absent — HTTP 400') (Get-Logged)
 $script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
 
 # A throwing seam is a wiring bug, but must not sink the push.
@@ -1504,6 +1505,57 @@ Check 'real: unparseable stdout -> error' 'output unparseable' $g.error
 $script:probeReturn = @{ ok = $true; timedOut = $false; code = 0; stdout = '{"other": 1}'; stderr = ''; error = $null }
 $g = & $script:realGetJevMaterial -Project 'p' -ThreadId 'T-a' -HeadMsgId 'msg-9'
 Check 'real: no jev key -> error' 'output has no jev key' $g.error
+function Write-Log { param([string]$Message) }
+
+# ===============================================================================================
+# T-material-put-sends-rules-hash (Bohr msg-9992 §3 / msg-9994): extras.rules_hash -> the PUT body's
+# `rules_hash` when non-empty, the key left out otherwise; the push log line always says
+# rules_hash=<sha>|absent (the "value B sent" source for Done-when 1).
+# ===============================================================================================
+Write-Host ''
+Write-Host '--- rules_hash on the material PUT ---'
+$script:logLines = New-Object System.Collections.Generic.List[string]
+function Write-Log { param([string]$Message) $script:logLines.Add($Message) }
+$script:jevReturn = @{ jev = $null; error = $null }
+$rulesSha = 'a' * 64
+function Invoke-RulesHashPush {
+    param($Envelope)
+    Reset-MaterialSpy
+    $script:logLines.Clear()
+    Push-DecisionMaterial -NotifyState @{} -Key 'p/T-rh' -Signature 'human:msg-1' `
+        -Project 'p' -ThreadId 'T-rh' -StopReason 'human' -Envelope $Envelope | Out-Null
+    return $script:materialLastCall.BodyJson
+}
+foreach ($shape in @('hashtable', 'pscustomobject')) {
+    $json = Invoke-RulesHashPush (New-ParkedEnvelope $shape @{ rules_hash = $rulesSha; rules_snapshot = 'saved' })
+    Check "${shape}: rules_hash present -> carried on the body" $rulesSha ($json | ConvertFrom-Json).rules_hash
+    $logged = $script:logLines -join "`n"
+    CheckTrue "${shape}: pushed log line carries rules_hash=<sha>" `
+        ($logged -match "material push: p/T-rh head=msg-777 .*rules_hash=$rulesSha rules_snapshot=saved") $logged
+
+    $json = Invoke-RulesHashPush (New-ParkedEnvelope $shape @{})
+    CheckTrue "${shape}: rules_hash absent -> key absent from the body" `
+        (-not (($json | ConvertFrom-Json).PSObject.Properties.Name -contains 'rules_hash')) $json
+    CheckTrue "${shape}: rules_hash absent -> never sent as null" (-not ($json -match '"rules_hash"')) $json
+    $logged = $script:logLines -join "`n"
+    CheckTrue "${shape}: pushed log line says rules_hash=absent" ($logged -match 'material push: .*rules_hash=absent') $logged
+
+    $json = Invoke-RulesHashPush (New-ParkedEnvelope $shape @{ rules_hash = '' })
+    CheckTrue "${shape}: empty rules_hash -> key absent from the body" (-not ($json -match '"rules_hash"')) $json
+
+    $json = Invoke-RulesHashPush (New-ParkedEnvelope $shape @{ rules_hash_error = 'TierCRulesError: not readable' })
+    CheckTrue "${shape}: hash failed -> key absent from the body" (-not ($json -match '"rules_hash"')) $json
+    $logged = $script:logLines -join "`n"
+    CheckTrue "${shape}: hash failed -> log line carries rules_hash_error" `
+        ($logged -match 'rules_hash=absent \(rules_hash_error: TierCRulesError: not readable\)') $logged
+}
+# A failed PUT logs the hash it tried to send, too.
+$script:materialReturn = @{ ok = $false; status = 500; body = 'boom'; elapsed_ms = 1; error = $null }
+$json = Invoke-RulesHashPush (New-ParkedEnvelope 'hashtable' @{ rules_hash = $rulesSha; rules_snapshot = 'failed' })
+$logged = $script:logLines -join "`n"
+CheckTrue 'PUT failed: FAILED log line carries rules_hash=<sha>' `
+    ($logged -match "material push FAILED .*rules_hash=$rulesSha rules_snapshot=failed — HTTP 500") $logged
+$script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
 function Write-Log { param([string]$Message) }
 
 Write-Host ''

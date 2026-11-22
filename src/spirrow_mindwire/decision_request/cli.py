@@ -77,6 +77,7 @@ import json
 import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from .claude_code import (
     DEFAULT_CLAUDE_CLI,
@@ -97,6 +98,9 @@ from .value_objects import (
     DecisionRequestInput,
     ThreadTailMessage,
 )
+
+if TYPE_CHECKING:
+    from spirrow_mindwire.config import MindwireSettings
 
 INPUT_SCHEMA_VERSION = 1
 
@@ -488,6 +492,66 @@ def _parked_lane_extras(head_body: str) -> dict[str, str]:
     return out
 
 
+#: The envelope extras keys carrying the v2 Tier-C rule file hash (T-material-put-sends-rules-hash,
+#: Bohr msg-9992 §1-§2 / msg-9994, Einstein msg-9993 / approved). Only :func:`main` writes them:
+#: a same-named key from the composer is dropped, then the CLI's own values are put in.
+_RULES_HASH_KEYS: tuple[str, ...] = ("rules_hash", "rules_hash_error", "rules_snapshot")
+
+
+def _load_rules_settings() -> MindwireSettings:
+    """The settings the rules hash is resolved from. A seam so tests can inject a failure."""
+    from spirrow_mindwire.config import load_settings
+
+    return load_settings()
+
+
+def _rules_hash_extras() -> dict[str, str]:
+    """Hash the v2 Tier-C rule file as it is now, for the material PUT's ``rules_hash``.
+
+    Uses the same path and the same hash as the live Decider (:func:`resolve_tierc_rules_path`,
+    :func:`load_tierc_rules` -> :attr:`TierCRules.sha256`, hex sha256 of the raw bytes), so the
+    value equals ``rules_sha256`` in the Decider log for the same file content. It does not
+    depend on ``[decider]`` being enabled: ``build_decider`` returns before loading the rules when
+    the Decider is off, and the rules hash is sent anyway (msg-1393 §2).
+
+    Returns one of:
+
+    * ``{"rules_hash": <sha>, "rules_snapshot": "saved" | "failed"}`` — the snapshot under
+      :func:`resolve_tierc_rules_snapshot_dir` is **best effort** (Obj-1-1, msg-9994): a failed
+      save does not withhold the hash. Verification (Done-when 1) uses the wrapper's
+      ``material push`` log line; ``<sha>.toml`` is a second source only when ``saved``.
+    * ``{"rules_hash_error": "<ExcType>: <msg>"}`` — settings load, path resolution or rule loading
+      failed. No ``rules_hash`` key: the PUT still goes out (D-34 fail-open), and an omitted key
+      means "not sent" on the receiver (never ``null``).
+
+    Never raises: the envelope must come back on stdout whatever happens here (I-2).
+    """
+    try:
+        from spirrow_mindwire.config import (
+            resolve_tierc_rules_path,
+            resolve_tierc_rules_snapshot_dir,
+        )
+        from spirrow_mindwire.decider.questions import load_tierc_rules
+
+        settings = _load_rules_settings()
+        path = resolve_tierc_rules_path(settings)
+        rules = load_tierc_rules(path)
+    except Exception as exc:
+        return {"rules_hash_error": f"{type(exc).__name__}: {exc}"}
+    out = {"rules_hash": rules.sha256}
+    # Everything snapshot-related, including resolving the snapshot directory, sits in this
+    # snapshot-only try: a failure here must not withhold the hash already computed above.
+    try:
+        from spirrow_mindwire.adapters.decider_lexora import snapshot_tierc_rules
+
+        snapshot_dir = resolve_tierc_rules_snapshot_dir(settings)
+        saved = snapshot_tierc_rules(rules, snapshot_dir)
+    except Exception:  # snapshot_tierc_rules never raises; resolver/import failures still must not.
+        saved = False
+    out["rules_snapshot"] = "saved" if saved else "failed"
+    return out
+
+
 # Module-level default: swappable in tests by monkey-patching this attribute
 # on the :mod:`.cli` module (kept separate from a --flag so tests do not
 # need to route a fetcher through argparse).
@@ -688,6 +752,12 @@ def main(argv: list[str] | None = None) -> int:
         merged = {k: v for k, v in envelope.extras.items() if k not in _PARKED_LANE_KEYS}
         merged.update(parked_extras)
         envelope = dataclasses.replace(envelope, extras=merged)
+    # The rules-hash keys (_RULES_HASH_KEYS) are this CLI's alone, like the parked-lane keys: drop
+    # any the composer returned, then put in the values computed here (Obj-1-3, msg-9994).
+    rules_extras = _rules_hash_extras()
+    merged = {k: v for k, v in envelope.extras.items() if k not in _RULES_HASH_KEYS}
+    merged.update(rules_extras)
+    envelope = dataclasses.replace(envelope, extras=merged)
     # D-33 (msg-1394 §14.3): stdout JSON is ASCII-only. The wrapper reads this pipe as UTF-8,
     # but on Windows the child's ``sys.stdout`` encoding is inherited from the console code page
     # (cp932 on the deploy host) and there is no exception path when the two disagree — the
