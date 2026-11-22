@@ -13,25 +13,50 @@ classified into exactly one of nine classes (:data:`CLASSES`, first match wins).
 ``a_prime_heredoc`` (a lone ``gh`` write whose body arrives through one quoted heredoc and whose
 other arguments pass the inline allowlist plus the stdin option) and
 ``a_prime_inline`` (a lone ``gh`` write whose arguments are all literal and on the allowlist)
-are allowed; everything else is denied before the command runs. A Bash call with no ``gh`` write
-passes untouched.
+are allowed; everything else is denied before the command runs.
 
-Scope: what it judges and what it lets through untouched (msg-9306 §1). Only calls that match the
-approved gh-write definition (:func:`gh_write`: ``pr``/``issue`` ``create|comment|edit|review``;
-``api`` with a write method or a field / ``--input``; ``pr``/``issue``/``release``/``gist`` with a
-body option; the four positional-file commands) are classified. Every other ``gh`` call is NOT
-judged and runs as it is — for example ``gh label create``, ``gh pr merge --squash`` (no body
-option), ``gh variable set``, ``gh secret set``, ``gh repo edit --description``. That is a known,
-intended boundary, not an oversight: whether to bring those calls under the guard (L-p2, measured
-first by M-10i) changes behaviour that is allowed today, so it is a human goal decision taken in
-the thread, not here. Making the boundary explicit does not make it safer; those writes still go
-out unjudged. ``test_scope_boundary_calls_outside_the_definition_pass`` (in
-``tests/test_gh_write_guard.py``) pins it so it cannot move silently.
+L-p2: every other ``gh`` call (msg-9821 §1-§2 + msg-9823, approved by Einstein in msg-9824,
+handed to implementation by the human post after msg-9850; Takahito's ruling msg-9797). A ``gh``
+call outside the approved gh-write definition (:func:`gh_write`: ``pr``/``issue``
+``create|comment|edit|review``; ``api`` with a write method or a field / ``--input``;
+``pr``/``issue``/``release``/``gist`` with a body option; the four positional-file commands) is no
+longer let through unjudged. It is judged by the ``<group> <sub>`` table :data:`L2_ALLOW` and, on
+an allowed row, by the argument shapes of rule R-d (:func:`judge_table`). Anything not on the table
+is denied (fail-closed): ``gh auth token`` and an ``auth status`` with arguments other than
+``-a``/``--active`` as ``gh_auth_token``; ``variable`` and ``secret set|delete`` as
+``gh_secret_value``; ``search`` and ``-S``/``--search`` as ``gh_search_text``; everything else —
+including ``gh api`` outside the write definition, ``gh`` alone, ``--version`` and options before
+the group — as ``gh_not_in_table``. ``auth setup-git`` is allowed as an explicit exception to rule
+R-c (it changes git's credential helper) because the ``gh_auth_token`` deny text points to it
+(msg-9797 §4) and it prints no token. Aliases are resolved first, from the gh 2.92.0 vocabulary.
+
+How the two judgements combine (msg-9821 §1, msg-9823 Obj-27-1). Every ``gh`` node in the command
+gets a verdict — a node inside the gh-write definition the L-p verdict of the whole command, any
+other node the table's — and :func:`combine` folds them in node order: one deny denies the whole
+command and the first deny names the class; an allow never ends the judgement early. A wrapper
+shell (``bash -c``) whose argument contains a ``gh`` word, and a launcher (``env``, ``xargs``,
+``time``, ...) with a ``gh`` argument, are denied as ``gh_not_in_table``: the table cannot see the
+shape of the call inside.
 
 What it does NOT do (ADR-2026-05-23-07 §8 decision 3, msg-9299 §6). This narrows the *shape* of
 ``gh`` writes so that the body of a write is a literal fixed in the command string. It does not
 close the path to GitHub: ``git push``, another program going out through the proxy, and the
 content of an allowed write itself are all untouched. It is not a guarantee that nothing leaves.
+For L-p2 two different things remain (msg-9823 §2):
+
+* narrower restrictions not taken this time — limiting ``-R`` and an ``owner/repo`` positional to
+  the clone's ``origin``, and a branch to a ref that exists locally. Both need the hook to read
+  git state at call time; they are a separate design, recorded as candidates.
+* what an allowed operation carries by nature — the PR / run number or name needed to perform it
+  is sent to GitHub as long as the operation is allowed, and would be even with the narrower
+  restrictions above. R-d restricts the *form* of an argument (``owner/repo``, branch, tag, number
+  shapes), not whether its value is safe: ``gh repo view <any name-shaped text>`` passes R-d and
+  is sent.
+
+Launch boundary (msg-9817 §0 as corrected by Obj-25-3). With the launch procedures examined in the
+thread (direct launch, a preceding ``test``), a safe launch boundary has not been established:
+diagnostics a program prints before it starts (a fatal interpreter error, for example) can reach
+the session context. That stays open and recorded; this module does not address it.
 
 Where it sits (ADR-2026-05-23-07 §7, msg-9301 §3). The roles' tool surfaces (``tools=``,
 ``mcp_servers``, session isolation) are unchanged; ``tests/test_role_tool_surface.py`` passes as
@@ -58,7 +83,8 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from claude_agent_sdk import HookContext, HookInput, HookJSONOutput, HookMatcher
@@ -843,6 +869,393 @@ def classify(cmd: str) -> str:
     return classify_ex(cmd)[0]
 
 
+# ---------------------------------------------------------- L-p2: the out-of-definition table
+#: L-p2 classes (msg-9819 §3, kept by msg-9821 §3). Every one of them denies.
+L2_CLASSES: tuple[str, ...] = (
+    "gh_auth_token",
+    "gh_secret_value",
+    "gh_search_text",
+    "gh_not_in_table",
+)
+
+#: Built-in aliases of gh 2.92.0, copied from the ``alias`` lines of the M-10j vocabulary
+#: ``gh_vocab_2.92.0.txt`` (sha256 ``be71a8761eb9…``, the canonical input named in msg-9817 §1;
+#: user aliases excluded). Top-level group aliases first, then ``(group, sub)`` aliases.
+GH_GROUP_ALIASES: dict[str, str] = {
+    "agents": "agent-task",
+    "at": "attestation",
+    "cs": "codespace",
+    "ext": "extension",
+    "rs": "ruleset",
+    "skills": "skill",
+}
+GH_SUB_ALIASES: dict[tuple[str, str], str] = {
+    ("alias", "ls"): "list",
+    ("cache", "ls"): "list",
+    ("codespace", "ls"): "list",
+    ("config", "ls"): "list",
+    ("extension", "ls"): "list",
+    ("gist", "ls"): "list",
+    ("gist", "new"): "create",
+    ("gpg-key", "ls"): "list",
+    ("issue", "ls"): "list",
+    ("issue", "new"): "create",
+    ("label", "ls"): "list",
+    ("org", "ls"): "list",
+    ("pr", "co"): "checkout",
+    ("pr", "ls"): "list",
+    ("pr", "new"): "create",
+    ("project", "ls"): "list",
+    ("release", "ls"): "list",
+    ("release", "new"): "create",
+    ("repo", "ls"): "list",
+    ("repo", "new"): "create",
+    ("ruleset", "ls"): "list",
+    ("run", "ls"): "list",
+    ("secret", "ls"): "list",
+    ("secret", "remove"): "delete",
+    ("skill", "add"): "install",
+    ("skill", "show"): "preview",
+    ("ssh-key", "ls"): "list",
+    ("variable", "ls"): "list",
+    ("variable", "remove"): "delete",
+    ("workflow", "ls"): "list",
+}
+
+#: msg-9821 §2: the allowed rows (R-a, R-b, and R-c's one exception ``auth setup-git``). A
+#: ``(group, sub)`` not here is denied. ``auth status`` is judged on its own (:func:`_judge_auth`).
+_PR_ALLOW = (
+    "list",
+    "view",
+    "diff",
+    "checks",
+    "status",
+    "checkout",
+    "ready",
+    "update-branch",
+    "close",
+    "reopen",
+    "merge",
+)
+L2_ALLOW: frozenset[tuple[str, str]] = frozenset(
+    {
+        *(("pr", s) for s in _PR_ALLOW),
+        *(("issue", s) for s in ("list", "view", "status", "close", "reopen")),
+        *(("run", s) for s in ("list", "view", "watch", "download")),
+        ("workflow", "list"),
+        ("workflow", "view"),
+        ("repo", "view"),
+        ("repo", "clone"),
+        *(("release", s) for s in ("list", "view", "download")),
+        ("label", "list"),
+        ("secret", "list"),
+        ("cache", "list"),
+        *(("ruleset", s) for s in ("list", "view", "check")),
+        ("auth", "setup-git"),
+    }
+)
+
+#: msg-9821 §2.1 (R-d): the argument shapes an allowed row accepts. The shapes restrict the *form*
+#: of a value only; they do not judge whether the value is safe to send (msg-9823 §1).
+_L2_NUMBER = re.compile(r"[0-9]+")
+_L2_NAME = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?")
+_L2_OWNER_REPO = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+_L2_JSON_FIELDS = re.compile(r"[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*")
+_L2_STATES = frozenset({"open", "closed", "merged", "all"})
+
+
+def _l2_number(v: str) -> bool:
+    return _L2_NUMBER.fullmatch(v) is not None
+
+
+def _l2_name(v: str) -> bool:
+    return _L2_NAME.fullmatch(v) is not None
+
+
+def _l2_owner_repo(v: str) -> bool:
+    return _L2_OWNER_REPO.fullmatch(v) is not None
+
+
+def _l2_json_fields(v: str) -> bool:
+    return _L2_JSON_FIELDS.fullmatch(v) is not None
+
+
+def _l2_state(v: str) -> bool:
+    return v in _L2_STATES
+
+
+def _l2_any(_v: str) -> bool:
+    return True
+
+
+#: Value-taking options every allowed row accepts, with the shape of their value.
+#: ``--jq`` / ``--template`` only format the response locally, so any literal value is accepted.
+_L2_COMMON_VAL: dict[str, Callable[[str], bool]] = {
+    "-R": _l2_owner_repo,
+    "--repo": _l2_owner_repo,
+    "--json": _l2_json_fields,
+    "--jq": _l2_any,
+    "--template": _l2_any,
+    "-L": _l2_number,
+    "--limit": _l2_number,
+}
+#: ``list`` rows also take ``-s``/``--state`` with a fixed word.
+_L2_STATE_VAL: dict[str, Callable[[str], bool]] = {"-s": _l2_state, "--state": _l2_state}
+_L2_ARTIFACT_VAL: dict[str, Callable[[str], bool]] = {
+    "-n": _l2_name,
+    "--name": _l2_name,
+    "-p": _l2_name,
+    "--pattern": _l2_name,
+}
+#: Row-specific value-taking options (msg-9821 §2.1 "行ごとに足す option"). ``-D``/``--dir`` is
+#: deliberately absent.
+_L2_ROW_VAL: dict[tuple[str, str], dict[str, Callable[[str], bool]]] = {
+    ("run", "download"): _L2_ARTIFACT_VAL,
+    ("release", "download"): _L2_ARTIFACT_VAL,
+}
+#: Row-specific flags (no value).
+_L2_ROW_FLAGS: dict[tuple[str, str], frozenset[str]] = {
+    ("pr", "merge"): frozenset(
+        {"--squash", "--merge", "--rebase", "-d", "--delete-branch", "--auto"}
+    ),
+    ("pr", "checks"): frozenset({"--watch", "--exit-status"}),
+    ("run", "watch"): frozenset({"--watch", "--exit-status"}),
+    ("run", "view"): frozenset({"--log-failed"}),
+}
+#: Options that send search text (msg-9819 §3 puts ``--search`` under ``gh_search_text``).
+_L2_SEARCH_OPTS = frozenset({"-S", "--search"})
+#: ``auth status`` is allowed bare or with exactly these; anything else may print the token.
+_L2_AUTH_STATUS_OK = frozenset({"-a", "--active"})
+#: Programs that run their arguments as a command (``env gh auth token``): a ``gh`` word among
+#: their arguments is a gh call whose shape the table cannot see, so it is denied.
+LAUNCHERS = frozenset(
+    {
+        "env",
+        "command",
+        "builtin",
+        "exec",
+        "time",
+        "nice",
+        "nohup",
+        "xargs",
+        "sudo",
+        "timeout",
+        "stdbuf",
+        "setsid",
+    }
+)
+
+
+def _is_gh_name(word: str) -> bool:
+    return word.replace("\\", "/").rsplit("/", 1)[-1].lower() in GH_NAMES
+
+
+def _row_args_ok(row: tuple[str, str], args: list[str]) -> str | None:
+    """``None`` when every argument of an allowed row has an accepted shape (R-d), otherwise the
+    denying class key. Nothing taken from ``args`` is ever returned."""
+    vals = dict(_L2_COMMON_VAL)
+    if row[1] == "list":
+        vals.update(_L2_STATE_VAL)
+    vals.update(_L2_ROW_VAL.get(row, {}))
+    flags = _L2_ROW_FLAGS.get(row, frozenset())
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and a != "-":
+            key, att = a, None
+            if a.startswith("--") and "=" in a:
+                key, att = a.split("=", 1)
+            if key in _L2_SEARCH_OPTS or (
+                not a.startswith("--") and len(a) > 2 and a[:2] in _L2_SEARCH_OPTS
+            ):
+                return "gh_search_text"
+            if key in flags and att is None:
+                i += 1
+                continue
+            check = vals.get(key)
+            if check is None:
+                return "gh_not_in_table"
+            if att is None:
+                if i + 1 >= len(args):
+                    return "gh_not_in_table"
+                i += 1
+                att = args[i]
+            if not check(att):
+                return "gh_not_in_table"
+        elif not (_l2_number(a) or _l2_name(a)):
+            return "gh_not_in_table"
+        i += 1
+    return None
+
+
+def _judge_auth(sub: str, args: list[str]) -> str | None:
+    if sub == "token":
+        return "gh_auth_token"
+    if sub == "status":
+        return None if all(a in _L2_AUTH_STATUS_OK for a in args) else "gh_auth_token"
+    if sub == "setup-git":
+        return _row_args_ok(("auth", sub), args)
+    return "gh_not_in_table"
+
+
+def judge_table(argv: list[str]) -> str | None:
+    """L-p2 verdict for one ``gh`` call outside the gh-write definition (msg-9821 §2).
+
+    ``argv`` holds literal values with ``argv[0]`` the ``gh`` name. ``None`` = allowed; otherwise
+    the denying class key. Options before the group or the sub, a missing group or sub, ``api``
+    outside the write definition (Obj-26-1 cut) and anything else not on the table are
+    ``gh_not_in_table`` (fail-closed).
+    """
+    if len(argv) < 2:
+        return "gh_not_in_table"  # `gh` alone
+    group = GH_GROUP_ALIASES.get(argv[1], argv[1])
+    if group.startswith("-"):
+        return "gh_not_in_table"  # `gh --version`, `gh -R o/r pr view 1`
+    if group == "search":
+        return "gh_search_text"
+    if group == "variable":
+        return "gh_secret_value"
+    if len(argv) < 3 or argv[2].startswith("-"):
+        return "gh_not_in_table"  # `gh pr`, `gh api /user`, `gh pr -R o/r view 1`
+    sub = GH_SUB_ALIASES.get((group, argv[2]), argv[2])
+    args = argv[3:]
+    if group == "secret" and sub in ("set", "delete"):
+        return "gh_secret_value"
+    if group == "auth":
+        return _judge_auth(sub, args)
+    if (group, sub) not in L2_ALLOW:
+        return "gh_not_in_table"
+    return _row_args_ok((group, sub), args)
+
+
+# ---------------------------------------------------------------------- combining the verdicts
+@dataclass(frozen=True)
+class Verdict:
+    """One ``gh`` node's verdict. ``key`` is the denying class, ``None`` when allowed."""
+
+    allowed: bool
+    key: str | None = None
+
+
+ALLOW = Verdict(True)
+
+
+def combine(verdicts: Sequence[Verdict]) -> Verdict:
+    """msg-9821 §1 step 3 / msg-9823 Obj-27-1: the whole command's verdict from every ``gh``
+    node's verdict, in node order. Any deny denies the whole command and the first deny decides
+    the class; an allow never ends the judgement early. No node at all is an allow."""
+    for v in verdicts:
+        if not v.allowed:
+            return v if v.key is not None else Verdict(False, "guard_error")
+    return ALLOW
+
+
+_READ_METHODS = frozenset({"GET", "HEAD"})
+_MERGE_SUBJECT_OPTS = frozenset({"-t", "--subject"})
+
+
+def _write_overlay(argv: list[str]) -> str | None:
+    """The L-p2 deny a node inside the gh-write definition still gets, whatever L-p says of it.
+
+    Two shapes the L-p allowlist admits carry free text the L-p2 table rules out:
+
+    * ``gh api`` with an explicit read method (``--method GET -f probe=...``): the fields become
+      the query of a GET, so it is the ``api`` read that Obj-26-1 cut denies (msg-9821 §4);
+    * ``gh pr merge`` with ``-t``/``--subject``: msg-9819 §2 / §4 deny it, as search-class text
+      (msg-9819 §3).
+    """
+    if len(argv) < 2:
+        return None
+    if argv[1] == "api":
+        for opt, val in _opt_words(argv[2:], _val_set("api", "")):
+            if opt in ("-X", "--method") and val is not None and val.upper() in _READ_METHODS:
+                return "gh_not_in_table"
+        return None
+    if argv[1:3] == ["pr", "merge"]:
+        for opt, _ in _opt_words(argv[3:], _val_set("pr", "merge")):
+            if opt in _MERGE_SUBJECT_OPTS:
+                return "gh_search_text"
+    return None
+
+
+def _opt_words(words: list[str], vals: frozenset[str]) -> list[tuple[str, str | None]]:
+    """``(option, value)`` pairs of ``words``, read with the option/value boundaries
+    :func:`_parse_items` uses (PR-gate on #606): a value-taking option (``vals``) consumes the next
+    word, so a value that looks like an option (``--body '--subject=x'``, ``-f '--method=GET'``)
+    is never itself read as one. ``--opt=value`` and an attached short value (``-XGET``) are split;
+    ``--`` ends the options. A flag (not in ``vals``) has the value ``None``."""
+    out: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(words):
+        v = words[i]
+        if v == "--":
+            break
+        if not v.startswith("-") or v == "-":
+            pass
+        elif v.startswith("--") and "=" in v:
+            k, a = v.split("=", 1)
+            out.append((k, a))
+        elif v in vals:
+            out.append((v, words[i + 1] if i + 1 < len(words) else None))
+            i += 1
+        elif not v.startswith("--") and len(v) > 2 and v[:2] in vals:
+            out.append((v[:2], v[2:]))
+        else:
+            out.append((v, None))
+        i += 1
+    return out
+
+
+def _node_verdicts(cmd: str, write: bool, write_key: str | None) -> list[Verdict]:
+    """Every ``gh`` node's verdict, in order. A node inside the gh-write definition carries the
+    L-p verdict of the whole command (``write_key``; ``None`` = allowed); every other node is
+    judged by the table. A gh write the tree cannot place (inside a wrapper shell) goes first."""
+    old = Verdict(write_key is None, write_key)
+    src = cmd.encode("utf-8", "replace")
+    try:
+        root: Node | None = parse(src)
+        usable = root is not None and not root.has_error and gap_scan(root, src)[0]
+    except Exception:
+        root, usable = None, False
+    if root is None or not usable:
+        # indeterminate: deny on a `gh` word, as the L-p path does (objection 4)
+        if write:
+            return [old]
+        return [Verdict(False, "gh_not_in_table")] if maybe_gh(cmd) else []
+    out: list[Verdict] = []
+    placed = False
+    for n in walk(root):
+        if n.type != "command":
+            continue
+        name = cmd_name(n)
+        if name is None:
+            continue
+        arg_nodes = list(n.children_by_field_name("argument"))
+        argv = [value(name)] + [value(a) for a in arg_nodes]
+        if _is_gh_name(argv[0]):
+            argv[0] = "gh"
+            if gh_write(argv):
+                out.append(old)
+                placed = True
+                over = _write_overlay(argv)
+                if over is not None:
+                    out.append(Verdict(False, over))
+            elif not literal(name) or not all(literal(a) for a in arg_nodes):
+                out.append(Verdict(False, "gh_not_in_table"))
+            else:
+                key = judge_table(argv)
+                out.append(Verdict(key is None, key))
+            continue
+        base = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if (base in WRAPPER_SHELLS and any(maybe_gh(a) for a in argv[1:])) or (
+            base in LAUNCHERS and any(_is_gh_name(a) for a in argv[1:])
+        ):
+            out.append(Verdict(False, "gh_not_in_table"))
+    if write and not placed:
+        out.insert(0, old)
+    return out
+
+
 # ------------------------------------------------------------------------- deny texts (fixed)
 #: P-1 (msg-9299 §1): the three command families the guidance is written for.
 FAMILY_PR_ISSUE = "pr_issue"
@@ -884,6 +1297,34 @@ _CLASS_REASON: dict[str, str] = {
     "other": "the gh write is not in the allowed form",
     "guard_error": "the guard could not decide",
 }
+#: msg-9819 §3 (kept by msg-9821 §3): the L-p2 texts, one per class whatever the family. The
+#: shared last two sentences ask for a placeholder command shape and forbid pasting the token or
+#: the output (C-42, Obj-25-1).
+_L2_REQUEST = (
+    "To ask for this command to be added to the allowed table, post in the thread the command "
+    "shape with every real value (host names, paths, tokens, IDs) replaced by a placeholder, why "
+    "it is needed, and why no allowed form works. Do not paste the token or the command's output."
+)
+_L2_TEXTS: dict[str, str] = {
+    "gh_auth_token": (
+        "L-p denied this gh call [gh_auth_token]: printing a GitHub token into the session is "
+        "not allowed. If you need it for git authentication, run `gh auth setup-git` once in its "
+        "own Bash call and then use git as usual. If your use cannot be replaced that way, stop "
+        "and raise it to a human in the thread (`NEXT: human`). " + _L2_REQUEST
+    ),
+    "gh_secret_value": (
+        "L-p denied this gh call [gh_secret_value]: reading or changing repository variables "
+        "and secrets is not allowed. " + _L2_REQUEST
+    ),
+    "gh_search_text": (
+        "L-p denied this gh call [gh_search_text]: sending search text to GitHub is not "
+        "allowed. " + _L2_REQUEST
+    ),
+    "gh_not_in_table": (
+        "L-p denied this gh call [gh_not_in_table]: this gh call, or one of its arguments, is "
+        "not in the allowed table. " + _L2_REQUEST
+    ),
+}
 #: The deny text for an unexpected failure inside the guard (fail-closed).
 GUARD_ERROR_KEY = "guard_error"
 
@@ -905,27 +1346,43 @@ def _family_of(cmd: str) -> str:
 
 
 def deny_text(key: str, family: str) -> str:
-    """The fixed deny reason for ``(class key, family)`` — built only from constants."""
+    """The fixed deny reason for ``(class key, family)`` — built only from constants. An L-p2
+    class has one text whatever the family (msg-9819 §3)."""
+    if key in _L2_TEXTS:
+        return _L2_TEXTS[key]
     reason = _CLASS_REASON.get(key, _CLASS_REASON["other"])
     guide = _GUIDES.get(family, _GUIDE_UNKNOWN)
     return f"L-p denied this gh write [{key}]: {reason}. {guide}"
 
 
 def decide(cmd: object) -> tuple[bool, str | None]:
-    """``(allowed, deny_text_or_None)`` for one Bash ``command`` value. Never raises."""
+    """``(allowed, deny_text_or_None)`` for one Bash ``command`` value. Never raises.
+
+    msg-9821 §1: every ``gh`` node is judged — a node inside the gh-write definition by the nine
+    L-p classes, any other by the L-p2 table — and :func:`combine` folds the verdicts; one deny
+    denies the whole command.
+    """
     try:
         if not isinstance(cmd, str):
             return False, deny_text(GUARD_ERROR_KEY, FAMILY_UNKNOWN)
-        if not is_gh_write(cmd):
-            return True, None
-        family = _family_of(cmd)
+        write = is_gh_write(cmd)
+        write_key: str | None = None
+        family = FAMILY_UNKNOWN
+        if write:
+            family = _family_of(cmd)
+            try:
+                cls = classify(cmd)
+            except Exception:
+                cls = "ts_parse_fail"
+            write_key = None if cls in ALLOWED_CLASSES else cls
         try:
-            cls = classify(cmd)
+            verdicts = _node_verdicts(cmd, write, write_key)
         except Exception:
-            cls = "ts_parse_fail"
-        if cls in ALLOWED_CLASSES:
+            verdicts = [Verdict(False, GUARD_ERROR_KEY)]
+        v = combine(verdicts)
+        if v.allowed:
             return True, None
-        return False, deny_text(cls, family)
+        return False, deny_text(v.key or GUARD_ERROR_KEY, family)
     except Exception:
         return False, deny_text(GUARD_ERROR_KEY, FAMILY_UNKNOWN)
 
@@ -994,9 +1451,13 @@ def gh_write_guard_hooks() -> dict[Any, list[HookMatcher]]:
 __all__ = [
     "ALLOWED_CLASSES",
     "CLASSES",
+    "L2_ALLOW",
+    "L2_CLASSES",
     "P1_PROMPT_BLOCK",
+    "Verdict",
     "classify",
     "classify_ex",
+    "combine",
     "decide",
     "deny_text",
     "gap_scan",
@@ -1004,5 +1465,6 @@ __all__ = [
     "gh_write_kind",
     "gh_write_pretooluse",
     "is_gh_write",
+    "judge_table",
     "parse",
 ]

@@ -239,26 +239,27 @@ def test_hook_ignores_other_tools() -> None:
     assert _run({"tool_name": "Read", "tool_input": {"file_path": MARK}}) == {}
 
 
-#: The scope boundary (msg-9306 §1): gh calls that write to GitHub but fall outside the approved
-#: gh-write definition (msg-8646 §4, msg-9287 §2). L-p does not judge them and lets them run.
-#: That is the intended, documented boundary — whether to widen it is L-p2 in
-#: T-real-infra-values-egress-from-agent-context (a human goal decision after M-10i). This test
-#: exists so the boundary cannot move in either direction without someone deciding it.
-OUT_OF_SCOPE = {
-    "gh label create x",
-    "gh pr merge 1 --squash",
-    "gh variable set X --body v",
-    "gh secret set X",
-    "gh repo edit --description d",
+#: gh calls outside the approved gh-write definition (msg-8646 §4, msg-9287 §2). Before L-p2
+#: they ran unjudged (msg-9306 §1); L-p2 (msg-9821 §2) judges them by the table instead.
+OUT_OF_DEFINITION = {
+    "gh label create x": "gh_not_in_table",
+    "gh pr merge 1 --squash": None,
+    "gh variable set X --body v": "gh_secret_value",
+    "gh secret set X": "gh_secret_value",
+    "gh repo edit --description d": "gh_not_in_table",
 }
-#: CASES entries that are out of scope (classified above for completeness only).
-NOT_WRITES = OUT_OF_SCOPE & {c for c, _ in CASES}
+#: CASES entries outside the definition (``classify`` still names their L-p class for parity).
+NOT_WRITES = set(OUT_OF_DEFINITION) & {c for c, _ in CASES}
 
 
-def test_scope_boundary_calls_outside_the_definition_pass() -> None:
-    for cmd in OUT_OF_SCOPE:
+def test_calls_outside_the_definition_are_judged_by_the_table() -> None:
+    for cmd, want in OUT_OF_DEFINITION.items():
         assert not g.is_gh_write(cmd), cmd
-        assert _run(_bash(cmd)) == {}, cmd
+        out = _run(_bash(cmd))
+        if want is None:
+            assert out == {}, cmd
+        else:
+            assert f"[{want}]" in _reason(out), cmd
 
 
 @pytest.mark.parametrize(
@@ -425,9 +426,13 @@ def test_leading_options_are_detected_and_denied(cmd: str) -> None:
 
 
 @pytest.mark.parametrize("cmd", ["gh --version", "gh --help", "gh -R o/r pr view 1"])
-def test_leading_options_on_reads_still_pass(cmd: str) -> None:
+def test_leading_options_on_reads_are_not_writes_but_not_in_the_table(cmd: str) -> None:
+    # Not a write (the L-p definition is unchanged), but L-p2 has no row for an option before
+    # the group: msg-9819 §1 step 3 / msg-9821 §1 step 4.
     assert not g.is_gh_write(cmd)
-    assert g.decide(cmd) == (True, None)
+    allowed, reason = g.decide(cmd)
+    assert not allowed
+    assert reason is not None and "[gh_not_in_table]" in reason
 
 
 def test_leading_option_readings_are_bounded() -> None:
@@ -608,7 +613,9 @@ def test_attached_short_body_options_with_literal_values_are_writes(cmd: str) ->
 )
 def test_attached_values_of_other_options_are_not_body_options(cmd: str) -> None:
     assert not g.is_gh_write(cmd), cmd
-    assert _run(_bash(cmd)) == {}, cmd
+    # Not a write, so L-p2 judges it: bundled short options and attached values are not among
+    # the argument shapes R-d accepts (msg-9821 §2.1).
+    assert "[gh_not_in_table]" in _reason(_run(_bash(cmd))), cmd
 
 
 # ------------- T-lp-allowlist-lacks-base-head-so-develop-flow-repos-cannot-open-prs (D1)
@@ -675,3 +682,321 @@ def test_api_header_is_not_the_pr_create_head_option() -> None:
 def test_p1_names_base_and_head_for_pr_create() -> None:
     assert "`gh pr create` also accepts `--base`/`--head`" in g.P1_PROMPT_BLOCK
     assert "--draft" not in g.P1_PROMPT_BLOCK
+
+
+# ============================================================================ L-p2 (msg-9821)
+def _deny_key(cmd: str) -> str:
+    allowed, reason = g.decide(cmd)
+    assert not allowed, cmd
+    assert reason is not None
+    m = [k for k in (*g.L2_CLASSES, *g.CLASSES) if f"[{k}]" in reason]
+    assert len(m) == 1, (cmd, reason)
+    return m[0]
+
+
+#: msg-9821 §2: at least one command per allowed row, aliases included (msg-9819 §4).
+L2_ALLOWED_CMDS = [
+    "gh pr list",
+    "gh pr ls -s open -L 20",
+    "gh pr view 12 -R o/r --json state",
+    "gh pr view 12 --json state,title --jq .state",
+    "gh pr diff 12",
+    "gh pr checks 12 --watch --exit-status",
+    "gh pr status",
+    "gh pr checkout 12",
+    "gh pr co 12",
+    "gh pr ready 12",
+    "gh pr update-branch 12",
+    "gh pr close 12",
+    "gh pr reopen 12",
+    "gh pr merge 12 --squash -d",
+    "gh pr merge 12 --merge --auto",
+    "gh issue list --state=closed",
+    "gh issue ls",
+    "gh issue view 3",
+    "gh issue status",
+    "gh issue close 3",
+    "gh issue reopen 3",
+    "gh run list -L 5",
+    "gh run ls",
+    "gh run view 99 --log-failed",
+    "gh run watch 99 --exit-status",
+    "gh run download 99 -n artifact-1",
+    "gh workflow list",
+    "gh workflow view ci.yml",
+    "gh repo view o/r",
+    "gh repo clone o/r",
+    "gh release list",
+    "gh release view v1.2.0",
+    "gh release download v1.2.0 -p dist.zip",
+    "gh label list",
+    "gh secret list",
+    "gh cache list",
+    "gh ruleset list",
+    "gh rs view 7",
+    "gh ruleset check main",
+    "gh auth setup-git",
+    "gh auth status",
+    "gh auth status -a",
+    "gh auth status --active",
+]
+
+
+@pytest.mark.parametrize("cmd", L2_ALLOWED_CMDS)
+def test_table_allowed_rows(cmd: str) -> None:
+    assert not g.is_gh_write(cmd)
+    assert g.decide(cmd) == (True, None)
+    assert _run(_bash(cmd)) == {}
+
+
+L2_DENIED_CMDS: list[tuple[str, str]] = [
+    # gh_auth_token (msg-9797 §2, msg-9819 §2)
+    ("gh auth token", "gh_auth_token"),
+    ("gh auth token -h example.invalid", "gh_auth_token"),
+    ("gh auth status -t", "gh_auth_token"),
+    ("gh auth status --show-token", "gh_auth_token"),
+    ("gh auth status -at", "gh_auth_token"),
+    ("gh auth status -h example.invalid", "gh_auth_token"),
+    # gh_secret_value
+    ("gh variable list", "gh_secret_value"),
+    ("gh variable ls", "gh_secret_value"),
+    ("gh variable get X", "gh_secret_value"),
+    ("gh secret set X", "gh_secret_value"),
+    ("gh secret delete X", "gh_secret_value"),
+    ("gh secret remove X", "gh_secret_value"),
+    # gh_search_text
+    ("gh search issues x", "gh_search_text"),
+    ("gh pr list -S x", "gh_search_text"),
+    ("gh issue list --search x", "gh_search_text"),
+    ("gh pr list --search=x", "gh_search_text"),
+    # gh_not_in_table: auth rows
+    ("gh auth login", "gh_not_in_table"),
+    ("gh auth logout", "gh_not_in_table"),
+    ("gh auth refresh", "gh_not_in_table"),
+    ("gh auth switch", "gh_not_in_table"),
+    # gh_not_in_table: groups and subs not on the table
+    ("gh gist list", "gh_not_in_table"),
+    ("gh codespace list", "gh_not_in_table"),
+    ("gh cs list", "gh_not_in_table"),
+    ("gh extension list", "gh_not_in_table"),
+    ("gh alias list", "gh_not_in_table"),
+    ("gh config get editor", "gh_not_in_table"),
+    ("gh ssh-key list", "gh_not_in_table"),
+    ("gh browse", "gh_not_in_table"),
+    ("gh status", "gh_not_in_table"),
+    ("gh repo list", "gh_not_in_table"),
+    ("gh repo ls", "gh_not_in_table"),
+    ("gh repo delete o/r", "gh_not_in_table"),
+    ("gh release delete v1", "gh_not_in_table"),
+    ("gh label create x", "gh_not_in_table"),
+    ("gh workflow run ci.yml", "gh_not_in_table"),
+    ("gh run rerun 99", "gh_not_in_table"),
+    ("gh issue delete 3", "gh_not_in_table"),
+    ("gh pr lock 3", "gh_not_in_table"),
+    ("gh pr frobnicate 3", "gh_not_in_table"),  # not in the vocabulary
+    ("gh frobnicate", "gh_not_in_table"),
+    ("gh", "gh_not_in_table"),
+    ("gh --version", "gh_not_in_table"),
+    ("gh help", "gh_not_in_table"),
+    ("gh pr", "gh_not_in_table"),
+    # gh api outside the write definition (Obj-26-1 cut)
+    ("gh api '/repos/O/R/issues?probe=" + MARK + "'", "gh_not_in_table"),
+    ("gh api /user", "gh_not_in_table"),
+    ("gh api", "gh_not_in_table"),
+    # R-d: arguments outside the accepted shapes
+    ("gh repo view 'x:" + MARK + "'", "gh_not_in_table"),
+    ("gh pr list --author " + MARK, "gh_not_in_table"),
+    ("gh pr view https://github.com/o/r/pull/1", "gh_not_in_table"),
+    ("gh run download 1 -D /tmp/" + MARK, "gh_not_in_table"),
+    ("gh pr list --label x", "gh_not_in_table"),
+    ("gh pr list --head x", "gh_not_in_table"),
+    ("gh pr list -s weird", "gh_not_in_table"),
+    ("gh pr view 1 -R notarepo", "gh_not_in_table"),
+    ("gh pr view 1 -L x", "gh_not_in_table"),
+    ("gh pr view 1 --json", "gh_not_in_table"),
+    ("gh pr view '1 2'", "gh_not_in_table"),
+    ("gh pr view a@b", "gh_not_in_table"),
+    ("gh pr view a=b", "gh_not_in_table"),
+    ("gh pr view 'a?b'", "gh_not_in_table"),
+    ("gh pr view 1 --squash", "gh_not_in_table"),  # a flag of another row
+    ("gh pr view 1 --", "gh_not_in_table"),
+    ('gh pr view "$X"', "gh_not_in_table"),  # not literal
+    ("gh pr -R o/r view 1", "gh_not_in_table"),
+    # gh in a wrapper shell or behind a launcher: the shape is not visible
+    ('bash -c "gh auth token"', "gh_not_in_table"),
+    ('pwsh -c "gh pr view 1"', "gh_not_in_table"),
+    ("env gh auth token", "gh_not_in_table"),
+    ("xargs gh auth token", "gh_not_in_table"),
+    ("command gh auth token", "gh_not_in_table"),
+]
+
+
+@pytest.mark.parametrize(("cmd", "want"), L2_DENIED_CMDS)
+def test_table_denied_rows(cmd: str, want: str) -> None:
+    assert _deny_key(cmd) == want
+
+
+def test_l2_classes_are_the_four() -> None:
+    assert g.L2_CLASSES == ("gh_auth_token", "gh_secret_value", "gh_search_text", "gh_not_in_table")
+    assert not set(g.L2_CLASSES) & set(g.CLASSES)
+
+
+def test_gh_auth_token_text_is_the_approved_one() -> None:
+    _, reason = g.decide("gh auth token")
+    assert reason == (
+        "L-p denied this gh call [gh_auth_token]: printing a GitHub token into the session is "
+        "not allowed. If you need it for git authentication, run `gh auth setup-git` once in its "
+        "own Bash call and then use git as usual. If your use cannot be replaced that way, stop "
+        "and raise it to a human in the thread (`NEXT: human`). To ask for this command to be "
+        "added to the allowed table, post in the thread the command shape with every real value "
+        "(host names, paths, tokens, IDs) replaced by a placeholder, why it is needed, and why "
+        "no allowed form works. Do not paste the token or the command's output."
+    )
+    # --show-token is the same class and the same text
+    assert g.decide("gh auth status --show-token") == (False, reason)
+
+
+@pytest.mark.parametrize("key", ["gh_secret_value", "gh_search_text", "gh_not_in_table"])
+def test_other_l2_texts_carry_the_placeholder_request(key: str) -> None:
+    text = g.deny_text(key, g.FAMILY_UNKNOWN)
+    assert text.startswith(f"L-p denied this gh call [{key}]: ")
+    assert text.endswith(
+        "post in the thread the command shape with every real value (host names, paths, tokens, "
+        "IDs) replaced by a placeholder, why it is needed, and why no allowed form works. Do not "
+        "paste the token or the command's output."
+    )
+
+
+def test_existing_texts_still_say_gh_write() -> None:
+    for key in g.CLASSES:
+        assert g.deny_text(key, g.FAMILY_PR_ISSUE).startswith(f"L-p denied this gh write [{key}]")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh auth token -h " + MARK,
+        "gh auth status -h " + MARK,
+        "gh variable get " + MARK,
+        "gh search code " + MARK,
+        "gh pr list -S " + MARK,
+        "gh api '/repos/O/R/issues?probe=" + MARK + "'",
+        "gh " + MARK,
+        "gh repo view 'x:" + MARK + "'",
+        "env " + MARK + "=1 gh auth token",
+        "gh pr view 1 && gh auth token -h " + MARK,
+    ],
+)
+def test_l2_deny_texts_echo_nothing_from_the_command(cmd: str) -> None:
+    reason = _reason(_run(_bash(cmd)))
+    assert MARK not in reason
+    for key in g.L2_CLASSES:
+        for fam in (g.FAMILY_PR_ISSUE, g.FAMILY_API, g.FAMILY_UNSUPPORTED, g.FAMILY_UNKNOWN):
+            assert MARK not in g.deny_text(key, fam)
+
+
+# ------------------------------------------------- combine (msg-9821 §1, msg-9823 Obj-27-1)
+OLD_ALLOW = g.Verdict(True)  # what an allowed gh write node (a_prime_*) carries
+OLD_DENY = g.Verdict(False, "body_file_path")
+NEW_ALLOW = g.Verdict(True)  # what an allowed table row carries
+NEW_DENY = g.Verdict(False, "gh_auth_token")
+
+
+@pytest.mark.parametrize(
+    ("verdicts", "want"),
+    [
+        # old allow / new deny, both orders
+        ([OLD_ALLOW, NEW_DENY], NEW_DENY),
+        ([NEW_DENY, OLD_ALLOW], NEW_DENY),
+        # old deny / new allow, both orders
+        ([OLD_DENY, NEW_ALLOW], OLD_DENY),
+        ([NEW_ALLOW, OLD_DENY], OLD_DENY),
+        # both deny: the first one names the class, in either order
+        ([OLD_DENY, NEW_DENY], OLD_DENY),
+        ([NEW_DENY, OLD_DENY], NEW_DENY),
+        # an allow never ends the judgement early, however many come first
+        ([OLD_ALLOW, NEW_ALLOW, NEW_ALLOW, NEW_DENY], NEW_DENY),
+        ([OLD_ALLOW, NEW_ALLOW], g.Verdict(True)),
+        ([], g.Verdict(True)),
+    ],
+)
+def test_combine_folds_old_and_new_verdicts(verdicts: list[g.Verdict], want: g.Verdict) -> None:
+    assert g.combine(verdicts) == want
+
+
+def test_combine_a_deny_without_a_class_is_a_guard_error() -> None:
+    assert g.combine([g.Verdict(False)]) == g.Verdict(False, "guard_error")
+
+
+def test_decide_feeds_every_node_to_combine(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[g.Verdict]] = []
+    real = g.combine
+
+    def spy(vs: Any) -> g.Verdict:
+        seen.append(list(vs))
+        return real(vs)
+
+    monkeypatch.setattr(g, "combine", spy)
+    g.decide("gh pr view 1 && gh pr checks 1 && gh auth token")
+    assert seen == [[g.Verdict(True), g.Verdict(True), g.Verdict(False, "gh_auth_token")]]
+
+
+#: msg-9821 §4: command-level regressions for mixed commands, both orders (kept alongside the
+#: combine tests; they do not by themselves show the folding, since `compound` denies first).
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh issue comment 1 --body-file - <<'EOF'\nx\nEOF\ngh auth token",
+        "gh auth token; gh issue comment 1 --body-file - <<'EOF'\nx\nEOF",
+        "gh issue comment 1 --body safe; gh auth token",
+        "gh pr view 1 && gh auth token",
+        "gh auth token && gh pr view 1",
+    ],
+)
+def test_mixed_commands_are_denied_in_either_order(cmd: str) -> None:
+    assert not g.decide(cmd)[0]
+
+
+def test_reads_combined_with_reads_are_allowed() -> None:
+    assert g.decide("gh pr view 1 && gh pr checks 1") == (True, None)
+
+
+@pytest.mark.parametrize(
+    ("cmd", "want"),
+    [
+        ("gh api --method GET -f probe=" + MARK + " /repos/O/R", "gh_not_in_table"),
+        ("gh api -X GET /repos/O/R -f probe=" + MARK, "gh_not_in_table"),
+        ("gh api --method=get -f probe=" + MARK + " /repos/O/R", "gh_not_in_table"),
+        ("gh pr merge 1 -t " + MARK, "gh_search_text"),
+        ("gh pr merge 1 --subject " + MARK, "gh_search_text"),
+        ("gh pr merge 1 --body x --subject=" + MARK, "gh_search_text"),
+        ("gh pr merge 1 -t" + MARK, "gh_search_text"),
+        ("gh api -f a=b -XGET /repos/O/R -f probe=" + MARK, "gh_not_in_table"),
+    ],
+)
+def test_writes_the_lp_allowlist_admits_are_still_denied_overall(cmd: str, want: str) -> None:
+    # Writes under the L-p definition, and allowed by L-p (a_prime_inline) — yet the whole result
+    # is deny (msg-9821 §4: "書き込み定義の側で先に判定される場合も、全体の結果が deny").
+    assert g.is_gh_write(cmd)
+    assert g.classify(cmd) == "a_prime_inline"
+    assert _deny_key(cmd) == want
+    assert MARK not in (g.decide(cmd)[1] or "")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh api -X POST repos/o/r/issues -f title=x",
+        "gh pr merge 1 --body x",
+        "gh pr close 1 --comment x",
+        # PR-gate on #606: an option-looking string given as a value is a value, not an option
+        "gh pr merge 1 --body '--subject=x'",
+        "gh pr merge 1 --body --subject",
+        "gh pr merge 1 --body -t",
+        "gh api -X POST repos/o/r/issues -f '--method=GET'",
+        "gh api -X POST repos/o/r/issues -f -X -f GET",
+        "gh api --method POST repos/o/r/issues -H '--method=GET'",
+    ],
+)
+def test_lp_allowed_writes_without_the_overlay_shapes_still_pass(cmd: str) -> None:
+    assert g.decide(cmd) == (True, None)
