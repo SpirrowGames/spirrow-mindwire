@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 from io import StringIO
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -58,6 +59,19 @@ from spirrow_mindwire.decision_request.stub import (
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rules_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``main`` hashes the Tier-C rule file from the loaded settings
+    (T-material-put-sends-rules-hash). Point the data root at an empty tmp dir so no test
+    reads the host's real ``mindwire.toml`` or writes a snapshot into the host's real
+    ``<data_dir>/decider/rules``."""
+    monkeypatch.setenv("MINDWIRE_PATHS__DATA_DIR", str(tmp_path / "mindwire-data"))
+    monkeypatch.delenv("MINDWIRE_DECIDER__TIERC__RULES_PATH", raising=False)
+    monkeypatch.delenv("MINDWIRE_DECIDER__TIERC__RULES_SNAPSHOT_DIR", raising=False)
+    monkeypatch.delenv("MINDWIRE_DECIDER__MODE", raising=False)
+    monkeypatch.delenv("MINDWIRE_DECIDER__TIERC__MODE", raising=False)
 
 
 def _sample_input(
@@ -1129,3 +1143,201 @@ class TestCliParkedLaneExtras:
         )
         assert "parked_lane" not in extras
         assert "protocol_violation" not in extras
+
+
+# --------------------------------------------------------------------------- #
+# T-material-put-sends-rules-hash: extras.rules_hash / rules_hash_error / rules_snapshot
+# (Bohr msg-9992 §1-§4, msg-9994 Obj-1-1..1-3; Einstein msg-9993 / approved)
+# --------------------------------------------------------------------------- #
+_RULES_TOML = (
+    b'[[rule]]\nid = "rule_1"\ntext = "cost"\n\n[[rule]]\nid = "rule_2"\ntext = "irreversible"\n'
+)
+
+
+class TestCliRulesHashExtras:
+    def _data_dir(self, tmp_path: Path) -> Path:
+        return tmp_path / "mindwire-data"
+
+    def _write_rules(self, tmp_path: Path, data: bytes = _RULES_TOML) -> Path:
+        path = self._data_dir(tmp_path) / "config" / "tierc_rules.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        composer_extras: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        # Asserts rc == 0 and composer_status == "ok" (the envelope survives every failure).
+        return TestCliParkedLaneExtras()._run(
+            monkeypatch,
+            capsys,
+            _fetch_of("plain decision\n\nNEXT: human"),
+            composer_extras=composer_extras,
+        )
+
+    def test_hash_equals_the_decider_loader_and_snapshot_is_saved(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        import hashlib
+
+        from spirrow_mindwire.decider.questions import load_tierc_rules
+
+        path = self._write_rules(tmp_path)
+        extras = self._run(monkeypatch, capsys)
+        sha = load_tierc_rules(path).sha256
+        assert sha == hashlib.sha256(_RULES_TOML).hexdigest()
+        assert extras["rules_hash"] == sha
+        assert extras["rules_snapshot"] == "saved"
+        assert "rules_hash_error" not in extras
+        snap = self._data_dir(tmp_path) / "decider" / "rules" / f"{sha}.toml"
+        assert snap.read_bytes() == _RULES_TOML
+
+    def test_hash_is_sent_with_the_decider_off(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        from spirrow_mindwire.config import load_settings
+
+        path = self._write_rules(tmp_path)
+        (path.parent / "mindwire.toml").write_text(
+            '[decider]\nmode = "off"\n\n[decider.tierc]\nmode = "off"\n', encoding="utf-8"
+        )
+        settings = load_settings()
+        assert settings.decider.mode == "off"
+        assert settings.decider.tierc.mode == "off"
+        extras = self._run(monkeypatch, capsys)
+        assert extras["rules_hash"] == load_tierc_rules_sha(path)
+
+    def test_missing_rules_file_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert "rules_snapshot" not in extras
+        assert extras["rules_hash_error"].startswith("TierCRulesError:")
+
+    def test_malformed_rules_file_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        self._write_rules(tmp_path, b"this is = = not toml")
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert extras["rules_hash_error"].startswith("TierCRulesError:")
+
+    def test_settings_load_failure_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        from spirrow_mindwire.decision_request import cli as cli_mod
+
+        self._write_rules(tmp_path)
+
+        def boom() -> Any:
+            raise ValueError("bad mindwire.toml")
+
+        monkeypatch.setattr(cli_mod, "_load_rules_settings", boom)
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert extras["rules_hash_error"] == "ValueError: bad mindwire.toml"
+
+    def test_real_settings_load_failure_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # No seam: an unknown key in the real mindwire.toml (extra="forbid") fails load_settings.
+        path = self._write_rules(tmp_path)
+        (path.parent / "mindwire.toml").write_text("no_such_key = 1\n", encoding="utf-8")
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert extras["rules_hash_error"].startswith("ValidationError:")
+
+    def test_path_resolution_failure_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        from spirrow_mindwire import config as config_mod
+
+        self._write_rules(tmp_path)
+
+        def boom(_settings: object) -> Path:
+            raise RuntimeError("cannot resolve")
+
+        monkeypatch.setattr(config_mod, "resolve_tierc_rules_path", boom)
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert extras["rules_hash_error"] == "RuntimeError: cannot resolve"
+
+    def test_rules_load_failure_omits_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        from spirrow_mindwire.decider import questions as questions_mod
+
+        self._write_rules(tmp_path)
+
+        def boom(_path: Path) -> Any:
+            raise questions_mod.TierCRulesError("injected")
+
+        monkeypatch.setattr(questions_mod, "load_tierc_rules", boom)
+        extras = self._run(monkeypatch, capsys)
+        assert "rules_hash" not in extras
+        assert extras["rules_hash_error"] == "TierCRulesError: injected"
+
+    def test_unwritable_snapshot_dir_still_sends_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        path = self._write_rules(tmp_path)
+        # A regular FILE where the snapshot directory's parent should be: mkdir fails everywhere.
+        (self._data_dir(tmp_path) / "decider").write_text("not a dir", encoding="utf-8")
+        extras = self._run(monkeypatch, capsys)
+        assert extras["rules_hash"] == load_tierc_rules_sha(path)
+        assert extras["rules_snapshot"] == "failed"
+        assert "rules_hash_error" not in extras
+
+    def test_snapshot_returning_false_still_sends_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        from spirrow_mindwire.adapters import decider_lexora
+
+        path = self._write_rules(tmp_path)
+        monkeypatch.setattr(decider_lexora, "snapshot_tierc_rules", lambda *_a, **_k: False)
+        extras = self._run(monkeypatch, capsys)
+        assert extras["rules_hash"] == load_tierc_rules_sha(path)
+        assert extras["rules_snapshot"] == "failed"
+
+    def test_composer_keys_of_the_same_name_are_dropped_on_success(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        path = self._write_rules(tmp_path)
+        extras = self._run(
+            monkeypatch,
+            capsys,
+            composer_extras={
+                "rules_hash": "bogus",
+                "rules_hash_error": "bogus",
+                "rules_snapshot": "bogus",
+                "backend": "stub-x",
+            },
+        )
+        assert extras["rules_hash"] == load_tierc_rules_sha(path)
+        assert extras["rules_snapshot"] == "saved"
+        assert "rules_hash_error" not in extras
+        assert extras["backend"] == "stub-x"  # other composer keys still merge
+
+    def test_composer_keys_of_the_same_name_are_dropped_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        extras = self._run(
+            monkeypatch,
+            capsys,
+            composer_extras={"rules_hash": "bogus", "rules_snapshot": "saved"},
+        )
+        assert "rules_hash" not in extras
+        assert "rules_snapshot" not in extras
+        assert extras["rules_hash_error"].startswith("TierCRulesError:")
+
+
+def load_tierc_rules_sha(path: Path) -> str:
+    """The Decider's own hash of ``path`` — what ``rules_hash`` must equal."""
+    from spirrow_mindwire.decider.questions import load_tierc_rules
+
+    return load_tierc_rules(path).sha256

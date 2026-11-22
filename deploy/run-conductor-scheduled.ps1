@@ -4891,6 +4891,37 @@ function Get-ParkedLaneFields {
     return $out
 }
 
+# The v2 Tier-C rule file hash for the material PUT body, read from the envelope's extras (cli.py
+# `_rules_hash_extras`; T-material-put-sends-rules-hash, Bohr msg-9992 §3 / msg-9994). Returns
+# @{ hash; note }:
+#   hash — the string to send as `rules_hash`, or $null when extras carries none (or an empty one:
+#          the IsNullOrEmpty guard, never `if ($x)`). With $null the key is LEFT OUT of the body,
+#          never sent as null.
+#   note — the token for the push log line: `rules_hash=<sha>` or `rules_hash=absent`, plus
+#          ` (rules_hash_error: ...)` when the composer could not hash the file and
+#          ` rules_snapshot=<saved|failed>` when it reported one. The `material push` line is the
+#          "value B sent" source for Done-when (1); the snapshot file is secondary (Obj-1-1).
+# A PUT without the key: magickit writes material with INSERT OR REPLACE on (project, thread_id),
+# so an earlier `rules_hash` stored for that thread is cleared to NULL, not kept (same as `jev`
+# below). That is right — a hash belongs to the head it was sent with, and labels copy it only
+# when head_msg_id matches (S-1). Read from a local magickit checkout, not from production
+# (Bohr msg-9994 Obj-1-3).
+function Get-RulesHashField {
+    param($Envelope)
+    $extras = Get-EnvelopeField -Object $Envelope -Name 'extras'
+    $hash = Get-EnvelopeField -Object $extras -Name 'rules_hash'
+    $err = Get-EnvelopeField -Object $extras -Name 'rules_hash_error'
+    $snap = Get-EnvelopeField -Object $extras -Name 'rules_snapshot'
+    $out = @{ hash = $null; note = 'rules_hash=absent' }
+    if (-not [string]::IsNullOrEmpty($hash)) {
+        $out.hash = "$hash"
+        $out.note = "rules_hash=$hash"
+    }
+    if (-not [string]::IsNullOrEmpty($err)) { $out.note += " (rules_hash_error: $err)" }
+    if (-not [string]::IsNullOrEmpty($snap)) { $out.note += " rules_snapshot=$snap" }
+    return $out
+}
+
 # Push the composer's material to magickit's `/v1/decisions/{project}/{thread_id}/material`.
 # Never throws, never blocks the notification path.
 #
@@ -5022,6 +5053,10 @@ function Push-DecisionMaterial {
     # extras -> body mapping lives in Get-ParkedLaneFields; read its comment before touching it.
     $parked = Get-ParkedLaneFields -Envelope $Envelope
     foreach ($k in $parked.Keys) { $body[$k] = $parked[$k] }
+    # The v2 rule file hash (T-material-put-sends-rules-hash). Get-RulesHashField's comment says
+    # what an absent key means on the receiver.
+    $rulesHash = Get-RulesHashField -Envelope $Envelope
+    if ($null -ne $rulesHash.hash) { $body['rules_hash'] = $rulesHash.hash }
     # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
     # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
     # output where `question` or `recommendation` or `recommendation_reason` equals "0"
@@ -5099,17 +5134,17 @@ function Push-DecisionMaterial {
             }
             catch { }
         }
-        Write-Log "material push: $Key head=$head replaced=$replaced $jevNote ($($result.elapsed_ms) ms) url=$url link=$link"
+        Write-Log "material push: $Key head=$head replaced=$replaced $jevNote $($rulesHash.note) ($($result.elapsed_ms) ms) url=$url link=$link"
     }
     elseif ($result.status) {
         $bodySnippet = if ($result.body) {
             $flat = ($result.body -replace "\s+", ' ').Trim()
             if ($flat.Length -gt 120) { $flat.Substring(0, 120) + '…' } else { $flat }
         } else { '<no body>' }
-        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote — HTTP $($result.status) $bodySnippet — 通知は継続"
+        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote $($rulesHash.note) — HTTP $($result.status) $bodySnippet — 通知は継続"
     }
     else {
-        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote — $($result.error) — 通知は継続"
+        Write-Log "material push FAILED (non-fatal): $Key head=$head $jevNote $($rulesHash.note) — $($result.error) — 通知は継続"
     }
     if ($result.ok) { return @{ outcome = 'pushed'; reason = $null; put = $result } }
     $why = if ($result.status) { "put_http_$($result.status)" } else { 'put_error' }
