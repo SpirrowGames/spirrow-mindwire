@@ -53,22 +53,42 @@ a maintenance window in which this stop holds.
    until it is gone.
 3. **Check the leases.** Every slot in `state/slot-leases.json` must be free. A held slot has a
    `state` field (`launching`, `running` or `quarantine_failed`); a free one has only
-   `last_thread_id`:
+   `last_thread_id`.
+
+   Run the check below in a shell that resolves the data directory the way the scheduled task does
+   (`deploy/run-conductor-scheduled.ps1`: `MINDWIRE_PATHS__DATA_DIR`, else `~/spirrow-mindwire-data`).
+   If the task sets that variable for itself and your shell does not, set
+   `$env:MINDWIRE_PATHS__DATA_DIR` to the task's value first. Any error stops the procedure.
 
    ```powershell
-   $p = Join-Path $env:MINDWIRE_PATHS__DATA_DIR 'state\slot-leases.json'   # or ~/spirrow-mindwire-data
+   $ErrorActionPreference = 'Stop'
+   $d = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME 'spirrow-mindwire-data' }
+   $d = (Resolve-Path -LiteralPath $d).Path        # throws if the directory does not exist
+   if (-not (Test-Path -LiteralPath (Join-Path $d 'config\mindwire.toml') -PathType Leaf)) {
+       throw "no config\mindwire.toml under ${d}: not the loop's data directory"
+   }
+   $p = Join-Path $d 'state\slot-leases.json'
+   "lease file: $p"
+   $held = 0
    if (Test-Path -LiteralPath $p) {
-       $o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+       $o = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json   # throws on unreadable JSON
+       if ($o.version -ne 1 -or $null -eq $o.repos) { throw "unexpected lease file shape in $p" }
        foreach ($r in $o.repos.PSObject.Properties) {
            foreach ($s in $r.Value.slots.PSObject.Properties) {
-               if ($s.Value.PSObject.Properties.Name -contains 'state') { "$($r.Name)/$($s.Name): $($s.Value.state) thread=$($s.Value.thread_id)" }
+               if ($s.Value.PSObject.Properties.Name -contains 'state') {
+                   $held++
+                   "HELD $($r.Name)/$($s.Name): $($s.Value.state) thread=$($s.Value.thread_id)"
+               }
            }
        }
-   }
+   } else { 'no lease file (slot mode has not run with this data directory)' }
+   if ($held -eq 0) { 'OK' } else { throw "$held held lease(s), listed above" }
    ```
 
-   Nothing printed (or no file): go on. A `launching` / `running` lease with no process left (step
-   2) is one whose turn end never ran. Return it with
+   Go on only when it ends with `OK`. An error, or any `HELD` line, means stop here. When switching
+   back, `no lease file` is expected only if slot mode never ran; if it did run, the path is wrong:
+   stop and find the data directory the task uses. A `launching` / `running` lease with no process
+   left (step 2) is one whose turn end never ran. Return it with
    `mindwire slot-recover --slots-root R --repo r --slot slot-NN --project p --state-dir S --confirm-no-process`
    (see `src/spirrow_mindwire/clone_slot_cli.py`). A `quarantine_failed` lease needs a person:
    leave it held, stop, and report it in the thread. Never edit `slot-leases.json` by hand.
