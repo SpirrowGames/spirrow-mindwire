@@ -128,7 +128,7 @@ a path can be trusted before the slot directory exists was not measured; do not 
   first role turn has `slot-borrowed <key>: <slots_root>\<repo>\slot-01 …` followed by
   `slot-finish <key>: <slots_root>\<repo>\slot-01 outcome=…`.
 - `git -C <slot> status --porcelain` is empty after that turn, and `slot-leases.json` shows the slot
-  free again (step 3 prints nothing).
+  free again (step 3 ends with `OK` and prints no `HELD` lines).
 
 ## Switching back
 
