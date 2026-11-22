@@ -63,15 +63,17 @@ from the gate's decisions log (``--decisions-log``, default the daemon's), never
 (:func:`security_section`):
 
 * ``heads`` — one outcome per ``(thread, msg_id)`` carrying a ``label=security`` row inside the
-  window: ``delivered`` (an ``ESCALATED`` row), else ``bounced`` (a ``BOUNCED`` row, split by
-  reason), else ``no_outcome``. Only rows inside ``[--since, --until)`` decide an outcome; within
-  them ``ESCALATED`` wins. Rows after the window are not read, so a later delivery never changes
-  a closed window (msg-9916 Obj-2-2).
+  window, read from every in-window row of that head whatever its label: ``delivered`` (an
+  ``ESCALATED`` row), else ``bounced`` (a ``BOUNCED`` row, split by reason), else ``no_outcome``.
+  Only rows inside ``[--since, --until)`` decide an outcome; within them ``ESCALATED`` wins.
+  Rows after the window are not read, so a later delivery never changes a closed window
+  (msg-9916 Obj-2-2).
 * ``hold_bounces`` — ``BOUNCED`` rows in the window with reason ``security-hold`` /
   ``security-hold-no-verdict``, whatever the head's label.
 * ``holds_opened`` / ``holds_released`` — distinct hold ids (a refusal merged into an open
   identical hold opens none), replayed by :func:`~spirrow_mindwire.tier_c_security_holds.
-  replay_hold_rows`. Rows from ``--replay-from`` (default: the start of the log) up to
+  replay_hold_rows`. Rows from ``--replay-from`` (default: the start of the log; it may not be
+  later than ``--since``) up to
   ``--since`` only set up which holds are open; bounces and releases inside the window count even
   for a hold opened before it (msg-9914 Obj-4).
 * a release's origin: ``human`` when the thread holds a ``HOLD-RELEASE: <id>`` line by the
@@ -361,7 +363,17 @@ def security_section(
     Pure; counts, hold ids and ``thread#msg_id`` refs only. ``rows`` in log (append) order. A row
     without a readable timezone-aware ``ts`` is replayed but counted nowhere
     (``rows_without_ts``).
+
+    ``replay_from`` only moves where the hold replay starts; it may not cut into the window, so
+    a ``replay_from`` later than ``since`` is a :class:`ValueError` (PR #601 round 1, Obj-2).
+    A head is selected when any in-window row of it carries ``label=security``, and its outcome
+    is read from **all** its in-window rows, whatever their label (PR #601 round 1, Obj-1).
     """
+    if replay_from is not None and replay_from > since:
+        raise ValueError(
+            f"replay_from ({replay_from.isoformat()}) is later than since ({since.isoformat()}):"
+            " it would drop rows from the measured window"
+        )
     # The log's ``thread`` is the bare thread id; one harvested in two projects is ambiguous.
     by_thread: dict[str, Sequence[Any] | None] = {}
     for _project, thread_id, messages in threads:
@@ -378,7 +390,8 @@ def security_section(
         replayed.append(dict(row))
         times.append(at)
 
-    heads: dict[str, list[Mapping[str, Any]]] = {}
+    by_head: dict[str, list[Mapping[str, Any]]] = {}
+    security_refs: set[str] = set()
     hold_bounces: dict[str, list[str]] = {r: [] for r in HOLD_BOUNCE_REASONS}
     opened: list[str] = []
     released: dict[str, list[str]] = {o: [] for o in RELEASE_ORIGINS}
@@ -388,8 +401,9 @@ def security_section(
             continue  # sets up the holds open at the window's start; counted nowhere
         row = step.row
         ref = f"{row.get('thread')}#{row.get('msg_id')}"
+        by_head.setdefault(ref, []).append(row)
         if row.get("label") == SECURITY_LABEL:
-            heads.setdefault(ref, []).append(row)
+            security_refs.add(ref)
         if row.get("kind") == LogKind.BOUNCED.value and row.get("reason") in hold_bounces:
             hold_bounces[str(row.get("reason"))].append(ref)
         if step.opened is not None:
@@ -402,6 +416,7 @@ def security_section(
     delivered: list[str] = []
     bounced: dict[str, list[str]] = {}
     no_outcome: list[str] = []
+    heads = {ref: head_rows for ref, head_rows in by_head.items() if ref in security_refs}
     for ref, head_rows in heads.items():
         kinds = [r.get("kind") for r in head_rows]
         if LogKind.ESCALATED.value in kinds:
@@ -504,9 +519,11 @@ def main(argv: list[str] | None = None) -> int:
         "--replay-from",
         type=_date,
         default=None,
-        help="replay holds from this time (default: the start of the log); counts use --since",
+        help="replay holds from this time (default: the start of the log; not after --since)",
     )
     args = parser.parse_args(argv)
+    if args.replay_from is not None and args.replay_from > args.since:
+        parser.error("--replay-from must not be later than --since")
 
     projects = tuple(args.project or builder.PROJECTS)
     loaded = load_config(args.config)

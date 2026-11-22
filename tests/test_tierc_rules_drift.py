@@ -57,3 +57,67 @@ def test_reworded_and_extra_rules_are_named(tmp_path: Path) -> None:
 def test_a_missing_runtime_file_is_reported_as_startup_reports_it(tmp_path: Path) -> None:
     with pytest.raises(TierCRulesError, match="init-config tierc-rules"):
         tierc_rules_drift(tmp_path / "absent.toml")
+
+
+# --------------------------------------------------------------------------- composition root
+# PR #601 round 1, Obj-3: the startup wiring itself — build_conductor warns on a differing (but
+# valid) runtime file and still builds; an identical copy builds without that warning.
+
+
+def _build_with_runtime_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_text: str
+) -> object:
+    from test_loop_runner import _conductor_settings
+    from test_tierc_gate_enforce import _build
+
+    from spirrow_mindwire.config import DeciderConfig, DeciderTierCConfig, PathsConfig
+
+    monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
+    monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
+    runtime = tmp_path / "config" / "tierc_rules.toml"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text(runtime_text, encoding="utf-8")
+    s = _conductor_settings().model_copy(
+        update={
+            "paths": PathsConfig(data_dir=tmp_path),
+            "decider": DeciderConfig(
+                backend="lexora",
+                tierc=DeciderTierCConfig(mode="annotate", questions="tierc-v2"),
+            ),
+        }
+    )
+    return _build(s).conductor
+
+
+def _without_rule_6(text: str) -> str:
+    head, sep, tail = text.partition('id = "rule_6"')
+    assert sep, "the template carries rule_6"
+    start = head.rfind("[[rule]]")
+    rest = tail.find("[[rule]]")
+    return head[:start] + ("" if rest < 0 else tail[rest:])
+
+
+def test_build_conductor_warns_on_drift_and_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    text = _without_rule_6(TEMPLATE.read_text(encoding="utf-8"))
+    with caplog.at_level(logging.WARNING):
+        cond = _build_with_runtime_rules(tmp_path, monkeypatch, text)
+    assert cond is not None
+    drift = [r.getMessage() for r in caplog.records if "rules_sha256=" in r.getMessage()]
+    assert len(drift) == 1 and "missing rule_6" in drift[0]
+
+
+def test_build_conductor_is_quiet_when_the_runtime_file_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        cond = _build_with_runtime_rules(
+            tmp_path, monkeypatch, TEMPLATE.read_text(encoding="utf-8")
+        )
+    assert cond is not None
+    assert not [r for r in caplog.records if "rules_sha256=" in r.getMessage()]

@@ -234,3 +234,45 @@ def test_an_unreadable_log_is_unmeasured_not_zero(tmp_path: Path) -> None:
     log = tmp_path / "log.jsonl"
     log.write_text(json.dumps(_held("msg-1", 1, "h1")) + "\n", encoding="utf-8")
     assert MEASURE.load_decisions_log(log) == [_held("msg-1", 1, "h1")]
+
+
+def test_a_later_unlabelled_escalation_of_a_security_head_counts_as_delivered() -> None:
+    # PR #601 round 1, Obj-1: the head is selected by its security row; its outcome is read from
+    # all its in-window rows, so an ESCALATED row without the label still wins.
+    rows = [
+        _row("BOUNCED", "msg-1", 1, reason="security-hold", label="security"),
+        _row("ESCALATED", "msg-1", 2),
+        _row("ESCALATED", "msg-2", 3, label="goal"),  # never a security head: not selected
+    ]
+    out = _section(rows)
+    assert out["heads_msg_ids"]["delivered"] == ["T-a#msg-1"]
+    assert out["heads"]["bounced"] == 0 and out["heads"]["no_outcome"] == 0
+
+
+def test_replay_from_later_than_since_is_refused() -> None:
+    # PR #601 round 1, Obj-2: replay_from may not cut into the window.
+    import pytest
+
+    with pytest.raises(ValueError, match="later than since"):
+        _section([], replay_from=_at(3))
+    assert _section([], replay_from=SINCE)["window"]["replay_from"] == SINCE.isoformat()
+
+
+def test_the_cli_refuses_replay_from_later_than_since(capsys: Any) -> None:
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        MEASURE.main(
+            [
+                "--since",
+                "2026-11-22",
+                "--until",
+                "2026-12-06",
+                "--out",
+                "x.json",
+                "--replay-from",
+                "2026-11-25",
+            ]
+        )
+    assert exc.value.code == 2
+    assert "--replay-from must not be later than --since" in capsys.readouterr().err
