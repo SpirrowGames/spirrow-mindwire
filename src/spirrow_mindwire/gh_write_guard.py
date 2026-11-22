@@ -1167,25 +1167,43 @@ def _write_overlay(argv: list[str]) -> str | None:
     if len(argv) < 2:
         return None
     if argv[1] == "api":
-        rest = argv[2:]
-        for i, t in enumerate(rest):
-            m = None
-            if t in ("-X", "--method") and i + 1 < len(rest):
-                m = rest[i + 1]
-            elif t.startswith("--method="):
-                m = t.split("=", 1)[1]
-            elif t.startswith("-X") and len(t) > 2:
-                m = t[2:]
-            if m is not None and m.upper() in _READ_METHODS:
+        for opt, val in _opt_words(argv[2:], _val_set("api", "")):
+            if opt in ("-X", "--method") and val is not None and val.upper() in _READ_METHODS:
                 return "gh_not_in_table"
         return None
     if argv[1:3] == ["pr", "merge"]:
-        for t in argv[3:]:
-            if t in _MERGE_SUBJECT_OPTS or t.split("=", 1)[0] == "--subject":
-                return "gh_search_text"
-            if t.startswith("-t") and not t.startswith("--"):
+        for opt, _ in _opt_words(argv[3:], _val_set("pr", "merge")):
+            if opt in _MERGE_SUBJECT_OPTS:
                 return "gh_search_text"
     return None
+
+
+def _opt_words(words: list[str], vals: frozenset[str]) -> list[tuple[str, str | None]]:
+    """``(option, value)`` pairs of ``words``, read with the option/value boundaries
+    :func:`_parse_items` uses (PR-gate on #606): a value-taking option (``vals``) consumes the next
+    word, so a value that looks like an option (``--body '--subject=x'``, ``-f '--method=GET'``)
+    is never itself read as one. ``--opt=value`` and an attached short value (``-XGET``) are split;
+    ``--`` ends the options. A flag (not in ``vals``) has the value ``None``."""
+    out: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(words):
+        v = words[i]
+        if v == "--":
+            break
+        if not v.startswith("-") or v == "-":
+            pass
+        elif v.startswith("--") and "=" in v:
+            k, a = v.split("=", 1)
+            out.append((k, a))
+        elif v in vals:
+            out.append((v, words[i + 1] if i + 1 < len(words) else None))
+            i += 1
+        elif not v.startswith("--") and len(v) > 2 and v[:2] in vals:
+            out.append((v[:2], v[2:]))
+        else:
+            out.append((v, None))
+        i += 1
+    return out
 
 
 def _node_verdicts(cmd: str, write: bool, write_key: str | None) -> list[Verdict]:

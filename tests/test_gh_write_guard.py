@@ -969,6 +969,9 @@ def test_reads_combined_with_reads_are_allowed() -> None:
         ("gh api --method=get -f probe=" + MARK + " /repos/O/R", "gh_not_in_table"),
         ("gh pr merge 1 -t " + MARK, "gh_search_text"),
         ("gh pr merge 1 --subject " + MARK, "gh_search_text"),
+        ("gh pr merge 1 --body x --subject=" + MARK, "gh_search_text"),
+        ("gh pr merge 1 -t" + MARK, "gh_search_text"),
+        ("gh api -f a=b -XGET /repos/O/R -f probe=" + MARK, "gh_not_in_table"),
     ],
 )
 def test_writes_the_lp_allowlist_admits_are_still_denied_overall(cmd: str, want: str) -> None:
@@ -986,6 +989,13 @@ def test_writes_the_lp_allowlist_admits_are_still_denied_overall(cmd: str, want:
         "gh api -X POST repos/o/r/issues -f title=x",
         "gh pr merge 1 --body x",
         "gh pr close 1 --comment x",
+        # PR-gate on #606: an option-looking string given as a value is a value, not an option
+        "gh pr merge 1 --body '--subject=x'",
+        "gh pr merge 1 --body --subject",
+        "gh pr merge 1 --body -t",
+        "gh api -X POST repos/o/r/issues -f '--method=GET'",
+        "gh api -X POST repos/o/r/issues -f -X -f GET",
+        "gh api --method POST repos/o/r/issues -H '--method=GET'",
     ],
 )
 def test_lp_allowed_writes_without_the_overlay_shapes_still_pass(cmd: str) -> None:
