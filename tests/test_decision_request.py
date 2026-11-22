@@ -1304,6 +1304,24 @@ class TestCliRulesHashExtras:
         assert extras["rules_hash"] == load_tierc_rules_sha(path)
         assert extras["rules_snapshot"] == "failed"
 
+    def test_snapshot_dir_resolution_failure_still_sends_the_hash(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # PR-gate REQUEST_CHANGES on #607: resolving the snapshot directory is snapshot work, so
+        # a throwing resolver degrades only the snapshot, never the already-computed hash.
+        from spirrow_mindwire import config as config_mod
+
+        path = self._write_rules(tmp_path)
+
+        def boom(_settings: object) -> Path:
+            raise RuntimeError("cannot resolve snapshot dir")
+
+        monkeypatch.setattr(config_mod, "resolve_tierc_rules_snapshot_dir", boom)
+        extras = self._run(monkeypatch, capsys)
+        assert extras["rules_hash"] == load_tierc_rules_sha(path)
+        assert extras["rules_snapshot"] == "failed"
+        assert "rules_hash_error" not in extras
+
     def test_composer_keys_of_the_same_name_are_dropped_on_success(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:

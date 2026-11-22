@@ -536,15 +536,17 @@ def _rules_hash_extras() -> dict[str, str]:
         settings = _load_rules_settings()
         path = resolve_tierc_rules_path(settings)
         rules = load_tierc_rules(path)
-        snapshot_dir = resolve_tierc_rules_snapshot_dir(settings)
     except Exception as exc:
         return {"rules_hash_error": f"{type(exc).__name__}: {exc}"}
     out = {"rules_hash": rules.sha256}
+    # Everything snapshot-related, including resolving the snapshot directory, sits in this
+    # snapshot-only try: a failure here must not withhold the hash already computed above.
     try:
         from spirrow_mindwire.adapters.decider_lexora import snapshot_tierc_rules
 
+        snapshot_dir = resolve_tierc_rules_snapshot_dir(settings)
         saved = snapshot_tierc_rules(rules, snapshot_dir)
-    except Exception:  # snapshot_tierc_rules never raises; an import failure still must not.
+    except Exception:  # snapshot_tierc_rules never raises; resolver/import failures still must not.
         saved = False
     out["rules_snapshot"] = "saved" if saved else "failed"
     return out
