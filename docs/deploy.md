@@ -121,6 +121,9 @@ Copy `deploy/mindwire.toml.example` to `<data_dir>/config/mindwire.toml` and fil
 own **clone** — not a linked worktree). `[conductor].roster` maps chatroom personas to roles and
 `naysayer_identity` must map to the `naysayer` role.
 
+`[loop].slots_root` (per-turn clone slots) is unset by default. Turning it on or off follows
+[`docs/clone-slot-enable.md`](clone-slot-enable.md), including the trust step for each slot path.
+
 ### Choosing the role sessions' model (`[loop].role_model` / `[loop].role_cli_path`)
 
 Both default to unset, which is the behaviour every deploy had before they existed: the proposer and
