@@ -36,6 +36,14 @@ repo_dir = "C:/workspace/sandbox/voxelworld-impl"
 # is not pinned by the lockfile.
 # role_model = "claude-opus-5-5"
 # role_cli_path = "C:/Users/tomtar/.local/bin/claude.exe"
+# Per-turn clone slots (T-ephemeral-impl-clone-slot-per-thread). Unset (the default) = today's
+# shared repo_dir clone, unchanged. When set, every implementer turn of EVERY repo in the sweep
+# borrows <slots_root>/<repo>/slot-NN/ (cloned from the bare mirror <slots_root>/<repo>.git) and
+# returns it at turn end; repo_dir is still read for the repo name and the origin URL. There is no
+# per-repo switch. Each slot path has to be marked trusted in Claude Code by a person. Turning it
+# on or off is a production change: follow docs/clone-slot-enable.md, never just edit these lines.
+# slots_root = "C:/workspace/slots"
+# slots_per_repo = 1   # default 1 (one clone per repo, today's parallelism)
 
 [conductor]
 # The single design thread the conductor drives (1 task = 1 thread). REQUIRED.
