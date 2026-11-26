@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_guard_hooks
 
 from spirrow_mindwire import clone_slot_cli
 from spirrow_mindwire.cli import main
@@ -44,6 +45,7 @@ def _prep_argv(tmp_path: Path, origin: Path, thread: str, turn: str) -> list[str
         "--slots-root", str(tmp_path / "slots"),
         "--repo", "sample",
         "--origin-url", str(origin),
+        "--hooks-path", str(make_guard_hooks(tmp_path / "guard-hooks")),
         "--state-dir", str(tmp_path / "state"),
         "--slots-per-repo", "1",
         "--thread-id", thread,

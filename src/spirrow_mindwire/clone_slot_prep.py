@@ -26,6 +26,19 @@
 6. The trust check is read-only (改訂 7): an untrusted slot path parks this turn with
    ``workspace-untrusted`` and the lease is returned.
 
+A8 (Bohr msg-10088, Einstein's go): two preflight checks a slot used to fail.
+
+* P3: every borrow copies the shared clone's ``core.hooksPath`` (``hooks_path``, read by the
+  wrapper) into the slot's local config, after the switch and before the trust check, so new,
+  existing and rebuilt slots all carry the secret guard. A value that is empty, relative, inside
+  ``slots_root`` or without a ``pre-commit`` file parks the turn with ``provision_failed`` before
+  anything else runs. P3 itself still does the full hook check.
+* P2: a slot keeps no ``mirror`` remote (its URL is a local path, which P2 refuses). It is cloned
+  with ``--origin mirror`` so the refs land in ``refs/remotes/mirror/*``, then the
+  ``remote.mirror`` section and every ``branch.*.remote = mirror`` are removed; a slot made before
+  A8 loses them on its next borrow. Every borrow-time fetch names the mirror's path as the source
+  with the same explicit refspec, so ``--remotes=mirror`` and ``mirror/<branch>`` read as before.
+
 Nothing here deletes a directory: quarantine is a rename. ``reset --hard`` is never used. What
 this module does NOT do: the finally wiring, notices, ``reap_orphans`` (A3), or the conductor's
 switch to the ledger-based continuation decision (A4).
@@ -345,6 +358,7 @@ class SlotPrep:
         slots_per_repo: int,
         git: GitRunner = _subprocess_git,
         rename: Callable[[Path, Path], None] = os.rename,
+        hooks_path: str,
         trusted: Callable[[Path], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         exports_root: Path | None = None,
@@ -352,6 +366,8 @@ class SlotPrep:
         self.slots_root = slots_root
         self.repo = repo
         self.origin_url = origin_url
+        # A8: the shared clone's effective core.hooksPath, copied into the slot on every borrow.
+        self.hooks_path = hooks_path
         self.store = store
         self.slots_per_repo = slots_per_repo
         self._git = git
@@ -380,6 +396,10 @@ class SlotPrep:
         )
         name = res.stdout.strip()
         return name if res.returncode == 0 and name else None
+
+    def _mirror_source(self) -> str:
+        """The mirror's path: the fetch source in place of a ``mirror`` remote (A8)."""
+        return str(mirror_path(self.slots_root, self.repo))
 
     # -- borrow ----------------------------------------------------------------------------
 
@@ -430,6 +450,9 @@ class SlotPrep:
         branch: str,
         base: str | None,
     ) -> PrepResult:
+        err = self._hooks_path_problem()
+        if err is not None:
+            return self._park(ref, lease, PARK_PROVISION_FAILED, err, acquire=acq, kept=kept)
         err = self._ensure_mirror()
         if err is not None:
             return self._park(ref, lease, PARK_PROVISION_FAILED, err, acquire=acq, kept=kept)
@@ -439,7 +462,14 @@ class SlotPrep:
         clone_seconds: float | None = None
         slot_bytes: int | None = None
         if slot.exists():
+            # A8: a slot made before A8 still has the mirror remote; drop it before the check. A
+            # slot that is not a repository fails here and is quarantined by the check below.
+            drop_err = self._drop_mirror_remote(slot)
             reason = self._check(slot)
+            if reason is None and drop_err is not None:
+                return self._park(
+                    ref, lease, PARK_PROVISION_FAILED, f"{slot}: {drop_err}", acquire=acq, kept=kept
+                )
             if reason is not None:
                 quarantine = self._quarantine(ref, lease, reason)
                 if quarantine.quarantine_path is None:
@@ -495,6 +525,17 @@ class SlotPrep:
                 kept=kept,
             )
         deleted = self._cleanup_branches(slot, branch)
+        err = self._arm_hooks(slot)
+        if err is not None:
+            return self._park(
+                ref,
+                lease,
+                PARK_PROVISION_FAILED,
+                f"{slot}: {err}",
+                acquire=acq,
+                quarantine=quarantine,
+                kept=kept,
+            )
         if self._trusted is not None and not self._trusted(slot):
             return self._park(
                 ref,
@@ -536,7 +577,7 @@ class SlotPrep:
         for marker, reason in _OP_MARKERS:
             if (git_dir / marker).exists():
                 return reason
-        judgement = SlotSaver(slot, git=self._git).judge(MIRROR_REMOTE)
+        judgement = SlotSaver(slot, git=self._git).judge(MIRROR_REMOTE, self._mirror_source())
         if judgement.saved:
             return None
         if "dirty" in judgement.reasons:
@@ -567,7 +608,7 @@ class SlotPrep:
         rec_reason: str | None = "rescue_failed"
         if reason != "provision_failed":
             saver = SlotSaver(slot, git=self._git, push_remote=PUSH_REMOTE)
-            judgement = saver.judge(MIRROR_REMOTE)
+            judgement = saver.judge(MIRROR_REMOTE, self._mirror_source())
             rescue = saver.rescue(prev, lease.turn_id, judgement, MIRROR_REMOTE)
             if rescue.outcome is SlotTurnOutcome.RESCUED:
                 recoverable, rec_reason = judge_recoverable(slot, self._git)
@@ -619,6 +660,83 @@ class SlotPrep:
         res = _call(self._git, slot, "remote", "add", PUSH_REMOTE, self.origin_url)
         if res.returncode != 0:
             return f"remote add failed: {_first_line(res)}"
+        return self._drop_mirror_remote(slot)
+
+    def _drop_mirror_remote(self, slot: Path) -> str | None:
+        """Remove the ``remote.mirror`` section and every ``branch.*.remote = mirror`` (A8).
+
+        P2 refuses any remote URL outside GitHub, and the mirror's URL is a local path. The
+        section is removed with ``config --remove-section``, not ``remote remove``, so the
+        ``refs/remotes/mirror/*`` refs stay. Nothing to remove is not an error.
+        """
+        have = _call(
+            self._git, slot, "config", "--local", "--get-regexp", rf"^remote\.{MIRROR_REMOTE}\."
+        )
+        if have.returncode == 0 and have.stdout.strip():
+            res = _call(
+                self._git, slot, "config", "--local", "--remove-section", f"remote.{MIRROR_REMOTE}"
+            )
+            if res.returncode != 0:
+                return f"cannot remove the {MIRROR_REMOTE} remote: {_first_line(res)}"
+        elif have.returncode != 1:
+            return f"cannot read the {MIRROR_REMOTE} remote: {_first_line(have)}"
+        tracking = _call(
+            self._git, slot, "config", "--local", "--get-regexp", r"^branch\..*\.remote$"
+        )
+        if tracking.returncode not in (0, 1):
+            return f"cannot read branch upstreams: {_first_line(tracking)}"
+        for line in tracking.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            if value.strip() != MIRROR_REMOTE:
+                continue
+            name = key.removeprefix("branch.").removesuffix(".remote")
+            for item in ("remote", "merge"):
+                # 5: the key is not set (merge can be absent); that is the state we want.
+                res = _call(
+                    self._git, slot, "config", "--local", "--unset", f"branch.{name}.{item}"
+                )
+                if res.returncode not in (0, 5):
+                    return f"cannot unset branch.{name}.{item}: {_first_line(res)}"
+        return None
+
+    def _hooks_path_problem(self) -> str | None:
+        """Why ``hooks_path`` cannot arm a slot, or ``None`` (A8, msg-10088 fix 2).
+
+        Relative: it would resolve inside the slot. Inside ``slots_root``: those hooks would come
+        from a cloned repo, which ``install_githooks.sh`` exists to prevent. No ``pre-commit``:
+        not the secret guard. P3 still checks the hooks in full before the role starts.
+        """
+        value = (self.hooks_path or "").strip()
+        if not value:
+            return (
+                "the shared clone has no core.hooksPath to copy into the slot, so the secret "
+                "guard cannot be armed; arm the shared clone with install_githooks.sh first"
+            )
+        hooks = Path(value)
+        if not hooks.is_absolute():
+            return f"core.hooksPath {value!r} is relative; a slot needs an absolute hooks path"
+        try:
+            inside = os.path.normcase(str(hooks.resolve())) + os.sep
+            root = os.path.normcase(str(self.slots_root.resolve())) + os.sep
+        except OSError as exc:
+            return f"core.hooksPath {value!r} cannot be resolved: {exc}"
+        if inside.startswith(root):
+            return f"core.hooksPath {value!r} is inside slots_root {self.slots_root}"
+        if not (hooks / "pre-commit").is_file():
+            return f"core.hooksPath {value!r} has no pre-commit file (not the secret guard)"
+        return None
+
+    def _arm_hooks(self, slot: Path) -> str | None:
+        """Set the slot's local ``core.hooksPath`` to ``hooks_path`` when it differs (A8)."""
+        value = self.hooks_path.strip()
+        cur = _call(self._git, slot, "config", "--local", "--get", "core.hooksPath")
+        if cur.returncode == 0 and cur.stdout.strip() == value:
+            return None
+        if cur.returncode not in (0, 1):
+            return f"cannot read core.hooksPath: {_first_line(cur)}"
+        res = _call(self._git, slot, "config", "--local", "core.hooksPath", value)
+        if res.returncode != 0:
+            return f"cannot set core.hooksPath: {_first_line(res)}"
         return None
 
     def _switch(self, slot: Path, branch: str, base: str) -> str | None:
@@ -628,7 +746,7 @@ class SlotPrep:
             "fetch",
             "--prune",
             "--no-tags",
-            MIRROR_REMOTE,
+            self._mirror_source(),
             f"+refs/heads/*:refs/remotes/{MIRROR_REMOTE}/*",
         )
         if fetch.returncode != 0:

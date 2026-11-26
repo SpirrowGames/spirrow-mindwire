@@ -3703,14 +3703,18 @@ function Invoke-CloneCheck {
 # for one launch. Returns @{ code; stdout; stderr }; a probe that could not run or timed out reports
 # code -1 (Get-SlotPrepDecision parks the thread with clone_slot_prep_crashed). --branch and --base
 # are left to slot-prep: loop/<stem> (the git-sync name) and the mirror's default branch.
+# A8 (Bohr msg-10088 fix 1): -HooksPath is the shared clone's core.hooksPath, which slot-prep copies
+# into the slot. It goes as one '--hooks-path=<value>' token so an empty value still reaches
+# slot-prep (which parks the turn with a reason) instead of being dropped from the argv.
 function Invoke-SlotPrep {
-    param([string]$SlotsRoot, [string]$Repo, [string]$OriginUrl, [string]$StateDir,
+    param([string]$SlotsRoot, [string]$Repo, [string]$OriginUrl, [string]$HooksPath, [string]$StateDir,
           [int]$SlotsPerRepo, [string]$ThreadId, [string]$TurnId)
     $perRepo = "$SlotsPerRepo"
     $wrapperPid = "$PID"
+    $hooksArg = "--hooks-path=$HooksPath"
     $r = Invoke-BoundedUvProbe -Label 'slot-prep' -TimeoutSeconds $SlotPrepTimeoutSeconds `
         -Arguments @('-m', 'spirrow_mindwire.cli', 'slot-prep', '--slots-root', $SlotsRoot, '--repo', $Repo,
-                     '--origin-url', $OriginUrl, '--state-dir', $StateDir, '--slots-per-repo', $perRepo,
+                     '--origin-url', $OriginUrl, $hooksArg, '--state-dir', $StateDir, '--slots-per-repo', $perRepo,
                      '--thread-id', $ThreadId, '--turn-id', $TurnId, '--wrapper-pid', $wrapperPid)
     if (-not $r.ok) { return @{ code = -1; stdout = ''; stderr = "$($r.error)" } }
     return @{ code = [int]$r.code; stdout = "$($r.stdout)"; stderr = "$($r.stderr)" }
@@ -3776,6 +3780,16 @@ function Get-SlotOriginUrl {
     $url = git -C $RepoDir remote get-url origin 2>$null
     if ($LASTEXITCODE -ne 0) { return '' }
     return "$url".Trim()
+}
+
+# A8 (Bohr msg-10088 fix 1): the candidate's own clone's effective core.hooksPath, the secret guard
+# the slot is armed with. Effective and with --path, as preflight P3 reads it. '' when unset or
+# unreadable (slot-prep then parks the thread with provision_failed and a reason).
+function Get-SlotHooksPath {
+    param([string]$RepoDir)
+    $value = git -C $RepoDir config --get --path core.hooksPath 2>$null
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return "$value".Trim()
 }
 
 # A borrowed slot that is not launched after all goes back to the pool: it was checked and nothing
@@ -7750,7 +7764,8 @@ try {
             $slotRepo = Get-SlotRepoName -RepoDir $cand.repo_dir
             $slotTurnId = New-SlotTurnId -NowUtc ((Get-Date).ToUniversalTime())
             $originUrl = Get-SlotOriginUrl -RepoDir $cand.repo_dir
-            $prepRun = Invoke-SlotPrep -SlotsRoot $slotMode.slots_root -Repo $slotRepo -OriginUrl $originUrl `
+            $hooksPath = Get-SlotHooksPath -RepoDir $cand.repo_dir
+            $prepRun = Invoke-SlotPrep -SlotsRoot $slotMode.slots_root -Repo $slotRepo -OriginUrl $originUrl -HooksPath $hooksPath `
                 -StateDir $slotStateDir -SlotsPerRepo $slotMode.slots_per_repo -ThreadId $thread -TurnId $slotTurnId
             $prepRow = Get-SlotRow -Stdout $prepRun.stdout -Prefix 'MINDWIRE_SLOT_PREP '
             $slotDecision = Get-SlotPrepDecision -Code $prepRun.code -Row $prepRow -Repo $slotRepo `

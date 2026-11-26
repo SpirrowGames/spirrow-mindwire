@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_guard_hooks
 
 from spirrow_mindwire.cli import main
 from spirrow_mindwire.clone_retreat import git_env
@@ -57,6 +58,7 @@ def _borrow(tmp_path: Path, origin: Path, thread: str = "T-a", turn: str = "t1")
         slots_root=tmp_path / "slots",
         repo=REPO,
         origin_url=str(origin),
+        hooks_path=str(make_guard_hooks(tmp_path / "guard-hooks")),
         store=_store(tmp_path),
         slots_per_repo=1,
         clock=lambda: NOW,

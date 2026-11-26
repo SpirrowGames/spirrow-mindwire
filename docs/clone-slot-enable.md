@@ -28,6 +28,13 @@ config file is not that instruction.
   `.claude.json` (`src/spirrow_mindwire/clone_slot_trust.py`; trust is not inherited from a parent
   directory). An untrusted slot parks that thread with `workspace-untrusted` and returns the lease.
   MindWire never writes Claude Code's config. A person marks each slot path trusted.
+- **Secret guard and remotes (A8).** On every borrow, `slot-prep` copies the shared clone's
+  effective `core.hooksPath` (`git -C <repo_dir> config --get --path core.hooksPath`, read by the
+  sweep) into the slot's local config, so preflight P3 finds the guard. An empty, relative, inside-
+  `slots_root` or `pre-commit`-less value parks that thread with `provision_failed` before anything
+  is cloned. The slot keeps no `mirror` remote, because preflight P2 refuses its local URL: the
+  borrow fetches from the mirror's path, and a slot made before A8 loses the remote on its next
+  borrow. The only remote left is `origin`.
 
 ## The stop window (used by both directions)
 
@@ -106,6 +113,13 @@ Before the window:
 - **Choose `slots_root`** on the same volume as the shared clones, outside every repo.
 - **List the slot paths** that will need trust: `<slots_root>/<repo>/slot-01` …
   `slot-<slots_per_repo>` for every repo that appears in `sweep.json`.
+- **Check every shared clone is armed** (A8): for each `repo_dir` in `sweep.json`,
+  `git -C <repo_dir> config --get --path core.hooksPath` prints the spirrow-docs `githooks`
+  directory. A slot is armed with exactly this value, so a shared clone without it parks its threads
+  with `provision_failed`. Arm it with the secret guard's `install_githooks.sh` (naming the clone,
+  not `--all`) before the window; do not set a hooks path on a slot by hand.
+- **Make sure the daemon checkout has A8.** Without it, a slot is never armed and every role turn
+  is refused with `check=P3` (msg-10086), and after that `check=P2`.
 
 In the window: steps 1–3 above, then add to `[loop]`:
 
