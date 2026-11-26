@@ -345,6 +345,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'lib/Lease.ps1')
 # T-ephemeral-impl-clone-slot-per-thread A3/A4: the slot pool's decisions and notices (pure). Inert
 # unless [loop].slots_root is set (accepted since A4; off by default).
+# A7: TOML basic-string escaping for Set-TomlValue (and Get-SlotModeConfig, via CloneSlot.ps1).
+. (Join-Path $PSScriptRoot 'lib/TomlString.ps1')
 . (Join-Path $PSScriptRoot 'lib/CloneSlot.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -5852,7 +5854,7 @@ function Set-TomlValue {
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '^\s*\[([^\]]+)\]\s*$') { $section = $Matches[1]; continue }
-        if ($section -eq $Section -and $lines[$i] -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*"(.*)"\s*$')) {
+        if ($section -eq $Section -and $lines[$i] -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*"(' + $TomlBasicStringBodyPattern + ')"\s*$')) {
             $index = $i
             $current = $Matches[1]
             break
@@ -5862,13 +5864,20 @@ function Set-TomlValue {
     if ($index -lt 0) {
         throw "no [$Section].$Key line found in $Path — refusing to guess; fix the config by hand."
     }
-    if ($current -eq $Value) { return }
+    # A7 (msg-10049): the value is written as a TOML basic string (lib/TomlString.ps1), so a slot
+    # path with backslashes stays exactly what slot-prep returned and the settings loader can read
+    # it. The comparison is on the decoded value, or the same path would be rewritten every turn; a
+    # line that does not decode is refused like a missing one.
+    try { $decoded = ConvertFrom-TomlBasicString -Text $current }
+    catch { throw "[$Section].$Key in $Path is not a valid TOML basic string ($($_.Exception.Message)) — refusing to guess; fix the config by hand." }
+    if ($decoded -ceq $Value) { return }
+    $encoded = ConvertTo-TomlBasicString -Value $Value
 
-    $lines[$index] = $Key + ' = "' + $Value + '"'
+    $lines[$index] = $Key + ' = "' + $encoded + '"'
     # UTF-8 without BOM, LF-preserving via explicit join (ReadAllLines already stripped the endings).
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, ($lines -join "`n") + "`n", $utf8NoBom)
-    Write-Log "[$Section].$Key : `"$current`" -> `"$Value`""
+    Write-Log "[$Section].$Key : `"$decoded`" -> `"$Value`""
 }
 
 # --- head probe ----------------------------------------------------------------------------------

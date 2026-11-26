@@ -41,4 +41,5 @@ pwsh -NoProfile -File tests/Test-SettledClose.ps1
 pwsh -NoProfile -File tests/Test-LedgerDrift.ps1
 pwsh -NoProfile -File tests/Test-HoldAckViaPark.ps1
 pwsh -NoProfile -File tests/Test-CloneSlot.ps1
+pwsh -NoProfile -File tests/Test-TomlString.ps1
 uv run pytest
