@@ -107,6 +107,16 @@ try {
     Check 'forward-slash slots_root unchanged' ((Get-SlotModeConfig -ConfigPath $cfg).slots_root -ceq 'C:/workspace/slots')
     [System.IO.File]::WriteAllText($cfg, "[loop]`nslots_root = `"C:\workspace\slots`"`n", $utf8)
     Check 'slots_root with an undefined escape is refused, not read raw' (Throws { Get-SlotModeConfig -ConfigPath $cfg })
+    # A7 round 1 (PR-gate on 97ac37e): a trailing lone backslash eats the closing quote; the line must
+    # be refused, not skipped as if slots_root were absent (which would mean shared-clone mode).
+    [System.IO.File]::WriteAllText($cfg, "[loop]`nslots_root = `"C:/slots\`"`n", $utf8)
+    Check 'slots_root with a trailing lone backslash is refused, not treated as absent' (Throws { Get-SlotModeConfig -ConfigPath $cfg })
+    [System.IO.File]::WriteAllText($cfg, "[loop]`nslots_root = 'C:/slots'`n", $utf8)
+    Check 'slots_root that is not a basic string is refused, not treated as absent' (Throws { Get-SlotModeConfig -ConfigPath $cfg })
+    [System.IO.File]::WriteAllText($cfg, "[loop]`nslots_root = `"`"`n", $utf8)
+    Check 'empty slots_root is still the shared-clone path' ($null -eq (Get-SlotModeConfig -ConfigPath $cfg))
+    [System.IO.File]::WriteAllText($cfg, "[loop]`n# slots_root = `"C:/slots\`"`n", $utf8)
+    Check 'a commented-out slots_root is still absent' ($null -eq (Get-SlotModeConfig -ConfigPath $cfg))
 }
 finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
