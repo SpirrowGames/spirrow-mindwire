@@ -31,6 +31,9 @@ $SlotUnrecoverableParkCode = 'clone_slot_unrecoverable'
 # A4: the conductor refused a CONTINUE in slot mode (slot_continuation.PARK_CODE).
 $SlotContinueRefusedParkCode = 'clone_slot_continue_refused'
 
+# A7: TOML basic-string decoding for the slots_root read below.
+. (Join-Path $PSScriptRoot 'TomlString.ps1')
+
 # [loop].slots_root and [loop].slots_per_repo from mindwire.toml, line-oriented like
 # Get-ConductorHardBudgetSeconds. $null when the file or the key is missing or slots_root is empty:
 # the shared-clone path. slots_per_repo defaults to 1 (config.LoopSettings.resolved_slots_per_repo).
@@ -43,7 +46,11 @@ function Get-SlotModeConfig {
     foreach ($line in [System.IO.File]::ReadAllLines($ConfigPath)) {
         if ($line -match '^\s*\[([^\]]+)\]\s*$') { $section = $Matches[1]; continue }
         if ($section -ne 'loop') { continue }
-        if ($line -match '^\s*slots_root\s*=\s*"(.*)"\s*(#.*)?$') { $root = $Matches[1] }
+        if ($line -match ('^\s*slots_root\s*=\s*"(' + $TomlBasicStringBodyPattern + ')"\s*(#.*)?$')) {
+            # A7: the decoded value, the same path the Python settings loader reads (TomlString.ps1).
+            try { $root = ConvertFrom-TomlBasicString -Text $Matches[1] }
+            catch { throw "[loop].slots_root in $ConfigPath is not a valid TOML basic string ($($_.Exception.Message)); fix the config by hand." }
+        }
         elseif ($line -match '^\s*slots_per_repo\s*=\s*(\d+)\s*(#.*)?$') { $perRepo = [int]$Matches[1] }
     }
     if (-not $root) { return $null }
