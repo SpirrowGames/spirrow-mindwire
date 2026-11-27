@@ -213,6 +213,45 @@ def test_mirror_remote_judgement(slot: Path, origin: Path, tmp_path: Path) -> No
     assert j.reasons == ("unpushed",)
 
 
+def test_mirror_judgement_from_the_path_without_a_mirror_remote(
+    slot: Path, origin: Path, tmp_path: Path
+) -> None:
+    # A8 (msg-10088 §3, Einstein's go): a slot has no ``mirror`` remote. The fetch names the
+    # mirror's path, the explicit refspec still writes refs/remotes/mirror/*, and the judgement and
+    # the rescue read --remotes=mirror and mirror/<branch> as before.
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--mirror", str(origin), str(mirror)],
+        check=True,
+        capture_output=True,
+    )
+    assert "mirror" not in _git(slot, "remote").split()
+    saver = SlotSaver(slot)
+    assert saver.judge("mirror", str(mirror)).saved
+    main_sha = _git(origin, "rev-parse", "main").strip()
+    assert _git(slot, "rev-parse", "mirror/main").strip() == main_sha
+
+    _git(slot, "switch", "-q", "-c", "feature/y")
+    sha = _commit(slot, "y.txt", "y\n", "y")
+    _git(slot, "push", "-q", "origin", "feature/y")  # on GitHub, but not yet in the mirror
+    j = saver.judge("mirror", str(mirror))
+    assert j.reasons == ("unpushed",) and j.fetched
+    res = saver.rescue(THREAD, TURN, j, "mirror")
+    assert res.outcome is SlotTurnOutcome.RESCUED
+    assert [t.sha for t in res.targets] == [sha]
+
+    # Once the mirror has the branch, the next judgement sees it under mirror/feature/y; a branch
+    # the mirror drops is pruned from refs/remotes/mirror/ too.
+    subprocess.run(["git", "-C", str(mirror), "fetch", "-q", "--prune", "origin"], check=True)
+    assert saver.judge("mirror", str(mirror)).saved
+    assert _git(slot, "rev-parse", "mirror/feature/y").strip() == sha
+    _git(origin, "branch", "-D", "feature/y")
+    subprocess.run(["git", "-C", str(mirror), "fetch", "-q", "--prune", "origin"], check=True)
+    saver.fetch("mirror", str(mirror))
+    gone = _git(slot, "rev-parse", "-q", "--verify", "refs/remotes/mirror/feature/y", check=False)
+    assert not gone.strip()
+
+
 def test_ledger_row_carries_the_mapping_and_is_not_counted(slot: Path, tmp_path: Path) -> None:
     (slot / "new.txt").write_text("wip\n", encoding="utf-8")
     res = SlotSaver(slot).check_and_rescue(THREAD, TURN)

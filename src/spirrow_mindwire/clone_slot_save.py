@@ -9,7 +9,9 @@ Judgement (:meth:`SlotSaver.judge`):
 
 1. ``git fetch --prune <remote> '+refs/heads/*:refs/remotes/<remote>/*'`` with the refspec written
    out, never the remote's configured one (msg-9402 Obj-36-2 §1). ``<remote>`` is ``origin``
-   (GitHub) at turn end and ``mirror`` (the local bare mirror) at borrow time.
+   (GitHub) at turn end and ``mirror`` (the local bare mirror) at borrow time. A slot has no
+   ``mirror`` remote configured (A8, msg-10088 §3: P2 refuses its local URL), so the borrow time
+   fetches from the mirror's path into the same ``refs/remotes/mirror/*``.
 2. ``git status --porcelain --ignore-submodules=none --untracked-files=all`` is empty.
 3. ``git rev-list --branches HEAD --not --remotes=<remote>`` is empty: every local branch and a
    detached HEAD are covered (msg-9402 Obj-36-1 §1).
@@ -188,17 +190,28 @@ class SlotSaver:
 
     # -- judgement ---------------------------------------------------------------------------
 
-    def fetch(self, remote: str) -> bool:
+    def fetch(self, remote: str, source: str | None = None) -> bool:
+        """Fetch into ``refs/remotes/<remote>/*`` with the refspec written out.
+
+        ``source`` is where to fetch from when it is not the configured remote ``remote`` (A8,
+        Bohr msg-10088 §3): a slot has no ``mirror`` remote, because P2 refuses its local URL, so
+        the borrow time passes the mirror's path. The refs land in the same place either way.
+        """
         res = self._git(
-            "fetch", "--prune", "--no-tags", remote, f"+refs/heads/*:refs/remotes/{remote}/*"
+            "fetch",
+            "--prune",
+            "--no-tags",
+            source or remote,
+            f"+refs/heads/*:refs/remotes/{remote}/*",
         )
         return res.returncode == 0
 
-    def judge(self, remote: str) -> SaveJudgement:
-        """Fetch ``remote`` with an explicit refspec, then the three checks. A check that cannot
-        run counts as unsaved; a failed fetch is unsaved too (it is never "saved")."""
+    def judge(self, remote: str, source: str | None = None) -> SaveJudgement:
+        """Fetch ``remote`` (from ``source`` when given) with an explicit refspec, then the three
+        checks. A check that cannot run counts as unsaved; a failed fetch is unsaved too (it is
+        never "saved")."""
         reasons: list[str] = []
-        fetched = self.fetch(remote)
+        fetched = self.fetch(remote, source)
         if not fetched:
             reasons.append("fetch_failed")
         status = self._git(

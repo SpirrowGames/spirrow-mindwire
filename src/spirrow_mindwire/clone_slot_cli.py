@@ -82,6 +82,14 @@ def add_parsers(sub: Any) -> None:
     prep.add_argument("--slots-root", required=True, type=Path)
     prep.add_argument("--repo", required=True)
     prep.add_argument("--origin-url", required=True, help="the GitHub URL the mirror follows")
+    prep.add_argument(
+        "--hooks-path",
+        required=True,
+        help=(
+            "the shared clone's effective core.hooksPath, copied into the slot (A8); empty, "
+            "relative, inside --slots-root or without pre-commit parks the turn"
+        ),
+    )
     prep.add_argument("--state-dir", required=True, type=Path)
     prep.add_argument("--slots-per-repo", required=True, type=int)
     prep.add_argument("--thread-id", required=True)
@@ -217,6 +225,7 @@ def run_prep(args: argparse.Namespace) -> int:
             slots_root=args.slots_root,
             repo=args.repo,
             origin_url=args.origin_url,
+            hooks_path=args.hooks_path,
             store=store,
             slots_per_repo=args.slots_per_repo,
             trusted=_trusted,

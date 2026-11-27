@@ -115,6 +115,27 @@ def test_slot_pool_call_sites_pass_cli_flags() -> None:
     )
 
 
+def test_slot_prep_passes_the_hooks_path_as_one_token() -> None:
+    """A8 (Bohr msg-10088 fix 1): ``--hooks-path=<value>`` is one token built in a variable, so
+    the ``'--flag'`` scan above cannot see it. Check it here: the variable is in the slot-prep
+    argv, it is built with the flag ``slot-prep --help`` lists, and the caller reads the value."""
+    text = _WRAPPER.read_text(encoding="utf-8")
+    call = next(m for m in _CALL.finditer(text) if m.group("label") == "'slot-prep'")
+    assert "$hooksArg" in call.group("args")
+    assert '$hooksArg = "--hooks-path=$HooksPath"' in text
+    assert "$hooksPath = Get-SlotHooksPath -RepoDir $cand.repo_dir" in text
+    assert "-HooksPath $hooksPath" in text
+    assert "git -C $RepoDir config --get --path core.hooksPath" in text
+    out = subprocess.run(
+        _help_command("-m spirrow_mindwire.cli slot-prep"),
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=_REPO_ROOT,
+    ).stdout
+    assert "--hooks-path" in out
+
+
 def test_hold_ack_call_site_uses_the_hold_only_flag() -> None:
     sites = {label: (target, flags) for label, target, flags in _SITES}
     # T-hold-observed-freshness-and-unlaunched-tick-ack F1: the caller always names the reason.

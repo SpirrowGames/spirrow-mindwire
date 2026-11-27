@@ -292,5 +292,41 @@ $loop = $src.IndexOf('foreach ($cand in $candidates) {', [Math]::Max(0, $gcCall)
 Check 'GC runs once per tick, slot mode only, before the candidate loop' (
     $gcCall -gt 0 -and $loop -gt $gcCall -and ([regex]::Matches($src, 'Invoke-QuarantineGc -SlotsRoot')).Count -eq 1)
 
+# --- 6. A8 (Bohr msg-10088 fix 1): the hooks path the slot is armed with -------------------------
+# Get-SlotHooksPath, lifted from the sweep and run against real clones: the shared clone's effective
+# core.hooksPath, '' when it is unset or the directory is no repository (slot-prep then parks).
+$fnHooks = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SlotHooksPath' }, $true) | Select-Object -First 1
+Check 'Get-SlotHooksPath is defined in the sweep' ($null -ne $fnHooks)
+Invoke-Expression $fnHooks.Extent.Text
+$tmpHooks = Join-Path $repoRoot ".git/mindwire-scratch/test-cloneslot-hooks-$PID"
+New-Item -ItemType Directory -Path $tmpHooks -Force | Out-Null
+try {
+    $clone = Join-Path $tmpHooks 'shared'
+    $plain = Join-Path $tmpHooks 'not-a-repo'
+    New-Item -ItemType Directory -Path $plain -Force | Out-Null
+    git init -q $clone 2>$null | Out-Null
+    $guard = (Join-Path $tmpHooks 'guard-hooks').Replace('\', '/')
+    git -C $clone config --local --unset core.hooksPath 2>$null
+    $unset = Get-SlotHooksPath -RepoDir $clone
+    git -C $clone config --local core.hooksPath $guard
+    $set = Get-SlotHooksPath -RepoDir $clone
+    # The scratch dir is inside this clone's .git; the ceiling stops git walking up into it.
+    $env:GIT_CEILING_DIRECTORIES = $tmpHooks
+    try { $none = Get-SlotHooksPath -RepoDir $plain }
+    finally { Remove-Item Env:GIT_CEILING_DIRECTORIES -ErrorAction SilentlyContinue }
+    # A global core.hooksPath on this host would make the "unset" case read that instead.
+    $global = git config --global --get core.hooksPath 2>$null
+    if (-not $global) { Check 'hooks path: unset -> empty' ($unset -eq '') "got '$unset'" }
+    Check 'hooks path: set -> the value, trimmed' ($set -eq $guard) "got '$set'"
+    Check 'hooks path: not a repository -> empty or a global value, never an error' ($none -eq '' -or $none -eq "$global".Trim()) "got '$none'"
+}
+finally { Remove-Item -LiteralPath $tmpHooks -Recurse -Force -ErrorAction SilentlyContinue }
+Check 'the borrow reads the hooks path from the candidate clone and passes it to slot-prep' (
+    $src.Contains('$hooksPath = Get-SlotHooksPath -RepoDir $cand.repo_dir') -and
+    $src.Contains('-OriginUrl $originUrl -HooksPath $hooksPath') -and
+    $src.Contains('$hooksArg = "--hooks-path=$HooksPath"'))
+$hk = $src.IndexOf('$hooksPath = Get-SlotHooksPath')
+Check 'the hooks path is read before the borrow' ($hk -gt 0 -and $hk -lt $prep) "$hk $prep"
+
 if ($script:failures -gt 0) { Write-Host "$($script:failures) failure(s)"; exit 1 }
 Write-Host "all passed"

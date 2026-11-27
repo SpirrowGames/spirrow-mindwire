@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_guard_hooks
 
 from spirrow_mindwire.clone_retreat import git_env
 from spirrow_mindwire.clone_slot import (
@@ -58,6 +59,7 @@ def origin(tmp_path: Path) -> Path:
 
 
 def _prep(tmp_path: Path, origin: Path, *, n: int = 1, **kw: object) -> SlotPrep:
+    kw.setdefault("hooks_path", str(make_guard_hooks(tmp_path / "guard-hooks")))
     return SlotPrep(
         slots_root=tmp_path / "slots",
         repo=REPO,
@@ -82,8 +84,10 @@ def test_first_borrow_creates_mirror_and_slot_on_own_branch(tmp_path: Path, orig
     slot = res.slot.path  # type: ignore[union-attr]
     assert slot == tmp_path / "slots" / REPO / "slot-01"
     assert _git(slot, "branch", "--show-current").strip() == "feature/T-a"
+    # A8: no mirror remote (P2 refuses its local URL); its refs stay under refs/remotes/mirror/.
     remotes = _git(slot, "remote").split()
-    assert sorted(remotes) == ["mirror", "origin"]
+    assert remotes == ["origin"]
+    assert _git(slot, "rev-parse", "--verify", "refs/remotes/mirror/main").strip()
     assert res.lease is not None and res.lease.state is LeaseState.LAUNCHING
     assert res.to_json()["outcome"] == "ready"
 
