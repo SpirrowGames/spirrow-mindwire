@@ -43,6 +43,7 @@ from .normalize import IdentityCollisionError, find_collisions, normalize_identi
 __all__ = [
     "MACHINE_INDEPENDENCE_CLASS",
     "MACHINE_ROLE_EXCEPTIONS",
+    "RETIRED_ROLES",
     "SETTLED_CLOSER",
     "ClassificationEntry",
     "ClassificationError",
@@ -162,6 +163,17 @@ MACHINE_ROLE_EXCEPTIONS: Mapping[str, frozenset[str]] = MappingProxyType(
 )
 
 
+#: Roles retired from the role registry (T-human-role-registry msg-10143). A
+#: retired role stays a valid value on past posts, but no identity may hold it: the loader
+#: refuses a ``legitimate`` set that names one, and the registration guard reports a
+#: payload or store record whose ``allowed_roles`` names one (``role_retired``).
+#:
+#: ``human``: ADR-2026-05-29-10 defined it; Takahito's ruling msg-8784 §2 replaced it with
+#: ``product_owner`` for the human, and §1 has Fermi declare the role it actually played.
+#: The identity ``human`` and the independence_class ``human`` are NOT retired.
+RETIRED_ROLES: frozenset[str] = frozenset({"human"})
+
+
 def machine_roles_are_excepted(name: str, roles: Iterable[str]) -> bool:
     """True iff the machine ``name`` may carry exactly ``roles`` (non-empty).
 
@@ -275,6 +287,12 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
     if not isinstance(legitimate, list) or not all(isinstance(r, str) for r in legitimate):
         raise ClassificationError(
             f"{path}: identities[{index}].legitimate must be a list of strings"
+        )
+    retired_roles = sorted(set(legitimate) & RETIRED_ROLES)
+    if retired_roles:
+        raise ClassificationError(
+            f"{path}: identities[{index}].legitimate names retired role(s) {retired_roles} "
+            f"(no identity may hold a retired role; T-human-role-registry msg-10143)"
         )
     retired = _parse_retired(raw.get("retired"), index, path)
     if retired is not None and legitimate:

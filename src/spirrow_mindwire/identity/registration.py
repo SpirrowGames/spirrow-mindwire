@@ -58,6 +58,7 @@ from typing import Any
 from .classification import (
     MACHINE_INDEPENDENCE_CLASS,
     MACHINE_ROLE_EXCEPTIONS,
+    RETIRED_ROLES,
     ClassificationEntry,
     machine_roles_are_excepted,
 )
@@ -116,6 +117,19 @@ def check_identity_against_classification(
             GuardViolation(
                 "allowed_roles_malformed",
                 f"allowed_roles must be a list of strings, got {allowed_roles!r}",
+            )
+        )
+
+    # A retired role (``human``) may be held by no identity, whatever its
+    # kind or classification. Checked first and independently of ``legitimate``, so neither a
+    # payload this repo builds nor a record written into the store by hand can carry one
+    # without a finding (T-human-role-registry msg-10141 Obj-1-2 / msg-10143 §2-2).
+    if roles is not None and roles & RETIRED_ROLES:
+        violations.append(
+            GuardViolation(
+                "role_retired",
+                f"allowed_roles holds retired role(s) {sorted(roles & RETIRED_ROLES)}; no "
+                f"identity may hold a retired role (T-human-role-registry msg-10143)",
             )
         )
 
