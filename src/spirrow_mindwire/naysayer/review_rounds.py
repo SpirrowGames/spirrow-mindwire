@@ -126,7 +126,12 @@ AUTHOR_OBJECTION_LINE_RULE_PR = (
     AUTHOR_OBJECTION_LINE_RULE
     + """ On a pull request these lines go under a `Gate objections round N` heading in the PR \
 body, not in commit messages. Take the base into your branch with a merge commit: a rebase or \
-force-push makes the next gate review the whole PR again."""
+force-push makes the next gate review the whole PR again. You may add an optional `## Settled` \
+section to the PR body for points already settled outside the gate (a pre-gate review, a human \
+ruling, a measurement), one line each: \
+`Settled: <path:line or place> — <the claim> — basis: <file:line | msg-id | measurement>` (for a \
+human ruling, `basis: ruling <msg-id>`). It is your hand transcription: nobody verifies it, and \
+it settles nothing by itself."""
 )
 
 
@@ -278,6 +283,22 @@ def scope_for_design_round(round_number: int | None) -> ReviewScope:
     return "delta" if round_number is not None and round_number >= 2 else "full"
 
 
+@dataclass(frozen=True)
+class LedgerMeasure:
+    """Stage A of T-pr-gate-settled-objections-ledger (msg-10102): what the round log adds.
+
+    Measurement only, like :class:`RoundCounts`: the ledger these describe is passed to no model,
+    and none of the numbers reaches a verdict. ``repeat`` / ``settled_hit`` are place-proximity
+    reference values (see :mod:`.settled_ledger`), never a count of re-submitted defects.
+    """
+
+    ledger_bytes: int
+    prompt_bytes: int
+    ledger_omitted: int
+    repeat: int | None
+    settled_hit: int | None
+
+
 def log_round(
     logger: logging.Logger,
     *,
@@ -290,6 +311,7 @@ def log_round(
     counts: RoundCounts | None,
     out_tokens: object,
     conditional_proceed: bool | None = None,
+    ledger: LedgerMeasure | None = None,
 ) -> None:
     """D5: one ``naysayer.round`` line per naysayer post, on the operator-side log.
 
@@ -300,6 +322,10 @@ def log_round(
     Naysayer-side facts only (msg-7474 Obj-2-2); the author's ``Obj-`` lines do not exist yet when
     this fires and are read offline by ``scripts/naysayer_round_stats.py``. ``counts`` of ``None``
     is ``objections_unparsed=1`` with every count ``-``, so it cannot be summed as zero (msg-7505).
+
+    ``ledger`` (PR gate only) adds ``ledger_bytes prompt_bytes ledger_omitted repeat
+    settled_hit``; ``None`` (a design round, or a ledger that could not be built) logs them ``-``.
+    ``repeat`` and ``settled_hit`` are ``-`` when the new review's objections did not parse.
     """
 
     def show(value: object) -> str:
@@ -308,6 +334,7 @@ def log_round(
     logger.info(
         "naysayer.round thread=%s pr=%s backend=%s model=%s round=%s scope=%s blocking=%s "
         "advisory=%s late=%s late_advisory=%s fix_missing=%s objections_unparsed=%d out_tokens=%s "
+        "ledger_bytes=%s prompt_bytes=%s ledger_omitted=%s repeat=%s settled_hit=%s "
         "conditional_proceed=%s",
         show(thread),
         show(pr),
@@ -322,6 +349,11 @@ def log_round(
         show(counts.fix_missing if counts else None),
         0 if counts else 1,
         show(out_tokens),
+        show(ledger.ledger_bytes if ledger else None),
+        show(ledger.prompt_bytes if ledger else None),
+        show(ledger.ledger_omitted if ledger else None),
+        show(ledger.repeat if ledger else None),
+        show(ledger.settled_hit if ledger else None),
         "-" if conditional_proceed is None else int(conditional_proceed),
     )
 
@@ -375,6 +407,7 @@ __all__ = [
     "OBJECTIONS_SENTINEL",
     "OBJECTION_ELEMENT_KEYS",
     "REVIEW_ROUND_RULES",
+    "LedgerMeasure",
     "ObjectionBlock",
     "ObjectionFacts",
     "ReviewScope",

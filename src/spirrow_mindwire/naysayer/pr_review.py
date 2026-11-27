@@ -144,11 +144,13 @@ from .review_rounds import (
     OBJECTION_ELEMENT_KEYS,
     OBJECTIONS_SENTINEL,
     REVIEW_ROUND_RULES,
+    LedgerMeasure,
     ObjectionFacts,
     ReviewScope,
     count_round,
     log_round,
 )
+from .settled_ledger import build_ledger, count_hits
 
 logger = logging.getLogger(__name__)
 
@@ -2139,8 +2141,13 @@ def _log_pr_round(
     completion: ChatCompletion,
     round_context: PrRoundContext,
     report: ObjectionReport,
+    ledger: LedgerMeasure | None = None,
 ) -> None:
-    """D5 for a PR-gate review. A block that would not parse is ``objections_unparsed``, not 0."""
+    """D5 for a PR-gate review. A block that would not parse is ``objections_unparsed``, not 0.
+
+    ``ledger`` is the Stage A measurement of T-pr-gate-settled-objections-ledger
+    (:func:`measure_ledger`); ``None`` logs its fields as ``-``.
+    """
     counts = None
     if report.status is not ObjectionParse.MISSING:
         counts = count_round(
@@ -2160,6 +2167,37 @@ def _log_pr_round(
         scope=round_context.scope,
         counts=counts,
         out_tokens=completion.usage.get("completion_tokens"),
+        ledger=ledger,
+    )
+
+
+def measure_ledger(
+    prior_reviews: tuple[str, ...],
+    pr_body: str | None,
+    report: ObjectionReport,
+    *,
+    prompt_bytes: int,
+) -> LedgerMeasure:
+    """Build the settled-objections ledger and measure it. Stage A: the ledger goes nowhere.
+
+    T-pr-gate-settled-objections-ledger msg-10102: the rendered ledger is only counted. It is
+    built with the same defang the previous review gets (:func:`_defang_prior`), so
+    ``ledger_bytes`` is what Stage B would add to the prompt, but nothing here hands it to a model
+    and there is no switch that would. ``repeat`` / ``settled_hit`` are ``None`` when the new
+    review's block did not parse, so an unread block is never counted as zero hits.
+    """
+    ledger = build_ledger(prior_reviews, pr_body, defang=_defang_prior)
+    hits = (
+        None
+        if report.status is ObjectionParse.MISSING
+        else count_hits(ledger, (o.where for o in report.objections))
+    )
+    return LedgerMeasure(
+        ledger_bytes=ledger.nbytes,
+        prompt_bytes=prompt_bytes,
+        ledger_omitted=ledger.omitted,
+        repeat=hits.repeat if hits else None,
+        settled_hit=hits.settled_hit if hits else None,
     )
 
 
@@ -2411,6 +2449,9 @@ class PrRoundContext:
     prev_sha: str = ""
     delta: str = ""
     prior_review: str = ""
+    # Every earlier whole-content review, oldest first, in every scope (T-pr-gate-settled-
+    # objections-ledger Stage A). Read only by the ledger measurement; ``render`` never shows it.
+    prior_reviews: tuple[str, ...] = ()
 
     def render(self) -> str:
         if self.scope != "delta":
@@ -3013,7 +3054,23 @@ class NaysayerPrReviewDriver:
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
         # What the model wrote, before citation checks can demote anything: D4 counts its format,
         # and a demoted LATE blocker must not read as an out-of-scope advisory.
-        _log_pr_round(pr.slug, tier, completion, round_context, decision.objections)
+        ledger_measure = await self._measure_ledger(
+            pr,
+            round_context,
+            decision.objections,
+            prompt_bytes=sum(
+                len((m.content or "").encode("utf-8"))
+                for m in _build_messages(
+                    view.text,
+                    pr.slug,
+                    coverage=coverage,
+                    round_context=round_context,
+                    conditions=conditions,
+                    ignore_report=view.ignore_report,
+                )
+            ),
+        )
+        _log_pr_round(pr.slug, tier, completion, round_context, decision.objections, ledger_measure)
         # T-gate-blocks-on-miscounted-line-numbers (Bohr msg-3604 D-1 / msg-3606 D-3 revise).
         # Between ``decide_verdict`` (which fixes ``gate_verdict`` from model verdict +
         # truncation valves) and the notice/log/submit downstream, run one pass that verifies
@@ -3113,6 +3170,34 @@ class NaysayerPrReviewDriver:
             base_ref=base_ref,
         )
 
+    async def _measure_ledger(
+        self,
+        pr: PrRef,
+        round_context: PrRoundContext,
+        report: ObjectionReport,
+        *,
+        prompt_bytes: int,
+    ) -> LedgerMeasure | None:
+        """Stage A ledger measurement, fail-open: measurement must never cost a posted review.
+
+        The PR body is read with the same single GET as :meth:`_resolve_conditions`; an unanswered
+        read builds the ledger from the gate's own reviews alone. Any exception logs a warning
+        and returns ``None``, which the round log shows as ``-``.
+        """
+        try:
+            state = await self._github.fetch_pr_state(pr)
+            body = (
+                (state.body or "")
+                if state.resolution in (PrResolution.OPEN, PrResolution.CLOSED)
+                else None
+            )
+            return measure_ledger(
+                round_context.prior_reviews, body, report, prompt_bytes=prompt_bytes
+            )
+        except Exception as exc:  # fail-open by design: telemetry never gates
+            logger.warning("settled ledger: measurement failed for %s: %s", pr.slug, exc)
+            return None
+
     async def _resolve_conditions(
         self, pr: PrRef, resolver: ConditionsResolver
     ) -> DesignConditionsCheck:
@@ -3193,7 +3278,9 @@ class NaysayerPrReviewDriver:
         if not reviews:
             return PrRoundContext(round_number=1, scope="full")
         round_number = len(reviews) + 1
-        fallback = PrRoundContext(round_number=round_number, scope="full-fallback")
+        fallback = PrRoundContext(
+            round_number=round_number, scope="full-fallback", prior_reviews=tuple(reviews)
+        )
         prior = reviews[-1]
         footer = parse_verdict_footer(prior)
         prev_sha = footer[0] if footer is not None else ""
@@ -3217,6 +3304,7 @@ class NaysayerPrReviewDriver:
             prev_sha=prev_sha,
             delta=delta,
             prior_review=prior,
+            prior_reviews=tuple(reviews),
         )
 
     async def _route(
