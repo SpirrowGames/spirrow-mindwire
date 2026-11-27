@@ -280,6 +280,49 @@ class GatePr:
     author_login: str
     author_type: str
     created_at: datetime
+    #: The listing row's ``requested_reviewers`` logins (T-gate-fires-on-review-request §1). A
+    #: team request (``requested_teams``) is not carried: it names no person who asked. A missing
+    #: or malformed field reads as empty, i.e. "no request".
+    requested_logins: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReviewRequestEvent:
+    """One ``review_requested`` timeline event that names a user reviewer.
+
+    The gate's review-request trigger (T-gate-fires-on-review-request §1) takes the newest one
+    naming the gate's own login: its ``event_id`` is the request id the fire marker carries, and
+    its actor is who asked. A re-request makes a new event, so a new id.
+    """
+
+    event_id: int
+    requested_login: str
+    actor_login: str
+    actor_type: str
+    created_at: datetime | None
+
+
+@dataclass(frozen=True)
+class IssueCommentInfo:
+    """One issue comment on a PR (the subset the review-request notice de-duplication reads)."""
+
+    body: str
+    author_login: str
+    created_at: datetime | None
+
+
+class GateRequestReadError(Exception):
+    """A read for the review-request trigger failed, already classified (design v1.1 §B).
+
+    ``transient`` is a timeout, a transport error, a 5xx or a rate limit; anything else (a plain
+    4xx, a body that is not JSON or not a list) is permanent. ``code`` is a short machine word
+    (``transient`` / ``http-<status>`` / ``shape``) the caller turns into a notice reason.
+    """
+
+    def __init__(self, message: str, *, transient: bool, code: str) -> None:
+        super().__init__(message)
+        self.transient = transient
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -1453,6 +1496,80 @@ class GitHubClient:
             out.append(PrHeadRow(number=number, state=state, merged_at=merged_at))
         return out
 
+    async def _gate_request_rows(self, path: str, *, what: str) -> list[Any]:
+        """Every row of a paginated list endpoint, or a classified :class:`GateRequestReadError`."""
+        out: list[Any] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                raise GateRequestReadError(
+                    f"GET {path} ({what}): {exc}", transient=True, code="transient"
+                ) from exc
+            if resp.status_code >= 400:
+                raise _gate_read_failure(f"GET {path} ({what})", resp)
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                raise GateRequestReadError(
+                    f"GET {path} ({what}): malformed JSON: {exc}", transient=False, code="shape"
+                ) from exc
+            if not isinstance(rows, list):
+                raise GateRequestReadError(
+                    f"GET {path} ({what}): expected a JSON list, got {type(rows).__name__}",
+                    transient=False,
+                    code="shape",
+                )
+            out.extend(rows)
+            if len(rows) < 100:
+                return out
+            page += 1
+
+    async def fetch_review_request_events(self, pr: PrRef) -> list[ReviewRequestEvent]:
+        """Every user ``review_requested`` event of ``pr``, oldest first (every page is read).
+
+        ``GET /repos/{o}/{r}/issues/{n}/timeline``. Read only for a PR whose listing row names
+        the gate's login among its requested reviewers (T-gate-fires-on-review-request §1).
+        Fail-loud: any failure raises :class:`GateRequestReadError`, already classified.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/timeline"
+        return _review_request_events(await self._gate_request_rows(path, what="timeline"))
+
+    async def list_issue_comments(self, pr: PrRef) -> list[IssueCommentInfo]:
+        """Every issue comment of ``pr`` (``GET /issues/{n}/comments``), fail-loud like above."""
+        path = f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
+        out: list[IssueCommentInfo] = []
+        for row in await self._gate_request_rows(path, what="issue comments"):
+            if not isinstance(row, dict):
+                continue
+            body = row.get("body")
+            user = row.get("user")
+            login = user.get("login") if isinstance(user, dict) else None
+            out.append(
+                IssueCommentInfo(
+                    body=body if isinstance(body, str) else "",
+                    author_login=login if isinstance(login, str) else "",
+                    created_at=_parse_github_timestamp(row.get("created_at")),
+                )
+            )
+        return out
+
+    async def post_issue_comment(self, pr: PrRef, body: str) -> None:
+        """``POST /issues/{n}/comments`` once. A failure raises :class:`GitHubHTTPError`."""
+        path = f"/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
+        try:
+            resp = await self._client.post(path, json={"body": body})
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"POST {path} (issue comment): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"POST {path} (issue comment) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
+            )
+
     async def fetch_review_body(self, pr: PrRef, review_id: str) -> str | None:
         """``GET /repos/{o}/{r}/pulls/{n}/reviews/{id}`` -> the review's body.
 
@@ -2372,7 +2489,59 @@ def _gate_pr_row(owner: str, repo: str, row: object) -> GatePr | None:
         author_login=login,
         author_type=user_type if isinstance(user_type, str) else "",
         created_at=base_row.created_at,
+        requested_logins=_requested_logins(row.get("requested_reviewers")),
     )
+
+
+def _requested_logins(raw: object) -> tuple[str, ...]:
+    """``requested_reviewers`` -> the logins it names; anything malformed contributes nothing."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        login = item.get("login") if isinstance(item, dict) else None
+        if isinstance(login, str) and login:
+            out.append(login)
+    return tuple(out)
+
+
+def _gate_read_failure(what: str, resp: httpx.Response) -> GateRequestReadError:
+    """Classify a non-2xx response of a review-request read (design v1.1 §B)."""
+    status = resp.status_code
+    transient = status >= 500 or status == 429 or _is_rate_limited(resp)
+    return GateRequestReadError(
+        f"{what} -> {status}: {_error_detail(resp)}",
+        transient=transient,
+        code="transient" if transient else f"http-{status}",
+    )
+
+
+def _review_request_events(rows: list[Any]) -> list[ReviewRequestEvent]:
+    """The ``review_requested`` rows naming a user reviewer; other rows are not this reader's."""
+    out: list[ReviewRequestEvent] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("event") != "review_requested":
+            continue
+        reviewer = row.get("requested_reviewer")
+        actor = row.get("actor")
+        event_id = row.get("id")
+        requested = reviewer.get("login") if isinstance(reviewer, dict) else None
+        actor_login = actor.get("login") if isinstance(actor, dict) else None
+        actor_type = actor.get("type") if isinstance(actor, dict) else None
+        if not isinstance(event_id, int) or isinstance(event_id, bool):
+            continue
+        if not isinstance(requested, str) or not isinstance(actor_login, str):
+            continue
+        out.append(
+            ReviewRequestEvent(
+                event_id=event_id,
+                requested_login=requested,
+                actor_login=actor_login,
+                actor_type=actor_type if isinstance(actor_type, str) else "",
+                created_at=_parse_github_timestamp(row.get("created_at")),
+            )
+        )
+    return out
 
 
 def _open_pr_row(owner: str, repo: str, row: object) -> OpenPr | None:
@@ -2747,10 +2916,12 @@ __all__ = [
     "CiStatus",
     "CrossPrApproveCoverage",
     "EnvironmentTerminalError",
+    "GateRequestReadError",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
+    "IssueCommentInfo",
     "PrFileList",
     "PrHeadListingShapeError",
     "PrHeadRow",
@@ -2761,6 +2932,7 @@ __all__ = [
     "Retryability",
     "ReviewEvent",
     "ReviewInfo",
+    "ReviewRequestEvent",
     "Scope",
     "TargetTerminalError",
     "classify_http_error",
