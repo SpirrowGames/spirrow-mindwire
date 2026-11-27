@@ -483,6 +483,36 @@ async def test_an_unreadable_pr_body_holds() -> None:
 
 
 @pytest.mark.anyio
+async def test_a_review_reads_the_pr_body_once_for_conditions_and_ledger() -> None:
+    # PR #612 gate advisory: the Stage A ledger measurement reuses the body the conditions check
+    # read instead of a second fetch_pr_state GET before the review is posted.
+    gh = _FakeGitHub()
+    real = gh.fetch_pr_state
+    reads: list[Any] = []
+
+    async def counting(pr: Any) -> Any:
+        reads.append(pr)
+        return await real(pr)
+
+    gh.fetch_pr_state = counting  # type: ignore[method-assign]
+    outcome, _lexora, _gh = await _review(THREAD_WITH_GO, _pr_body(*GOOD_ROWS), github=gh)
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert len(reads) == 1
+
+
+@pytest.mark.anyio
+async def test_a_raising_pr_body_read_still_holds() -> None:
+    gh = _FakeGitHub()
+
+    async def boom(pr: Any) -> Any:
+        raise RuntimeError("github down")
+
+    gh.fetch_pr_state = boom  # type: ignore[method-assign]
+    outcome, _lexora, _gh = await _review(THREAD_WITH_GO, _pr_body(*GOOD_ROWS), github=gh)
+    assert outcome.verdict is ReviewEvent.COMMENT
+
+
+@pytest.mark.anyio
 async def test_a_pr_whose_thread_has_no_conditional_go_reviews_as_before() -> None:
     body = _pr_body(section=False)
     outcome, lexora, _gh = await _review(_msgs(("Einstein", PLAIN_GO)), body)

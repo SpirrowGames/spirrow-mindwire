@@ -20,6 +20,8 @@ _OBJ_LINE_RE = re.compile(r"^\s*Obj-(\d+)-(\d+):\s*採用=(min|cut|own|as-propos
 _BACKEND_RE = re.compile(r"<!-- attest:.*?\bbackend=([\w.-]+)")
 _LOG_FIELD_RE = re.compile(r"\b([a-z_]+)=(\S+)")
 _LOG_COUNT_FIELDS = ("late", "late_advisory", "fix_missing", "objections_unparsed")
+# T-pr-gate-settled-objections-ledger Stage A (msg-10102): summed for the Stage B cost estimate.
+_LEDGER_LOG_FIELDS = ("ledger_bytes", "prompt_bytes", "ledger_omitted", "repeat", "settled_hit")
 
 
 @dataclass(frozen=True)
@@ -131,7 +133,7 @@ def tally_log_lines(lines: Iterable[str]) -> dict[tuple[str, str], Counter[str]]
         counter["posts"] += 1
         if fields.get("scope") == "full-fallback":
             counter["full_fallback"] += 1
-        for name in (*_LOG_COUNT_FIELDS, "out_tokens"):
+        for name in (*_LOG_COUNT_FIELDS, "out_tokens", *_LEDGER_LOG_FIELDS):
             value = fields.get(name, "-")
             if value.isdigit():
                 counter[name] += int(value)
