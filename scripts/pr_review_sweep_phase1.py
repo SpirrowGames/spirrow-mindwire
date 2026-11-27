@@ -37,6 +37,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol
 
+from spirrow_mindwire.conductor.gate_records import RECEIVING_THREAD_PREFIX
 from spirrow_mindwire.github.client import GitHubClient, PrRef, PrResolution, PrState
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 from spirrow_mindwire.magickit.read_only import ReadOnlyMcp as _SharedReadOnlyMcp
@@ -107,12 +108,13 @@ class ReadOnlyMcp(_SharedReadOnlyMcp):
 async def sweep_project(
     mcp: ReadOnlyMcp, github: PrStateReader, entry: ProjectEntry
 ) -> tuple[list[LedgerRow], list[Excluded]]:
-    """Classify every ``T-pr-review-*`` thread in one project."""
+    """Classify every ``T-pr-review-*`` and ``T-gate-request-*`` thread in one project."""
     rows: list[LedgerRow] = []
     excluded: list[Excluded] = []
     for thread in await _PHASE0._list_threads(mcp, entry.project):
         thread_id = str(thread.get("thread_id") or "")
-        if not thread_id.startswith(LEDGER_ID_PREFIX):
+        receiving = thread_id.startswith(RECEIVING_THREAD_PREFIX)
+        if not thread_id.startswith(LEDGER_ID_PREFIX) and not receiving:
             continue
         status = str(thread.get("status") or "")
 
@@ -122,7 +124,11 @@ async def sweep_project(
             excluded.append(Excluded(thread_id, status, out_of_scope))
             continue
 
-        number = entry.pr_number_for_thread(thread_id)
+        number = (
+            entry.pr_number_for_receiving_thread(thread_id)
+            if receiving
+            else entry.pr_number_for_thread(thread_id)
+        )
         if number is None:
             rows.append(unparseable_row(thread_id, entry.project, status))
             continue

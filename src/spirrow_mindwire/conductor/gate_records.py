@@ -104,6 +104,24 @@ from ..naysayer.pr_review import (
 #: vocabulary — the leaf module both writers depend on — so one file defines the string.
 RELAY_AUTHOR = "pr-gate-relay"
 
+#: The review-request receiving thread (T-gate-fires-on-review-request v1.1 §A): one per PR,
+#: ``T-gate-request-<repo>-<n>``, opened by the review-request trigger for a member's PR. It has
+#: no AI implementer, whatever the roster says: no verdict on a member's PR may start a turn that
+#: pushes to it, and none may hand it to the human either (one human turn per member PR). So the
+#: conductor dispatches no implementer there, and every gate post that would end in
+#: ``NEXT: human`` ends in ``STOP: done`` instead (:func:`receiving_terminal`). Defined here, the
+#: leaf both relay writers (``conductor.core`` and ``orchestrator``) already import.
+RECEIVING_THREAD_PREFIX = "T-gate-request-"
+_RECEIVING_RE = re.compile(rf"^{re.escape(RECEIVING_THREAD_PREFIX)}.+-\d+$")
+#: What a receiving thread's gate posts end in instead of a ``NEXT:`` hand-off.
+RECEIVING_TERMINAL = "STOP: done"
+
+
+def is_receiving_thread(thread_id: str) -> bool:
+    """Whether ``thread_id`` is a review-request receiving thread (see above)."""
+    return _RECEIVING_RE.match(thread_id) is not None
+
+
 #: The ci-route marker, byte-for-byte from design v0.3.1 §5.2A.5:
 #: ``<!-- mindwire:ci-route v1 {"head":"<sha>","conclusion":"failure","checks":["gate"]} -->``
 _CI_ROUTE_OPEN = "<!-- mindwire:ci-route v1 "
@@ -785,6 +803,8 @@ __all__ = [
     "MERGE_SELF_MARK",
     "MERGE_WAIT_LINE",
     "MERGE_WAIT_MARK",
+    "RECEIVING_TERMINAL",
+    "RECEIVING_THREAD_PREFIX",
     "RELAY_AUTHOR",
     "CiRouteCause",
     "RelayRoute",
@@ -798,6 +818,7 @@ __all__ = [
     "decide_relay_route",
     "is_merge_self_relay",
     "is_merge_wait_relay",
+    "is_receiving_thread",
     "mergeable_unknown_since",
     "normalize_sha",
     "prior_advisory_approvals",

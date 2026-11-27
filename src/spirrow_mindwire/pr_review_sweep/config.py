@@ -51,6 +51,12 @@ SUPPORTED_SCHEMA_VERSION = 1
 #: so ``T-pr-review-spirrow-mindwire-`` cannot also match a project named
 #: ``spirrow-mindwire-legacy``.
 _THREAD_PREFIX_TEMPLATE = "T-pr-review-{project}-"
+#: The review-request receiving thread, ``T-gate-request-<repo>-<n>``: the
+#: ``conductor.gate_records.RECEIVING_THREAD_PREFIX`` followed by the lower-cased GitHub
+#: *repository* name, exactly as ``auto_gate.request.receiving_thread_id`` builds it. It is
+#: keyed on the repo, not the project: the two differ whenever a repo is mapped to a project
+#: of another name, and a project-keyed parser would never match the producer's thread.
+_GATE_REQUEST_PREFIX_TEMPLATE = "T-gate-request-{repo}-"
 
 #: Rejected verbatim (case-insensitive, after stripping) as ``justification``. This is
 #: the list the example file publishes, not an invented superset — see the module
@@ -116,6 +122,22 @@ class ProjectEntry:
         tail = thread_id[len(prefix) :]
         # ``str.isdigit`` is True for non-ASCII digits (fullwidth forms), which ``int()``
         # then happily parses into a number that is not what the thread id says.
+        if not tail or not tail.isascii() or not tail.isdigit():
+            return None
+        return int(tail)
+
+    def pr_number_for_receiving_thread(self, thread_id: str) -> int | None:
+        """``T-gate-request-<repo>-42`` -> ``42``, or ``None`` when it is not one.
+
+        The review-request receiving thread (T-gate-fires-on-review-request v1.1 §A) maps one
+        to one to a PR exactly as a ledger does, so Phase 1 / 2 close it on the same rule once
+        its PR is merged or closed. Phase 0's measurement does not read it.
+        """
+        # Same normalisation as the producer (``receiving_thread_id``): repo name lower-cased.
+        prefix = _GATE_REQUEST_PREFIX_TEMPLATE.format(repo=self.repo.lower())
+        if not thread_id.startswith(prefix):
+            return None
+        tail = thread_id[len(prefix) :]
         if not tail or not tail.isascii() or not tail.isdigit():
             return None
         return int(tail)

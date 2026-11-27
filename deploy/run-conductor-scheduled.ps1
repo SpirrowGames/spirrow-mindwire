@@ -7137,6 +7137,8 @@ try {
         -Clones $sweepIntakeConfig.clones -ControlSink $offCandidateControl
     $autoGate = Invoke-AutoGateTick -Projects $passedHoldProjects
     $autoGateDigestLines = @(if ($null -ne $autoGate -and $autoGate.cap_line) { $autoGate.cap_line })
+    # T-gate-fires-on-review-request v1.1 §B: review-request notices that could not be written.
+    $autoGateDigestLines += @(if ($null -ne $autoGate -and $autoGate.notice_line) { $autoGate.notice_line })
     Add-PreLoopPhase -Phases $preLoopPhases -Name 'autogate' -Seconds (Get-SweepElapsedSeconds -Since $phaseStartUtc -Now (Get-SweepNowUtc))
 
     # T-thread-relations-unused-so-parallel-rule-cannot-be-checked: once per tick, before any launch,
