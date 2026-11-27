@@ -44,15 +44,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from ...conductor.gate_records import RECEIVING_THREAD_PREFIX, is_receiving_thread
 from ...conductor.handoff import PR_REVIEW_TOKEN
 from ...github.client import GatePr, IssueCommentInfo, PrRef, ReviewInfo, ReviewRequestEvent
 from ..decide import PR_EVENT_RELAY_AUTHOR, Post
 from .decide import has_gate_hold, is_bot_author
 
-#: v1.1 §A. Not ``T-pr-review-``: that is the gate's ledger, closed by ``pr_review_sweep`` and the
-#: target of its own critique posts, so a receiving thread there would relay to itself (v1 §3).
-RECEIVING_THREAD_PREFIX = "T-gate-request-"
-_RECEIVING_RE = re.compile(rf"^{re.escape(RECEIVING_THREAD_PREFIX)}.+-\d+$")
 #: The ``trigger`` field of the fire marker (v1 §4). 1c's own markers carry none.
 TRIGGER_REVIEW_REQUEST = "review-request"
 _FIRE_MARKER_RE = re.compile(r"^<!-- mindwire:auto-gate v1 (?P<payload>\{.*\}) -->$")
@@ -115,13 +112,12 @@ _NOTICE_TEXT: Mapping[str, str] = {
 
 
 def receiving_thread_id(pr: PrRef) -> str:
-    """``T-gate-request-<repo>-<n>``, built the way the ledger id is (repo lower-cased)."""
+    """``T-gate-request-<repo>-<n>``, built the way the ledger id is (repo lower-cased).
+
+    Not ``T-pr-review-``: that is the gate's ledger, closed by ``pr_review_sweep`` and the target
+    of its own critique posts, so a receiving thread there would relay to itself (v1 §3).
+    """
     return f"{RECEIVING_THREAD_PREFIX}{pr.repo.lower()}-{pr.number}"
-
-
-def is_receiving_thread(thread_id: str) -> bool:
-    """Whether ``thread_id`` is a review-request receiving thread (no implementer, v1.1 §A)."""
-    return _RECEIVING_RE.match(thread_id) is not None
 
 
 def requests_gate(pr: GatePr, review_login: str) -> bool:

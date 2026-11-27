@@ -174,10 +174,12 @@ from .gate_records import (
     CI_ROUTE_CI_RED,
     CI_ROUTE_CONFLICT,
     MERGE_WAIT_LINE,
+    RECEIVING_TERMINAL,
     RELAY_AUTHOR,
     RelayRoute,
     ci_route_heads,
     is_merge_wait_relay,
+    is_receiving_thread,
     mergeable_unknown_since,
     normalize_sha,
     render_admission_heading,
@@ -915,6 +917,13 @@ class Conductor:
             )
         except RoleResolutionError:
             self._implementer_identity = None
+        # T-gate-fires-on-review-request v1.1 §A: a review-request receiving thread has no
+        # implementer, whatever the (global) roster says, so no verdict, ci-route or gate resume
+        # there can start a turn that pushes to a member's PR. Its gate posts settle instead of
+        # handing to the human (:meth:`_gate_tail`, :meth:`_gate_stop_reason`).
+        self._receiving_thread = is_receiving_thread(self._thread_ref.thread_id)
+        if self._receiving_thread:
+            self._implementer_identity = None
 
     async def run(self) -> ConductorOutcome:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
@@ -1110,7 +1119,9 @@ class Conductor:
                         )
                         return self._stop(
                             round_index,
-                            StopReason.MERGE_WAIT if merge_wait else StopReason.HUMAN,
+                            self._gate_stop_reason(
+                                StopReason.MERGE_WAIT if merge_wait else StopReason.HUMAN
+                            ),
                             _msg_id(note) or latest_msg_id,
                             forced,
                             forced_saveable,
@@ -1127,7 +1138,7 @@ class Conductor:
                         )
                         return self._stop(
                             round_index,
-                            StopReason.HUMAN,
+                            self._gate_stop_reason(StopReason.HUMAN),
                             _msg_id(escalation) or latest_msg_id,
                             forced,
                             forced_saveable,
@@ -1147,7 +1158,7 @@ class Conductor:
                             # exactly one implementer persona there is nobody to dispatch.
                             return self._stop(
                                 round_index,
-                                StopReason.HUMAN,
+                                self._gate_stop_reason(StopReason.HUMAN),
                                 route_msg_id or latest_msg_id,
                                 forced,
                                 forced_saveable,
@@ -1205,6 +1216,10 @@ class Conductor:
                         if relay_msg_id and is_merge_wait_relay(_content(relay_msg))
                         else StopReason.HUMAN
                     )
+                    # A receiving thread's relay ends in ``STOP: done`` (orchestrator), but only
+                    # once it was posted: a relay that failed to post still stops at the human.
+                    if relay_msg_id:
+                        reason = self._gate_stop_reason(reason)
                     return self._stop(round_index, reason, last, forced, forced_saveable)
                 # Gate-only slice (msg-6313 §1'): the relay is posted and stays the head; the
                 # implementer is resumed from it on a later tick, in the role lane. An advisory
@@ -3978,6 +3993,14 @@ class Conductor:
         )
         return decision, rollup, unknown_since
 
+    def _gate_tail(self, tail: str) -> str:
+        """``tail``, or :data:`RECEIVING_TERMINAL` in a receiving thread (see ``__init__``)."""
+        return RECEIVING_TERMINAL if self._receiving_thread else tail
+
+    def _gate_stop_reason(self, reason: StopReason) -> StopReason:
+        """A gate stop in a receiving thread is a settle: its post ends in ``STOP: done``."""
+        return StopReason.SETTLED if self._receiving_thread else reason
+
     async def _post_admission_escalation(
         self, pr_ref: str, decision: AdmissionResult
     ) -> dict[str, Any]:
@@ -3996,7 +4019,7 @@ class Conductor:
             f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
             f"{decision.reason}\n\n"
             f"The gate was NOT fired. This is a machine observation of CI, not a review.\n\n"
-            f"NEXT: {HUMAN_TOKEN}"
+            f"{self._gate_tail(f'NEXT: {HUMAN_TOKEN}')}"
         )
         return await self._post_as_relay(body)
 
@@ -4089,6 +4112,8 @@ class Conductor:
                 merge_wait = is_merge_wait_relay(body)
                 break
         tail = f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}" if merge_wait else f"NEXT: {HUMAN_TOKEN}"
+        tail = self._gate_tail(tail)
+        merge_wait = merge_wait and not self._receiving_thread
         # T-fix-push-never-regates D3 (Bohr msg-9571): name WHO may re-nominate. R0-OVERRIDE
         # trusts the configured human identity only; "a person" read as anyone, and a hand-off
         # by ``operator`` was then refused here again (lexora msg-1127 / msg-1128). The
@@ -4136,7 +4161,7 @@ class Conductor:
                 f"not the question. Merge the PR's base branch into your branch (merge, never "
                 f"rebase), resolve the conflicts, run the gate, push, and hand back with "
                 f"`NEXT: pr-review {pr_ref}`.\n\n"
-                f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
+                f"{self._gate_tail(f'NEXT: {self._implementer_identity or HUMAN_TOKEN}')}\n\n"
                 f"{marker}"
             )
             return await self._post_as_relay(body)
@@ -4155,7 +4180,7 @@ class Conductor:
             f"{decision.reason}\n\n"
             f"The gate was NOT fired — there is no review verdict to act on. Fix CI and push; "
             f"the next tick re-reads the rollup on the new head.\n\n"
-            f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
+            f"{self._gate_tail(f'NEXT: {self._implementer_identity or HUMAN_TOKEN}')}\n\n"
             f"{marker}"
         )
         return await self._post_as_relay(body)

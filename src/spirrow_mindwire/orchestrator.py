@@ -27,10 +27,12 @@ from .conductor.gate_records import (
     ADVISORY_SELF_TRIAGE_INSTRUCTION,
     MERGE_SELF_INSTRUCTION,
     MERGE_WAIT_LINE,
+    RECEIVING_TERMINAL,
     RELAY_AUTHOR,
     RelayRoute,
     carries_advisory,
     decide_relay_route,
+    is_receiving_thread,
     prior_advisory_approvals,
     render_ci_hold_marker,
     render_merge_self_line,
@@ -643,6 +645,12 @@ class PrReviewOrchestrator:
             tail.append(f"{MERGE_WAIT_LINE}\nNEXT: {HUMAN_TOKEN}")
         else:
             tail.append(f"NEXT: {HUMAN_TOKEN}")
+        if is_receiving_thread(design_thread):
+            # T-gate-fires-on-review-request v1.1 §A: a review-request receiving thread has no
+            # implementer (the conductor passes none) and must not hand a member's PR to the
+            # human either. The verdict stands on GitHub; the thread settles.
+            route = RelayRoute.HUMAN
+            tail = [RECEIVING_TERMINAL]
         body = (
             f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
             f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
