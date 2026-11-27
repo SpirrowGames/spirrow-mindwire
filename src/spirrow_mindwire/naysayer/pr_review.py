@@ -2709,6 +2709,14 @@ async def _raise_unread() -> str | None:
     raise NaysayerPrReviewError("PR facts unreadable; base ref unknown")
 
 
+@dataclass(frozen=True)
+class _PrBodyRead:
+    """One review's read of the PR body: ``body`` (``None`` when unanswered) or the ``error``."""
+
+    body: str | None
+    error: Exception | None
+
+
 class NaysayerPrReviewDriver:
     """Independent PR-diff code review via Lexora (one-shot) + GitHub (T20 → ADR-19 driver)."""
 
@@ -2814,9 +2822,13 @@ class NaysayerPrReviewDriver:
         # Query CI BEFORE the (costly) content review and short-circuit when it is not green —
         # fail-closed: failure / pending / UNKNOWN never APPROVE (fetch_ci_status never raises).
         ci = await self._github.fetch_ci_status(pr)
+        # One PR-body GET per review, shared by the design-conditions check and the Stage A
+        # ledger measurement (PR #612 gate advisory): read here only when the check needs it,
+        # and otherwise lazily by the measurement itself.
+        body_read = await self._read_pr_body(pr) if design_conditions is not None else None
         conditions = (
-            await self._resolve_conditions(pr, design_conditions)
-            if design_conditions is not None
+            await self._resolve_conditions(pr, design_conditions, body_read)
+            if design_conditions is not None and body_read is not None
             else None
         )
         conditions_active = conditions is not None and conditions.active
@@ -3056,6 +3068,7 @@ class NaysayerPrReviewDriver:
         # and a demoted LATE blocker must not read as an out-of-scope advisory.
         ledger_measure = await self._measure_ledger(
             pr,
+            body_read,
             round_context,
             decision.objections,
             prompt_bytes=sum(
@@ -3170,9 +3183,28 @@ class NaysayerPrReviewDriver:
             base_ref=base_ref,
         )
 
+    async def _read_pr_body(self, pr: PrRef) -> _PrBodyRead:
+        """The PR body from one ``fetch_pr_state`` GET (the read the sweep uses).
+
+        Never raises: an exception is kept in :attr:`_PrBodyRead.error` so each consumer applies
+        its own failure rule (the conditions check holds, the ledger measurement drops to the
+        gate's own reviews). An unanswered read is a ``None`` body.
+        """
+        try:
+            state = await self._github.fetch_pr_state(pr)
+        except Exception as exc:  # each consumer decides fail-closed / fail-open
+            return _PrBodyRead(body=None, error=exc)
+        body = (
+            (state.body or "")
+            if state.resolution in (PrResolution.OPEN, PrResolution.CLOSED)
+            else None
+        )
+        return _PrBodyRead(body=body, error=None)
+
     async def _measure_ledger(
         self,
         pr: PrRef,
+        body_read: _PrBodyRead | None,
         round_context: PrRoundContext,
         report: ObjectionReport,
         *,
@@ -3180,42 +3212,37 @@ class NaysayerPrReviewDriver:
     ) -> LedgerMeasure | None:
         """Stage A ledger measurement, fail-open: measurement must never cost a posted review.
 
-        The PR body is read with the same single GET as :meth:`_resolve_conditions`; an unanswered
-        read builds the ledger from the gate's own reviews alone. Any exception logs a warning
-        and returns ``None``, which the round log shows as ``-``.
+        ``body_read`` is the PR body this review already read for the design-conditions check;
+        only when no check ran (``None``) is the body fetched here, so a review makes at most one
+        PR-body GET. An unanswered or failed read builds the ledger from the gate's own reviews
+        alone. Any exception logs a warning and returns ``None``, which the round log shows as
+        ``-``.
         """
         try:
-            state = await self._github.fetch_pr_state(pr)
-            body = (
-                (state.body or "")
-                if state.resolution in (PrResolution.OPEN, PrResolution.CLOSED)
-                else None
-            )
+            if body_read is None:
+                body_read = await self._read_pr_body(pr)
             return measure_ledger(
-                round_context.prior_reviews, body, report, prompt_bytes=prompt_bytes
+                round_context.prior_reviews, body_read.body, report, prompt_bytes=prompt_bytes
             )
         except Exception as exc:  # fail-open by design: telemetry never gates
             logger.warning("settled ledger: measurement failed for %s: %s", pr.slug, exc)
             return None
 
     async def _resolve_conditions(
-        self, pr: PrRef, resolver: ConditionsResolver
+        self, pr: PrRef, resolver: ConditionsResolver, body_read: _PrBodyRead
     ) -> DesignConditionsCheck:
-        """Read the PR body and run ``resolver`` on it. Any failure is a HOLD, never a pass.
+        """Run ``resolver`` on the PR body this review read. Any failure is a HOLD, never a pass.
 
-        The body is read with the same single GET the sweep uses (``fetch_pr_state``); an
-        unanswered read hands ``None`` to the resolver, which holds for the human. An exception
-        out of the resolver is caught here for the same reason: a check that could not run must
-        not let the review fall back to "no conditions".
+        ``body_read`` comes from :meth:`_read_pr_body` (the same single GET the sweep uses); a
+        failed read re-raises here and holds, and an unanswered read hands ``None`` to the
+        resolver, which holds for the human. An exception out of the resolver is caught here for
+        the same reason: a check that could not run must not let the review fall back to "no
+        conditions".
         """
         try:
-            state = await self._github.fetch_pr_state(pr)
-            body = (
-                (state.body or "")
-                if state.resolution in (PrResolution.OPEN, PrResolution.CLOSED)
-                else None
-            )
-            return await resolver(body)
+            if body_read.error is not None:
+                raise body_read.error
+            return await resolver(body_read.body)
         except Exception as exc:  # fail-closed: an unrun check holds
             logger.warning("design conditions: check failed for %s: %s", pr.slug, exc)
             return DesignConditionsCheck(
