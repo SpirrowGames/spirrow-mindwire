@@ -58,9 +58,9 @@ from ..conductor.handoff import (
     settles_by_terminal_form,
 )
 from ..github.client import PrRef, PrResolution, PrState, parse_pr_ref
-from ..identity.normalize import normalize_identity_key
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ..pr_event_advance.runner import list_open_threads
+from ..settled_close.classify import HUMAN_IDENTITY_NAMES, is_human_name
 from ..tail_cache import CachedTail, TailCache
 from ..value_objects import Role
 from .decide import (
@@ -103,8 +103,9 @@ HUMAN_ROLE = "human"
 #: ``human`` no longer counts, so Fermi's bare ``NEXT: none`` is counted as ``unclassified``
 #: (reported, never hidden).
 HUMAN_CLOSE_ROLE = "product_owner"
-#: magickit ``HUMAN_IDENTITY_NAMES``; the same names ``settled_close`` checks.
-HUMAN_IDENTITY_NAMES = frozenset({"human"})
+#: magickit ``HUMAN_IDENTITY_NAMES``, re-exported from ``settled_close`` so the counting class
+#: and the protection share one definition of the identity names (PR #615 gate advisory); only
+#: their role policies differ, on purpose.
 
 
 class PrStateSource(Protocol):
@@ -231,7 +232,7 @@ class RoleLookup:
         self._cache: dict[str, bool | None] = {}
 
     async def is_human(self, author: str) -> bool | None:
-        if author in HUMAN_IDENTITY_NAMES or normalize_identity_key(author) in HUMAN_IDENTITY_NAMES:
+        if is_human_name(author):
             return True
         if author not in self._cache:
             self._cache[author] = await self._lookup(author)

@@ -88,3 +88,12 @@ class TestParkWakeHumanClose:
 
     def test_unregistered_author_is_not_human(self) -> None:
         assert asyncio.run(RoleLookup(_Store({})).is_human("nobody")) is False
+
+
+def test_park_wake_and_settled_close_share_one_identity_name_set() -> None:
+    # PR #615 gate advisory: the counting class and the protection must not drift apart on
+    # identity names; park_wake re-exports settled_close's set rather than redefining it.
+    from spirrow_mindwire.park_wake.runner import HUMAN_IDENTITY_NAMES as PARK_WAKE_NAMES
+    from spirrow_mindwire.settled_close.classify import HUMAN_IDENTITY_NAMES as SETTLED_NAMES
+
+    assert PARK_WAKE_NAMES is SETTLED_NAMES
