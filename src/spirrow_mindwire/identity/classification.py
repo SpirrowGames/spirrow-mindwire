@@ -163,7 +163,7 @@ MACHINE_ROLE_EXCEPTIONS: Mapping[str, frozenset[str]] = MappingProxyType(
 )
 
 
-#: Roles retired from the role registry (T-human-role-registry msg-10143). A
+#: Roles retired from the role registry (ADR-2026-11-28-25, T-human-role-registry). A
 #: retired role stays a valid value on past posts, but no identity may hold it: the loader
 #: refuses a ``legitimate`` set that names one, and the registration guard reports a
 #: payload or store record whose ``allowed_roles`` names one (``role_retired``).
@@ -292,7 +292,7 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
     if retired_roles:
         raise ClassificationError(
             f"{path}: identities[{index}].legitimate names retired role(s) {retired_roles} "
-            f"(no identity may hold a retired role; T-human-role-registry msg-10143)"
+            f"(no identity may hold a retired role; ADR-2026-11-28-25)"
         )
     retired = _parse_retired(raw.get("retired"), index, path)
     if retired is not None and legitimate:

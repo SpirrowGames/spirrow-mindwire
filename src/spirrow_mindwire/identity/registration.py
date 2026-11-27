@@ -129,7 +129,7 @@ def check_identity_against_classification(
             GuardViolation(
                 "role_retired",
                 f"allowed_roles holds retired role(s) {sorted(roles & RETIRED_ROLES)}; no "
-                f"identity may hold a retired role (T-human-role-registry msg-10143)",
+                f"identity may hold a retired role (ADR-2026-11-28-25)",
             )
         )
 

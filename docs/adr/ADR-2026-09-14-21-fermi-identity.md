@@ -69,6 +69,10 @@ ADR-2026-05-29-10 の 7 role のどれを名乗るかは投稿ごとに決まる
 ことは「役を名乗らなくてよい」ことではない**: 投稿時に role を申告する経路がある限り、
 その投稿で実際に果たした役を申告する。
 
+> 注記（2026-11-28、ADR-2026-11-28-25）: 「ADR-2026-05-29-10 の 7 role」は、退役していない
+> registry の role と読む。role `human` は退役したので、Fermi は `human` を名乗らない
+> （Takahito 裁定 `T-role-null-must-become-impossible` msg-8784 §1）。
+
 `embodiment = web_ai_chat` は自己申告値（ADR-2026-05-29-12）であり、Prismind の
 `EMBODIMENT_VALUES` に既にある列挙値をそのまま使う。新しい値は要らない。
 
