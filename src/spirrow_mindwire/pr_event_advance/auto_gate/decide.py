@@ -12,6 +12,8 @@ Evaluation order, first match wins:
 ==  =======================================  ==============================================
 #   condition                                result
 ==  =======================================  ==============================================
+0   reviewers name the gate's login          Noop(review-requested) (runner; the
+                                             review-request pass judged it, request.py)
 1   draft                                    Noop(draft)
 2   bot author                               Noop(bot-author)
 3   base not in ``gate_bases``               Noop(stacked)
@@ -96,6 +98,9 @@ class AutoGateNoop(StrEnum):
     #: msg-8022 Obj-2-2: the ``Thread:`` line names another project that the wrapper's control
     #: HOLD left out of this pass. Not :attr:`HOLD`, which is the PR body's own ``Gate: hold``.
     THREAD_PROJECT_HELD = "thread-project-held"
+    #: T-gate-fires-on-review-request v1 §5: the PR's reviewers name the gate's login, so the
+    #: review-request pass judged it this tick; 1c does not count it a second time.
+    REVIEW_REQUESTED = "review-requested"
 
 
 @dataclass(frozen=True)

@@ -123,3 +123,27 @@ def test_any_other_tool_raises(tool: str) -> None:
     with pytest.raises(_MODULE.Phase1WriteAttemptedError):
         asyncio.run(_MODULE.ReadOnlyMcp(mcp).call_tool(tool, {}))
     assert mcp.calls == []
+
+
+def test_receiving_threads_close_with_their_pr() -> None:
+    """T-gate-fires-on-review-request §C-10: a receiving thread is closed on its PR's close."""
+    threads = [
+        {"thread_id": "T-gate-request-spirrow-mindwire-4", "status": "active"},
+        {"thread_id": "T-gate-request-spirrow-mindwire-5", "status": "active"},
+        {"thread_id": "T-gate-request-other-6", "status": "active"},
+    ]
+    ref = PrRef("SpirrowGames", "spirrow-mindwire", 5)
+    github = _GitHub(
+        {4: _closed(4, merged=False), 5: PrState(ref=ref, resolution=PrResolution.OPEN)}
+    )
+    rows, _ = asyncio.run(
+        _MODULE.sweep_project(_MODULE.ReadOnlyMcp(_Mcp(threads, [])), github, _ENTRY)
+    )
+    by_id = {r.thread_id: r for r in rows}
+    assert by_id["T-gate-request-spirrow-mindwire-4"].cls is Phase1Class.TERMINAL_CLOSED
+    assert by_id["T-gate-request-spirrow-mindwire-4"].is_close_candidate
+    assert by_id["T-gate-request-spirrow-mindwire-5"].cls is Phase1Class.OPEN
+    assert by_id["T-gate-request-other-6"].cls is Phase1Class.UNPARSEABLE
+    assert sorted(github.asked) == [4, 5]
+    # Phase 0's measurement still reads ledgers only.
+    assert _ENTRY.pr_number_for_thread("T-gate-request-spirrow-mindwire-4") is None

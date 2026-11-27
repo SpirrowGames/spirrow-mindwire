@@ -181,11 +181,22 @@ def render_request_marker(*, repo: str, pr: int, event: int, requester: str) -> 
 
 
 def request_already_fired(
-    messages: Iterable[Mapping[str, object]], *, repo: str, number: int, event: int
+    messages: Iterable[Mapping[str, object]],
+    *,
+    repo: str,
+    number: int,
+    event: int,
+    trust_opener: bool = False,
 ) -> bool:
-    """M4: a relay-authored review-request marker with this ``(repo, pr, event)``."""
-    for message in messages:
-        if message.get("author") != PR_EVENT_RELAY_AUTHOR:
+    """M4: a relay-authored review-request marker with this ``(repo, pr, event)``.
+
+    ``trust_opener`` also reads the thread's opening message whatever author the chatroom
+    recorded for it: in a receiving thread that message is the fire post this trigger opened the
+    thread with (``propose_content``), and missing it would fire the same request every tick.
+    """
+    for index, message in enumerate(messages):
+        opener = trust_opener and index == 0
+        if message.get("author") != PR_EVENT_RELAY_AUTHOR and not opener:
             continue
         for line in str(message.get("content", "")).splitlines():
             match = _FIRE_MARKER_RE.match(line.strip())

@@ -50,6 +50,12 @@ from .decide import (
     settled_tail_refusal,
     tail_decision,
 )
+from .request_runner import (
+    RequestPassResult,
+    RequestSource,
+    RequestTarget,
+    run_request_pass,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +67,12 @@ MAX_FIRES_PER_TICK = 3
 _VERDICT_REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED"})
 
 
-class GatePrSource(Protocol):
-    """The GitHub reads 1c needs (satisfied by :class:`~...github.client.GitHubClient`)."""
+class GatePrSource(RequestSource, Protocol):
+    """The GitHub calls 1c needs (satisfied by :class:`~...github.client.GitHubClient`).
+
+    The review-request trigger's calls (:class:`.request_runner.RequestSource`) are part of it:
+    one pass runs both (T-gate-fires-on-review-request v1 §5).
+    """
 
     async def list_open_gate_prs(self, owner: str, repo: str) -> GatePrListing: ...
 
@@ -160,6 +170,11 @@ class PassReport:
     decisions: list[dict[str, Any]] = field(default_factory=list)
     list_errors: list[dict[str, Any]] = field(default_factory=list)
     unrecognized: int = 0
+    #: T-gate-fires-on-review-request: PR comments written (D6), requests left waiting without
+    #: one (queued-behind / tick slots), and the PRs whose notice could not be written.
+    notices: list[dict[str, Any]] = field(default_factory=list)
+    waits: dict[str, list[str]] = field(default_factory=dict)
+    undeliverable: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         out = dict(self.__dict__)
@@ -421,6 +436,61 @@ def _failure_row(ref: str, judged: _Judged, reason: str) -> dict[str, Any]:
     return {k: v for k, v in row.items() if v is not None}
 
 
+class _Budget:
+    """The day's counter and this tick's slots, shared by both triggers (D7, msg-7735).
+
+    Only a successful fire spends; a counter write that fails is reported and costs no double
+    fire, because the post is the fire record (msg-7737).
+    """
+
+    def __init__(
+        self,
+        *,
+        counter: DailyCounter,
+        store: DailyCounterStore,
+        cap: int,
+        slots: int,
+        report: PassReport,
+    ) -> None:
+        self.counter = counter
+        self.store = store
+        self.cap = cap
+        self.slots = slots
+        self.report = report
+
+    def daily_exhausted(self) -> bool:
+        return self.counter.fired >= self.cap
+
+    def tick_exhausted(self) -> bool:
+        return self.slots <= 0
+
+    def spend(self, ref: str) -> None:
+        self.slots -= 1
+        self.counter.fired += 1
+        self.report.fired = self.counter.fired
+        if self.counter.fired >= self.cap:
+            self.counter.capped_on = self.counter.date_jst
+            self.report.capped_on = self.counter.date_jst
+        try:
+            self.store.save(self.counter)
+        except OSError as exc:
+            logger.warning("auto-gate: counter write failed: %r", exc)
+            self.report.failures.append({"pr_ref": ref, "reason": f"counter-write: {exc}"})
+
+
+def _merge_request_result(report: PassReport, result: RequestPassResult) -> None:
+    report.examined += result.examined
+    report.posted.extend(result.posted)
+    report.notices.extend(result.notices)
+    report.failures.extend(result.failures)
+    report.decisions.extend(result.decisions)
+    report.undeliverable.extend(result.undeliverable)
+    for reason, refs in result.noops.items():
+        report.noops.setdefault(reason, []).extend(refs)
+    for reason, refs in result.waits.items():
+        report.waits.setdefault(reason, []).extend(refs)
+
+
 async def run_pass(
     *,
     mcp: McpToolCaller,
@@ -470,13 +540,20 @@ async def run_pass(
         counter = DailyCounter(today)
     report.fired = counter.fired
     report.capped_on = counter.capped_on
-    if config.live and counter.fired >= config.daily_cap:
+    capped = config.live and counter.fired >= config.daily_cap
+    if capped:
         report.status = "cap_reached"
         report.message = (
             f"auto-gate: daily cap reached ({counter.fired}/{config.daily_cap}), pass skipped"
         )
-        return report
-    slots = min(MAX_FIRES_PER_TICK, config.daily_cap - counter.fired)
+    budget = _Budget(
+        counter=counter,
+        store=store,
+        cap=config.daily_cap,
+        slots=max(0, min(MAX_FIRES_PER_TICK, config.daily_cap - counter.fired)),
+        report=report,
+    )
+    listed: list[tuple[RepoTarget, PrProject, list[GatePr]]] = []
     for target in unique_targets:
         pr_project = repo_map.resolve(target.owner, target.repo)
         try:
@@ -487,11 +564,40 @@ async def run_pass(
             )
             continue
         report.unrecognized += listing.unrecognized
-        for pr in sorted(listing.prs, key=lambda row: row.ref.number):
-            if config.live and slots <= 0:
+        listed.append((target, pr_project, sorted(listing.prs, key=lambda row: row.ref.number)))
+    # T-gate-fires-on-review-request v1 §5: a person's request first, on the shared budget. A
+    # capped day still reads the requests, so each one is told the cap (M6) once.
+    requests = await run_request_pass(
+        mcp=mcp,
+        gh=gh,
+        targets=[
+            RequestTarget(pr=pr, pr_project=pr_project)
+            for _target, pr_project, prs in listed
+            for pr in prs
+        ],
+        budget=budget,
+        review_login=review_login,
+        now=now,
+        live=config.live,
+        roster=roster,
+    )
+    _merge_request_result(report, requests)
+    if capped:
+        return report
+    for target, pr_project, prs in listed:
+        for pr in prs:
+            if config.live and budget.tick_exhausted():
                 return report
-            report.examined += 1
             ref = pr.ref.slug
+            if ref in requests.signalled:
+                # v1 §5: judged above; not counted twice in one tick.
+                _record_noop(report, ref, _Judged(noop=AutoGateNoop.REVIEW_REQUESTED))
+                if not config.live:
+                    report.decisions.append(
+                        _decision_row(ref, _Judged(noop=AutoGateNoop.REVIEW_REQUESTED))
+                    )
+                continue
+            report.examined += 1
             judged = await _judge(
                 mcp=mcp,
                 gh=gh,
@@ -521,21 +627,11 @@ async def run_pass(
                 if why is not None:
                     report.failures.append(_failure_row(ref, judged, why))
                     continue
-                slots -= 1
-                counter.fired += 1
-                report.fired = counter.fired
-                if counter.fired >= config.daily_cap:
-                    counter.capped_on = today
-                    report.capped_on = today
                 report.posted.append(
                     {"pr_ref": ref, "thread_id": judged.thread_id, "msg_id": msg_id}
                 )
-                try:
-                    store.save(counter)
-                except OSError as exc:
-                    # The post is the fire record, so this cannot double-fire (msg-7737).
-                    logger.warning("auto-gate: counter write failed: %r", exc)
-                    report.failures.append({"pr_ref": ref, "reason": f"counter-write: {exc}"})
+                # The post is the fire record, so a failed counter write cannot double-fire.
+                budget.spend(ref)
     return report
 
 

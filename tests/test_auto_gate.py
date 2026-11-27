@@ -5,6 +5,7 @@ msg-7619 + msg-7735, and the fire record msg-7737.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,10 +21,14 @@ from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.github.client import (
     GatePr,
     GatePrListing,
+    GateRequestReadError,
     GitHubClient,
+    GitHubHTTPError,
+    IssueCommentInfo,
     OpenPrListingError,
     PrRef,
     ReviewInfo,
+    ReviewRequestEvent,
 )
 from spirrow_mindwire.magickit.client import MagickitMcpError, ThreadResolvedError
 from spirrow_mindwire.pr_event_advance.auto_gate.__main__ import (
@@ -45,6 +50,7 @@ from spirrow_mindwire.pr_event_advance.auto_gate.decide import (
     resolve_thread_link,
     tail_decision,
 )
+from spirrow_mindwire.pr_event_advance.auto_gate.request_runner import undeliverable_digest_line
 from spirrow_mindwire.pr_event_advance.auto_gate.runner import (
     AutoGateConfig,
     DailyCounterStore,
@@ -158,6 +164,15 @@ class FakeGh:
         self.review_error = review_error
         self.list_calls = 0
         self.review_calls = 0
+        # The review-request trigger's reads (T-gate-fires-on-review-request). Unused unless a
+        # PR's ``requested_logins`` names the review login.
+        self.events: dict[int, list[ReviewRequestEvent]] = {}
+        self.timeline_error: Exception | None = None
+        self.comments: dict[int, list[IssueCommentInfo]] = {}
+        self.comments_error: Exception | None = None
+        self.comment_post_error: Exception | None = None
+        self.timeline_calls = 0
+        self.comment_clock = _NOW
 
     async def list_open_gate_prs(self, owner: str, repo: str) -> GatePrListing:
         self.list_calls += 1
@@ -168,6 +183,24 @@ class FakeGh:
         if self.review_error is not None:
             raise self.review_error
         return self.reviews
+
+    async def fetch_review_request_events(self, pr: PrRef) -> list[ReviewRequestEvent]:
+        self.timeline_calls += 1
+        if self.timeline_error is not None:
+            raise self.timeline_error
+        return list(self.events.get(pr.number, []))
+
+    async def list_issue_comments(self, pr: PrRef) -> list[IssueCommentInfo]:
+        if self.comments_error is not None:
+            raise self.comments_error
+        return list(self.comments.get(pr.number, []))
+
+    async def post_issue_comment(self, pr: PrRef, body: str) -> None:
+        if self.comment_post_error is not None:
+            raise self.comment_post_error
+        self.comments.setdefault(pr.number, []).append(
+            IssueCommentInfo(body=body, author_login=_LOGIN, created_at=self.comment_clock)
+        )
 
 
 async def _run(
@@ -489,7 +522,7 @@ async def test_five_targets_fire_oldest_three_then_the_rest(tmp_path: Path) -> N
     ]
 
 
-async def test_cap_minus_one_fires_one_and_next_tick_lists_nothing(tmp_path: Path) -> None:
+async def test_cap_minus_one_fires_one_and_next_tick_fires_nothing(tmp_path: Path) -> None:
     _seed(tmp_path, 29)
     prs = [_pr(n, body=f"Thread: T-{n}") for n in (1, 2, 3)]
     mcp = FakeMcp({f"T-{n}": [_msg("NEXT: none")] for n in (1, 2, 3)})
@@ -499,7 +532,10 @@ async def test_cap_minus_one_fires_one_and_next_tick_lists_nothing(tmp_path: Pat
     assert _fired_state(tmp_path)["fired"] == 30
     assert gh.list_calls == 1
     report = await _run(mcp, gh, tmp_path)
-    assert gh.list_calls == 1  # the listing was not called again
+    # T-gate-fires-on-review-request M6: a capped day still lists, so a review request is told
+    # the cap once. 1c itself judges nothing and posts nothing.
+    assert gh.list_calls == 2
+    assert report.examined == 0
     assert report.status == "cap_reached"
     assert report.message == "auto-gate: daily cap reached (30/30), pass skipped"
     assert len(mcp.posts) == 1
@@ -1331,3 +1367,346 @@ def test_resolve_targets_reads_the_shared_table() -> None:
     assert errors[0]["error"].startswith("origin unreadable:")
     assert errors[1]["error"] == "origin is not a GitHub remote"
     assert errors[2]["error"] == "no clones entry"
+
+
+# ---- T-gate-fires-on-review-request: the review-request pass (design v1.1 §C, v1.2 §C-6) ---- #
+
+_RECV = "T-gate-request-widgets-7"
+_AUTO_GATE_PAYLOAD = "<!-- mindwire:auto-gate v1 "
+
+
+def _req_pr(number: int = 7, *, body: str = "Closes #488", **kw: Any) -> GatePr:
+    pr = _pr(number, body=body, **kw)
+    return dataclasses.replace(pr, requested_logins=(_LOGIN,))
+
+
+def _ev(event_id: int = 11, *, actor: str = "dany1468", actor_type: str = "User") -> Any:
+    return ReviewRequestEvent(
+        event_id=event_id,
+        requested_login=_LOGIN,
+        actor_login=actor,
+        actor_type=actor_type,
+        created_at=_NOW - timedelta(minutes=5),
+    )
+
+
+class RequestMcp(FakeMcp):
+    """FakeMcp plus ``chatroom_open_thread``, and "not found" for an absent receiving thread."""
+
+    def __init__(self, *args: Any, open_race: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.opened: list[dict[str, Any]] = []
+        self._open_race = open_race
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        thread_id = arguments["thread_id"]
+        if name == "chatroom_open_thread":
+            if self._open_race:
+                # Someone else opened it a moment ago, with this same request's fire post.
+                self._open_race = False
+                self.threads[thread_id] = [
+                    _msg(arguments["propose_content"], "orchestrator", "msg-0")
+                ]
+                raise MagickitMcpError(f"Thread {thread_id!r} already exists in project")
+            self.opened.append(arguments)
+            self.threads[thread_id] = [_msg(arguments["propose_content"], "orchestrator")]
+            return {"thread_id": thread_id}
+        if (
+            name == "chatroom_get_thread"
+            and thread_id.startswith("T-gate-request-")
+            and thread_id not in self.threads
+        ):
+            raise MagickitMcpError(f"Thread {thread_id!r} not found in project 'proj'")
+        if name == "chatroom_post_message" and thread_id.startswith("T-gate-request-"):
+            self.posts.append(arguments)
+            self.threads[thread_id].append(_msg(arguments["content"], arguments["author"]))
+            return {"msg": {"msg_id": f"msg-{len(self.posts) + 100}"}}
+        return await super().call_tool(name, arguments)
+
+
+def _fires(mcp: RequestMcp) -> int:
+    """Fire posts written for review requests: thread opens plus posts into a receiving thread."""
+    into = [p for p in mcp.posts if p["thread_id"].startswith("T-gate-request-")]
+    return len(mcp.opened) + len(into)
+
+
+def _notices(gh: FakeGh, number: int = 7) -> list[str]:
+    return [c.body for c in gh.comments.get(number, [])]
+
+
+def _gate_review(at: datetime) -> ReviewInfo:
+    return ReviewInfo(
+        login=_LOGIN,
+        state="COMMENTED",
+        commit_id=_HEAD,
+        submitted_at=at.isoformat().replace("+00:00", "Z"),
+    )
+
+
+async def test_request_opens_the_receiving_thread_and_fires_once_per_event(
+    tmp_path: Path,
+) -> None:
+    """§C-1 / §C-2: the same event never fires twice; a re-request (new event) fires again."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr()])
+    gh.events[7] = [_ev(11)]
+    report = await _run(mcp, gh, tmp_path)
+    assert len(mcp.opened) == 1
+    opened = mcp.opened[0]
+    assert opened["thread_id"] == _RECV
+    assert opened["owner"] == PR_EVENT_RELAY_AUTHOR
+    assert opened["propose_content"].splitlines()[-1] == f"NEXT: pr-review {_REPO}#7"
+    assert '"trigger": "review-request", "event": 11' in opened["propose_content"]
+    assert report.fired == 1 and _fired_state(tmp_path)["fired"] == 1
+    assert report.noops.get("review-requested") == [f"{_REPO}#7"]  # 1c did not judge it again
+    # Next tick, same request still pending: nothing.
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 1
+    # The gate's relay settles the thread; a re-request is a new event and fires once more.
+    mcp.threads[_RECV].append(_msg("VERDICT\n\nSTOP: done", RELAY_AUTHOR))
+    gh.events[7] = [_ev(11), _ev(12)]
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 2
+    assert '"event": 12' in mcp.posts[-1]["content"]
+    assert _notices(gh) == []
+
+
+async def test_request_ignores_a_changed_thread_line(tmp_path: Path) -> None:
+    """§C-3 (Obj-1-1): the receiving thread does not move with the body's ``Thread:`` line."""
+    mcp = RequestMcp({"T-a": [_msg("NEXT: none")], "T-b": [_msg("NEXT: none")]})
+    gh = FakeGh([_req_pr(body="Thread: T-a")])
+    gh.events[7] = [_ev(11)]
+    await _run(mcp, gh, tmp_path)
+    assert "T-a" in mcp.opened[0]["propose_content"]  # copied for the reader only
+    gh.prs = [_req_pr(body="Thread: T-b")]
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 1
+    assert mcp.threads["T-a"] == [_msg("NEXT: none")]
+    assert mcp.threads["T-b"] == [_msg("NEXT: none")]
+
+
+async def test_open_race_rereads_and_does_not_fire_twice(tmp_path: Path) -> None:
+    """§C-4: "already exists" re-reads; the racing opener's marker for this event is a noop."""
+    mcp = RequestMcp({}, open_race=True)
+    gh = FakeGh([_req_pr()])
+    gh.events[7] = [_ev(11)]
+    report = await _run(mcp, gh, tmp_path)
+    assert mcp.opened == [] and mcp.posts == []
+    assert report.noops.get("request-already-fired") == [f"{_REPO}#7"]
+    assert report.fired == 0
+
+
+async def test_requests_go_first_and_share_the_cap_and_slots(tmp_path: Path) -> None:
+    """§C-5: one budget for both triggers; requests first; the cap is noticed exactly once."""
+    _seed(tmp_path, 28)
+    prs = [_pr(1, body="Thread: T-1"), _pr(2, body="Thread: T-2")] + [
+        _req_pr(n) for n in (8, 9, 10)
+    ]
+    mcp = RequestMcp({"T-1": [_msg("NEXT: none")], "T-2": [_msg("NEXT: none")]})
+    gh = FakeGh(prs)
+    for n in (8, 9, 10):
+        gh.events[n] = [_ev(100 + n)]
+    report = await _run(mcp, gh, tmp_path)
+    # Two left today: both go to the requests, 1c gets none.
+    assert [row["pr_ref"] for row in report.posted] == [f"{_REPO}#8", f"{_REPO}#9"]
+    assert report.fired == 30 and report.capped_on == _TODAY
+    assert mcp.threads["T-1"] == [_msg("NEXT: none")]
+    assert len(_notices(gh, 10)) == 1 and "cap" in _notices(gh, 10)[0]
+    await _run(mcp, gh, tmp_path)  # capped day: still told once, not twice
+    assert len(_notices(gh, 10)) == 1
+    assert _notices(gh, 8) == [] and _notices(gh, 9) == []
+
+
+async def test_tick_slots_wait_silently(tmp_path: Path) -> None:
+    """Slots for this tick ran out (not the day's cap): the request waits, no notice."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr(n) for n in (1, 2, 3, 4)])
+    for n in (1, 2, 3, 4):
+        gh.events[n] = [_ev(n)]
+    report = await _run(mcp, gh, tmp_path)
+    assert report.fired == 3
+    assert report.waits == {"tick-slots": [f"{_REPO}#4"]}
+    assert _notices(gh, 4) == []
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 4
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (GateRequestReadError("503", transient=True, code="transient"), "timeline-transient"),
+        (GateRequestReadError("403", transient=False, code="http-403"), "timeline-http-403"),
+        (GateRequestReadError("404", transient=False, code="http-404"), "timeline-http-404"),
+    ],
+)
+async def test_timeline_failure_is_noticed_once_and_retried(
+    tmp_path: Path, error: Exception, reason: str
+) -> None:
+    """§C-6 a / b: one notice on the first tick, none after, retried, fired on recovery."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr()])
+    gh.timeline_error = error
+    for _ in range(3):
+        await _run(mcp, gh, tmp_path)
+    assert len(_notices(gh)) == 1
+    assert f'"reason": "{reason}"' in _notices(gh)[0] and '"event": null' in _notices(gh)[0]
+    assert gh.timeline_calls == 3
+    gh.timeline_error = None
+    gh.events[7] = [_ev(11)]
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 1
+
+
+async def test_missing_request_event_is_noticed_once(tmp_path: Path) -> None:
+    """§C-6 c."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr()])
+    await _run(mcp, gh, tmp_path)
+    await _run(mcp, gh, tmp_path)
+    assert len(_notices(gh)) == 1 and "request-event-missing" in _notices(gh)[0]
+    assert _fires(mcp) == 0
+
+
+async def test_null_event_window_restarts_after_a_gate_review(tmp_path: Path) -> None:
+    """§C-6 d / e: a review by the gate login closes the window; unread reviews do not."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr()])
+    gh.timeline_error = GateRequestReadError("503", transient=True, code="transient")
+    await _run(mcp, gh, tmp_path)
+    # e: the review list unread -> the whole PR -> no second notice.
+    gh.review_error = RuntimeError("reviews down")
+    await _run(mcp, gh, tmp_path)
+    assert len(_notices(gh)) == 1
+    # d: a gate review after the notice -> the same failure is a new incident.
+    gh.review_error = None
+    gh.reviews = [_gate_review(_NOW + timedelta(minutes=1))]
+    gh.comment_clock = _NOW + timedelta(minutes=2)
+    await _run(mcp, gh, tmp_path)
+    await _run(mcp, gh, tmp_path)
+    assert len(_notices(gh)) == 2
+
+
+async def test_undeliverable_notice_is_recorded_and_digested(tmp_path: Path) -> None:
+    """§C-6 f."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr(body="Gate: hold")])
+    gh.events[7] = [_ev(11)]
+    gh.comment_post_error = GitHubHTTPError("no", status_code=403)
+    report = await _run(mcp, gh, tmp_path)
+    assert report.undeliverable == [f"{_REPO}#7"]
+    assert any(
+        str(f.get("reason", "")).startswith("notice-undeliverable: 403") for f in report.failures
+    )
+    line = undeliverable_digest_line(report.undeliverable)
+    assert line is not None and f"{_REPO}#7" in line and "1 件" in line
+    assert undeliverable_digest_line([]) is None
+
+
+@pytest.mark.parametrize(
+    ("pr_kwargs", "event_kwargs", "reason"),
+    [
+        ({}, {"actor": "renovate[bot]"}, "requester-bot"),
+        ({}, {"actor": "ci", "actor_type": "Bot"}, "requester-bot"),
+        ({}, {"actor": _LOGIN}, "requester-bot"),
+        ({"body": "Gate: hold"}, {}, "hold"),
+    ],
+)
+async def test_m1_m2_notice_and_do_not_fire(
+    tmp_path: Path, pr_kwargs: dict[str, Any], event_kwargs: dict[str, Any], reason: str
+) -> None:
+    """§C-7: M1 and M2."""
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr(**pr_kwargs)])
+    gh.events[7] = [_ev(11, **event_kwargs)]
+    await _run(mcp, gh, tmp_path)
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 0
+    assert len(_notices(gh)) == 1 and f'"reason": "{reason}"' in _notices(gh)[0]
+
+
+async def test_m3_draft_stacked_and_bot_author_still_fire(tmp_path: Path) -> None:
+    """§C-7: M3 is not read for a request."""
+    mcp = RequestMcp({})
+    pr = _req_pr(draft=True, base="feature/x", login="dependabot[bot]", user_type="Bot")
+    gh = FakeGh([pr])
+    gh.events[7] = [_ev(11)]
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 1
+
+
+async def test_after_a_request_fire_1c_skips_and_then_sees_the_verdict(tmp_path: Path) -> None:
+    """§C-8: while requested, 1c skips (review-requested); after the review, already-gated."""
+    mcp = RequestMcp({"T-x": [_msg("done\n\nNEXT: none")]})
+    gh = FakeGh([_req_pr(body="Thread: T-x")])
+    gh.events[7] = [_ev(11)]
+    report = await _run(mcp, gh, tmp_path)
+    assert report.noops["review-requested"] == [f"{_REPO}#7"]
+    assert mcp.threads["T-x"] == [_msg("done\n\nNEXT: none")]
+    # The gate reviews the head: GitHub drops the request, and 1c reads the verdict.
+    gh.prs = [_pr(7, body="Thread: T-x")]
+    gh.reviews = [_gate_review(_NOW)]
+    report = await _run(mcp, gh, tmp_path)
+    assert report.noops["already-gated"] == [f"{_REPO}#7"]
+    assert mcp.threads["T-x"] == [_msg("done\n\nNEXT: none")]
+
+
+async def test_resolved_receiving_thread_is_noticed(tmp_path: Path) -> None:
+    mcp = RequestMcp(
+        {_RECV: [_msg("old\n\nSTOP: done", RELAY_AUTHOR)]}, statuses={_RECV: "resolved"}
+    )
+    gh = FakeGh([_req_pr()])
+    gh.events[7] = [_ev(11)]
+    await _run(mcp, gh, tmp_path)
+    assert _fires(mcp) == 0
+    assert "receiving-thread-closed" in _notices(gh)[0]
+
+
+async def test_queued_behind_receiving_thread_waits_silently(tmp_path: Path) -> None:
+    """M7: the earlier request's gate is still running in the thread."""
+    marker = '<!-- mindwire:auto-gate v1 {"repo": "acme/widgets", "pr": 7, "trigger": "review-request", "event": 10, "requester": "d"} -->'  # noqa: E501
+    tail = _msg(f"x\n{marker}\nNEXT: pr-review {_REPO}#7", PR_EVENT_RELAY_AUTHOR)
+    mcp = RequestMcp({_RECV: [tail]})
+    gh = FakeGh([_req_pr()])
+    gh.events[7] = [_ev(10), _ev(11)]
+    report = await _run(mcp, gh, tmp_path)
+    assert report.waits == {"queued-behind": [f"{_REPO}#7"]}
+    assert _fires(mcp) == 0 and _notices(gh) == []
+
+
+async def test_dry_run_judges_requests_and_writes_nothing(tmp_path: Path) -> None:
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr(7), _req_pr(8, body="Gate: hold")])
+    gh.events[7] = [_ev(11)]
+    gh.events[8] = [_ev(12)]
+    report = await _run(mcp, gh, tmp_path, config=AutoGateConfig(live=False))
+    rows = {(r["pr_ref"], r["result"]) for r in report.decisions if r.get("trigger")}
+    assert rows == {(f"{_REPO}#7", "would-fire"), (f"{_REPO}#8", "would-notice")}
+    assert _fires(mcp) == 0 and gh.comments == {}
+
+
+async def test_unresolved_project_waits_an_hour_then_notices(tmp_path: Path) -> None:
+    mcp = RequestMcp({})
+    gh = FakeGh([_req_pr()])
+    gh.events[7] = [_ev(11)]
+    incomplete = RepoProjectMap(candidates={}, unresolved=frozenset({"proj"}))
+
+    async def run(now: datetime) -> PassReport:
+        return await run_pass(
+            mcp=mcp,
+            gh=gh,
+            targets=[_TARGET],
+            config=_LIVE,
+            store=DailyCounterStore(tmp_path / "state" / "auto-gate-daily.json"),
+            review_login=_LOGIN,
+            now=now,
+            known_projects={"proj"},
+            repo_map=incomplete,
+            roster=_ROSTER,
+        )
+
+    report = await run(_NOW)
+    assert report.waits == {"pr-project-incomplete-waiting": [f"{_REPO}#7"]}
+    assert _notices(gh) == []
+    await run(_NOW + timedelta(hours=2))
+    assert len(_notices(gh)) == 1 and "pr-project-incomplete" in _notices(gh)[0]
+    assert _fires(mcp) == 0

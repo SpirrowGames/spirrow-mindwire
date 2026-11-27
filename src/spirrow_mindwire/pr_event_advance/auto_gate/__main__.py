@@ -27,6 +27,7 @@ from ...config import load_settings
 from ...github.client import GitHubClient
 from ...magickit.client import StreamableHttpChatroomMcp
 from ...repo_projects import RepoProjectMap, build_repo_project_map
+from .request_runner import undeliverable_digest_line
 from .runner import (
     DEFAULT_DAILY_CAP,
     DEFAULT_GATE_BASES,
@@ -143,6 +144,9 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
     line = cap_digest_line(report, now)
     if line is not None:
         out["cap_line"] = line
+    notice_line = undeliverable_digest_line(report.undeliverable)
+    if notice_line is not None:
+        out["notice_line"] = notice_line
     return out
 
 
