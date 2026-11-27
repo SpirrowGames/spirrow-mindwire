@@ -24,6 +24,7 @@ from test_conductor_core import _ROSTER, _FakeChatroomMcp, _ScriptedDispatcher, 
 
 from spirrow_mindwire import loop_runner
 from spirrow_mindwire.conductor.core import Conductor, ConductorOutcome, StopReason
+from spirrow_mindwire.conductor.run_budget import PostPhaseMcp
 from spirrow_mindwire.conductor.stand_down import (
     EVENT_KIND_STAND_DOWN,
     STAND_DOWN_EXIT_CODE,
@@ -260,7 +261,9 @@ async def test_all_points_resolved_proceeds_to_preflight_and_build(
 
     def _build(_s: Any, **kw: Any) -> Any:
         reached.append("build")
-        assert kw["mcp"] is mcp  # one transport for resolution and the run
+        # One transport for resolution and the run. The run sees it through PostPhaseMcp
+        # (T-run-budget-exhausted-by-chain-dispatches-new-turn, msg-9837 D3''-2).
+        assert isinstance(kw["mcp"], PostPhaseMcp) and kw["mcp"].inner is mcp
         return _C()
 
     monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: reached.append("preflight"))

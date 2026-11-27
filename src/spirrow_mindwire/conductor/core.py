@@ -219,7 +219,7 @@ from .head_skip import stage1_skips
 from .human_identity import is_human_identity
 from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
-from .run_budget import RunPhase, enter_phase
+from .run_budget import PHASE_PR_GATE, RunPhase, emit_budget_yield, enter_phase
 from .spawn_timeout import (
     SPAWN_ATTEMPTS,
     SpawnGaveUp,
@@ -471,6 +471,18 @@ class StopReason(StrEnum):
     # nobody. Deliberately not ``ROUND_CAP``, which is the runaway backstop and means something
     # else.
     SLICE_END = "slice_end"
+    # T-run-budget-exhausted-by-chain-dispatches-new-turn (Bohr msg-9835 D1', endorsed by Einstein
+    # msg-9838): the run's remaining wall-clock budget was below the reserve of the turn about to
+    # start (checked right before the role's ``query`` / before the PR gate fires). Nothing is
+    # dispatched and nothing is posted by this stop, so the head that asked for the turn is still
+    # the head and the next tick starts it with a full budget. Like ``slice_end``: not terminal,
+    # notifies nobody; a head that keeps yielding is bounded by the stall watchdog.
+    BUDGET_YIELD = "budget_yield"
+    # Same thread (msg-9837 D3''): the budget expired while the run was in a phase that wrote
+    # nothing outside and had no post in flight (``run_budget.AUTO_RESUME_PHASES``). Returned by
+    # ``loop_runner.run_conductor``, never by :meth:`Conductor.run`. No notice; the head is
+    # unchanged and the next tick re-runs it; bounded by the stall watchdog.
+    BUDGET_CUT = "budget_cut"
     # The PR-gate APPROVEd a PR whose merge is the human's (base=main). Not a decision: opening the
     # PR already asked for the merge, and the merge-wait PR list carries it (Takahito, msg-4361
     # "main へのマージは判断点から外す"; restated 2026-10-03). The relay ends ``NEXT: human`` so
@@ -928,6 +940,20 @@ class Conductor:
     async def run(self) -> ConductorOutcome:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
 
+        A turn the remaining budget cannot hold is not started (:class:`_BudgetYield`, raised from
+        the one place each kind of turn is dispatched) and the run stops on
+        :attr:`StopReason.BUDGET_YIELD` against the head that asked for it.
+        """
+        try:
+            return await self._run_rounds()
+        except _BudgetYield as y:
+            return self._stop(
+                y.rounds, StopReason.BUDGET_YIELD, y.last_msg_id, y.forced, y.forced_saveable
+            )
+
+    async def _run_rounds(self) -> ConductorOutcome:
+        """Drive the thread turn-by-turn until a stop condition; return the outcome.
+
         Each turn re-reads the thread (the prior turn's reply was posted synchronously by
         ``dispatch`` → gateway). **Precondition**: the gateway is read-your-writes consistent for a
         single thread (magickit/conclair is; the shipped ``ChatroomWatcher`` relies on the same), so
@@ -1193,6 +1219,15 @@ class Conductor:
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through. R1b / R7
                     # reach here only when mergeable is known (R1e / R1f replace them otherwise).
+                # D1' (msg-9835): the gate posts a GitHub review, so it is not started without
+                # its reserve. Nothing has been posted on this path yet (INVOKE posts nothing).
+                self._check_budget(
+                    "pr_gate",
+                    rounds=round_index,
+                    last_msg_id=latest_msg_id,
+                    forced=forced,
+                    forced_saveable=forced_saveable,
+                )
                 relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
@@ -1381,6 +1416,7 @@ class Conductor:
                         rounds=round_index,
                         forced=forced,
                         forced_saveable=forced_saveable,
+                        identity=author_identity,
                     )
                     if parked is not None:
                         return self._stop(
@@ -1506,6 +1542,7 @@ class Conductor:
                 rounds=round_index,
                 forced=forced,
                 forced_saveable=forced_saveable,
+                identity=target_identity,
             )
             if parked is not None:
                 return self._stop(round_index, StopReason.HUMAN, parked, forced, forced_saveable)
@@ -3485,13 +3522,25 @@ class Conductor:
         not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        with enter_phase(self._run_phase, "pr_gate.review"):
+        turn = (
+            self._run_phase.begin_turn(
+                round_index=self._run_phase.rounds_started - 1,
+                role="pr_gate",
+                identity=pr_ref,
+                phase=PHASE_PR_GATE,
+            )
+            if self._run_phase is not None
+            else None
+        )
+        with enter_phase(self._run_phase, PHASE_PR_GATE):
             _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
                 project=self._thread_ref.project_id,
                 pr_ref=pr_ref,
                 design_thread=self._thread_ref.thread_id,
                 implementer=self._implementer_identity,
             )
+        if turn is not None and self._run_phase is not None:
+            self._run_phase.end_turn(turn)
         # The route the relay writer decided (U3'). A relay dict without one — a caller that
         # predates U3', or a malformed return — fails to the human, the safe direction.
         route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
@@ -4382,8 +4431,16 @@ class Conductor:
         rounds: int,
         forced: int,
         forced_saveable: int,
+        identity: str = "-",
     ) -> str | None:
         """Dispatch ``msg``; if the adapter raises, record a snapshot and re-raise unchanged.
+
+        Budget (T-run-budget-exhausted-by-chain-dispatches-new-turn, msg-9835 D1' / msg-9837
+        D3''-1): every role turn of the run is sent from here, after its session was spawned. The
+        remaining budget is checked first and, when it is below the role's reserve,
+        :class:`_BudgetYield` is raised before anything is sent. Nothing awaits between that
+        check and entering ``<role>.dispatch``, so the role's ``query`` never starts under
+        ``<role>.spawn`` or ``conductor``.
 
         Returns ``None`` when the turn ran. Returns the posted park notice's ``msg_id`` when the
         git-sync hook parked the thread (ADR-2026-10-09-23 unit 1): the caller then stops the run
@@ -4401,6 +4458,13 @@ class Conductor:
         adapter's ``own_role``). It decides, with ``rounds``, whether this dispatch carries the
         T-retry-once-before-quarantine notice: see :func:`.retry_notice.retry_notice_for`.
         """
+        self._check_budget(
+            role.value,
+            rounds=rounds,
+            last_msg_id=_msg_id(msg) or None,
+            forced=forced,
+            forced_saveable=forced_saveable,
+        )
         notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
         retreat = self._pending_clone_retreat(role)
         if role is Role.IMPLEMENTER:
@@ -4432,6 +4496,16 @@ class Conductor:
         clone_notice = (
             "\n\n".join(t for t in (retreat.text if retreat is not None else None, unpushed) if t)
             or None
+        )
+        turn = (
+            self._run_phase.begin_turn(
+                round_index=rounds,
+                role=role.value,
+                identity=identity,
+                phase=f"{role.value}.dispatch",
+            )
+            if self._run_phase is not None
+            else None
         )
         try:
             with enter_phase(self._run_phase, f"{role.value}.dispatch"):
@@ -4471,6 +4545,8 @@ class Conductor:
                     resume_notice_delivered=self._resume_notice_delivered,
                 )
             raise
+        if turn is not None and self._run_phase is not None:
+            self._run_phase.end_turn(turn)
         if first_resume_dispatch:
             # The turn was sent (the dispatch returned): the sweep may now clear its record.
             self._resume_notice_delivered = True
@@ -4683,10 +4759,39 @@ class Conductor:
             rounds=round_index,
             forced=forced,
             forced_saveable=forced_saveable,
+            identity=implementer_identity,
         )
         if parked is not None:
             return self._stop(round_index, StopReason.HUMAN, parked, forced, forced_saveable)
         return None
+
+    def _check_budget(
+        self,
+        role: str,
+        *,
+        rounds: int,
+        last_msg_id: str | None,
+        forced: int,
+        forced_saveable: int,
+    ) -> None:
+        """Raise :class:`_BudgetYield` when the run cannot hold a ``role`` turn (msg-9835 D1').
+
+        Round 1 included (Einstein msg-9834 #2): the deadline started before the launch was
+        resolved and the session spawned. No budget wired (tests, library use) = always passes.
+        """
+        if self._run_phase is None:
+            return
+        short = self._run_phase.short_for(role)
+        if short is None:
+            return
+        remaining, reserve = short
+        emit_budget_yield(remaining_s=remaining, reserve_s=reserve, role=role, rounds=rounds)
+        raise _BudgetYield(
+            rounds=rounds,
+            last_msg_id=last_msg_id,
+            forced=forced,
+            forced_saveable=forced_saveable,
+        )
 
     def _stop(
         self,
@@ -4728,6 +4833,23 @@ class Conductor:
             forced_naysayer_turns=forced,
             forced_naysayer_turns_saveable=forced_saveable,
         )
+
+
+class _BudgetYield(Exception):  # noqa: N818 — a control-flow signal, not an error
+    """A turn was not started because the run's budget could not hold it (msg-9835 D1').
+
+    Raised by :meth:`Conductor._check_budget` and caught only in :meth:`Conductor.run`, which
+    turns it into the :attr:`StopReason.BUDGET_YIELD` stop against ``last_msg_id``.
+    """
+
+    def __init__(
+        self, *, rounds: int, last_msg_id: str | None, forced: int, forced_saveable: int
+    ) -> None:
+        super().__init__("budget_yield")
+        self.rounds = rounds
+        self.last_msg_id = last_msg_id
+        self.forced = forced
+        self.forced_saveable = forced_saveable
 
 
 def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:

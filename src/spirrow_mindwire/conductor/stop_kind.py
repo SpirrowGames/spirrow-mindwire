@@ -70,6 +70,12 @@ STOP_KIND_BY_STOP_REASON: dict[StopReason, StopKind | None] = {
     # Not in §6.3. A gate-lane run handing its relay / ci-route head to the role lane; the next
     # tick resumes the implementer from it. Not a stall and not a stop anyone waits on.
     StopReason.SLICE_END: None,
+    # Not in §6.3 (T-run-budget-exhausted-by-chain-dispatches-new-turn). The run's budget could
+    # not hold the next turn (BUDGET_YIELD) or ran out in a phase that wrote nothing outside
+    # (BUDGET_CUT): the head is unchanged and the next tick re-runs it. Not a stall by itself;
+    # when it does not clear, the stall watchdog's STALLED notice is the stop.
+    StopReason.BUDGET_YIELD: None,
+    StopReason.BUDGET_CUT: None,
     # Not in §6.3. A merge waiting on the PR list, not a stall; 1b resumes it.
     StopReason.MERGE_WAIT: None,
     # Not in §6.3 (T-merged-pr-fact-never-reaches-design-thread). The PR was already merged or

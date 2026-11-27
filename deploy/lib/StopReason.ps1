@@ -56,6 +56,13 @@
 #               stopped before spawning the implementer (T-sweep-starves-deep-candidates PR-B,
 #               Bohr msg-6313 §1′). The post stays the head; the next tick launches it in the role
 #               lane and the gate resume picks it up. Routine hand-off, not a stop anyone waits on.
+#   'budget_yield' / 'budget_cut' — the run's wall-clock budget (T-run-budget-exhausted-by-chain-
+#               dispatches-new-turn, Bohr msg-9835 / msg-9837). budget_yield: the next turn was not
+#               started because the remaining budget was below its reserve. budget_cut: the budget
+#               ran out in a phase that wrote nothing outside and had no post in flight. Both post
+#               nothing and leave the head as it was; the next tick re-runs it, and a head that keeps
+#               stopping this way is stood down by the stall watchdog ('stalled_to_human', in the
+#               map). A cut-off that may have written outside is still 'human' with its notice.
 #   'summon_yield' — the thread yielded to an active Summon (T-human-call-priority-interrupt, Bohr
 #               msg-6743 §3 / msg-6755 v1.6): a person called the loop to another thread on purpose,
 #               so each bystander's stop is not news. Where a forgotten Summon is heard is the
