@@ -147,3 +147,34 @@ def test_receiving_threads_close_with_their_pr() -> None:
     assert sorted(github.asked) == [4, 5]
     # Phase 0's measurement still reads ledgers only.
     assert _ENTRY.pr_number_for_thread("T-gate-request-spirrow-mindwire-4") is None
+
+
+def test_receiving_thread_parser_keys_on_repo_not_project() -> None:
+    """PR #614 gate Obj-1: repo ``acme/Widgets`` mapped to project ``product``.
+
+    The producer names the thread after the (lower-cased) repository, so the sweep's parser
+    must too, or the receiving thread is unparseable and never closes with its PR.
+    """
+    from spirrow_mindwire.pr_event_advance.auto_gate.request import receiving_thread_id
+
+    entry = ProjectEntry(project="product", owner="acme", repo="Widgets")
+    produced = receiving_thread_id(PrRef("acme", "Widgets", 7))
+    assert produced == "T-gate-request-widgets-7"
+    assert entry.pr_number_for_receiving_thread(produced) == 7
+    assert entry.pr_number_for_receiving_thread("T-gate-request-product-7") is None
+
+    threads = [{"thread_id": produced, "status": "active"}]
+    closed = PrState(
+        ref=PrRef("acme", "Widgets", 7),
+        resolution=PrResolution.CLOSED,
+        closed_at=_CLOSED_AT,
+        merged=True,
+    )
+    github = _GitHub({7: closed})
+    rows, _ = asyncio.run(
+        _MODULE.sweep_project(_MODULE.ReadOnlyMcp(_Mcp(threads, [])), github, entry)
+    )
+    assert [r.thread_id for r in rows] == [produced]
+    assert rows[0].cls is Phase1Class.TERMINAL_MERGED
+    assert rows[0].is_close_candidate
+    assert github.asked == [7]
