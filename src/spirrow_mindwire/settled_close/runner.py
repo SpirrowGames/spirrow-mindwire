@@ -31,7 +31,8 @@ from ..magickit.client import MagickitMcpError
 from ..pr_event_advance.runner import list_open_threads
 from ..value_objects import Role
 from .classify import (
-    HUMAN_ROLE,
+    HUMAN_INDEPENDENCE_CLASS,
+    HUMAN_OWNER_ROLES,
     LISTED_CLASSES,
     OwnerKind,
     SettledClass,
@@ -98,7 +99,11 @@ class OwnerLookup:
             roles = identity.get("allowed_roles") if isinstance(identity, dict) else None
             if not isinstance(roles, list):
                 return OwnerKind.UNAVAILABLE
-            return OwnerKind.HUMAN if HUMAN_ROLE in roles else OwnerKind.AGENT
+            if not HUMAN_OWNER_ROLES.isdisjoint(roles):
+                return OwnerKind.HUMAN
+            if identity.get("independence_class") == HUMAN_INDEPENDENCE_CLASS:
+                return OwnerKind.HUMAN
+            return OwnerKind.AGENT
         return OwnerKind.UNRESOLVED
 
 

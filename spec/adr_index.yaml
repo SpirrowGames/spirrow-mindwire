@@ -61,7 +61,7 @@ adrs:
     thread: T-T28-author-role-identity
     body: chatroom:spirrow-mindwire/T-T28-author-role-identity#msg-283
   - id: ADR-2026-05-29-10
-    title: "role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum)"
+    title: "role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum)。`human` の行・closeable_roles・正規表記は ADR-2026-11-28-25 で partial-supersede（`product_owner` 新設、`human` は段階的に退役）"
     thread: T-T29-role-registry
     body: chatroom:spirrow-mindwire/T-T29-role-registry#msg-309
   - id: ADR-2026-05-29-11
@@ -110,3 +110,6 @@ adrs:
   - id: ADR-2026-10-22-24
     title: "Magickit の実装レーンと本番 deploy 権限（ADR-2026-05-27-09 D-6 amendment）"
     body: repo:docs/adr/ADR-2026-10-22-24-magickit-implementation-lane-and-deploy-authority.md
+  - id: ADR-2026-11-28-25
+    title: "role `product_owner` の新設と role `human` の段階的退役（ADR-2026-05-29-10 partial-supersede）"
+    body: repo:docs/adr/ADR-2026-11-28-25-product-owner-role-and-human-role-retirement.md

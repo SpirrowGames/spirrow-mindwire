@@ -60,6 +60,19 @@ GATE_TAG = "gate:naysayer"
 #: magickit ``HUMAN_IDENTITY_NAMES``.
 HUMAN_IDENTITY_NAMES = frozenset({"human"})
 HUMAN_ROLE = "human"
+#: The role that replaces ``human`` for the human (Takahito msg-8784 §2; T-human-role-registry).
+PRODUCT_OWNER_ROLE = "product_owner"
+#: The protection key for "do not auto-close a thread the human owns" (T-human-role-registry
+#: msg-10148 ② / msg-10150, Einstein go on msg-10150). This is a fail-closed PROTECTION, so the key
+#: is deliberately wide: a registered owner counts as the human when any of these holds —
+#: its ``allowed_roles`` holds one of :data:`HUMAN_OWNER_ROLES` (the retired ``human`` is kept so
+#: the protection does not drop before the store is changed), or its ``independence_class`` is
+#: :data:`HUMAN_INDEPENDENCE_CLASS` (so Fermi stays protected once ``human`` is taken off its
+#: ``allowed_roles``). The name check (:func:`is_human_name`) runs before any lookup. The
+#: embodiment EXCEPTION of ADR-2026-05-29-12 is the opposite direction and keys on the
+#: server-resolved identity ``human`` only (msg-10145); do not reuse this set for it.
+HUMAN_OWNER_ROLES = frozenset({HUMAN_ROLE, PRODUCT_OWNER_ROLE})
+HUMAN_INDEPENDENCE_CLASS = "human"
 
 
 class SettledClass(StrEnum):
@@ -272,7 +285,10 @@ def refusal_class(error_type: str | None, details_reason: str | None) -> Settled
 
 __all__ = [
     "GATE_TAG",
+    "HUMAN_INDEPENDENCE_CLASS",
+    "HUMAN_OWNER_ROLES",
     "LISTED_CLASSES",
+    "PRODUCT_OWNER_ROLE",
     "REFUSAL_ERROR_TYPE_CLASS",
     "REFUSAL_REASON_CLASS",
     "SETTLED_DISPOSITION_ROLE",

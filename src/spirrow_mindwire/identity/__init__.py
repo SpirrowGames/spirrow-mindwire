@@ -33,6 +33,7 @@ identically without changing the derivation.
 from .classification import (
     MACHINE_INDEPENDENCE_CLASS,
     MACHINE_ROLE_EXCEPTIONS,
+    RETIRED_ROLES,
     SETTLED_CLOSER,
     ClassificationEntry,
     ClassificationError,
@@ -67,6 +68,7 @@ __all__ = [
     "EMBODIMENT_VALUES",
     "MACHINE_INDEPENDENCE_CLASS",
     "MACHINE_ROLE_EXCEPTIONS",
+    "RETIRED_ROLES",
     "SETTLED_CLOSER",
     "SPAWNABLE_EMBODIMENT",
     "ClassificationEntry",

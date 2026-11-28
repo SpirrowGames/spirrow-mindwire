@@ -5,7 +5,8 @@ One pass per project per sweep tick (``python -m spirrow_mindwire.park_wake``, c
 
 1. **Classify every ``NEXT: none`` head** (magickit msg-1015 v11 §1, moved to mindwire from
    magickit): ``done`` / ``blocked_on`` from a valid ``STOP:`` line; otherwise ``unclassified``
-   for an agent and ``human_close`` for an author whose registered roles include ``human``. Every
+   for an agent and ``human_close`` for the identity ``human`` or an author registered with
+   ``product_owner`` (T-human-role-registry msg-10150). Every
    open thread of the project is read — not only the sweep's candidates — so a thread nobody
    drives through the conductor (msg-2014 §2 (4), the magickit n=1 threads) is classified too.
 2. **Wake fired parks** (D-7): :func:`~.decide.select_wakes` over the facts read this tick, then
@@ -59,6 +60,7 @@ from ..conductor.handoff import (
 from ..github.client import PrRef, PrResolution, PrState, parse_pr_ref
 from ..magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from ..pr_event_advance.runner import list_open_threads
+from ..settled_close.classify import HUMAN_IDENTITY_NAMES, is_human_name
 from ..tail_cache import CachedTail, TailCache
 from ..value_objects import Role
 from .decide import (
@@ -88,8 +90,22 @@ TOOLS_USED: frozenset[str] = frozenset(
     }
 )
 
-#: The registered role that makes an author's bare ``NEXT: none`` a ``human_close`` (v11 §1).
+#: The retired role ``human`` (T-human-role-registry). Kept as a name for readers of the
+#: history; it no longer makes a ``human_close`` (msg-10150 Obj-3-3).
 HUMAN_ROLE = "human"
+#: The registered role that makes an author's bare ``NEXT: none`` a ``human_close``.
+#:
+#: ``human_close`` is a COUNTING class, not a protection: it only keeps the human's close out of
+#: the ``unclassified`` accident count, and nothing is closed, moved or woken on it
+#: (``conductor/disposition.py``). So the key is narrow (T-human-role-registry msg-10150
+#: Obj-3-3): the identity ``human`` by name, or an author whose ``allowed_roles`` holds
+#: ``product_owner`` (msg-8784 §2). ``independence_class`` is not used, and the retired role
+#: ``human`` no longer counts, so Fermi's bare ``NEXT: none`` is counted as ``unclassified``
+#: (reported, never hidden).
+HUMAN_CLOSE_ROLE = "product_owner"
+#: magickit ``HUMAN_IDENTITY_NAMES``, re-exported from ``settled_close`` so the counting class
+#: and the protection share one definition of the identity names (PR #615 gate advisory); only
+#: their role policies differ, on purpose.
 
 
 class PrStateSource(Protocol):
@@ -216,6 +232,8 @@ class RoleLookup:
         self._cache: dict[str, bool | None] = {}
 
     async def is_human(self, author: str) -> bool | None:
+        if is_human_name(author):
+            return True
         if author not in self._cache:
             self._cache[author] = await self._lookup(author)
         return self._cache[author]
@@ -234,7 +252,7 @@ class RoleLookup:
         roles = identity.get("allowed_roles") if isinstance(identity, dict) else None
         if not isinstance(roles, list):
             return None
-        return HUMAN_ROLE in roles
+        return HUMAN_CLOSE_ROLE in roles
 
 
 def live_roles(heads: list[Head], roster: Mapping[str, Role]) -> list[Role | None] | None:
@@ -548,6 +566,8 @@ async def _post_malformed_notice(
 
 
 __all__ = [
+    "HUMAN_CLOSE_ROLE",
+    "HUMAN_IDENTITY_NAMES",
     "HUMAN_ROLE",
     "TOOLS_USED",
     "FactReader",
